@@ -37,6 +37,15 @@ export interface SlackPostResult {
   threadTs?: string;
 }
 
+export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
+
+export interface SlackAgentSessionStatusResult {
+  status: SlackAgentSessionStatus;
+  agentStatus: SlackAgentSessionStatus;
+  title?: string;
+  warning?: string;
+}
+
 export interface SlackChannel {
   id: string;
   name?: string;
@@ -123,11 +132,22 @@ export interface SlackApiClient {
     threadTs?: string;
     replyBroadcast: boolean;
   }): Promise<SlackPostResult>;
+  setAgentSessionStatus(input: {
+    channelId: string;
+    threadTs: string;
+    status: SlackAgentSessionStatus;
+    initiatorUserId?: string;
+    title?: string;
+  }): Promise<SlackAgentSessionStatusResult>;
   addReaction(channelId: string, messageTs: string, emojiName: string): Promise<void>;
 }
 
 const maxTextFileBytes = 1_048_576;
 const maxImageFileBytes = 5_242_880;
+
+function isAgentSessionStatus(value: unknown): value is SlackAgentSessionStatus {
+  return value === "active" || value === "processing" || value === "suspended" || value === "closed";
+}
 
 function optionalCursor(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -570,6 +590,42 @@ export class SlackWebApiClient implements SlackApiClient {
       channelId: nonEmpty(response.channel, "channel"),
       messageTs: nonEmpty(response.ts, "ts"),
       ...(response.message?.thread_ts ? { threadTs: response.message.thread_ts } : {}),
+    };
+  }
+
+  async setAgentSessionStatus(input: {
+    channelId: string;
+    threadTs: string;
+    status: SlackAgentSessionStatus;
+    initiatorUserId?: string;
+    title?: string;
+  }): Promise<SlackAgentSessionStatusResult> {
+    const response = await callSlack(() =>
+      this.client.apiCall("agents.sessions.setStatus", {
+        channel_id: input.channelId,
+        thread_ts: input.threadTs,
+        status: input.status,
+        ...(input.initiatorUserId ? { initiator_user_id: input.initiatorUserId } : {}),
+        ...(input.title ? { title: input.title } : {}),
+      }),
+    );
+    const payload = response as unknown as {
+      status?: unknown;
+      agent_status?: unknown;
+      title?: unknown;
+      warning?: unknown;
+    };
+    const sessionStatus = isAgentSessionStatus(payload.status) ? payload.status : input.status;
+    const agentStatus = isAgentSessionStatus(payload.agent_status)
+      ? payload.agent_status
+      : input.status;
+    return {
+      status: sessionStatus,
+      agentStatus,
+      ...(typeof payload.title === "string" && payload.title ? { title: payload.title } : {}),
+      ...(typeof payload.warning === "string" && payload.warning
+        ? { warning: payload.warning }
+        : {}),
     };
   }
 

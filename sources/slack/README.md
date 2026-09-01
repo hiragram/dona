@@ -44,7 +44,9 @@ tokenは用途と接頭辞を混同しないでください。
 
 `app_mention`だけに絞る場合は、manifestからmessage eventsと対応するhistory scopesを削除できます。その場合も`app_mentions:read`と`app_mention`は残します。
 
-MCPは、チャンネル・ユーザー・リアクション・ファイルの参照に`channels:read`、`groups:read`、`users:read`、`reactions:read`、`files:read`を使います。書き込みには`chat:write`と`reactions:write`を使います。manifestのscopeを既存Appへ追加した後は、各workspaceでAppをreinstallしてください。
+現在のmanifestのように`app_mention`とmessage eventsを併用すると、チャンネル内のメンションは両方のイベントとして配送されます。Adapterは自分宛メンションを含む`message.channels` / `message.groups`をACKだけしてDispatcherへ送らず、`app_mention`だけを処理します。DMのmessage eventは除外しません。
+
+MCPは、チャンネル・ユーザー・リアクション・ファイルの参照に`channels:read`、`groups:read`、`users:read`、`reactions:read`、`files:read`を使います。メッセージ投稿とAgent Sessionの状態変更には`chat:write`、Agent宣言には`assistant:write`、リアクション追加には`reactions:write`を使います。manifestのscopeを既存Appへ追加した後は、各workspaceでAppをreinstallしてください。
 
 ## 起動
 
@@ -98,8 +100,11 @@ MCPが公開するツール:
 | `get_thread` | なし | channel IDとthread timestampでスレッドを読む |
 | `get_reactions` | なし | messageの既存リアクションを取得 |
 | `get_file` | なし | ファイル情報と対応形式の内容を取得 |
+| `set_agent_session_status` | あり | threadのAgent Sessionを`processing`、`active`、`suspended`、`closed`へ変更 |
 | `post_message` | あり | channel投稿またはthread返信 |
 | `add_reaction` | あり | messageへemoji reactionを追加 |
+
+`set_agent_session_status`は、Donaが返信すると判断した後に`processing`、返信完了後に`active`、質問や承認待ちでは`suspended`を設定します。`closed`は会話を明示的に終了するときだけ使います。statusを設定しないイベントにはローディング表示は出ません。
 
 MCPはSlack APIへの自動再試行を無効にしています。書き込みの通信結果が曖昧な場合、二重投稿を避けるためエージェントへ自動再試行しないよう伝えます。token、投稿本文、スレッド本文は通常ログへ出しません。
 
@@ -113,7 +118,7 @@ cd ../..
 codex mcp list
 ```
 
-設定では読み取りツールをそのまま使え、`post_message`と`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
+設定では読み取りツールをそのまま使え、`set_agent_session_status`、`post_message`、`add_reaction`は実行前に承認対象となる`default_tools_approval_mode = "writes"`を指定しています。既に起動している`dona-main`へ反映するには、そのCodexエージェントを再起動してください。Codexのproject-scoped `.codex/config.toml` とstdio MCP設定については[OpenAI公式ドキュメント](https://developers.openai.com/codex/mcp)も参照できます。
 
 MCPだけを手動で起動するデバッグ用コマンドもありますが、通常はCodexに起動させます。
 

@@ -94,9 +94,17 @@ export function normalizeSlackEvent(
   if (actorId && botUserIds.has(actorId)) return null;
 
   const channelId = nonEmptyString(event.channel);
+  const channelType = nonEmptyString(event.channel_type);
   const messageTs = nonEmptyString(event.ts);
   const threadTs = nonEmptyString(event.thread_ts) ?? messageTs;
   let text = typeof event.text === "string" ? event.text : "";
+  if (
+    type === "message" &&
+    (channelType === "channel" || channelType === "group") &&
+    [...botUserIds].some((botUserId) => text.includes(`<@${botUserId}>`))
+  ) {
+    return null;
+  }
   if (type === "app_mention") {
     for (const botUserId of botUserIds) text = text.replaceAll(`<@${botUserId}>`, " ");
     text = text.trim();
@@ -110,7 +118,6 @@ export function normalizeSlackEvent(
     thread_ts: threadTs,
   };
   if (actorId) subject.actor_id = actorId;
-  const channelType = nonEmptyString(event.channel_type);
   if (channelType && slackChannelTypes.has(channelType)) subject.channel_type = channelType;
   const payload: Record<string, unknown> = { text };
   const eventTs = nonEmptyString(event.event_ts) ?? messageTs;

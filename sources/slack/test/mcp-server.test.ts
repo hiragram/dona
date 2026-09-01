@@ -9,6 +9,8 @@ import type { SlackLogger } from "../src/logger.js";
 import { createSlackMcpServer } from "../src/mcp/server.js";
 import type {
   SlackApiClient,
+  SlackAgentSessionStatus,
+  SlackAgentSessionStatusResult,
   SlackChannel,
   SlackChannelPage,
   SlackFileInfo,
@@ -36,6 +38,13 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+  }> = [];
+  readonly sessionStatuses: Array<{
+    channelId: string;
+    threadTs: string;
+    status: SlackAgentSessionStatus;
+    initiatorUserId?: string;
+    title?: string;
   }> = [];
 
   async authenticate(): Promise<SlackWorkspaceIdentity> {
@@ -123,6 +132,20 @@ class FakeSlackClient implements SlackApiClient {
     this.posts.push(input);
     return { channelId: input.channelId, messageTs: "2.3", ...(input.threadTs ? { threadTs: input.threadTs } : {}) };
   }
+  async setAgentSessionStatus(input: {
+    channelId: string;
+    threadTs: string;
+    status: SlackAgentSessionStatus;
+    initiatorUserId?: string;
+    title?: string;
+  }): Promise<SlackAgentSessionStatusResult> {
+    this.sessionStatuses.push(input);
+    return {
+      status: input.status,
+      agentStatus: input.status,
+      ...(input.title ? { title: input.title } : {}),
+    };
+  }
   async addReaction(): Promise<void> {}
 }
 
@@ -160,6 +183,7 @@ describe("Dona Slack MCP server", () => {
           "get_thread",
           "get_reactions",
           "get_file",
+          "set_agent_session_status",
           "post_message",
           "add_reaction",
         ],
@@ -172,6 +196,40 @@ describe("Dona Slack MCP server", () => {
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
       );
+      assert.equal(
+        listed.tools.find(({ name }) => name === "set_agent_session_status")?.annotations?.idempotentHint,
+        true,
+      );
+
+      const statusResult = await client.callTool({
+        name: "set_agent_session_status",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          thread_ts: "1.2",
+          status: "processing",
+          initiator_user_id: "U1",
+          title: "Test request",
+        },
+      });
+      assert.equal(statusResult.isError, undefined);
+      assert.deepEqual(fake.sessionStatuses, [
+        {
+          channelId: "C123",
+          threadTs: "1.2",
+          status: "processing",
+          initiatorUserId: "U1",
+          title: "Test request",
+        },
+      ]);
+      assert.deepEqual(statusResult.structuredContent, {
+        workspace: "company",
+        channel_id: "C123",
+        thread_ts: "1.2",
+        status: "processing",
+        agent_status: "processing",
+        title: "Test request",
+      });
 
       const result = await client.callTool({
         name: "post_message",

@@ -171,6 +171,43 @@ describe("SlackSocketAdapter", () => {
     await adapter.stop();
   });
 
+  test("ACKs duplicate message delivery for an app mention without dispatching it", async () => {
+    const client = new FakeSocketClient();
+    let calls = 0;
+    const adapter = new SlackSocketAdapter(
+      [{ workspace: "company", client }],
+      {
+        async postEvent() {
+          calls += 1;
+          return { statusCode: 202, body: "{}" };
+        },
+        healthReady: async () => true,
+      },
+      config,
+      logger,
+    );
+    await adapter.start();
+    let acked = false;
+    client.emit(
+      "slack_event",
+      socketEnvelope("env-message-duplicate", async () => void (acked = true), {
+        ...eventBody("Ev-message-duplicate"),
+        event: {
+          type: "message",
+          user: "U_USER",
+          channel: "C01234567",
+          channel_type: "channel",
+          ts: "1756722030.123456",
+          event_ts: "1756722030.123456",
+          text: "<@U_BOT> hello",
+        },
+      }),
+    );
+    await waitFor(() => acked);
+    assert.equal(calls, 0);
+    await adapter.stop();
+  });
+
   test("reconnects after an unexpected disconnect", async () => {
     const client = new FakeSocketClient();
     const adapter = new SlackSocketAdapter(

@@ -43,6 +43,40 @@ describe("normalizeSlackEvent", () => {
     assert.equal(result.envelope.payload.text, "今週の未処理事項を整理して");
   });
 
+  test("ignores duplicate channel message events for app mentions but preserves DMs", () => {
+    for (const channelType of ["channel", "group"]) {
+      assert.equal(
+        normalizeSlackEvent(
+          payload({
+            event: {
+              type: "message",
+              user: "U1",
+              channel: "C1",
+              channel_type: channelType,
+              ts: "1.0",
+              text: "<@U_BOT> hello",
+            },
+          }),
+        ),
+        null,
+      );
+    }
+
+    const directMessage = normalizeSlackEvent(
+      payload({
+        event: {
+          type: "message",
+          user: "U1",
+          channel: "D1",
+          channel_type: "im",
+          ts: "1.0",
+          text: "<@U_BOT> hello",
+        },
+      }),
+    );
+    assert.ok(directMessage);
+  });
+
   test("preserves safe file metadata without private download URLs", () => {
     const withFile = payload();
     (withFile.event as Record<string, unknown>).files = [

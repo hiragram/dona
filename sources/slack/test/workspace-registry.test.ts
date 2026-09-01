@@ -5,6 +5,7 @@ import type { KeychainStore } from "../src/keychain.js";
 import type { SlackLogger } from "../src/logger.js";
 import type {
   SlackApiClient,
+  SlackAgentSessionStatusResult,
   SlackChannel,
   SlackChannelPage,
   SlackFileInfo,
@@ -61,6 +62,9 @@ class FakeSlackClient implements SlackApiClient {
   }
   async postMessage(): Promise<SlackPostResult> {
     return { channelId: "C1", messageTs: "1.1" };
+  }
+  async setAgentSessionStatus(): Promise<SlackAgentSessionStatusResult> {
+    return { status: "active", agentStatus: "active" };
   }
   async addReaction(): Promise<void> {}
 }
