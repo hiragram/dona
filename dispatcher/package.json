@@ -1,0 +1,32 @@
+{
+  "name": "@dona/dispatcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable, serial event dispatcher for Dona",
+  "type": "module",
+  "engines": {
+    "node": ">=20.17.0"
+  },
+  "bin": {
+    "dona-dispatcher": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts serve",
+    "start": "node dist/cli.js serve",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^17.2.2",
+    "ulid": "^3.0.2",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^7.0.2"
+  }
+}

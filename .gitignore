@@ -1,0 +1,25 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

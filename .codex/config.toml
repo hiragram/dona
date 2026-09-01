@@ -1,0 +1,10 @@
+[mcp_servers.dona_slack]
+command = "node"
+args = ["dist/mcp/index.js"]
+cwd = "sources/slack"
+enabled = true
+required = false
+enabled_tools = ["list_workspaces", "list_channels", "get_channel", "list_users", "get_user", "get_thread", "get_reactions", "get_file", "post_message", "add_reaction"]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 20
+tool_timeout_sec = 60

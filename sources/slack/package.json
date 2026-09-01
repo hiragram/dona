@@ -1,0 +1,39 @@
+{
+  "name": "@dona/slack-source",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Slack Socket Mode adapter and stdio MCP server for Dona",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "bin": {
+    "dona-slack-adapter": "dist/index.js",
+    "dona-slack-mcp": "dist/mcp/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/index.ts",
+    "dev:mcp": "tsx src/mcp/index.ts",
+    "dev:watch": "node --watch --import tsx src/index.ts",
+    "start": "node dist/index.js",
+    "start:mcp": "node dist/mcp/index.js",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@github/keytar": "^7.10.6",
+    "@inquirer/password": "^5.2.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@slack/socket-mode": "^3.0.1",
+    "@slack/web-api": "^8.1.1",
+    "dotenv": "^17.2.2",
+    "undici": "^7.29.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^7.0.2"
+  }
+}

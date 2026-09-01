@@ -1,0 +1,13 @@
+{
+  "name": "dona",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local development launcher for Dona",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs"
+  }
+}
