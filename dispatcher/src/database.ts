@@ -4,11 +4,23 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 
-import type { EnqueueResult, EventEnvelope, EventRow, EventStatus, ResultEnvelope } from "./types.js";
-import { eventStatuses } from "./types.js";
+import type {
+  CreateJobRequest,
+  CreateJobResult,
+  EnqueueResult,
+  EventEnvelope,
+  EventRow,
+  EventStatus,
+  JobResultEnvelope,
+  JobRow,
+  JobStatus,
+  ResultEnvelope,
+} from "./types.js";
+import { eventStatuses, jobStatuses } from "./types.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
+const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 
 function nowUtc(): string {
@@ -36,10 +48,8 @@ export class DispatcherDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 1) throw new Error(`Database schema version ${version} is newer than supported version 1`);
-    if (version === 1) return;
-
-    this.db.exec(`
+    if (version > 2) throw new Error(`Database schema version ${version} is newer than supported version 2`);
+    if (version < 1) this.db.exec(`
       CREATE TABLE events (
         sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id            TEXT NOT NULL UNIQUE,
@@ -68,6 +78,41 @@ export class DispatcherDatabase {
       );
       CREATE INDEX events_dispatch_idx ON events(status, available_at, sequence);
       PRAGMA user_version = 1;
+    `);
+    if (version < 2) this.db.exec(`
+      CREATE TABLE jobs (
+        job_id                TEXT PRIMARY KEY,
+        source_event_id       TEXT NOT NULL UNIQUE REFERENCES events(event_id),
+        source                TEXT NOT NULL,
+        workspace_id          TEXT,
+        channel_id            TEXT,
+        thread_ts             TEXT,
+        actor_id              TEXT,
+        objective             TEXT NOT NULL,
+        workspace_json        TEXT NOT NULL,
+        status                TEXT NOT NULL CHECK (status IN (${jobStatusSql})),
+        attempt_count         INTEGER NOT NULL DEFAULT 0,
+        available_at          TEXT NOT NULL,
+        workspace_path        TEXT NOT NULL,
+        result_path           TEXT NOT NULL,
+        herdr_workspace_id    TEXT,
+        herdr_pane_id         TEXT,
+        agent_name            TEXT NOT NULL UNIQUE,
+        dispatch_started_at   TEXT,
+        prompt_accepted_at    TEXT,
+        completed_at          TEXT,
+        result_json           TEXT,
+        completion_event_id   TEXT REFERENCES events(event_id),
+        steer_event_id        TEXT,
+        steer_state           TEXT CHECK (steer_state IN ('dispatching', 'accepted') OR steer_state IS NULL),
+        last_error_code       TEXT,
+        last_error_message    TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL
+      );
+      CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
+      CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
+      PRAGMA user_version = 2;
     `);
   }
 
@@ -147,6 +192,352 @@ export class DispatcherDatabase {
         .all(status, limit) as EventRow[];
     }
     return this.db.prepare("SELECT * FROM events ORDER BY sequence LIMIT ?").all(limit) as EventRow[];
+  }
+
+  createJob(
+    request: CreateJobRequest,
+    workspaceRoot: string,
+    resultDir: string,
+    at = new Date(),
+  ): CreateJobResult {
+    const sourceEvent = this.getRequired(request.source_event_id);
+    const workspaceJson = stableStringify(request.workspace);
+    const replyTarget = sourceEvent.reply_target_json
+      ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
+      : {};
+    const subject = JSON.parse(sourceEvent.subject_json) as Record<string, unknown>;
+    const workspaceId = stringValue(replyTarget.workspace_id);
+    const channelId = stringValue(replyTarget.channel_id);
+    const threadTs = stringValue(replyTarget.thread_ts);
+    if (
+      sourceEvent.source !== "slack" ||
+      stringValue(replyTarget.kind) !== "slack_thread" ||
+      !workspaceId ||
+      !channelId ||
+      !threadTs
+    ) {
+      throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target`);
+    }
+
+    return this.db.transaction(() => {
+      const existing = this.db
+        .prepare("SELECT * FROM jobs WHERE source_event_id = ?")
+        .get(request.source_event_id) as JobRow | undefined;
+      if (existing) {
+        return {
+          row: existing,
+          duplicate: true,
+          payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
+        };
+      }
+
+      const jobId = `job_${ulid(at.getTime()).toLowerCase()}`;
+      const workspacePath = request.workspace.kind === "scratch"
+        ? path.join(workspaceRoot, "scratch", jobId)
+        : path.join(
+          workspaceRoot,
+          "github",
+          request.workspace.repository.split("/")[0]!,
+          request.workspace.repository.split("/")[1]!,
+          "worktrees",
+          jobId,
+        );
+      const resultPath = path.join(resultDir, `${jobId}.json`);
+      const timestamp = at.toISOString();
+      this.db.prepare(`
+        INSERT INTO jobs (
+          job_id, source_event_id, source, workspace_id, channel_id, thread_ts, actor_id,
+          objective, workspace_json, status, available_at, workspace_path, result_path,
+          agent_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+      `).run(
+        jobId,
+        request.source_event_id,
+        sourceEvent.source,
+        workspaceId,
+        channelId,
+        threadTs,
+        stringValue(subject.actor_id),
+        request.objective,
+        workspaceJson,
+        timestamp,
+        workspacePath,
+        resultPath,
+        jobId,
+        timestamp,
+        timestamp,
+      );
+      return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
+    })();
+  }
+
+  getJob(jobId: string): JobRow | undefined {
+    return this.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | undefined;
+  }
+
+  listJobs(status?: JobStatus, limit = 100): JobRow[] {
+    if (status) {
+      return this.db.prepare("SELECT * FROM jobs WHERE status = ? ORDER BY created_at LIMIT ?").all(status, limit) as JobRow[];
+    }
+    return this.db.prepare("SELECT * FROM jobs ORDER BY created_at LIMIT ?").all(limit) as JobRow[];
+  }
+
+  listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
+    return this.db.prepare(`
+      SELECT * FROM jobs
+      WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ?
+      ORDER BY created_at DESC LIMIT ?
+    `).all(workspaceId, channelId, threadTs, limit) as JobRow[];
+  }
+
+  listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
+    return this.db.prepare(`
+      SELECT * FROM jobs
+      WHERE (status IN ('queued', 'retryable_failed') AND available_at <= ?)
+         OR status = 'running'
+      ORDER BY created_at LIMIT ?
+    `).all(at.toISOString(), limit) as JobRow[];
+  }
+
+  listJobsNeedingNotification(limit = 100): JobRow[] {
+    return this.db.prepare(`
+      SELECT * FROM jobs
+      WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
+        AND completion_event_id IS NULL
+      ORDER BY updated_at LIMIT ?
+    `).all(limit) as JobRow[];
+  }
+
+  recoverStaleJobs(at = new Date()): { retryable: number; needsReview: number } {
+    const timestamp = at.toISOString();
+    const retryable = this.db.prepare(`
+      UPDATE jobs SET status = 'retryable_failed', available_at = ?,
+        last_error_code = 'stale_preparing',
+        last_error_message = 'Dispatcher restarted before the job prompt was attempted', updated_at = ?
+      WHERE status = 'preparing'
+    `).run(timestamp, timestamp).changes;
+    const needsReview = this.db.prepare(`
+      UPDATE jobs SET status = 'needs_review',
+        last_error_code = 'ambiguous_job_control',
+        last_error_message = 'Dispatcher restarted while job prompt, steer, or cancellation acceptance was unknown',
+        steer_state = NULL, updated_at = ?
+      WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
+    `).run(timestamp).changes;
+    return { retryable, needsReview };
+  }
+
+  beginJobPreparation(jobId: string, at = new Date()): JobRow {
+    const timestamp = at.toISOString();
+    const changed = this.db.prepare(`
+      UPDATE jobs SET status = 'preparing', attempt_count = attempt_count + 1,
+        last_error_code = NULL, last_error_message = NULL, updated_at = ?
+      WHERE job_id = ? AND status IN ('queued', 'retryable_failed') AND available_at <= ?
+    `).run(timestamp, jobId, timestamp).changes;
+    if (changed !== 1) throw new Error(`Job ${jobId} is no longer ready to prepare`);
+    return this.getJobRequired(jobId);
+  }
+
+  setJobRuntime(jobId: string, herdrWorkspaceId: string, herdrPaneId: string): void {
+    this.updateJob(jobId, ["preparing"], "preparing", {
+      herdr_workspace_id: herdrWorkspaceId,
+      herdr_pane_id: herdrPaneId,
+    });
+  }
+
+  beginJobDispatch(jobId: string, at = new Date()): JobRow {
+    this.updateJob(jobId, ["preparing"], "dispatching", { dispatch_started_at: at.toISOString() });
+    return this.getJobRequired(jobId);
+  }
+
+  markJobRunning(jobId: string, at = new Date()): void {
+    this.updateJob(jobId, ["dispatching"], "running", {
+      prompt_accepted_at: at.toISOString(),
+      last_error_code: null,
+      last_error_message: null,
+    });
+  }
+
+  recordJobPreparationFailure(
+    jobId: string,
+    code: string,
+    message: string,
+    maxAttempts: number,
+    at = new Date(),
+  ): JobRow {
+    const row = this.getJobRequired(jobId);
+    if (row.status !== "preparing") throw new Error(`Job ${jobId} is not preparing`);
+    const status: JobStatus = row.attempt_count >= maxAttempts ? "failed" : "retryable_failed";
+    const availableAt = status === "failed" ? at.toISOString() : retryAt(row.attempt_count, at);
+    this.updateJob(jobId, ["preparing"], status, {
+      available_at: availableAt,
+      last_error_code: code,
+      last_error_message: message,
+      ...(status === "failed" ? { completed_at: at.toISOString() } : {}),
+    });
+    return this.getJobRequired(jobId);
+  }
+
+  recordJobSafePromptFailure(
+    jobId: string,
+    code: string,
+    message: string,
+    maxAttempts: number,
+    at = new Date(),
+  ): JobRow {
+    const row = this.getJobRequired(jobId);
+    if (row.status !== "dispatching") throw new Error(`Job ${jobId} is not dispatching`);
+    const status: JobStatus = row.attempt_count >= maxAttempts ? "failed" : "retryable_failed";
+    const availableAt = status === "failed" ? at.toISOString() : retryAt(row.attempt_count, at);
+    this.updateJob(jobId, ["dispatching"], status, {
+      available_at: availableAt,
+      last_error_code: code,
+      last_error_message: message,
+      ...(status === "failed" ? { completed_at: at.toISOString() } : {}),
+    });
+    return this.getJobRequired(jobId);
+  }
+
+  markJobNeedsReview(jobId: string, code: string, message: string): void {
+    const row = this.getJobRequired(jobId);
+    if (["completed", "failed", "cancelled"].includes(row.status)) return;
+    this.updateJob(jobId, [row.status], "needs_review", {
+      last_error_code: code,
+      last_error_message: message,
+      steer_state: null,
+    });
+  }
+
+  markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
+    this.updateJob(jobId, from, "blocked", {
+      last_error_code: "agent_blocked",
+      last_error_message: message,
+    });
+  }
+
+  saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string): void {
+    const status: JobStatus = result.status === "completed" ? "completed" : "failed";
+    this.updateJob(jobId, ["running"], status, {
+      result_json: stableStringify(result),
+      result_path: resultPath,
+      completed_at: result.completed_at,
+      last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
+      last_error_message: result.status === "failed" ? result.summary : null,
+    });
+  }
+
+  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
+    this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    const row = this.getJobRequired(jobId);
+    if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
+    if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
+    this.db.prepare(`
+      UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
+      WHERE job_id = ?
+    `).run(`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`, sourceEventId, nowUtc(), jobId);
+    return this.getJobRequired(jobId);
+  }
+
+  beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {
+    this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    const row = this.getJobRequired(jobId);
+    if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
+    if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
+    this.db.prepare(`
+      UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
+    `).run(sourceEventId, nowUtc(), jobId);
+    return { row: this.getJobRequired(jobId), duplicate: false };
+  }
+
+  markJobSteerAccepted(jobId: string, sourceEventId: string): void {
+    const changed = this.db.prepare(`
+      UPDATE jobs SET steer_state = 'accepted', updated_at = ?
+      WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
+    `).run(nowUtc(), jobId, sourceEventId).changes;
+    if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+  }
+
+  clearJobSteer(jobId: string, sourceEventId: string): void {
+    this.db.prepare(`
+      UPDATE jobs SET steer_event_id = NULL, steer_state = NULL, updated_at = ?
+      WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
+    `).run(nowUtc(), jobId, sourceEventId);
+  }
+
+  beginJobCancellation(jobId: string, sourceEventId: string): JobRow {
+    this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    const row = this.getJobRequired(jobId);
+    if (row.status === "cancelled") return row;
+    if (!["queued", "retryable_failed", "running", "blocked"].includes(row.status)) {
+      throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
+    }
+    this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+    return this.getJobRequired(jobId);
+  }
+
+  markJobCancelled(jobId: string, reason: string, at = new Date()): void {
+    this.updateJob(jobId, ["cancelling"], "cancelled", {
+      completed_at: at.toISOString(),
+      last_error_code: "cancelled",
+      last_error_message: reason,
+    });
+  }
+
+  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult {
+    const job = this.getJobRequired(jobId);
+    if (job.completion_event_id) {
+      const existing = this.get(job.completion_event_id);
+      if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
+      return { row: existing, duplicate: true, payloadMismatch: false };
+    }
+    const sourceEvent = this.getRequired(job.source_event_id);
+    const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
+    const envelope: EventEnvelope = {
+      schema_version: 1,
+      source: "dona_job",
+      external_event_id: `${job.job_id}:${job.status}`,
+      type: `job_${job.status}`,
+      occurred_at: at.toISOString(),
+      subject: {
+        job_id: job.job_id,
+        source_event_id: job.source_event_id,
+        ...(job.workspace_id ? { workspace_id: job.workspace_id } : {}),
+        ...(job.channel_id ? { channel_id: job.channel_id } : {}),
+        ...(job.thread_ts ? { thread_ts: job.thread_ts } : {}),
+        ...(job.actor_id ? { actor_id: job.actor_id } : {}),
+      },
+      payload: {
+        job_id: job.job_id,
+        job_status: job.status,
+        workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
+        ...(result ? { result } : {}),
+        ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
+        ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
+      },
+      reply_target: sourceEvent.reply_target_json
+        ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
+        : null,
+      trace: { job_id: job.job_id, source_event_id: job.source_event_id },
+    };
+    const enqueued = this.enqueue(envelope, at);
+    this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
+      .run(enqueued.row.event_id, at.toISOString(), jobId);
+    return enqueued;
+  }
+
+  private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
+    const job = this.getJobRequired(jobId);
+    const sourceEvent = this.getRequired(sourceEventId);
+    const replyTarget = sourceEvent.reply_target_json
+      ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
+      : {};
+    if (
+      sourceEvent.source !== "slack" ||
+      stringValue(replyTarget.workspace_id) !== job.workspace_id ||
+      stringValue(replyTarget.channel_id) !== job.channel_id ||
+      stringValue(replyTarget.thread_ts) !== job.thread_ts
+    ) {
+      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s Slack thread`);
+    }
   }
 
   hasBlockedEvent(): boolean {
@@ -343,6 +734,28 @@ export class DispatcherDatabase {
     return row;
   }
 
+  private getJobRequired(jobId: string): JobRow {
+    const row = this.getJob(jobId);
+    if (!row) throw new Error(`Job ${jobId} was not found`);
+    return row;
+  }
+
+  private updateJob(
+    jobId: string,
+    from: JobStatus[],
+    to: JobStatus,
+    values: Record<string, string | null>,
+  ): void {
+    const timestamp = nowUtc();
+    const assignments = [...Object.keys(values).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
+    const params = [...Object.values(values), to, timestamp, jobId, ...from];
+    const placeholders = from.map(() => "?").join(", ");
+    const changed = this.db.prepare(
+      `UPDATE jobs SET ${assignments.join(", ")} WHERE job_id = ? AND status IN (${placeholders})`,
+    ).run(...params).changes;
+    if (changed !== 1) throw new Error(`Invalid status transition for job ${jobId} to ${to}`);
+  }
+
   private transition(
     eventId: string,
     from: EventStatus[],
@@ -358,4 +771,8 @@ export class DispatcherDatabase {
       .run(...params).changes;
     if (changed !== 1) throw new Error(`Invalid status transition for event ${eventId} to ${to}`);
   }
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }

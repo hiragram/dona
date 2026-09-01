@@ -1,6 +1,6 @@
 # Dona Dispatcher
 
-AdapterからUnix Domain Socket上のHTTP/1.1でイベントを受け、SQLiteへ永続化した後にHerdrの`dona-main`へ1件ずつ投入します。
+AdapterからUnix Domain Socket上のHTTP/1.1でイベントを受け、SQLiteへ永続化した後にHerdrの`dona-main`へ1件ずつ投入します。長い作業は別のCodexワーカーへ委任でき、`dona-main`は次のイベント受付へ戻れます。
 
 ## セットアップと起動
 
@@ -16,8 +16,21 @@ npm run dev
 ~/Library/Application Support/Dona/
 ├── dona.sqlite3
 ├── results/<event_id>.json
+├── job-results/<job_id>.json
 └── run/dispatcher.sock
 ```
+
+ジョブworkspaceの初期値は次のとおりです。
+
+```text
+~/.dona/workspaces/
+├── scratch/<job_id>/
+└── github/<owner>/<repo>/
+    ├── repository/
+    └── worktrees/<job_id>/
+```
+
+GitHub jobのbranchは`dona/<job_id>`です。Dona独自のrepository許可台帳は設けず、clone、push、PR作成の認証・権限は`gh`とGitHub側へ委ねます。
 
 `run`と`results`は`0700`、socketとDBは`0600`へ設定します。SQLiteはWALモードです。起動時に接続不能なsocketが残っていればstale socketとして削除し、接続可能なら二重起動として失敗します。
 
@@ -28,6 +41,13 @@ HERDR_SESSION=dona
 DONA_AGENT_NAME=dona-main
 DONA_HERDR_PATH=herdr
 DONA_AGENT_MISSING_GRACE_MS=5000
+DONA_JOBS_WORKSPACE_ROOT=~/.dona/workspaces
+DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results
+DONA_JOB_CONCURRENCY=4
+DONA_JOB_AGENT_START_TIMEOUT_MS=30000
+DONA_JOB_COMMAND_TIMEOUT_MS=10000
+DONA_GH_PATH=gh
+DONA_GIT_PATH=git
 ```
 
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
@@ -37,6 +57,22 @@ herdr --session dona agent get dona-main
 herdr --session dona agent prompt dona-main <prompt>
 herdr --session dona agent wait dona-main --until idle --until done --until blocked --timeout 120000
 ```
+
+バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、同じ`job_id`をHerdr agent名としてCodexを起動します。GitHub jobではDispatcherが検証・選択したrepositoryとworktreeだけを、起動時の`projects = { "<path>" = { trust_level = "trusted" } }`overrideへ渡すため、対話的なproject trust確認でworkerが停止しません。これはsandboxやcommand approvalを無効化する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
+
+## Dona Dispatcher MCP
+
+Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
+
+- `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任
+- `list_thread_jobs`: Slack threadに紐づくジョブを列挙
+- `get_job_status`: 状態と結果を取得
+- `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
+- `cancel_job`: ジョブを中止
+
+ビルド後はリポジトリの[`.codex/config.toml`](../.codex/config.toml)を読んだCodexが`dist/mcp/index.js`を起動します。`npm run dev`が起動するのは常駐DispatcherとSlack Adapterだけです。
+
+ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ワーカーはSlackへ直接書き込みません。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -94,6 +130,9 @@ npm exec -- tsx src/cli.ts event complete evt_...
 npm exec -- tsx src/cli.ts event dead-letter evt_...
 npm exec -- tsx src/cli.ts event retry evt_...
 npm exec -- tsx src/cli.ts event retry evt_... --force
+npm exec -- tsx src/cli.ts job list
+npm exec -- tsx src/cli.ts job list --status running
+npm exec -- tsx src/cli.ts job show job_...
 ```
 
 `blocked`または`needs_review`のretryには`--force`が必要です。Herdr画面、結果ファイル、構造化ログを確認し、二重実行の可能性を理解した場合だけ実行してください。
@@ -106,6 +145,8 @@ npm exec -- tsx src/cli.ts event retry evt_... --force
 - staleな`dispatching`: 起動時に`needs_review`へ移します。
 - `blocked`: 自動解除せず、キュー全体を停止します。
 - `needs_review` / `completed` / `dead_letter`: 自動変更しません。
+
+ジョブは複数同時に動きますが、同じ`dona-main`へのイベント投入は従来どおり1件ずつです。ジョブの`preparing`は再起動時に`retryable_failed`へ戻します。prompt、steer、cancelの受理が曖昧な状態は`needs_review`へ移し、自動再投入しません。`running`は結果ファイルとHerdr agent状態の監視を再開し、最初のpromptを再送しません。
 
 Result Envelopeは完成パスの最大1 MiB、schema version、event ID、status、UTC完了日時を検証します。`actions`は保存するだけで実行しません。agentの画面テキストは結果判定に使いません。
 

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { afterEach, describe, test } from "node:test";
 
+import Database from "better-sqlite3";
+
 import { DispatcherDatabase } from "../src/database.js";
+import { envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -11,6 +14,17 @@ afterEach(async () => {
 });
 
 describe("DispatcherDatabase", () => {
+  test("migrates an existing schema v1 database to the jobs schema", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const legacy = new Database(config.databasePath);
+    legacy.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY); PRAGMA user_version = 1;");
+    legacy.close();
+    const database = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(database.listJobs(), []);
+    database.close();
+  });
+
   test("deduplicates the same source event without overwriting its payload", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -67,6 +81,60 @@ describe("DispatcherDatabase", () => {
     database.enqueue(eventEnvelope("Ev-2"));
     database.recordPreDispatchFailure(first.event_id, "herdr_unavailable", "offline", 5);
     assert.equal(database.nextAvailable(), undefined);
+    database.close();
+  });
+
+  test("persists jobs, scopes follow-up input to the Slack thread, and emits one completion event", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-source")).row;
+    const created = database.createJob(
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    assert.equal(created.duplicate, false);
+    assert.match(created.row.job_id, /^job_[0-9a-hjkmnp-tv-z]{26}$/);
+    assert.equal(created.row.workspace_path, `${config.jobsWorkspaceRoot}/scratch/${created.row.job_id}`);
+    assert.equal(database.createJob(
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).duplicate, true);
+
+    const followUp = database.enqueue(eventEnvelope("Ev-job-follow-up")).row;
+    database.appendQueuedJobInstruction(created.row.job_id, followUp.event_id, "条件を追加する");
+    assert.match(database.getJob(created.row.job_id)!.objective, /条件を追加する/);
+    assert.equal(database.listThreadJobs("T_TEST", "C_TEST", "1756722030.123456").length, 1);
+
+    const otherThreadEnvelope = eventEnvelope("Ev-other-thread");
+    otherThreadEnvelope.reply_target!.thread_ts = "1756722031.000001";
+    otherThreadEnvelope.subject.thread_ts = "1756722031.000001";
+    const otherThread = database.enqueue(otherThreadEnvelope).row;
+    assert.throws(
+      () => database.appendQueuedJobInstruction(created.row.job_id, otherThread.event_id, "wrong thread"),
+      /does not belong/,
+    );
+
+    database.beginJobPreparation(created.row.job_id);
+    database.setJobRuntime(created.row.job_id, "1", "w1:p1");
+    database.beginJobDispatch(created.row.job_id);
+    database.markJobRunning(created.row.job_id);
+    database.saveJobResult(created.row.job_id, {
+      schema_version: 1,
+      job_id: created.row.job_id,
+      status: "completed",
+      summary: "完了",
+      output: { format: "markdown", text: "結果" },
+      completed_at: new Date().toISOString(),
+    }, created.row.result_path);
+    const notification = database.enqueueJobNotification(created.row.job_id);
+    const duplicate = database.enqueueJobNotification(created.row.job_id);
+    assert.equal(notification.row.source, "dona_job");
+    assert.equal(notification.row.event_type, "job_completed");
+    assert.equal(envelopeFromRow(notification.row).source, "dona_job");
+    assert.equal(duplicate.row.event_id, notification.row.event_id);
     database.close();
   });
 });

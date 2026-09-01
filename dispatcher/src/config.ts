@@ -13,6 +13,13 @@ export interface DispatcherConfig {
   agentMissingGraceMs: number;
   queuePollMs: number;
   maxAttempts: number;
+  jobsWorkspaceRoot: string;
+  jobResultsDir: string;
+  jobConcurrency: number;
+  jobAgentStartTimeoutMs: number;
+  jobCommandTimeoutMs: number;
+  ghPath: string;
+  gitPath: string;
 }
 
 function expandHome(value: string): string {
@@ -58,5 +65,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     queuePollMs: positiveInteger(env.DONA_QUEUE_POLL_MS, 1_000, "DONA_QUEUE_POLL_MS"),
     maxAttempts: positiveInteger(env.DONA_MAX_ATTEMPTS, 5, "DONA_MAX_ATTEMPTS"),
+    jobsWorkspaceRoot: expandHome(
+      env.DONA_JOBS_WORKSPACE_ROOT ?? path.join(os.homedir(), ".dona", "workspaces"),
+    ),
+    jobResultsDir: expandHome(env.DONA_JOB_RESULTS_DIR ?? path.join(base, "job-results")),
+    jobConcurrency: positiveInteger(env.DONA_JOB_CONCURRENCY, 4, "DONA_JOB_CONCURRENCY"),
+    jobAgentStartTimeoutMs: positiveInteger(
+      env.DONA_JOB_AGENT_START_TIMEOUT_MS,
+      30_000,
+      "DONA_JOB_AGENT_START_TIMEOUT_MS",
+    ),
+    jobCommandTimeoutMs: positiveInteger(
+      env.DONA_JOB_COMMAND_TIMEOUT_MS,
+      10_000,
+      "DONA_JOB_COMMAND_TIMEOUT_MS",
+    ),
+    ghPath: nonEmpty(env.DONA_GH_PATH, "gh", "DONA_GH_PATH"),
+    gitPath: nonEmpty(env.DONA_GIT_PATH, "git", "DONA_GIT_PATH"),
   };
 }

@@ -3,7 +3,7 @@ import "dotenv/config";
 
 import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
-import { eventStatuses, type EventStatus } from "./types.js";
+import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
 
 function usage(): never {
@@ -13,7 +13,9 @@ function usage(): never {
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
   dona-dispatcher event complete <event_id>
-  dona-dispatcher event dead-letter <event_id>`);
+  dona-dispatcher event dead-letter <event_id>
+  dona-dispatcher job list [--status STATUS]
+  dona-dispatcher job show <job_id>`);
   process.exit(2);
 }
 
@@ -30,10 +32,27 @@ async function main(): Promise<void> {
     await runService(config);
     return;
   }
-  if (args[0] !== "event") usage();
+  if (!["event", "job"].includes(args[0]!)) usage();
   const command = args[1];
   const database = new DispatcherDatabase(config.databasePath);
   try {
+    if (args[0] === "job") {
+      if (command === "list") {
+        const statusIndex = args.indexOf("--status");
+        const status = statusIndex === -1 ? undefined : args[statusIndex + 1];
+        if (status !== undefined && !jobStatuses.includes(status as JobStatus)) usage();
+        console.log(JSON.stringify(database.listJobs(status as JobStatus | undefined), null, 2));
+        return;
+      }
+      if (command === "show") {
+        const jobId = eventIdAt(args, 2);
+        const row = database.getJob(jobId);
+        if (!row) throw new Error(`Job ${jobId} was not found`);
+        console.log(JSON.stringify(row, null, 2));
+        return;
+      }
+      usage();
+    }
     if (command === "list") {
       const statusIndex = args.indexOf("--status");
       const status = statusIndex === -1 ? undefined : args[statusIndex + 1];

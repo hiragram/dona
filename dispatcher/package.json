@@ -8,7 +8,8 @@
     "node": ">=20.17.0"
   },
   "bin": {
-    "dona-dispatcher": "dist/cli.js"
+    "dona-dispatcher": "dist/cli.js",
+    "dona-dispatcher-mcp": "dist/mcp/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -18,6 +19,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^12.11.1",
     "dotenv": "^17.2.2",
     "ulid": "^3.0.2",

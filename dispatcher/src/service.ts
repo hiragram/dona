@@ -2,6 +2,8 @@ import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
+import { HerdrJobAgentRuntime } from "./job-runtime.js";
+import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { DispatcherWorker } from "./worker.js";
 
@@ -16,12 +18,21 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   const worker = new DispatcherWorker(database, herdr, config, workerLogger);
-  const api = new DispatcherApi(database, worker, config, apiLogger);
+  const jobSupervisor = new JobSupervisor(
+    database,
+    new HerdrJobAgentRuntime(config),
+    config,
+    createLogger("dispatcher_jobs"),
+    () => worker.wake(),
+  );
+  const api = new DispatcherApi(database, worker, jobSupervisor, config, apiLogger);
 
   try {
     await api.start();
     worker.start();
+    jobSupervisor.start();
   } catch (error) {
+    if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (worker.isRunning()) await worker.stop();
     database.close();
     throw error;
@@ -36,6 +47,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       try {
         api.beginShutdown();
         await api.stop();
+        await jobSupervisor.stop();
         await worker.stop();
         database.close();
         resolve();

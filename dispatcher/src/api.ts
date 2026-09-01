@@ -6,10 +6,22 @@ import path from "node:path";
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
-import { parseEventEnvelope, RequestValidationError } from "./validation.js";
+import type { JobControlResult } from "./job-supervisor.js";
+import {
+  parseCancelJobRequest,
+  parseCreateJobRequest,
+  parseEventEnvelope,
+  parseSteerJobRequest,
+  RequestValidationError,
+} from "./validation.js";
 
 class BodyTooLargeError extends Error {}
 class PersistenceUnavailableError extends Error {}
+class ApiRequestError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+  }
+}
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -62,6 +74,13 @@ export interface ApiWorkerState {
   wake(): void;
 }
 
+export interface ApiJobController {
+  isRunning(): boolean;
+  wake(): void;
+  steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult>;
+  cancel(jobId: string, sourceEventId: string, reason?: string): Promise<JobControlResult>;
+}
+
 export class DispatcherApi {
   private server: http.Server | undefined;
   private shuttingDown = false;
@@ -69,6 +88,7 @@ export class DispatcherApi {
   constructor(
     private readonly database: DispatcherDatabase,
     private readonly worker: ApiWorkerState,
+    private readonly jobs: ApiJobController,
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
   ) {}
@@ -130,13 +150,17 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
-        let ready = !this.shuttingDown && this.worker.isRunning();
+        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning();
         try {
           this.database.assertReadableWritable();
         } catch {
           ready = false;
         }
         sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        return;
+      }
+      if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
+        await this.handleJobs(request, response, url);
         return;
       }
       if (request.method !== "POST" || url.pathname !== "/v1/events") {
@@ -147,24 +171,7 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("shutting_down", "Dispatcher is shutting down"));
         return;
       }
-      const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
-      if (contentType !== "application/json") {
-        sendJson(response, 415, errorBody("unsupported_media_type", "Content-Type must be application/json"));
-        return;
-      }
-      const declaredLength = Number(request.headers["content-length"] ?? 0);
-      if (Number.isFinite(declaredLength) && declaredLength > this.config.requestMaxBytes) {
-        request.resume();
-        sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"));
-        return;
-      }
-      const body = await readBody(request, this.config.requestMaxBytes);
-      let input: unknown;
-      try {
-        input = JSON.parse(body.toString("utf8"));
-      } catch {
-        throw new RequestValidationError("Request body must be valid JSON");
-      }
+      const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
       let result;
       try {
@@ -209,6 +216,8 @@ export class DispatcherApi {
           error_message: error.message,
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
+      } else if (error instanceof ApiRequestError) {
+        sendJson(response, error.status, errorBody(error.code, error.message));
       } else {
         this.logger.error("Dispatcher API request failed", {
           error_code: "internal_error",
@@ -217,6 +226,96 @@ export class DispatcherApi {
         if (!response.headersSent) sendJson(response, 500, errorBody("internal_error", "Dispatcher internal error"));
         else response.end();
       }
+    }
+  }
+
+  private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    if (this.shuttingDown && request.method !== "GET") {
+      throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
+    }
+    if (request.method === "POST" && url.pathname === "/v1/jobs") {
+      const input = parseCreateJobRequest(await this.readJson(request));
+      let result;
+      try {
+        result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
+      } catch (error) {
+        throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
+      }
+      if (result.payloadMismatch) {
+        this.logger.warn("Duplicate job request differs from persisted job", {
+          job_id: result.row.job_id,
+          source_event_id: result.row.source_event_id,
+        });
+      }
+      this.jobs.wake();
+      sendJson(response, result.duplicate ? 200 : 202, {
+        schema_version: 1,
+        duplicate: result.duplicate,
+        job: result.row,
+      });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const workspaceId = url.searchParams.get("workspace_id");
+      const channelId = url.searchParams.get("channel_id");
+      const threadTs = url.searchParams.get("thread_ts");
+      if (!workspaceId || !channelId || !threadTs) {
+        throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
+      }
+      sendJson(response, 200, {
+        schema_version: 1,
+        jobs: this.database.listThreadJobs(workspaceId, channelId, threadTs),
+      });
+      return;
+    }
+    const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel))?$/.exec(url.pathname);
+    if (!match) throw new ApiRequestError(404, "not_found", "Route not found");
+    const jobId = match[1]!;
+    const action = match[2];
+    if (request.method === "GET" && !action) {
+      const job = this.database.getJob(jobId);
+      if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      sendJson(response, 200, { schema_version: 1, job });
+      return;
+    }
+    if (request.method === "POST" && action === "steer") {
+      const input = parseSteerJobRequest(await this.readJson(request));
+      try {
+        const result = await this.jobs.steer(jobId, input.source_event_id, input.instruction);
+        sendJson(response, 200, { schema_version: 1, duplicate: result.duplicate, job: result.row });
+      } catch (error) {
+        throw new ApiRequestError(409, "job_steer_failed", error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (request.method === "POST" && action === "cancel") {
+      const input = parseCancelJobRequest(await this.readJson(request));
+      try {
+        const result = await this.jobs.cancel(jobId, input.source_event_id, input.reason);
+        sendJson(response, 200, { schema_version: 1, duplicate: result.duplicate, job: result.row });
+      } catch (error) {
+        throw new ApiRequestError(409, "job_cancel_failed", error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    throw new ApiRequestError(404, "not_found", "Route not found");
+  }
+
+  private async readJson(request: IncomingMessage): Promise<unknown> {
+    const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+    if (contentType !== "application/json") {
+      throw new ApiRequestError(415, "unsupported_media_type", "Content-Type must be application/json");
+    }
+    const declaredLength = Number(request.headers["content-length"] ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > this.config.requestMaxBytes) {
+      request.resume();
+      throw new BodyTooLargeError();
+    }
+    const body = await readBody(request, this.config.requestMaxBytes);
+    try {
+      return JSON.parse(body.toString("utf8"));
+    } catch {
+      throw new RequestValidationError("Request body must be valid JSON");
     }
   }
 }

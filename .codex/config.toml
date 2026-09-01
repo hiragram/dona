@@ -8,3 +8,14 @@ enabled_tools = ["list_workspaces", "list_channels", "get_channel", "list_users"
 default_tools_approval_mode = "writes"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
+
+[mcp_servers.dona_dispatcher]
+command = "node"
+args = ["dist/mcp/index.js"]
+cwd = "dispatcher"
+enabled = true
+required = false
+enabled_tools = ["delegate_job", "list_thread_jobs", "get_job_status", "steer_job", "cancel_job"]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 20
+tool_timeout_sec = 30

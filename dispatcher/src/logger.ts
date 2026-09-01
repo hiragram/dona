@@ -8,7 +8,7 @@ export interface Logger {
   error(message: string, fields?: LogFields): void;
 }
 
-function write(level: LogLevel, component: string, message: string, fields: LogFields = {}): void {
+function write(level: LogLevel, component: string, message: string, fields: LogFields = {}, stderrOnly = false): void {
   const line = JSON.stringify({
     timestamp: new Date().toISOString(),
     level,
@@ -16,14 +16,15 @@ function write(level: LogLevel, component: string, message: string, fields: LogF
     message,
     ...fields,
   });
-  (level === "error" ? process.stderr : process.stdout).write(`${line}\n`);
+  (stderrOnly || level === "error" ? process.stderr : process.stdout).write(`${line}\n`);
 }
 
-export function createLogger(component: string): Logger {
+export function createLogger(component: string, options: { stderrOnly?: boolean } = {}): Logger {
+  const stderrOnly = options.stderrOnly ?? false;
   return {
-    debug: (message, fields) => write("debug", component, message, fields),
-    info: (message, fields) => write("info", component, message, fields),
-    warn: (message, fields) => write("warn", component, message, fields),
-    error: (message, fields) => write("error", component, message, fields),
+    debug: (message, fields) => write("debug", component, message, fields, stderrOnly),
+    info: (message, fields) => write("info", component, message, fields, stderrOnly),
+    warn: (message, fields) => write("warn", component, message, fields, stderrOnly),
+    error: (message, fields) => write("error", component, message, fields, stderrOnly),
   };
 }

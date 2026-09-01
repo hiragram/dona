@@ -10,6 +10,12 @@ import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+const jobs = {
+  isRunning: () => true,
+  wake() {},
+  async steer() { throw new Error("not used"); },
+  async cancel() { throw new Error("not used"); },
+};
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
@@ -49,6 +55,7 @@ describe("DispatcherApi", () => {
     const api = new DispatcherApi(
       database,
       { isRunning: () => true, wake: () => void (wakeCount += 1) },
+      jobs,
       config,
       logger,
     );
@@ -72,13 +79,51 @@ describe("DispatcherApi", () => {
     roots.push(root);
     config.requestMaxBytes = 20;
     const database = new DispatcherDatabase(config.databasePath);
-    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, config, logger);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
     await api.start();
     assert.equal(
       (await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"), "text/plain")).status,
       415,
     );
     assert.equal((await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"))).status, 413);
+    await api.stop();
+    database.close();
+  });
+
+  test("creates and reads a durable background job over UDS", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    let jobWakeCount = 0;
+    const jobController = { ...jobs, wake: () => void (jobWakeCount += 1) };
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobController,
+      config,
+      logger,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-job-api"));
+    const created = await request(config.socketPath, "POST", "/v1/jobs", {
+      source_event_id: accepted.body.event_id,
+      objective: "リポジトリを調査する",
+      workspace: { kind: "github", repository: "owner/repo" },
+    });
+    assert.equal(created.status, 202);
+    const job = created.body.job as Record<string, unknown>;
+    assert.match(String(job.job_id), /^job_/);
+    assert.equal(jobWakeCount, 1);
+    const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}`);
+    assert.equal(shown.status, 200);
+    assert.equal((shown.body.job as Record<string, unknown>).source_event_id, accepted.body.event_id);
+    const listed = await request(
+      config.socketPath,
+      "GET",
+      "/v1/jobs?workspace_id=T_TEST&channel_id=C_TEST&thread_ts=1756722030.123456",
+    );
+    assert.equal(listed.status, 200);
+    assert.equal((listed.body.jobs as unknown[]).length, 1);
     await api.stop();
     database.close();
   });

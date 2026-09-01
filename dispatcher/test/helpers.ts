@@ -21,6 +21,13 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       agentMissingGraceMs: 50,
       queuePollMs: 10,
       maxAttempts: 5,
+      jobsWorkspaceRoot: path.join(root, "workspaces"),
+      jobResultsDir: path.join(root, "job-results"),
+      jobConcurrency: 4,
+      jobAgentStartTimeoutMs: 100,
+      jobCommandTimeoutMs: 100,
+      ghPath: "gh",
+      gitPath: "git",
     },
   };
 }

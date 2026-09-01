@@ -5,9 +5,10 @@ Donaは、外部イベントを1つの秘書エージェントへ安全に直列
 ```text
 Slack Socket Mode -> sources/slack Adapter -> UDS HTTP -> dispatcher -> SQLite -> Herdr dona-main
                                                          dona-main -> sources/slack MCP -> Slack Web API
+                                                         dona-main -> dispatcher MCP -> background Codex jobs
 ```
 
-- [`dispatcher/`](./dispatcher/README.md): 永続キュー、重複排除、単一worker、Herdr連携、結果回収、運用CLI
+- [`dispatcher/`](./dispatcher/README.md): 永続キュー、`dona-main`への直列投入、バックグラウンドJob supervisor、別プロセスのstdio MCP
 - [`sources/slack/`](./sources/slack/README.md): Socket Mode Adapterと、同じKeychain認証を使う別プロセスのstdio MCP
 
 Slack AdapterはHerdrやSQLiteを直接操作しません。Dispatcherからエージェントへの入口は一方向です。エージェントがSlack操作を選んだ場合は、別プロセスのDona Slack MCPを使います。
@@ -31,7 +32,7 @@ npm run dev
 
 Herdrの`dona`セッション内には、事前に`dona-main`という名前のCodexエージェントを起動してください。詳細な設定、疎通方法、復旧コマンドは各ディレクトリのREADMEにあります。
 
-`npm run dev`が起動するのはDispatcherとAdapterだけです。stdio MCPは[`.codex/config.toml`](./.codex/config.toml)を読んだCodexが必要に応じて起動します。
+`npm run dev`が起動するのはDispatcherとAdapterだけです。Slack MCPとDispatcher MCPのstdioプロセスは[`.codex/config.toml`](./.codex/config.toml)を読んだCodexが必要に応じて起動します。
 
 ## launchdで常駐
 

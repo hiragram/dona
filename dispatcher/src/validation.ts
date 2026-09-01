@@ -1,6 +1,13 @@
 import { z } from "zod";
 
-import type { EventEnvelope, ResultEnvelope } from "./types.js";
+import type {
+  CancelJobRequest,
+  CreateJobRequest,
+  EventEnvelope,
+  JobResultEnvelope,
+  ResultEnvelope,
+  SteerJobRequest,
+} from "./types.js";
 
 const jsonObject = z.record(z.string(), z.unknown());
 const utcRfc3339 = z
@@ -11,7 +18,7 @@ const utcRfc3339 = z
 const eventEnvelopeSchema = z
   .object({
     schema_version: z.literal(1),
-    source: z.literal("slack"),
+    source: z.enum(["slack", "dona_job"]),
     external_event_id: z.string().trim().min(1),
     type: z.string().trim().min(1),
     occurred_at: utcRfc3339,
@@ -33,6 +40,46 @@ const resultEnvelopeSchema = z
     completed_at: utcRfc3339,
   })
   .loose();
+
+const repository = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/, "must be owner/repo");
+const gitRef = z
+  .string()
+  .trim()
+  .min(1)
+  .max(255)
+  .refine((value) => !value.startsWith("-") && !value.includes("..") && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value), "must be a safe Git ref");
+
+const createJobSchema = z.object({
+  source_event_id: z.string().trim().min(1),
+  objective: z.string().trim().min(1).max(100_000),
+  workspace: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("scratch") }).strip(),
+    z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
+  ]),
+}).strip();
+
+const steerJobSchema = z.object({
+  source_event_id: z.string().trim().min(1),
+  instruction: z.string().trim().min(1).max(100_000),
+}).strip();
+
+const cancelJobSchema = z.object({
+  source_event_id: z.string().trim().min(1),
+  reason: z.string().trim().min(1).max(2_000).optional(),
+}).strip();
+
+const jobResultEnvelopeSchema = z.object({
+  schema_version: z.literal(1),
+  job_id: z.string().min(1),
+  status: z.enum(["completed", "failed"]),
+  summary: z.string().min(1),
+  output: z.object({ format: z.enum(["markdown", "text"]), text: z.string() }).optional(),
+  artifacts: z.array(jsonObject).optional(),
+  actions: z.array(z.unknown()).optional(),
+  completed_at: utcRfc3339,
+}).loose();
 
 export class RequestValidationError extends Error {
   constructor(message: string) {
@@ -62,6 +109,34 @@ export function parseResultEnvelope(input: unknown, eventId: string): ResultEnve
     throw new RequestValidationError("event_id does not match the dispatched event");
   }
   return parsed.data as ResultEnvelope;
+}
+
+function parseWithSchema<T>(schema: z.ZodType, input: unknown): T {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const location = issue?.path.length ? `${issue.path.join(".")} ` : "";
+    throw new RequestValidationError(`${location}${issue?.message ?? "is invalid"}`);
+  }
+  return parsed.data as T;
+}
+
+export function parseCreateJobRequest(input: unknown): CreateJobRequest {
+  return parseWithSchema<CreateJobRequest>(createJobSchema, input);
+}
+
+export function parseSteerJobRequest(input: unknown): SteerJobRequest {
+  return parseWithSchema<SteerJobRequest>(steerJobSchema, input);
+}
+
+export function parseCancelJobRequest(input: unknown): CancelJobRequest {
+  return parseWithSchema<CancelJobRequest>(cancelJobSchema, input);
+}
+
+export function parseJobResultEnvelope(input: unknown, jobId: string): JobResultEnvelope {
+  const result = parseWithSchema<JobResultEnvelope>(jobResultEnvelopeSchema, input);
+  if (result.job_id !== jobId) throw new RequestValidationError("job_id does not match the dispatched job");
+  return result;
 }
 
 export function stableStringify(value: unknown): string {

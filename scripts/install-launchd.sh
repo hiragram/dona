@@ -7,6 +7,8 @@ DISPATCHER_DIR="$REPO_DIR/dispatcher"
 SLACK_DIR="$REPO_DIR/sources/slack"
 NODE_PATH=$(command -v node)
 HERDR_PATH=$(command -v herdr)
+GH_PATH=$(command -v gh)
+GIT_PATH=$(command -v git)
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 DONA_DIR="$HOME/Library/Application Support/Dona"
 LOG_DIR="$DONA_DIR/logs"
@@ -36,6 +38,8 @@ DISPATCHER_XML=$(escape_xml "$DISPATCHER_DIR")
 SLACK_XML=$(escape_xml "$SLACK_DIR")
 LOG_XML=$(escape_xml "$LOG_DIR")
 HERDR_XML=$(escape_xml "$HERDR_PATH")
+GH_XML=$(escape_xml "$GH_PATH")
+GIT_XML=$(escape_xml "$GIT_PATH")
 
 cat > "$DISPATCHER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,6 +57,8 @@ cat > "$DISPATCHER_PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>DONA_HERDR_PATH</key><string>$HERDR_XML</string>
+    <key>DONA_GH_PATH</key><string>$GH_XML</string>
+    <key>DONA_GIT_PATH</key><string>$GIT_XML</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
