@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -12,6 +13,7 @@ export interface SlackAdapterConfig {
   shutdownGraceMs: number;
   socketModeEnabled: true;
   logLevel: SlackLogLevel;
+  buildSha: string;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -30,6 +32,16 @@ function expandHome(value: string): string {
 function socketModeEnabled(value: string | undefined): true {
   if (value === undefined || value.trim() === "" || value.trim().toLowerCase() === "true") return true;
   throw new Error("SLACK_SOCKET_MODE_ENABLED must be true; HTTP event reception is not supported");
+}
+
+function buildSha(env: NodeJS.ProcessEnv): string {
+  const explicit = env.DONA_BUILD_SHA?.trim();
+  if (explicit) return explicit;
+  const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return "development";
+  const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as { sha?: unknown };
+  if (typeof parsed.sha !== "string" || !/^[0-9a-f]{40}$/.test(parsed.sha)) throw new Error("DONA release manifest SHA is invalid");
+  return parsed.sha;
 }
 
 export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAdapterConfig {
@@ -52,5 +64,6 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     shutdownGraceMs: positiveInteger(env.SLACK_SHUTDOWN_GRACE_MS, 3_000, "SLACK_SHUTDOWN_GRACE_MS"),
     socketModeEnabled: socketModeEnabled(env.SLACK_SOCKET_MODE_ENABLED),
     logLevel: existing.logLevel,
+    buildSha: buildSha(env),
   };
 }

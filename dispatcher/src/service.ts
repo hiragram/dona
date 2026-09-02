@@ -6,6 +6,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { DispatcherWorker } from "./worker.js";
+import { UpdaterClient } from "./updater-client.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -25,7 +26,20 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
   );
-  const api = new DispatcherApi(database, worker, jobSupervisor, config, apiLogger);
+  const api = new DispatcherApi(
+    database,
+    worker,
+    jobSupervisor,
+    config,
+    apiLogger,
+    new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
+    {
+      async quiesce() {
+        await jobSupervisor.stop();
+        await worker.stop();
+      },
+    },
+  );
 
   try {
     await api.start();

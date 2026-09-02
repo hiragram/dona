@@ -9,6 +9,10 @@ export interface DispatcherJobClient {
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
+  planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
+  applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
+  getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
+  cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
 }
 
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i).describe("現在処理中のDona event_id");
@@ -16,6 +20,10 @@ const jobId = z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/).describe("delegat
 const slackId = z.string().min(1).max(64);
 const threadTs = z.string().regex(/^\d+\.\d+$/);
 const repository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/);
+const updateRequestId = z.string().regex(/^upd_[0-9a-hjkmnp-tv-z]{26}$/);
+const updatePlanId = z.string().regex(/^plan_[0-9a-hjkmnp-tv-z]{26}$/);
+const planHash = z.string().regex(/^[0-9a-f]{64}$/);
+const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
 
 function success(data: Record<string, unknown>) {
   return {
@@ -42,6 +50,8 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       instructions:
         "Donaのバックグラウンドジョブ制御ツール。長い調査や開発作業をdelegate_jobへ委任し、Slackイベントの処理自体は速やかに完了してください。" +
         "同じSlack threadの後続入力はlist_thread_jobsとget_job_statusで対象を確認してからsteer_jobへ渡します。" +
+        "self-updateはplan_self_updateでexact SHAのplanを確認し、人間がそのplanを明示承認した場合だけapply_self_updateを呼びます。" +
+        "apply/cancelのtimeoutはacceptance unknownとして扱い、同じwriteをblind retryしないでください。" +
         "DispatcherはHerdr/Codexへの投入と永続化を担当します。生のHerdrコマンドを別経路で実行しないでください。",
     },
   );
@@ -119,6 +129,63 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return success(await client.cancelJob(job_id, { source_event_id, ...(reason ? { reason } : {}) }));
     } catch (error) {
       return failure(error, logger, "cancel_job");
+    }
+  });
+
+  server.registerTool("plan_self_update", {
+    title: "Plan Dona self-update",
+    description: "固定repository/mainからexact target SHA、互換性、plan hashを読み取り専用で計画します。raw ref/URL/path/commandは受け付けません。",
+    inputSchema: { source_event_id: eventId },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ source_event_id }) => {
+    try {
+      return success(await client.planSelfUpdate({ source_event_id }));
+    } catch (error) {
+      return failure(error, logger, "plan_self_update");
+    }
+  });
+
+  server.registerTool("apply_self_update", {
+    title: "Apply approved Dona self-update",
+    description: "明示承認されたexact planだけをstable updaterへ投入します。service停止・pointer切替・rollbackを含み得ます。",
+    inputSchema: {
+      source_event_id: eventId,
+      plan_id: updatePlanId,
+      plan_hash: planHash,
+      approval_id: approvalId.describe("exact planに対する人間の承認receipt ID"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  }, async (input) => {
+    try {
+      return success(await client.applySelfUpdate(input));
+    } catch (error) {
+      return failure(error, logger, "apply_self_update");
+    }
+  });
+
+  server.registerTool("get_self_update_status", {
+    title: "Get Dona self-update status",
+    description: "update state、lease/fence、SHA、health、rollback可否、outboxを取得します。",
+    inputSchema: { request_id: updateRequestId.optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ request_id }) => {
+    try {
+      return success(await client.getSelfUpdateStatus(request_id));
+    } catch (error) {
+      return failure(error, logger, "get_self_update_status");
+    }
+  });
+
+  server.registerTool("cancel_self_update", {
+    title: "Cancel Dona self-update",
+    description: "activation前のupdateをcancelします。外部mutation開始後はneeds_reviewへfail closedします。",
+    inputSchema: { source_event_id: eventId, request_id: updateRequestId, reason: z.string().min(1).max(2_000).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  }, async ({ source_event_id, request_id, reason }) => {
+    try {
+      return success(await client.cancelSelfUpdate({ source_event_id, request_id, ...(reason ? { reason } : {}) }));
+    } catch (error) {
+      return failure(error, logger, "cancel_self_update");
     }
   });
 
