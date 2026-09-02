@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import fs from "node:fs/promises";
 import net from "node:net";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const canonicalRemote = "https://github.com/hiragram/dona.git";
@@ -48,10 +50,24 @@ export function socketIsListening(socketPath, timeoutMs = 500) {
   });
 }
 
+export async function cleanupInstallStaging(releaseRoot, stagingDir) {
+  const stagingRoot = path.join(releaseRoot, ".staging");
+  if (
+    !path.isAbsolute(releaseRoot) ||
+    path.dirname(stagingDir) !== stagingRoot ||
+    !/^install\.[A-Za-z0-9]+$/.test(path.basename(stagingDir))
+  ) {
+    throw new Error("Refusing to clean an invalid staging directory");
+  }
+  await fs.rm(stagingDir, { recursive: true, force: true });
+}
+
 async function main() {
-  const [mode, value] = process.argv.slice(2);
+  const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
-    console.error("Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket>");
+    console.error(
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir>",
+    );
     return 2;
   }
   if (mode === "validate-remote") return normalizeCanonicalRemote(value) ? 0 : 1;
@@ -61,6 +77,15 @@ async function main() {
       return 1;
     }
     return 0;
+  }
+  if (mode === "cleanup-staging" && secondValue) {
+    try {
+      await cleanupInstallStaging(value, secondValue);
+      return 0;
+    } catch {
+      console.error("staging directory cleanup targetが不正です。");
+      return 1;
+    }
   }
   console.error("Unknown preflight mode");
   return 2;

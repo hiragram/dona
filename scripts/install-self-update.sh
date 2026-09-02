@@ -28,6 +28,10 @@ INSTALL_SHA=$($GIT_PATH -C "$REPOSITORY_DIR" rev-parse HEAD^{commit})
 INSTALL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/dona-self-update-install.XXXXXX")
 
 cleanup_temp() {
+  if [[ -n "${STAGING_DIR:-}" ]]; then
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" cleanup-staging "$RELEASE_ROOT" "$STAGING_DIR" || \
+      print -u2 "staging directoryのcleanupに失敗しました。"
+  fi
   if [[ -n "${INSTALL_TMP:-}" && -d "$INSTALL_TMP" && "$INSTALL_TMP" == *dona-self-update-install.* ]]; then
     rm -rf "$INSTALL_TMP"
   fi
@@ -113,20 +117,25 @@ $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/relea
 /usr/bin/tar -xf "$INSTALL_TMP/release.tar" -C "$STAGING_DIR"
 
 mkdir -p "$INSTALL_TMP/npm-cache"
+/usr/bin/touch "$INSTALL_TMP/npm-userconfig" "$INSTALL_TMP/npm-globalconfig"
 for component in dispatcher sources/slack updater; do
   COMPONENT_DIR="$STAGING_DIR/$component"
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" \
     CI=1 NO_COLOR=1 npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_audit=false npm_config_fund=false \
-    npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null npm_config_update_notifier=false \
+    npm_config_userconfig="$INSTALL_TMP/npm-userconfig" npm_config_globalconfig="$INSTALL_TMP/npm-globalconfig" \
+    npm_config_update_notifier=false \
     "$NPM_PATH" --prefix "$COMPONENT_DIR" ci
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" CI=1 NO_COLOR=1 \
-    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig="$INSTALL_TMP/npm-userconfig" \
+    npm_config_globalconfig="$INSTALL_TMP/npm-globalconfig" \
     "$NPM_PATH" --prefix "$COMPONENT_DIR" test
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" CI=1 NO_COLOR=1 \
-    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig="$INSTALL_TMP/npm-userconfig" \
+    npm_config_globalconfig="$INSTALL_TMP/npm-globalconfig" \
     "$NPM_PATH" --prefix "$COMPONENT_DIR" run typecheck
   env -i PATH="$(dirname "$NODE_PATH"):$(dirname "$NPM_PATH"):/usr/bin:/bin:/usr/sbin:/sbin" CI=1 NO_COLOR=1 \
-    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+    npm_config_cache="$INSTALL_TMP/npm-cache" npm_config_userconfig="$INSTALL_TMP/npm-userconfig" \
+    npm_config_globalconfig="$INSTALL_TMP/npm-globalconfig" \
     "$NPM_PATH" --prefix "$COMPONENT_DIR" run build
 done
 NPM_VERSION=$($NPM_PATH --version)
@@ -137,6 +146,7 @@ if [[ -e "$FINAL_RELEASE" ]]; then
   exit 1
 fi
 /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
+STAGING_DIR=
 
 /usr/bin/ditto "$FINAL_RELEASE/updater" "$CONTROL_ROOT/updater.next"
 /bin/mv "$CONTROL_ROOT/updater.next" "$CONTROL_ROOT/updater"
