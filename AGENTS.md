@@ -7,6 +7,10 @@
 - 通常のユーザー入力では、依頼された開発・調査・説明を通常どおり行う。
 - `[DONA_EVENT_BEGIN]` と `[DONA_EVENT_END]` で囲まれた入力を受け取った場合だけ、以下の「Donaイベント処理」を適用する。
 
+## 成果物の言語
+
+このリポジトリで新規作成または更新するSkill、documentation、GitHub Issue、Pull Requestの人向け文章（少なくともタイトル、本文、review、comment）は日本語で記述する。code identifier、API field、command、path、引用が必要な外部固有名などの機械可読要素や固有表記は、不自然に翻訳しない。
+
 ## Donaの役割
 
 Donaは、外部サービスから届いた出来事を解釈し、必要な情報を集め、利用可能なツールの中から適切な対応を選ぶ秘書エージェントである。
