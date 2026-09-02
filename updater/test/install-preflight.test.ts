@@ -12,8 +12,8 @@ const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
 
-async function run(mode: string, value: string): Promise<void> {
-  await execute(process.execPath, [preflight, mode, value]);
+async function run(mode: string, ...values: string[]): Promise<void> {
+  await execute(process.execPath, [preflight, mode, ...values]);
 }
 
 test("installer accepts only canonical HTTPS and SSH forms for hiragram/dona", async () => {
@@ -67,6 +67,57 @@ test("bootstrap preflight distinguishes a listening dispatcher socket from an un
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("isolated npm uses separate empty config files with npm 11", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-npm-config-"));
+  const npmCli = process.env.npm_execpath;
+  assert.ok(npmCli);
+  try {
+    const userConfig = path.join(root, "npm-userconfig");
+    const globalConfig = path.join(root, "npm-globalconfig");
+    await Promise.all([fs.writeFile(userConfig, ""), fs.writeFile(globalConfig, "")]);
+    const result = await execute(process.execPath, [npmCli, "--version"], {
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        CI: "1",
+        NO_COLOR: "1",
+        npm_config_cache: path.join(root, "npm-cache"),
+        npm_config_audit: "false",
+        npm_config_fund: "false",
+        npm_config_userconfig: userConfig,
+        npm_config_globalconfig: globalConfig,
+        npm_config_update_notifier: "false",
+      },
+    });
+    assert.match(result.stdout, /^\d+\.\d+\.\d+/);
+
+    const installerSource = await fs.readFile(installer, "utf8");
+    assert.doesNotMatch(installerSource, /npm_config_(?:user|global)config=\/dev\/null/);
+    assert.match(installerSource, /npm_config_userconfig="\$INSTALL_TMP\/npm-userconfig"/);
+    assert.match(installerSource, /npm_config_globalconfig="\$INSTALL_TMP\/npm-globalconfig"/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed install cleanup removes only the generated staging directory", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-cleanup-"));
+  const releaseRoot = path.join(root, "releases");
+  const stagingDir = path.join(releaseRoot, ".staging", "install.ABC123");
+  const sibling = path.join(releaseRoot, ".staging", "keep-me");
+  try {
+    await Promise.all([
+      fs.mkdir(stagingDir, { recursive: true }),
+      fs.mkdir(sibling, { recursive: true }),
+    ]);
+    await run("cleanup-staging", releaseRoot, stagingDir);
+    await assert.rejects(fs.stat(stagingDir), { code: "ENOENT" });
+    assert.equal((await fs.stat(sibling)).isDirectory(), true);
+    await assert.rejects(run("cleanup-staging", releaseRoot, sibling));
+  } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
