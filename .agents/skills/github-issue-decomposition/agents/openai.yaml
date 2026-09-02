@@ -1,7 +1,7 @@
 interface:
-  display_name: "GitHub Issue Decomposition"
-  short_description: "Design reviewable Epic and native issue graphs"
-  default_prompt: "Use $github-issue-decomposition to design a substantial repository theme as an Epic, native sub-issues, and a minimal blocker DAG."
+  display_name: "GitHub Issue分解"
+  short_description: "大規模テーマをreview可能なnative Issue構成へ分解"
+  default_prompt: "$github-issue-decomposition を使って、大規模なrepositoryテーマをEpic、native sub-issues、最小blocker DAGとして設計してください。"
 
 policy:
   allow_implicit_invocation: true
