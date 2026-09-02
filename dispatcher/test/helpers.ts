@@ -28,6 +28,9 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       jobCommandTimeoutMs: 100,
       ghPath: "gh",
       gitPath: "git",
+      updaterSocketPath: path.join(root, "update-control", "updater.sock"),
+      updateInternalTokenPath: path.join(root, "update-control", "dispatcher.token"),
+      buildSha: "development",
     },
   };
 }

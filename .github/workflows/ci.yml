@@ -26,6 +26,8 @@ jobs:
             runner: ubuntu-24.04
           - component: sources/slack
             runner: macos-26
+          - component: updater
+            runner: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

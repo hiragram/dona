@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherApi } from "../src/api.js";
@@ -20,7 +21,14 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-function request(socketPath: string, method: string, route: string, body?: unknown, contentType = "application/json") {
+function request(
+  socketPath: string,
+  method: string,
+  route: string,
+  body?: unknown,
+  contentType = "application/json",
+  extraHeaders: Record<string, string> = {},
+) {
   const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   return new Promise<{ status: number; body: Record<string, unknown> }>((resolve, reject) => {
     const req = http.request(
@@ -28,7 +36,7 @@ function request(socketPath: string, method: string, route: string, body?: unkno
         socketPath,
         method,
         path: route,
-        headers: encoded ? { "content-type": contentType, "content-length": encoded.length } : undefined,
+        headers: { ...extraHeaders, ...(encoded ? { "content-type": contentType, "content-length": String(encoded.length) } : {}) },
       },
       (response) => {
         const chunks: Buffer[] = [];
@@ -124,6 +132,131 @@ describe("DispatcherApi", () => {
     );
     assert.equal(listed.status, 200);
     assert.equal((listed.body.jobs as unknown[]).length, 1);
+    await api.stop();
+    database.close();
+  });
+
+  test("separates external events from authenticated dona_update injection and deduplicates completion", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await fs.mkdir(path.dirname(config.updateInternalTokenPath), { recursive: true, mode: 0o700 });
+    const token = "a".repeat(64);
+    await fs.writeFile(config.updateInternalTokenPath, token, { mode: 0o600 });
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
+    await api.start();
+    const envelope = {
+      schema_version: 1,
+      source: "dona_update",
+      external_event_id: "update:upd_01m1es03xy5cf8d9pm5cwx4srv:terminal:1",
+      type: "update_succeeded",
+      occurred_at: "2026-09-02T00:00:00.000Z",
+      subject: { request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv" },
+      payload: {
+        request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv",
+        update_status: "succeeded",
+        current_sha: "1".repeat(40),
+        target_sha: "2".repeat(40),
+        previous_sha: null,
+        plan_hash: "a".repeat(64),
+        policy_version: "2026-09-02.1",
+        rollback_compatible: true,
+        active_sha: "2".repeat(40),
+        error: null,
+      },
+      reply_target: { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" },
+    };
+    assert.equal((await request(config.socketPath, "POST", "/v1/events", envelope)).status, 400);
+    assert.equal((await request(config.socketPath, "POST", "/v1/internal/update-events", envelope)).status, 403);
+    const first = await request(config.socketPath, "POST", "/v1/internal/update-events", envelope, "application/json", { "x-dona-update-token": token });
+    const duplicate = await request(config.socketPath, "POST", "/v1/internal/update-events", envelope, "application/json", { "x-dona-update-token": token });
+    assert.equal(first.status, 202);
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.body.event_id, first.body.event_id);
+    const mismatched = structuredClone(envelope);
+    mismatched.payload.active_sha = "3".repeat(40);
+    assert.equal((await request(
+      config.socketPath,
+      "POST",
+      "/v1/internal/update-events",
+      mismatched,
+      "application/json",
+      { "x-dona-update-token": token },
+    )).status, 409);
+    const lookup = await request(
+      config.socketPath,
+      "GET",
+      `/v1/internal/update-events/lookup?external_event_id=${encodeURIComponent(envelope.external_event_id)}`,
+      undefined,
+      "application/json",
+      { "x-dona-update-token": token },
+    );
+    assert.equal(lookup.body.exists, true);
+    await api.stop();
+    database.close();
+  });
+
+  test("binds self-update planning to persisted event context and exposes terminal and quiesce barriers", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    let workerRunning = true;
+    let jobsRunning = true;
+    const calls: unknown[] = [];
+    const updates = {
+      async plan(input: unknown) { calls.push(input); return { schema_version: 1, plan: {} }; },
+      async apply(input: unknown) { calls.push({ apply: input }); return { schema_version: 1, accepted: true }; },
+      async status() { return { schema_version: 1, updates: [] }; },
+      async cancel() { return { schema_version: 1, state: "cancelled" }; },
+    };
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => workerRunning, wake() {} },
+      { ...jobs, isRunning: () => jobsRunning },
+      config,
+      logger,
+      updates,
+      { async quiesce() { workerRunning = false; jobsRunning = false; } },
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-update-plan"));
+    const eventId = accepted.body.event_id as string;
+    assert.equal((await request(config.socketPath, "GET", `/v1/events/${eventId}/terminal`)).body.terminal, false);
+    assert.equal((await request(config.socketPath, "POST", "/v1/self-update/plan", { source_event_id: eventId })).status, 200);
+    assert.deepEqual(calls, [{
+      source_event_id: eventId,
+      reply_target: { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" },
+    }]);
+    database.manualComplete(eventId);
+    assert.equal((await request(config.socketPath, "GET", `/v1/events/${eventId}/terminal`)).body.terminal, true);
+    assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
+      source_event_id: eventId,
+      plan_id: "plan_01m1es03xy5cf8d9pm5cwx4srw",
+      plan_hash: "a".repeat(64),
+      approval_id: "approval-1",
+    })).status, 202);
+    assert.deepEqual(calls[1], { apply: {
+      source_event_id: eventId,
+      plan_id: "plan_01m1es03xy5cf8d9pm5cwx4srw",
+      plan_hash: "a".repeat(64),
+      approval_id: "approval-1",
+      reply_target: { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" },
+    } });
+    const quiesced = await request(config.socketPath, "POST", "/v1/admin/quiesce", {
+      schema_version: 1,
+      protocol: 1,
+      operation_id: "upd_01m1es03xy5cf8d9pm5cwx4srv",
+      target_sha: "2".repeat(40),
+    });
+    assert.equal(quiesced.status, 200);
+    assert.equal(quiesced.body.drained, true);
+    assert.equal((await request(config.socketPath, "GET", "/health/version")).status, 503);
+    assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
+      source_event_id: eventId,
+      plan_id: "plan_01m1es03xy5cf8d9pm5cwx4srw",
+      plan_hash: "a".repeat(64),
+      approval_id: "approval-1",
+    })).status, 503);
     await api.stop();
     database.close();
   });

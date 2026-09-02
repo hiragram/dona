@@ -35,6 +35,22 @@ export class DispatcherApiClient {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`, input);
   }
 
+  planSelfUpdate(input: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", "/v1/self-update/plan", input);
+  }
+
+  applySelfUpdate(input: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", "/v1/self-update/apply", input);
+  }
+
+  getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>> {
+    return this.request("GET", requestId ? `/v1/self-update/status?request_id=${encodeURIComponent(requestId)}` : "/v1/self-update/status");
+  }
+
+  cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", "/v1/self-update/cancel", input);
+  }
+
   private request(method: string, route: string, body?: unknown): Promise<Record<string, unknown>> {
     const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     return new Promise((resolve, reject) => {

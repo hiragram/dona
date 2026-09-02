@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "policy_version": "2026-09-02.1",
+  "repository": "hiragram/dona",
+  "canonical_remote": "https://github.com/hiragram/dona.git",
+  "default_branch": "main",
+  "control_root": "/Users/USERNAME/Library/Application Support/Dona/update-control",
+  "release_root": "/Users/USERNAME/Library/Application Support/Dona/runtime/releases",
+  "current_pointer": "/Users/USERNAME/Library/Application Support/Dona/runtime/current",
+  "previous_pointer": "/Users/USERNAME/Library/Application Support/Dona/runtime/previous",
+  "dispatcher_socket": "/Users/USERNAME/Library/Application Support/Dona/run/dispatcher.sock",
+  "slack_socket": "/Users/USERNAME/Library/Application Support/Dona/run/slack-adapter.sock",
+  "dispatcher_internal_token_file": "/Users/USERNAME/Library/Application Support/Dona/update-control/dispatcher.token",
+  "launchd": {
+    "dispatcher_label": "dev.dona.dispatcher",
+    "slack_label": "dev.dona.slack-adapter"
+  },
+  "executables": {
+    "git": "/usr/bin/git",
+    "npm": "/opt/homebrew/bin/npm",
+    "node": "/opt/homebrew/bin/node",
+    "launchctl": "/bin/launchctl",
+    "gh": "/opt/homebrew/bin/gh"
+  },
+  "timeouts": {
+    "command_ms": 900000,
+    "health_ms": 30000,
+    "drain_ms": 30000,
+    "lease_ms": 60000
+  },
+  "output_limit_bytes": 1048576,
+  "disk_floor_bytes": 2147483648,
+  "retain_successful": 2,
+  "required_checks": [
+    "Verify dispatcher",
+    "Verify sources/slack",
+    "Verify updater"
+  ],
+  "require_verified_signature": false,
+  "compatibility": {
+    "protocol": 1,
+    "config": 1,
+    "app_schema_read_min": 2,
+    "app_schema_read_max": 2,
+    "app_schema_write": 2,
+    "rollback_safe": true
+  }
+}

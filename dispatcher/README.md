@@ -48,6 +48,9 @@ DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
 DONA_GH_PATH=gh
 DONA_GIT_PATH=git
+DONA_UPDATER_SOCKET_PATH=~/Library/Application Support/Dona/update-control/updater.sock
+DONA_UPDATE_INTERNAL_TOKEN_PATH=~/Library/Application Support/Dona/update-control/dispatcher.token
+DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
 
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
@@ -69,6 +72,14 @@ Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも�
 - `get_job_status`: 状態と結果を取得
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
+- `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
+- `apply_self_update`: exact plan hashと明示承認receiptを投入（destructive）
+- `get_self_update_status`: state、fence、SHA、health、outboxを取得（read-only）
+- `cancel_self_update`: activation前にcancel。外部mutation後はneeds_review（destructive）
+
+`apply_self_update`のacceptedはupdater DB commit後だけ返ります。元のSlack受付eventが`completed`になる前にupdaterはactivationをclaimしません。timeoutや接続切断でapply/cancelのacceptanceが不明な場合は、同じwriteを再送せずstatusを確認します。
+
+terminal updateは`source: dona_update`として同じ直列キューへ戻ります。外部`POST /v1/events`はこのsourceを拒否し、0600 tokenを使うinternal UDS routeだけがtyped payloadを受けます。stable external IDで重複を吸収し、POST response喪失時はlookup後に判断します。
 
 ビルド後はリポジトリの[`.codex/config.toml`](../.codex/config.toml)を読んだCodexが`dist/mcp/index.js`を起動します。`npm run dev`が起動するのは常駐DispatcherとSlack Adapterだけです。
 
@@ -116,7 +127,10 @@ health check:
 ```sh
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/live
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/ready
+curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/version
 ```
+
+`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。build SHA、protocol 1、app schema 2、config 1だけをhealthへ出し、pathやsecretは返しません。
 
 ## 運用CLI
 

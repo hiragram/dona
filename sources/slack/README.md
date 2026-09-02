@@ -134,6 +134,7 @@ npm run dev:mcp
 - SDKのheartbeatを使用し、切断・`warning`・`refresh_requested`後は1/2/5/10/30秒を基準にjitter付きで再接続します。
 - 認証・token種別・scopeの恒久エラーは高速に再試行しません。
 - graceful shutdownは処理中のDispatcher受付とACKを最大3秒待ってから切断します。
+- typed `POST /v1/admin/quiesce`は新規Socket ingressを止め、in-flight Dispatcher POST/Slack ACKをbounded drainします。
 - token、WebSocket URL、payload全文、本文は通常ログへ出しません。
 
 ## ローカルhealth check
@@ -146,9 +147,12 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
 
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.sock" \
   http://localhost/health/ready
+
+curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.sock" \
+  http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessだけを返します。secretやlocal private pathは返しません。
 
 ## 検証
 

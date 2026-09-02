@@ -147,3 +147,11 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - 外部への破壊的操作、権限変更、支払い、広範囲な通知など、イベントから明確に許可されたとは言えない操作は実行しない。
 - Slack上で依頼者へ安全に確認できる場合は、必要な質問をスレッドへ投稿して今回のイベントを完了できる。回答は後続の別イベントとして扱う。
 - ツール障害や曖昧な外部書き込みにより安全に完了できない場合は、無理に成功扱いせず`failed`として理由を残す。
+
+## Self-update
+
+- Self-updateは最初に`plan_self_update`でfixed mainのexact SHA、plan hash、CI、互換性、rollback可否を提示する。利用者がそのexact planを明示承認した場合だけ`apply_self_update`を呼ぶ。Codex host approvalを利用者のupdate承認とみなさない。
+- `apply_self_update`がacceptedを返してもupdate完了ではない。現在の受付eventのResult Envelopeを先に`completed`として公開し、stable updaterがterminal barrier後にactivationを開始できるようにする。Agent Sessionはterminal `dona_update`通知まで`processing`を維持できる。
+- apply/cancel、launchctl、completion POSTの応答がtimeout・切断で曖昧なら同じwriteをblind retryしない。`get_self_update_status`、external ID lookup、pointer/receipt/version healthによるreconcileへ送る。
+- `source: dona_update`はstable updaterがinternal routeから生成するterminal通知である。`payload.update_status`と確認済みfieldだけを元`reply_target`へ通知し、updateを自動再実行しない。`succeeded`/`rolled_back`/`cancelled`後はAgent Sessionを`active`、人間の判断が必要な`failed`/`needs_review`は`suspended`にする。
+- Slack/MCP入力からraw repository URL、ref、path、command、npm flag、launchctl argument、environmentをupdateへ渡さない。secret、private path、raw planをResultやSlackへ投稿しない。

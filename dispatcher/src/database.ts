@@ -181,6 +181,34 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT * FROM events WHERE event_id = ?").get(eventId) as EventRow | undefined;
   }
 
+  getByExternalId(source: string, externalEventId: string): EventRow | undefined {
+    return this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
+      .get(source, externalEventId) as EventRow | undefined;
+  }
+
+  isEventCompleted(eventId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE event_id = ? AND status = 'completed'")
+      .get(eventId) !== undefined;
+  }
+
+  updateSafetyStatus(): { safe: boolean; unsafe_states: string[] } {
+    const unsafe: string[] = [];
+    const eventRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM events
+      WHERE status IN ('dispatching', 'waiting_agent') GROUP BY status
+    `).all() as Array<{ status: string; count: number }>;
+    for (const row of eventRows) unsafe.push(`events.${row.status}:${row.count}`);
+    const jobRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM jobs
+      WHERE status IN ('dispatching', 'cancelling') GROUP BY status
+    `).all() as Array<{ status: string; count: number }>;
+    for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
+    const steer = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE steer_state = 'dispatching'")
+      .get() as { count: number };
+    if (steer.count > 0) unsafe.push(`jobs.steer_acceptance_unknown:${steer.count}`);
+    return { safe: unsafe.length === 0, unsafe_states: unsafe };
+  }
+
   getBySequence(sequence: number): EventRow | undefined {
     return this.db.prepare("SELECT * FROM events WHERE sequence = ?").get(sequence) as EventRow | undefined;
   }

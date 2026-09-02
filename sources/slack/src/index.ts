@@ -37,7 +37,7 @@ async function main(): Promise<void> {
     timeoutMs: config.dispatcherTimeoutMs,
   });
   const adapter = new SlackSocketAdapter(sockets, dispatcher, config, logger);
-  const health = new SlackHealthServer(config.healthSocketPath, adapter, dispatcher, logger);
+  const health = new SlackHealthServer(config.healthSocketPath, adapter, dispatcher, logger, config.buildSha);
   await health.start();
   try {
     await adapter.start();

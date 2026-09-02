@@ -33,6 +33,22 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "cancelJob", args: [jobId, input] });
         return { schema_version: 1, job: { job_id: jobId, status: "cancelled" } };
       },
+      async planSelfUpdate(input) {
+        calls.push({ method: "planSelfUpdate", args: [input] });
+        return { schema_version: 1, plan: {} };
+      },
+      async applySelfUpdate(input) {
+        calls.push({ method: "applySelfUpdate", args: [input] });
+        return { schema_version: 1, accepted: true };
+      },
+      async getSelfUpdateStatus(requestId) {
+        calls.push({ method: "getSelfUpdateStatus", args: [requestId] });
+        return { schema_version: 1, updates: [] };
+      },
+      async cancelSelfUpdate(input) {
+        calls.push({ method: "cancelSelfUpdate", args: [input] });
+        return { schema_version: 1, state: "cancelled" };
+      },
     };
     const server = createDispatcherMcpServer(api, logger);
     const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -46,9 +62,15 @@ describe("Dona Dispatcher MCP server", () => {
         "get_job_status",
         "steer_job",
         "cancel_job",
+        "plan_self_update",
+        "apply_self_update",
+        "get_self_update_status",
+        "cancel_self_update",
       ]);
       assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "apply_self_update")?.annotations?.destructiveHint, true);
 
       const result = await client.callTool({
         name: "delegate_job",

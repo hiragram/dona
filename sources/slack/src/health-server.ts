@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import http, { type ServerResponse } from "node:http";
+import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
 
@@ -35,16 +35,20 @@ export interface AdapterHealthState {
   isSocketReady(): boolean;
   isStopping(): boolean;
   connectionStates(): Record<string, string>;
+  quiesce(): Promise<void>;
+  drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
 }
 
 export class SlackHealthServer {
   private server: http.Server | undefined;
+  private quiesceOperationId: string | undefined;
 
   constructor(
     private readonly socketPath: string,
     private readonly adapter: AdapterHealthState,
     private readonly dispatcher: Pick<DispatcherClient, "healthReady">,
     private readonly logger: SlackLogger,
+    private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
   ) {}
 
   async start(): Promise<void> {
@@ -60,9 +64,7 @@ export class SlackHealthServer {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
 
-    this.server = http.createServer((request, response) => {
-      void this.handle(request.method ?? "", request.url ?? "/", response);
-    });
+    this.server = http.createServer((request, response) => void this.handle(request, response));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error);
       this.server!.once("error", onError);
@@ -89,8 +91,9 @@ export class SlackHealthServer {
     }
   }
 
-  private async handle(method: string, requestUrl: string, response: ServerResponse): Promise<void> {
-    const pathname = new URL(requestUrl, "http://localhost").pathname;
+  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const method = request.method ?? "";
+    const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });
       return;
@@ -104,6 +107,60 @@ export class SlackHealthServer {
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
       });
+      return;
+    }
+    if (method === "GET" && pathname === "/health/version") {
+      const dispatcherReady = await this.dispatcher.healthReady();
+      const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
+      const ready = workspacesReady && dispatcherReady;
+      send(response, ready ? 200 : 503, {
+        schema_version: 1,
+        status: ready ? "ready" : "not_ready",
+        service: "slack_adapter",
+        build_sha: this.buildSha,
+        protocol: 1,
+        app_schema: 2,
+        config: 1,
+        workspaces_ready: workspacesReady,
+        socket_mode: this.adapter.connectionStates(),
+        dispatcher_ready: dispatcherReady,
+      });
+      return;
+    }
+    if (method === "GET" && pathname === "/v1/admin/drain-status") {
+      send(response, 200, { schema_version: 1, protocol: 1, service: "slack_adapter", ...this.adapter.drainStatus() });
+      return;
+    }
+    if (method === "POST" && pathname === "/v1/admin/quiesce") {
+      let input: Record<string, unknown>;
+      try {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of request) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > 16_384) throw new Error("body too large");
+          chunks.push(buffer);
+        }
+        input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      } catch {
+        send(response, 400, { schema_version: 1, error: { code: "invalid_request", message: "Quiesce request must be JSON" } });
+        return;
+      }
+      if (!input || typeof input !== "object" || Object.keys(input).some((key) => !["schema_version", "protocol", "operation_id", "target_sha"].includes(key)) ||
+        input.schema_version !== 1 || input.protocol !== 1 || typeof input.operation_id !== "string" || !/^upd_[0-9a-hjkmnp-tv-z]{26}$/.test(input.operation_id) ||
+        typeof input.target_sha !== "string" || !/^[0-9a-f]{40}$/.test(input.target_sha)) {
+        send(response, 400, { schema_version: 1, error: { code: "invalid_request", message: "Quiesce request is invalid" } });
+        return;
+      }
+      if (this.quiesceOperationId && this.quiesceOperationId !== input.operation_id) {
+        send(response, 409, { schema_version: 1, error: { code: "already_quiescing", message: "Adapter is quiescing for another update" } });
+        return;
+      }
+      this.quiesceOperationId = input.operation_id;
+      await this.adapter.quiesce();
+      const status = this.adapter.drainStatus();
+      send(response, status.drained ? 200 : 409, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
