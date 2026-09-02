@@ -98,6 +98,9 @@ export class DispatcherApi {
   private server: http.Server | undefined;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
+  private quiescePromise: Promise<void> | undefined;
+  private quiesceComplete = false;
+  private quiesceError: string | undefined;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -205,14 +208,16 @@ export class DispatcherApi {
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/drain-status") {
         const safety = this.database.updateSafetyStatus();
+        const unsafeStates = [...safety.unsafe_states, ...(this.quiesceError ? ["dispatcher.quiesce_failed"] : [])];
         sendJson(response, 200, {
           schema_version: 1,
           protocol: 1,
           service: "dispatcher",
           quiescing: this.shuttingDown,
-          drained: this.shuttingDown && safety.safe && !this.worker.isRunning() && !this.jobs.isRunning(),
-          in_flight: safety.unsafe_states.length,
-          unsafe_states: safety.unsafe_states,
+          drained: this.shuttingDown && this.quiesceComplete && unsafeStates.length === 0 &&
+            !this.worker.isRunning() && !this.jobs.isRunning(),
+          in_flight: unsafeStates.length,
+          unsafe_states: unsafeStates,
         });
         return;
       }
@@ -228,16 +233,31 @@ export class DispatcherApi {
         }
         this.quiesceOperationId = input.operation_id;
         this.beginShutdown();
-        await this.quiesceController?.quiesce();
+        if (!this.quiescePromise) {
+          this.quiescePromise = Promise.resolve(this.quiesceController?.quiesce())
+            .then(() => {
+              this.quiesceComplete = true;
+            })
+            .catch((error: unknown) => {
+              this.quiesceError = error instanceof Error ? error.message : String(error);
+              this.logger.error("Dispatcher quiesce failed", {
+                error_code: "quiesce_failed",
+                error_message: this.quiesceError,
+              });
+            });
+        }
         const safety = this.database.updateSafetyStatus();
-        sendJson(response, safety.safe ? 200 : 409, {
+        const unsafeStates = [...safety.unsafe_states, ...(this.quiesceError ? ["dispatcher.quiesce_failed"] : [])];
+        const drained = this.quiesceComplete && unsafeStates.length === 0 &&
+          !this.worker.isRunning() && !this.jobs.isRunning();
+        sendJson(response, drained ? 200 : 202, {
           schema_version: 1,
           protocol: 1,
           service: "dispatcher",
           quiescing: true,
-          drained: safety.safe && !this.worker.isRunning() && !this.jobs.isRunning(),
-          in_flight: safety.unsafe_states.length,
-          unsafe_states: safety.unsafe_states,
+          drained,
+          in_flight: unsafeStates.length,
+          unsafe_states: unsafeStates,
         });
         return;
       }

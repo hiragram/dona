@@ -4,6 +4,9 @@ import type {
   Compatibility,
   DrainSnapshot,
   HealthSnapshot,
+  MainAgentObservation,
+  MainAgentStartResult,
+  MainAgentStopResult,
   OutboxRow,
   ReleaseManifest,
   UpdateRow,
@@ -56,6 +59,10 @@ export interface RuntimePort {
   stopDispatcher(): Promise<CommandResult>;
   startDispatcher(): Promise<CommandResult>;
   startSlack(): Promise<CommandResult>;
+  waitForMainAgentIdle(): Promise<MainAgentObservation>;
+  stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult>;
+  startMainAgent(paneId: string, releasePath: string): Promise<MainAgentStartResult>;
+  mainAgentStatus(releasePath: string): Promise<MainAgentObservation>;
   dispatcherHealth(): Promise<HealthSnapshot>;
   slackHealth(): Promise<HealthSnapshot>;
 }

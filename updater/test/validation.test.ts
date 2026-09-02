@@ -30,6 +30,9 @@ describe("fixed self-update surface", () => {
     try {
       assert.throws(() => parsePolicy({ ...policy, canonical_remote: "https://example.invalid/other.git" }), /canonical_remote/);
       assert.throws(() => parsePolicy({ ...policy, control_root: `${policy.release_root}/control` }), /outside/);
+      assert.throws(() => parsePolicy({ ...policy, config_root: "/tmp/unrelated-config" }), /fixed base/);
+      assert.throws(() => parsePolicy({ ...policy, main_agent: { ...policy.main_agent, session: "other" } }), /main_agent/);
+      assert.throws(() => parsePolicy({ ...policy, executables: { ...policy.executables, herdr: "herdr" } }), /absolute/);
     } finally {
       const fs = await import("node:fs/promises");
       await fs.rm(root, { recursive: true, force: true });

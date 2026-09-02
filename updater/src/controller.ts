@@ -1,13 +1,15 @@
 import { ulid } from "ulid";
+import path from "node:path";
 
 import type { UpdateDatabase } from "./database.js";
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, Clock, DispatcherPort, GitPort, Logger, ReleaseStorePort, RuntimePort } from "./ports.js";
 import { redactText } from "./redaction.js";
-import type { ApplyRequest, HealthSnapshot, PlanRequest, ReleaseManifest, UpdateRow } from "./types.js";
+import type { ApplyRequest, HealthSnapshot, MainAgentObservation, PlanRequest, ReleaseManifest, UpdateRow } from "./types.js";
 import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
+type ActiveServices = "none" | "dispatcher" | "all" | "unknown";
 
 function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
   return previous.rollback_safe && target.rollback_safe &&
@@ -18,6 +20,11 @@ function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseM
 
 function resultSucceeded(result: { exit_code: number | null; timed_out: boolean }): boolean {
   return result.exit_code === 0 && !result.timed_out;
+}
+
+function mainAgentMatches(agent: MainAgentObservation): boolean {
+  return agent.exists && agent.name === "dona-main" && agent.kind === "codex" && agent.session_id !== null &&
+    agent.interactive_ready && agent.matches_release && agent.status !== null && agent.status !== "unknown";
 }
 
 export class UpdateController {
@@ -100,10 +107,12 @@ export class UpdateController {
     if (!requestId) return { schema_version: 1, updates: this.database.list() };
     const row = this.database.get(requestId);
     if (!row) throw new Error(`Update request ${requestId} was not found`);
-    const [observed, dispatcherHealth, slackHealth] = await Promise.all([
-      this.releases.observe(),
+    const observed = await this.releases.observe();
+    const activeRelease = observed.current_sha ? path.join(this.policy.release_root, observed.current_sha) : this.policy.current_pointer;
+    const [dispatcherHealth, slackHealth, mainAgent] = await Promise.all([
       this.runtime.dispatcherHealth(),
       this.runtime.slackHealth(),
+      this.runtime.mainAgentStatus(activeRelease),
     ]);
     return {
       schema_version: 1,
@@ -111,14 +120,17 @@ export class UpdateController {
       compatibility: JSON.parse(row.compatibility_json),
       audit: this.database.auditRows(requestId),
       outbox: this.database.outboxFor(requestId) ?? null,
-      observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth },
+      observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth, main_agent: mainAgent },
     };
   }
 
   async doctor(): Promise<Record<string, unknown>> {
     const current = await this.releases.readCurrentManifest();
     const previous = await this.releases.readPreviousManifest();
-    const remote = await this.git.refresh(current.sha);
+    const [remote, mainAgent] = await Promise.all([
+      this.git.refresh(current.sha),
+      this.runtime.mainAgentStatus(path.join(this.policy.release_root, current.sha)),
+    ]);
     const protectedShas = new Set([current.sha, ...(previous ? [previous.sha] : [])]);
     return {
       schema_version: 1,
@@ -132,6 +144,7 @@ export class UpdateController {
       cleanup_dry_run: await this.releases.cleanupPlan(protectedShas),
       database: "read_write",
       updater_self_update: "disabled",
+      main_agent: mainAgent,
     };
   }
 
@@ -173,19 +186,20 @@ export class UpdateController {
     const claimed = this.database.claim(requestId, this.owner, this.policy.timeouts.lease_ms, this.clock.now());
     if (!claimed) throw new Error("Update request is leased by another controller");
     const observation = await this.releases.observe();
-    const [dispatcherHealth, slackHealth] = await Promise.all([
-      this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
+    const expectedRelease = observation.current_sha ? path.join(this.policy.release_root, observation.current_sha) : this.policy.current_pointer;
+    const [dispatcherHealth, slackHealth, mainAgent] = await Promise.all([
+      this.runtime.dispatcherHealth(), this.runtime.slackHealth(), this.runtime.mainAgentStatus(expectedRelease),
     ]);
     if (
       observation.current_sha === claimed.target_sha &&
       this.healthMatches(dispatcherHealth, claimed.target_sha, false) &&
-      this.healthMatches(slackHealth, claimed.target_sha, true)
+      this.healthMatches(slackHealth, claimed.target_sha, true) && mainAgentMatches(mainAgent)
     ) {
       this.database.terminal(claimed.request_id, claimed.fence, "succeeded", "reconciled_target_health", {}, this.clock.now());
     } else if (
       observation.current_sha === claimed.current_sha &&
       this.healthMatches(dispatcherHealth, claimed.current_sha, false) &&
-      this.healthMatches(slackHealth, claimed.current_sha, true)
+      this.healthMatches(slackHealth, claimed.current_sha, true) && mainAgentMatches(mainAgent)
     ) {
       this.database.terminal(claimed.request_id, claimed.fence, "rolled_back", "reconciled_previous_health", {}, this.clock.now());
     } else if (observation.current_sha !== claimed.current_sha && observation.current_sha !== claimed.target_sha) {
@@ -218,7 +232,10 @@ export class UpdateController {
       }, this.clock.now());
       throw new Error("Operator rollback refused because pointer observation does not match the exact plan");
     }
-    await this.withLeaseHeartbeat(row, () => this.rollback(row, "operator_approved_emergency_rollback", true));
+    await this.withLeaseHeartbeat(row, () => this.rollback(row, "operator_approved_emergency_rollback", {
+      operatorApproved: true,
+      activeServices: "unknown",
+    }));
     return this.status(requestId);
   }
 
@@ -254,6 +271,7 @@ export class UpdateController {
 
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
+    let mainAgentPaneId: string | undefined;
     this.assertLease(row);
     if (row.state === "preparing") {
       const refreshed = await this.git.refresh(row.current_sha);
@@ -299,18 +317,31 @@ export class UpdateController {
       if (!row.approval_event_id || !(await this.dispatcher.eventTerminal(row.approval_event_id))) {
         throw new Error("approval_event_terminal_barrier_not_met");
       }
-      const safety = await this.dispatcher.safetyStatus();
-      this.assertLease(row);
-      if (!safety.safe) throw new Error(`unsafe_dispatcher_state:${safety.unsafe_states.join(",")}`);
       row = this.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started", {}, this.clock.now());
     }
     if (row.state === "quiescing") {
       const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
       this.assertLease(row);
-      if (!slackDrain.drained || slackDrain.in_flight !== 0) throw new Error("slack_adapter_drain_incomplete");
+      if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+        throw new Error("slack_adapter_drain_incomplete");
+      }
       const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
       this.assertLease(row);
-      if (!dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) throw new Error("dispatcher_drain_incomplete");
+      if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+        throw new Error("dispatcher_drain_incomplete");
+      }
+      const mainAgent = await this.runtime.waitForMainAgentIdle();
+      this.assertLease(row);
+      if (!mainAgent.exists || !["idle", "done"].includes(mainAgent.status ?? "") ||
+        mainAgent.name !== this.policy.main_agent.name || mainAgent.kind !== "codex") {
+        return void this.needsReview(row, mainAgent.status === "blocked" ? "main_agent_blocked" : "main_agent_not_idle");
+      }
+      const mainAgentStop = await this.runtime.stopMainAgent(mainAgent);
+      this.assertLease(row);
+      if (mainAgentStop.outcome !== "stopped" || !mainAgentStop.pane_id) {
+        return void this.needsReview(row, mainAgentStop.error_code ?? "main_agent_stop_acceptance_unknown");
+      }
+      mainAgentPaneId = mainAgentStop.pane_id;
       const stopSlack = await this.runtime.stopSlack();
       this.assertLease(row);
       if (!resultSucceeded(stopSlack)) return void this.needsReview(row, "slack_stop_acceptance_unknown");
@@ -330,6 +361,20 @@ export class UpdateController {
     }
     if (row.state === "restarting") {
       this.database.incrementRestartAttempts(row.request_id, row.fence, this.clock.now());
+      if (!mainAgentPaneId) return void this.needsReview(row, "main_agent_pane_not_recorded");
+      const targetRelease = path.join(this.policy.release_root, row.target_sha);
+      const mainAgentStart = await this.runtime.startMainAgent(mainAgentPaneId, targetRelease);
+      this.assertLease(row);
+      if (mainAgentStart.outcome === "accepted_unknown") {
+        return void this.needsReview(row, mainAgentStart.error_code ?? "main_agent_start_acceptance_unknown");
+      }
+      if (mainAgentStart.outcome === "rejected") {
+        await this.rollback(row, mainAgentStart.error_code ?? "main_agent_target_start_failed", {
+          knownPaneId: mainAgentPaneId,
+          activeServices: "none",
+        });
+        return;
+      }
       const dispatcherStart = await this.runtime.startDispatcher();
       this.assertLease(row);
       if (!resultSucceeded(dispatcherStart)) return void this.needsReview(row, "dispatcher_start_acceptance_unknown");
@@ -337,7 +382,7 @@ export class UpdateController {
       this.assertLease(row);
       if (!this.healthMatches(dispatcherHealth, row.target_sha, false)) {
         if (dispatcherHealth.live && dispatcherHealth.build_sha && dispatcherHealth.build_sha !== row.target_sha) {
-          await this.rollback(row, "dispatcher_wrong_target_sha");
+          await this.rollback(row, "dispatcher_wrong_target_sha", { activeServices: "dispatcher" });
         } else {
           this.needsReview(row, "dispatcher_target_health_unavailable");
         }
@@ -353,10 +398,16 @@ export class UpdateController {
       this.assertLease(row);
       if (!this.healthMatches(slackHealth, row.target_sha, true)) {
         if (slackHealth.live && slackHealth.build_sha && slackHealth.build_sha !== row.target_sha) {
-          await this.rollback(row, "slack_wrong_target_sha");
+          await this.rollback(row, "slack_wrong_target_sha", { activeServices: "all" });
         } else {
           this.needsReview(row, "slack_workspace_readiness_unavailable");
         }
+        return;
+      }
+      const mainAgent = await this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.target_sha));
+      this.assertLease(row);
+      if (!mainAgentMatches(mainAgent)) {
+        await this.rollback(row, "main_agent_target_unavailable", { activeServices: "all" });
         return;
       }
       this.database.checkpoint();
@@ -374,9 +425,13 @@ export class UpdateController {
     }
   }
 
-  private async rollback(row: UpdateRow, reason: string, operatorApproved = false): Promise<void> {
+  private async rollback(
+    row: UpdateRow,
+    reason: string,
+    options: { operatorApproved?: boolean; knownPaneId?: string; activeServices: ActiveServices },
+  ): Promise<void> {
     this.assertLease(row);
-    if (row.rollback_compatible !== 1 || (!operatorApproved && row.restart_attempts > 1)) {
+    if (row.rollback_compatible !== 1 || (!options.operatorApproved && row.restart_attempts > 1)) {
       this.needsReview(row, "rollback_not_safe_or_circuit_open");
       return;
     }
@@ -384,18 +439,58 @@ export class UpdateController {
       last_error_code: reason,
       last_error_message: "Target regression was observed by versioned local health",
     }, this.clock.now());
-    const stopSlack = await this.runtime.stopSlack();
-    this.assertLease(rolling);
-    const stopDispatcher = await this.runtime.stopDispatcher();
-    this.assertLease(rolling);
-    if (!resultSucceeded(stopSlack) || !resultSucceeded(stopDispatcher)) {
-      this.needsReview(rolling, "rollback_stop_acceptance_unknown");
-      return;
+    if (options.activeServices === "all") {
+      const slackDrain = await this.runtime.quiesceSlack(rolling.request_id, rolling.current_sha);
+      this.assertLease(rolling);
+      if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+        return void this.needsReview(rolling, "rollback_slack_drain_incomplete");
+      }
+    }
+    if (["dispatcher", "all"].includes(options.activeServices)) {
+      const dispatcherDrain = await this.runtime.quiesceDispatcher(rolling.request_id, rolling.current_sha);
+      this.assertLease(rolling);
+      if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+        return void this.needsReview(rolling, "rollback_dispatcher_drain_incomplete");
+      }
+    }
+    let mainAgentPaneId = options.knownPaneId;
+    if (!mainAgentPaneId) {
+      const mainAgent = await this.runtime.waitForMainAgentIdle();
+      this.assertLease(rolling);
+      if (!mainAgent.exists || !["idle", "done"].includes(mainAgent.status ?? "")) {
+        return void this.needsReview(rolling, mainAgent.status === "blocked" ? "rollback_main_agent_blocked" : "rollback_main_agent_not_idle");
+      }
+      const mainAgentStop = await this.runtime.stopMainAgent(mainAgent);
+      this.assertLease(rolling);
+      if (mainAgentStop.outcome !== "stopped" || !mainAgentStop.pane_id) {
+        return void this.needsReview(rolling, mainAgentStop.error_code ?? "rollback_main_agent_stop_unknown");
+      }
+      mainAgentPaneId = mainAgentStop.pane_id;
+    }
+    if (["all", "unknown"].includes(options.activeServices)) {
+      const stopSlack = await this.runtime.stopSlack();
+      this.assertLease(rolling);
+      if (!resultSucceeded(stopSlack)) return void this.needsReview(rolling, "rollback_slack_stop_acceptance_unknown");
+    }
+    if (["dispatcher", "all", "unknown"].includes(options.activeServices)) {
+      const stopDispatcher = await this.runtime.stopDispatcher();
+      this.assertLease(rolling);
+      if (!resultSucceeded(stopDispatcher)) {
+        return void this.needsReview(rolling, "rollback_dispatcher_stop_acceptance_unknown");
+      }
     }
     const receipt = await this.releases.rollback(rolling);
     this.assertLease(rolling);
     this.database.recordActivationGeneration(rolling.request_id, rolling.fence, receipt.generation, this.clock.now());
     rolling = { ...rolling, activation_generation: receipt.generation };
+    const mainAgentStart = await this.runtime.startMainAgent(
+      mainAgentPaneId,
+      path.join(this.policy.release_root, rolling.current_sha),
+    );
+    this.assertLease(rolling);
+    if (mainAgentStart.outcome !== "started") {
+      return void this.needsReview(rolling, mainAgentStart.error_code ?? "rollback_main_agent_start_unknown");
+    }
     const dispatcherStart = await this.runtime.startDispatcher();
     this.assertLease(rolling);
     if (!resultSucceeded(dispatcherStart)) return void this.needsReview(rolling, "rollback_dispatcher_start_unknown");

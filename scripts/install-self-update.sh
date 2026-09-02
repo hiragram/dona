@@ -139,7 +139,7 @@ for component in dispatcher sources/slack updater; do
     "$NPM_PATH" --prefix "$COMPONENT_DIR" run build
 done
 NPM_VERSION=$($NPM_PATH --version)
-$NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-02.1"
+$NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.1"
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
   print -u2 "release $INSTALL_SHA は既に存在します。上書きしません。"

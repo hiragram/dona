@@ -11,12 +11,18 @@ export interface UpdatePolicy {
   canonical_remote: string;
   default_branch: "main";
   control_root: string;
+  config_root: string;
   release_root: string;
   current_pointer: string;
   previous_pointer: string;
   dispatcher_socket: string;
   slack_socket: string;
   dispatcher_internal_token_file: string;
+  main_agent: {
+    session: "dona";
+    name: "dona-main";
+    minimum_herdr_version: string;
+  };
   launchd: {
     dispatcher_label: string;
     slack_label: string;
@@ -27,11 +33,15 @@ export interface UpdatePolicy {
     node: string;
     launchctl: string;
     gh: string;
+    herdr: string;
   };
   timeouts: {
     command_ms: number;
     health_ms: number;
     drain_ms: number;
+    agent_drain_ms: number;
+    agent_exit_ms: number;
+    agent_start_ms: number;
     lease_ms: number;
   };
   output_limit_bytes: number;
@@ -87,8 +97,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   const value = record(input, "policy");
   exact(value, [
     "schema_version", "policy_version", "repository", "canonical_remote", "default_branch",
-    "control_root", "release_root", "current_pointer", "previous_pointer", "dispatcher_socket",
-    "slack_socket", "dispatcher_internal_token_file", "launchd", "executables", "timeouts",
+    "control_root", "config_root", "release_root", "current_pointer", "previous_pointer", "dispatcher_socket",
+    "slack_socket", "dispatcher_internal_token_file", "main_agent", "launchd", "executables", "timeouts",
     "output_limit_bytes", "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
   ], "policy");
   if (value.schema_version !== 1 || value.repository !== "hiragram/dona" || value.default_branch !== "main") {
@@ -98,16 +108,23 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (typeof value.policy_version !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(value.policy_version)) {
     throw new ValidationError("policy_version is invalid");
   }
+  const mainAgent = record(value.main_agent, "main_agent");
+  exact(mainAgent, ["session", "name", "minimum_herdr_version"], "main_agent");
+  if (mainAgent.session !== "dona" || mainAgent.name !== "dona-main" ||
+    typeof mainAgent.minimum_herdr_version !== "string" || !/^\d+\.\d+\.\d+$/.test(mainAgent.minimum_herdr_version)) {
+    throw new ValidationError("main_agent configuration is not allowed");
+  }
   const launchd = record(value.launchd, "launchd");
   exact(launchd, ["dispatcher_label", "slack_label"], "launchd");
   if (launchd.dispatcher_label !== "dev.dona.dispatcher" || launchd.slack_label !== "dev.dona.slack-adapter") {
     throw new ValidationError("launchd labels are not allowed");
   }
   const executables = record(value.executables, "executables");
-  exact(executables, ["git", "npm", "node", "launchctl", "gh"], "executables");
+  exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr"], "executables");
   const timeouts = record(value.timeouts, "timeouts");
-  exact(timeouts, ["command_ms", "health_ms", "drain_ms", "lease_ms"], "timeouts");
+  exact(timeouts, ["command_ms", "health_ms", "drain_ms", "agent_drain_ms", "agent_exit_ms", "agent_start_ms", "lease_ms"], "timeouts");
   const controlRoot = absolute(value.control_root, "control_root");
+  const configRoot = absolute(value.config_root, "config_root");
   const releaseRoot = absolute(value.release_root, "release_root");
   const currentPointer = absolute(value.current_pointer, "current_pointer");
   const previousPointer = absolute(value.previous_pointer, "previous_pointer");
@@ -117,12 +134,17 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (releaseRoot === controlRoot || releaseRoot.startsWith(`${controlRoot}${path.sep}`) || controlRoot.startsWith(`${releaseRoot}${path.sep}`)) {
     throw new ValidationError("stable control_root must be outside the mutable release_root");
   }
+  const baseRoot = path.dirname(controlRoot);
+  if (path.dirname(configRoot) !== baseRoot || path.dirname(path.dirname(releaseRoot)) !== baseRoot) {
+    throw new ValidationError("config, control, and runtime roots must share one fixed base directory");
+  }
   const executablePaths = {
     git: absolute(executables.git, "executables.git"),
     npm: absolute(executables.npm, "executables.npm"),
     node: absolute(executables.node, "executables.node"),
     launchctl: absolute(executables.launchctl, "executables.launchctl"),
     gh: absolute(executables.gh, "executables.gh"),
+    herdr: absolute(executables.herdr, "executables.herdr"),
   };
   const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater"];
   const requiredChecks = value.required_checks;
@@ -138,12 +160,18 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     canonical_remote: value.canonical_remote,
     default_branch: "main",
     control_root: controlRoot,
+    config_root: configRoot,
     release_root: releaseRoot,
     current_pointer: currentPointer,
     previous_pointer: previousPointer,
     dispatcher_socket: absolute(value.dispatcher_socket, "dispatcher_socket"),
     slack_socket: absolute(value.slack_socket, "slack_socket"),
     dispatcher_internal_token_file: absolute(value.dispatcher_internal_token_file, "dispatcher_internal_token_file"),
+    main_agent: {
+      session: "dona",
+      name: "dona-main",
+      minimum_herdr_version: mainAgent.minimum_herdr_version,
+    },
     launchd: {
       dispatcher_label: typeof launchd.dispatcher_label === "string" ? launchd.dispatcher_label : "",
       slack_label: typeof launchd.slack_label === "string" ? launchd.slack_label : "",
@@ -153,6 +181,9 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       command_ms: integer(timeouts.command_ms, "timeouts.command_ms"),
       health_ms: integer(timeouts.health_ms, "timeouts.health_ms"),
       drain_ms: integer(timeouts.drain_ms, "timeouts.drain_ms"),
+      agent_drain_ms: integer(timeouts.agent_drain_ms, "timeouts.agent_drain_ms"),
+      agent_exit_ms: integer(timeouts.agent_exit_ms, "timeouts.agent_exit_ms"),
+      agent_start_ms: integer(timeouts.agent_start_ms, "timeouts.agent_start_ms"),
       lease_ms: integer(timeouts.lease_ms, "timeouts.lease_ms"),
     },
     output_limit_bytes: integer(value.output_limit_bytes, "output_limit_bytes", 1_024),
