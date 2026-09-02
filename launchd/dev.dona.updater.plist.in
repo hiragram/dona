@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.dona.updater</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__CONTROL_ROOT__/updater/dist/cli.js</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key><string>__CONTROL_ROOT__/updater</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DONA_UPDATE_POLICY_PATH</key><string>__CONTROL_ROOT__/policy.json</string>
+    <key>DONA_UPDATER_BUILD_SHA</key><string>__INSTALL_SHA__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__LOG_ROOT__/updater.log</string>
+  <key>StandardErrorPath</key><string>__LOG_ROOT__/updater.error.log</string>
+</dict>
+</plist>

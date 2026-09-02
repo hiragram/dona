@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.dona.dispatcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__RUNTIME_ROOT__/current/dispatcher/dist/cli.js</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key><string>__RUNTIME_ROOT__/current/dispatcher</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DOTENV_CONFIG_PATH</key><string>__CONFIG_ROOT__/dispatcher.env</string>
+    <key>DONA_RELEASE_MANIFEST_PATH</key><string>__RUNTIME_ROOT__/current/release-manifest.json</string>
+    <key>DONA_UPDATER_SOCKET_PATH</key><string>__CONTROL_ROOT__/updater.sock</string>
+    <key>DONA_UPDATE_INTERNAL_TOKEN_PATH</key><string>__CONTROL_ROOT__/dispatcher.token</string>
+    <key>DONA_HERDR_PATH</key><string>__HERDR__</string>
+    <key>DONA_GH_PATH</key><string>__GH__</string>
+    <key>DONA_GIT_PATH</key><string>__GIT__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__LOG_ROOT__/dispatcher.log</string>
+  <key>StandardErrorPath</key><string>__LOG_ROOT__/dispatcher.error.log</string>
+</dict>
+</plist>
