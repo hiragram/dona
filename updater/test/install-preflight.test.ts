@@ -40,7 +40,9 @@ test("installer accepts only canonical HTTPS and SSH forms for hiragram/dona", a
   }
 });
 
-test("installer prints option-prefixed usage text without treating it as a zsh print option", async () => {
+test("installer prints option-prefixed usage text without treating it as a zsh print option", {
+  skip: process.platform !== "darwin",
+}, async () => {
   await assert.rejects(execute("/bin/zsh", [installer]), (error: unknown) => {
     const result = error as { code?: number; stderr?: string };
     assert.equal(result.code, 2);
