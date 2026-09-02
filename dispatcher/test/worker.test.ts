@@ -130,6 +130,54 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 
+  test("quiesces after the accepted event completes without dispatching the next queued event", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await fs.mkdir(config.resultsDir, { recursive: true });
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = database.enqueue(eventEnvelope("Ev-drain-1")).row;
+    const second = database.enqueue(eventEnvelope("Ev-drain-2")).row;
+    let releasePrompt!: () => void;
+    const promptMayFinish = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    const prompted: string[] = [];
+    let fields: { eventId: string; resultPath: string } | undefined;
+    const herdr: HerdrClient = {
+      async get() {
+        return ok("idle");
+      },
+      async prompt(prompt) {
+        fields = promptFields(prompt);
+        prompted.push(fields.eventId);
+        await promptMayFinish;
+        await fs.writeFile(fields.resultPath, JSON.stringify({
+          schema_version: 1,
+          event_id: fields.eventId,
+          status: "completed",
+          completed_at: new Date().toISOString(),
+          actions: [],
+          memory_candidates: [],
+        }));
+        return ok("working");
+      },
+      async wait() {
+        return ok("done");
+      },
+    };
+    const worker = new DispatcherWorker(database, herdr, config, logger);
+    worker.start();
+    await waitFor(() => prompted.length === 1);
+    worker.quiesceAfterCurrent();
+    releasePrompt();
+    await waitFor(() => !worker.isRunning());
+    assert.equal(database.get(first.event_id)?.status, "completed");
+    assert.equal(database.get(second.event_id)?.status, "queued");
+    assert.deepEqual(prompted, [first.event_id]);
+    await worker.stop();
+    database.close();
+  });
+
   test("moves a waiting event to needs_review when the accepted agent stays unavailable", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

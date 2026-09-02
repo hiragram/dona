@@ -149,6 +149,33 @@ export interface DrainSnapshot {
   unsafe_states: string[];
 }
 
+export type MainAgentStatus = "idle" | "done" | "working" | "blocked" | "unknown";
+
+export interface MainAgentObservation {
+  exists: boolean;
+  name: string | null;
+  kind: string | null;
+  pane_id: string | null;
+  status: MainAgentStatus | null;
+  interactive_ready: boolean;
+  working_directory: string | null;
+  session_id: string | null;
+  matches_release: boolean;
+  error_code: string | null;
+}
+
+export interface MainAgentStopResult {
+  outcome: "stopped" | "rejected" | "accepted_unknown";
+  pane_id: string | null;
+  error_code: string | null;
+}
+
+export interface MainAgentStartResult {
+  outcome: "started" | "rejected" | "accepted_unknown";
+  observation: MainAgentObservation;
+  error_code: string | null;
+}
+
 export interface CommandResult {
   exit_code: number | null;
   stdout: string;

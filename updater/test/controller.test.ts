@@ -7,7 +7,7 @@ import { UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
-import type { CommandResult, DrainSnapshot, HealthSnapshot, OutboxRow } from "../src/types.js";
+import type { CommandResult, DrainSnapshot, HealthSnapshot, MainAgentObservation, OutboxRow } from "../src/types.js";
 import { currentSha, installPointers, logger, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
@@ -65,8 +65,18 @@ class FakeDispatcher implements DispatcherPort {
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
   wrongTargetOnce = false;
+  wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
-  constructor(private readonly store: ReleaseStore, private readonly policySha: () => string) {}
+  mainWaitStatus: MainAgentObservation["status"] = "idle";
+  mainObserveStatus: MainAgentObservation["status"] = "idle";
+  mainStartUnknownOnce = false;
+  private mainAgentExists = true;
+  mainAgentSha = currentSha;
+  constructor(
+    private readonly store: ReleaseStore,
+    private readonly policySha: () => string,
+    private readonly releaseRoot: string,
+  ) {}
   async quiesceSlack(): Promise<DrainSnapshot> { this.calls.push("quiesceSlack"); return { service: "slack_adapter", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
   async quiesceDispatcher(): Promise<DrainSnapshot> { this.calls.push("quiesceDispatcher"); return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
   async stopSlack() { this.calls.push("stopSlack"); return ok; }
@@ -80,6 +90,34 @@ class FakeRuntime implements RuntimePort {
     return ok;
   }
   async startSlack() { this.calls.push("startSlack"); return ok; }
+  async waitForMainAgentIdle(): Promise<MainAgentObservation> {
+    this.calls.push("waitForMainAgentIdle");
+    return this.mainAgent(this.mainAgentSha, this.mainWaitStatus);
+  }
+  async stopMainAgent(expected: MainAgentObservation) {
+    this.calls.push("stopMainAgent");
+    assert.equal(expected.pane_id, "w1:p1");
+    this.mainAgentExists = false;
+    return { outcome: "stopped" as const, pane_id: "w1:p1", error_code: null };
+  }
+  async startMainAgent(paneId: string, releasePath: string) {
+    this.calls.push(`startMainAgent:${path.basename(releasePath)}`);
+    assert.equal(paneId, "w1:p1");
+    if (this.mainStartUnknownOnce) {
+      this.mainStartUnknownOnce = false;
+      return {
+        outcome: "accepted_unknown" as const,
+        observation: this.mainAgent(this.mainAgentSha, "unknown", releasePath),
+        error_code: "main_agent_start_timeout",
+      };
+    }
+    this.mainAgentExists = true;
+    this.mainAgentSha = path.basename(releasePath);
+    return { outcome: "started" as const, observation: this.mainAgent(this.mainAgentSha, "idle", releasePath), error_code: null };
+  }
+  async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
+    return this.mainAgent(this.mainAgentSha, this.mainObserveStatus, releasePath);
+  }
   async dispatcherHealth(): Promise<HealthSnapshot> {
     const current = (await this.store.observe()).current_sha;
     if (this.wrongTargetOnce && current === targetSha) {
@@ -89,10 +127,29 @@ class FakeRuntime implements RuntimePort {
     return this.health("dispatcher", current, true);
   }
   async slackHealth(): Promise<HealthSnapshot> {
+    if (this.wrongSlackOnce) {
+      this.wrongSlackOnce = false;
+      return { ...this.health("slack_adapter", "f".repeat(40), true), workspaces_ready: true };
+    }
     return { ...this.health("slack_adapter", (await this.store.observe()).current_sha, true), workspaces_ready: true };
   }
   private health(service: HealthSnapshot["service"], sha: string | null, ready: boolean): HealthSnapshot {
     return { service, live: true, ready, build_sha: sha ?? this.policySha(), protocol: 1, app_schema: 2, config: 1 };
+  }
+  private mainAgent(sha: string, status: MainAgentObservation["status"], expectedRelease?: string): MainAgentObservation {
+    const workingDirectory = path.join(this.releaseRoot, sha);
+    return {
+      exists: this.mainAgentExists,
+      name: this.mainAgentExists ? "dona-main" : null,
+      kind: this.mainAgentExists ? "codex" : null,
+      pane_id: this.mainAgentExists ? "w1:p1" : null,
+      status: this.mainAgentExists ? status : null,
+      interactive_ready: this.mainAgentExists,
+      working_directory: this.mainAgentExists ? workingDirectory : null,
+      session_id: this.mainAgentExists ? `session-${sha}` : null,
+      matches_release: this.mainAgentExists && expectedRelease !== undefined && workingDirectory === expectedRelease,
+      error_code: null,
+    };
   }
 }
 
@@ -104,7 +161,7 @@ async function fixture() {
   const store = new ReleaseStore(policy);
   const dispatcher = new FakeDispatcher();
   const build = new FakeBuild();
-  const runtime = new FakeRuntime(store, () => currentSha);
+  const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
   const controller = new UpdateController(database, policy, new FakeGit(), build, store, runtime, dispatcher, logger, {
     now: () => new Date("2026-09-02T00:00:00.000Z"),
   }, "controller-test");
@@ -126,7 +183,8 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(requestId)?.state, "succeeded");
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "stopSlack", "stopDispatcher", "startDispatcher", "startSlack",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      `startMainAgent:${targetSha}`, "startDispatcher", "startSlack",
     ]);
     assert.equal(f.database.outboxFor(requestId)?.status, "pending");
     f.dispatcher.delivery = "accepted_unknown";
@@ -147,9 +205,52 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "stopSlack", "stopDispatcher", "startDispatcher",
-      "stopSlack", "stopDispatcher", "startDispatcher", "startSlack",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      `startMainAgent:${targetSha}`, "startDispatcher", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent",
+      "stopDispatcher", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
+    f.database.close();
+  });
+
+  test("drains both target services before rolling dona-main back after a Slack wrong SHA", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-slack-rollback",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      `startMainAgent:${targetSha}`, "startDispatcher", "startSlack",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("accepts a proven target dona-main that started handling a new event during final verification", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-working-main",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainObserveStatus = "working";
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "succeeded");
     f.database.close();
   });
 
@@ -166,6 +267,51 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "pre_activation_failed");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, []);
+    f.database.close();
+  });
+
+  test("does not stop a blocked dona-main or switch the release pointer", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-blocked",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "blocked";
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "main_agent_blocked");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle"]);
+    f.database.close();
+  });
+
+  test("does not start services or retry when dona-main start acceptance is unknown", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-main-start-timeout",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainStartUnknownOnce = true;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "main_agent_start_timeout");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      `startMainAgent:${targetSha}`,
+    ]);
     f.database.close();
   });
 
@@ -197,7 +343,7 @@ describe("UpdateController isolated end-to-end", () => {
     const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
     const store = new ReleaseStore(policy);
     const dispatcher = new FakeDispatcher();
-    const runtime = new FakeRuntime(store, () => currentSha);
+    const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
     const untrustedGit = new FakeGit();
     untrustedGit.refresh = async (current: string) => ({
       current_sha: current,
@@ -239,6 +385,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.recordActivationGeneration(requestId, row.fence, receipt.generation);
     row = f.database.transition(requestId, row.fence, "restarting", "pointer_activated", { activation_generation: receipt.generation });
     f.database.transition(requestId, row.fence, "verifying", "restart_response_lost");
+    f.runtime.mainAgentSha = targetSha;
     await f.controller.processNext();
     assert.equal(f.database.get(requestId)?.state, "succeeded");
     assert.deepEqual(f.runtime.calls, []);

@@ -13,8 +13,10 @@ apply_self_update
   -> 元Slack受付eventのcompleted barrierを待つ
   -> isolated checkoutで3 packageのnpm ci/test/typecheck/build
   -> immutable releases/<sha>をpublish
-  -> Slack Adapter、Dispatcherの順にquiesce/drain/clean stop
+  -> Slack Adapterのingressを止め、Dispatcherをstop-after-currentでdrain
+  -> Herdr上のdona-mainがidle/doneになったことを確認して同じpaneのCodexを終了
   -> previous/current pointerをsame-filesystem renameで切替
+  -> target releaseを明示的にtrustしたCodexを同じpaneへdona-mainとして起動
   -> Dispatcher、Slack Adapterの順にstartしtarget SHA healthを検証
   -> stable outboxからinternal dona_update eventを新Dispatcherへ配送
 ```
@@ -28,9 +30,10 @@ apply_self_update
 policyは次を固定します。
 
 - `hiragram/dona`、HTTPS canonical remote、`main`
-- stable control root、release/current/previous、UDS、internal token file
+- stable control root、release/current/previous、0600 config root、UDS、internal token file
 - `dev.dona.dispatcher`と`dev.dona.slack-adapter`
-- absolute `git/npm/node/gh/launchctl`
+- fixed Herdr session `dona`、agent名`dona-main`、minimum Herdr version
+- absolute `git/npm/node/gh/herdr/launchctl`
 - timeout、output上限、disk floor、retention
 - expected GitHub Actions check 3件と、任意のcommit signature gate
 - protocol/config/app schema read/write range
@@ -62,8 +65,8 @@ npm run build
 npm audit --audit-level=high
 ```
 
-testはtemporary SQLite/release root、isolated temporary Git remote、fake runtime/Dispatcherを使います。実GitHub、Slack、Keychain、production LaunchAgent、live processは操作しません。
+testはtemporary SQLite/release root、isolated temporary Git remote、fake runtime/Dispatcher/Herdr responseを使います。Codexへ渡すMCP environmentは固定config pathだけで、token値をargvへ載せないことも検証します。実GitHub、Slack、Keychain、production LaunchAgent、live processは操作しません。
 
 ## 既知の制約
 
-初期版はstable updater自身とpolicyの自動更新、app DB migrationを行いません。protocol・config・schema compatibilityを変更するreleaseは、別のmaintenance windowでstable updater/policyを監査して更新するまでfail closedします。通常releaseのplistは更新しません。
+stable updater自身とpolicyの自動更新、app DB migrationは行いません。このdona-main lifecycle対応を既存installへ導入する最初の1回は、別のmaintenance windowでstable updaterとpolicyを`2026-09-03.1`へ更新する必要があります。通常releaseのplistは更新しません。

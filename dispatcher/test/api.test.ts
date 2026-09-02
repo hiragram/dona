@@ -7,7 +7,7 @@ import { afterEach, describe, test } from "node:test";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
-import { eventEnvelope, tempConfig } from "./helpers.js";
+import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -202,6 +202,10 @@ describe("DispatcherApi", () => {
     const database = new DispatcherDatabase(config.databasePath);
     let workerRunning = true;
     let jobsRunning = true;
+    let finishQuiesce!: () => void;
+    const quiesceMayFinish = new Promise<void>((resolve) => {
+      finishQuiesce = resolve;
+    });
     const calls: unknown[] = [];
     const updates = {
       async plan(input: unknown) { calls.push(input); return { schema_version: 1, plan: {} }; },
@@ -216,7 +220,7 @@ describe("DispatcherApi", () => {
       config,
       logger,
       updates,
-      { async quiesce() { workerRunning = false; jobsRunning = false; } },
+      { async quiesce() { await quiesceMayFinish; workerRunning = false; jobsRunning = false; } },
     );
     await api.start();
     const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-update-plan"));
@@ -248,8 +252,13 @@ describe("DispatcherApi", () => {
       operation_id: "upd_01m1es03xy5cf8d9pm5cwx4srv",
       target_sha: "2".repeat(40),
     });
-    assert.equal(quiesced.status, 200);
-    assert.equal(quiesced.body.drained, true);
+    assert.equal(quiesced.status, 202);
+    assert.equal(quiesced.body.drained, false);
+    finishQuiesce();
+    await waitFor(() => !workerRunning && !jobsRunning);
+    const drained = await request(config.socketPath, "GET", "/v1/admin/drain-status");
+    assert.equal(drained.status, 200);
+    assert.equal(drained.body.drained, true);
     assert.equal((await request(config.socketPath, "GET", "/health/version")).status, 503);
     assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
       source_event_id: eventId,

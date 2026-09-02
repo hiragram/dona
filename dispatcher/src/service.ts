@@ -35,8 +35,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        worker.quiesceAfterCurrent();
         await jobSupervisor.stop();
-        await worker.stop();
       },
     },
   );

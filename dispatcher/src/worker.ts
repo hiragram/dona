@@ -44,6 +44,7 @@ export class DispatcherWorker {
   private readonly abortController = new AbortController();
   private running = false;
   private stopping = false;
+  private quiescing = false;
   private loopPromise: Promise<void> | undefined;
 
   constructor(
@@ -54,7 +55,7 @@ export class DispatcherWorker {
   ) {}
 
   isRunning(): boolean {
-    return this.running && !this.stopping;
+    return this.running;
   }
 
   start(): void {
@@ -64,17 +65,26 @@ export class DispatcherWorker {
       this.logger.warn("Recovered stale dispatching events as needs_review", { count: recovered });
     }
     this.running = true;
-    this.loopPromise = this.loop().catch((error: unknown) => {
-      this.logger.error("Worker loop stopped unexpectedly", {
-        error_code: "worker_crashed",
-        error_message: error instanceof Error ? error.message : String(error),
+    this.loopPromise = this.loop()
+      .catch((error: unknown) => {
+        this.logger.error("Worker loop stopped unexpectedly", {
+          error_code: "worker_crashed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      })
+      .finally(() => {
+        this.running = false;
       });
-      throw error;
-    });
   }
 
   wake(): void {
     this.wakeSignal.wake();
+  }
+
+  quiesceAfterCurrent(): void {
+    this.quiescing = true;
+    this.wake();
   }
 
   async stop(): Promise<void> {
@@ -87,6 +97,7 @@ export class DispatcherWorker {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
+      if (this.quiescing) break;
       let handled = false;
       if (!this.database.hasBlockedEvent()) {
         const waiting = this.database.nextWaiting();
@@ -101,6 +112,7 @@ export class DispatcherWorker {
           }
         }
       }
+      if (this.quiescing) break;
       if (!handled || !this.stopping) await this.wakeSignal.wait(this.config.queuePollMs);
     }
   }

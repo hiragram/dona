@@ -7,7 +7,17 @@ import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
 import { ProcessRunner, minimalEnvironment } from "./process.js";
 import { redactText } from "./redaction.js";
-import type { CommandResult, Compatibility, DrainSnapshot, HealthSnapshot, OutboxRow } from "./types.js";
+import type {
+  CommandResult,
+  Compatibility,
+  DrainSnapshot,
+  HealthSnapshot,
+  MainAgentObservation,
+  MainAgentStartResult,
+  MainAgentStopResult,
+  MainAgentStatus,
+  OutboxRow,
+} from "./types.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
 function commandError(name: string, result: CommandResult): Error {
@@ -278,6 +288,99 @@ function drainSnapshot(response: HttpResponse, service: DrainSnapshot["service"]
   };
 }
 
+const mainAgentStatuses = new Set<MainAgentStatus>(["idle", "done", "working", "blocked", "unknown"]);
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function findString(input: unknown, keys: readonly string[]): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const value = input as Record<string, unknown>;
+  for (const key of keys) if (typeof value[key] === "string") return value[key] as string;
+  for (const child of Object.values(value)) {
+    const found = findString(child, keys);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function findAgentInfo(input: unknown): Record<string, unknown> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const value = input as Record<string, unknown>;
+  if (typeof value.pane_id === "string" && mainAgentStatuses.has(value.agent_status as MainAgentStatus)) return value;
+  for (const child of Object.values(value)) {
+    const found = findAgentInfo(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function herdrErrorCode(result: CommandResult): string | undefined {
+  return findString(parseJson(result.stderr || result.stdout), ["error_code", "code"]);
+}
+
+function missingMainAgent(errorCode: string | undefined): MainAgentObservation {
+  return {
+    exists: false,
+    name: null,
+    kind: null,
+    pane_id: null,
+    status: null,
+    interactive_ready: false,
+    working_directory: null,
+    session_id: null,
+    matches_release: false,
+    error_code: errorCode ?? null,
+  };
+}
+
+function mainAgentObservation(result: CommandResult, expectedReleasePath?: string): MainAgentObservation {
+  const errorCode = herdrErrorCode(result);
+  if (result.timed_out || result.output_truncated || result.exit_code !== 0) {
+    if (["agent_not_found", "agent_not_running"].includes(errorCode ?? "")) return missingMainAgent(errorCode);
+    return missingMainAgent(errorCode ?? (result.timed_out ? "herdr_timeout" : "herdr_command_failed"));
+  }
+  const info = findAgentInfo(parseJson(result.stdout));
+  if (!info) return missingMainAgent("invalid_herdr_agent_response");
+  const session = info.agent_session && typeof info.agent_session === "object"
+    ? info.agent_session as Record<string, unknown>
+    : undefined;
+  const workingDirectory = typeof info.foreground_cwd === "string"
+    ? info.foreground_cwd
+    : typeof info.cwd === "string" ? info.cwd : null;
+  return {
+    exists: true,
+    name: typeof info.name === "string" ? info.name : null,
+    kind: typeof info.agent === "string" ? info.agent : null,
+    pane_id: typeof info.pane_id === "string" ? info.pane_id : null,
+    status: mainAgentStatuses.has(info.agent_status as MainAgentStatus) ? info.agent_status as MainAgentStatus : null,
+    interactive_ready: info.interactive_ready === true,
+    working_directory: workingDirectory,
+    session_id: session?.kind === "id" && typeof session.value === "string" ? session.value : null,
+    matches_release: expectedReleasePath !== undefined && workingDirectory !== null &&
+      path.normalize(workingDirectory) === path.normalize(expectedReleasePath),
+    error_code: null,
+  };
+}
+
+function sameMainAgent(left: MainAgentObservation, right: MainAgentObservation): boolean {
+  return left.exists && right.exists && left.pane_id === right.pane_id && left.name === right.name && left.kind === right.kind &&
+    left.session_id !== null && left.session_id === right.session_id;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function tomlInlineTable(values: Readonly<Record<string, string>>): string {
+  return `{ ${Object.entries(values).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`).join(", ")} }`;
+}
+
 export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
@@ -289,10 +392,17 @@ export class RealRuntime implements RuntimePort {
   }
 
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {
-    const response = await udsRequest(this.policy.dispatcher_socket, "POST", "/v1/admin/quiesce", {
+    let snapshot = drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
-    }, this.policy.timeouts.drain_ms);
-    return drainSnapshot(response, "dispatcher");
+    }, this.policy.timeouts.health_ms), "dispatcher");
+    const deadline = Date.now() + this.policy.timeouts.agent_drain_ms;
+    while (!snapshot.drained && Date.now() < deadline) {
+      await delay(100);
+      snapshot = drainSnapshot(await udsRequest(
+        this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
+      ), "dispatcher");
+    }
+    return snapshot;
   }
 
   stopSlack(): Promise<CommandResult> {
@@ -311,6 +421,125 @@ export class RealRuntime implements RuntimePort {
     return this.launchctl(["kickstart", this.domainTarget(this.policy.launchd.slack_label)]);
   }
 
+  async waitForMainAgentIdle(): Promise<MainAgentObservation> {
+    if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
+    const result = await this.herdr([
+      "--session", this.policy.main_agent.session,
+      "agent", "wait", this.policy.main_agent.name,
+      "--until", "idle", "--until", "done", "--until", "blocked",
+      "--timeout", String(this.policy.timeouts.agent_drain_ms),
+    ], this.policy.timeouts.agent_drain_ms + 5_000);
+    return mainAgentObservation(result);
+  }
+
+  async stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult> {
+    if (!expected.exists || !expected.pane_id || !expected.session_id || !["idle", "done"].includes(expected.status ?? "") ||
+      expected.name !== this.policy.main_agent.name || expected.kind !== "codex") {
+      return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_not_idle" };
+    }
+    const current = await this.readMainAgent();
+    if (!sameMainAgent(expected, current) || !["idle", "done"].includes(current.status ?? "") || !current.interactive_ready) {
+      return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_identity_changed" };
+    }
+    const stopped = await this.herdr([
+      "--session", this.policy.main_agent.session,
+      "agent", "send-keys", expected.pane_id, "ctrl+c",
+    ], this.policy.timeouts.health_ms);
+    if (stopped.timed_out || stopped.output_truncated || stopped.exit_code !== 0) {
+      return { outcome: "accepted_unknown", pane_id: expected.pane_id, error_code: herdrErrorCode(stopped) ?? "main_agent_stop_unknown" };
+    }
+    const deadline = Date.now() + this.policy.timeouts.agent_exit_ms;
+    do {
+      const observed = await this.readAgent(expected.pane_id);
+      if (!observed.exists && ["agent_not_found", "agent_not_running"].includes(observed.error_code ?? "")) {
+        return { outcome: "stopped", pane_id: expected.pane_id, error_code: null };
+      }
+      if (!observed.exists) {
+        return { outcome: "accepted_unknown", pane_id: expected.pane_id, error_code: observed.error_code ?? "main_agent_exit_observation_failed" };
+      }
+      if (!sameMainAgent(expected, observed)) {
+        return { outcome: "accepted_unknown", pane_id: expected.pane_id, error_code: "main_agent_identity_changed_after_stop" };
+      }
+      await delay(100);
+    } while (Date.now() < deadline);
+    return { outcome: "accepted_unknown", pane_id: expected.pane_id, error_code: "main_agent_exit_not_observed" };
+  }
+
+  async startMainAgent(paneId: string, releasePath: string): Promise<MainAgentStartResult> {
+    if (!/^[a-z0-9][a-z0-9:_-]{0,63}$/.test(paneId)) {
+      return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_pane"), error_code: "invalid_main_agent_pane" };
+    }
+    let canonicalRelease: string;
+    let canonicalConfigRoot: string;
+    try {
+      const [root, release, configRoot, configRootStats] = await Promise.all([
+        fs.realpath(this.policy.release_root), fs.realpath(releasePath), fs.realpath(this.policy.config_root),
+        fs.lstat(this.policy.config_root),
+      ]);
+      const uid = process.getuid?.();
+      if (path.dirname(release) !== root || !/^[0-9a-f]{40}$/.test(path.basename(release))) throw new Error("release_path_outside_fixed_root");
+      if (uid === undefined || !configRootStats.isDirectory() || configRootStats.isSymbolicLink() ||
+        configRootStats.uid !== uid || (configRootStats.mode & 0o077) !== 0) throw new Error("config_root_is_not_private");
+      const codexConfigStats = await fs.lstat(path.join(release, ".codex", "config.toml"));
+      if (!codexConfigStats.isFile() || codexConfigStats.isSymbolicLink() || codexConfigStats.uid !== uid ||
+        (codexConfigStats.mode & 0o022) !== 0) throw new Error("codex_config_is_not_trusted");
+      for (const name of ["dispatcher.env", "slack.env"]) {
+        const stats = await fs.lstat(path.join(configRoot, name));
+        if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+          throw new Error("config_file_is_not_private");
+        }
+      }
+      canonicalRelease = release;
+      canonicalConfigRoot = configRoot;
+    } catch {
+      return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_release"), error_code: "invalid_main_agent_release" };
+    }
+    const projectTrust = `projects = { ${JSON.stringify(canonicalRelease)} = { trust_level = "trusted" } }`;
+    const dispatcherMcpEnvironment = `mcp_servers.dona_dispatcher.env = ${tomlInlineTable({
+      DOTENV_CONFIG_PATH: path.join(canonicalConfigRoot, "dispatcher.env"),
+      DONA_RELEASE_MANIFEST_PATH: path.join(this.policy.current_pointer, "release-manifest.json"),
+      DONA_UPDATER_SOCKET_PATH: path.join(this.policy.control_root, "updater.sock"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
+      DONA_HERDR_PATH: this.policy.executables.herdr,
+      DONA_GH_PATH: this.policy.executables.gh,
+      DONA_GIT_PATH: this.policy.executables.git,
+    })}`;
+    const slackMcpEnvironment = `mcp_servers.dona_slack.env = ${tomlInlineTable({
+      DOTENV_CONFIG_PATH: path.join(canonicalConfigRoot, "slack.env"),
+    })}`;
+    const deadline = Date.now() + this.policy.timeouts.agent_exit_ms;
+    let result: CommandResult;
+    do {
+      result = await this.herdr([
+        "--session", this.policy.main_agent.session,
+        "agent", "start", this.policy.main_agent.name,
+        "--kind", "codex", "--pane", paneId,
+        "--timeout", String(this.policy.timeouts.agent_start_ms),
+        "--", "-C", canonicalRelease, "-c", projectTrust,
+        "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+      ], this.policy.timeouts.agent_start_ms + 5_000);
+      if (result.exit_code === 0 && !result.timed_out && !result.output_truncated) break;
+      if (herdrErrorCode(result) !== "agent_pane_busy" || Date.now() >= deadline) break;
+      await delay(100);
+    } while (true);
+    let observation = mainAgentObservation(result, canonicalRelease);
+    if (!observation.exists || !observation.matches_release) observation = await this.mainAgentStatus(canonicalRelease);
+    if (observation.exists && observation.name === this.policy.main_agent.name && observation.kind === "codex" &&
+      observation.pane_id === paneId && observation.session_id !== null && observation.interactive_ready &&
+      observation.matches_release && ["idle", "done"].includes(observation.status ?? "")) {
+      return { outcome: "started", observation, error_code: null };
+    }
+    const errorCode = herdrErrorCode(result) ?? observation.error_code ?? "main_agent_start_failed";
+    const definitelyRejected = !result.timed_out && !result.output_truncated && !observation.exists &&
+      ["agent_pane_busy", "agent_not_found", "invalid_request"].includes(errorCode);
+    return { outcome: definitelyRejected ? "rejected" : "accepted_unknown", observation, error_code: errorCode };
+  }
+
+  async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
+    if (!(await this.herdrVersionSupported())) return missingMainAgent("unsupported_herdr_version");
+    return this.readMainAgent(releasePath);
+  }
+
   async dispatcherHealth(): Promise<HealthSnapshot> {
     return this.health(this.policy.dispatcher_socket, "dispatcher");
   }
@@ -325,6 +554,33 @@ export class RealRuntime implements RuntimePort {
       outputLimitBytes: this.policy.output_limit_bytes,
       env: minimalEnvironment(),
     });
+  }
+
+  private herdr(args: readonly string[], timeoutMs: number): Promise<CommandResult> {
+    return this.runner.run(this.policy.executables.herdr, args, {
+      timeoutMs,
+      outputLimitBytes: this.policy.output_limit_bytes,
+      env: minimalEnvironment({ HOME: os.homedir() }),
+    });
+  }
+
+  private async herdrVersionSupported(): Promise<boolean> {
+    const version = await this.herdr(["--version"], this.policy.timeouts.health_ms);
+    const actualVersion = /^herdr\s+(\d+\.\d+\.\d+)\s*$/m.exec(version.stdout)?.[1];
+    return !version.timed_out && version.exit_code === 0 && actualVersion !== undefined &&
+      versionAtLeast(actualVersion, this.policy.main_agent.minimum_herdr_version);
+  }
+
+  private async readMainAgent(expectedReleasePath?: string): Promise<MainAgentObservation> {
+    return this.readAgent(this.policy.main_agent.name, expectedReleasePath);
+  }
+
+  private async readAgent(target: string, expectedReleasePath?: string): Promise<MainAgentObservation> {
+    const result = await this.herdr([
+      "--session", this.policy.main_agent.session,
+      "agent", "get", target,
+    ], this.policy.timeouts.health_ms);
+    return mainAgentObservation(result, expectedReleasePath);
   }
 
   private domainTarget(label: string): string {

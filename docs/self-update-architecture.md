@@ -31,13 +31,17 @@ activationは次のcrash-observable sequenceです。
 4. stable control rootへactivation receiptをatomic write + file/directory fsync
 5. DBへactivation generationをfenced commit
 
-crash後はDB stateだけで推測せず、current/previous、release manifest、receipt、Dispatcher/SlackのSHA healthを再観測します。current=targetかつ両serviceがtarget readyならsuccess、current=planned currentかつ両serviceがprevious readyならrolled backです。それ以外は`needs_review`です。
+crash後はDB stateだけで推測せず、current/previous、release manifest、receipt、Dispatcher/SlackのSHA health、`dona-main`のrelease cwdを再観測します。current=targetかつ両serviceとagentがtarget readyならsuccess、current=planned currentかつ両serviceとagentがprevious readyならrolled backです。それ以外は`needs_review`です。
 
 rollbackは`current`をknown-good previousへ先に切り替え、その後`previous`をtargetへ移します。二つのrename間でcrashしてもtargetはimmutable SHA directoryから回収でき、known-good pointerを失いません。`needs_review`のcompletionでは稼働SHAを推測せず`active_sha: null`にします。
 
 ## Runtimeの停止・起動順序
 
-applyを受けたapproval event IDと、そのeventの永続化済みreply targetをrequestへ保存します。この受付eventのResultが`completed`になるまでactivation leaseをclaimしません。local UDSはrequest/response双方のschema・protocol versionとservice種別を検証します。normal activationはSlack Adapterを最初にquiesceし、新規Socket ingressを止め、in-flight Dispatcher commit/Slack ACKをbounded drainします。次にDispatcherの新規event/job/update control受付を止め、prompt/steer/cancel acceptance-unknownがないことを確認します。clean SIGTERM後にpointerを切り替え、Dispatcherを先にstartしてtarget SHA/protocol/schema readyを確認し、その後Slack Adapterをstartして全workspace readyを確認します。
+applyを受けたapproval event IDと、そのeventの永続化済みreply targetをrequestへ保存します。この受付eventのResultが`completed`になるまでactivation leaseをclaimしません。local UDSはrequest/response双方のschema・protocol versionとservice種別を検証します。normal activationはSlack Adapterを最初にquiesceし、新規Socket ingressを止め、in-flight Dispatcher commit/Slack ACKをbounded drainします。次にDispatcherをstop-after-currentへ移し、新しいqueue item、job、update controlを受け付けず、すでに`dona-main`へ受理された1件のResult公開だけを完走させます。prompt/steer/cancel acceptance-unknownがなく、Herdr上の`dona-main`が`idle`または`done`であることを確認してから、そのexact agent identityへ`Ctrl+C`を送り、agent消失を観測します。
+
+clean stop後にpointerを切り替え、同じpaneへtargetのimmutable releaseを`-C`で指定したCodexを`dona-main`という名前で起動します。project-scoped `.codex/config.toml`はtrusted projectでだけ読み込まれるため、updaterが生成したexact target release pathだけをinline `projects`設定でtrustします。stdio MCPにはprotected policy由来の`config/*.env`、current manifest、updater socket、固定executableのpathだけをinline environmentとして渡し、credential値はargvやreleaseへ載せません。config rootと2つのenv fileが実directory・regular file・owner-onlyでない場合は起動前に拒否します。agent名、kind、pane、Codex session、foreground cwd、interactive readinessを照合してからDispatcherをstartし、target SHA/protocol/schema readyを確認した後にSlack Adapterをstartして全workspace readyを確認します。Codex CLIの終了とproject configの仕様は[OpenAI公式のCLI reference](https://developers.openai.com/codex/cli/reference/)と[config basics](https://developers.openai.com/codex/config-basic/)に従います。
+
+targetの起動後にrollbackする場合も、起動済みのSlack/Dispatcherを先にquiesceして新規投入を止め、`dona-main`をidleまでdrainしてexact identityを停止します。pointerをpreviousへ戻した後、previous releaseから同じpaneへCodexを再生成します。`blocked`、`unknown`、identity変化、終了・起動acceptance不明ではblind retryせず`needs_review`にします。
 
 LaunchAgentはroutine releaseで書き換えません。Dispatcher/Slackは`KeepAlive.SuccessfulExit=false`なのでclean quiesce終了は勝手にrestartせず、crashだけがthrottle付きrestart対象です。stable updaterだけは`KeepAlive=true`です。updater service自身は自分のbootout/bootstrapを行いません。
 

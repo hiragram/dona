@@ -49,14 +49,14 @@ Herdrの`dona`セッション内には、事前に`dona-main`という名前のC
 ./scripts/install-self-update.sh --bootstrap
 ```
 
-`--install`はprocessを停止・開始せず、`--bootstrap`だけがlaunchctlを操作します。routine updateではplistを書き換えず、stable updaterが`runtime/current` pointerを切り替えます。旧`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy互換用です。
+`--install`はprocessを停止・開始せず、`--bootstrap`だけがlaunchctlを操作します。routine updateではplistを書き換えず、stable updaterが`dona-main`をdrainして同じHerdr paneへtarget releaseのCodexを再生成し、`runtime/current` pointerとDispatcher/Slack Adapterを切り替えます。旧`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy互換用です。
 
 設計と復旧:
 
 - [Self-update architecture](./docs/self-update-architecture.md)
 - [Self-update運用runbook](./docs/self-update-runbook.md)
 
-updater自身の自動更新、app DB schema migration、GitHub repository settings変更は初期版の対象外です。
+updater自身の自動更新、app DB schema migration、GitHub repository settings変更は対象外です。既存installへ`dona-main` lifecycle対応を導入する最初の1回だけはstable updater/policyのmaintenance更新が必要です。
 
 ## 全体検証
 
