@@ -43,6 +43,27 @@ describe("ReleaseStore", () => {
     assert.equal(observed.previous_sha, targetSha);
   });
 
+  test("allows hardlinks only when every link is contained in the staging tree", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    const staging = await store.prepareStaging(row().request_id, 1);
+    const binary = path.join(staging, "binary");
+    const alias = path.join(staging, "binary-alias");
+    await fs.writeFile(binary, "built artifact\n", { mode: 0o700 });
+    await fs.link(binary, alias);
+
+    const release = await store.publish(staging, manifest(targetSha));
+    const [binaryStats, aliasStats] = await Promise.all([
+      fs.stat(path.join(release, "binary")),
+      fs.stat(path.join(release, "binary-alias")),
+    ]);
+    assert.equal(binaryStats.ino, aliasStats.ino);
+    assert.equal(binaryStats.nlink, 2);
+    assert.equal(binaryStats.mode & 0o777, 0o400);
+  });
+
   test("rejects generated path traversal, symlink escape, and unsafe permissions", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
@@ -56,5 +77,14 @@ describe("ReleaseStore", () => {
     await fs.writeFile(path.join(permissionStage, "unsafe"), "x", { mode: 0o666 });
     await fs.chmod(path.join(permissionStage, "unsafe"), 0o666);
     await assert.rejects(store.publish(permissionStage, manifest(targetSha)), /permissions/);
+
+    const externalHardlinkStage = await store.prepareStaging(row().request_id, 4);
+    const stagedFile = path.join(externalHardlinkStage, "linked-outside");
+    await fs.writeFile(stagedFile, "x", { mode: 0o600 });
+    await fs.link(stagedFile, path.join(root, "outside-staging"));
+    await assert.rejects(
+      store.publish(externalHardlinkStage, manifest(targetSha)),
+      /staging_owner_permissions_or_hardlink_invalid/,
+    );
   });
 });

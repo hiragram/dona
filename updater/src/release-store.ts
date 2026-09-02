@@ -255,6 +255,27 @@ export class ReleaseStore {
   }
 
   private async scanTree(root: string, current: string): Promise<void> {
+    const hardlinks = new Map<string, { expectedLinks: number; paths: string[] }>();
+    await this.scanTreeEntry(root, current, hardlinks);
+    for (const [inode, observation] of hardlinks) {
+      if (observation.paths.length !== observation.expectedLinks) {
+        throw new Error("staging_owner_permissions_or_hardlink_invalid");
+      }
+      for (const candidate of observation.paths) {
+        const stats = await fs.lstat(candidate);
+        if (!stats.isFile() || `${stats.dev}:${stats.ino}` !== inode || stats.nlink !== observation.paths.length ||
+          stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
+          throw new Error("staging_owner_permissions_or_hardlink_invalid");
+        }
+      }
+    }
+  }
+
+  private async scanTreeEntry(
+    root: string,
+    current: string,
+    hardlinks: Map<string, { expectedLinks: number; paths: string[] }>,
+  ): Promise<void> {
     const stats = await fs.lstat(current);
     if (stats.isSymbolicLink()) {
       const resolved = await fs.realpath(current);
@@ -262,11 +283,23 @@ export class ReleaseStore {
       if (!inside(realRoot, resolved)) throw new Error("staging_symlink_escape");
       return;
     }
-    if (stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0 || stats.nlink > (stats.isDirectory() ? 2 + (await fs.readdir(current)).length : 1)) {
+    if (stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
       throw new Error("staging_owner_permissions_or_hardlink_invalid");
     }
-    if (!stats.isDirectory()) return;
-    for (const child of await fs.readdir(current)) await this.scanTree(root, path.join(current, child));
+    if (stats.isDirectory()) {
+      const children = await fs.readdir(current);
+      if (stats.nlink > 2 + children.length) throw new Error("staging_owner_permissions_or_hardlink_invalid");
+      for (const child of children) await this.scanTreeEntry(root, path.join(current, child), hardlinks);
+      return;
+    }
+    if (!stats.isFile() || stats.nlink < 1) throw new Error("staging_owner_permissions_or_hardlink_invalid");
+    if (stats.nlink > 1) {
+      const inode = `${stats.dev}:${stats.ino}`;
+      const observation = hardlinks.get(inode) ?? { expectedLinks: stats.nlink, paths: [] };
+      if (observation.expectedLinks !== stats.nlink) throw new Error("staging_owner_permissions_or_hardlink_invalid");
+      observation.paths.push(current);
+      hardlinks.set(inode, observation);
+    }
   }
 
   private async makeImmutable(current: string): Promise<void> {
