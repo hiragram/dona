@@ -15,7 +15,7 @@ DOMAIN="gui/$UID"
 
 if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" ]]; then
   print -u2 "Usage: $0 --check | --install | --bootstrap"
-  print -u2 "--checkはtemplateのみ検証し、--installはrelease/config/plistを配置し、--bootstrapだけがlaunchctlを操作します。"
+  print -u2 -- "--checkはtemplateのみ検証し、--installはrelease/config/plistを配置し、--bootstrapだけがlaunchctlを操作します。"
   exit 2
 fi
 
@@ -52,6 +52,9 @@ if [[ "$MODE" == "--bootstrap" ]]; then
       exit 1
     fi
   done
+  if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$BASE_DIR/run/dispatcher.sock"
+  fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
   fi
@@ -68,15 +71,16 @@ if [[ "$MODE" == "--bootstrap" ]]; then
 fi
 
 if [[ "$(uname -s)" != "Darwin" || "$UID" == "0" ]]; then
-  print -u2 "--installは非rootのmacOS GUI userだけで実行できます。"
+  print -u2 -- "--installは非rootのmacOS GUI userだけで実行できます。"
   exit 1
 fi
-if [[ "$($GIT_PATH -C "$REPOSITORY_DIR" remote get-url origin)" != "https://github.com/hiragram/dona.git" ]]; then
+if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-remote \
+  "$($GIT_PATH -C "$REPOSITORY_DIR" remote get-url origin)"; then
   print -u2 "originがcanonical repositoryではありません。"
   exit 1
 fi
 if [[ "$($GIT_PATH -C "$REPOSITORY_DIR" symbolic-ref --short HEAD)" != "main" ]]; then
-  print -u2 "--installはcanonical main branchのclean checkoutだけを受け付けます。"
+  print -u2 -- "--installはcanonical main branchのclean checkoutだけを受け付けます。"
   exit 1
 fi
 if [[ -n "$($GIT_PATH -C "$REPOSITORY_DIR" status --porcelain=v1 --untracked-files=all)" ]]; then
