@@ -169,6 +169,37 @@ function versionAtLeast(actual: string, minimum: string): boolean {
   return true;
 }
 
+async function isolatedNpmEnvironment(
+  policy: UpdatePolicy,
+  extra: Readonly<Record<string, string>> = {},
+): Promise<Record<string, string>> {
+  const directory = path.join(policy.control_root, "npm-config");
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const uid = process.getuid?.();
+  const directoryStats = await fs.lstat(directory);
+  if (uid === undefined || !directoryStats.isDirectory() || directoryStats.isSymbolicLink() ||
+    directoryStats.uid !== uid || (directoryStats.mode & 0o077) !== 0) {
+    throw new Error("npm_config_directory_is_not_private");
+  }
+  const configPaths = {
+    npm_config_userconfig: path.join(directory, "userconfig"),
+    npm_config_globalconfig: path.join(directory, "globalconfig"),
+  };
+  for (const configPath of Object.values(configPaths)) {
+    try {
+      await fs.writeFile(configPath, "", { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const stats = await fs.lstat(configPath);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== uid || stats.size !== 0 ||
+      (stats.mode & 0o077) !== 0) {
+      throw new Error("npm_config_file_is_not_private_and_empty");
+    }
+  }
+  return minimalEnvironment({ ...extra, ...configPaths });
+}
+
 export class CanonicalBuild implements BuildPort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
@@ -176,7 +207,7 @@ export class CanonicalBuild implements BuildPort {
     const npmVersion = requireSuccess("npm --version", await this.runner.run(this.policy.executables.npm, ["--version"], {
       timeoutMs: this.policy.timeouts.command_ms,
       outputLimitBytes: this.policy.output_limit_bytes,
-      env: minimalEnvironment({ npm_config_userconfig: "/dev/null", npm_config_globalconfig: "/dev/null" }),
+      env: await isolatedNpmEnvironment(this.policy),
     }));
     return { node_version: process.versions.node, npm_version: npmVersion };
   }
@@ -189,12 +220,10 @@ export class CanonicalBuild implements BuildPort {
   }> {
     const components = ["dispatcher", "sources/slack", "updater"] as const;
     const lockHashes: Record<string, string> = {};
-    const npmEnvironment = minimalEnvironment({
+    const npmEnvironment = await isolatedNpmEnvironment(this.policy, {
       npm_config_audit: "false",
       npm_config_fund: "false",
       npm_config_update_notifier: "false",
-      npm_config_userconfig: "/dev/null",
-      npm_config_globalconfig: "/dev/null",
       npm_config_cache: path.join(this.policy.control_root, "npm-cache"),
     });
     await fs.mkdir(npmEnvironment.npm_config_cache!, { recursive: true, mode: 0o700 });
