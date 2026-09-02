@@ -8,6 +8,9 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
+import { CanonicalBuild } from "../src/adapters.js";
+import { tempPolicy } from "./helpers.js";
+
 const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
@@ -98,6 +101,32 @@ test("isolated npm uses separate empty config files with npm 11", async () => {
     assert.doesNotMatch(installerSource, /npm_config_(?:user|global)config=\/dev\/null/);
     assert.match(installerSource, /npm_config_userconfig="\$INSTALL_TMP\/npm-userconfig"/);
     assert.match(installerSource, /npm_config_globalconfig="\$INSTALL_TMP\/npm-globalconfig"/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stable updater uses separate controller-owned npm config files", async () => {
+  const npmCli = process.env.npm_execpath;
+  assert.ok(npmCli);
+  const { root, policy } = await tempPolicy();
+  policy.executables.npm = npmCli;
+  try {
+    const result = await new CanonicalBuild(policy).toolchain();
+    assert.match(result.npm_version, /^\d+\.\d+\.\d+/);
+    const configDirectory = path.join(policy.control_root, "npm-config");
+    const userConfig = path.join(configDirectory, "userconfig");
+    const globalConfig = path.join(configDirectory, "globalconfig");
+    assert.notEqual(userConfig, globalConfig);
+    for (const configPath of [userConfig, globalConfig]) {
+      const stats = await fs.lstat(configPath);
+      assert.equal(stats.isFile(), true);
+      assert.equal(stats.size, 0);
+      assert.equal(stats.mode & 0o077, 0);
+    }
+    await fs.unlink(userConfig);
+    await fs.symlink("/dev/null", userConfig);
+    await assert.rejects(new CanonicalBuild(policy).toolchain(), /npm_config_file_is_not_private_and_empty/);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
