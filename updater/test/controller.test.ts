@@ -69,6 +69,7 @@ class FakeRuntime implements RuntimePort {
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
   mainObserveStatus: MainAgentObservation["status"] = "idle";
+  mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   private mainAgentExists = true;
   mainAgentSha = currentSha;
@@ -97,6 +98,13 @@ class FakeRuntime implements RuntimePort {
   async stopMainAgent(expected: MainAgentObservation) {
     this.calls.push("stopMainAgent");
     assert.equal(expected.pane_id, "w1:p1");
+    if (this.mainStopOutcome !== "stopped") {
+      return {
+        outcome: this.mainStopOutcome,
+        pane_id: "w1:p1",
+        error_code: this.mainStopOutcome === "rejected" ? "main_agent_identity_changed" : "main_agent_stop_timeout",
+      };
+    }
     this.mainAgentExists = false;
     return { outcome: "stopped" as const, pane_id: "w1:p1", error_code: null };
   }
@@ -287,7 +295,84 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
     assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "main_agent_blocked");
     assert.equal((await f.store.observe()).current_sha, currentSha);
-    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle"]);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("restores current services when dona-main stop is definitively rejected before mutation", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-main-stop-rejected",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainStopOutcome = "rejected";
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "main_agent_identity_changed");
+    assert.match(row.last_error_message ?? "", /restarted and verified/);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("does not restart services when dona-main stop acceptance is unknown", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-main-stop-timeout",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainStopOutcome = "accepted_unknown";
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "main_agent_stop_timeout");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent",
+    ]);
+    f.database.close();
+  });
+
+  test("does not retry or continue when quiesce recovery restart acceptance is unknown", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-quiesce-recovery-timeout",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainStopOutcome = "rejected";
+    f.runtime.dispatcherStartUnknownOnce = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_dispatcher_restart_unknown");
+    assert.match(row.last_error_message ?? "", /no blind retry/);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher",
+    ]);
     f.database.close();
   });
 

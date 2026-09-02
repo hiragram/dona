@@ -334,10 +334,18 @@ export class UpdateController {
       this.assertLease(row);
       if (!mainAgent.exists || !["idle", "done"].includes(mainAgent.status ?? "") ||
         mainAgent.name !== this.policy.main_agent.name || mainAgent.kind !== "codex") {
-        return void this.needsReview(row, mainAgent.status === "blocked" ? "main_agent_blocked" : "main_agent_not_idle");
+        await this.restoreQuiescedServices(
+          row,
+          mainAgent.status === "blocked" ? "main_agent_blocked" : "main_agent_not_idle",
+        );
+        return;
       }
       const mainAgentStop = await this.runtime.stopMainAgent(mainAgent);
       this.assertLease(row);
+      if (mainAgentStop.outcome === "rejected") {
+        await this.restoreQuiescedServices(row, mainAgentStop.error_code ?? "main_agent_stop_rejected");
+        return;
+      }
       if (mainAgentStop.outcome !== "stopped" || !mainAgentStop.pane_id) {
         return void this.needsReview(row, mainAgentStop.error_code ?? "main_agent_stop_acceptance_unknown");
       }
@@ -528,10 +536,67 @@ export class UpdateController {
       (!requireWorkspaces || health.workspaces_ready === true);
   }
 
-  private needsReview(row: UpdateRow, code: string): void {
+  private async restoreQuiescedServices(row: UpdateRow, causeCode: string): Promise<void> {
+    const dispatcherStart = await this.runtime.startDispatcher();
+    this.assertLease(row);
+    if (!resultSucceeded(dispatcherStart)) {
+      this.needsReview(
+        row,
+        "quiesce_recovery_dispatcher_restart_unknown",
+        `Update stopped before main-agent mutation (${causeCode}), but Dispatcher restart acceptance is unknown; no blind retry was attempted`,
+      );
+      return;
+    }
+    const dispatcherHealth = await this.waitForHealth("dispatcher", row.current_sha);
+    this.assertLease(row);
+    if (!this.healthMatches(dispatcherHealth, row.current_sha, false)) {
+      this.needsReview(
+        row,
+        "quiesce_recovery_dispatcher_health_failed",
+        `Update stopped before main-agent mutation (${causeCode}), but current Dispatcher health was not verified`,
+      );
+      return;
+    }
+    const slackStart = await this.runtime.startSlack();
+    this.assertLease(row);
+    if (!resultSucceeded(slackStart)) {
+      this.needsReview(
+        row,
+        "quiesce_recovery_slack_restart_unknown",
+        `Update stopped before main-agent mutation (${causeCode}), but Slack restart acceptance is unknown; no blind retry was attempted`,
+      );
+      return;
+    }
+    const slackHealth = await this.waitForHealth("slack_adapter", row.current_sha);
+    this.assertLease(row);
+    if (!this.healthMatches(slackHealth, row.current_sha, true)) {
+      this.needsReview(
+        row,
+        "quiesce_recovery_slack_health_failed",
+        `Update stopped before main-agent mutation (${causeCode}), but current Slack health was not verified`,
+      );
+      return;
+    }
+    this.logger.info("Quiesced current services were restarted after a pre-mutation update stop", {
+      request_id: row.request_id,
+      current_sha: row.current_sha,
+      cause_code: causeCode,
+    });
+    this.needsReview(
+      row,
+      causeCode,
+      "Update stopped before main-agent mutation; current Dispatcher and Slack services were restarted and verified",
+    );
+  }
+
+  private needsReview(
+    row: UpdateRow,
+    code: string,
+    message = "External command or runtime acceptance could not be proven; no blind retry was attempted",
+  ): void {
     this.database.terminal(row.request_id, row.fence, "needs_review", code, {
       last_error_code: code,
-      last_error_message: "External command or runtime acceptance could not be proven; no blind retry was attempted",
+      last_error_message: message,
     }, this.clock.now());
   }
 

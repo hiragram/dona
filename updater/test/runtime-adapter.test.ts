@@ -19,7 +19,7 @@ class RecordingRunner {
   }
 }
 
-function agentResponse(cwd: string, sessionId: string | null): string {
+function agentResponse(cwd: string, sessionId: string | null, interactiveReady = true): string {
   return JSON.stringify({
     result: {
       type: "agent_info",
@@ -35,7 +35,7 @@ function agentResponse(cwd: string, sessionId: string | null): string {
         name: "dona-main",
         cwd,
         foreground_cwd: cwd,
-        interactive_ready: true,
+        interactive_ready: interactiveReady,
         launch_pending: false,
         ...(sessionId ? { agent_session: { source: "codex", agent: "codex", kind: "id", value: sessionId } } : {}),
       },
@@ -48,6 +48,7 @@ class AgentRunner extends RecordingRunner {
   cwd: string;
   sessionId: string | null = "session-old";
   omitSessionOnStart = false;
+  interactiveReady = true;
 
   constructor(cwd: string) {
     super();
@@ -57,14 +58,14 @@ class AgentRunner extends RecordingRunner {
   override async run(executable: string, args: readonly string[], options: RunOptions): Promise<CommandResult> {
     this.calls.push({ executable, args, options });
     if (args[0] === "--version") return { ...ok, stdout: "herdr 0.8.2\n" };
-    if (args.includes("wait")) return { ...ok, stdout: agentResponse(this.cwd, this.sessionId) };
+    if (args.includes("wait")) return { ...ok, stdout: agentResponse(this.cwd, this.sessionId, this.interactiveReady) };
     if (args.includes("send-keys")) {
       this.running = false;
       return { ...ok, stdout: JSON.stringify({ result: { type: "ok" } }) };
     }
     if (args.includes("get")) {
       return this.running
-        ? { ...ok, stdout: agentResponse(this.cwd, this.sessionId) }
+        ? { ...ok, stdout: agentResponse(this.cwd, this.sessionId, this.interactiveReady) }
         : { ...ok, exit_code: 1, stderr: JSON.stringify({ error: { code: "agent_not_found", message: "missing" } }) };
     }
     if (args.includes("start")) {
@@ -72,7 +73,7 @@ class AgentRunner extends RecordingRunner {
       this.cwd = String(args[separator + 2]);
       this.sessionId = this.omitSessionOnStart ? null : "session-new";
       this.running = true;
-      return { ...ok, stdout: agentResponse(this.cwd, this.sessionId) };
+      return { ...ok, stdout: agentResponse(this.cwd, this.sessionId, this.interactiveReady) };
     }
     return ok;
   }
@@ -152,8 +153,8 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     assert.deepEqual(recording.calls.map(({ executable, args }) => [executable, ...args]), [
       [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.slack_label}`],
       [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.dispatcher_label}`],
-      [policy.executables.launchctl, "kickstart", `gui/${uid}/${policy.launchd.dispatcher_label}`],
-      [policy.executables.launchctl, "kickstart", `gui/${uid}/${policy.launchd.slack_label}`],
+      [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.slack_label}`],
     ]);
     assert.equal(Object.values(recording.calls[0]!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {
@@ -178,13 +179,16 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
   const runner = new AgentRunner(currentRelease);
   const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner);
   try {
+    runner.interactiveReady = false;
     const idle = await runtime.waitForMainAgentIdle();
     assert.equal(idle.status, "idle");
     assert.equal(idle.session_id, "session-old");
+    assert.equal(idle.interactive_ready, false);
     runner.sessionId = "session-replaced";
     assert.equal((await runtime.stopMainAgent(idle)).outcome, "rejected");
     runner.sessionId = "session-old";
     assert.deepEqual(await runtime.stopMainAgent(idle), { outcome: "stopped", pane_id: "w1:p1", error_code: null });
+    runner.interactiveReady = true;
     const started = await runtime.startMainAgent("w1:p1", targetRelease);
     assert.equal(started.outcome, "started");
     assert.equal(started.observation.matches_release, true);

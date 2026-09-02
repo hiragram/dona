@@ -443,11 +443,11 @@ export class RealRuntime implements RuntimePort {
   }
 
   startDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
   }
 
   startSlack(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", this.domainTarget(this.policy.launchd.slack_label)]);
+    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
   }
 
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
@@ -467,7 +467,7 @@ export class RealRuntime implements RuntimePort {
       return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_not_idle" };
     }
     const current = await this.readMainAgent();
-    if (!sameMainAgent(expected, current) || !["idle", "done"].includes(current.status ?? "") || !current.interactive_ready) {
+    if (!sameMainAgent(expected, current) || !["idle", "done"].includes(current.status ?? "")) {
       return { outcome: "rejected", pane_id: expected.pane_id, error_code: "main_agent_identity_changed" };
     }
     const stopped = await this.herdr([
