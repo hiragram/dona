@@ -156,8 +156,9 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
 
   assertContract(polling, "stalled no-duplicate", [
     /eyes.*duplicate `@codex review`.*投稿しない/,
-    /CI check\/status contextの`status`.*`conclusion`/,
+    /CI check runの`status`\/`conclusion`.*commit status contextの`state`/,
     /`queued`から`in_progress`.*state change/,
+    /`pending`から`success`.*state change/,
     /30分.*stalled.*停止/,
     /自動retriggerしない/,
     /空reaction.*完了ではない/,

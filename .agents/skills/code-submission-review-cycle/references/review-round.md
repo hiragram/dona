@@ -34,7 +34,7 @@ round recordには少なくとも次を保持する。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
-exact trigger集合、reaction、review/comment集合、head/base SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
+exact trigger集合、reaction、review/comment集合、head/base SHA、CI check runの`status`/`conclusion`、commit status contextの`state`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`、`pending`から`success`などterminal前後の遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
 
 ## round結果を判定する
 
