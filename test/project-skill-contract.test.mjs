@@ -131,6 +131,8 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /未返信を残したままfresh triggerを投稿しない/,
   ]);
   assertContract(polling, "poll source", [
+    /issue comments.*exact `@codex review`.*trigger一覧.*pagination/,
+    /recordのtriggerより新しいexact trigger.*round競合.*停止/,
     /exact trigger commentのreaction一覧endpoint.*pagination/,
     /reactionごとの`user`/,
     /Codex integration.*actor.*`\+1`だけ.*clean/,
@@ -138,6 +140,8 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /issue comment/,
     /inline review comment/,
     /current head SHA.*status check.*check run/,
+    /Pull Request association.*head\/base SHA.*tested merge commit.*GitHub API evidence/,
+    /base driftより前のrun.*current CIに数えず/,
   ]);
   assertContract(boundary, "round identity", [
     /exact head SHA.*selected base ref\/SHA.*結び付け/,
@@ -193,8 +197,10 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
     /未解決finding.*過去round.*inline comment.*direct reply済み/,
     /local `HEAD`.*upstream.*Pull Request head SHA.*一致/,
     /mergeable.*base conflict.*open.*non-draft/,
-    /current head SHA.*期待するCI suite\/check context.*少なくとも1回観測.*required\/current CI.*terminal success/,
+    /期待するCI suite\/check context.*少なくとも1回観測.*required\/current CI.*terminal success/,
     /checkが空.*成功としない/,
+    /current head\/base pair.*GitHub API evidence/,
+    /base driftより前のrun.*成功としない/,
   ]);
   assertContract(boundary, "authorization boundary", [
     /Pull Request自体のmerge.*force push.*rebase.*無関係なcleanup.*許可しない/,
@@ -205,8 +211,13 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   assertContract(target, "conflict workflow", [
     /指定したbaseを優先.*指定がない場合だけdefault branch/,
     /current branch.*selected base自身でない.*task commit.*直接pushしない/,
-    /working treeがclean.*既存commit.*対象変更.*再利用.*空commitを作らない/,
+    /working treeがclean.*新しいcommit.*空commitを作らない/,
+    /既存task commit.*再利用/,
+    /未commit diffの有無にかかわらず.*selected base.*全commit.*全diff.*branch全体.*task.*review対応/,
+    /無関係なcommit.*pushせず停止/,
     /upstream未設定.*同名remote refが存在しない.*non-force.*初回push.*upstreamを設定/,
+    /upstream設定済み.*remote\/ref.*task branch自身.*selected baseではない/,
+    /explicit refspec.*forceなし.*bare `git push`/,
     /local task commit.*upstreamより先行.*fast-forward.*forceなし.*localとupstreamが既に一致.*不要なpushをしない/,
     /同じhead\/selected base.*open Pull Request.*重複/,
     /matching Pull Requestが存在しない.*selected base向けnon-draft/,

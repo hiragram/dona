@@ -25,15 +25,16 @@ round recordには少なくとも次を保持する。
 
 各pollで同じsnapshot時刻帯の次のsourceをすべてpaginationして確認する。
 
-1. exact trigger commentのreaction一覧endpointをpaginationし、reactionごとの`user`を取得する。Codex integrationとlogin/type/app associationなどから確認できたactorの`eyes`だけを進行中、同actorの`+1`だけをclean completion signalとする。人間や別Appのreactionはsignalに使わず、空reactionは開始前または遷移中の可能性があるため完了ではない。
-2. triggerのGitHub server時刻より後に作成・提出されたCodex-authored Pull Request review。
-3. trigger後のCodex-authored issue comment。対象`target_sha`を明記し、no-major-issues/no-findingsを明示するcompletion commentはclean signalとして使える。
-4. trigger後のCodex-authored inline review comment。`commit_id`または`original_commit_id`が`target_sha`と一致するfindingだけをcurrent roundへ帰属させる。
-5. Pull Requestのcurrent head SHA、base ref/SHA、state/draft、mergeability、merge state、およびcurrent headに紐づくrequired/current status checkとcheck run。repository workflowとbranch ruleから期待するsuite/contextが一度も現れていない空状態はsuccessにしない。
+1. Pull Requestのissue commentsからbodyがexact `@codex review`のtrigger一覧をpaginationする。round recordのtriggerより新しいexact triggerを検出した場合は、別actorや別workerとのround競合を時刻だけで調停せず停止する。競合trigger ID/URLと各reaction・artifactの観測結果を報告し、どちらも自動retriggerしない。
+2. round recordに保存したexact trigger commentのreaction一覧endpointをpaginationし、reactionごとの`user`を取得する。Codex integrationとlogin/type/app associationなどから確認できたactorの`eyes`だけを進行中、同actorの`+1`だけをclean completion signalとする。人間や別Appのreactionはsignalに使わず、空reactionは開始前または遷移中の可能性があるため完了ではない。
+3. triggerのGitHub server時刻より後に作成・提出されたCodex-authored Pull Request review。
+4. trigger後のCodex-authored issue comment。対象`target_sha`を明記し、no-major-issues/no-findingsを明示するcompletion commentはclean signalとして使える。
+5. trigger後のCodex-authored inline review comment。`commit_id`または`original_commit_id`が`target_sha`と一致するfindingだけをcurrent roundへ帰属させる。
+6. Pull Requestのcurrent head SHA、base ref/SHA、state/draft、mergeability、merge state、およびrequired/current status check、check run、workflow runを取得する。repository workflowとbranch ruleから期待するsuite/contextが一度も現れていない空状態はsuccessにしない。各accepted runについて、Pull Request associationのhead/base SHA、tested merge commitのparents、または同等のGitHub API evidenceがround recordの`target_sha`と`base_sha`の組を検証したことを確認する。base driftより前のrunや対象pairを証明できないrunはcurrent CIに数えず、安全な再実行手段が依頼権限内になければ停止する。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
-reaction、review/comment集合、head/base SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
+exact trigger集合、reaction、review/comment集合、head/base SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
 
 ## round結果を判定する
 
