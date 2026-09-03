@@ -237,6 +237,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /usr/bin/ditto "$FINAL_RELEASE/updater" "$BACKUP_ROOT/updater.next"
   find "$BACKUP_ROOT/updater.next" -type f -exec chmod 400 {} +
   find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +
+  chmod 700 "$BACKUP_ROOT/updater.next"
   /bin/cp "$INSTALL_TMP/rendered/policy.json" "$BACKUP_ROOT/policy.next.json"
   /bin/cp "$INSTALL_TMP/rendered/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist"
   chmod 600 "$BACKUP_ROOT/policy.next.json" "$BACKUP_ROOT/dev.dona.updater.next.plist"
@@ -302,6 +303,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
 fi
 
 /usr/bin/ditto "$FINAL_RELEASE/updater" "$CONTROL_ROOT/updater.next"
+chmod 700 "$CONTROL_ROOT/updater.next"
 /bin/mv "$CONTROL_ROOT/updater.next" "$CONTROL_ROOT/updater"
 
 /bin/ln -s "releases/$INSTALL_SHA" "$RUNTIME_ROOT/.current.tmp"

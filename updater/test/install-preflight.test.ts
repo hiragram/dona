@@ -109,6 +109,35 @@ test("control-plane upgrade preflight requires exact updater health and only ter
   }
 });
 
+test("macOS keeps a hardened staged updater renamable by reopening only its root", {
+  skip: process.platform !== "darwin",
+}, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-rename-"));
+  const staged = path.join(root, "updater.next");
+  const destination = path.join(root, "updater");
+  const child = path.join(staged, "dist");
+  const entrypoint = path.join(child, "cli.js");
+  try {
+    await fs.mkdir(child, { recursive: true });
+    await fs.writeFile(entrypoint, "export {};\n");
+    await fs.chmod(entrypoint, 0o400);
+    await fs.chmod(child, 0o500);
+    await fs.chmod(staged, 0o500);
+    await assert.rejects(execute("/bin/mv", [staged, destination]), /Permission denied/);
+
+    await fs.chmod(staged, 0o700);
+    await execute("/bin/mv", [staged, destination]);
+    assert.equal((await fs.stat(destination)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(path.join(destination, "dist"))).mode & 0o777, 0o500);
+    assert.equal((await fs.stat(path.join(destination, "dist", "cli.js"))).mode & 0o777, 0o400);
+  } finally {
+    const cleanupRoot = await fs.stat(destination).then(() => destination, () => staged);
+    await fs.chmod(cleanupRoot, 0o700).catch(() => undefined);
+    await fs.chmod(path.join(cleanupRoot, "dist"), 0o700).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("installer exposes the guarded control-plane upgrade mode", async () => {
   const source = await fs.readFile(installer, "utf8");
   assert.match(source, /--upgrade-control/);
@@ -123,6 +152,14 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /SELECT COUNT\(\*\) FROM update_requests WHERE state NOT IN/);
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
+  const hardenedUpgradeTree = source.indexOf('find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +');
+  const writableUpgradeRoot = source.indexOf('chmod 700 "$BACKUP_ROOT/updater.next"');
+  const upgradeRename = source.indexOf('/bin/mv "$BACKUP_ROOT/updater.next" "$CONTROL_ROOT/updater"');
+  assert.ok(hardenedUpgradeTree >= 0 && hardenedUpgradeTree < writableUpgradeRoot);
+  assert.ok(writableUpgradeRoot < upgradeRename);
+  const writableInstallRoot = source.indexOf('chmod 700 "$CONTROL_ROOT/updater.next"');
+  const installRename = source.indexOf('/bin/mv "$CONTROL_ROOT/updater.next" "$CONTROL_ROOT/updater"');
+  assert.ok(writableInstallRoot >= 0 && writableInstallRoot < installRename);
   if (process.platform === "darwin") await execute("/bin/zsh", ["-n", installer]);
 });
 
