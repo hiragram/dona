@@ -227,7 +227,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   PRESTOP_NONTERMINAL_COUNT=$(/usr/bin/sqlite3 "$CONTROL_ROOT/updater.sqlite3" \
     "SELECT COUNT(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled');")
   if [[ ! "$PRESTOP_NONTERMINAL_COUNT" =~ '^[0-9]+$' || "$PRESTOP_NONTERMINAL_COUNT" != "0" ]]; then
-    print -u2 "停止前のDB確認でnonterminal self-updateを$PRESTOP_NONTERMINAL_COUNT件検出したため、stable updaterを停止しません。"
+    print -u2 "停止前のDB確認でnonterminal self-updateを${PRESTOP_NONTERMINAL_COUNT}件検出したため、stable updaterを停止しません。"
     exit 1
   fi
   mkdir -p "$CONTROL_ROOT/control-backups"
@@ -258,7 +258,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   NONTERMINAL_COUNT=$(/usr/bin/sqlite3 "$CONTROL_ROOT/updater.sqlite3" \
     "SELECT COUNT(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled');")
   if [[ ! "$NONTERMINAL_COUNT" =~ '^[0-9]+$' || "$NONTERMINAL_COUNT" != "0" ]]; then
-    print -u2 "停止後のDB確認でnonterminal self-updateを$NONTERMINAL_COUNT件検出したため、旧updaterを再開します。"
+    print -u2 "停止後のDB確認でnonterminal self-updateを${NONTERMINAL_COUNT}件検出したため、旧updaterを再開します。"
     exit 1
   fi
 
@@ -286,7 +286,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" >/dev/null 2>&1 || true
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0
-    print "stable updaterとpolicyを$INSTALL_SHAへ更新し、version healthを確認しました。"
+    print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"
     print "次に通常updateをplan/applyして、DispatcherとSlack Adapterを同じreleaseへ切り替えてください。"
     exit 0
   fi
