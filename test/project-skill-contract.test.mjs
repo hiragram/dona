@@ -122,8 +122,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /Pull Request head SHA.*結び付け/,
     /reconcile中にheadが変わった場合.*triggerを受理せず停止/,
     /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
-    /Codex actorの`eyes`.*新規投稿しない/,
-    /current SHA.*exact triggerへ一意.*引き継ぐ.*複数候補.*停止/,
+    /latest trigger.*`eyes`.*terminal review\/completion.*reactionも空.*pending.*新規投稿せず.*poll/,
+    /current SHA.*exact triggerへ一意.*引き継ぐ.*複数候補.*30分.*停止/,
+    /全Codex inline comments.*direct replies.*pagination.*未返信.*元threadへdirect reply/,
+    /未返信を残したままfresh triggerを投稿しない/,
   ]);
   assertContract(polling, "poll source", [
     /exact trigger commentのreaction一覧endpoint.*pagination/,
@@ -144,6 +146,8 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
 
   assertContract(polling, "stalled no-duplicate", [
     /eyes.*duplicate `@codex review`.*投稿しない/,
+    /CI check\/status contextの`status`.*`conclusion`/,
+    /`queued`から`in_progress`.*state change/,
     /30分.*stalled.*停止/,
     /自動retriggerしない/,
     /空reaction.*完了ではない/,
@@ -191,8 +195,10 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   assertContract(target, "conflict workflow", [
     /指定したbaseを優先.*指定がない場合だけdefault branch/,
     /current branch.*selected base自身でない.*task commit.*直接pushしない/,
-    /同じhead\/selected base.*重複.*selected base向けnon-draft/,
-    /既存Pull Requestがdraft.*重複作成しない.*許可.*ready.*確認できなければ.*停止/,
+    /同じhead\/selected base.*open Pull Request.*重複/,
+    /matching Pull Requestが存在しない.*selected base向けnon-draft/,
+    /closed\/mergedだけ.*current head.*selected baseとの差分.*新規Pull Request作成.*過去PRを変更せず/,
+    /既存open Pull Requestがdraft.*重複作成せず.*許可.*ready.*確認できなければ.*停止/,
     /latest selected baseをmerge/,
     /rebase.*force push.*ours.*theirs.*stash.*破棄.*禁止/,
   ]);

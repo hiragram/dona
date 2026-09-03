@@ -19,8 +19,8 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 1. latest remote default branch、current branch、upstream、local diff、同じhead/baseのopen/closed Pull Requestを再取得する。ユーザーまたは既存workflowが指定したbaseを優先し、指定がない場合だけdefault branchをbaseに選ぶ。
 2. push前にcurrent branchがselected base自身でないことを確認する。同じ場合は、依頼範囲で安全に作成できる衝突のないtask branchへ切り替えるか、人間へ確認して停止する。task commitをselected baseへ直接pushしない。
-3. task fileだけを検証・明示stage・commitし、remoteへforceなしでpushする。Pull Requestがなければ、同じhead/selected baseの重複がないことを再確認し、そのselected base向けnon-draft Pull Requestを作る。
-4. 同じhead/selected baseの既存Pull Requestがdraftなら重複作成しない。依頼がnon-draft提出またはready化を許可していると確認できる場合だけreadyへ変更して再取得し、確認できなければ人間へ質問して停止する。
+3. task fileだけを検証・明示stage・commitし、remoteへforceなしでpushする。同じhead/selected baseのopen Pull Requestがなければ、open/closed/mergedを含む重複を再確認する。closed/mergedだけが一致する場合は、current headにselected baseとの差分があり依頼が新規Pull Request作成を許可していると確認できる場合だけ、過去PRを変更せず新しいnon-draft Pull Requestを作る。それ以外は人間へ確認して停止する。
+4. matching Pull Requestが存在しない場合も、作成権限を確認してselected base向けnon-draft Pull Requestを作る。同じhead/selected baseの既存open Pull Requestがdraftなら重複作成せず、依頼がnon-draft提出またはready化を許可していると確認できる場合だけreadyへ変更して再取得し、確認できなければ人間へ質問して停止する。
 5. local `HEAD`、upstream、Pull Request head SHAの完全一致と、selected base/head/state/non-draft、mergeability、base conflict、required/current CIを記録する。
 6. base conflictがあればlatest selected baseをmergeする。各conflictを文脈ごとに解消して検証し、merge commitを通常pushする。rebase、force push、無差別な`ours`/`theirs`選択、ユーザー変更のstash・破棄は禁止する。
 

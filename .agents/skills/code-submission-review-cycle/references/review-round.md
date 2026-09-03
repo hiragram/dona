@@ -5,9 +5,10 @@
 ## round recordを作る
 
 1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認する。違えばtriggerを投稿せず、どのstateがcurrentかを解消する。
-2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。Codex actorの`eyes`があるtriggerを見つけた場合は新規投稿しない。保存済みround record、またはCodex-authoredのrunning artifactがcurrent SHAを明記しserver時刻からexact triggerへ一意に対応する場合だけそのroundを引き継ぐ。複数候補、別SHA、対応不明なら停止して人間へ報告する。
-3. 進行中roundがない場合だけ、exact `@codex review`をPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
-4. writeの応答がtimeout・切断で曖昧なら同じcommentを再投稿しない。issue commentsを再取得し、author、bodyの完全一致、server時刻帯によりcommentを照合し、Pull Request headがwrite直前の`target_sha`から変わっていないことも確認する。issue comment単体はhead SHAを証明しないため、reconcile中にheadが変わった場合はそのtriggerを受理せず停止する。commentを1件かつ同じheadへ一意に確定できない場合も停止する。
+2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。latest triggerについて、Codex actorの`eyes`がある場合だけでなく、Codexのterminal review/completionがまだなくreactionも空の場合もpendingとして新規投稿せず30〜60秒間隔でpollする。保存済みround record、またはCodex-authored artifactがcurrent SHAを明記しserver時刻からexact triggerへ一意に対応する場合だけそのroundを引き継ぐ。複数候補、別SHA、対応不明、30分state変化なしのいずれかなら停止して人間へ報告する。
+3. 全Codex inline commentsとdirect repliesをpaginationし、過去roundの各top-level inline findingに返信済みか照合する。未返信があればcodeとcommit historyからdispositionと修正commitを一意に証明できる場合だけ元threadへdirect replyして再取得する。証明できなければ停止し、未返信comment URLと不足情報を報告する。未返信を残したままfresh triggerを投稿しない。
+4. pending roundがなく過去inlineへの返信も完備した場合だけ、exact `@codex review`をPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
+5. writeの応答がtimeout・切断で曖昧なら同じcommentを再投稿しない。issue commentsを再取得し、author、bodyの完全一致、server時刻帯によりcommentを照合し、Pull Request headがwrite直前の`target_sha`から変わっていないことも確認する。issue comment単体はhead SHAを証明しないため、reconcile中にheadが変わった場合はそのtriggerを受理せず停止する。commentを1件かつ同じheadへ一意に確定できない場合も停止する。
 
 round recordには少なくとも次を保持する。
 
@@ -30,7 +31,7 @@ round recordには少なくとも次を保持する。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
-reaction、review/comment集合、head SHA、CI conclusionのいずれかが変化した時点で`last_state_change_at`を更新する。30分変化がなければstalledとして停止する。trigger ID/URL、target SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
+reaction、review/comment集合、head SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
 
 ## round結果を判定する
 
