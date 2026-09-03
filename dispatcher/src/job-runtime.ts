@@ -20,17 +20,29 @@ export interface JobAgentRuntime {
   cancel(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
+function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
+  const expected = path.join(config.jobsWorkspaceRoot, "scratch", row.job_id);
+  if (row.workspace_path !== expected) {
+    throw new Error("Scratch workspace path does not match the Dispatcher-generated job path");
+  }
+}
+
 export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
   const args = ["--add-dir", config.jobResultsDir];
   const workspace = workspaceFromJob(row);
-  if (workspace.kind === "github") {
+  let trustedPaths: string[];
+  if (workspace.kind === "scratch") {
+    assertScratchWorkspacePath(row, config);
+    trustedPaths = [row.workspace_path];
+  } else {
     const [owner, repo] = workspace.repository.split("/") as [string, string];
     const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", owner, repo, "repository");
-    const projects = [repositoryPath, row.workspace_path]
-      .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
-      .join(", ");
-    args.push("-c", `projects = { ${projects} }`);
+    trustedPaths = [repositoryPath, row.workspace_path];
   }
+  const projects = trustedPaths
+    .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
+    .join(", ");
+  args.push("-c", `projects = { ${projects} }`);
   return args;
 }
 
@@ -168,6 +180,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
   constructor(private readonly config: DispatcherConfig) {}
 
   async prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime> {
+    const workspace = workspaceFromJob(row);
+    if (workspace.kind === "scratch") assertScratchWorkspacePath(row, this.config);
+
     await fs.mkdir(this.config.jobsWorkspaceRoot, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
     await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
@@ -183,7 +198,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       }
     }
 
-    const workspace = workspaceFromJob(row);
     const created = workspace.kind === "scratch"
       ? await this.createScratchWorkspace(row, signal)
       : await this.createGitHubWorktree(row, workspace.repository, workspace.base_ref, signal);
@@ -257,6 +271,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
   }
 
   private async createScratchWorkspace(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    assertScratchWorkspacePath(row, this.config);
     await fs.mkdir(row.workspace_path, { recursive: true, mode: 0o700 });
     await fs.chmod(row.workspace_path, 0o700);
     return this.herdr([
