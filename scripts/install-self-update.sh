@@ -18,7 +18,9 @@ CONTROL_BACKUP_ROOT=""
 
 bootstrap_updater_reconciled() {
   local context=$1
+  local expected_sha=$2
   local output=""
+  local observed=""
   local exit_code=0
   integer attempt
   integer observation
@@ -29,13 +31,14 @@ bootstrap_updater_reconciled() {
       exit_code=$?
     fi
     for observation in {1..20}; do
-      if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-        print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、登録済み状態を確認しました。"
+      observed=$(/bin/launchctl print "$DOMAIN/dev.dona.updater" 2>/dev/null) || observed=""
+      if [[ "$observed" == *"DONA_UPDATER_BUILD_SHA => ${expected_sha}"* ]]; then
+        print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの登録済み状態を確認しました。"
         return 0
       fi
       /bin/sleep 0.1
     done
-    print -u2 -- "${context}のlaunchctl bootstrap attempt ${attempt}はexit ${exit_code}で拒否され、未登録状態を確認しました。"
+    print -u2 -- "${context}のlaunchctl bootstrap attempt ${attempt}はexit ${exit_code}で拒否され、expected SHAの未登録状態を確認しました。"
     if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
   done
   return 1
@@ -71,7 +74,7 @@ restore_control_plane() {
       /bin/rm -f "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/updater.sqlite3-wal" "$CONTROL_ROOT/updater.sqlite3-shm"
     fi
   fi
-  if ! bootstrap_updater_reconciled "旧stable updaterの復旧"; then
+  if ! bootstrap_updater_reconciled "旧stable updaterの復旧" "$OLD_UPDATER_SHA"; then
     print -u2 "旧stable updaterをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
   fi
@@ -308,7 +311,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  if bootstrap_updater_reconciled "新しいstable updaterの登録" && \
+  if bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"
