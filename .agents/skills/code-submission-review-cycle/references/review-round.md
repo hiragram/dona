@@ -4,7 +4,7 @@
 
 ## round recordを作る
 
-1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認する。違えばtriggerを投稿せず、どのstateがcurrentかを解消する。
+1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認し、selected base refとそのcurrent SHAも取得して対象diffを固定する。いずれかが不明または不一致ならtriggerを投稿せず、どのstateがcurrentかを解消する。
 2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。latest triggerについて、Codex actorの`eyes`がある場合だけでなく、Codexのterminal review/completionがまだなくreactionも空の場合もpendingとして新規投稿せず30〜60秒間隔でpollする。保存済みround record、またはCodex-authored artifactがcurrent SHAを明記しserver時刻からexact triggerへ一意に対応する場合だけそのroundを引き継ぐ。複数候補、別SHA、対応不明、30分state変化なしのいずれかなら停止して人間へ報告する。
 3. 全Codex inline commentsとdirect repliesをpaginationし、過去roundの各top-level inline findingに返信済みか照合する。未返信があればcodeとcommit historyからdispositionと修正commitを一意に証明できる場合だけ元threadへdirect replyして再取得する。証明できなければ停止し、未返信comment URLと不足情報を報告する。未返信を残したままfresh triggerを投稿しない。
 4. pending roundがなく過去inlineへの返信も完備した場合だけ、exact `@codex review`をPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
@@ -13,6 +13,8 @@
 round recordには少なくとも次を保持する。
 
 - `target_sha`
+- `base_ref`
+- `base_sha`
 - `trigger_comment_id`
 - `trigger_comment_url`
 - `trigger_created_at`
@@ -27,17 +29,17 @@ round recordには少なくとも次を保持する。
 2. triggerのGitHub server時刻より後に作成・提出されたCodex-authored Pull Request review。
 3. trigger後のCodex-authored issue comment。対象`target_sha`を明記し、no-major-issues/no-findingsを明示するcompletion commentはclean signalとして使える。
 4. trigger後のCodex-authored inline review comment。`commit_id`または`original_commit_id`が`target_sha`と一致するfindingだけをcurrent roundへ帰属させる。
-5. Pull Requestのcurrent head SHA、base/head/state/draft、mergeability、merge state、およびrequired/current status checkとcheck run。
+5. Pull Requestのcurrent head SHA、base ref/SHA、state/draft、mergeability、merge state、およびcurrent headに紐づくrequired/current status checkとcheck run。repository workflowとbranch ruleから期待するsuite/contextが一度も現れていない空状態はsuccessにしない。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
-reaction、review/comment集合、head SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
+reaction、review/comment集合、head/base SHA、CI check/status contextの`status`または`conclusion`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`などterminal前のstatus遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
 
 ## round結果を判定する
 
-- **clean:** exact triggerへCodex integrationと確認したactorが`+1`を付けた、またはtrigger後のCodex-authored commentが`target_sha`を明記してno-major-issues/no-findingsを明示する。さらにcurrent headが`target_sha`のままで、current roundにfindingがないことを確認する。
-- **findings:** target SHAに対する新しいCodex reviewまたはinline commentがfindingを含む。review summaryだけで打ち切らず、inline commentsをpaginationし全件取得する。
-- **superseded:** Pull Request headが`target_sha`から変わった。旧roundをclean扱いせず、current headのpush・検証・SHA一致を確認した後にfresh roundを作る。
+- **clean:** exact triggerへCodex integrationと確認したactorが`+1`を付けた、またはtrigger後のCodex-authored commentが`target_sha`を明記してno-major-issues/no-findingsを明示する。さらにcurrent head/baseがround recordのSHAのままで、current roundにfindingがないことを確認する。
+- **findings:** target SHAに対する新しいCodex reviewまたはinline commentがfindingを含む場合も、Codex actorの`eyes`消失とterminal review/completionを確認するまでfeedback処理やhead変更を始めない。terminal後にreviewsとinline commentsをもう一度paginationし、全finding集合を固定してから処理する。
+- **superseded:** Pull Request head SHA、base ref、base SHAのいずれかがround recordから変わった。旧roundをclean扱いせず、current head/baseの取得・検証・SHA一致を確認した後にfresh roundを作る。
 - **stalled:** 30分state変化がない。duplicate triggerを書かず、人間によるretrigger判断を待つ。
 
 ## feedbackを処理する

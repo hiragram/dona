@@ -119,7 +119,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
   assertContract(record, "exact trigger/SHA binding", [
     /exact `@codex review`.*1件/,
     /comment ID.*URL.*GitHub server時刻/,
-    /Pull Request head SHA.*結び付け/,
+    /Pull Request head SHA.*selected base ref.*current SHA.*対象diffを固定/,
+    /^- `target_sha`$/m,
+    /^- `base_ref`$/m,
+    /^- `base_sha`$/m,
     /reconcile中にheadが変わった場合.*triggerを受理せず停止/,
     /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
     /latest trigger.*`eyes`.*terminal review\/completion.*reactionも空.*pending.*新規投稿せず.*poll/,
@@ -136,7 +139,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /inline review comment/,
     /current head SHA.*status check.*check run/,
   ]);
-  assertContract(boundary, "round identity", [/古いround.*別SHA.*無視/]);
+  assertContract(boundary, "round identity", [
+    /exact head SHA.*selected base ref\/SHA.*結び付け/,
+    /古いround.*別SHA.*無視/,
+  ]);
 });
 
 test("stalled roundはduplicate triggerなしで停止する", async () => {
@@ -154,6 +160,8 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
   ]);
   assertContract(decision, "empty state is not clean", [
     /superseded.*旧roundをclean扱いせず/,
+    /findings.*`eyes`消失.*terminal review\/completion.*feedback処理やhead変更を始めない/,
+    /terminal後.*reviews.*inline comments.*pagination.*全finding集合を固定/,
   ]);
 });
 
@@ -180,15 +188,17 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   const target = section(skill, "review targetを固定する");
 
   assertContract(completion, "completion gates", [
-    /latest round.*current Pull Request head SHA/,
+    /latest round.*current Pull Request head SHA.*current base ref\/SHA/,
     /\+1.*no-major-issues\/no-findings/,
     /未解決finding.*過去round.*inline comment.*direct reply済み/,
     /local `HEAD`.*upstream.*Pull Request head SHA.*一致/,
     /mergeable.*base conflict.*open.*non-draft/,
-    /required\/current CI.*terminal success/,
+    /current head SHA.*期待するCI suite\/check context.*少なくとも1回観測.*required\/current CI.*terminal success/,
+    /checkが空.*成功としない/,
   ]);
   assertContract(boundary, "authorization boundary", [
-    /merge.*force push.*rebase.*無関係なcleanup.*許可しない/,
+    /Pull Request自体のmerge.*force push.*rebase.*無関係なcleanup.*許可しない/,
+    /latest selected base.*task branchへmerge.*手順に限って許可/,
     /task fileだけ.*明示stage/,
     /stash.*破棄.*上書き.*しない/,
   ]);
@@ -196,6 +206,7 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
     /指定したbaseを優先.*指定がない場合だけdefault branch/,
     /current branch.*selected base自身でない.*task commit.*直接pushしない/,
     /working treeがclean.*既存commit.*対象変更.*再利用.*空commitを作らない/,
+    /upstream未設定.*同名remote refが存在しない.*non-force.*初回push.*upstreamを設定/,
     /local task commit.*upstreamより先行.*fast-forward.*forceなし.*localとupstreamが既に一致.*不要なpushをしない/,
     /同じhead\/selected base.*open Pull Request.*重複/,
     /matching Pull Requestが存在しない.*selected base向けnon-draft/,
