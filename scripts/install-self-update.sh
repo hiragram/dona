@@ -187,10 +187,6 @@ if [[ "$MODE" == "--upgrade-control" && ! -d "$CONTROL_ROOT/updater" ]]; then
   print -u2 "stable updaterが未導入です。先に--installと--bootstrapを実行してください。"
   exit 1
 fi
-if [[ "$MODE" == "--upgrade-control" ]]; then
-  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-slack-metadata-attested "$CONFIG_ROOT/slack.env"
-fi
-
 umask 077
 mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT" "$LAUNCH_AGENTS_DIR"
 chmod 700 "$BASE_DIR" "$CONTROL_ROOT" "$RUNTIME_ROOT" "$RELEASE_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT"

@@ -149,7 +149,6 @@ describe("SlackHealthServer", () => {
       "2".repeat(40),
       reporter,
       tokenPath,
-      true,
     );
     await server.start();
     try {
@@ -206,7 +205,7 @@ describe("SlackHealthServer", () => {
     }
   });
 
-  test("does not expose or execute the reporter without metadata-schema attestation", async () => {
+  test("does not expose or execute the reporter without a private token path", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-health-"));
     roots.push(root);
     const socketPath = path.join(root, "run", "slack.sock");
@@ -241,8 +240,7 @@ describe("SlackHealthServer", () => {
           };
         },
       },
-      tokenPath,
-      false,
+      undefined,
     );
     await server.start();
     try {
@@ -276,8 +274,8 @@ describe("SlackHealthServer", () => {
     const reporter: UpdateNotificationPort = {
       async deliver(input) {
         throw new UpdateNotificationPermanentError(
-          "metadata_not_persisted",
-          "Slack posted the notification without the exact registered identity metadata",
+          "identity_block_not_persisted",
+          "Slack posted the notification without the exact identity block",
           {
             notification_id: input.notification_id,
             workspace_id: input.workspace_id,
@@ -304,7 +302,6 @@ describe("SlackHealthServer", () => {
       "2".repeat(40),
       reporter,
       tokenPath,
-      true,
     );
     await server.start();
     try {
@@ -321,8 +318,8 @@ describe("SlackHealthServer", () => {
       }, { "x-dona-update-token": token });
       assert.equal(response.status, 409);
       assert.deepEqual(response.body.error, {
-        code: "metadata_not_persisted",
-        message: "Slack posted the notification without the exact registered identity metadata",
+        code: "identity_block_not_persisted",
+        message: "Slack posted the notification without the exact identity block",
       });
       assert.deepEqual(response.body.receipt, {
         notification_id: "update:upd_01m1es03xy5cf8d9pm5cwx4srv:terminal:2",

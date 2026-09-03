@@ -92,9 +92,10 @@ class FakeSlackClient implements SlackApiClient {
         {
           ts: "1.2",
           userId: "U1",
-          text: "external message",
-          fileIds: ["F123"],
-          reactions: [{ name: "eyes", count: 1, userIds: ["U1"] }],
+        text: "external message",
+        fileIds: ["F123"],
+        blockIds: [],
+        reactions: [{ name: "eyes", count: 1, userIds: ["U1"] }],
         },
       ],
       hasMore: false,

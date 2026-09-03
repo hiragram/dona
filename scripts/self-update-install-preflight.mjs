@@ -180,23 +180,11 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
   }
 }
 
-export async function assertSlackMetadataSchemaAttested(environmentPath) {
-  if (!path.isAbsolute(environmentPath)) throw new Error("Slack environment path must be absolute");
-  const lines = (await fs.readFile(environmentPath, "utf8")).split(/\r?\n/);
-  const declarations = lines.filter((line) =>
-    /^\s*SLACK_UPDATE_METADATA_SCHEMA_REGISTERED\s*=/.test(line) && !/^\s*#/.test(line),
-  );
-  if (declarations.length !== 1 ||
-    !/^\s*SLACK_UPDATE_METADATA_SCHEMA_REGISTERED\s*=\s*(?:true|"true"|'true')\s*(?:#.*)?$/i.test(declarations[0])) {
-    throw new Error("Slack update metadata schema registration and read scope are not explicitly attested");
-  }
-}
-
 async function main() {
   const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
     console.error(
-      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha> | assert-slack-metadata-attested <environment-file>",
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
     );
     return 2;
   }
@@ -243,15 +231,6 @@ async function main() {
   if (mode === "validate-existing-release" && secondValue && process.argv[5]) {
     try {
       await validateExistingRelease(value, secondValue, process.argv[5]);
-      return 0;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      return 1;
-    }
-  }
-  if (mode === "assert-slack-metadata-attested") {
-    try {
-      await assertSlackMetadataSchemaAttested(value);
       return 0;
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));

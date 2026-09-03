@@ -218,21 +218,6 @@ test("an existing immutable release is reusable only with the exact control-plan
   }
 });
 
-test("control upgrade requires an explicit Slack metadata-schema registration attestation", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-schema-attestation-"));
-  const environmentPath = path.join(root, "slack.env");
-  try {
-    await fs.writeFile(environmentPath, "SLACK_WORKSPACES=company\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=false\n");
-    await assert.rejects(run("assert-slack-metadata-attested", environmentPath), /not explicitly attested/);
-    await fs.writeFile(environmentPath, "SLACK_WORKSPACES=company\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\n");
-    await run("assert-slack-metadata-attested", environmentPath);
-    await fs.writeFile(environmentPath, "SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\n");
-    await assert.rejects(run("assert-slack-metadata-attested", environmentPath), /not explicitly attested/);
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
-
 test("isolated npm uses separate empty config files with npm 11", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-npm-config-"));
   const npmCli = process.env.npm_execpath;

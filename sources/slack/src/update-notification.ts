@@ -1,4 +1,4 @@
-import type { SlackAgentSessionStatus, SlackApiClient, SlackMessageMetadata } from "./slack-api.js";
+import type { SlackAgentSessionStatus, SlackApiClient, SlackThreadMessage } from "./slack-api.js";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 const notificationIdPattern = /^update:upd_[0-9a-hjkmnp-tv-z]{26}:terminal:\d+$/;
@@ -34,7 +34,7 @@ export interface UpdateNotificationPort {
 export class UpdateNotificationPermanentError extends Error {
   constructor(
     readonly code: "unknown_workspace" | "duplicate_update_notification" | "conflicting_update_notification" |
-      "metadata_not_persisted" | "ambiguous_update_notification",
+      "identity_block_not_persisted" | "ambiguous_update_notification",
     message: string,
     readonly receipt?: UpdateNotificationResult,
   ) {
@@ -64,7 +64,7 @@ export function parseUpdateNotificationRequest(input: unknown): UpdateNotificati
     typeof value.workspace_id !== "string" || !idPattern.test(value.workspace_id) ||
     typeof value.channel_id !== "string" || !idPattern.test(value.channel_id) ||
     typeof value.thread_ts !== "string" || !timestampPattern.test(value.thread_ts) ||
-    typeof value.text !== "string" || value.text.length < 1 || value.text.length > 12_000 ||
+    typeof value.text !== "string" || value.text.length < 1 || value.text.length > 3_000 ||
     (value.desired_session_status !== "active" && value.desired_session_status !== "suspended")) {
     throw new Error("notification is invalid");
   }
@@ -74,41 +74,39 @@ export function parseUpdateNotificationRequest(input: unknown): UpdateNotificati
   return value as unknown as UpdateNotificationRequest;
 }
 
-function metadata(input: UpdateNotificationRequest): SlackMessageMetadata {
-  return {
-    eventType: "dona.update_notification",
-    eventPayload: {
-      notification_id: input.notification_id,
-      request_id: input.request_id,
-      terminal_fence: input.terminal_fence,
-    },
-  };
+function identityBlockId(input: UpdateNotificationRequest): string {
+  return `dona_update_notification:${input.notification_id}`;
 }
 
-function metadataMatches(actual: SlackMessageMetadata | undefined, expected: SlackMessageMetadata): boolean {
-  if (!actual || actual.eventType !== expected.eventType) return false;
-  const actualEntries = Object.entries(actual.eventPayload).sort(([left], [right]) => left.localeCompare(right));
-  const expectedEntries = Object.entries(expected.eventPayload).sort(([left], [right]) => left.localeCompare(right));
-  return JSON.stringify(actualEntries) === JSON.stringify(expectedEntries);
+function authoredByReporter(message: SlackThreadMessage, botId: string | undefined, botUserId: string | undefined): boolean {
+  return (botId !== undefined && message.botId === botId) ||
+    (botUserId !== undefined && message.userId === botUserId);
 }
 
 async function existingMessage(
   client: SlackApiClient,
   input: UpdateNotificationRequest,
+  botId: string | undefined,
+  botUserId: string | undefined,
 ): Promise<string | undefined> {
+  if (!botId && !botUserId) {
+    throw new UpdateNotificationPermanentError(
+      "ambiguous_update_notification",
+      "Slack bot identity is unavailable for update notification reconciliation",
+    );
+  }
   let cursor: string | undefined;
   let found: string | undefined;
   const seenCursors = new Set<string>();
   do {
     const thread = await client.getThread(input.channel_id, input.thread_ts, 200, cursor);
     const matching = thread.messages.filter((message) =>
-      message.metadata?.eventType === "dona.update_notification" &&
-      message.metadata.eventPayload.notification_id === input.notification_id,
+      message.blockIds.includes(identityBlockId(input)),
     );
-    if (matching.some((message) => !metadataMatches(message.metadata, metadata(input)))) {
+    if (matching.some((message) => !authoredByReporter(message, botId, botUserId))) {
       throw new UpdateNotificationPermanentError(
         "conflicting_update_notification",
-        "an update notification with conflicting identity metadata already exists",
+        "an update notification identity block exists on a message from another author",
       );
     }
     if (matching.length > 1 || (found !== undefined && matching.length === 1)) {
@@ -119,7 +117,7 @@ async function existingMessage(
     }
     if (matching[0]) found = matching[0].ts;
     if (thread.hasMore && !thread.nextCursor) {
-      throw new Error("Slack thread pagination ended before all metadata could be checked");
+      throw new Error("Slack thread pagination ended before all identity blocks could be checked");
     }
     cursor = thread.nextCursor;
     if (cursor && seenCursors.has(cursor)) throw new Error("Slack thread pagination cursor repeated");
@@ -142,11 +140,9 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
         );
       }
     })();
-    let messageTs = await existingMessage(connection.client, input);
+    let messageTs = await existingMessage(connection.client, input, connection.botId, connection.botUserId);
     let postStatus: "created" | "existing" = "existing";
-    let postedMetadata: SlackMessageMetadata | undefined;
     if (!messageTs) {
-      const expectedMetadata = metadata(input);
       postStatus = "created";
       try {
         const posted = await connection.client.postMessage({
@@ -154,24 +150,23 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
           text: input.text,
           threadTs: input.thread_ts,
           replyBroadcast: false,
-          metadata: expectedMetadata,
+          identityBlockId: identityBlockId(input),
         });
         messageTs = posted.messageTs;
-        postedMetadata = posted.metadata;
       } catch {
         try {
-          messageTs = await existingMessage(connection.client, input);
+          messageTs = await existingMessage(connection.client, input, connection.botId, connection.botUserId);
         } catch (error) {
           if (error instanceof UpdateNotificationPermanentError) throw error;
           throw new UpdateNotificationPermanentError(
             "ambiguous_update_notification",
-            "Slack post acceptance and identity metadata could not be reconciled",
+            "Slack post acceptance and identity block could not be reconciled",
           );
         }
         if (!messageTs) {
           throw new UpdateNotificationPermanentError(
             "ambiguous_update_notification",
-            "Slack post acceptance is unknown and exact identity metadata was not observed",
+            "Slack post acceptance is unknown and the exact identity block was not observed",
           );
         }
       }
@@ -193,12 +188,17 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       post_status: postStatus,
       session_status: session.status,
     };
-    if (postStatus === "created" && !metadataMatches(postedMetadata, metadata(input))) {
-      const observedMessageTs = await existingMessage(connection.client, input);
+    if (postStatus === "created") {
+      const observedMessageTs = await existingMessage(
+        connection.client,
+        input,
+        connection.botId,
+        connection.botUserId,
+      );
       if (observedMessageTs !== messageTs) {
         throw new UpdateNotificationPermanentError(
-          "metadata_not_persisted",
-          "Slack posted the notification without the exact registered identity metadata",
+          "identity_block_not_persisted",
+          "Slack posted the notification without the exact identity block",
           result,
         );
       }

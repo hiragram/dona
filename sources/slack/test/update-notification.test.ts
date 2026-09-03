@@ -9,7 +9,6 @@ import type {
   SlackChannel,
   SlackChannelPage,
   SlackFileInfo,
-  SlackMessageMetadata,
   SlackPostResult,
   SlackReactionSnapshot,
   SlackThread,
@@ -49,7 +48,7 @@ class FakeSlackClient implements SlackApiClient {
   postCount = 0;
   statusCount = 0;
   failStatusOnce = false;
-  async authenticate() { return { teamId: "T123" }; }
+  async authenticate() { return { teamId: "T123", botId: "B_TEST", botUserId: "U_TEST" }; }
   async listChannels(): Promise<SlackChannelPage> { return { channels: [] }; }
   async getChannel(): Promise<SlackChannel> {
     return { id: "C123", isPrivate: false, isArchived: false, isMember: true, isShared: false };
@@ -67,22 +66,23 @@ class FakeSlackClient implements SlackApiClient {
     return { channelId: "C123", messageTs: "1.1", messageText: "", reactions: [] };
   }
   async getFile(): Promise<SlackFileInfo> { return { id: "F_TEST", channelIds: [], contentTruncated: false }; }
-  async postMessage(input: { channelId: string; text: string; threadTs?: string; replyBroadcast: boolean; metadata?: SlackMessageMetadata }): Promise<SlackPostResult> {
+  async postMessage(input: { channelId: string; text: string; threadTs?: string; replyBroadcast: boolean; identityBlockId?: string }): Promise<SlackPostResult> {
     this.postCount += 1;
     const messageTs = `1788390700.${this.postCount}`;
     this.messages.push({
       ts: messageTs,
       ...(input.threadTs ? { threadTs: input.threadTs } : {}),
+      userId: "U_TEST",
+      botId: "B_TEST",
       text: input.text,
       fileIds: [],
+      blockIds: input.identityBlockId ? [input.identityBlockId] : [],
       reactions: [],
-      ...(input.metadata ? { metadata: input.metadata } : {}),
     });
     return {
       channelId: input.channelId,
       messageTs,
       ...(input.threadTs ? { threadTs: input.threadTs } : {}),
-      ...(input.metadata ? { metadata: input.metadata } : {}),
     };
   }
   async setAgentSessionStatus(): Promise<SlackAgentSessionStatusResult> {
@@ -115,9 +115,13 @@ describe("SlackUpdateNotificationReporter", () => {
       () => parseUpdateNotificationRequest({ ...request, command: "ignored" }),
       /fields do not match/,
     );
+    assert.throws(
+      () => parseUpdateNotificationRequest({ ...request, text: "x".repeat(3_001) }),
+      /notification is invalid/,
+    );
   });
 
-  test("reconciles an ambiguous partial delivery by metadata without posting twice", async () => {
+  test("reconciles an ambiguous partial delivery by identity block without posting twice", async () => {
     const { client, reporter } = await reporterFixture();
     client.failStatusOnce = true;
     await assert.rejects(reporter.deliver(request), /status response lost/);
@@ -127,69 +131,44 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(result.message_ts, "1788390700.1");
     assert.equal(client.postCount, 1);
     assert.equal(client.statusCount, 2);
-    assert.deepEqual(client.messages[0]?.metadata, {
-      eventType: "dona.update_notification",
-      eventPayload: {
-        notification_id: request.notification_id,
-        request_id: request.request_id,
-        terminal_fence: request.terminal_fence,
-      },
-    });
+    assert.deepEqual(client.messages[0]?.blockIds, [
+      `dona_update_notification:${request.notification_id}`,
+    ]);
   });
 
-  test("fails closed when duplicate metadata is already present", async () => {
+  test("fails closed when duplicate identity blocks are already present", async () => {
     const { client, reporter } = await reporterFixture();
-    const metadata = {
-      eventType: "dona.update_notification",
-      eventPayload: {
-        notification_id: request.notification_id,
-        request_id: request.request_id,
-        terminal_fence: request.terminal_fence,
-      },
-    };
+    const blockIds = [`dona_update_notification:${request.notification_id}`];
     client.messages.push(
-      { ts: "1.1", text: "one", fileIds: [], reactions: [], metadata },
-      { ts: "1.2", text: "two", fileIds: [], reactions: [], metadata },
+      { ts: "1.1", botId: "B_TEST", text: "one", fileIds: [], blockIds, reactions: [] },
+      { ts: "1.2", botId: "B_TEST", text: "two", fileIds: [], blockIds, reactions: [] },
     );
     await assert.rejects(reporter.deliver(request), /duplicate update notifications/);
     assert.equal(client.postCount, 0);
     assert.equal(client.statusCount, 0);
   });
 
-  test("does not trust a matching notification ID with conflicting bound fields", async () => {
+  test("does not trust a matching identity block from another author", async () => {
     const { client, reporter } = await reporterFixture();
     client.messages.push({
       ts: "1.1",
+      botId: "B_OTHER",
       text: "conflict",
       fileIds: [],
+      blockIds: [`dona_update_notification:${request.notification_id}`],
       reactions: [],
-      metadata: {
-        eventType: "dona.update_notification",
-        eventPayload: {
-          notification_id: request.notification_id,
-          request_id: request.request_id,
-          terminal_fence: request.terminal_fence + 1,
-        },
-      },
     });
-    await assert.rejects(reporter.deliver(request), /conflicting identity metadata/);
+    await assert.rejects(reporter.deliver(request), /another author/);
     assert.equal(client.postCount, 0);
     assert.equal(client.statusCount, 0);
   });
 
-  test("detects duplicate notification metadata across all thread pages", async () => {
+  test("detects duplicate notification identity blocks across all thread pages", async () => {
     const { client, reporter } = await reporterFixture();
-    const metadata = {
-      eventType: "dona.update_notification",
-      eventPayload: {
-        notification_id: request.notification_id,
-        request_id: request.request_id,
-        terminal_fence: request.terminal_fence,
-      },
-    };
+    const blockIds = [`dona_update_notification:${request.notification_id}`];
     client.threadPages = [
-      { messages: [{ ts: "1.1", text: "one", fileIds: [], reactions: [], metadata }], hasMore: true },
-      { messages: [{ ts: "1.2", text: "two", fileIds: [], reactions: [], metadata }], hasMore: false },
+      { messages: [{ ts: "1.1", botId: "B_TEST", text: "one", fileIds: [], blockIds, reactions: [] }], hasMore: true },
+      { messages: [{ ts: "1.2", botId: "B_TEST", text: "two", fileIds: [], blockIds, reactions: [] }], hasMore: false },
     ];
     await assert.rejects(reporter.deliver(request), /duplicate update notifications/);
     assert.equal(client.postCount, 0);
@@ -199,7 +178,7 @@ describe("SlackUpdateNotificationReporter", () => {
   test("does not post when Slack claims another page but omits its cursor", async () => {
     const { client, reporter } = await reporterFixture();
     client.threadPageReader = () => ({ messages: [], hasMore: true });
-    await assert.rejects(reporter.deliver(request), /pagination ended before all metadata/);
+    await assert.rejects(reporter.deliver(request), /pagination ended before all identity blocks/);
     assert.equal(client.postCount, 0);
     assert.equal(client.statusCount, 0);
   });
@@ -222,16 +201,12 @@ describe("SlackUpdateNotificationReporter", () => {
     );
   });
 
-  test("confirms persisted metadata by read-back when the post response omits it", async () => {
+  test("confirms the persisted identity block by read-back after posting", async () => {
     const { client, reporter } = await reporterFixture();
     const original = client.postMessage.bind(client);
     client.postMessage = async (input) => {
       const posted = await original(input);
-      return {
-        channelId: posted.channelId,
-        messageTs: posted.messageTs,
-        ...(posted.threadTs ? { threadTs: posted.threadTs } : {}),
-      };
+      return posted;
     };
     const result = await reporter.deliver(request);
     assert.equal(result.post_status, "created");
@@ -240,7 +215,7 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 1);
   });
 
-  test("recovers a lost post response only when exact metadata is visible", async () => {
+  test("recovers a lost post response only when the exact identity block is visible", async () => {
     const { client, reporter } = await reporterFixture();
     const original = client.postMessage.bind(client);
     client.postMessage = async (input) => {
@@ -254,12 +229,12 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 1);
   });
 
-  test("does not retry an ambiguous post whose exact metadata is absent", async () => {
+  test("does not retry an ambiguous post whose exact identity block is absent", async () => {
     const { client, reporter } = await reporterFixture();
     const original = client.postMessage.bind(client);
     client.postMessage = async (input) => {
       await original(input);
-      delete client.messages.at(-1)?.metadata;
+      client.messages.at(-1)!.blockIds = [];
       throw new Error("post response lost");
     };
     await assert.rejects(
@@ -272,12 +247,12 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 0);
   });
 
-  test("returns a permanent partial receipt when Slack does not persist registered metadata", async () => {
+  test("returns a permanent partial receipt when Slack does not persist the identity block", async () => {
     const { client, reporter } = await reporterFixture();
     const original = client.postMessage.bind(client);
     client.postMessage = async (input) => {
       const posted = await original(input);
-      delete client.messages.at(-1)?.metadata;
+      client.messages.at(-1)!.blockIds = [];
       return {
         channelId: posted.channelId,
         messageTs: posted.messageTs,
@@ -288,7 +263,7 @@ describe("SlackUpdateNotificationReporter", () => {
       reporter.deliver(request),
       (error: unknown) => error instanceof Error &&
         error.name === "UpdateNotificationPermanentError" &&
-        (error as { code?: unknown }).code === "metadata_not_persisted" &&
+        (error as { code?: unknown }).code === "identity_block_not_persisted" &&
         (error as { receipt?: { message_ts?: unknown } }).receipt?.message_ts === "1788390700.1",
     );
     assert.equal(client.postCount, 1);
