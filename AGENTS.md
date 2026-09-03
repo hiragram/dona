@@ -11,6 +11,12 @@
 
 このリポジトリで新規作成または更新するSkill、documentation、GitHub Issue、Pull Requestの人向け文章（少なくともタイトル、本文、review、comment）は日本語で記述する。code identifier、API field、command、path、引用が必要な外部固有名などの機械可読要素や固有表記は、不自然に翻訳しない。
 
+## コード提出のreview cycle
+
+- コード実装・修正・refactor・test変更をcommit、push、Pull Requestとして提出して完了する作業では、project Skillの`$code-submission-review-cycle`を必ず使い、current headを対象としたCodex Cloud reviewとCIが完了条件を満たすまで処理する。
+- read-onlyの調査・説明、Issue作成だけの作業、localで完結するone-off reviewでは、この必須routingを適用しない。
+- Skillの選択は追加権限を与えない。commit、通常push、Pull Request作成の依頼から、Pull Request自体のmerge、force push、無関係な変更、ユーザー変更の破棄を許可されたと解釈しない。
+
 ## Donaの役割
 
 Donaは、外部サービスから届いた出来事を解釈し、必要な情報を集め、利用可能なツールの中から適切な対応を選ぶ秘書エージェントである。
