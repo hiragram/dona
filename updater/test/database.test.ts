@@ -120,8 +120,13 @@ describe("UpdateDatabase", () => {
     db.transition(first, 2, "quiescing", "quiesce");
     db.transition(first, 2, "activating", "activate");
     db.transition(first, 2, "restarting", "restart");
-    db.transition(first, 2, "verifying", "verify");
-    db.terminal(first, 2, "succeeded", "done");
+    db.transition(first, 2, "verifying", "verify", {
+      last_error_code: "transient_observation_timeout",
+      last_error_message: "the runtime was still starting",
+    });
+    const succeeded = db.terminal(first, 2, "succeeded", "done");
+    assert.equal(succeeded.last_error_code, null);
+    assert.equal(succeeded.last_error_message, null);
     assert.equal(db.outboxFor(first)?.external_event_id, `update:${first}:terminal:2`);
     assert.throws(() => make(secondEventId, 10), /terminal notification is not settled/);
     const firstOutbox = db.markOutboxDelivering(db.outboxFor(first)!.outbox_id);
