@@ -51,15 +51,9 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 
 ## Stable control-plane更新と既存インシデント補正
 
-stable updaterとpolicy/schemaを更新する前に、各workspaceのSlack Appへ[`sources/slack/manifest.yaml`](../sources/slack/manifest.yaml)を反映します。App Manifestのトップレベル`metadata.event_subscriptions`で`dona.update_notification` schemaを、bot scopeで`metadata.message:read`を確認し、追加scopeがtokenへ反映されるようAppを再認可します。`settings.metadata`はschema登録先ではありません。確認後、owner-onlyの`config/slack.env`へ次を1行だけ設定します。
+セルフアップデート通知の重複防止は、Slack Appのcustom message metadata schemaに依存しません。通知本文を表示するsection blockの`block_id`へ決定論的な`notification_id`を埋め、同じBotの投稿だけをthread全pageから照合します。このfieldは通常のmessage read/write権限で永続化・再読できるため、manifest変更、`metadata.message:read`、App再認可、外部状態のattestationは不要です。
 
-```dotenv
-SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true
-```
-
-この値は外部状態の自動検出ではなく運用者のattestationです。schema登録またはscope再認可が未反映のまま有効化してはいけません。未設定、`false`、重複定義では`--upgrade-control`が拒否され、新Slack Adapterも`update_notification_protocol`をhealthへ公開しません。
-
-その後maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
+maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
 
 ```sh
 ./scripts/install-self-update.sh --upgrade-control

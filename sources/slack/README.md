@@ -108,9 +108,7 @@ MCPが公開するツール:
 
 MCPはSlack APIへの自動再試行を無効にしています。書き込みの通信結果が曖昧な場合、二重投稿を避けるためエージェントへ自動再試行しないよう伝えます。token、投稿本文、スレッド本文は通常ログへ出しません。
 
-セルフアップデート通知では、`request_id`とterminal fenceから一意な`notification_id`を作り、`dona.update_notification` metadataとして投稿します。再配送時は`conversations.replies`をcursorの終端まで読み、同じmetadataが1件なら既存投稿を再利用します。0件だけ新規投稿し、複数件なら恒久エラーとして止めます。Slack Agent Sessionは成功・rollback・cancelで`active`、失敗・確認待ちで`suspended`へ遷移します。本文、宛先、statusはDispatcherのstrict schema以外から指定できません。
-
-Slack AppのApp Manifestへ[`manifest.yaml`](./manifest.yaml)を反映し、manifestトップレベルの`metadata.event_subscriptions`にある`dona.update_notification` schemaとbot scopeの`metadata.message:read`を各workspaceで確認して再認可してから、`slack.env`の`SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true`を設定します。`metadata`を`settings`配下へ置くとSlackはschemaを登録せず、投稿時にmetadataをwarning付きで破棄します。未設定または`false`ではAdapterは`update_notification_protocol`をversion healthへ公開せず、Updaterはterminal完了を確定しません。schema登録とscope付与を確認せずにこの値だけを有効化してはいけません。
+セルフアップデート通知では、`request_id`とterminal fenceから一意な`notification_id`を作り、表示本文を持つsection blockの`block_id`へ埋め込みます。再配送時は`conversations.replies`をcursorの終端まで読み、同じBotのexact blockが1件なら既存投稿を再利用します。0件だけ新規投稿し、複数件または別投稿者による衝突なら恒久エラーとして止めます。Slack Agent Sessionは成功・rollback・cancelで`active`、失敗・確認待ちで`suspended`へ遷移します。本文、宛先、statusはDispatcherのstrict schema以外から指定できません。この方式はcustom message metadata schema、`metadata.message:read` scope、App再認可、運用者attestationを必要としません。
 
 `get_file`は、テキスト系ファイルを最大1 MiBで本文として返します。JPEG、PNG、GIF、WebPは最大5 MiBでMCPのimage contentとして返し、大きな画像ではSlackの縮小画像を使用します。その他のバイナリは安全なメタデータとSlack permalinkだけを返します。`url_private`とBot tokenはエージェントへ渡しません。イベントに添付されたファイルは、private URLを除いた`file_id`などの最小情報だけがEvent Envelopeへ入ります。
 
@@ -156,7 +154,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
   http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessを返し、metadata readinessをattestし、内部reporterと共有tokenを読み取れる場合だけ`update_notification_protocol: 1`を加えます。attestationがない場合は内部通知endpoint自体も503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
 
 ## 検証
 

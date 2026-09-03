@@ -12,7 +12,6 @@ const config: SlackAdapterConfig = {
   dispatcherSocketPath: "/tmp/dispatcher.sock",
   healthSocketPath: "/tmp/slack-health.sock",
   updateInternalTokenPath: "/tmp/dispatcher.token",
-  updateMetadataSchemaRegistered: false,
   dispatcherConnectTimeoutMs: 500,
   dispatcherTimeoutMs: 2_000,
   shutdownGraceMs: 200,

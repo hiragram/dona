@@ -49,7 +49,6 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
-    config.updateMetadataSchemaRegistered,
   );
   await health.start();
   try {

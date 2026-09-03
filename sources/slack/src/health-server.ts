@@ -70,7 +70,6 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
-    private readonly updateNotificationProtocolEnabled = false,
   ) {}
 
   async start(): Promise<void> {
@@ -117,10 +116,10 @@ export class SlackHealthServer {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
-      if (!this.updateNotificationProtocolEnabled || !this.updateNotifications || !this.updateInternalTokenPath) {
+      if (!this.updateNotifications || !this.updateInternalTokenPath) {
         send(response, 503, {
           schema_version: 1,
-          error: { code: "reporter_unavailable", message: "Update reporter is not configured and attested" },
+          error: { code: "reporter_unavailable", message: "Update reporter is not configured" },
         });
         return;
       }
@@ -181,8 +180,8 @@ export class SlackHealthServer {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
       const ready = workspacesReady && dispatcherReady;
-      const updateNotificationProtocolReady = this.updateNotificationProtocolEnabled &&
-        this.updateNotifications !== undefined && await this.internalTokenReady();
+      const updateNotificationProtocolReady = this.updateNotifications !== undefined &&
+        await this.internalTokenReady();
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",

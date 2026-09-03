@@ -12,22 +12,6 @@ features:
   bot_user:
     display_name: dona
     always_online: false
-metadata:
-  event_subscriptions:
-    - event_type: dona.update_notification
-      schema:
-        type: object
-        required:
-          - notification_id
-          - request_id
-          - terminal_fence
-        properties:
-          notification_id:
-            type: string
-          request_id:
-            type: string
-          terminal_fence:
-            type: integer
 oauth_config:
   scopes:
     bot:
@@ -40,7 +24,6 @@ oauth_config:
       - im:history
       - mpim:history
       - chat:write
-      - metadata.message:read
       - files:read
       - reactions:read
       - reactions:write

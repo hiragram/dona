@@ -17,7 +17,6 @@ describe("loadAdapterConfig", () => {
       config.healthSocketPath,
       path.join(os.homedir(), "Library", "Application Support", "Dona", "run", "slack-adapter.sock"),
     );
-    assert.equal(config.updateMetadataSchemaRegistered, false);
   });
 
   test("rejects attempts to disable Socket Mode", () => {
@@ -27,14 +26,4 @@ describe("loadAdapterConfig", () => {
     );
   });
 
-  test("enables update notification protocol only from an explicit metadata-schema attestation", () => {
-    assert.equal(loadAdapterConfig({
-      SLACK_WORKSPACES: "company",
-      SLACK_UPDATE_METADATA_SCHEMA_REGISTERED: "true",
-    }).updateMetadataSchemaRegistered, true);
-    assert.throws(() => loadAdapterConfig({
-      SLACK_WORKSPACES: "company",
-      SLACK_UPDATE_METADATA_SCHEMA_REGISTERED: "yes",
-    }), /must be true or false/);
-  });
 });

@@ -185,7 +185,7 @@ describe("UpdateNotificationWorker", () => {
     notifications.close();
   });
 
-  test("keeps a confirmed partial Slack receipt when metadata persistence fails", async () => {
+  test("keeps a confirmed partial Slack receipt when identity-block persistence fails", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const events = new DispatcherDatabase(config.databasePath);
@@ -195,8 +195,8 @@ describe("UpdateNotificationWorker", () => {
       async deliver(input) {
         return {
           outcome: "permanent",
-          code: "metadata_not_persisted",
-          message: "Slack omitted metadata",
+          code: "identity_block_not_persisted",
+          message: "Slack omitted the identity block",
           receipt: {
             notification_id: input.notification_id as string,
             workspace_id: input.workspace_id as string,

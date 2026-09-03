@@ -9,7 +9,6 @@ export interface SlackAdapterConfig {
   dispatcherSocketPath: string;
   healthSocketPath: string;
   updateInternalTokenPath: string;
-  updateMetadataSchemaRegistered: boolean;
   dispatcherConnectTimeoutMs: number;
   dispatcherTimeoutMs: number;
   shutdownGraceMs: number;
@@ -36,13 +35,6 @@ function socketModeEnabled(value: string | undefined): true {
   throw new Error("SLACK_SOCKET_MODE_ENABLED must be true; HTTP event reception is not supported");
 }
 
-function metadataSchemaRegistered(value: string | undefined): boolean {
-  if (value === undefined || value.trim() === "") return false;
-  if (value.trim().toLowerCase() === "true") return true;
-  if (value.trim().toLowerCase() === "false") return false;
-  throw new Error("SLACK_UPDATE_METADATA_SCHEMA_REGISTERED must be true or false");
-}
-
 function buildSha(env: NodeJS.ProcessEnv): string {
   const explicit = env.DONA_BUILD_SHA?.trim();
   if (explicit) return explicit;
@@ -67,7 +59,6 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     updateInternalTokenPath: expandHome(
       env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
     ),
-    updateMetadataSchemaRegistered: metadataSchemaRegistered(env.SLACK_UPDATE_METADATA_SCHEMA_REGISTERED),
     dispatcherConnectTimeoutMs: positiveInteger(
       env.DONA_CONNECT_TIMEOUT_MS,
       500,
