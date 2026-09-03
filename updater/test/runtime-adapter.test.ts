@@ -43,6 +43,23 @@ function agentResponse(cwd: string, sessionId: string | null, interactiveReady =
   });
 }
 
+function paneResponse(cwd: string): string {
+  return JSON.stringify({
+    result: {
+      type: "pane_info",
+      pane: {
+        terminal_id: "term-1",
+        agent_status: "unknown",
+        workspace_id: "w1",
+        tab_id: "w1:t1",
+        pane_id: "w1:p1",
+        cwd,
+        foreground_cwd: cwd,
+      },
+    },
+  });
+}
+
 class AgentRunner extends RecordingRunner {
   running = true;
   cwd: string;
@@ -50,6 +67,7 @@ class AgentRunner extends RecordingRunner {
   omitSessionOnStart = false;
   interactiveReady = true;
   becomeReadyOnNextGet = false;
+  ignoreCwdChange = false;
 
   constructor(cwd: string) {
     super();
@@ -64,6 +82,16 @@ class AgentRunner extends RecordingRunner {
       this.running = false;
       return { ...ok, stdout: JSON.stringify({ result: { type: "ok" } }) };
     }
+    if (args.includes("pane") && args.includes("run")) {
+      const command = String(args.at(-1));
+      const match = /^cd -- '(.*)'$/.exec(command);
+      if (!match) return { ...ok, exit_code: 1, stderr: JSON.stringify({ error: { code: "invalid_request" } }) };
+      if (!this.ignoreCwdChange) this.cwd = match[1]!.replaceAll(`'\\''`, "'");
+      return { ...ok, stdout: JSON.stringify({ result: { type: "ok" } }) };
+    }
+    if (args.includes("pane") && args.includes("get")) {
+      return { ...ok, stdout: paneResponse(this.cwd) };
+    }
     if (args.includes("get")) {
       if (this.becomeReadyOnNextGet) {
         this.becomeReadyOnNextGet = false;
@@ -74,8 +102,6 @@ class AgentRunner extends RecordingRunner {
         : { ...ok, exit_code: 1, stderr: JSON.stringify({ error: { code: "agent_not_found", message: "missing" } }) };
     }
     if (args.includes("start")) {
-      const separator = args.indexOf("--");
-      this.cwd = String(args[separator + 2]);
       this.sessionId = this.omitSessionOnStart ? null : "session-new";
       this.running = true;
       return { ...ok, stdout: agentResponse(this.cwd, this.sessionId, this.interactiveReady) };
@@ -205,6 +231,9 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
       [policy.executables.herdr, "--session", "dona", "agent", "get", "dona-main"],
       [policy.executables.herdr, "--session", "dona", "agent", "send-keys", "w1:p1", "ctrl+c"],
       [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
+      [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
+      [policy.executables.herdr, "--session", "dona", "pane", "run", "w1:p1", `cd -- '${canonicalTargetRelease}'`],
+      [policy.executables.herdr, "--session", "dona", "pane", "get", "w1:p1"],
       [
         policy.executables.herdr, "--session", "dona", "agent", "start", "dona-main", "--kind", "codex",
         "--pane", "w1:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
@@ -212,13 +241,33 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
       ],
     ]);
+    runner.running = false;
+    runner.cwd = currentRelease;
+    runner.sessionId = "session-old";
     runner.interactiveReady = false;
     runner.becomeReadyOnNextGet = true;
     const delayedReady = await runtime.startMainAgent("w1:p1", targetRelease, "session-old");
     assert.equal(delayedReady.outcome, "started");
     assert.equal(delayedReady.observation.interactive_ready, true);
+    runner.running = false;
+    runner.cwd = currentRelease;
     runner.omitSessionOnStart = true;
     assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "accepted_unknown");
+    const busyCallCount = runner.calls.length;
+    const busy = await runtime.startMainAgent("w1:p1", targetRelease);
+    assert.equal(busy.outcome, "rejected");
+    assert.equal(busy.error_code, "agent_pane_busy");
+    assert.equal(runner.calls.length, busyCallCount + 1);
+    assert.deepEqual(runner.calls.at(-1)!.args, ["--session", "dona", "agent", "get", "w1:p1"]);
+    runner.running = false;
+    runner.cwd = currentRelease;
+    runner.ignoreCwdChange = true;
+    const unchangedCwdCallCount = runner.calls.length;
+    const unchangedCwd = await runtime.startMainAgent("w1:p1", targetRelease);
+    assert.equal(unchangedCwd.outcome, "accepted_unknown");
+    assert.equal(unchangedCwd.error_code, "main_agent_pane_cwd_change_unknown");
+    assert.equal(runner.calls.slice(unchangedCwdCallCount).some(({ args }) => args.includes("start")), false);
+    runner.ignoreCwdChange = false;
     const callCount = runner.calls.length;
     await fs.chmod(path.join(policy.config_root, "slack.env"), 0o644);
     assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "rejected");

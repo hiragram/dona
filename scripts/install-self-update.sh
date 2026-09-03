@@ -16,6 +16,31 @@ CONTROL_UPGRADE_ACTIVE=0
 CONTROL_SWAPPED=0
 CONTROL_BACKUP_ROOT=""
 
+bootstrap_updater_reconciled() {
+  local context=$1
+  local output=""
+  local exit_code=0
+  integer attempt
+  integer observation
+  for attempt in 1 2; do
+    if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 2>&1); then
+      return 0
+    else
+      exit_code=$?
+    fi
+    for observation in {1..20}; do
+      if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
+        print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、登録済み状態を確認しました。"
+        return 0
+      fi
+      /bin/sleep 0.1
+    done
+    print -u2 -- "${context}のlaunchctl bootstrap attempt ${attempt}はexit ${exit_code}で拒否され、未登録状態を確認しました。"
+    if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
+  done
+  return 1
+}
+
 restore_control_plane() {
   if [[ "$CONTROL_UPGRADE_ACTIVE" != "1" || -z "$CONTROL_BACKUP_ROOT" ]]; then return 0; fi
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
@@ -46,7 +71,7 @@ restore_control_plane() {
       /bin/rm -f "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/updater.sqlite3-wal" "$CONTROL_ROOT/updater.sqlite3-shm"
     fi
   fi
-  if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" >/dev/null 2>&1; then
+  if ! bootstrap_updater_reconciled "旧stable updaterの復旧"; then
     print -u2 "旧stable updaterをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
   fi
@@ -283,8 +308,8 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" >/dev/null 2>&1 || true
-  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
+  if bootstrap_updater_reconciled "新しいstable updaterの登録" && \
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"
     print "次に通常updateをplan/applyして、DispatcherとSlack Adapterを同じreleaseへ切り替えてください。"

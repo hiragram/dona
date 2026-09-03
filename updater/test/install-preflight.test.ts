@@ -152,6 +152,9 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /SELECT COUNT\(\*\) FROM update_requests WHERE state NOT IN/);
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
+  assert.match(source, /bootstrap_updater_reconciled/);
+  assert.match(source, /未登録状態を確認しました/);
+  assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
   assert.doesNotMatch(source, /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/u);
   const hardenedUpgradeTree = source.indexOf('find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +');
   const writableUpgradeRoot = source.indexOf('chmod 700 "$BACKUP_ROOT/updater.next"');

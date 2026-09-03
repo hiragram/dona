@@ -349,6 +349,18 @@ function findAgentInfo(input: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
+function findPaneInfo(input: unknown): Record<string, unknown> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const value = input as Record<string, unknown>;
+  if (typeof value.pane_id === "string" &&
+    (typeof value.foreground_cwd === "string" || typeof value.cwd === "string")) return value;
+  for (const child of Object.values(value)) {
+    const found = findPaneInfo(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 function herdrErrorCode(result: CommandResult): string | undefined {
   return findString(parseJson(result.stderr || result.stdout), ["error_code", "code"]);
 }
@@ -397,6 +409,15 @@ function mainAgentObservation(result: CommandResult, expectedReleasePath?: strin
   };
 }
 
+function paneWorkingDirectory(result: CommandResult): string | undefined {
+  if (result.timed_out || result.output_truncated || result.exit_code !== 0) return undefined;
+  const info = findPaneInfo(parseJson(result.stdout));
+  if (!info) return undefined;
+  return typeof info.foreground_cwd === "string"
+    ? info.foreground_cwd
+    : typeof info.cwd === "string" ? info.cwd : undefined;
+}
+
 function sameMainAgent(left: MainAgentObservation, right: MainAgentObservation): boolean {
   return left.exists && right.exists && left.pane_id === right.pane_id && left.name === right.name && left.kind === right.kind &&
     left.session_id !== null && left.session_id === right.session_id;
@@ -408,6 +429,10 @@ function delay(milliseconds: number): Promise<void> {
 
 function tomlInlineTable(values: Readonly<Record<string, string>>): string {
   return `{ ${Object.entries(values).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`).join(", ")} }`;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 export class RealRuntime implements RuntimePort {
@@ -522,6 +547,36 @@ export class RealRuntime implements RuntimePort {
       canonicalConfigRoot = configRoot;
     } catch {
       return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_release"), error_code: "invalid_main_agent_release" };
+    }
+    const paneOccupant = await this.readAgent(paneId);
+    if (paneOccupant.exists) {
+      return { outcome: "rejected", observation: paneOccupant, error_code: "agent_pane_busy" };
+    }
+    if (!["agent_not_found", "agent_not_running"].includes(paneOccupant.error_code ?? "")) {
+      return { outcome: "accepted_unknown", observation: paneOccupant, error_code: "main_agent_pane_state_unknown" };
+    }
+    const cwdChange = await this.herdr([
+      "--session", this.policy.main_agent.session,
+      "pane", "run", paneId, `cd -- ${shellSingleQuote(canonicalRelease)}`,
+    ], this.policy.timeouts.health_ms);
+    const cwdDeadline = Date.now() + this.policy.timeouts.agent_exit_ms;
+    let observedPaneCwd: string | undefined;
+    do {
+      const pane = await this.herdr([
+        "--session", this.policy.main_agent.session,
+        "pane", "get", paneId,
+      ], this.policy.timeouts.health_ms);
+      observedPaneCwd = paneWorkingDirectory(pane);
+      if (observedPaneCwd !== undefined && path.normalize(observedPaneCwd) === path.normalize(canonicalRelease)) break;
+      await delay(100);
+    } while (Date.now() < cwdDeadline);
+    if (observedPaneCwd === undefined || path.normalize(observedPaneCwd) !== path.normalize(canonicalRelease)) {
+      const errorCode = herdrErrorCode(cwdChange) ?? "main_agent_pane_cwd_change_unknown";
+      return {
+        outcome: cwdChange.exit_code !== 0 && !cwdChange.timed_out && !cwdChange.output_truncated ? "rejected" : "accepted_unknown",
+        observation: missingMainAgent(errorCode),
+        error_code: errorCode,
+      };
     }
     const projectTrust = `projects = { ${JSON.stringify(canonicalRelease)} = { trust_level = "trusted" } }`;
     const dispatcherMcpEnvironment = `mcp_servers.dona_dispatcher.env = ${tomlInlineTable({
