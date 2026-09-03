@@ -153,7 +153,9 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
   assert.match(source, /bootstrap_updater_reconciled/);
-  assert.match(source, /未登録状態を確認しました/);
+  assert.match(source, /DONA_UPDATER_BUILD_SHA => \$\{expected_sha\}/);
+  assert.match(source, /exact SHAの登録済み状態を確認しました/);
+  assert.match(source, /expected SHAの未登録状態を確認しました/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
   assert.doesNotMatch(source, /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/u);
   const hardenedUpgradeTree = source.indexOf('find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +');
