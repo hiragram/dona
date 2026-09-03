@@ -752,6 +752,10 @@ export class UpdateDatabase {
       lease_expires_at: null,
       reconcile_after: null,
       reconcile_deadline: null,
+      ...(to === "succeeded" ? {
+        last_error_code: null,
+        last_error_message: null,
+      } : {}),
     }, code, {});
     this.db.prepare("UPDATE controller_state SET active_request_id = NULL, updated_at = ? WHERE singleton = 1 AND active_request_id = ?")
       .run(at.toISOString(), row.request_id);

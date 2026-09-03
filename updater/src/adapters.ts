@@ -20,6 +20,9 @@ import type {
 } from "./types.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
+const mainAgentStartupPrompt =
+  "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。";
+
 function commandError(name: string, result: CommandResult): Error {
   const suffix = result.timed_out ? "timed out" : `exited ${result.exit_code}`;
   return new Error(redactText(`${name} ${suffix}: ${result.stderr || result.stdout}`, 1_000));
@@ -601,6 +604,7 @@ export class RealRuntime implements RuntimePort {
         "--timeout", String(this.policy.timeouts.agent_start_ms),
         "--", "-C", canonicalRelease, "-c", projectTrust,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+        "-c", "check_for_update_on_startup=false", mainAgentStartupPrompt,
       ], this.policy.timeouts.agent_start_ms + 5_000);
       if (result.exit_code === 0 && !result.timed_out && !result.output_truncated) break;
       if (herdrErrorCode(result) !== "agent_pane_busy" || Date.now() >= deadline) break;

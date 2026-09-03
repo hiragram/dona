@@ -51,7 +51,7 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 
 ## Stable control-plane更新と既存インシデント補正
 
-stable updaterとpolicy/schemaを更新する前に、各workspaceのSlack Appへ[`sources/slack/manifest.yaml`](../sources/slack/manifest.yaml)を反映します。App Manifest上で`dona.update_notification` schemaとbot scopeの`metadata.message:read`を確認し、追加scopeがtokenへ反映されるようAppを再認可します。確認後、owner-onlyの`config/slack.env`へ次を1行だけ設定します。
+stable updaterとpolicy/schemaを更新する前に、各workspaceのSlack Appへ[`sources/slack/manifest.yaml`](../sources/slack/manifest.yaml)を反映します。App Manifestのトップレベル`metadata.event_subscriptions`で`dona.update_notification` schemaを、bot scopeで`metadata.message:read`を確認し、追加scopeがtokenへ反映されるようAppを再認可します。`settings.metadata`はschema登録先ではありません。確認後、owner-onlyの`config/slack.env`へ次を1行だけ設定します。
 
 ```dotenv
 SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true
