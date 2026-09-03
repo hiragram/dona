@@ -121,6 +121,9 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /comment ID.*URL.*GitHub server時刻/,
     /Pull Request head SHA.*結び付け/,
     /reconcile中にheadが変わった場合.*triggerを受理せず停止/,
+    /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
+    /Codex actorの`eyes`.*新規投稿しない/,
+    /current SHA.*exact triggerへ一意.*引き継ぐ.*複数候補.*停止/,
   ]);
   assertContract(polling, "poll source", [
     /exact trigger commentのreaction一覧endpoint.*pagination/,
@@ -155,7 +158,9 @@ test("feedback後は各inline threadへdirect replyしてからfresh roundへ進
   const feedback = section(reviewRound, "feedbackを処理する");
 
   assertContract(feedback, "inline direct reply", [
-    /push後.*Codex inline comment全件/,
+    /file変更が生じた場合だけ.*commit.*push/,
+    /file変更がない場合.*空commitやpushを行わず.*current SHA一致/,
+    /修正をpushした後.*file変更なし.*Codex inline comment全件/,
     /comments\/\{comment_id\}\/replies.*direct inline reply/,
     /short commit hash.*変更方針.*検証/,
     /対応しない.*具体的.*根拠/,
@@ -187,6 +192,7 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
     /指定したbaseを優先.*指定がない場合だけdefault branch/,
     /current branch.*selected base自身でない.*task commit.*直接pushしない/,
     /同じhead\/selected base.*重複.*selected base向けnon-draft/,
+    /既存Pull Requestがdraft.*重複作成しない.*許可.*ready.*確認できなければ.*停止/,
     /latest selected baseをmerge/,
     /rebase.*force push.*ours.*theirs.*stash.*破棄.*禁止/,
   ]);

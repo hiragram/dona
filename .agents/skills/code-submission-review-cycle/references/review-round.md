@@ -5,8 +5,9 @@
 ## round recordを作る
 
 1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認する。違えばtriggerを投稿せず、どのstateがcurrentかを解消する。
-2. exact `@codex review`だけをPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
-3. writeの応答がtimeout・切断で曖昧なら同じcommentを再投稿しない。issue commentsを再取得し、author、bodyの完全一致、server時刻帯によりcommentを照合し、Pull Request headがwrite直前の`target_sha`から変わっていないことも確認する。issue comment単体はhead SHAを証明しないため、reconcile中にheadが変わった場合はそのtriggerを受理せず停止する。commentを1件かつ同じheadへ一意に確定できない場合も停止する。
+2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。Codex actorの`eyes`があるtriggerを見つけた場合は新規投稿しない。保存済みround record、またはCodex-authoredのrunning artifactがcurrent SHAを明記しserver時刻からexact triggerへ一意に対応する場合だけそのroundを引き継ぐ。複数候補、別SHA、対応不明なら停止して人間へ報告する。
+3. 進行中roundがない場合だけ、exact `@codex review`をPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
+4. writeの応答がtimeout・切断で曖昧なら同じcommentを再投稿しない。issue commentsを再取得し、author、bodyの完全一致、server時刻帯によりcommentを照合し、Pull Request headがwrite直前の`target_sha`から変わっていないことも確認する。issue comment単体はhead SHAを証明しないため、reconcile中にheadが変わった場合はそのtriggerを受理せず停止する。commentを1件かつ同じheadへ一意に確定できない場合も停止する。
 
 round recordには少なくとも次を保持する。
 
@@ -42,12 +43,12 @@ reaction、review/comment集合、head SHA、CI conclusionのいずれかが変�
 
 1. findingごとに対象diff、現在のcode、call site、schema、test、repository指示、明示された要件を照合する。
 2. 妥当でscope内なら最小の修正と意味のあるregression testを加え、repository既定の検証を実行する。不適用、既修正、明示要件と衝突するfindingは変更せず、具体的なcode根拠または要件を記録する。
-3. taskとreview関連fileだけを明示stage・commitし、通常pushする。local/upstream/Pull Request SHA、base conflict、mergeability、current CIを再確認する。base conflictなら`SKILL.md`のmerge規則へ戻る。
-4. push後、前roundのCodex inline comment全件へ`POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies`でdirect inline replyを行う。
+3. 修正でfile変更が生じた場合だけ、taskとreview関連fileを明示stage・commitし、通常pushする。local/upstream/Pull Request SHA、base conflict、mergeability、current CIを再確認する。base conflictなら`SKILL.md`のmerge規則へ戻る。不適用・既修正findingだけでfile変更がない場合は空commitやpushを行わず、current SHA一致を維持する。
+4. 修正をpushした後、またはfile変更なしの判断を確定した後に、前roundのCodex inline comment全件へ`POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies`でdirect inline replyを行う。
    - 修正済み: short commit hash、変更方針、実行した検証を書く。
    - 同じcommitで複数findingを直した場合も、各inline threadへ個別にreplyする。
    - 対応しない: commitを捏造せず、変更しない具体的なproduct要件または技術的根拠を書く。
 5. reply writeが曖昧ならblind retryせず、そのinline threadのrepliesを再取得してauthor、server時刻、body、reply targetで照合する。一意に確定できなければ停止する。
-6. 全inline commentにdirect replyがあることとSHA一致を確認してから、fresh `@codex review`で次roundを開始する。
+6. 全inline commentにdirect replyがあることとSHA一致を確認してから、fresh `@codex review`で次roundを開始する。file変更なしの場合は同じSHAを次roundのtargetとしてよい。
 
 一般Pull Request commentやreview summaryをinline direct replyの代用にしない。新しいpushにより旧roundのclean signalは失効する。
