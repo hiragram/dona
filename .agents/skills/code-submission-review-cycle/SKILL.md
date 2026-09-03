@@ -19,10 +19,11 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 1. latest remote default branch、current branch、upstream、local diff、同じhead/baseのopen/closed Pull Requestを再取得する。ユーザーまたは既存workflowが指定したbaseを優先し、指定がない場合だけdefault branchをbaseに選ぶ。
 2. push前にcurrent branchがselected base自身でないことを確認する。同じ場合は、依頼範囲で安全に作成できる衝突のないtask branchへ切り替えるか、人間へ確認して停止する。task commitをselected baseへ直接pushしない。
-3. task fileだけを検証・明示stage・commitし、remoteへforceなしでpushする。同じhead/selected baseのopen Pull Requestがなければ、open/closed/mergedを含む重複を再確認する。closed/mergedだけが一致する場合は、current headにselected baseとの差分があり依頼が新規Pull Request作成を許可していると確認できる場合だけ、過去PRを変更せず新しいnon-draft Pull Requestを作る。それ以外は人間へ確認して停止する。
-4. matching Pull Requestが存在しない場合も、作成権限を確認してselected base向けnon-draft Pull Requestを作る。同じhead/selected baseの既存open Pull Requestがdraftなら重複作成せず、依頼がnon-draft提出またはready化を許可していると確認できる場合だけreadyへ変更して再取得し、確認できなければ人間へ質問して停止する。
-5. local `HEAD`、upstream、Pull Request head SHAの完全一致と、selected base/head/state/non-draft、mergeability、base conflict、required/current CIを記録する。
-6. base conflictがあればlatest selected baseをmergeする。各conflictを文脈ごとに解消して検証し、merge commitを通常pushする。rebase、force push、無差別な`ours`/`theirs`選択、ユーザー変更のstash・破棄は禁止する。
+3. taskの未commit diffがあれば、task fileだけを検証・明示stage・commitする。working treeがcleanならselected baseとの差分とcommit historyを調べ、既存commitが対象変更を一意に含むことを確認する。確認できた既存task commitは再利用し、新しいcommitや空commitを作らない。対象commitを証明できなければ停止する。
+4. local task commitがupstreamより先行しfast-forwardである場合だけremoteへforceなしでpushする。localとupstreamが既に一致する再開では不要なpushをしない。同じhead/selected baseのopen Pull Requestがなければ、open/closed/mergedを含む重複を再確認する。closed/mergedだけが一致する場合は、current headにselected baseとの差分があり依頼が新規Pull Request作成を許可していると確認できる場合だけ、過去PRを変更せず新しいnon-draft Pull Requestを作る。それ以外は人間へ確認して停止する。
+5. matching Pull Requestが存在しない場合も、作成権限を確認してselected base向けnon-draft Pull Requestを作る。同じhead/selected baseの既存open Pull Requestがdraftなら重複作成せず、依頼がnon-draft提出またはready化を許可していると確認できる場合だけreadyへ変更して再取得し、確認できなければ人間へ質問して停止する。
+6. local `HEAD`、upstream、Pull Request head SHAの完全一致と、selected base/head/state/non-draft、mergeability、base conflict、required/current CIを記録する。
+7. base conflictがあればlatest selected baseをmergeする。各conflictを文脈ごとに解消して検証し、merge commitを通常pushする。rebase、force push、無差別な`ours`/`theirs`選択、ユーザー変更のstash・破棄は禁止する。
 
 reviewを始める前に[review round手順](references/review-round.md)を全文読み、その監視・feedback・返信・曖昧writeの規則に従う。
 

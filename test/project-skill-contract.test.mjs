@@ -195,6 +195,8 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   assertContract(target, "conflict workflow", [
     /指定したbaseを優先.*指定がない場合だけdefault branch/,
     /current branch.*selected base自身でない.*task commit.*直接pushしない/,
+    /working treeがclean.*既存commit.*対象変更.*再利用.*空commitを作らない/,
+    /local task commit.*upstreamより先行.*fast-forward.*forceなし.*localとupstreamが既に一致.*不要なpushをしない/,
     /同じhead\/selected base.*open Pull Request.*重複/,
     /matching Pull Requestが存在しない.*selected base向けnon-draft/,
     /closed\/mergedだけ.*current head.*selected baseとの差分.*新規Pull Request作成.*過去PRを変更せず/,
