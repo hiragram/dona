@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify-skill:
-    name: Verify github-issue-decomposition skill
+  project-skills:
+    name: Verify project Skills
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -27,8 +27,8 @@ jobs:
         with:
           node-version: 24
 
-      - name: Run routing contract tests
-        run: node --test .agents/skills/github-issue-decomposition/tests/*.test.mjs
+      - name: Validate project Skills
+        run: npm run test:skills
 
   verify:
     name: Verify ${{ matrix.component }}
