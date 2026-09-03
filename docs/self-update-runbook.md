@@ -34,7 +34,7 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 3. 明示承認後だけ、Donaは`apply_self_update(source_event_id, plan_id, plan_hash, approval_id)`を呼びます。
 4. acceptedは「approval受付eventとexact planをDBへcommitした」意味です。その受付Event Resultが`completed`になるまでactivationは始まりません。
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
-6. `get_self_update_status`でstate/health/outboxに加えて`main_agent`のcwd/sessionを確認します。terminal通知は元Slack threadへ別eventとして戻ります。
+6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
 
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
 
@@ -47,13 +47,27 @@ node "$HOME/Library/Application Support/Dona/update-control/updater/dist/cli.js"
 node "$HOME/Library/Application Support/Dona/update-control/updater/dist/cli.js" reconcile upd_...
 ```
 
-reconcileはpointer、receipt、DB fence/checkpoint、両serviceのversioned health、`dona-main`のagent identityとforeground cwdを読みます。観測がtarget successかprevious rollbackを一意に証明できない場合は`needs_review`のままです。
+reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent、両serviceのversioned health/通知protocol、`dona-main`のagent identity、Codex session、foreground cwdを読みます。acceptance不明のstop/startはpolicyの`reconcile_ms`内でread-only観測し、同じwriteは再送しません。観測がtarget successかprevious rollbackを一意に証明できないまま期限を迎えた場合だけ`needs_review`にします。
 
-## dona-main lifecycle対応の初回導入
+## Stable control-plane更新と既存インシデント補正
 
-既存installのstable updaterとpolicyはroutine updateの対象外です。この機能を最初に導入する回だけはmaintenance windowを確保し、active updateがないことを確認してからstable updater copyと`policy.json`を`2026-09-03.1`へ更新し、updaterを再起動します。旧stable updaterへ新policyだけを先に渡すとschema検証で起動できないため、binaryとpolicyを一組として切り替えます。通常updateでこの導入を代用してはいけません。
+stable updaterとpolicy/schemaを更新する前に、各workspaceのSlack Appへ[`sources/slack/manifest.yaml`](../sources/slack/manifest.yaml)を反映します。App Manifest上で`dona.update_notification` schemaとbot scopeの`metadata.message:read`を確認し、追加scopeがtokenへ反映されるようAppを再認可します。確認後、owner-onlyの`config/slack.env`へ次を1行だけ設定します。
 
-導入後は`doctor`でminimum Herdr version、`dona-main`、current releaseを確認してから通常updateをplanします。stable updaterの停止・copy・復旧commandは環境固有のため、このrepositoryのinstallerがin-place control-plane upgradeを実装するまでは手動手順としてreviewし、同じcommandをtimeout後に反復しません。
+```dotenv
+SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true
+```
+
+この値は外部状態の自動検出ではなく運用者のattestationです。schema登録またはscope再認可が未反映のまま有効化してはいけません。未設定、`false`、重複定義では`--upgrade-control`が拒否され、新Slack Adapterも`update_notification_protocol`をhealthへ公開しません。
+
+その後maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
+
+```sh
+./scripts/install-self-update.sh --upgrade-control
+```
+
+このmodeは、同じSHAのreleaseが既存でもfresh stagingと実行treeの内容hashが一致しない限り再利用しません。Updaterだけを停止し、socket停止後にSQLite全件でnonterminal countが0であることを再確認します。その後、旧updater/policy/plistとcheckpoint・integrity確認済みSQLiteを`update-control/control-backups/<new-sha>.<attempt>/`へ保存します。新SHA、`update_schema: 3`、DB読書きが揃うversion healthを確認できなければ旧一式とDBを戻し、旧SHA healthを確認します。成功後もDispatcher/Slack Adapterは旧releaseのままなので、表示された新SHAを対象に通常のplan/applyを続けます。
+
+policy `2026-09-03.1`で`main_agent_start_failed`になった既存requestは、旧runtime上でtarget pointer、activation receipt、両service、`dona-main`が一致した場合だけ証拠を保存します。この時点では訂正通知を送りません。通常updateでDispatcher/Slack Adapterの`update_notification_protocol: 1`を確認した後、新しいterminal fenceを発行し、元threadへ訂正を1回だけ投稿します。
 
 ## Emergency rollback
 

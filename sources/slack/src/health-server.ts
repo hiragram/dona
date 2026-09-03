@@ -1,10 +1,16 @@
 import fs from "node:fs/promises";
+import { timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherClient } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
+import {
+  parseUpdateNotificationRequest,
+  UpdateNotificationPermanentError,
+  type UpdateNotificationPort,
+} from "./update-notification.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -13,6 +19,19 @@ function send(response: ServerResponse, statusCode: number, body: unknown): void
     "content-length": encoded.length,
   });
   response.end(encoded);
+}
+
+async function readPrivateToken(tokenPath: string): Promise<string | undefined> {
+  try {
+    const stats = await fs.lstat(tokenPath);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0) {
+      return undefined;
+    }
+    const token = (await fs.readFile(tokenPath, "utf8")).trim();
+    return token.length >= 32 ? token : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function socketIsAlive(socketPath: string): Promise<boolean> {
@@ -49,6 +68,9 @@ export class SlackHealthServer {
     private readonly dispatcher: Pick<DispatcherClient, "healthReady">,
     private readonly logger: SlackLogger,
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
+    private readonly updateNotifications?: UpdateNotificationPort,
+    private readonly updateInternalTokenPath?: string,
+    private readonly updateNotificationProtocolEnabled = false,
   ) {}
 
   async start(): Promise<void> {
@@ -94,6 +116,52 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (method === "POST" && pathname === "/v1/internal/update-notifications") {
+      if (!this.updateNotificationProtocolEnabled || !this.updateNotifications || !this.updateInternalTokenPath) {
+        send(response, 503, {
+          schema_version: 1,
+          error: { code: "reporter_unavailable", message: "Update reporter is not configured and attested" },
+        });
+        return;
+      }
+      if (!(await this.authorized(request))) {
+        send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
+        return;
+      }
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, error: { code: "shutting_down", message: "Slack Adapter is stopping" } });
+        return;
+      }
+      try {
+        const input = parseUpdateNotificationRequest(await this.readJson(request));
+        const result = await this.updateNotifications.deliver(input);
+        send(response, 200, { schema_version: 1, ...result });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const invalid = message.startsWith("notification ");
+        const permanent = error instanceof UpdateNotificationPermanentError;
+        const errorCode = invalid
+          ? "invalid_update_notification"
+          : permanent
+            ? error.code
+            : "update_notification_failed";
+        this.logger.error("Slack update notification failed", {
+          error_code: errorCode,
+          error_message: message,
+        });
+        send(response, invalid ? 400 : permanent ? 409 : 503, {
+          schema_version: 1,
+          ...(error instanceof UpdateNotificationPermanentError && error.receipt
+            ? { receipt: error.receipt }
+            : {}),
+          error: {
+            code: errorCode,
+            message: invalid || permanent ? message : "Slack update notification could not be completed",
+          },
+        });
+      }
+      return;
+    }
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });
       return;
@@ -113,6 +181,8 @@ export class SlackHealthServer {
       const dispatcherReady = await this.dispatcher.healthReady();
       const workspacesReady = !this.adapter.isStopping() && this.adapter.isSocketReady();
       const ready = workspacesReady && dispatcherReady;
+      const updateNotificationProtocolReady = this.updateNotificationProtocolEnabled &&
+        this.updateNotifications !== undefined && await this.internalTokenReady();
       send(response, ready ? 200 : 503, {
         schema_version: 1,
         status: ready ? "ready" : "not_ready",
@@ -121,6 +191,7 @@ export class SlackHealthServer {
         protocol: 1,
         app_schema: 2,
         config: 1,
+        ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),
         workspaces_ready: workspacesReady,
         socket_mode: this.adapter.connectionStates(),
         dispatcher_ready: dispatcherReady,
@@ -164,5 +235,37 @@ export class SlackHealthServer {
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
+  }
+
+  private async authorized(request: IncomingMessage): Promise<boolean> {
+    const supplied = request.headers["x-dona-update-token"];
+    if (typeof supplied !== "string" || !this.updateInternalTokenPath) return false;
+    const expected = await readPrivateToken(this.updateInternalTokenPath);
+    return expected !== undefined && supplied.length === expected.length &&
+      timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+  }
+
+  private async internalTokenReady(): Promise<boolean> {
+    if (!this.updateInternalTokenPath) return false;
+    return (await readPrivateToken(this.updateInternalTokenPath)) !== undefined;
+  }
+
+  private async readJson(request: IncomingMessage): Promise<unknown> {
+    if (request.headers["content-type"]?.split(";", 1)[0] !== "application/json") {
+      throw new Error("notification content type must be application/json");
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of request) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > 64 * 1024) throw new Error("notification body exceeds 64 KiB");
+      chunks.push(buffer);
+    }
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      throw new Error("notification body must be JSON");
+    }
   }
 }

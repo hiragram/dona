@@ -58,6 +58,12 @@ export class SlackWorkspaceRegistry {
     );
   }
 
+  getByTeamId(teamId: string): SlackWorkspaceConnection {
+    const connection = [...this.connections.values()].find((candidate) => candidate.teamId === teamId);
+    if (connection) return connection;
+    throw new Error(`Unknown Slack workspace ID: ${teamId}`);
+  }
+
   list(): Omit<SlackWorkspaceConnection, "client">[] {
     return [...this.connections.values()].map(({ client: _client, ...identity }) => identity);
   }

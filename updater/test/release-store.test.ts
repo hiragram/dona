@@ -20,6 +20,7 @@ function row(): UpdateRow {
     restart_attempts: 0, lease_owner: "controller", lease_expires_at: "2026-09-02T00:00:10.000Z", fence: 1,
     cancellation_requested: 0, cancellation_event_id: null, last_error_code: null, last_error_message: null,
     created_at: "2026-09-02T00:00:00.000Z", updated_at: "2026-09-02T00:00:00.000Z", completed_at: null,
+    reconcile_after: null, reconcile_deadline: null, last_reconciled_at: null, observed_active_sha: null,
   };
 }
 
@@ -86,5 +87,49 @@ describe("ReleaseStore", () => {
       store.publish(externalHardlinkStage, manifest(targetSha)),
       /staging_owner_permissions_or_hardlink_invalid/,
     );
+  });
+
+  test("rejects a malformed or extended activation receipt instead of trusting a cast", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    await fs.mkdir(policy.control_root, { recursive: true });
+    await fs.writeFile(path.join(policy.control_root, "activation-receipt.json"), JSON.stringify({
+      schema_version: 1,
+      request_id: row().request_id,
+      fence: 1,
+      generation: 1,
+      from_sha: currentSha,
+      to_sha: targetSha,
+      pointer_switched_at: "2026-09-03T00:00:00.000Z",
+      untrusted_extension: true,
+    }));
+    await assert.rejects(store.observe(), /unsupported fields/);
+  });
+
+  test("resumes a rollback after only the current pointer was durably switched", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    const staging = await store.prepareStaging(row().request_id, 1);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    const release = await store.publish(staging, manifest(targetSha));
+    const activation = await store.activate(row(), release);
+
+    await fs.unlink(policy.current_pointer);
+    await fs.symlink(path.join(policy.release_root, currentSha), policy.current_pointer);
+    const partial = await store.observe();
+    assert.equal(partial.current_sha, currentSha);
+    assert.equal(partial.previous_sha, currentSha);
+    assert.equal(partial.receipt?.to_sha, targetSha);
+
+    const rollback = await store.rollback({ ...row(), state: "rolling_back", activation_generation: activation.generation });
+    assert.equal(rollback.generation, activation.generation + 1);
+    const observed = await store.observe();
+    assert.equal(observed.current_sha, currentSha);
+    assert.equal(observed.previous_sha, targetSha);
+    assert.equal(observed.receipt?.to_sha, currentSha);
   });
 });

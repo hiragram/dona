@@ -494,7 +494,7 @@ export class RealRuntime implements RuntimePort {
     return { outcome: "accepted_unknown", pane_id: expected.pane_id, error_code: "main_agent_exit_not_observed" };
   }
 
-  async startMainAgent(paneId: string, releasePath: string): Promise<MainAgentStartResult> {
+  async startMainAgent(paneId: string, releasePath: string, previousSessionId?: string): Promise<MainAgentStartResult> {
     if (!/^[a-z0-9][a-z0-9:_-]{0,63}$/.test(paneId)) {
       return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_pane"), error_code: "invalid_main_agent_pane" };
     }
@@ -552,13 +552,20 @@ export class RealRuntime implements RuntimePort {
       await delay(100);
     } while (true);
     let observation = mainAgentObservation(result, canonicalRelease);
-    if (!observation.exists || !observation.matches_release) observation = await this.mainAgentStatus(canonicalRelease);
-    if (observation.exists && observation.name === this.policy.main_agent.name && observation.kind === "codex" &&
-      observation.pane_id === paneId && observation.session_id !== null && observation.interactive_ready &&
-      observation.matches_release && ["idle", "done"].includes(observation.status ?? "")) {
-      return { outcome: "started", observation, error_code: null };
+    const observationDeadline = Date.now() + this.policy.timeouts.agent_start_ms;
+    while (true) {
+      if (observation.exists && observation.name === this.policy.main_agent.name && observation.kind === "codex" &&
+        observation.pane_id === paneId && observation.session_id !== null &&
+        observation.session_id !== previousSessionId && observation.interactive_ready &&
+        observation.matches_release && ["idle", "done"].includes(observation.status ?? "")) {
+        return { outcome: "started", observation, error_code: null };
+      }
+      const remaining = observationDeadline - Date.now();
+      if (remaining <= 0) break;
+      await delay(Math.min(250, remaining));
+      observation = await this.mainAgentStatus(canonicalRelease);
     }
-    const errorCode = herdrErrorCode(result) ?? observation.error_code ?? "main_agent_start_failed";
+    const errorCode = herdrErrorCode(result) ?? observation.error_code ?? "main_agent_start_observation_timeout";
     const definitelyRejected = !result.timed_out && !result.output_truncated && !observation.exists &&
       ["agent_pane_busy", "agent_not_found", "invalid_request"].includes(errorCode);
     return { outcome: definitelyRejected ? "rejected" : "accepted_unknown", observation, error_code: errorCode };
@@ -630,6 +637,9 @@ export class RealRuntime implements RuntimePort {
         protocol: typeof response.protocol === "number" ? response.protocol : null,
         app_schema: typeof response.app_schema === "number" ? response.app_schema : null,
         config: typeof response.config === "number" ? response.config : null,
+        ...(typeof response.update_notification_protocol === "number"
+          ? { update_notification_protocol: response.update_notification_protocol }
+          : {}),
         ...(service === "slack_adapter" ? { workspaces_ready: response.workspaces_ready === true } : {}),
       };
     } catch {
@@ -659,13 +669,13 @@ export class RealDispatcher implements DispatcherPort {
     };
   }
 
-  async deliverCompletion(outbox: OutboxRow): Promise<"delivered" | "accepted_unknown" | "rejected"> {
+  async deliverCompletion(outbox: OutboxRow): Promise<import("./types.js").CompletionDeliveryResult> {
     let token: string;
     try {
       token = (await fs.readFile(this.policy.dispatcher_internal_token_file, "utf8")).trim();
-      if (token.length < 32) return "rejected";
+      if (token.length < 32) return { outcome: "definitive_rejection", error_code: "invalid_internal_token" };
     } catch {
-      return "rejected";
+      return { outcome: "definitive_rejection", error_code: "missing_internal_token" };
     }
     try {
       const response = await udsRequest(
@@ -676,30 +686,51 @@ export class RealDispatcher implements DispatcherPort {
         this.policy.timeouts.health_ms,
         { "x-dona-update-token": token },
       );
-      return response.statusCode === 200 || response.statusCode === 202 ? "delivered" : "rejected";
-    } catch {
-      return "accepted_unknown";
+      if (response.statusCode === 200 || response.statusCode === 202) {
+        const parsed = parsedObject(response);
+        return typeof parsed.event_id === "string"
+          ? { outcome: "accepted", event_id: parsed.event_id }
+          : { outcome: "acceptance_unknown", error_code: "missing_dispatcher_event_id" };
+      }
+      return response.statusCode >= 400 && response.statusCode < 500
+        ? { outcome: "definitive_rejection", error_code: `dispatcher_http_${response.statusCode}` }
+        : { outcome: "unavailable", error_code: `dispatcher_http_${response.statusCode}` };
+    } catch (error) {
+      return {
+        outcome: "acceptance_unknown",
+        error_code: error instanceof Error && error.message.includes("timeout")
+          ? "completion_post_timeout"
+          : "completion_post_connection_lost",
+      };
     }
   }
 
-  async completionExists(externalEventId: string): Promise<boolean> {
+  async completionLookup(outbox: OutboxRow): Promise<import("./types.js").CompletionLookupResult> {
     let token: string;
     try {
       token = (await fs.readFile(this.policy.dispatcher_internal_token_file, "utf8")).trim();
-      if (token.length < 32) return false;
+      if (token.length < 32) return { outcome: "unavailable", error_code: "invalid_internal_token" };
     } catch {
-      return false;
+      return { outcome: "unavailable", error_code: "missing_internal_token" };
     }
     try {
-      const query = new URLSearchParams({ external_event_id: externalEventId });
+      const query = new URLSearchParams({
+        external_event_id: outbox.external_event_id,
+        payload_sha256: sha256(outbox.payload_json),
+      });
       const response = await udsRequest(
         this.policy.dispatcher_socket, "GET", `/v1/internal/update-events/lookup?${query}`, undefined,
         this.policy.timeouts.health_ms, { "x-dona-update-token": token },
       );
-      if (response.statusCode === 404) return false;
-      return parsedObject(response).exists === true;
+      if (response.statusCode === 404) return { outcome: "absent" };
+      if (response.statusCode === 409) return { outcome: "conflict", error_code: "completion_payload_mismatch" };
+      if (response.statusCode !== 200) return { outcome: "unavailable", error_code: `dispatcher_lookup_http_${response.statusCode}` };
+      const parsed = parsedObject(response);
+      return parsed.exists === true && typeof parsed.event_id === "string" && typeof parsed.status === "string"
+        ? { outcome: "exists", event_id: parsed.event_id, status: parsed.status }
+        : { outcome: "unavailable", error_code: "invalid_dispatcher_lookup_response" };
     } catch {
-      return false;
+      return { outcome: "unavailable", error_code: "dispatcher_lookup_unavailable" };
     }
   }
 }

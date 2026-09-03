@@ -11,6 +11,8 @@ import { MacOSKeychainStore } from "./keychain.js";
 import { createSlackLogger, createSocketSdkLogger } from "./logger.js";
 import { promptSecret } from "./prompt.js";
 import { SlackSocketAdapter, type WorkspaceSocket } from "./socket-adapter.js";
+import { SlackUpdateNotificationReporter } from "./update-notification.js";
+import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -36,8 +38,19 @@ async function main(): Promise<void> {
     connectTimeoutMs: config.dispatcherConnectTimeoutMs,
     timeoutMs: config.dispatcherTimeoutMs,
   });
+  const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
+  const updateNotifications = new SlackUpdateNotificationReporter(registry);
   const adapter = new SlackSocketAdapter(sockets, dispatcher, config, logger);
-  const health = new SlackHealthServer(config.healthSocketPath, adapter, dispatcher, logger, config.buildSha);
+  const health = new SlackHealthServer(
+    config.healthSocketPath,
+    adapter,
+    dispatcher,
+    logger,
+    config.buildSha,
+    updateNotifications,
+    config.updateInternalTokenPath,
+    config.updateMetadataSchemaRegistered,
+  );
   await health.start();
   try {
     await adapter.start();

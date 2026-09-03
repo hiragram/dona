@@ -20,7 +20,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
     root,
     policy: {
       schema_version: 1,
-      policy_version: "2026-09-03.1",
+      policy_version: "2026-09-03.2",
       repository: "hiragram/dona",
       canonical_remote: "https://github.com/hiragram/dona.git",
       default_branch: "main",
@@ -40,7 +40,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
       },
       timeouts: {
         command_ms: 5_000, health_ms: 100, drain_ms: 100, agent_drain_ms: 100,
-        agent_exit_ms: 100, agent_start_ms: 100, lease_ms: 1_000,
+        agent_exit_ms: 100, agent_start_ms: 100, reconcile_ms: 2_000, lease_ms: 1_000,
       },
       output_limit_bytes: 64 * 1024,
       disk_floor_bytes: 0,
@@ -64,7 +64,7 @@ export function manifest(sha: string): ReleaseManifest {
     schema_version: 1,
     sha,
     repository: "hiragram/dona",
-    policy_version: "2026-09-03.1",
+    policy_version: "2026-09-03.2",
     lock_hashes: { dispatcher: "a".repeat(64), "sources/slack": "b".repeat(64), updater: "c".repeat(64) },
     node_version: process.versions.node,
     npm_version: "11.0.0",

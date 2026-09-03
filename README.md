@@ -56,7 +56,7 @@ Herdrの`dona`セッション内には、事前に`dona-main`という名前のC
 - [Self-update architecture](./docs/self-update-architecture.md)
 - [Self-update運用runbook](./docs/self-update-runbook.md)
 
-updater自身の自動更新、app DB schema migration、GitHub repository settings変更は対象外です。既存installへ`dona-main` lifecycle対応を導入する最初の1回だけはstable updater/policyのmaintenance更新が必要です。
+updater自身はroutine updateの対象外です。stable updater/policy/schemaの更新には、非terminal requestを拒否し、旧DBとfilesをbackupして新旧version healthを照合する`./scripts/install-self-update.sh --upgrade-control`をmaintenance windowで使います。app DB schema migrationとGitHub repository settings変更は対象外です。
 
 ## 全体検証
 

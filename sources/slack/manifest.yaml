@@ -24,12 +24,29 @@ oauth_config:
       - im:history
       - mpim:history
       - chat:write
+      - metadata.message:read
       - files:read
       - reactions:read
       - reactions:write
       - users:read
   pkce_enabled: false
 settings:
+  metadata:
+    event_subscriptions:
+      - event_type: dona.update_notification
+        schema:
+          type: object
+          required:
+            - notification_id
+            - request_id
+            - terminal_fence
+          properties:
+            notification_id:
+              type: string
+            request_id:
+              type: string
+            terminal_fence:
+              type: integer
   event_subscriptions:
     bot_events:
       - app_mention

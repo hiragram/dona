@@ -582,11 +582,43 @@ export class DispatcherDatabase {
     const head = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed')
+        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
         ORDER BY sequence LIMIT 1
       `)
       .get() as EventRow | undefined;
     return head && head.available_at <= at.toISOString() ? head : undefined;
+  }
+
+  updateEventsNeedingNotification(): EventRow[] {
+    return this.db.prepare(`
+      SELECT * FROM events
+      WHERE source = 'dona_update' AND status IN ('queued', 'retryable_failed')
+      ORDER BY sequence
+    `).all() as EventRow[];
+  }
+
+  saveDeterministicCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    const row = this.getRequired(eventId);
+    if (row.status === "completed") return;
+    this.transition(eventId, ["queued", "retryable_failed"], "completed", {
+      result_json: stableStringify(result),
+      result_path: resultPath,
+      completed_at: result.completed_at,
+      last_error_code: null,
+      last_error_message: null,
+    });
+  }
+
+  saveDeterministicFailure(eventId: string, result: ResultEnvelope, resultPath: string, code: string): void {
+    const row = this.getRequired(eventId);
+    if (["needs_review", "completed"].includes(row.status)) return;
+    this.transition(eventId, ["queued", "retryable_failed"], "needs_review", {
+      result_json: stableStringify(result),
+      result_path: resultPath,
+      completed_at: result.completed_at,
+      last_error_code: code,
+      last_error_message: result.summary ?? "Update notification requires review",
+    });
   }
 
   recoverStaleDispatching(at = new Date()): number {

@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -8,6 +8,8 @@ import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
+import { envelopeFromRow } from "./prompt.js";
+import { readPrivateToken } from "./private-token.js";
 import {
   parseCancelJobRequest,
   parseCreateJobRequest,
@@ -15,6 +17,7 @@ import {
   parseInternalUpdateEventEnvelope,
   parseSteerJobRequest,
   RequestValidationError,
+  stableStringify,
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
@@ -73,6 +76,7 @@ async function socketIsAlive(socketPath: string, timeoutMs = 500): Promise<boole
 
 export interface ApiWorkerState {
   isRunning(): boolean;
+  isHealthy?(): boolean;
   wake(): void;
 }
 
@@ -110,6 +114,7 @@ export class DispatcherApi {
     private readonly logger: Logger,
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
+    private readonly updateNotifications?: ApiWorkerState,
   ) {}
 
   async start(): Promise<void> {
@@ -169,7 +174,8 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning();
+        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
         try {
           this.database.assertReadableWritable();
         } catch {
@@ -179,7 +185,8 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning();
+        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
         try {
           this.database.assertReadableWritable();
         } catch {
@@ -193,6 +200,7 @@ export class DispatcherApi {
           protocol: 1,
           app_schema: 2,
           config: 1,
+          ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;
       }
@@ -412,7 +420,7 @@ export class DispatcherApi {
       const envelope = parseInternalUpdateEventEnvelope(await this.readJson(request));
       const result = this.database.enqueue(envelope);
       if (result.payloadMismatch) throw new ApiRequestError(409, "completion_payload_mismatch", "Stable external ID already exists with different payload");
-      this.worker.wake();
+      this.updateNotifications?.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
         event_id: result.row.event_id,
@@ -423,11 +431,21 @@ export class DispatcherApi {
     }
     if (request.method === "GET" && url.pathname === "/v1/internal/update-events/lookup") {
       const externalEventId = url.searchParams.get("external_event_id");
+      const expectedPayloadSha256 = url.searchParams.get("payload_sha256");
       if (!externalEventId || !/^update:upd_[0-9a-hjkmnp-tv-z]{26}:terminal:\d+$/.test(externalEventId)) {
         throw new ApiRequestError(400, "invalid_request", "external_event_id is invalid");
       }
+      if (!expectedPayloadSha256 || !/^[0-9a-f]{64}$/.test(expectedPayloadSha256)) {
+        throw new ApiRequestError(400, "invalid_request", "payload_sha256 is invalid");
+      }
       const row = this.database.getByExternalId("dona_update", externalEventId);
       if (!row) throw new ApiRequestError(404, "not_found", "Completion event was not found");
+      const persistedPayloadSha256 = createHash("sha256")
+        .update(stableStringify(envelopeFromRow(row)))
+        .digest("hex");
+      if (persistedPayloadSha256 !== expectedPayloadSha256) {
+        throw new ApiRequestError(409, "completion_payload_mismatch", "Completion event payload does not match the outbox");
+      }
       sendJson(response, 200, { schema_version: 1, exists: true, event_id: row.event_id, status: row.status });
       return;
     }
@@ -437,13 +455,8 @@ export class DispatcherApi {
   private async authorizedUpdateRequest(request: IncomingMessage): Promise<boolean> {
     const supplied = request.headers["x-dona-update-token"];
     if (typeof supplied !== "string") return false;
-    let expected: string;
-    try {
-      expected = (await fs.readFile(this.config.updateInternalTokenPath, "utf8")).trim();
-    } catch {
-      return false;
-    }
-    if (expected.length < 32 || supplied.length !== expected.length) return false;
+    const expected = await readPrivateToken(this.config.updateInternalTokenPath);
+    if (!expected || supplied.length !== expected.length) return false;
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 

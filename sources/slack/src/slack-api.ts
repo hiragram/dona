@@ -24,17 +24,25 @@ export interface SlackThreadMessage {
   text: string;
   fileIds: string[];
   reactions: SlackReaction[];
+  metadata?: SlackMessageMetadata;
 }
 
 export interface SlackThread {
   messages: SlackThreadMessage[];
   hasMore: boolean;
+  nextCursor?: string;
+}
+
+export interface SlackMessageMetadata {
+  eventType: string;
+  eventPayload: Record<string, string | number | boolean>;
 }
 
 export interface SlackPostResult {
   channelId: string;
   messageTs: string;
   threadTs?: string;
+  metadata?: SlackMessageMetadata;
 }
 
 export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
@@ -123,7 +131,7 @@ export interface SlackApiClient {
   getChannel(channelId: string): Promise<SlackChannel>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
-  getThread(channelId: string, threadTs: string, limit: number): Promise<SlackThread>;
+  getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
   getReactions(channelId: string, messageTs: string): Promise<SlackReactionSnapshot>;
   getFile(fileId: string): Promise<SlackFileInfo>;
   postMessage(input: {
@@ -131,6 +139,7 @@ export interface SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    metadata?: SlackMessageMetadata;
   }): Promise<SlackPostResult>;
   setAgentSessionStatus(input: {
     channelId: string;
@@ -157,6 +166,20 @@ function optionalCursor(value: string | undefined): string | undefined {
 function epochSecondsToIso(value: number | undefined): string | undefined {
   if (value === undefined || !Number.isFinite(value)) return undefined;
   return new Date(value * 1_000).toISOString();
+}
+
+function messageMetadata(value: unknown): SlackMessageMetadata | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const metadata = value as { event_type?: unknown; event_payload?: unknown };
+  if (typeof metadata.event_type !== "string" || !metadata.event_payload ||
+    typeof metadata.event_payload !== "object" || Array.isArray(metadata.event_payload) ||
+    Object.values(metadata.event_payload).some((item) =>
+      typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean"
+    )) return undefined;
+  return {
+    eventType: metadata.event_type,
+    eventPayload: metadata.event_payload as Record<string, string | number | boolean>,
+  };
 }
 
 function channelFromResponse(channel: {
@@ -388,10 +411,17 @@ export class SlackWebApiClient implements SlackApiClient {
     return userFromResponse(response.user);
   }
 
-  async getThread(channelId: string, threadTs: string, limit: number): Promise<SlackThread> {
+  async getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread> {
     const response = await callSlack(() =>
-      this.client.conversations.replies({ channel: channelId, ts: threadTs, limit }),
+      this.client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        limit,
+        include_all_metadata: true,
+        ...(cursor ? { cursor } : {}),
+      }),
     );
+    const nextCursor = optionalCursor(response.response_metadata?.next_cursor);
     return {
       messages: (response.messages ?? []).flatMap((message) => {
         if (!message.ts) return [];
@@ -414,10 +444,12 @@ export class SlackWebApiClient implements SlackApiClient {
                   ]
                 : [],
             ),
+            ...(messageMetadata(message.metadata) ? { metadata: messageMetadata(message.metadata)! } : {}),
           },
         ];
       }),
       hasMore: response.has_more ?? false,
+      ...(nextCursor ? { nextCursor } : {}),
     };
   }
 
@@ -565,6 +597,7 @@ export class SlackWebApiClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    metadata?: SlackMessageMetadata;
   }): Promise<SlackPostResult> {
     const base = {
       channel: input.channelId,
@@ -572,6 +605,12 @@ export class SlackWebApiClient implements SlackApiClient {
       mrkdwn: true as const,
       unfurl_links: false,
       unfurl_media: false,
+      ...(input.metadata ? {
+        metadata: {
+          event_type: input.metadata.eventType,
+          event_payload: input.metadata.eventPayload,
+        },
+      } : {}),
     };
     const response = await callSlack(() => {
       if (input.threadTs && input.replyBroadcast) {
@@ -590,6 +629,7 @@ export class SlackWebApiClient implements SlackApiClient {
       channelId: nonEmpty(response.channel, "channel"),
       messageTs: nonEmpty(response.ts, "ts"),
       ...(response.message?.thread_ts ? { threadTs: response.message.thread_ts } : {}),
+      ...(messageMetadata(response.message?.metadata) ? { metadata: messageMetadata(response.message?.metadata)! } : {}),
     };
   }
 

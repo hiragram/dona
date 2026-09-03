@@ -46,7 +46,7 @@ for (const name of ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-a
 
 const policy = {
   schema_version: 1,
-  policy_version: "2026-09-03.1",
+  policy_version: "2026-09-03.2",
   repository: "hiragram/dona",
   canonical_remote: "https://github.com/hiragram/dona.git",
   default_branch: "main",
@@ -65,7 +65,7 @@ const policy = {
   },
   timeouts: {
     command_ms: 900000, health_ms: 30000, drain_ms: 30000, agent_drain_ms: 900000,
-    agent_exit_ms: 30000, agent_start_ms: 60000, lease_ms: 60000,
+    agent_exit_ms: 30000, agent_start_ms: 60000, reconcile_ms: 300000, lease_ms: 60000,
   },
   output_limit_bytes: 1048576,
   disk_floor_bytes: 2147483648,

@@ -96,13 +96,19 @@ export class UpdaterApi {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       if (request.method === "GET" && url.pathname === "/health/version") {
-        send(response, this.service.isRunning() ? 200 : 503, {
+        let ready = this.service.isRunning();
+        try {
+          this.database.assertReadableWritable();
+        } catch {
+          ready = false;
+        }
+        send(response, ready ? 200 : 503, {
           schema_version: 1,
-          status: this.service.isRunning() ? "ready" : "not_ready",
+          status: ready ? "ready" : "not_ready",
           service: "updater",
           build_sha: this.buildSha,
           protocol: 1,
-          update_schema: 1,
+          update_schema: 3,
         });
         return;
       }

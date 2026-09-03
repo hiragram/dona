@@ -116,6 +116,10 @@ export interface UpdateRow {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  reconcile_after: string | null;
+  reconcile_deadline: string | null;
+  last_reconciled_at: string | null;
+  observed_active_sha: string | null;
 }
 
 export interface OutboxRow {
@@ -128,7 +132,60 @@ export interface OutboxRow {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+  dispatcher_event_id: string | null;
+  dispatcher_accepted_at: string | null;
+  slack_reported_at: string | null;
+  next_attempt_at: string | null;
+  superseded_by_outbox_id: string | null;
 }
+
+export const runtimeOperationKinds = [
+  "stop_main_agent",
+  "stop_slack",
+  "stop_dispatcher",
+  "start_target_main_agent",
+  "start_target_dispatcher",
+  "start_target_slack",
+  "restart_current_dispatcher",
+  "restart_current_slack",
+  "stop_target_slack",
+  "stop_target_dispatcher",
+  "stop_target_main_agent",
+  "start_previous_main_agent",
+  "start_previous_dispatcher",
+  "start_previous_slack",
+  "legacy_confirmation",
+] as const;
+
+export type RuntimeOperationKind = (typeof runtimeOperationKinds)[number];
+export type RuntimeOperationPhase = "prepared" | "accepted" | "observed" | "rejected" | "acceptance_unknown";
+
+export interface RuntimeOperationRow {
+  operation_id: string;
+  request_id: string;
+  fence: number;
+  kind: RuntimeOperationKind;
+  phase: RuntimeOperationPhase;
+  target_ref: string;
+  expected_sha: string | null;
+  previous_session_id: string | null;
+  observed_session_id: string | null;
+  evidence_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type CompletionDeliveryResult =
+  | { outcome: "accepted"; event_id: string }
+  | { outcome: "definitive_rejection"; error_code: string }
+  | { outcome: "acceptance_unknown"; error_code: string }
+  | { outcome: "unavailable"; error_code: string };
+
+export type CompletionLookupResult =
+  | { outcome: "exists"; event_id: string; status: string }
+  | { outcome: "absent" }
+  | { outcome: "conflict"; error_code: string }
+  | { outcome: "unavailable"; error_code: string };
 
 export interface HealthSnapshot {
   service: "dispatcher" | "slack_adapter";
@@ -138,6 +195,7 @@ export interface HealthSnapshot {
   protocol: number | null;
   app_schema: number | null;
   config: number | null;
+  update_notification_protocol?: number;
   workspaces_ready?: boolean;
 }
 

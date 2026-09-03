@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -65,11 +66,126 @@ test("bootstrap preflight distinguishes a listening dispatcher socket from an un
       server.once("error", reject);
       server.listen(socketPath, resolve);
     });
-    await assert.rejects(run("assert-socket-unused", socketPath), /npm run dev/);
+    await assert.rejects(run("assert-socket-unused", socketPath), /processが応答中/);
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("control-plane upgrade preflight requires exact updater health and only terminal requests", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-upgrade-preflight-"));
+  const socketPath = path.join(root, "updater.sock");
+  let state = "needs_review";
+  let nonterminalCount = 0;
+  let updateSchema: number | undefined = 3;
+  const sha = "2".repeat(40);
+  const server = http.createServer((request, response) => {
+    const body = request.url === "/health/version"
+      ? { schema_version: 1, status: "ready", service: "updater", build_sha: sha, update_schema: updateSchema }
+      : { schema_version: 1, updates: [{ state }], nonterminal_count: nonterminalCount };
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(body));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+    await run("assert-control-upgrade-safe", socketPath);
+    await run("wait-updater-sha", socketPath, sha, "500", "3");
+    updateSchema = 1;
+    await assert.rejects(run("wait-updater-sha", socketPath, sha, "50", "3"), /was not observed/);
+    updateSchema = 3;
+    state = "approved";
+    nonterminalCount = 1;
+    await assert.rejects(run("assert-control-upgrade-safe", socketPath), /active self-update/);
+    await assert.rejects(run("wait-updater-sha", socketPath, "3".repeat(40), "50"), /was not observed/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("installer exposes the guarded control-plane upgrade mode", async () => {
+  const source = await fs.readFile(installer, "utf8");
+  assert.match(source, /--upgrade-control/);
+  assert.match(source, /assert-control-upgrade-safe/);
+  assert.match(source, /wait-updater-sha/);
+  assert.match(source, /updater\.previous\.sqlite3/);
+  assert.match(source, /updater\.database-was-absent/);
+  assert.match(source, /PRAGMA integrity_check/);
+  assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
+  assert.match(source, /stable updaterを停止しません/);
+  assert.match(source, /updater\.next" -type f -exec chmod 400/);
+  assert.match(source, /SELECT COUNT\(\*\) FROM update_requests WHERE state NOT IN/);
+  assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
+  assert.match(source, /旧stable updaterの復旧healthを確認できません/);
+  if (process.platform === "darwin") await execute("/bin/zsh", ["-n", installer]);
+});
+
+test("an existing immutable release is reusable only with the exact control-plane contract", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-existing-release-"));
+  const sha = "2".repeat(40);
+  const existingRelease = path.join(root, sha);
+  const stagedRelease = path.join(root, "staging");
+  const manifestPath = path.join(existingRelease, "release-manifest.json");
+  const manifest = {
+    schema_version: 1,
+    sha,
+    repository: "hiragram/dona",
+    policy_version: "2026-09-03.2",
+    compatibility: {
+      protocol: 1,
+      config: 1,
+      app_schema_read_min: 2,
+      app_schema_read_max: 2,
+      app_schema_write: 2,
+      rollback_safe: true,
+    },
+  };
+  try {
+    await Promise.all([
+      fs.mkdir(path.join(existingRelease, "updater", "dist"), { recursive: true }),
+      fs.mkdir(path.join(stagedRelease, "updater", "dist"), { recursive: true }),
+    ]);
+    await Promise.all([
+      fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "export {};\n"),
+      fs.writeFile(path.join(stagedRelease, "updater", "dist", "cli.js"), "export {};\n"),
+    ]);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
+    await run("validate-existing-release", existingRelease, stagedRelease, sha);
+    await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "tampered\n");
+    await assert.rejects(
+      run("validate-existing-release", existingRelease, stagedRelease, sha),
+      /tree does not match/,
+    );
+    await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "export {};\n");
+    await assert.rejects(
+      run("validate-existing-release", existingRelease, stagedRelease, "3".repeat(40)),
+      /arguments are invalid/,
+    );
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, policy_version: "2026-09-03.1" }));
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /does not match/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("control upgrade requires an explicit Slack metadata-schema registration attestation", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-schema-attestation-"));
+  const environmentPath = path.join(root, "slack.env");
+  try {
+    await fs.writeFile(environmentPath, "SLACK_WORKSPACES=company\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=false\n");
+    await assert.rejects(run("assert-slack-metadata-attested", environmentPath), /not explicitly attested/);
+    await fs.writeFile(environmentPath, "SLACK_WORKSPACES=company\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\n");
+    await run("assert-slack-metadata-attested", environmentPath);
+    await fs.writeFile(environmentPath, "SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\nSLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true\n");
+    await assert.rejects(run("assert-slack-metadata-attested", environmentPath), /not explicitly attested/);
+  } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });

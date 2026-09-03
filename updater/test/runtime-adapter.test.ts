@@ -49,6 +49,7 @@ class AgentRunner extends RecordingRunner {
   sessionId: string | null = "session-old";
   omitSessionOnStart = false;
   interactiveReady = true;
+  becomeReadyOnNextGet = false;
 
   constructor(cwd: string) {
     super();
@@ -64,6 +65,10 @@ class AgentRunner extends RecordingRunner {
       return { ...ok, stdout: JSON.stringify({ result: { type: "ok" } }) };
     }
     if (args.includes("get")) {
+      if (this.becomeReadyOnNextGet) {
+        this.becomeReadyOnNextGet = false;
+        this.interactiveReady = true;
+      }
       return this.running
         ? { ...ok, stdout: agentResponse(this.cwd, this.sessionId, this.interactiveReady) }
         : { ...ok, exit_code: 1, stderr: JSON.stringify({ error: { code: "agent_not_found", message: "missing" } }) };
@@ -207,6 +212,11 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
       ],
     ]);
+    runner.interactiveReady = false;
+    runner.becomeReadyOnNextGet = true;
+    const delayedReady = await runtime.startMainAgent("w1:p1", targetRelease, "session-old");
+    assert.equal(delayedReady.outcome, "started");
+    assert.equal(delayedReady.observation.interactive_ready, true);
     runner.omitSessionOnStart = true;
     assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "accepted_unknown");
     const callCount = runner.calls.length;

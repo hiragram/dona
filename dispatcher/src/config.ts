@@ -23,6 +23,8 @@ export interface DispatcherConfig {
   gitPath: string;
   updaterSocketPath: string;
   updateInternalTokenPath: string;
+  updateNotificationDatabasePath: string;
+  slackAdapterSocketPath: string;
   buildSha: string;
 }
 
@@ -101,6 +103,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     updateInternalTokenPath: expandHome(
       env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
+    updateNotificationDatabasePath: expandHome(
+      env.DONA_UPDATE_NOTIFICATION_DATABASE_PATH ?? path.join(base, "update-notifications.sqlite3"),
+    ),
+    slackAdapterSocketPath: expandHome(
+      env.SLACK_HEALTH_SOCKET_PATH ?? path.join(base, "run", "slack-adapter.sock"),
     ),
     buildSha: buildSha(env),
   };
