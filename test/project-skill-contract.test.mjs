@@ -1,0 +1,187 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const skillRoot = resolve(repositoryRoot, ".agents/skills/code-submission-review-cycle");
+
+async function read(relativePath) {
+  return readFile(resolve(repositoryRoot, relativePath), "utf8");
+}
+
+function parseFrontmatter(markdown) {
+  const match = markdown.match(/^---\n([\s\S]*?)\n---\n/);
+  assert.ok(match, "SKILL.mdにYAML frontmatterが必要です");
+
+  return Object.fromEntries(
+    match[1].split("\n").map((line) => {
+      const separator = line.indexOf(":");
+      assert.notEqual(separator, -1, `frontmatter fieldを解釈できません: ${line}`);
+      const key = line.slice(0, separator).trim();
+      const rawValue = line.slice(separator + 1).trim();
+      return [key, rawValue.replace(/^(["'])(.*)\1$/, "$2")];
+    }),
+  );
+}
+
+function parseMappingYaml(source) {
+  const root = {};
+  const stack = [{ indent: -1, value: root }];
+
+  for (const [index, rawLine] of source.split("\n").entries()) {
+    if (/^\s*(?:#|$)/.test(rawLine)) continue;
+    const match = rawLine.match(/^(\s*)([A-Za-z_][\w-]*):(?:\s+(.*))?$/);
+    assert.ok(match, `openai.yaml ${index + 1}行目をmappingとして解釈できません`);
+    const indent = match[1].length;
+    assert.equal(indent % 2, 0, "openai.yamlのindentは2 spaces単位にします");
+
+    while (stack.at(-1).indent >= indent) stack.pop();
+    const parent = stack.at(-1).value;
+    const rawValue = match[3];
+    let value;
+    if (rawValue === undefined) {
+      value = {};
+    } else if (rawValue === "true" || rawValue === "false") {
+      value = rawValue === "true";
+    } else {
+      assert.match(rawValue, /^"(?:[^"\\]|\\.)*"$/, "string valueはdouble quoteで囲みます");
+      value = JSON.parse(rawValue);
+    }
+    parent[match[2]] = value;
+    if (rawValue === undefined) stack.push({ indent, value });
+  }
+
+  return root;
+}
+
+function section(markdown, heading) {
+  const headings = [...markdown.matchAll(/^(#{1,6})\s+(.+)$/gm)];
+  const startIndex = headings.findIndex((candidate) => candidate[2] === heading);
+  assert.notEqual(startIndex, -1, `必須sectionがありません: ${heading}`);
+  const current = headings[startIndex];
+  const next = headings.slice(startIndex + 1).find((candidate) => candidate[1].length <= current[1].length);
+  return markdown.slice(current.index, next?.index ?? markdown.length);
+}
+
+function assertContract(source, label, patterns) {
+  for (const pattern of patterns) {
+    assert.match(source, pattern, `${label}のcontractが不足しています: ${pattern}`);
+  }
+}
+
+test("implicit invocation metadataとrouting boundaryが整合する", async () => {
+  const [skill, openaiYaml] = await Promise.all([
+    read(".agents/skills/code-submission-review-cycle/SKILL.md"),
+    read(".agents/skills/code-submission-review-cycle/agents/openai.yaml"),
+  ]);
+  const frontmatter = parseFrontmatter(skill);
+  const metadata = parseMappingYaml(openaiYaml);
+
+  assert.equal(frontmatter.name, "code-submission-review-cycle");
+  assert.equal(metadata.policy?.allow_implicit_invocation, true);
+  assert.match(metadata.interface?.default_prompt ?? "", /\$code-submission-review-cycle/);
+  assert.ok((metadata.interface?.short_description?.length ?? 0) >= 25);
+  assert.ok((metadata.interface?.short_description?.length ?? 0) <= 64);
+
+  assertContract(frontmatter.description, "implicit routing", [
+    /コード実装.*修正.*refactor.*test変更/,
+    /commit.*push.*Pull Request/,
+    /read-only.*Issue作成だけ.*one-off review/,
+  ]);
+});
+
+test("AGENTS.mdがコード提出だけをmandatory routingにする", async () => {
+  const agents = await read("AGENTS.md");
+  const routing = section(agents, "コード提出のreview cycle");
+
+  assertContract(routing, "mandatory routing", [
+    /コード実装.*commit.*push.*Pull Request.*\$code-submission-review-cycle.*必ず使/,
+    /read-only.*Issue作成だけ.*one-off review.*適用しない/,
+    /merge.*force push.*無関係な変更.*許可されたと解釈しない/,
+  ]);
+});
+
+test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける", async () => {
+  const [skill, reviewRound] = await Promise.all([
+    read(".agents/skills/code-submission-review-cycle/SKILL.md"),
+    read(".agents/skills/code-submission-review-cycle/references/review-round.md"),
+  ]);
+  const target = section(skill, "review targetを固定する");
+  const boundary = section(skill, "安全境界");
+  const record = section(reviewRound, "round recordを作る");
+  const polling = section(reviewRound, "30〜60秒間隔で全sourceをpollする");
+
+  const link = target.match(/\[[^\]]+\]\((references\/[^)]+)\)/)?.[1];
+  assert.equal(link, "references/review-round.md");
+  assert.equal(resolve(skillRoot, link), resolve(skillRoot, "references/review-round.md"));
+  assertContract(record, "exact trigger/SHA binding", [
+    /exact `@codex review`.*1件/,
+    /comment ID.*URL.*GitHub server時刻/,
+    /Pull Request head SHA.*結び付け/,
+  ]);
+  assertContract(polling, "poll source", [
+    /exact trigger commentのreaction/,
+    /Pull Request review/,
+    /issue comment/,
+    /inline review comment/,
+    /current head SHA.*status check.*check run/,
+  ]);
+  assertContract(boundary, "round identity", [/古いround.*別SHA.*無視/]);
+});
+
+test("stalled roundはduplicate triggerなしで停止する", async () => {
+  const reviewRound = await read(".agents/skills/code-submission-review-cycle/references/review-round.md");
+  const polling = section(reviewRound, "30〜60秒間隔で全sourceをpollする");
+  const decision = section(reviewRound, "round結果を判定する");
+
+  assertContract(polling, "stalled no-duplicate", [
+    /eyes.*duplicate `@codex review`.*投稿しない/,
+    /30分.*stalled.*停止/,
+    /自動retriggerしない/,
+    /空reaction.*完了ではない/,
+  ]);
+  assertContract(decision, "empty state is not clean", [
+    /superseded.*旧roundをclean扱いせず/,
+  ]);
+});
+
+test("feedback後は各inline threadへdirect replyしてからfresh roundへ進む", async () => {
+  const reviewRound = await read(".agents/skills/code-submission-review-cycle/references/review-round.md");
+  const feedback = section(reviewRound, "feedbackを処理する");
+
+  assertContract(feedback, "inline direct reply", [
+    /push後.*Codex inline comment全件/,
+    /comments\/\{comment_id\}\/replies.*direct inline reply/,
+    /short commit hash.*変更方針.*検証/,
+    /対応しない.*具体的.*根拠/,
+    /全inline comment.*direct reply.*fresh `@codex review`/,
+    /一般Pull Request comment.*代用にしない/,
+  ]);
+});
+
+test("SKILL.mdが全completion gateと禁止事項を保持する", async () => {
+  const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
+  const completion = section(skill, "完了条件");
+  const boundary = section(skill, "routingと権限境界");
+  const target = section(skill, "review targetを固定する");
+
+  assertContract(completion, "completion gates", [
+    /latest round.*current Pull Request head SHA/,
+    /\+1.*no-major-issues\/no-findings/,
+    /未解決finding.*過去round.*inline comment.*direct reply済み/,
+    /local `HEAD`.*upstream.*Pull Request head SHA.*一致/,
+    /mergeable.*base conflict.*open.*non-draft/,
+    /required\/current CI.*terminal success/,
+  ]);
+  assertContract(boundary, "authorization boundary", [
+    /merge.*force push.*rebase.*無関係なcleanup.*許可しない/,
+    /task fileだけ.*明示stage/,
+    /stash.*破棄.*上書き.*しない/,
+  ]);
+  assertContract(target, "conflict workflow", [
+    /latest baseをmerge/,
+    /rebase.*force push.*ours.*theirs.*stash.*破棄.*禁止/,
+  ]);
+});
