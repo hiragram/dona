@@ -28,7 +28,7 @@ jobs:
           node-version: 24
 
       - name: Validate project Skills
-        run: node --test test/project-skill-contract.test.mjs
+        run: npm run test:skills
 
   verify:
     name: Verify ${{ matrix.component }}
