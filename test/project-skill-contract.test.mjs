@@ -120,9 +120,12 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /exact `@codex review`.*1件/,
     /comment ID.*URL.*GitHub server時刻/,
     /Pull Request head SHA.*結び付け/,
+    /reconcile中にheadが変わった場合.*triggerを受理せず停止/,
   ]);
   assertContract(polling, "poll source", [
-    /exact trigger commentのreaction/,
+    /exact trigger commentのreaction一覧endpoint.*pagination/,
+    /reactionごとの`user`/,
+    /Codex integration.*actor.*`\+1`だけ.*clean/,
     /Pull Request review/,
     /issue comment/,
     /inline review comment/,
@@ -181,7 +184,10 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
     /stash.*破棄.*上書き.*しない/,
   ]);
   assertContract(target, "conflict workflow", [
-    /latest baseをmerge/,
+    /指定したbaseを優先.*指定がない場合だけdefault branch/,
+    /current branch.*selected base自身でない.*task commit.*直接pushしない/,
+    /同じhead\/selected base.*重複.*selected base向けnon-draft/,
+    /latest selected baseをmerge/,
     /rebase.*force push.*ours.*theirs.*stash.*破棄.*禁止/,
   ]);
 });
