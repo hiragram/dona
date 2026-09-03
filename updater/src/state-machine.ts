@@ -15,7 +15,7 @@ const transitions: Readonly<Record<UpdateState, readonly UpdateState[]>> = {
   failed: [],
   rolling_back: ["rolled_back", "needs_review"],
   rolled_back: [],
-  needs_review: ["rolling_back"],
+  needs_review: ["rolling_back", "verifying"],
   cancelled: [],
 };
 

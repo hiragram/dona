@@ -42,6 +42,7 @@ export interface UpdatePolicy {
     agent_drain_ms: number;
     agent_exit_ms: number;
     agent_start_ms: number;
+    reconcile_ms: number;
     lease_ms: number;
   };
   output_limit_bytes: number;
@@ -122,7 +123,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   const executables = record(value.executables, "executables");
   exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr"], "executables");
   const timeouts = record(value.timeouts, "timeouts");
-  exact(timeouts, ["command_ms", "health_ms", "drain_ms", "agent_drain_ms", "agent_exit_ms", "agent_start_ms", "lease_ms"], "timeouts");
+  exact(timeouts, ["command_ms", "health_ms", "drain_ms", "agent_drain_ms", "agent_exit_ms", "agent_start_ms", "reconcile_ms", "lease_ms"], "timeouts");
   const controlRoot = absolute(value.control_root, "control_root");
   const configRoot = absolute(value.config_root, "config_root");
   const releaseRoot = absolute(value.release_root, "release_root");
@@ -184,6 +185,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       agent_drain_ms: integer(timeouts.agent_drain_ms, "timeouts.agent_drain_ms"),
       agent_exit_ms: integer(timeouts.agent_exit_ms, "timeouts.agent_exit_ms"),
       agent_start_ms: integer(timeouts.agent_start_ms, "timeouts.agent_start_ms"),
+      reconcile_ms: integer(timeouts.reconcile_ms, "timeouts.reconcile_ms"),
       lease_ms: integer(timeouts.lease_ms, "timeouts.lease_ms"),
     },
     output_limit_bytes: integer(value.output_limit_bytes, "output_limit_bytes", 1_024),

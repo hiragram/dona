@@ -8,6 +8,8 @@ import type {
   MainAgentStartResult,
   MainAgentStopResult,
   OutboxRow,
+  CompletionDeliveryResult,
+  CompletionLookupResult,
   ReleaseManifest,
   UpdateRow,
 } from "./types.js";
@@ -61,7 +63,7 @@ export interface RuntimePort {
   startSlack(): Promise<CommandResult>;
   waitForMainAgentIdle(): Promise<MainAgentObservation>;
   stopMainAgent(expected: MainAgentObservation): Promise<MainAgentStopResult>;
-  startMainAgent(paneId: string, releasePath: string): Promise<MainAgentStartResult>;
+  startMainAgent(paneId: string, releasePath: string, previousSessionId?: string): Promise<MainAgentStartResult>;
   mainAgentStatus(releasePath: string): Promise<MainAgentObservation>;
   dispatcherHealth(): Promise<HealthSnapshot>;
   slackHealth(): Promise<HealthSnapshot>;
@@ -70,8 +72,8 @@ export interface RuntimePort {
 export interface DispatcherPort {
   eventTerminal(eventId: string): Promise<boolean>;
   safetyStatus(): Promise<{ safe: boolean; unsafe_states: string[] }>;
-  deliverCompletion(outbox: OutboxRow): Promise<"delivered" | "accepted_unknown" | "rejected">;
-  completionExists(externalEventId: string): Promise<boolean>;
+  deliverCompletion(outbox: OutboxRow): Promise<CompletionDeliveryResult>;
+  completionLookup(outbox: OutboxRow): Promise<CompletionLookupResult>;
 }
 
 export interface Logger {

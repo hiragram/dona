@@ -3,7 +3,7 @@ import path from "node:path";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { ActivationReceipt, ReleaseManifest, UpdateRow } from "./types.js";
-import { canonicalJson, fullSha, parseReleaseManifest } from "./validation.js";
+import { canonicalJson, fullSha, parseActivationReceipt, parseReleaseManifest } from "./validation.js";
 
 async function fsyncDirectory(directory: string): Promise<void> {
   const handle = await fs.open(directory, "r");
@@ -134,13 +134,26 @@ export class ReleaseStore {
   async rollback(request: UpdateRow): Promise<ActivationReceipt> {
     const current = await this.resolvePointer(this.policy.current_pointer, true);
     const previous = await this.resolvePointer(this.policy.previous_pointer, true);
-    if (!current || !previous || path.basename(current) !== request.target_sha || path.basename(previous) !== request.current_sha) {
+    const activationReceipt = await this.readReceipt();
+    const currentSha = current ? path.basename(current) : null;
+    const previousSha = previous ? path.basename(previous) : null;
+    const exactActivationReceipt = activationReceipt?.request_id === request.request_id &&
+      activationReceipt.from_sha === request.current_sha && activationReceipt.to_sha === request.target_sha &&
+      activationReceipt.generation === request.activation_generation && activationReceipt.fence <= request.fence;
+    const untouchedRollback = currentSha === request.target_sha && previousSha === request.current_sha;
+    const resumableRollback = currentSha === request.current_sha &&
+      (previousSha === request.current_sha || previousSha === request.target_sha);
+    if (!current || !previous || !exactActivationReceipt || (!untouchedRollback && !resumableRollback)) {
       throw new Error("rollback_pointer_cas_mismatch");
     }
-    // Switch current first. A crash between the two renames leaves both pointers on
-    // the known-good release, while the target remains recoverable by its exact SHA.
-    await this.atomicPointer(this.policy.current_pointer, previous);
-    await this.atomicPointer(this.policy.previous_pointer, current);
+    const target = await this.validateReleasePath(path.join(this.policy.release_root, request.target_sha), request.target_sha);
+    if (untouchedRollback) {
+      // Switch current first. A crash between the two renames leaves both pointers on
+      // the known-good release. The exact activation receipt lets the next controller
+      // complete only the remaining previous-pointer and receipt writes.
+      await this.atomicPointer(this.policy.current_pointer, previous);
+    }
+    if (previousSha !== request.target_sha) await this.atomicPointer(this.policy.previous_pointer, target);
     const receipt: ActivationReceipt = {
       schema_version: 1,
       request_id: request.request_id,
@@ -159,13 +172,7 @@ export class ReleaseStore {
       this.resolvePointer(this.policy.current_pointer, false),
       this.resolvePointer(this.policy.previous_pointer, false),
     ]);
-    let receipt: ActivationReceipt | null = null;
-    try {
-      const body = await fs.readFile(path.join(this.policy.control_root, "activation-receipt.json"), "utf8");
-      receipt = JSON.parse(body) as ActivationReceipt;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    const receipt = await this.readReceipt();
     return {
       current_sha: current ? path.basename(current) : null,
       previous_sha: previous ? path.basename(previous) : null,
@@ -210,6 +217,16 @@ export class ReleaseStore {
   private async readPointerManifest(pointer: string, required: boolean): Promise<ReleaseManifest | null> {
     const resolved = await this.resolvePointer(pointer, required);
     return resolved ? this.readManifest(resolved) : null;
+  }
+
+  private async readReceipt(): Promise<ActivationReceipt | null> {
+    try {
+      const body = await fs.readFile(path.join(this.policy.control_root, "activation-receipt.json"), "utf8");
+      return parseActivationReceipt(JSON.parse(body));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
   }
 
   private async resolvePointer(pointer: string, required: boolean): Promise<string | null> {

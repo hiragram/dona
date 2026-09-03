@@ -4,10 +4,10 @@
 
 | application | entry point | responsibility |
 |---|---|---|
-| Slack Adapter | `dist/index.js` | Socket Modeでイベントを受信し、Dispatcherへ一方向に渡す |
+| Slack Adapter | `dist/index.js` | Socket ModeイベントをDispatcherへ渡し、typed internal update通知をSlackへ届ける |
 | Dona Slack MCP | `dist/mcp/index.js` | CodexがSlackの読み取り・書き込みを任意に実行するstdio MCP |
 
-AdapterはSlack Socket ModeのWebSocketからイベントを受信し、共通Event Envelopeへ正規化してDona Dispatcherへ転送します。Macへの公開port、Request URL、Signing Secretは不要です。MCPはAdapterとは別プロセスで、Herdr/Codexから必要時に起動されます。
+AdapterはSlack Socket ModeのWebSocketからイベントを受信し、共通Event Envelopeへ正規化してDona Dispatcherへ転送します。また、認証済みの内部UDS endpointでセルフアップデートの固定terminal通知を受け、該当threadへの投稿とAgent Session状態変更を行います。Macへの公開port、Request URL、Signing Secretは不要です。MCPはAdapterとは別プロセスで、Herdr/Codexから必要時に起動されます。
 
 通常の`message`はDona宛とは限らないため、正規化時にSlackの`channel_type`（`channel` / `group` / `im` / `mpim`）を許可リストで検証し、存在する場合は`subject.channel_type`として渡します。Donaはこの値、イベント種別、本文、スレッド文脈から対応要否を判断します。
 
@@ -108,6 +108,10 @@ MCPが公開するツール:
 
 MCPはSlack APIへの自動再試行を無効にしています。書き込みの通信結果が曖昧な場合、二重投稿を避けるためエージェントへ自動再試行しないよう伝えます。token、投稿本文、スレッド本文は通常ログへ出しません。
 
+セルフアップデート通知では、`request_id`とterminal fenceから一意な`notification_id`を作り、`dona.update_notification` metadataとして投稿します。再配送時は`conversations.replies`をcursorの終端まで読み、同じmetadataが1件なら既存投稿を再利用します。0件だけ新規投稿し、複数件なら恒久エラーとして止めます。Slack Agent Sessionは成功・rollback・cancelで`active`、失敗・確認待ちで`suspended`へ遷移します。本文、宛先、statusはDispatcherのstrict schema以外から指定できません。
+
+Slack AppのApp Manifestへ[`manifest.yaml`](./manifest.yaml)を反映し、`metadata.event_subscriptions`の`dona.update_notification` schemaとbot scopeの`metadata.message:read`を各workspaceで確認して再認可してから、`slack.env`の`SLACK_UPDATE_METADATA_SCHEMA_REGISTERED=true`を設定します。未設定または`false`ではAdapterは`update_notification_protocol`をversion healthへ公開せず、Updaterはterminal完了を確定しません。schema登録とscope付与を確認せずにこの値だけを有効化してはいけません。
+
 `get_file`は、テキスト系ファイルを最大1 MiBで本文として返します。JPEG、PNG、GIF、WebPは最大5 MiBでMCPのimage contentとして返し、大きな画像ではSlackの縮小画像を使用します。その他のバイナリは安全なメタデータとSlack permalinkだけを返します。`url_private`とBot tokenはエージェントへ渡しません。イベントに添付されたファイルは、private URLを除いた`file_id`などの最小情報だけがEvent Envelopeへ入ります。
 
 ビルド後、リポジトリの[`.codex/config.toml`](../../.codex/config.toml)が、Donaプロジェクトで起動したCodexへstdio MCPを追加します。
@@ -152,7 +156,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
   http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessだけを返します。secretやlocal private pathは返しません。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessを返し、metadata readinessをattestし、内部reporterと共有tokenを読み取れる場合だけ`update_notification_protocol: 1`を加えます。attestationがない場合は内部通知endpoint自体も503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
 
 ## 検証
 

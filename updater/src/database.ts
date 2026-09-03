@@ -13,11 +13,53 @@ import type {
   UpdatePlan,
   UpdateRow,
   UpdateState,
+  RuntimeOperationKind,
+  RuntimeOperationPhase,
+  RuntimeOperationRow,
 } from "./types.js";
 import { terminalUpdateStates, updateStates } from "./types.js";
 import { canonicalJson, sha256 } from "./validation.js";
 
 const stateSql = updateStates.map((state) => `'${state}'`).join(", ");
+const terminalStateSql = terminalUpdateStates.map((state) => `'${state}'`).join(", ");
+const reconcilableNeedsReviewCodes = [
+  // Policy 2026-09-03.1 compatibility bridge.
+  "main_agent_start_failed",
+  "dispatcher_start_acceptance_unknown",
+  "dispatcher_target_health_unavailable",
+  "slack_start_acceptance_unknown",
+  "slack_workspace_readiness_unavailable",
+  // Policy 2026-09-03.2 bounded observation outcomes.
+  "main_agent_stop_acceptance_unknown",
+  "main_agent_start_acceptance_unknown",
+  "main_agent_start_observation_timeout",
+  "activation_evidence_mismatch",
+  "ambiguous_runtime_observation",
+  "stop_slack_acceptance_unknown",
+  "stop_slack_observation_timeout",
+  "stop_dispatcher_acceptance_unknown",
+  "stop_dispatcher_observation_timeout",
+  "start_target_dispatcher_acceptance_unknown",
+  "start_target_dispatcher_health_unavailable",
+  "start_target_slack_acceptance_unknown",
+  "start_target_slack_health_unavailable",
+  "rollback_pointer_observation_mismatch",
+  "rollback_activation_evidence_mismatch",
+  "rollback_stop_evidence_incomplete",
+  "rollback_activation_unconfirmed",
+  "rollback_previous_health_failed",
+  "rollback_main_agent_stop_acceptance_unknown",
+  "rollback_main_agent_start_acceptance_unknown",
+  "stop_target_slack_acceptance_unknown",
+  "stop_target_slack_observation_timeout",
+  "stop_target_dispatcher_acceptance_unknown",
+  "stop_target_dispatcher_observation_timeout",
+  "start_previous_dispatcher_acceptance_unknown",
+  "start_previous_dispatcher_health_unavailable",
+  "start_previous_slack_acceptance_unknown",
+  "start_previous_slack_health_unavailable",
+] as const;
+const reconcilableNeedsReviewSql = reconcilableNeedsReviewCodes.map(() => "?").join(", ");
 
 function text(value: unknown): string | null {
   return typeof value === "string" ? value : null;
@@ -57,9 +99,11 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 1) throw new Error(`Updater database schema ${version} is newer than supported schema 1`);
-    if (version === 1) return;
-    this.db.exec(`
+    if (version > 3) throw new Error(`Updater database schema ${version} is newer than supported schema 3`);
+    const migrate = (sql: string): void => {
+      this.db.transaction(() => { this.db.exec(sql); })();
+    };
+    if (version === 0) migrate(`
       CREATE TABLE update_requests (
         request_id             TEXT PRIMARY KEY,
         source_event_id        TEXT NOT NULL UNIQUE,
@@ -87,7 +131,11 @@ export class UpdateDatabase {
         last_error_message     TEXT,
         created_at             TEXT NOT NULL,
         updated_at             TEXT NOT NULL,
-        completed_at           TEXT
+        completed_at           TEXT,
+        reconcile_after        TEXT,
+        reconcile_deadline     TEXT,
+        last_reconciled_at     TEXT,
+        observed_active_sha    TEXT
       );
       CREATE INDEX update_requests_state_idx ON update_requests(state, created_at);
 
@@ -125,10 +173,61 @@ export class UpdateDatabase {
         attempt_count    INTEGER NOT NULL DEFAULT 0,
         last_error       TEXT,
         created_at       TEXT NOT NULL,
-        updated_at       TEXT NOT NULL
+        updated_at       TEXT NOT NULL,
+        dispatcher_event_id TEXT,
+        dispatcher_accepted_at TEXT,
+        slack_reported_at TEXT,
+        next_attempt_at TEXT,
+        superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id)
       );
       CREATE INDEX update_outbox_status_idx ON update_outbox(status, created_at);
-      PRAGMA user_version = 1;
+      CREATE TABLE runtime_operations (
+        operation_id        TEXT PRIMARY KEY,
+        request_id          TEXT NOT NULL REFERENCES update_requests(request_id),
+        fence               INTEGER NOT NULL,
+        kind                TEXT NOT NULL,
+        phase               TEXT NOT NULL CHECK (phase IN ('prepared', 'accepted', 'observed', 'rejected', 'acceptance_unknown')),
+        target_ref          TEXT NOT NULL,
+        expected_sha        TEXT,
+        previous_session_id TEXT,
+        observed_session_id TEXT,
+        evidence_json       TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL,
+        UNIQUE(request_id, kind)
+      );
+      PRAGMA user_version = 3;
+    `);
+    if (version === 1) migrate(`
+      ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
+      ALTER TABLE update_requests ADD COLUMN reconcile_deadline TEXT;
+      ALTER TABLE update_requests ADD COLUMN last_reconciled_at TEXT;
+      ALTER TABLE update_requests ADD COLUMN observed_active_sha TEXT;
+      ALTER TABLE update_outbox ADD COLUMN dispatcher_event_id TEXT;
+      ALTER TABLE update_outbox ADD COLUMN dispatcher_accepted_at TEXT;
+      ALTER TABLE update_outbox ADD COLUMN slack_reported_at TEXT;
+      ALTER TABLE update_outbox ADD COLUMN next_attempt_at TEXT;
+      ALTER TABLE update_outbox ADD COLUMN superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id);
+      CREATE TABLE runtime_operations (
+        operation_id        TEXT PRIMARY KEY,
+        request_id          TEXT NOT NULL REFERENCES update_requests(request_id),
+        fence               INTEGER NOT NULL,
+        kind                TEXT NOT NULL,
+        phase               TEXT NOT NULL CHECK (phase IN ('prepared', 'accepted', 'observed', 'rejected', 'acceptance_unknown')),
+        target_ref          TEXT NOT NULL,
+        expected_sha        TEXT,
+        previous_session_id TEXT,
+        observed_session_id TEXT,
+        evidence_json       TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL,
+        UNIQUE(request_id, kind)
+      );
+      PRAGMA user_version = 3;
+    `);
+    if (version === 2) migrate(`
+      ALTER TABLE update_outbox ADD COLUMN superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id);
+      PRAGMA user_version = 3;
     `);
   }
 
@@ -138,6 +237,11 @@ export class UpdateDatabase {
 
   checkpoint(): void {
     this.db.pragma("wal_checkpoint(FULL)");
+  }
+
+  assertReadableWritable(): void {
+    this.db.prepare("SELECT 1").get();
+    this.db.prepare("UPDATE update_requests SET state = state WHERE 0").run();
   }
 
   createPlan(request: PlanRequest, material: PlanMaterial, at = new Date()): { row: UpdateRow; plan: UpdatePlan; duplicate: boolean } {
@@ -153,6 +257,15 @@ export class UpdateDatabase {
           existing.policy_version !== material.policy_version || existing.compatibility_json !== compatibilityJson;
         if (mismatch) throw new Error("A plan for this source event already exists with different material");
         return { row: existing, plan: this.planFromRow(existing), duplicate: true };
+      }
+      const openRequest = this.db.prepare(`
+        SELECT request_id FROM update_requests
+        WHERE state NOT IN (${terminalStateSql})
+        ORDER BY created_at LIMIT 1
+      `).get() as { request_id: string } | undefined;
+      if (openRequest) throw new Error(`Another self-update plan is still open: ${openRequest.request_id}`);
+      if (this.hasUnreportedTerminalNotification()) {
+        throw new Error("The previous self-update terminal notification is not settled");
       }
 
       const requestId = `upd_${ulid(at.getTime()).toLowerCase()}`;
@@ -234,12 +347,21 @@ export class UpdateDatabase {
     })();
   }
 
-  nextRunnable(): UpdateRow | undefined {
+  nextRunnable(at = new Date()): UpdateRow | undefined {
     return this.db.prepare(`
       SELECT * FROM update_requests
       WHERE state IN ('approved', 'preparing', 'staged', 'quiescing', 'activating', 'restarting', 'verifying', 'rolling_back')
+        AND (reconcile_after IS NULL OR reconcile_after <= ?)
       ORDER BY created_at LIMIT 1
-    `).get() as UpdateRow | undefined;
+    `).get(at.toISOString()) as UpdateRow | undefined;
+  }
+
+  reconcilableNeedsReview(): UpdateRow[] {
+    return this.db.prepare(`
+      SELECT * FROM update_requests
+      WHERE state = 'needs_review' AND last_error_code IN (${reconcilableNeedsReviewSql})
+      ORDER BY completed_at
+    `).all(...reconcilableNeedsReviewCodes) as UpdateRow[];
   }
 
   claim(requestId: string, owner: string, leaseMs: number, at = new Date()): UpdateRow | undefined {
@@ -297,6 +419,46 @@ export class UpdateDatabase {
     })();
   }
 
+  completeEvidenceReconcile(
+    requestId: string,
+    terminalStatus: "succeeded" | "rolled_back",
+    activeSha: string,
+    at = new Date(),
+  ): UpdateRow {
+    return this.db.transaction(() => {
+      const row = this.getRequired(requestId);
+      if (row.state !== "needs_review") throw new Error("Evidence reconcile requires needs_review state");
+      const allowed = this.reconcilableNeedsReview().some((candidate) => candidate.request_id === requestId) ||
+        this.runtimeOperation(requestId, "legacy_confirmation")?.phase === "observed";
+      if (!allowed) throw new Error("This needs_review reason is not eligible for evidence reconciliation");
+      if (!this.terminalOutboxSettledForCorrection(requestId)) {
+        throw new Error("Prior terminal notification acceptance is not settled");
+      }
+      const controller = this.db.prepare("SELECT active_request_id FROM controller_state WHERE singleton = 1")
+        .get() as { active_request_id: string | null };
+      if (controller.active_request_id && controller.active_request_id !== requestId) throw new Error("Another update is active");
+      const fence = row.fence + 1;
+      const intermediate: UpdateState = terminalStatus === "succeeded" ? "verifying" : "rolling_back";
+      assertTransition(row.state, intermediate);
+      const changed = this.db.prepare(`
+        UPDATE update_requests SET state = ?, completed_at = NULL, lease_owner = NULL,
+          lease_expires_at = NULL, fence = ?, reconcile_after = NULL, reconcile_deadline = NULL,
+          last_reconciled_at = ?, updated_at = ?
+        WHERE request_id = ? AND fence = ? AND state = 'needs_review'
+      `).run(intermediate, fence, at.toISOString(), at.toISOString(), requestId, row.fence).changes;
+      if (changed !== 1) throw new Error("Evidence reconcile was rejected by CAS");
+      this.db.prepare("UPDATE controller_state SET active_request_id = ?, updated_at = ? WHERE singleton = 1")
+        .run(requestId, at.toISOString());
+      const reopened = this.getRequired(requestId);
+      this.audit(reopened, "needs_review", intermediate, "evidence_reconcile_started", {}, at);
+      return this.completeInternal(reopened, terminalStatus, `reconciled_${terminalStatus}_evidence`, {
+        observed_active_sha: activeSha,
+        last_error_code: null,
+        last_error_message: null,
+      }, at);
+    })();
+  }
+
   renewLease(requestId: string, fence: number, owner: string, leaseMs: number, at = new Date()): void {
     const changed = this.db.prepare(`
       UPDATE update_requests SET lease_expires_at = ?, updated_at = ?
@@ -345,6 +507,108 @@ export class UpdateDatabase {
     if (changed !== 1) throw new Error("Restart attempt rejected by fencing token");
   }
 
+  deferReconcile(
+    requestId: string,
+    fence: number,
+    errorCode: string,
+    errorMessage: string,
+    after: Date,
+    deadline: Date,
+    at = new Date(),
+  ): void {
+    const changed = this.db.prepare(`
+      UPDATE update_requests SET reconcile_after = ?, reconcile_deadline = COALESCE(reconcile_deadline, ?),
+        last_reconciled_at = ?, last_error_code = ?, last_error_message = ?,
+        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE request_id = ? AND fence = ? AND completed_at IS NULL
+    `).run(
+      after.toISOString(), deadline.toISOString(), at.toISOString(), errorCode,
+      errorMessage.slice(0, 2_000), at.toISOString(), requestId, fence,
+    ).changes;
+    if (changed !== 1) throw new Error("Reconcile deferral rejected by fencing token");
+  }
+
+  clearReconcile(requestId: string, fence: number, at = new Date()): void {
+    const changed = this.db.prepare(`
+      UPDATE update_requests SET reconcile_after = NULL, reconcile_deadline = NULL,
+        last_reconciled_at = ?, updated_at = ? WHERE request_id = ? AND fence = ?
+    `).run(at.toISOString(), at.toISOString(), requestId, fence).changes;
+    if (changed !== 1) throw new Error("Reconcile clear rejected by fencing token");
+  }
+
+  prepareRuntimeOperation(
+    requestId: string,
+    fence: number,
+    kind: RuntimeOperationKind,
+    targetRef: string,
+    expectedSha: string | null,
+    previousSessionId: string | null,
+    evidence: Record<string, unknown> = {},
+    at = new Date(),
+  ): RuntimeOperationRow {
+    return this.db.transaction(() => {
+      const fenced = this.db.prepare(`
+        UPDATE update_requests SET updated_at = updated_at
+        WHERE request_id = ? AND fence = ? AND (
+          completed_at IS NULL OR (state = 'needs_review' AND ? = 'legacy_confirmation')
+        )
+      `).run(requestId, fence, kind).changes;
+      if (fenced !== 1) throw new Error(`Runtime operation ${kind} was rejected by fencing token`);
+      const operationId = `runtime:${requestId}:${kind}`;
+      const evidenceJson = canonicalJson(evidence);
+      this.db.prepare(`
+        INSERT OR IGNORE INTO runtime_operations (
+          operation_id, request_id, fence, kind, phase, target_ref, expected_sha,
+          previous_session_id, observed_session_id, evidence_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, NULL, ?, ?, ?)
+      `).run(
+        operationId, requestId, fence, kind, targetRef, expectedSha, previousSessionId,
+        evidenceJson, at.toISOString(), at.toISOString(),
+      );
+      const row = this.runtimeOperation(requestId, kind);
+      if (!row || row.target_ref !== targetRef || row.expected_sha !== expectedSha ||
+        row.previous_session_id !== previousSessionId) {
+        throw new Error(`Runtime operation ${kind} does not match its persisted intent`);
+      }
+      return row;
+    })();
+  }
+
+  recordRuntimeOperation(
+    requestId: string,
+    fence: number,
+    kind: RuntimeOperationKind,
+    phase: RuntimeOperationPhase,
+    observedSessionId: string | null,
+    evidence: Record<string, unknown>,
+    at = new Date(),
+  ): RuntimeOperationRow {
+    const changed = this.db.prepare(`
+      UPDATE runtime_operations SET fence = ?, phase = ?, observed_session_id = ?, evidence_json = ?, updated_at = ?
+      WHERE request_id = ? AND kind = ? AND EXISTS (
+        SELECT 1 FROM update_requests
+        WHERE request_id = ? AND fence = ? AND (
+          completed_at IS NULL OR (state = 'needs_review' AND ? = 'legacy_confirmation')
+        )
+      )
+    `).run(
+      fence, phase, observedSessionId, canonicalJson(evidence), at.toISOString(),
+      requestId, kind, requestId, fence, kind,
+    ).changes;
+    if (changed !== 1) throw new Error(`Runtime operation ${kind} was not prepared or was rejected by fencing token`);
+    return this.runtimeOperation(requestId, kind)!;
+  }
+
+  runtimeOperation(requestId: string, kind: RuntimeOperationKind): RuntimeOperationRow | undefined {
+    return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? AND kind = ?")
+      .get(requestId, kind) as RuntimeOperationRow | undefined;
+  }
+
+  runtimeOperations(requestId: string): RuntimeOperationRow[] {
+    return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? ORDER BY created_at, operation_id")
+      .all(requestId) as RuntimeOperationRow[];
+  }
+
   get(requestId: string): UpdateRow | undefined {
     return this.db.prepare("SELECT * FROM update_requests WHERE request_id = ?").get(requestId) as UpdateRow | undefined;
   }
@@ -357,46 +621,97 @@ export class UpdateDatabase {
     return this.db.prepare("SELECT * FROM update_requests ORDER BY created_at DESC LIMIT ?").all(limit) as UpdateRow[];
   }
 
+  nonTerminalCount(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM update_requests WHERE state NOT IN (${terminalStateSql})`)
+      .get() as { count: number };
+    return row.count;
+  }
+
   auditRows(requestId: string): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM update_audit WHERE request_id = ? ORDER BY sequence").all(requestId) as Array<Record<string, unknown>>;
   }
 
-  pendingOutbox(limit = 100): OutboxRow[] {
-    return this.db.prepare("SELECT * FROM update_outbox WHERE status IN ('pending', 'delivering') ORDER BY created_at LIMIT ?")
-      .all(limit) as OutboxRow[];
+  pendingOutbox(limit = 100, at = new Date()): OutboxRow[] {
+    return this.db.prepare(`
+      SELECT * FROM update_outbox
+      WHERE (status IN ('pending', 'delivering') OR (status = 'delivered' AND slack_reported_at IS NULL))
+        AND superseded_by_outbox_id IS NULL
+        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      ORDER BY created_at LIMIT ?
+    `).all(at.toISOString(), limit) as OutboxRow[];
+  }
+
+  hasUnreportedTerminalNotification(): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM update_outbox
+      WHERE superseded_by_outbox_id IS NULL AND (
+        status IN ('pending', 'delivering') OR (status = 'delivered' AND slack_reported_at IS NULL)
+      ) LIMIT 1
+    `).get();
+    return row !== undefined;
   }
 
   outboxFor(requestId: string): OutboxRow | undefined {
-    return this.db.prepare("SELECT * FROM update_outbox WHERE request_id = ? ORDER BY created_at DESC, outbox_id DESC LIMIT 1")
+    return this.db.prepare("SELECT * FROM update_outbox WHERE request_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
       .get(requestId) as OutboxRow | undefined;
+  }
+
+  terminalOutboxSettledForCorrection(requestId: string): boolean {
+    const outbox = this.outboxFor(requestId);
+    if (!outbox || outbox.superseded_by_outbox_id !== null) return false;
+    return (outbox.status === "pending" && outbox.attempt_count === 0) || outbox.status === "needs_review" ||
+      (outbox.status === "delivered" && outbox.slack_reported_at !== null);
   }
 
   markOutboxDelivering(outboxId: string, at = new Date()): OutboxRow {
     this.db.prepare(`UPDATE update_outbox SET status = 'delivering', attempt_count = attempt_count + 1,
-      last_error = NULL, updated_at = ? WHERE outbox_id = ? AND status IN ('pending', 'delivering')`)
+      last_error = NULL, next_attempt_at = NULL, updated_at = ? WHERE outbox_id = ? AND status IN ('pending', 'delivering')`)
       .run(at.toISOString(), outboxId);
     return this.outboxRequired(outboxId);
   }
 
-  markOutboxDelivered(outboxId: string, at = new Date()): void {
-    this.db.prepare("UPDATE update_outbox SET status = 'delivered', last_error = NULL, updated_at = ? WHERE outbox_id = ?")
-      .run(at.toISOString(), outboxId);
+  markOutboxDelivered(outboxId: string, dispatcherEventId: string, at = new Date()): void {
+    this.db.prepare(`UPDATE update_outbox SET status = 'delivered', dispatcher_event_id = ?,
+      dispatcher_accepted_at = COALESCE(dispatcher_accepted_at, ?), next_attempt_at = ?,
+      last_error = NULL, updated_at = ? WHERE outbox_id = ?`)
+      .run(dispatcherEventId, at.toISOString(), new Date(at.getTime() + 1_000).toISOString(), at.toISOString(), outboxId);
+  }
+
+  markOutboxReported(outboxId: string, at = new Date()): void {
+    this.db.prepare(`UPDATE update_outbox SET slack_reported_at = ?, next_attempt_at = NULL,
+      last_error = NULL, updated_at = ? WHERE outbox_id = ? AND status = 'delivered'`)
+      .run(at.toISOString(), at.toISOString(), outboxId);
   }
 
   markOutboxNeedsReview(outboxId: string, error: string, at = new Date()): void {
-    this.db.prepare("UPDATE update_outbox SET status = 'needs_review', last_error = ?, updated_at = ? WHERE outbox_id = ?")
+    this.db.prepare("UPDATE update_outbox SET status = 'needs_review', next_attempt_at = NULL, last_error = ?, updated_at = ? WHERE outbox_id = ?")
       .run(error.slice(0, 2_000), at.toISOString(), outboxId);
   }
 
-  markOutboxPending(outboxId: string, error: string, at = new Date()): void {
-    this.db.prepare("UPDATE update_outbox SET status = 'pending', last_error = ?, updated_at = ? WHERE outbox_id = ?")
-      .run(error.slice(0, 2_000), at.toISOString(), outboxId);
+  markOutboxPending(outboxId: string, error: string, at = new Date(), delayMs = 1_000): void {
+    this.db.prepare("UPDATE update_outbox SET status = 'pending', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE outbox_id = ?")
+      .run(new Date(at.getTime() + delayMs).toISOString(), error.slice(0, 2_000), at.toISOString(), outboxId);
+  }
+
+  deferOutboxLookup(outboxId: string, error: string, at = new Date(), delayMs = 1_000): void {
+    this.db.prepare("UPDATE update_outbox SET status = 'delivering', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE outbox_id = ?")
+      .run(new Date(at.getTime() + delayMs).toISOString(), error.slice(0, 2_000), at.toISOString(), outboxId);
+  }
+
+  deferOutboxReport(outboxId: string, error: string, at = new Date(), delayMs = 1_000): void {
+    this.db.prepare("UPDATE update_outbox SET status = 'delivered', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE outbox_id = ?")
+      .run(new Date(at.getTime() + delayMs).toISOString(), error.slice(0, 2_000), at.toISOString(), outboxId);
   }
 
   metrics(): { states: Record<string, number>; outbox_pending: number } {
     const rows = this.db.prepare("SELECT state, COUNT(*) AS count FROM update_requests GROUP BY state")
       .all() as Array<{ state: string; count: number }>;
-    const outbox = this.db.prepare("SELECT COUNT(*) AS count FROM update_outbox WHERE status IN ('pending', 'delivering')")
+    const outbox = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM update_outbox
+      WHERE superseded_by_outbox_id IS NULL AND (
+        status IN ('pending', 'delivering') OR (status = 'delivered' AND slack_reported_at IS NULL)
+      )
+    `)
       .get() as { count: number };
     return { states: Object.fromEntries(rows.map((row) => [row.state, row.count])), outbox_pending: outbox.count };
   }
@@ -406,6 +721,7 @@ export class UpdateDatabase {
     const allowed = new Set([
       "approval_id", "cancellation_requested", "last_error_code", "last_error_message", "completed_at",
       "approval_event_id", "cancellation_event_id", "lease_owner", "lease_expires_at", "activation_generation", "restart_attempts",
+      "reconcile_after", "reconcile_deadline", "last_reconciled_at", "observed_active_sha",
     ]);
     for (const key of Object.keys(fields)) if (!allowed.has(key)) throw new Error(`Unsupported update mutation field ${key}`);
     const assignments = ["state = ?", "updated_at = ?", ...Object.keys(fields).map((key) => `${key} = ?`)];
@@ -427,9 +743,15 @@ export class UpdateDatabase {
   ): UpdateRow {
     const completed = this.transitionInternal(row, to, at, {
       ...fields,
+      observed_active_sha: fields.observed_active_sha ?? (
+        to === "succeeded" ? row.target_sha :
+          to === "rolled_back" ? row.current_sha : null
+      ),
       completed_at: at.toISOString(),
       lease_owner: null,
       lease_expires_at: null,
+      reconcile_after: null,
+      reconcile_deadline: null,
     }, code, {});
     this.db.prepare("UPDATE controller_state SET active_request_id = NULL, updated_at = ? WHERE singleton = 1 AND active_request_id = ?")
       .run(at.toISOString(), row.request_id);
@@ -456,17 +778,21 @@ export class UpdateDatabase {
         plan_hash: row.plan_hash,
         policy_version: row.policy_version,
         rollback_compatible: row.rollback_compatible === 1,
-        active_sha: row.state === "succeeded" ? row.target_sha :
-          row.state === "rolled_back" || row.state === "failed" || row.state === "cancelled" ? row.current_sha : null,
+        active_sha: row.observed_active_sha,
         error: row.last_error_code ? { code: row.last_error_code, message: row.last_error_message } : null,
       },
       reply_target: JSON.parse(row.reply_target_json) as Record<string, unknown>,
     };
+    const outboxId = `out_${row.request_id.slice(4)}_${row.fence}`;
     this.db.prepare(`
       INSERT OR IGNORE INTO update_outbox (
         outbox_id, request_id, external_event_id, payload_json, status, created_at, updated_at
       ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    `).run(`out_${row.request_id.slice(4)}_${row.fence}`, row.request_id, payload.external_event_id, canonicalJson(payload), at.toISOString(), at.toISOString());
+    `).run(outboxId, row.request_id, payload.external_event_id, canonicalJson(payload), at.toISOString(), at.toISOString());
+    this.db.prepare(`
+      UPDATE update_outbox SET superseded_by_outbox_id = ?, updated_at = ?
+      WHERE request_id = ? AND outbox_id <> ? AND status = 'pending' AND superseded_by_outbox_id IS NULL
+    `).run(outboxId, at.toISOString(), row.request_id, outboxId);
   }
 
   private audit(row: UpdateRow, from: UpdateState | null, to: UpdateState, code: string, details: Record<string, unknown>, at: Date): void {

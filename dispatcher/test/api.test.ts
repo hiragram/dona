@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, test } from "node:test";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
+import { stableStringify } from "../src/validation.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
@@ -183,15 +185,33 @@ describe("DispatcherApi", () => {
       "application/json",
       { "x-dona-update-token": token },
     )).status, 409);
+    const payloadSha256 = createHash("sha256").update(stableStringify(envelope)).digest("hex");
     const lookup = await request(
       config.socketPath,
       "GET",
-      `/v1/internal/update-events/lookup?external_event_id=${encodeURIComponent(envelope.external_event_id)}`,
+      `/v1/internal/update-events/lookup?external_event_id=${encodeURIComponent(envelope.external_event_id)}&payload_sha256=${payloadSha256}`,
       undefined,
       "application/json",
       { "x-dona-update-token": token },
     );
     assert.equal(lookup.body.exists, true);
+    assert.equal((await request(
+      config.socketPath,
+      "GET",
+      `/v1/internal/update-events/lookup?external_event_id=${encodeURIComponent(envelope.external_event_id)}&payload_sha256=${"f".repeat(64)}`,
+      undefined,
+      "application/json",
+      { "x-dona-update-token": token },
+    )).status, 409);
+    await fs.chmod(config.updateInternalTokenPath, 0o644);
+    assert.equal((await request(
+      config.socketPath,
+      "GET",
+      `/v1/internal/update-events/lookup?external_event_id=${encodeURIComponent(envelope.external_event_id)}&payload_sha256=${payloadSha256}`,
+      undefined,
+      "application/json",
+      { "x-dona-update-token": token },
+    )).status, 403);
     await api.stop();
     database.close();
   });

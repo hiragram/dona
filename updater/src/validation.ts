@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 
-import type { ApplyRequest, CancelRequest, Compatibility, PlanRequest, ReleaseManifest, ReplyTarget } from "./types.js";
+import type {
+  ActivationReceipt,
+  ApplyRequest,
+  CancelRequest,
+  Compatibility,
+  PlanRequest,
+  ReleaseManifest,
+  ReplyTarget,
+} from "./types.js";
 
 const eventIdPattern = /^evt_[0-9A-HJKMNP-TV-Z]{26}$/i;
 const requestIdPattern = /^upd_[0-9a-hjkmnp-tv-z]{26}$/;
@@ -87,6 +95,32 @@ export function parseCancelRequest(input: unknown): CancelRequest {
 
 export function parseRequestId(value: unknown): string {
   return string(value, requestIdPattern, "request_id");
+}
+
+export function parseActivationReceipt(input: unknown): ActivationReceipt {
+  const value = object(input, "activation receipt");
+  exactKeys(value, [
+    "schema_version", "request_id", "fence", "generation", "from_sha", "to_sha", "pointer_switched_at",
+  ], "activation receipt");
+  if (value.schema_version !== 1 || !Number.isSafeInteger(value.fence) || (value.fence as number) < 1 ||
+    !Number.isSafeInteger(value.generation) || (value.generation as number) < 1) {
+    throw new ValidationError("activation receipt schema, fence, or generation is invalid");
+  }
+  const switchedAt = string(
+    value.pointer_switched_at,
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/,
+    "activation receipt pointer_switched_at",
+  );
+  if (Number.isNaN(Date.parse(switchedAt))) throw new ValidationError("activation receipt timestamp is invalid");
+  return {
+    schema_version: 1,
+    request_id: string(value.request_id, requestIdPattern, "activation receipt request_id"),
+    fence: value.fence as number,
+    generation: value.generation as number,
+    from_sha: fullSha(value.from_sha, "activation receipt from_sha"),
+    to_sha: fullSha(value.to_sha, "activation receipt to_sha"),
+    pointer_switched_at: switchedAt,
+  };
 }
 
 export function canonicalJson(value: unknown): string {

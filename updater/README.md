@@ -21,7 +21,7 @@ apply_self_update
   -> stable outboxからinternal dona_update eventを新Dispatcherへ配送
 ```
 
-状態は`requested / planning / awaiting_approval / approved / preparing / staged / quiescing / activating / restarting / verifying / succeeded / failed / rolling_back / rolled_back / needs_review / cancelled`を明示します。外部commandのtimeout、launchctl応答喪失、pointer/health不一致はblind retryせず`needs_review`にします。自動rollbackは、target由来のwrong SHAがlocal healthで確認でき、previousのprotocol/config/app schemaが双方向互換で、circuit breaker内の場合に1回だけです。
+状態は`requested / planning / awaiting_approval / approved / preparing / staged / quiescing / activating / restarting / verifying / succeeded / failed / rolling_back / rolled_back / needs_review / cancelled`を明示します。外部command前にruntime intentを保存し、timeoutやlaunchctl応答喪失はbounded read-only reconcileへ移します。同じwriteを再送せず、期限内にprocess/session/version healthを証明できない場合だけ`needs_review`にします。自動rollbackは、target由来のwrong SHAがlocal healthで確認でき、previousのprotocol/config/app schemaが双方向互換で、circuit breaker内の場合に1回だけです。
 
 ## 固定policy
 
@@ -53,7 +53,7 @@ node dist/cli.js reconcile upd_...
 node dist/cli.js rollback upd_... --confirm-plan-hash <64-hex>
 ```
 
-operator rollbackは`needs_review`かつcurrent=exact target、previous=planned current、互換性ありの場合、plan hash一致の場合だけ再開します。`/metrics`はstate別件数とpending outbox数を出します。statusはlease/fence、attempt、activation generation、restart回数、SHA、health、last error、audit、outboxを返します。
+operator rollbackは`needs_review`かつcurrent=exact target、previous=planned current、互換性ありの場合、plan hash一致の場合だけ再開します。`/metrics`はstate別件数とpending outbox数を出します。statusはlease/fence、attempt、activation generation、restart回数、SHA、health、last error、audit、runtime operations、runtime/notification state、outboxを返します。
 
 ## 検証
 
@@ -67,6 +67,6 @@ npm audit --audit-level=high
 
 testはtemporary SQLite/release root、isolated temporary Git remote、fake runtime/Dispatcher/Herdr responseを使います。Codexへ渡すMCP environmentは固定config pathだけで、token値をargvへ載せないことも検証します。実GitHub、Slack、Keychain、production LaunchAgent、live processは操作しません。
 
-## 既知の制約
+## Stable control-plane更新
 
-stable updater自身とpolicyの自動更新、app DB migrationは行いません。このdona-main lifecycle対応を既存installへ導入する最初の1回は、別のmaintenance windowでstable updaterとpolicyを`2026-09-03.1`へ更新する必要があります。通常releaseのplistは更新しません。
+stable updater自身はroutine updateに含めません。policy/schema変更はmaintenance windowで`./scripts/install-self-update.sh --upgrade-control`を使い、非terminal requestがないこと、Slack metadata schema登録の明示attestation、旧DB checkpoint/integrity/backup、新旧version healthを確認して切り替えます。app DB migrationとGitHub repository settings変更は対象外です。
