@@ -34,7 +34,7 @@ Pull Requestの作成・本文更新では、repository標準の`.github/PULL_RE
 
 1. Pull Request本文を書き込む前に、round対象として固定するselected baseのexact SHAから`.github/PULL_REQUEST_TEMPLATE.md`を取得し、取得元のbase ref/SHAを記録する。local checkoutや過去に保存したtemplateだけでcurrent templateを代用しない。fileが存在しない、取得できない、空である、または構造を安全に解釈できない場合はPRを作成・更新せず、review triggerも投稿せずに停止する。
 2. templateのコメント、全見出し、各欄の目的を読み、見出しと順序を維持したPR本文をtaskの実diffと検証結果から作る。少なくとも次を意味的に反映する。
-   - `完了する Issue`: taskまたは確認済みscopeから、そのPRのmergeでIssue全体が完了すると証明できる場合だけ、templateの標準形式`Closes #xx`を記載する。部分対応、単なる関連、Issue不明、完了が曖昧な場合はautomatic closing referenceを使用せず、placeholderの`Closes #xx`も残さない。GitHubが解釈する`close`、`closes`、`closed`、`fix`、`fixes`、`fixed`、`resolve`、`resolves`、`resolved`の各keywordを大文字小文字とcolonの有無にかかわらず検査し、Issue全体の完了を証明できないIssue referenceを残さない。完了を証明できる場合もPR本文では標準形式へ正規化する。
+   - `完了する Issue`: selected baseがrepositoryのdefault branchであり、taskまたは確認済みscopeからそのPRのmergeでIssue全体が完了すると証明できる場合だけ、templateの標準形式`Closes #xx`を記載する。cross-repository Issueなら対象を変えない`Closes OWNER/REPOSITORY#xx`とする。non-default base、部分対応、単なる関連、Issue不明、完了が曖昧な場合はautomatic closing referenceを使用せず、placeholderの`Closes #xx`も残さない。GitHubが解釈する`close`、`closes`、`closed`、`fix`、`fixes`、`fixed`、`resolve`、`resolves`、`resolved`の各keywordを大文字小文字とcolonの有無にかかわらず検査し、Issue全体の完了を証明できないIssue referenceを残さない。完了を証明できる場合もkeywordだけを`Closes`へ正規化し、same-repositoryの`#xx`またはcross-repositoryの`OWNER/REPOSITORY#xx`という参照対象を保持する。
    - `変更内容の概要・方針`: 実際の変更と、このPR固有の実装方針・判断だけを書く。
    - `テストのカバー範囲`: 追加・更新したtestが検証する範囲と、未カバーまたは未検証の境界を書く。testを変更しない場合も、その理由と実際に確認した範囲を明記する。
    - `動作確認方法`: 実際に実行した再現可能なcommandまたは確認手順と結果を書く。未実行のcommandを実行済みとして記載しない。
@@ -63,7 +63,7 @@ Pull Requestの作成・本文更新では、repository標準の`.github/PULL_RE
 - latest roundに未解決findingがなく、過去roundのCodex inline commentすべてへdirect reply済みである。
 - local `HEAD`、upstream、Pull Request head SHAが一致している。
 - Pull Requestがcurrent baseへmergeableで、base conflictがなく、openかつnon-draftである。
-- Pull Request本文がcurrent baseの標準`.github/PULL_REQUEST_TEMPLATE.md`の全欄を反映し、Issue情報を不必要に重複せず、Issue全体の完了を証明できないautomatic closing referenceや未解決placeholderを含まない。許可したIssue closeは標準形式`Closes #xx`である。
+- Pull Request本文がcurrent baseの標準`.github/PULL_REQUEST_TEMPLATE.md`の全欄を反映し、Issue情報を不必要に重複せず、default branch向けでIssue全体の完了を証明できないautomatic closing referenceや未解決placeholderを含まない。許可したIssue closeは対象repositoryを保持した標準形式`Closes #xx`または`Closes OWNER/REPOSITORY#xx`である。
 - repository workflowとbranch ruleから期待するCI suite/check contextが少なくとも1回観測され、各accepted check/workflow runがcurrent head/base pairを検証したことをPull Request association、tested merge commit、または同等のGitHub API evidenceで確認でき、required/current CIがすべてterminal successである。checkが空の状態、base driftより前のrun、head/base pairを証明できないrunを成功としない。CIが構成されていない、またはcurrent pairのrunを安全に起動できない場合は未検証境界として停止する。current changeに起因するfailureは修正し、新しいheadにfresh review roundを行う。
 
 Pull Request URL、final SHA、各roundのtarget SHA・trigger URL・clean/finding、feedbackの修正commit、inline reply URL、mergeability、CI結果、変更しなかったscope、未検証境界を報告する。明示的な別依頼がない限りPull Requestをmergeしない。

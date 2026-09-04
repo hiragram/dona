@@ -208,10 +208,11 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /local checkout.*過去に保存したtemplate.*代用しない/,
     /存在しない.*取得できない.*空.*構造を安全に解釈できない.*PRを作成・更新せず.*review trigger.*停止/,
     /コメント.*全見出し.*各欄の目的.*見出しと順序を維持/,
-    /`完了する Issue`.*Issue全体が完了.*場合だけ.*`Closes #xx`/,
-    /部分対応.*単なる関連.*Issue不明.*曖昧.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
+    /`完了する Issue`.*selected base.*default branch.*Issue全体が完了.*場合だけ.*`Closes #xx`/,
+    /cross-repository Issue.*対象を変えない`Closes OWNER\/REPOSITORY#xx`/,
+    /non-default base.*部分対応.*単なる関連.*Issue不明.*曖昧.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
     /`close`.*`closes`.*`closed`.*`fix`.*`fixes`.*`fixed`.*`resolve`.*`resolves`.*`resolved`.*大文字小文字.*colon.*検査/,
-    /Issue全体の完了を証明できないIssue reference.*残さない.*標準形式へ正規化/,
+    /Issue全体の完了を証明できないIssue reference.*残さない.*keywordだけ.*`Closes`.*same-repository.*cross-repository.*参照対象を保持/,
     /`変更内容の概要・方針`.*実際の変更.*実装方針・判断/,
     /`テストのカバー範囲`.*未カバー.*未検証の境界/,
     /`動作確認方法`.*実際に実行.*再現可能.*未実行.*実行済みとして記載しない/,
@@ -236,8 +237,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
   assertContract(completion, "template completion gate", [
     /current baseの標準`.github\/PULL_REQUEST_TEMPLATE\.md`の全欄を反映/,
     /Issue情報を不必要に重複せず/,
-    /Issue全体の完了を証明できないautomatic closing reference.*未解決placeholder.*含まない/,
-    /許可したIssue close.*標準形式`Closes #xx`/,
+    /default branch向け.*Issue全体の完了を証明できないautomatic closing reference.*未解決placeholder.*含まない/,
+    /許可したIssue close.*対象repositoryを保持.*`Closes #xx`.*`Closes OWNER\/REPOSITORY#xx`/,
   ]);
 });
 
