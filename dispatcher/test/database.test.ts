@@ -6,10 +6,12 @@ import Database from "better-sqlite3";
 
 import {
   DispatcherDatabase,
+  JobCreationError,
   migrateDispatcherDatabase,
   type DispatcherMigrationStep,
 } from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
+import { canonicalJobPayloadSha256, parseCreateJobRequest } from "../src/validation.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -152,6 +154,10 @@ describe("DispatcherDatabase", () => {
       .sort((left, right) => String(left.job_id).localeCompare(String(right.job_id)));
     assert.deepEqual(after, before);
     assert.deepEqual(new Set(database.listJobs().map((row) => row.job_key)), new Set(["legacy-default"]));
+    assert.equal(
+      database.reconcileEventJob("evt-source-queued", "legacy-default", "0".repeat(64)),
+      "unverified_legacy",
+    );
     assert.equal(database.getJobGroup("evt-source-completed")?.notification_mode, "legacy");
     assert.equal(database.getJobGroup("evt-source-running")?.notification_mode, "grouped");
     assert.equal(database.getJobGroup("evt-source-running")?.sealed_at, null);
@@ -264,6 +270,30 @@ describe("DispatcherDatabase", () => {
     }
   });
 
+  test("keeps migrated v2 jobs reusable without inventing an immutable payload fingerprint", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const fixture = new Database(config.databasePath);
+    fixture.prepare("UPDATE jobs SET objective = ? WHERE job_id = 'job-queued'")
+      .run(`objective-queued\n\n[DONA_FOLLOW_UP]\n${"x".repeat(100_001)}\n[/DONA_FOLLOW_UP]`);
+    fixture.close();
+
+    const database = new DispatcherDatabase(config.databasePath);
+    assert.equal(
+      database.reconcileEventJob("evt-source-queued", "legacy-default", "0".repeat(64)),
+      "unverified_legacy",
+    );
+    const reused = database.createJob({
+      source_event_id: "evt-source-queued",
+      objective: "objective-queued",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(reused.outcome, "reused");
+    assert.equal(reused.row.job_id, "job-queued");
+    database.close();
+  });
+
   test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -277,6 +307,15 @@ describe("DispatcherDatabase", () => {
     );
     assert.equal(created.row.job_key, "legacy-default");
     assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "legacy");
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "unexpected.second",
+        objective: "別の調査",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
     assert.deepEqual(database.ensureJobGroup(source.event_id, "legacy").created, false);
     assert.throws(() => database.ensureJobGroup(source.event_id, "grouped"), /already uses legacy/);
 
@@ -292,6 +331,128 @@ describe("DispatcherDatabase", () => {
     const duplicateClaim = database.claimJobGroupTransition(source.event_id, "attention", contender.event_id);
     assert.equal(duplicateClaim.claimed, false);
     assert.equal(duplicateClaim.row.attention_event_id, owner.event_id);
+    database.close();
+  });
+
+  test("creates distinct keyed jobs and reconciles reuse, conflict, and closed groups", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-keyed-jobs")).row;
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "research.primary",
+      objective: "  first objective  ",
+      workspace: { kind: "scratch" as const },
+    };
+    const firstCanonicalPayloadSha256 = canonicalJobPayloadSha256(parseCreateJobRequest(firstRequest));
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "research.secondary",
+      objective: "second objective",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.equal(first.outcome, "created");
+    assert.equal(first.duplicate, false);
+    assert.equal(first.row.objective, "first objective");
+    assert.equal(second.outcome, "created");
+    assert.notEqual(first.row.job_id, second.row.job_id);
+    assert.notEqual(first.row.workspace_path, second.row.workspace_path);
+    assert.notEqual(first.row.result_path, second.row.result_path);
+    assert.notEqual(first.row.agent_name, second.row.agent_name);
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
+
+    const reused = database.createJob(
+      firstRequest,
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    assert.equal(reused.outcome, "reused");
+    assert.equal(reused.duplicate, true);
+    assert.equal(reused.row.job_id, first.row.job_id);
+
+    const followUp = database.enqueue(eventEnvelope("Ev-keyed-jobs-follow-up")).row;
+    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "include the latest data");
+    assert.match(database.getJob(first.row.job_id)!.objective, /include the latest data/);
+    const reusedAfterSteer = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(reusedAfterSteer.outcome, "reused");
+    assert.equal(reusedAfterSteer.row.job_id, first.row.job_id);
+    assert.equal(
+      database.reconcileEventJob(source.event_id, first.row.job_key, firstCanonicalPayloadSha256),
+      "matched",
+    );
+
+    const persistedBeforeConflict = database.getJob(first.row.job_id);
+    assert.throws(
+      () => database.createJob(
+        { ...firstRequest, objective: "different" },
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError && error.code === "job_idempotency_conflict",
+    );
+    assert.deepEqual(database.getJob(first.row.job_id), persistedBeforeConflict);
+    assert.equal(database.listEventJobs(source.event_id).length, 2);
+
+    database.beginJobPreparation(first.row.job_id);
+    database.setJobRuntime(first.row.job_id, "workspace-1", "pane-1");
+    database.beginJobDispatch(first.row.job_id);
+    database.markJobRunning(first.row.job_id);
+    database.saveJobResult(first.row.job_id, {
+      schema_version: 1,
+      job_id: first.row.job_id,
+      status: "completed",
+      summary: "first completed",
+      completed_at: new Date().toISOString(),
+    }, first.row.result_path);
+    const notification = database.enqueueJobNotification(first.row.job_id);
+    assert.deepEqual(envelopeFromRow(notification.row).payload.workspace, { kind: "scratch" });
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "legacy");
+    const createdAfterSiblingCompletion = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "research.after-sibling",
+      objective: "third objective",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(createdAfterSiblingCompletion.outcome, "created");
+
+    database.saveDeterministicCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      summary: "delegation complete",
+      actions: [],
+      memory_candidates: [],
+      completed_at: new Date().toISOString(),
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).outcome,
+      "reused",
+    );
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.after-completion",
+        objective: "fourth objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
+    assert.deepEqual(database.listEventJobs(source.event_id, "missing"), []);
+    assert.equal(
+      database.reconcileEventJob(source.event_id, first.row.job_key, firstCanonicalPayloadSha256),
+      "matched",
+    );
+    assert.equal(database.reconcileEventJob(source.event_id, first.row.job_key, "0".repeat(64)), "conflict");
+    assert.equal(database.reconcileEventJob(source.event_id, "missing", "0".repeat(64)), "not_found");
+    assert.deepEqual(
+      database.listEventJobs(source.event_id, first.row.job_key).map(({ job_id }) => job_id),
+      [first.row.job_id],
+    );
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes(config.jobsWorkspaceRoot), false);
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes("first objective"), false);
     database.close();
   });
 

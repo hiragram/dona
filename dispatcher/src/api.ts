@@ -5,12 +5,13 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import type { DispatcherDatabase } from "./database.js";
+import { JobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import {
+  jobKeyPattern,
   parseCancelJobRequest,
   parseCreateJobRequest,
   parseEventEnvelope,
@@ -212,6 +213,33 @@ export class DispatcherApi {
         const eventId = decodeURIComponent(url.pathname.split("/")[3]!);
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(eventId)) throw new ApiRequestError(400, "invalid_request", "event_id is invalid");
         sendJson(response, 200, { schema_version: 1, event_id: eventId, terminal: this.database.isEventCompleted(eventId) });
+        return;
+      }
+      if (request.method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)) {
+        const sourceEventId = decodeURIComponent(url.pathname.split("/")[3]!);
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        const requestedJobKey = url.searchParams.get("job_key");
+        const jobKey = requestedJobKey?.trim();
+        if (jobKey !== undefined && !jobKeyPattern.test(jobKey)) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is invalid");
+        }
+        const canonicalPayloadSha256 = url.searchParams.get("canonical_payload_sha256") ?? undefined;
+        if (canonicalPayloadSha256 !== undefined && !/^[0-9a-f]{64}$/.test(canonicalPayloadSha256)) {
+          throw new ApiRequestError(400, "invalid_request", "canonical_payload_sha256 is invalid");
+        }
+        if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
+        }
+        sendJson(response, 200, {
+          schema_version: 1,
+          source_event_id: sourceEventId,
+          jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
+            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
+            : {}),
+        });
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/update-safety") {
@@ -474,17 +502,15 @@ export class DispatcherApi {
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
+        if (error instanceof JobCreationError) {
+          throw new ApiRequestError(409, error.code, error.message);
+        }
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
-      }
-      if (result.payloadMismatch) {
-        this.logger.warn("Duplicate job request differs from persisted job", {
-          job_id: result.row.job_id,
-          source_event_id: result.row.source_event_id,
-        });
       }
       this.jobs.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         duplicate: result.duplicate,
         job: result.row,
       });

@@ -1,7 +1,8 @@
 import type { JobRow, JobWorkspace } from "./types.js";
+import { parseJobWorkspace } from "./validation.js";
 
 export function workspaceFromJob(row: JobRow): JobWorkspace {
-  return JSON.parse(row.workspace_json) as JobWorkspace;
+  return parseJobWorkspace(JSON.parse(row.workspace_json));
 }
 
 export function buildJobPrompt(row: JobRow): string {
