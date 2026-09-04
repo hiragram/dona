@@ -129,7 +129,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /reconcile中にhead、base、body hash.*変わった場合.*triggerを受理せず停止/,
     /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
     /latest trigger.*`eyes`.*terminal review\/completion.*reactionも空.*pending.*新規投稿せず.*poll/,
-    /current SHA.*exact triggerへ一意.*引き継ぐ.*複数候補.*30分.*停止/,
+    /保存済みround record.*`target_sha`.*`base_ref`.*`base_sha`.*`body_sha256`.*`template_base_sha`.*すべて復元.*current head\/base\/body identity.*一致.*場合だけ/,
+    /current SHAだけ.*Codex-authored artifact.*body identityを復元できない.*旧roundを引き継がない/,
+    /recordがなく.*pending.*duplicate triggerを投稿せず停止.*terminal artifact.*current identityのcleanに使わず.*fresh round/,
+    /複数候補.*別identity.*対応不明.*30分.*停止/,
     /全Codex inline comments.*direct replies.*pagination.*未返信.*元threadへdirect reply/,
     /未返信を残したままfresh triggerを投稿しない/,
   ]);
@@ -168,6 +171,7 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
     /空reaction.*完了ではない/,
   ]);
   assertContract(decision, "empty state is not clean", [
+    /clean.*current head\/base\/body hash.*round recordのidentity/,
     /superseded.*head SHA.*base ref.*base SHA.*body hash.*旧roundをclean扱いしない/,
     /base ref\/SHAが変わった.*新しいexact base SHA.*標準templateを再取得.*reconcile.*再取得.*検証/,
     /body hashだけが変わった.*current template.*reconcile/,
@@ -211,8 +215,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /`動作確認方法`.*実際に実行.*再現可能.*未実行.*実行済みとして記載しない/,
     /Issueに既にある背景、要件、受け入れ条件.*不必要に複製せず.*Issueへの参照/,
     /current templateの全必須欄.*意味的に記入済み.*未解決placeholder.*含まず/,
-    /既存Pull Request.*current本文を再取得.*raw本文のhash.*snapshot.*人間が追記.*保持.*最小限reconcile/,
-    /write直前.*もう一度取得.*snapshotのhash.*変化.*古いsnapshot.*書き込まず.*最新本文.*reconcileをやり直す/,
+    /既存Pull Request.*current本文を再取得.*raw本文のhash.*head ref\/SHA.*base ref\/SHA.*snapshot.*人間が追記.*保持.*最小限reconcile/,
+    /write直前.*本文とhead\/base identity.*もう一度取得.*snapshot.*変化.*古いsnapshot.*書き込まず.*最新のdiff.*exact base SHA.*template.*reconcileをやり直す/,
     /競合.*一意に判断できない.*上書きせず.*停止/,
     /作成・更新後.*再取得.*実際の本文.*head\/base\/state\/non-draft/,
     /write結果が曖昧.*blind retryせず.*本文.*更新時刻.*head\/base.*照合/,
