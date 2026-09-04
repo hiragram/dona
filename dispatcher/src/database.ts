@@ -260,7 +260,7 @@ export class DispatcherDatabase {
         };
       }
 
-      const jobId = `job_${ulid(at.getTime()).toLowerCase()}`;
+      const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, request.objective);
       const workspacePath = request.workspace.kind === "scratch"
         ? path.join(workspaceRoot, "scratch", jobId)
         : path.join(
@@ -272,7 +272,6 @@ export class DispatcherDatabase {
           jobId,
         );
       const resultPath = path.join(resultDir, `${jobId}.json`);
-      const agentName = jobAgentName(jobId, request.objective);
       const timestamp = at.toISOString();
       this.db.prepare(`
         INSERT INTO jobs (
@@ -293,7 +292,7 @@ export class DispatcherDatabase {
         timestamp,
         workspacePath,
         resultPath,
-        agentName,
+        jobId,
         timestamp,
         timestamp,
       );

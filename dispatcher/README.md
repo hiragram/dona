@@ -64,7 +64,7 @@ herdr --session dona agent prompt dona-main <prompt>
 herdr --session dona agent wait dona-main --until idle --until done --until blocked --timeout 120000
 ```
 
-バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、Herdrの32文字制限内に収まる`j<完全なULID>-<固定slug>`をagent名としてCodexを起動します。たとえば改善作業は`j01m1ne631mt99zdpwfmrwsvjdg-impr`です。slugは外部入力を転写せず、`impr`、`fix`、`impl`、`test`、`docs`、`rvw`、`rsch`、`updt`、`dply`、`rels`、`task`の固定語彙から選びます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みの旧agent名も再起動時にそのまま使います。
+バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、30文字の`job_id`をそのままHerdr agent名としてCodexを起動します。新規`job_id`はULID互換の26文字の末尾4文字を固定slugにし、たとえば改善作業は`job_01m1ne631mt99zdpwfmrwsenhc`になります。slugは外部入力を転写せず、`enhc`（改善）、`mend`（修正）、`feat`（実装）、`test`（テスト）、`read`（文書）、`rvwx`（レビュー）、`rsch`（調査）、`sync`（更新）、`send`（デプロイ）、`tags`（リリース）、`task`（その他）の固定語彙から選びます。ULIDの時刻部と60bitのランダム値を保持し、既存のjob ID形式、DB schema v2、`agent_name = job_id`も維持するため、旧リリースへ戻した場合も新規ジョブを同じ名前で制御できます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みのagent名も再起動時にそのまま使います。
 
 Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" } }`inline tableを起動時overrideに使い、scratch jobではDispatcherが生成した`<jobsWorkspaceRoot>/scratch/<job_id>`との完全一致を検証した当該workspace 1件だけ、GitHub jobでは従来どおり検証・選択したrepositoryとworktreeだけをtrustします。scratch root、job-results、global Codex configはtrust対象にしません。これはsandbox、command approval、network policyを変更する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
 

@@ -95,9 +95,9 @@ describe("DispatcherDatabase", () => {
       config.jobResultsDir,
     );
     assert.equal(created.duplicate, false);
-    assert.match(created.row.job_id, /^job_[0-9a-hjkmnp-tv-z]{26}$/);
-    assert.match(created.row.agent_name, /^j[0-9a-hjkmnp-tv-z]{26}-rsch$/);
-    assert.equal(created.row.agent_name.length, 32);
+    assert.match(created.row.job_id, /^job_[0-9a-hjkmnp-tv-z]{22}rsch$/);
+    assert.equal(created.row.agent_name, created.row.job_id);
+    assert.equal(created.row.agent_name.length, 30);
     assert.equal(created.row.workspace_path, `${config.jobsWorkspaceRoot}/scratch/${created.row.job_id}`);
     assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}.json`);
     assert.equal(database.createJob(
@@ -166,14 +166,15 @@ describe("DispatcherDatabase", () => {
       config.jobResultsDir,
     ).row;
 
-    assert.match(first.agent_name, /^j[0-9a-hjkmnp-tv-z]{26}-impr$/);
-    assert.equal(first.agent_name.length, 32);
+    assert.match(first.agent_name, /^job_[0-9a-hjkmnp-tv-z]{22}enhc$/);
+    assert.equal(first.agent_name, first.job_id);
+    assert.equal(first.agent_name.length, 30);
     assert.doesNotMatch(first.agent_name, /private|token|example/);
     assert.notEqual(second.agent_name, first.agent_name);
     database.close();
   });
 
-  test("preserves a persisted legacy job ID agent name when reopening schema v2", async () => {
+  test("preserves the rollback-compatible job ID agent name when reopening schema v2", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -186,7 +187,10 @@ describe("DispatcherDatabase", () => {
     database.close();
 
     const raw = new Database(config.databasePath);
-    raw.prepare("UPDATE jobs SET agent_name = ? WHERE job_id = ?").run(job.job_id, job.job_id);
+    const persisted = raw.prepare("SELECT agent_name FROM jobs WHERE job_id = ?").get(job.job_id) as {
+      agent_name: string;
+    };
+    assert.equal(persisted.agent_name, job.job_id);
     raw.close();
 
     const reopened = new DispatcherDatabase(config.databasePath);

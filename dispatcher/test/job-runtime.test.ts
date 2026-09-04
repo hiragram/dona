@@ -156,7 +156,7 @@ process.exit(1);
     database.close();
   });
 
-  test("passes the persisted display name through the Herdr workspace and agent-start boundary", async () => {
+  test("passes the rollback-compatible display name through the Herdr workspace and agent-start boundary", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const logPath = `${root}/herdr-argv.jsonl`;
@@ -202,7 +202,8 @@ process.exit(2);
     assert.ok(start, JSON.stringify(calls));
     assert.equal(workspace[workspace.indexOf("--label") + 1], job.agent_name);
     assert.equal(start[4], job.agent_name);
-    assert.notEqual(job.agent_name, job.job_id);
+    assert.equal(job.agent_name, job.job_id);
+    assert.match(job.agent_name, /enhc$/);
     database.close();
   });
 });
