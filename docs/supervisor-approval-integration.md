@@ -68,7 +68,7 @@ native relationがこのgraphと一致することを、Epic側の`sub_issues`�
 
 integration PRは、次の証拠が同一のcurrent head/base pairで揃った場合だけmerge可能と判定します。
 
-- #15〜#25がすべて完了し、Issueのnative parent/dependency stateと実装stateが一致する。
+- #15〜#25それぞれの実装PRがintegration branchへmerge済みで、各Issueのacceptance criteriaと必須testの完了証拠がある。GitHub上のopen/closed stateだけを実装完了の根拠にしない。
 - binding済みsupervisorのみが、instance/workspace/request/action/Slack coordinatesの照合後にdecisionできる。
 - typed immutable snapshot/hash、expiry、one-shot consume、TOCTOU再検証、cross-workspace拒否がend-to-endで確認できる。
 - original event/turnのterminal後もpending requestが再起動を越え、別の`dona_approval` eventからだけ1回resumeする。
@@ -76,6 +76,16 @@ integration PRは、次の証拠が同一のcurrent head/base pairで揃った�
 - approval-requiredなMVP operationでlegacy direct-write bypassが閉じ、Phase 1のresume未接続状態を安全な完成と誤認しない。
 - background jobのcancel/expiry/restart競合、運用診断、reconcile、retention、backup/restore、rotation、break-glassをdeterministic testとrunbookで検証する。
 - repositoryの全検証、security/chaos E2E、current integration PR headのCodex Cloud reviewとCIがcleanである。
+
+## `main` merge後のIssue完了照合
+
+non-default branchへmergeする子PRのclosing keywordだけでは、子Issueのcloseを完了証拠として保証できません。integration PRが`main`へmergeされた後に、次の順序でGitHub stateを照合します。
+
+1. #15〜#25ごとに、merge済み子PR、acceptance/test証拠、native parent/dependencyが最終実装と一致するか確認する。
+2. 完了証拠の揃った子Issueだけを明示的にcloseし、再取得して#15〜#25がすべてclosedであることを確認する。
+3. 全子IssueとEpic完了条件が一致した場合だけ#26をcloseする。
+
+このscaffoldのPR本文にはclosing keywordを先行記載せず、誤mergeで#26を早期closeしないようにします。
 
 ## 現在の検証境界
 
