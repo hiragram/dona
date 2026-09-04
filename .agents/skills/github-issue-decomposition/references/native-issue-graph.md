@@ -38,7 +38,7 @@ partial creation後の自動rollbackに使わない。
 
 完全なintegration workflowでは、先に[integration feature workflow手順](integration-feature-workflow.md)を読み、その全体順序を優先する。以下のIssue・relation操作は、そのworkflowのparent作成段階、child作成段階、native graph設定段階に分けて実施する。Issueだけの作成が明示された場合は、branchやPRを追加せず以下を連続して実施できる。
 
-1. 提案・再利用node、正規化title、期待するbody/label/state、parent membership、完全な`blocker -> blocked` edge集合を含むplanを固定する。
+1. 提案・再利用node、正規化title、期待するbody/label/state、parent membership、完全な`blocker -> blocked` edge集合を含むplanを固定する。完全なintegration workflowでは、親Epicだけのexact `epic` labelと、固定した親Epic identityへ対応するDraft integration PRもplanへ含める。
 2. write直前に全open/closed Issueを再取得し、関連topologyを取得する。
 3. 不足しているIssue resourceだけを作成する。次のwrite前に、返されたURL、Issue番号、REST `id`、response acceptanceを記録する。updateを明示的に依頼されていない再利用Issueは変更しない。
 4. 意図した各childをEpicへattachし、parentを両方向から検証してからdependency edgeを追加する。
@@ -53,8 +53,8 @@ partial success後は必ず新しいread snapshotから再開する。受理済�
 
 write responseを信用するだけでなく、再取得して以下を確認する。
 
-1. **resource:** 計画した各nodeが期待するtitle、body、state、scope内labelでちょうど1件だけ存在する。再利用nodeは意図したownershipと無関係なmetadataを維持している。
-2. **parent topology:** Epicの完全な`sub_issues`集合がplanと一致し、意図した各childの`parent`がそのEpicを返す。再利用childも両方向から確認する。
+1. **resource:** 計画した各nodeが期待するtitle、body、state、scope内labelでちょうど1件だけ存在する。再利用nodeは意図したownershipと無関係なmetadataを維持している。完全なintegration workflowでは、親Epicだけが既存のexact `epic` labelを持ち、他のlabelが意図せず変更されていないことを確認する。
+2. **parent topology:** Epicの完全な`sub_issues`集合がplanと一致し、意図した各childの`parent`がそのEpicを返す。再利用childも両方向から確認する。完全なintegration workflowではEpic自身にnative parentがないroot Issueであり、Draft integration PRのpagination済み`closingIssuesReferences`がそのIssue番号・REST `id`・URLだけへ一意に対応することも確認する。
 3. **dependency topology:** 各blocked nodeの`blocked_by`に全direct blockerがあり、各blockerの`blocking`に対応するblocked nodeがある。件数だけでなく完全な有向edge集合を比較する。
 4. **DAG特性:** cycleが存在しない。direct `A -> C`ごとに、`A`から`C`への別pathを検索する。別pathがあれば推移冗長なため、計画graphからそのedgeを除く。
 5. **scope:** 同一titleの重複、意図しないIssue、label、Project、Milestone、assignee、parent変更、close、dependency削除が発生していない。

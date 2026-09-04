@@ -20,7 +20,7 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 
 - Issueの設計、下書き、評価、提案を求められた場合、またはGitHubへのwriteが明示的に許可されていない場合は、**plan-only**を使う。Issue、relation、label、Project、Milestone、assignmentを作成・変更しない。
 - 明示的に依頼された種類のwriteだけを行う場合は、**create-or-update**を使う。対象を指定repository、テーマ、resource種別に限定する。close、delete、reparent、detach、dependency削除の許可を推測しない。
-- Issue作成、feature branchのpush、integration PR作成をすべて明示的に依頼された場合だけ、完全なintegration workflowを実行する。Issue作成だけの依頼からbranchやPRの作成を推測しない。既存backlogのtopology整理では、依頼された既存Issueだけを変更し、明示されていないbranchやPRを作成しない。
+- 構造化Issue routeでIssue作成、feature branchのpush、integration PR作成をすべて明示的に依頼された場合だけ、完全なintegration workflowを実行する。このrouteでは親Epicへ既存のexact `epic` labelを付け、integration PRをDraftで作成する。Issue作成だけの依頼からbranchやPRの作成を推測しない。既存backlogのtopology整理では、依頼された既存Issueだけを変更し、明示されていないbranchやPRを作成しない。
 - read-only調査後もmode、repository、またはwrite範囲に実質的な曖昧さが残る場合は、plan-onlyに留めるか、write前に質問する。
 
 ## repositoryの事実を確定する
@@ -45,6 +45,7 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 - Decision/ADR Issueは、解決結果がdownstream contractを変える未解決のproduct、security、API、data、ownership、運用上の判断にだけ使う。通常task、単なる調査、決定済み設計はADRにしない。
 - 成果とownershipが一致する既存Issueは再利用する。関連Issueとは重複しない境界を記載し、新Epicを完全に見せるためだけにreparentしない。
 - すべてのnodeを[Issue記述contract](references/issue-contract.md)に従ってdraftする。
+- 完全なintegration workflowでだけ、親Epicの識別metadataとしてexact `epic` labelを必須にする。単一Issue routeやIssue-onlyの構造化routeへこのlabelを自動適用しない。
 
 ## 最小native DAGを組み立てる
 
@@ -58,10 +59,10 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 
 1. 規模判定と根拠、提案・再利用するIssue、title、責務境界を含む完全なplanを提示するか、内部で確定する。構造化Issueではlabel、parent membership、blocker edge、parallel laneも含める。
 2. 最初のwrite直前に全Issueを再取得し、完全一致・正規化title、既存relation、write範囲を再確認する。
-3. 完全なintegration workflowでは、[integration feature workflow手順](references/integration-feature-workflow.md)を読み、`親Epic Issue -> feature branch -> 空commit -> integration PR -> 子Issue -> native graph`の順序を必ず守る。
+3. 完全なintegration workflowでは、[integration feature workflow手順](references/integration-feature-workflow.md)を読み、`親Epic Issue（epic label） -> feature branch -> 空commit -> Draft integration PR -> 子Issue -> native graph`の順序を必ず守る。
 4. 単一Issue routeでは、許可された1件のIssueだけを作成または更新する。構造化Issue routeでIssueだけの作成が許可された場合は、許可されたIssueとnative relationだけを[native graph手順](references/native-issue-graph.md)に従って作成し、branchやPRは作成しない。
 5. GitHub native sub-issuesとissue dependenciesを使う。Markdown checkbox listは説明用に限り、native relationの代替にしない。APIまたは権限を利用できない場合は制約を報告し、代替topologyを捏造しない。
-6. 既存のlabel、Project、Milestone、assignee規約には明示された範囲内だけで従う。個別に依頼されていないものを作成しない。
+6. 既存のlabel、Project、Milestone、assignee規約には明示された範囲内だけで従う。完全なintegration workflowで親Epicへ既存のexact `epic` labelを加算する場合を除き、個別に依頼されていないmetadataを変更しない。`epic` labelを含め、存在しないlabelを自動作成しない。
 7. 次へ進む前に、受理された各resourceとrelationを記録する。timeoutや接続断後にacceptanceが不明な場合はblind retryせず、対象stateを再取得する。結果の一意性を証明できない場合は停止する。
 8. partial success後は、残るwriteが安全か判断する前に、作成・変更済みresourceをすべて照合する。明示的な許可なしに破壊的cleanupを行わない。
 
@@ -69,7 +70,7 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 
 - 影響を受けた全Issueを再取得し、title、body、state、labelを検証する。
 - 単一Issue routeでは、同じ成果の重複がなく、単独でreview・testでき、意図しないrelationやmetadata変更がないことを確認する。
-- 構造化Issue routeでは、各parentを両方向から検証する。parentの完全な`sub_issues`一覧と各childの`parent`を確認する。
+- 構造化Issue routeでは、各parentを両方向から検証する。parentの完全な`sub_issues`一覧と各childの`parent`を確認する。完全なintegration workflowでは、固定した親Epicがroot Issueでexact `epic` labelを持ち、Draft integration PRの唯一のclosing targetと一致することも確認する。
 - 構造化Issue routeでは、各dependencyを両方向から検証する。blocked Issueの`blocked_by`とblockerの`blocking`を確認する。
 - 意図したedge集合と観測したedge集合を完全一致で比較し、cycle、推移冗長、重複title、再利用Issueのownership、意図しないwriteを再確認する。
 - 規模判定、作成・更新したIssue、検証証拠、未解決判断、partial failureまたは曖昧な失敗を報告する。構造化Issueではnative parent topology、最小blocker edge、parallel laneも報告し、部分的にしか検証していないgraphを完了扱いしない。

@@ -33,6 +33,8 @@ Epicには以下を記載する。
 
 Phaseはrolloutの説明には使えるが、それだけをdependency graphの根拠にしてはならない。
 
+完全なintegration workflowでは、親Epicだけに既存のexact `epic` labelを付ける。単一Issue route、Issue-onlyの構造化route、子Issueへは、このcontractを理由に`epic`や他のlabelを自動付与しない。存在しないlabelも自動作成しない。
+
 ## 実装sub-issue
 
 各実装childには以下を記載する。
@@ -51,7 +53,7 @@ acceptance criteriaだけでIssueを独立してreviewできるようにする�
 完全なintegration workflowでは、各child本文へ以下も固定して記載する。
 
 - 実装PRのmerge先となるexact feature branch名。例: `feature/foo-bar`。
-- feature branchからdefault branchへのintegration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
+- feature branchからdefault branchへのDraft integration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 実装PRのbaseはdefault branchではなく、上記feature branchであること。
 
 ## Decision/ADR Issueの記述
