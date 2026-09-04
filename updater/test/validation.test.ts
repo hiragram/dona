@@ -20,6 +20,10 @@ describe("fixed self-update surface", () => {
       app_schema_write: 3,
       rollback_safe: true,
     });
+    const examplePolicy = JSON.parse(
+      await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),
+    ) as { compatibility: unknown };
+    assert.deepEqual(examplePolicy.compatibility, metadata);
   });
 
   test("does not accept repository, ref, path, command, npm flags, launchctl args, or environment", () => {
