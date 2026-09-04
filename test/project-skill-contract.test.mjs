@@ -208,13 +208,19 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /local checkout.*過去に保存したtemplate.*代用しない/,
     /存在しない.*取得できない.*空.*構造を安全に解釈できない.*PRを作成・更新せず.*review trigger.*停止/,
     /コメント.*全見出し.*各欄の目的.*見出しと順序を維持/,
-    /`完了する Issue`.*Issue全体が完了.*場合だけ`Closes #xx`/,
-    /部分対応.*単なる関連.*Issue不明.*曖昧.*`Closes`を使用せず.*`Closes #xx`.*残さない/,
+    /`完了する Issue`.*Issue全体が完了.*場合だけ.*`Closes #xx`/,
+    /部分対応.*単なる関連.*Issue不明.*曖昧.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
+    /`close`.*`closes`.*`closed`.*`fix`.*`fixes`.*`fixed`.*`resolve`.*`resolves`.*`resolved`.*大文字小文字.*colon.*検査/,
+    /Issue全体の完了を証明できないIssue reference.*残さない.*標準形式へ正規化/,
     /`変更内容の概要・方針`.*実際の変更.*実装方針・判断/,
     /`テストのカバー範囲`.*未カバー.*未検証の境界/,
     /`動作確認方法`.*実際に実行.*再現可能.*未実行.*実行済みとして記載しない/,
     /Issueに既にある背景、要件、受け入れ条件.*不必要に複製せず.*Issueへの参照/,
     /current templateの全必須欄.*意味的に記入済み.*未解決placeholder.*含まず/,
+    /全automatic closing keyword.*same-repository.*cross-repository Issue reference.*検査.*許可・正規化.*以外を残さない/,
+    /新規Pull Request.*head ref\/SHA.*selected base ref\/SHA.*template取得元のbase SHA.*template blob\/hash.*snapshot/,
+    /作成write直前.*local `HEAD`.*upstream.*remote head.*current base.*current template blob\/hash.*再取得.*snapshot.*比較/,
+    /古いdiffまたはtemplate.*PRを作成せず.*最新identity.*本文生成と検証をやり直す/,
     /既存Pull Request.*current本文を再取得.*raw本文のhash.*head ref\/SHA.*base ref\/SHA.*snapshot.*人間が追記.*保持.*最小限reconcile/,
     /write直前.*本文とhead\/base identity.*もう一度取得.*snapshot.*変化.*古いsnapshot.*書き込まず.*最新のdiff.*exact base SHA.*template.*reconcileをやり直す/,
     /競合.*一意に判断できない.*上書きせず.*停止/,
@@ -230,7 +236,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
   assertContract(completion, "template completion gate", [
     /current baseの標準`.github\/PULL_REQUEST_TEMPLATE\.md`の全欄を反映/,
     /Issue情報を不必要に重複せず/,
-    /Issue全体の完了を証明できない`Closes`.*未解決placeholder.*含まない/,
+    /Issue全体の完了を証明できないautomatic closing reference.*未解決placeholder.*含まない/,
+    /許可したIssue close.*標準形式`Closes #xx`/,
   ]);
 });
 
