@@ -4,8 +4,8 @@
 
 ## round recordを作る
 
-1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認し、selected base refとそのcurrent SHA、repositoryのcurrent default branch refも取得して対象diffを固定する。current Pull Requestのraw本文を取得し、selected baseのexact SHAから取得した標準templateとcurrent default branch条件を反映済みであることを`SKILL.md`の手順で検証して、raw UTF-8 bytesのSHA-256 hashをbody identityとして固定する。いずれかが不明または不一致ならtriggerを投稿せず、どのstateがcurrentかを解消する。
-2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。latest triggerについて、Codex actorの`eyes`がある場合だけでなく、Codexのterminal review/completionがまだなくreactionも空の場合もpendingとして新規投稿せず30〜60秒間隔でpollする。既存roundを引き継ぐのは、保存済みround recordから`target_sha`、`base_ref`、`base_sha`、`default_branch_ref`、`body_sha256`、`template_base_sha`、trigger ID/時刻をすべて復元でき、current head/base/default-branch/body identityと一致する場合だけにする。current SHAだけを明記したCodex-authored artifactはtrigger時点のbody identityを復元できないため、それだけで旧roundを引き継がない。完全なrecordがなくlatest triggerがpendingならduplicate triggerを投稿せず停止し、terminal artifactだけがある場合はそのsignalをcurrent identityのcleanに使わず、current templateと本文、過去inline replyを検証した後にfresh roundを開始する。複数候補、別identity、対応不明、30分state変化なしのいずれかも停止して人間へ報告する。
+1. `local HEAD == upstream SHA == Pull Request head SHA`を再確認し、selected base refとそのcurrent SHA、repositoryのcurrent default branch refも取得して対象diffを固定する。current Pull Requestのraw本文とGraphQL `closingIssuesReferences`全pageを取得し、selected baseのexact SHAから取得した標準template、current default branch条件、各closing relationshipのIssue完了条件を`SKILL.md`の手順で検証する。raw本文と、Issue node ID・repository nameWithOwner・numberでsortしたclosing relationship canonical listをそれぞれSHA-256 hash化し、body/closing identityとして固定する。いずれかが不明または不一致ならtriggerを投稿せず、どのstateがcurrentかを解消する。
+2. 投稿前に全issue commentsからbodyがexact `@codex review`の既存triggerをpaginationし、各triggerのreaction一覧もpaginationしてactorを確認する。latest triggerについて、Codex actorの`eyes`がある場合だけでなく、Codexのterminal review/completionがまだなくreactionも空の場合もpendingとして新規投稿せず30〜60秒間隔でpollする。既存roundを引き継ぐのは、保存済みround recordから`target_sha`、`base_ref`、`base_sha`、`default_branch_ref`、`body_sha256`、`closing_issues_sha256`、`template_base_sha`、trigger ID/時刻をすべて復元でき、current head/base/default-branch/body/closing identityと一致する場合だけにする。current SHAだけを明記したCodex-authored artifactはtrigger時点のbody/closing identityを復元できないため、それだけで旧roundを引き継がない。完全なrecordがなくlatest triggerがpendingならduplicate triggerを投稿せず停止し、terminal artifactだけがある場合はそのsignalをcurrent identityのcleanに使わず、current templateと本文、closing relationship、過去inline replyを検証した後にfresh roundを開始する。複数候補、別identity、対応不明、30分state変化なしのいずれかも停止して人間へ報告する。
 3. 全Codex inline commentsとdirect repliesをpaginationし、過去roundの各top-level inline findingに返信済みか照合する。未返信があればcodeとcommit historyからdispositionと修正commitを一意に証明できる場合だけ元threadへdirect replyして再取得する。証明できなければ停止し、未返信comment URLと不足情報を報告する。未返信を残したままfresh triggerを投稿しない。
 4. pending roundがなく過去inlineへの返信も完備した場合だけ、exact `@codex review`をPull Requestのissue commentとして1件投稿する。成功responseからcomment ID、URL、`created_at`のGitHub server時刻を取得し、その時点のPull Request head SHAと結び付ける。
 5. writeの応答がtimeout・切断で曖昧なら同じcommentを再投稿しない。issue commentsを再取得し、author、bodyの完全一致、server時刻帯によりcommentを照合し、Pull Request head、base、body hashがwrite直前のround identityから変わっていないことも確認する。issue comment単体は対象identityを証明しないため、reconcile中にhead、base、body hashのいずれかが変わった場合はそのtriggerを受理せず停止する。commentを1件かつ同じidentityへ一意に確定できない場合も停止する。
@@ -17,6 +17,7 @@ round recordには少なくとも次を保持する。
 - `base_sha`
 - `default_branch_ref`
 - `body_sha256`
+- `closing_issues_sha256`
 - `template_base_sha`
 - `trigger_comment_id`
 - `trigger_comment_url`
@@ -33,7 +34,7 @@ round recordには少なくとも次を保持する。
 3. triggerのGitHub server時刻より後に作成・提出されたCodex-authored Pull Request review。
 4. trigger後のCodex-authored issue comment。対象`target_sha`を明記し、no-major-issues/no-findingsを明示するcompletion commentはclean signalとして使える。
 5. trigger後のCodex-authored inline review comment。`commit_id`または`original_commit_id`が`target_sha`と一致するfindingだけをcurrent roundへ帰属させる。
-6. Pull Requestのcurrent head SHA、base ref/SHA、repository default branch ref、raw本文から再計算したbody hash、state/draft、mergeability、merge state、およびrequired/current status check、check run、workflow runを取得する。repository workflowとbranch ruleから期待するsuite/contextが一度も現れていない空状態はsuccessにしない。各accepted runについて、Pull Request associationのhead/base SHA、tested merge commitのparents、または同等のGitHub API evidenceがround recordの`target_sha`と`base_sha`の組を検証したことを確認する。base driftより前のrunや対象pairを証明できないrunはcurrent CIに数えず、安全な再実行手段が依頼権限内になければ停止する。
+6. Pull Requestのcurrent head SHA、base ref/SHA、repository default branch ref、raw本文から再計算したbody hash、`closingIssuesReferences`全pageから再計算したclosing relationship hash、state/draft、mergeability、merge state、およびrequired/current status check、check run、workflow runを取得する。repository workflowとbranch ruleから期待するsuite/contextが一度も現れていない空状態はsuccessにしない。各accepted runについて、Pull Request associationのhead/base SHA、tested merge commitのparents、または同等のGitHub API evidenceがround recordの`target_sha`と`base_sha`の組を検証したことを確認する。base driftより前のrunや対象pairを証明できないrunはcurrent CIに数えず、安全な再実行手段が依頼権限内になければ停止する。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
@@ -41,9 +42,9 @@ exact trigger集合、reaction、review/comment集合、head/base SHA、CI check
 
 ## round結果を判定する
 
-- **clean:** exact triggerへCodex integrationと確認したactorが`+1`を付けた、またはtrigger後のCodex-authored commentが`target_sha`を明記してno-major-issues/no-findingsを明示する。さらにcurrent head/base/default-branch/body hashがround recordのidentityのままで、current roundにfindingがないことを確認する。
+- **clean:** exact triggerへCodex integrationと確認したactorが`+1`を付けた、またはtrigger後のCodex-authored commentが`target_sha`を明記してno-major-issues/no-findingsを明示する。さらにcurrent head/base/default-branch/body/closing hashがround recordのidentityのままで、current roundにfindingがないことを確認する。
 - **findings:** target SHAに対する新しいCodex reviewまたはinline commentがfindingを含む場合も、Codex actorの`eyes`消失とterminal review/completionを確認するまでfeedback処理やhead変更を始めない。terminal後にreviewsとinline commentsをもう一度paginationし、全finding集合を固定してから処理する。
-- **superseded:** Pull Request head SHA、base ref、base SHA、repository default branch ref、body hashのいずれかがround recordから変わった。旧roundをclean扱いしない。base ref/SHAまたはdefault branch refが変わった場合は新しいexact base SHAから標準templateを再取得し、automatic closing reference条件を再評価して本文をreconcile・再取得・検証する。body hashだけが変わった場合もcurrent templateとtask事実へreconcileする。current head/base/default-branch/body identityを固定し直した後にfresh roundを作る。
+- **superseded:** Pull Request head SHA、base ref、base SHA、repository default branch ref、body hash、closing relationship hashのいずれかがround recordから変わった。旧roundをclean扱いしない。base ref/SHAまたはdefault branch refが変わった場合は新しいexact base SHAから標準templateを再取得し、automatic closing reference条件を再評価して本文をreconcile・再取得・検証する。body hashまたはclosing relationship hashだけが変わった場合もcurrent template、task事実、Issue完了条件へreconcileする。current head/base/default-branch/body/closing identityを固定し直した後にfresh roundを作る。
 - **stalled:** 30分state変化がない。duplicate triggerを書かず、人間によるretrigger判断を待つ。
 
 ## feedbackを処理する
