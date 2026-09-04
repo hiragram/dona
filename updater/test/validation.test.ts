@@ -1,12 +1,31 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import { describe, test } from "node:test";
 
 import { parsePolicy } from "../src/policy.js";
 import { redactText } from "../src/redaction.js";
-import { parseApplyRequest, parsePlanRequest } from "../src/validation.js";
+import { parseApplyRequest, parseCompatibilityMetadata, parsePlanRequest } from "../src/validation.js";
 import { tempPolicy } from "./helpers.js";
 
 describe("fixed self-update surface", () => {
+  test("publishes the dispatcher v2/v3 read range and schema-v3 write target", async () => {
+    const metadata = parseCompatibilityMetadata(JSON.parse(
+      await fs.readFile(new URL("../../config/release-compatibility.json", import.meta.url), "utf8"),
+    ));
+    assert.deepEqual(metadata, {
+      protocol: 1,
+      config: 1,
+      app_schema_read_min: 2,
+      app_schema_read_max: 3,
+      app_schema_write: 3,
+      rollback_safe: true,
+    });
+    const examplePolicy = JSON.parse(
+      await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),
+    ) as { compatibility: unknown };
+    assert.deepEqual(examplePolicy.compatibility, metadata);
+  });
+
   test("does not accept repository, ref, path, command, npm flags, launchctl args, or environment", () => {
     const base = {
       source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
