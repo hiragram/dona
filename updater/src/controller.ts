@@ -24,7 +24,10 @@ interface TerminalObservation {
   activeSha: string;
 }
 
-function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
+export function releaseCompatibilityMatches(
+  previous: ReleaseManifest["compatibility"],
+  target: ReleaseManifest["compatibility"],
+): boolean {
   return previous.rollback_safe && target.rollback_safe &&
     previous.protocol === target.protocol && previous.config === target.config &&
     previous.app_schema_write >= target.app_schema_read_min && previous.app_schema_write <= target.app_schema_read_max &&
@@ -80,7 +83,7 @@ export class UpdateController {
       built_at: this.clock.now().toISOString(),
       compatibility: git.target_compatibility,
     };
-    const rollbackCompatible = compatible(current.compatibility, targetManifest.compatibility);
+    const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
     if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
@@ -1253,8 +1256,17 @@ export class UpdateController {
   }
 
   private healthMatches(health: HealthSnapshot, sha: string, requireWorkspaces: boolean): boolean {
+    const rangeAbsent = health.app_schema_read_min === undefined && health.app_schema_read_max === undefined &&
+      health.app_schema_write === undefined;
+    const rangeMatches = health.app_schema_read_min === this.policy.compatibility.app_schema_read_min &&
+      health.app_schema_read_max === this.policy.compatibility.app_schema_read_max &&
+      health.app_schema_write === this.policy.compatibility.app_schema_write;
+    const legacySingleSchemaProjection = this.policy.compatibility.app_schema_read_min ===
+      this.policy.compatibility.app_schema_read_max &&
+      this.policy.compatibility.app_schema_write === this.policy.compatibility.app_schema_read_min && rangeAbsent;
     return health.ready && health.build_sha === sha && health.protocol === this.policy.compatibility.protocol &&
       health.app_schema === this.policy.compatibility.app_schema_write && health.config === this.policy.compatibility.config &&
+      (legacySingleSchemaProjection || rangeMatches) &&
       (!requireWorkspaces || health.workspaces_ready === true);
   }
 

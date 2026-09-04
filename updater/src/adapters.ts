@@ -695,6 +695,15 @@ export class RealRuntime implements RuntimePort {
         build_sha: typeof response.build_sha === "string" ? response.build_sha : null,
         protocol: typeof response.protocol === "number" ? response.protocol : null,
         app_schema: typeof response.app_schema === "number" ? response.app_schema : null,
+        ...(typeof response.app_schema_read_min === "number"
+          ? { app_schema_read_min: response.app_schema_read_min }
+          : {}),
+        ...(typeof response.app_schema_read_max === "number"
+          ? { app_schema_read_max: response.app_schema_read_max }
+          : {}),
+        ...(typeof response.app_schema_write === "number"
+          ? { app_schema_write: response.app_schema_write }
+          : {}),
         config: typeof response.config === "number" ? response.config : null,
         ...(typeof response.update_notification_protocol === "number"
           ? { update_notification_protocol: response.update_notification_protocol }

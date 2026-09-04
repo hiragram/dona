@@ -252,6 +252,17 @@ describe("DispatcherApi", () => {
       source_event_id: eventId,
       reply_target: { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" },
     }]);
+    const version = await request(config.socketPath, "GET", "/health/version");
+    assert.deepEqual(
+      {
+        app_schema: version.body.app_schema,
+        app_schema_read_min: version.body.app_schema_read_min,
+        app_schema_read_max: version.body.app_schema_read_max,
+        app_schema_write: version.body.app_schema_write,
+      },
+      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3 },
+    );
+    assert.equal(JSON.stringify(version.body).includes(config.databasePath), false);
     database.manualComplete(eventId);
     assert.equal((await request(config.socketPath, "GET", `/v1/events/${eventId}/terminal`)).body.terminal, true);
     assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
