@@ -108,6 +108,7 @@ class FakeRuntime implements RuntimePort {
   mainStartUnknownOnce = false;
   previousMainStartUnknownOnce = false;
   notificationProtocolReady = true;
+  actualAppSchema = 2;
   afterSlackStart: (() => Promise<void>) | undefined;
   private readonly healthCompatibility = new Map<string, Compatibility>();
   private mainAgentExists = true;
@@ -217,7 +218,7 @@ class FakeRuntime implements RuntimePort {
       ready,
       build_sha: live ? sha ?? this.policySha() : null,
       protocol: live ? 1 : null,
-      app_schema: live ? compatibility?.app_schema_write ?? 2 : null,
+      app_schema: live ? this.actualAppSchema : null,
       config: live ? 1 : null,
       ...(live && compatibility ? {
         app_schema_read_min: compatibility.app_schema_read_min,
@@ -371,6 +372,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.build.compatibility = schemaV3Compatibility;
     f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
     f.runtime.setHealthCompatibility(targetSha, schemaV3Compatibility);
+    f.runtime.actualAppSchema = 3;
 
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     const plan = planned.plan as { plan_id: string; plan_hash: string };

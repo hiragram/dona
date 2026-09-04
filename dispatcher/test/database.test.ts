@@ -164,6 +164,17 @@ describe("DispatcherDatabase", () => {
     const legacyCompletion = envelopeFromRow(database.get("evt-completion-completed")!);
     assert.equal(legacyCompletion.source, "dona_job");
     assert.equal("group" in legacyCompletion.payload, false);
+    const running = database.getJob("job-running")!;
+    const completionTime = "2026-09-03T00:04:00.000Z";
+    database.saveJobResult("job-running", {
+      schema_version: 1,
+      job_id: "job-running",
+      status: "completed",
+      summary: "完了",
+      completed_at: completionTime,
+    }, running.result_path);
+    database.enqueueJobNotification("job-running", new Date(completionTime));
+    assert.equal(database.getJobGroup("evt-source-running")?.notification_mode, "legacy");
     database.close();
 
     const restarted = new DispatcherDatabase(config.databasePath);
@@ -265,9 +276,9 @@ describe("DispatcherDatabase", () => {
       new Date("2026-09-03T01:00:00.000Z"),
     );
     assert.equal(created.row.job_key, "legacy-default");
-    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
-    assert.deepEqual(database.ensureJobGroup(source.event_id, "grouped").created, false);
-    assert.throws(() => database.ensureJobGroup(source.event_id, "legacy"), /already uses grouped/);
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "legacy");
+    assert.deepEqual(database.ensureJobGroup(source.event_id, "legacy").created, false);
+    assert.throws(() => database.ensureJobGroup(source.event_id, "grouped"), /already uses legacy/);
 
     const sealed = database.sealJobGroup(source.event_id, new Date("2026-09-03T01:01:00.000Z"));
     assert.equal(sealed.sealed_at, "2026-09-03T01:01:00.000Z");
@@ -397,6 +408,7 @@ describe("DispatcherDatabase", () => {
     assert.equal(notification.row.event_type, "job_completed");
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");
     assert.equal(duplicate.row.event_id, notification.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "legacy");
     database.close();
   });
 

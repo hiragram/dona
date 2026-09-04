@@ -411,7 +411,7 @@ export class DispatcherDatabase {
           INSERT INTO job_groups (
             source_event_id, sealed_at, notification_mode, attention_event_id,
             all_terminal_event_id, created_at, updated_at
-          ) VALUES (?, NULL, 'grouped', NULL, NULL, ?, ?)
+          ) VALUES (?, NULL, 'legacy', NULL, NULL, ?, ?)
         `).run(request.source_event_id, timestamp, timestamp);
       }
       this.db.prepare(`
@@ -713,45 +713,58 @@ export class DispatcherDatabase {
   }
 
   enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult {
-    const job = this.getJobRequired(jobId);
-    if (job.completion_event_id) {
-      const existing = this.get(job.completion_event_id);
-      if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
-      return { row: existing, duplicate: true, payloadMismatch: false };
-    }
-    const sourceEvent = this.getRequired(job.source_event_id);
-    const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
-    const envelope: EventEnvelope = {
-      schema_version: 1,
-      source: "dona_job",
-      external_event_id: `${job.job_id}:${job.status}`,
-      type: `job_${job.status}`,
-      occurred_at: at.toISOString(),
-      subject: {
-        job_id: job.job_id,
-        source_event_id: job.source_event_id,
-        ...(job.workspace_id ? { workspace_id: job.workspace_id } : {}),
-        ...(job.channel_id ? { channel_id: job.channel_id } : {}),
-        ...(job.thread_ts ? { thread_ts: job.thread_ts } : {}),
-        ...(job.actor_id ? { actor_id: job.actor_id } : {}),
-      },
-      payload: {
-        job_id: job.job_id,
-        job_status: job.status,
-        workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
-        ...(result ? { result } : {}),
-        ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
-        ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
-      },
-      reply_target: sourceEvent.reply_target_json
-        ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
-        : null,
-      trace: { job_id: job.job_id, source_event_id: job.source_event_id },
-    };
-    const enqueued = this.enqueue(envelope, at);
-    this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
-      .run(enqueued.row.event_id, at.toISOString(), jobId);
-    return enqueued;
+    return this.db.transaction(() => {
+      const job = this.getJobRequired(jobId);
+      const timestamp = at.toISOString();
+      const group = this.getJobGroupRequired(job.source_event_id);
+      if (group.notification_mode === "grouped") {
+        if (group.attention_event_id || group.all_terminal_event_id) {
+          throw new Error(`Job group ${job.source_event_id} already has grouped notification ownership`);
+        }
+        this.db.prepare(`
+          UPDATE job_groups SET notification_mode = 'legacy', updated_at = ?
+          WHERE source_event_id = ? AND notification_mode = 'grouped'
+        `).run(timestamp, job.source_event_id);
+      }
+      if (job.completion_event_id) {
+        const existing = this.get(job.completion_event_id);
+        if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
+        return { row: existing, duplicate: true, payloadMismatch: false };
+      }
+      const sourceEvent = this.getRequired(job.source_event_id);
+      const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
+      const envelope: EventEnvelope = {
+        schema_version: 1,
+        source: "dona_job",
+        external_event_id: `${job.job_id}:${job.status}`,
+        type: `job_${job.status}`,
+        occurred_at: timestamp,
+        subject: {
+          job_id: job.job_id,
+          source_event_id: job.source_event_id,
+          ...(job.workspace_id ? { workspace_id: job.workspace_id } : {}),
+          ...(job.channel_id ? { channel_id: job.channel_id } : {}),
+          ...(job.thread_ts ? { thread_ts: job.thread_ts } : {}),
+          ...(job.actor_id ? { actor_id: job.actor_id } : {}),
+        },
+        payload: {
+          job_id: job.job_id,
+          job_status: job.status,
+          workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
+          ...(result ? { result } : {}),
+          ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
+          ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
+        },
+        reply_target: sourceEvent.reply_target_json
+          ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
+          : null,
+        trace: { job_id: job.job_id, source_event_id: job.source_event_id },
+      };
+      const enqueued = this.enqueue(envelope, at);
+      this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
+        .run(enqueued.row.event_id, timestamp, jobId);
+      return enqueued;
+    })();
   }
 
   private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
