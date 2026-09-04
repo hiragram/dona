@@ -123,7 +123,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /^- `target_sha`$/m,
     /^- `base_ref`$/m,
     /^- `base_sha`$/m,
-    /reconcile中にheadが変わった場合.*triggerを受理せず停止/,
+    /^- `body_sha256`$/m,
+    /^- `template_base_sha`$/m,
+    /raw本文.*標準template.*検証.*SHA-256 hash.*body identity.*固定/,
+    /reconcile中にhead、base、body hash.*変わった場合.*triggerを受理せず停止/,
     /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
     /latest trigger.*`eyes`.*terminal review\/completion.*reactionも空.*pending.*新規投稿せず.*poll/,
     /current SHA.*exact triggerへ一意.*引き継ぐ.*複数候補.*30分.*停止/,
@@ -140,6 +143,7 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /issue comment/,
     /inline review comment/,
     /current head SHA.*status check.*check run/,
+    /raw本文.*body hash/,
     /Pull Request association.*head\/base SHA.*tested merge commit.*GitHub API evidence/,
     /base driftより前のrun.*current CIに数えず/,
   ]);
@@ -164,7 +168,9 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
     /空reaction.*完了ではない/,
   ]);
   assertContract(decision, "empty state is not clean", [
-    /superseded.*旧roundをclean扱いせず/,
+    /superseded.*head SHA.*base ref.*base SHA.*body hash.*旧roundをclean扱いしない/,
+    /base ref\/SHAが変わった.*新しいexact base SHA.*標準templateを再取得.*reconcile.*再取得.*検証/,
+    /body hashだけが変わった.*current template.*reconcile/,
     /findings.*`eyes`消失.*terminal review\/completion.*feedback処理やhead変更を始めない/,
     /terminal後.*reviews.*inline comments.*pagination.*全finding集合を固定/,
   ]);
@@ -205,11 +211,13 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /`動作確認方法`.*実際に実行.*再現可能.*未実行.*実行済みとして記載しない/,
     /Issueに既にある背景、要件、受け入れ条件.*不必要に複製せず.*Issueへの参照/,
     /current templateの全必須欄.*意味的に記入済み.*未解決placeholder.*含まず/,
-    /既存Pull Request.*current本文を再取得.*人間が追記.*保持.*最小限reconcile/,
+    /既存Pull Request.*current本文を再取得.*raw本文のhash.*snapshot.*人間が追記.*保持.*最小限reconcile/,
+    /write直前.*もう一度取得.*snapshotのhash.*変化.*古いsnapshot.*書き込まず.*最新本文.*reconcileをやり直す/,
     /競合.*一意に判断できない.*上書きせず.*停止/,
     /作成・更新後.*再取得.*実際の本文.*head\/base\/state\/non-draft/,
     /write結果が曖昧.*blind retryせず.*本文.*更新時刻.*head\/base.*照合/,
     /追加push.*変更概要.*test範囲.*動作確認.*fresh roundの前.*更新・再取得・検証/,
+    /selected base ref\/SHAが変わった.*新しいexact base SHA.*template.*必ず再取得.*reconcile.*再取得.*検証/,
   ]);
   assertContract(boundary, "template review gate", [
     /templateの取得.*意味的反映.*再取得検証.*review roundを開始しない/,
@@ -229,7 +237,7 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   const target = section(skill, "review targetを固定する");
 
   assertContract(completion, "completion gates", [
-    /latest round.*current Pull Request head SHA.*current base ref\/SHA/,
+    /latest round.*current Pull Request head SHA.*current base ref\/SHA.*current PR body hash/,
     /\+1.*no-major-issues\/no-findings/,
     /未解決finding.*過去round.*inline comment.*direct reply済み/,
     /local `HEAD`.*upstream.*Pull Request head SHA.*一致/,
