@@ -186,6 +186,42 @@ test("feedback後は各inline threadへdirect replyしてからfresh roundへ進
   ]);
 });
 
+test("PR本文はcurrent baseの標準template全欄を反映して再取得検証する", async () => {
+  const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
+  const template = section(skill, "標準Pull Request templateを反映する");
+  const boundary = section(skill, "安全境界");
+  const completion = section(skill, "完了条件");
+
+  assertContract(template, "standard PR template", [
+    /作成・本文更新.*\.github\/PULL_REQUEST_TEMPLATE\.md.*必ず使う/,
+    /selected baseのexact SHA.*取得元のbase ref\/SHA.*記録/,
+    /local checkout.*過去に保存したtemplate.*代用しない/,
+    /存在しない.*取得できない.*空.*構造を安全に解釈できない.*PRを作成・更新せず.*review trigger.*停止/,
+    /コメント.*全見出し.*各欄の目的.*見出しと順序を維持/,
+    /`完了する Issue`.*Issue全体が完了.*場合だけ`Closes #xx`/,
+    /部分対応.*単なる関連.*Issue不明.*曖昧.*`Closes`を使用せず.*`Closes #xx`.*残さない/,
+    /`変更内容の概要・方針`.*実際の変更.*実装方針・判断/,
+    /`テストのカバー範囲`.*未カバー.*未検証の境界/,
+    /`動作確認方法`.*実際に実行.*再現可能.*未実行.*実行済みとして記載しない/,
+    /Issueに既にある背景、要件、受け入れ条件.*不必要に複製せず.*Issueへの参照/,
+    /current templateの全必須欄.*意味的に記入済み.*未解決placeholder.*含まず/,
+    /既存Pull Request.*current本文を再取得.*人間が追記.*保持.*最小限reconcile/,
+    /競合.*一意に判断できない.*上書きせず.*停止/,
+    /作成・更新後.*再取得.*実際の本文.*head\/base\/state\/non-draft/,
+    /write結果が曖昧.*blind retryせず.*本文.*更新時刻.*head\/base.*照合/,
+    /追加push.*変更概要.*test範囲.*動作確認.*fresh roundの前.*更新・再取得・検証/,
+  ]);
+  assertContract(boundary, "template review gate", [
+    /templateの取得.*意味的反映.*再取得検証.*review roundを開始しない/,
+    /外部writeが曖昧.*既存本文と競合.*blind retry.*しない/,
+  ]);
+  assertContract(completion, "template completion gate", [
+    /current baseの標準`.github\/PULL_REQUEST_TEMPLATE\.md`の全欄を反映/,
+    /Issue情報を不必要に重複せず/,
+    /Issue全体の完了を証明できない`Closes`.*未解決placeholder.*含まない/,
+  ]);
+});
+
 test("SKILL.mdが全completion gateと禁止事項を保持する", async () => {
   const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
   const completion = section(skill, "完了条件");
