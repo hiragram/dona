@@ -169,11 +169,13 @@ describe("Dona Dispatcher MCP server", () => {
         throw new DispatcherClientError(undefined, "Dispatcher request timed out after 10000ms");
       },
       getJob: notUsed,
-      async listEventJobs(sourceEventId, jobKey) {
+      async listEventJobs(sourceEventId, jobKey, canonicalPayloadSha256) {
         listCalls += 1;
+        assert.match(canonicalPayloadSha256 ?? "", /^[0-9a-f]{64}$/);
         return {
           schema_version: 1,
           source_event_id: sourceEventId,
+          reconciliation: "matched",
           jobs: [{ job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", job_key: jobKey, status: "queued" }],
         };
       },
@@ -210,11 +212,14 @@ describe("Dona Dispatcher MCP server", () => {
         arguments: {
           source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
           job_key: " repo.audit ",
+          objective: "調査する",
+          workspace_kind: "scratch",
         },
       });
       assert.equal(reconciled.isError, undefined);
       assert.equal(createCalls, 1);
       assert.equal(listCalls, 1);
+      assert.equal((reconciled.structuredContent as { reconciliation: string }).reconciliation, "matched");
       assert.equal(
         ((reconciled.structuredContent as { jobs: Array<{ job_id: string }> }).jobs[0]?.job_id),
         "job_01m1es03xy5cf8d9pm5cwx4srv",

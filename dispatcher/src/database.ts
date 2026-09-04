@@ -9,6 +9,7 @@ import type {
   CreateJobResult,
   EnqueueResult,
   EventJobProjection,
+  EventJobReconciliation,
   EventEnvelope,
   EventRow,
   EventStatus,
@@ -21,7 +22,7 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
-import { canonicalJobPayload, legacyJobKey, parseCreateJobRequest, stableStringify } from "./validation.js";
+import { canonicalJobPayloadSha256, legacyJobKey, parseCreateJobRequest, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -133,6 +134,15 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   if (version < 3) db.transaction(() => {
+    db.function("dona_canonical_job_payload_sha256", { deterministic: true }, (
+      sourceEventId: string,
+      objective: string,
+      workspaceJson: string,
+    ) => canonicalJobPayloadSha256(parseCreateJobRequest({
+      source_event_id: sourceEventId,
+      objective,
+      workspace: JSON.parse(workspaceJson) as CreateJobRequest["workspace"],
+    })));
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -145,6 +155,10 @@ export function migrateDispatcherDatabase(
         actor_id              TEXT,
         objective             TEXT NOT NULL,
         workspace_json        TEXT NOT NULL,
+        canonical_payload_sha256 TEXT NOT NULL CHECK (
+          length(canonical_payload_sha256) = 64
+          AND canonical_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
         status                TEXT NOT NULL CHECK (status IN (${jobStatusSql})),
         attempt_count         INTEGER NOT NULL DEFAULT 0,
         available_at          TEXT NOT NULL,
@@ -168,14 +182,16 @@ export function migrateDispatcherDatabase(
       );
       INSERT INTO jobs_v3 (
         job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
-        objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
+        objective, workspace_json, canonical_payload_sha256, status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
         last_error_code, last_error_message, created_at, updated_at
       )
       SELECT
         job_id, source_event_id, 'legacy-default', source, workspace_id, channel_id, thread_ts, actor_id,
-        objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
+        objective, workspace_json,
+        dona_canonical_job_payload_sha256(source_event_id, objective, workspace_json),
+        status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
         last_error_code, last_error_message, created_at, updated_at
@@ -375,7 +391,7 @@ export class DispatcherDatabase {
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
     const workspaceJson = stableStringify(parsedRequest.workspace);
-    const canonicalPayloadJson = stableStringify(canonicalJobPayload(parsedRequest));
+    const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -398,13 +414,7 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM jobs WHERE source_event_id = ? AND job_key = ?")
         .get(parsedRequest.source_event_id, jobKey) as JobRow | undefined;
       if (existing) {
-        const existingRequest = parseCreateJobRequest({
-          source_event_id: existing.source_event_id,
-          objective: existing.objective,
-          workspace: JSON.parse(existing.workspace_json) as CreateJobRequest["workspace"],
-        });
-        const existingCanonicalPayloadJson = stableStringify(canonicalJobPayload(existingRequest));
-        if (existingCanonicalPayloadJson !== canonicalPayloadJson) {
+        if (existing.canonical_payload_sha256 !== canonicalPayloadSha256) {
           throw new JobCreationError(
             "job_idempotency_conflict",
             `Job key ${jobKey} already exists with a different canonical payload`,
@@ -417,11 +427,21 @@ export class DispatcherDatabase {
         };
       }
 
+      const currentSourceEvent = this.getRequired(parsedRequest.source_event_id);
+      if (["completed", "blocked", "needs_review", "dead_letter"].includes(currentSourceEvent.status)) {
+        throw new JobCreationError(
+          "job_group_closed",
+          `Job group ${parsedRequest.source_event_id} is closed because its source event is ${currentSourceEvent.status}`,
+        );
+      }
       const group = this.getJobGroup(parsedRequest.source_event_id);
       if (group?.sealed_at) {
         throw new JobCreationError("job_group_closed", `Job group ${parsedRequest.source_event_id} is sealed`);
       }
-      if (group?.notification_mode === "legacy" && jobKey !== legacyJobKey) {
+      const hasLegacyDefaultJob = group?.notification_mode === "legacy" && this.db.prepare(`
+        SELECT 1 FROM jobs WHERE source_event_id = ? AND job_key = ?
+      `).get(parsedRequest.source_event_id, legacyJobKey) !== undefined;
+      if (hasLegacyDefaultJob && jobKey !== legacyJobKey) {
         throw new JobCreationError(
           "job_group_closed",
           `Legacy job group ${parsedRequest.source_event_id} does not accept additional job keys`,
@@ -457,9 +477,9 @@ export class DispatcherDatabase {
       this.db.prepare(`
         INSERT INTO jobs (
           job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
-          objective, workspace_json, status, available_at, workspace_path, result_path,
+          objective, workspace_json, canonical_payload_sha256, status, available_at, workspace_path, result_path,
           agent_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
       `).run(
         jobId,
         parsedRequest.source_event_id,
@@ -471,6 +491,7 @@ export class DispatcherDatabase {
         stringValue(subject.actor_id),
         parsedRequest.objective,
         workspaceJson,
+        canonicalPayloadSha256,
         timestamp,
         workspacePath,
         resultPath,
@@ -579,6 +600,18 @@ export class DispatcherDatabase {
       last_error_code: row.last_error_code,
       result_summary: this.jobResultSummary(row),
     }));
+  }
+
+  reconcileEventJob(
+    sourceEventId: string,
+    jobKey: string,
+    canonicalPayloadSha256: string,
+  ): EventJobReconciliation {
+    const row = this.db.prepare(`
+      SELECT canonical_payload_sha256 FROM jobs WHERE source_event_id = ? AND job_key = ?
+    `).get(sourceEventId, jobKey) as Pick<JobRow, "canonical_payload_sha256"> | undefined;
+    if (!row) return "not_found";
+    return row.canonical_payload_sha256 === canonicalPayloadSha256 ? "matched" : "conflict";
   }
 
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {

@@ -225,10 +225,20 @@ export class DispatcherApi {
         if (jobKey !== undefined && !jobKeyPattern.test(jobKey)) {
           throw new ApiRequestError(400, "invalid_request", "job_key is invalid");
         }
+        const canonicalPayloadSha256 = url.searchParams.get("canonical_payload_sha256") ?? undefined;
+        if (canonicalPayloadSha256 !== undefined && !/^[0-9a-f]{64}$/.test(canonicalPayloadSha256)) {
+          throw new ApiRequestError(400, "invalid_request", "canonical_payload_sha256 is invalid");
+        }
+        if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
+        }
         sendJson(response, 200, {
           schema_version: 1,
           source_event_id: sourceEventId,
           jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
+            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
+            : {}),
         });
         return;
       }

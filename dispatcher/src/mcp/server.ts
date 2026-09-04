@@ -3,12 +3,21 @@ import * as z from "zod/v4";
 
 import { DispatcherClientError } from "../client.js";
 import type { Logger } from "../logger.js";
-import { jobKeyPattern, legacyJobKey } from "../validation.js";
+import {
+  canonicalJobPayloadSha256,
+  jobKeyPattern,
+  legacyJobKey,
+  parseCreateJobRequest,
+} from "../validation.js";
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
-  listEventJobs(sourceEventId: string, jobKey?: string): Promise<Record<string, unknown>>;
+  listEventJobs(
+    sourceEventId: string,
+    jobKey?: string,
+    canonicalPayloadSha256?: string,
+  ): Promise<Record<string, unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
@@ -107,12 +116,41 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("list_event_jobs", {
     title: "List source event jobs",
-    description: "create応答のtimeout・切断後に、source_event_idと任意のjob_keyから0件・1件・複数件を読み取り専用で照合します。writeを自動再送しません。",
-    inputSchema: { source_event_id: eventId, job_key: jobKey.optional() },
+    description: "create応答のtimeout・切断後に、source_event_idと任意のjob_keyから0件・1件・複数件を読み取り専用で照合します。元のobjectiveとworkspaceも指定するとcanonical payloadのmatched/conflictを判定します。writeを自動再送しません。",
+    inputSchema: {
+      source_event_id: eventId,
+      job_key: jobKey.optional(),
+      objective: z.string().min(1).max(100_000).optional(),
+      workspace_kind: z.enum(["scratch", "github"]).optional(),
+      repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
+      base_ref: z.string().min(1).max(255).optional(),
+    },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ source_event_id, job_key }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
     try {
-      return success(await client.listEventJobs(source_event_id, job_key));
+      const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined;
+      if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
+      if (!job_key || objective === undefined || workspace_kind === undefined) {
+        throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
+      }
+      if (workspace_kind === "github" && !repo) throw new Error("repository is required for a GitHub job");
+      if (workspace_kind === "scratch" && (repo || base_ref)) {
+        throw new Error("repository/base_ref are only valid for a GitHub job");
+      }
+      const workspace = workspace_kind === "scratch"
+        ? { kind: "scratch" as const }
+        : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
+      const canonicalRequest = parseCreateJobRequest({
+        source_event_id,
+        ...(job_key === legacyJobKey ? {} : { job_key }),
+        objective,
+        workspace,
+      });
+      return success(await client.listEventJobs(
+        source_event_id,
+        job_key,
+        canonicalJobPayloadSha256(canonicalRequest),
+      ));
     } catch (error) {
       return failure(error, logger, "list_event_jobs");
     }

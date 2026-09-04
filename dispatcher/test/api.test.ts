@@ -8,7 +8,7 @@ import { afterEach, describe, test } from "node:test";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
-import { stableStringify } from "../src/validation.js";
+import { canonicalJobPayloadSha256, parseCreateJobRequest, stableStringify } from "../src/validation.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
@@ -268,12 +268,13 @@ describe("DispatcherApi", () => {
     const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-lost-job-response"));
     const sourceEventId = String(accepted.body.event_id);
 
-    await requestAndDropResponseBody(config.socketPath, "/v1/jobs", {
+    const createBody = {
       source_event_id: sourceEventId,
       job_key: "response.lost",
       objective: "recover through read-only lookup",
       workspace: { kind: "scratch" },
-    });
+    };
+    await requestAndDropResponseBody(config.socketPath, "/v1/jobs", createBody);
     const persisted = database.listEventJobs(sourceEventId, "response.lost");
     assert.equal(persisted.length, 1);
     assert.equal(jobWakeCount, 1);
@@ -281,10 +282,30 @@ describe("DispatcherApi", () => {
     const reconciled = await request(
       config.socketPath,
       "GET",
-      `/v1/events/${sourceEventId}/jobs?job_key=response.lost`,
+      `/v1/events/${sourceEventId}/jobs?job_key=response.lost&canonical_payload_sha256=${
+        canonicalJobPayloadSha256(parseCreateJobRequest(createBody))
+      }`,
     );
     assert.equal(reconciled.status, 200);
+    assert.equal(reconciled.body.reconciliation, "matched");
     assert.equal((reconciled.body.jobs as Array<Record<string, unknown>>)[0]?.job_id, persisted[0]?.job_id);
+    const conflict = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=response.lost&canonical_payload_sha256=${"0".repeat(64)}`,
+    );
+    assert.equal(conflict.body.reconciliation, "conflict");
+    const notFound = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=missing&canonical_payload_sha256=${"0".repeat(64)}`,
+    );
+    assert.equal(notFound.body.reconciliation, "not_found");
+    assert.equal((await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?canonical_payload_sha256=${"0".repeat(64)}`,
+    )).status, 400);
     assert.equal(database.listEventJobs(sourceEventId).length, 1);
     assert.equal(jobWakeCount, 1);
     await api.stop();

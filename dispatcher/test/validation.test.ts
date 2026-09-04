@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 
 import {
   canonicalJobPayload,
+  canonicalJobPayloadSha256,
   parseCreateJobRequest,
   parseEventEnvelope,
   parseInternalUpdateEventEnvelope,
@@ -104,5 +105,6 @@ describe("job creation validation", () => {
       stableStringify(canonicalJobPayload(first)),
       stableStringify(canonicalJobPayload(second)),
     );
+    assert.equal(canonicalJobPayloadSha256(first), canonicalJobPayloadSha256(second));
   });
 });

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { z } from "zod";
 
 import type {
@@ -180,6 +182,12 @@ export function parseCreateJobRequest(input: unknown): CreateJobRequest {
 
 export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayload {
   return { objective: request.objective, workspace: request.workspace };
+}
+
+export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
+  return createHash("sha256")
+    .update(stableStringify(canonicalJobPayload(request)))
+    .digest("hex");
 }
 
 export function parseSteerJobRequest(input: unknown): SteerJobRequest {
