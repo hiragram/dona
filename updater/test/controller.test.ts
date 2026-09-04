@@ -9,6 +9,7 @@ import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/por
 import { ReleaseStore } from "../src/release-store.js";
 import type {
   CommandResult,
+  Compatibility,
   CompletionDeliveryResult,
   CompletionLookupResult,
   DrainSnapshot,
@@ -40,6 +41,10 @@ test("requires a v2/v3 compatibility bridge before a schema-v3 writing release",
 });
 
 class FakeGit implements GitPort {
+  targetCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
     return {
@@ -47,7 +52,7 @@ class FakeGit implements GitPort {
       target_sha: this.target,
       target_reachable: this.reachable,
       ci_trusted: true,
-      target_compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+      target_compatibility: this.targetCompatibility,
     };
   }
   async stage(target: string, destination: string) {
@@ -59,6 +64,10 @@ class FakeGit implements GitPort {
 
 class FakeBuild implements BuildPort {
   fail = false;
+  compatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
   async toolchain() { return { node_version: process.versions.node, npm_version: "11.0.0" }; }
   async buildRelease() {
     if (this.fail) throw new Error("canonical tests failed");
@@ -66,7 +75,7 @@ class FakeBuild implements BuildPort {
       lock_hashes: { dispatcher: "a".repeat(64), "sources/slack": "b".repeat(64), updater: "c".repeat(64) },
       node_version: process.versions.node,
       npm_version: "11.0.0",
-      compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+      compatibility: this.compatibility,
     };
   }
 }
@@ -100,6 +109,7 @@ class FakeRuntime implements RuntimePort {
   previousMainStartUnknownOnce = false;
   notificationProtocolReady = true;
   afterSlackStart: (() => Promise<void>) | undefined;
+  private readonly healthCompatibility = new Map<string, Compatibility>();
   private mainAgentExists = true;
   private dispatcherLive = true;
   private slackLive = true;
@@ -113,6 +123,9 @@ class FakeRuntime implements RuntimePort {
     this.mainAgentExists = false;
     this.dispatcherLive = false;
     this.slackLive = false;
+  }
+  setHealthCompatibility(sha: string, compatibility: Compatibility): void {
+    this.healthCompatibility.set(sha, compatibility);
   }
   async quiesceSlack(): Promise<DrainSnapshot> { this.calls.push("quiesceSlack"); return { service: "slack_adapter", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
   async quiesceDispatcher(): Promise<DrainSnapshot> { this.calls.push("quiesceDispatcher"); return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
@@ -197,14 +210,20 @@ class FakeRuntime implements RuntimePort {
     return { ...this.health("slack_adapter", current, true), workspaces_ready: true };
   }
   private health(service: HealthSnapshot["service"], sha: string | null, ready: boolean, live = true): HealthSnapshot {
+    const compatibility = sha ? this.healthCompatibility.get(sha) : undefined;
     return {
       service,
       live,
       ready,
       build_sha: live ? sha ?? this.policySha() : null,
       protocol: live ? 1 : null,
-      app_schema: live ? 2 : null,
+      app_schema: live ? compatibility?.app_schema_write ?? 2 : null,
       config: live ? 1 : null,
+      ...(live && compatibility ? {
+        app_schema_read_min: compatibility.app_schema_read_min,
+        app_schema_read_max: compatibility.app_schema_read_max,
+        app_schema_write: compatibility.app_schema_write,
+      } : {}),
       ...(live && this.notificationProtocolReady ? { update_notification_protocol: 1 } : {}),
     };
   }
@@ -233,14 +252,15 @@ async function fixture(policyVersion = "2026-09-03.2") {
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
   const store = new ReleaseStore(policy);
   const dispatcher = new FakeDispatcher();
+  const git = new FakeGit();
   const build = new FakeBuild();
   const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
   let now = new Date("2026-09-02T00:00:00.000Z");
-  const controller = new UpdateController(database, policy, new FakeGit(), build, store, runtime, dispatcher, logger, {
+  const controller = new UpdateController(database, policy, git, build, store, runtime, dispatcher, logger, {
     now: () => new Date(now),
   }, "controller-test");
   return {
-    policy, database, store, dispatcher, build, runtime, controller,
+    policy, database, store, dispatcher, git, build, runtime, controller,
     advance: (milliseconds: number) => { now = new Date(now.getTime() + milliseconds); },
   };
 }
@@ -332,6 +352,42 @@ describe("UpdateController isolated end-to-end", () => {
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
       `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
+    f.database.close();
+  });
+
+  test("validates rollback health against the previous release manifest compatibility", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    f.runtime.setHealthCompatibility(targetSha, schemaV3Compatibility);
+
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-schema-v3-rollback",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+
+    await f.controller.processNext();
+
+    assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
 
