@@ -22,7 +22,15 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
-import { canonicalJobPayloadSha256, legacyJobKey, parseCreateJobRequest, stableStringify } from "./validation.js";
+import {
+  canonicalJobPayloadSha256,
+  jobCreationPayloadSha256FromWorkspace,
+  legacyJobKey,
+  parseCreateJobRequest,
+  parseJobWorkspace,
+  serializeJobWorkspace,
+  stableStringify,
+} from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -134,15 +142,6 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   if (version < 3) db.transaction(() => {
-    db.function("dona_canonical_job_payload_sha256", { deterministic: true }, (
-      sourceEventId: string,
-      objective: string,
-      workspaceJson: string,
-    ) => canonicalJobPayloadSha256(parseCreateJobRequest({
-      source_event_id: sourceEventId,
-      objective,
-      workspace: JSON.parse(workspaceJson) as CreateJobRequest["workspace"],
-    })));
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -155,10 +154,6 @@ export function migrateDispatcherDatabase(
         actor_id              TEXT,
         objective             TEXT NOT NULL,
         workspace_json        TEXT NOT NULL,
-        canonical_payload_sha256 TEXT NOT NULL CHECK (
-          length(canonical_payload_sha256) = 64
-          AND canonical_payload_sha256 NOT GLOB '*[^0-9a-f]*'
-        ),
         status                TEXT NOT NULL CHECK (status IN (${jobStatusSql})),
         attempt_count         INTEGER NOT NULL DEFAULT 0,
         available_at          TEXT NOT NULL,
@@ -182,16 +177,14 @@ export function migrateDispatcherDatabase(
       );
       INSERT INTO jobs_v3 (
         job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
-        objective, workspace_json, canonical_payload_sha256, status, attempt_count, available_at, workspace_path, result_path,
+        objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
         last_error_code, last_error_message, created_at, updated_at
       )
       SELECT
         job_id, source_event_id, 'legacy-default', source, workspace_id, channel_id, thread_ts, actor_id,
-        objective, workspace_json,
-        dona_canonical_job_payload_sha256(source_event_id, objective, workspace_json),
-        status, attempt_count, available_at, workspace_path, result_path,
+        objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
         last_error_code, last_error_message, created_at, updated_at
@@ -390,8 +383,8 @@ export class DispatcherDatabase {
     const parsedRequest = parseCreateJobRequest(request);
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
-    const workspaceJson = stableStringify(parsedRequest.workspace);
     const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
+    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace, canonicalPayloadSha256);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -414,7 +407,16 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM jobs WHERE source_event_id = ? AND job_key = ?")
         .get(parsedRequest.source_event_id, jobKey) as JobRow | undefined;
       if (existing) {
-        if (existing.canonical_payload_sha256 !== canonicalPayloadSha256) {
+        const existingCanonicalPayloadSha256 = jobCreationPayloadSha256FromWorkspace(
+          JSON.parse(existing.workspace_json) as unknown,
+        );
+        if (existingCanonicalPayloadSha256 === undefined && jobKey !== legacyJobKey) {
+          throw new JobCreationError(
+            "job_idempotency_conflict",
+            `Job key ${jobKey} has no immutable canonical payload fingerprint`,
+          );
+        }
+        if (existingCanonicalPayloadSha256 !== undefined && existingCanonicalPayloadSha256 !== canonicalPayloadSha256) {
           throw new JobCreationError(
             "job_idempotency_conflict",
             `Job key ${jobKey} already exists with a different canonical payload`,
@@ -477,9 +479,9 @@ export class DispatcherDatabase {
       this.db.prepare(`
         INSERT INTO jobs (
           job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
-          objective, workspace_json, canonical_payload_sha256, status, available_at, workspace_path, result_path,
+          objective, workspace_json, status, available_at, workspace_path, result_path,
           agent_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
       `).run(
         jobId,
         parsedRequest.source_event_id,
@@ -491,7 +493,6 @@ export class DispatcherDatabase {
         stringValue(subject.actor_id),
         parsedRequest.objective,
         workspaceJson,
-        canonicalPayloadSha256,
         timestamp,
         workspacePath,
         resultPath,
@@ -608,10 +609,12 @@ export class DispatcherDatabase {
     canonicalPayloadSha256: string,
   ): EventJobReconciliation {
     const row = this.db.prepare(`
-      SELECT canonical_payload_sha256 FROM jobs WHERE source_event_id = ? AND job_key = ?
-    `).get(sourceEventId, jobKey) as Pick<JobRow, "canonical_payload_sha256"> | undefined;
+      SELECT workspace_json FROM jobs WHERE source_event_id = ? AND job_key = ?
+    `).get(sourceEventId, jobKey) as Pick<JobRow, "workspace_json"> | undefined;
     if (!row) return "not_found";
-    return row.canonical_payload_sha256 === canonicalPayloadSha256 ? "matched" : "conflict";
+    const storedSha256 = jobCreationPayloadSha256FromWorkspace(JSON.parse(row.workspace_json) as unknown);
+    if (storedSha256 === undefined) return "unverified_legacy";
+    return storedSha256 === canonicalPayloadSha256 ? "matched" : "conflict";
   }
 
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
@@ -844,7 +847,7 @@ export class DispatcherDatabase {
         payload: {
           job_id: job.job_id,
           job_status: job.status,
-          workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
+          workspace: parseJobWorkspace(JSON.parse(job.workspace_json)) as Record<string, unknown>,
           ...(result ? { result } : {}),
           ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
           ...(job.last_error_message ? { error_message: job.last_error_message } : {}),

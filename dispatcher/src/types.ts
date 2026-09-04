@@ -140,7 +140,6 @@ export interface JobRow {
   actor_id: string | null;
   objective: string;
   workspace_json: string;
-  canonical_payload_sha256: string;
   status: JobStatus;
   attempt_count: number;
   available_at: string;
@@ -189,4 +188,4 @@ export interface EventJobProjection {
   result_summary: string | null;
 }
 
-export type EventJobReconciliation = "not_found" | "matched" | "conflict";
+export type EventJobReconciliation = "not_found" | "matched" | "conflict" | "unverified_legacy";

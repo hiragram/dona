@@ -7,6 +7,7 @@ import type {
   CanonicalJobPayload,
   CreateJobRequest,
   EventEnvelope,
+  JobWorkspace,
   JobResultEnvelope,
   ResultEnvelope,
   SteerJobRequest,
@@ -20,6 +21,7 @@ const utcRfc3339 = z
 
 export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 export const legacyJobKey = "legacy-default";
+const jobCreationMetadataKey = "__dona_job_creation";
 
 const eventEnvelopeSchema = z
   .object({
@@ -90,6 +92,14 @@ const gitRef = z
   .max(255)
   .refine((value) => !value.startsWith("-") && !value.includes("..") && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value), "must be a safe Git ref");
 
+const jobWorkspaceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("scratch") }).strip(),
+  z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
+]);
+const jobCreationMetadataSchema = z.object({
+  canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
 const createJobSchema = z.object({
   source_event_id: z.string().trim().min(1),
   job_key: z
@@ -99,10 +109,7 @@ const createJobSchema = z.object({
     .refine((value) => value !== legacyJobKey, `${legacyJobKey} is reserved and must be omitted`)
     .optional(),
   objective: z.string().trim().min(1).max(100_000),
-  workspace: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("scratch") }).strip(),
-    z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
-  ]),
+  workspace: jobWorkspaceSchema,
 }).strip();
 
 const steerJobSchema = z.object({
@@ -188,6 +195,25 @@ export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
   return createHash("sha256")
     .update(stableStringify(canonicalJobPayload(request)))
     .digest("hex");
+}
+
+export function serializeJobWorkspace(workspace: JobWorkspace, canonicalPayloadSha256: string): string {
+  return stableStringify({
+    ...workspace,
+    [jobCreationMetadataKey]: { canonical_payload_sha256: canonicalPayloadSha256 },
+  });
+}
+
+export function parseJobWorkspace(input: unknown): JobWorkspace {
+  return parseWithSchema<JobWorkspace>(jobWorkspaceSchema, input);
+}
+
+export function jobCreationPayloadSha256FromWorkspace(input: unknown): string | undefined {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const parsed = jobCreationMetadataSchema.safeParse(
+    (input as Record<string, unknown>)[jobCreationMetadataKey],
+  );
+  return parsed.success ? parsed.data.canonical_payload_sha256 : undefined;
 }
 
 export function parseSteerJobRequest(input: unknown): SteerJobRequest {
