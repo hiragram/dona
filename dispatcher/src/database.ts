@@ -17,6 +17,7 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
+import { jobAgentName } from "./job-agent-name.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -243,6 +244,7 @@ export class DispatcherDatabase {
           jobId,
         );
       const resultPath = path.join(resultDir, `${jobId}.json`);
+      const agentName = jobAgentName(jobId, request.objective);
       const timestamp = at.toISOString();
       this.db.prepare(`
         INSERT INTO jobs (
@@ -263,7 +265,7 @@ export class DispatcherDatabase {
         timestamp,
         workspacePath,
         resultPath,
-        jobId,
+        agentName,
         timestamp,
         timestamp,
       );

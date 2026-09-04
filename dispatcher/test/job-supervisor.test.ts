@@ -37,6 +37,7 @@ describe("JobSupervisor", () => {
       config.jobResultsDir,
     ).row;
     let promptCount = 0;
+    let promptTarget = "";
     let workerWakeCount = 0;
     const runtime: JobAgentRuntime = {
       async prepare() {
@@ -44,8 +45,9 @@ describe("JobSupervisor", () => {
         return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" };
       },
       async get() { return ok("idle"); },
-      async prompt(_jobId, prompt) {
+      async prompt(agentName, prompt) {
         promptCount += 1;
+        promptTarget = agentName;
         assert.match(prompt, /\[DONA_JOB_BEGIN\]/);
         const result = {
           schema_version: 1,
@@ -70,6 +72,7 @@ describe("JobSupervisor", () => {
     await supervisor.stop();
     assert.equal(database.getJob(job.job_id)?.status, "completed");
     assert.equal(promptCount, 1);
+    assert.equal(promptTarget, job.agent_name);
     assert.ok(workerWakeCount >= 1);
     const notification = database.get(database.getJob(job.job_id)!.completion_event_id!);
     assert.equal(notification?.source, "dona_job");
@@ -93,10 +96,11 @@ describe("JobSupervisor", () => {
     database.beginJobDispatch(job.job_id);
     database.markJobRunning(job.job_id);
     const steers: string[] = [];
+    const steerTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
       async get() { return ok("working"); },
-      async prompt(_jobId, text) { steers.push(text); return ok("working"); },
+      async prompt(agentName, text) { steerTargets.push(agentName); steers.push(text); return ok("working"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
     };
@@ -104,7 +108,74 @@ describe("JobSupervisor", () => {
     const result = await supervisor.steer(job.job_id, followUp.event_id, "追加条件");
     assert.equal(result.duplicate, false);
     assert.deepEqual(steers, ["追加条件"]);
+    assert.deepEqual(steerTargets, [job.agent_name]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    database.close();
+  });
+
+  test("uses the persisted agent name when monitoring a job after restart", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-resumed-agent-name")).row;
+    const job = database.createJob(
+      { source_event_id: source.event_id, objective: "実装する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "1", "w1:p1");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    const waitTargets: string[] = [];
+    const runtime: JobAgentRuntime = {
+      async prepare() { throw new Error("not used"); },
+      async get() { return ok("working"); },
+      async prompt() { return ok("working"); },
+      async wait(agentName) {
+        waitTargets.push(agentName);
+        return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" };
+      },
+      async cancel() { return ok("idle"); },
+    };
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => waitTargets.length > 0);
+    await supervisor.stop();
+
+    assert.equal(waitTargets[0], job.agent_name);
+    assert.equal(database.getJob(job.job_id)?.status, "running");
+    database.close();
+  });
+
+  test("uses the persisted agent name when cancelling a running job", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-cancel-source")).row;
+    const followUp = database.enqueue(eventEnvelope("Ev-cancel-follow-up")).row;
+    const job = database.createJob(
+      { source_event_id: source.event_id, objective: "修正する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "1", "w1:p1");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    const cancelTargets: string[] = [];
+    const runtime: JobAgentRuntime = {
+      async prepare() { throw new Error("not used"); },
+      async get() { return ok("working"); },
+      async prompt() { return ok("working"); },
+      async wait() { return ok("working"); },
+      async cancel(agentName) { cancelTargets.push(agentName); return ok("idle"); },
+    };
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    const result = await supervisor.cancel(job.job_id, followUp.event_id);
+
+    assert.deepEqual(cancelTargets, [job.agent_name]);
+    assert.equal(result.row.status, "cancelled");
     database.close();
   });
 });

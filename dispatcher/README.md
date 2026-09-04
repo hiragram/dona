@@ -58,7 +58,7 @@ herdr --session dona agent prompt dona-main <prompt>
 herdr --session dona agent wait dona-main --until idle --until done --until blocked --timeout 120000
 ```
 
-バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、同じ`job_id`をHerdr agent名としてCodexを起動します。GitHub jobではDispatcherが検証・選択したrepositoryとworktreeだけを、起動時の`projects = { "<path>" = { trust_level = "trusted" } }`overrideへ渡すため、対話的なproject trust確認でworkerが停止しません。これはsandboxやcommand approvalを無効化する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
+バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、Herdrの32文字制限内に収まる`j<完全なULID>-<固定slug>`をagent名としてCodexを起動します。たとえば改善作業は`j01m1ne631mt99zdpwfmrwsvjdg-impr`です。slugは外部入力を転写せず、`impr`、`fix`、`impl`、`test`、`docs`、`rvw`、`rsch`、`updt`、`dply`、`rels`、`task`の固定語彙から選びます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みの旧agent名も再起動時にそのまま使います。GitHub jobではDispatcherが検証・選択したrepositoryとworktreeだけを、起動時の`projects = { "<path>" = { trust_level = "trusted" } }`overrideへ渡すため、対話的なproject trust確認でworkerが停止しません。これはsandboxやcommand approvalを無効化する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
 
 ## Dona Dispatcher MCP
 
