@@ -70,7 +70,8 @@ herdr --session dona agent wait dona-main --until idle --until done --until bloc
 
 Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
 
-- `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任
+- `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
+- `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
 - `get_job_status`: 状態と結果を取得
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer

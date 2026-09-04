@@ -1,11 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
+import { DispatcherClientError } from "../client.js";
 import type { Logger } from "../logger.js";
+import { jobKeyPattern, legacyJobKey } from "../validation.js";
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
+  listEventJobs(sourceEventId: string, jobKey?: string): Promise<Record<string, unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
@@ -24,6 +27,16 @@ const updateRequestId = z.string().regex(/^upd_[0-9a-hjkmnp-tv-z]{26}$/);
 const updatePlanId = z.string().regex(/^plan_[0-9a-hjkmnp-tv-z]{26}$/);
 const planHash = z.string().regex(/^[0-9a-f]{64}$/);
 const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
+const jobKey = z.string().trim().regex(jobKeyPattern);
+const createJobKey = jobKey.refine(
+  (value) => value !== legacyJobKey,
+  `${legacyJobKey} is reserved; omit job_key for legacy behavior`,
+);
+const preservedJobErrorCodes = new Set([
+  "job_idempotency_conflict",
+  "job_group_closed",
+  "job_group_limit_exceeded",
+]);
 
 function success(data: Record<string, unknown>) {
   return {
@@ -34,8 +47,19 @@ function success(data: Record<string, unknown>) {
 
 function failure(error: unknown, logger: Logger, tool: string) {
   const message = error instanceof Error ? error.message : String(error);
-  logger.error("Dispatcher MCP tool failed", { tool, error_code: "dispatcher_tool_error", error_message: message });
-  const data = { error: { code: "dispatcher_tool_error", message } };
+  const dispatcherBody = error instanceof DispatcherClientError &&
+      typeof error.body === "object" && error.body !== null
+    ? error.body as { error?: { code?: unknown; message?: unknown } }
+    : undefined;
+  const dispatcherCode = dispatcherBody?.error?.code;
+  const code = typeof dispatcherCode === "string" && preservedJobErrorCodes.has(dispatcherCode)
+    ? dispatcherCode
+    : "dispatcher_tool_error";
+  const safeMessage = code === "dispatcher_tool_error"
+    ? message
+    : typeof dispatcherBody?.error?.message === "string" ? dispatcherBody.error.message : message;
+  logger.error("Dispatcher MCP tool failed", { tool, error_code: code, error_message: safeMessage });
+  const data = { error: { code, message: safeMessage } };
   return {
     isError: true,
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
@@ -58,25 +82,39 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("delegate_job", {
     title: "Delegate background job",
-    description: "長時間になりそうな調査・開発を、別のCodexワーカーへ委任します。1 eventにつき1 jobです。",
+    description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。同じsource eventでは安定したjob_keyごとに1つの論理jobへ収束します。",
     inputSchema: {
       source_event_id: eventId,
+      job_key: createJobKey.optional().describe("同じsource event内でcallerがwrite前に決める安定key。省略時のみlegacy-default"),
       objective: z.string().min(1).max(100_000),
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async ({ source_event_id, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
     try {
       if (workspace_kind === "github" && !repo) throw new Error("repository is required for a GitHub job");
       if (workspace_kind === "scratch" && (repo || base_ref)) throw new Error("repository/base_ref are only valid for a GitHub job");
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
-      return success(await client.createJob({ source_event_id, objective, workspace }));
+      return success(await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace }));
     } catch (error) {
       return failure(error, logger, "delegate_job");
+    }
+  });
+
+  server.registerTool("list_event_jobs", {
+    title: "List source event jobs",
+    description: "create応答のtimeout・切断後に、source_event_idと任意のjob_keyから0件・1件・複数件を読み取り専用で照合します。writeを自動再送しません。",
+    inputSchema: { source_event_id: eventId, job_key: jobKey.optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ source_event_id, job_key }) => {
+    try {
+      return success(await client.listEventJobs(source_event_id, job_key));
+    } catch (error) {
+      return failure(error, logger, "list_event_jobs");
     }
   });
 

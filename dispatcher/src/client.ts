@@ -18,6 +18,11 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
+  listEventJobs(sourceEventId: string, jobKey?: string): Promise<Record<string, unknown>> {
+    const query = jobKey === undefined ? "" : `?${new URLSearchParams({ job_key: jobKey })}`;
+    return this.request("GET", `/v1/events/${encodeURIComponent(sourceEventId)}/jobs${query}`);
+  }
+
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {
     const query = new URLSearchParams({
       workspace_id: workspaceId,

@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { parseEventEnvelope, parseInternalUpdateEventEnvelope, parseResultEnvelope } from "../src/validation.js";
+import {
+  canonicalJobPayload,
+  parseCreateJobRequest,
+  parseEventEnvelope,
+  parseInternalUpdateEventEnvelope,
+  parseResultEnvelope,
+  stableStringify,
+} from "../src/validation.js";
 import { eventEnvelope } from "./helpers.js";
 
 describe("event validation", () => {
@@ -54,5 +61,48 @@ describe("event validation", () => {
     assert.throws(() => parseEventEnvelope(envelope), /source/);
     assert.equal(parseInternalUpdateEventEnvelope(envelope).source, "dona_update");
     assert.throws(() => parseInternalUpdateEventEnvelope({ ...envelope, type: "update_succeeded" }), /type\/status mismatch/);
+  });
+});
+
+describe("job creation validation", () => {
+  test("accepts job key boundaries and reserves legacy-default for omission", () => {
+    const base = {
+      source_event_id: " evt_source ",
+      objective: " investigate ",
+      workspace: { kind: "scratch", ignored: true },
+      ignored: true,
+    };
+    const omitted = parseCreateJobRequest(base);
+    assert.equal(omitted.job_key, undefined);
+    assert.equal(omitted.source_event_id, "evt_source");
+    assert.equal(omitted.objective, "investigate");
+    assert.deepEqual(omitted.workspace, { kind: "scratch" });
+
+    assert.equal(parseCreateJobRequest({ ...base, job_key: "a" }).job_key, "a");
+    assert.equal(parseCreateJobRequest({ ...base, job_key: " report.daily " }).job_key, "report.daily");
+    assert.equal(parseCreateJobRequest({ ...base, job_key: `a${"._-0".repeat(15)}abc` }).job_key?.length, 64);
+    for (const jobKey of ["", "A", "-starts-wrong", `${"a".repeat(65)}`, "legacy-default"]) {
+      assert.throws(() => parseCreateJobRequest({ ...base, job_key: jobKey }), /job_key|lowercase|reserved/);
+    }
+  });
+
+  test("canonicalizes only the validated objective and workspace", () => {
+    const first = parseCreateJobRequest({
+      source_event_id: "evt_source",
+      job_key: "one",
+      objective: "  investigate  ",
+      workspace: { kind: "github", repository: " owner/repo ", base_ref: " main ", ignored: "value" },
+      ignored: "value",
+    });
+    const second = parseCreateJobRequest({
+      source_event_id: "evt_source",
+      job_key: "two",
+      objective: "investigate",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+    });
+    assert.equal(
+      stableStringify(canonicalJobPayload(first)),
+      stableStringify(canonicalJobPayload(second)),
+    );
   });
 });

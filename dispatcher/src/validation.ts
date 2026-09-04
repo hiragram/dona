@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type {
   CancelJobRequest,
+  CanonicalJobPayload,
   CreateJobRequest,
   EventEnvelope,
   JobResultEnvelope,
@@ -14,6 +15,9 @@ const utcRfc3339 = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/, "must be UTC RFC 3339")
   .refine((value) => !Number.isNaN(Date.parse(value)), "must be a valid timestamp");
+
+export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
+export const legacyJobKey = "legacy-default";
 
 const eventEnvelopeSchema = z
   .object({
@@ -75,6 +79,7 @@ const resultEnvelopeSchema = z
 
 const repository = z
   .string()
+  .trim()
   .regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/, "must be owner/repo");
 const gitRef = z
   .string()
@@ -85,6 +90,12 @@ const gitRef = z
 
 const createJobSchema = z.object({
   source_event_id: z.string().trim().min(1),
+  job_key: z
+    .string()
+    .trim()
+    .regex(jobKeyPattern, "must be 1-64 lowercase key characters")
+    .refine((value) => value !== legacyJobKey, `${legacyJobKey} is reserved and must be omitted`)
+    .optional(),
   objective: z.string().trim().min(1).max(100_000),
   workspace: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("scratch") }).strip(),
@@ -165,6 +176,10 @@ function parseWithSchema<T>(schema: z.ZodType, input: unknown): T {
 
 export function parseCreateJobRequest(input: unknown): CreateJobRequest {
   return parseWithSchema<CreateJobRequest>(createJobSchema, input);
+}
+
+export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayload {
+  return { objective: request.objective, workspace: request.workspace };
 }
 
 export function parseSteerJobRequest(input: unknown): SteerJobRequest {

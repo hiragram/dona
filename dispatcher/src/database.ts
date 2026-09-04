@@ -8,6 +8,7 @@ import type {
   CreateJobRequest,
   CreateJobResult,
   EnqueueResult,
+  EventJobProjection,
   EventEnvelope,
   EventRow,
   EventStatus,
@@ -20,11 +21,22 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
-import { stableStringify } from "./validation.js";
+import { canonicalJobPayload, legacyJobKey, parseCreateJobRequest, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+export type JobCreationErrorCode =
+  | "job_idempotency_conflict"
+  | "job_group_closed"
+  | "job_group_limit_exceeded";
+
+export class JobCreationError extends Error {
+  constructor(readonly code: JobCreationErrorCode, message: string) {
+    super(message);
+    this.name = "JobCreationError";
+  }
+}
 
 export const dispatcherSchemaCompatibility = {
   read_min: 2,
@@ -359,8 +371,11 @@ export class DispatcherDatabase {
     resultDir: string,
     at = new Date(),
   ): CreateJobResult {
-    const sourceEvent = this.getRequired(request.source_event_id);
-    const workspaceJson = stableStringify(request.workspace);
+    const parsedRequest = parseCreateJobRequest(request);
+    const sourceEvent = this.getRequired(parsedRequest.source_event_id);
+    const jobKey = parsedRequest.job_key ?? legacyJobKey;
+    const workspaceJson = stableStringify(parsedRequest.workspace);
+    const canonicalPayloadJson = stableStringify(canonicalJobPayload(parsedRequest));
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -378,56 +393,83 @@ export class DispatcherDatabase {
       throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target`);
     }
 
-    return this.db.transaction(() => {
+    return this.db.transaction((): CreateJobResult => {
       const existing = this.db
-        .prepare("SELECT * FROM jobs WHERE source_event_id = ? AND job_key = 'legacy-default'")
-        .get(request.source_event_id) as JobRow | undefined;
+        .prepare("SELECT * FROM jobs WHERE source_event_id = ? AND job_key = ?")
+        .get(parsedRequest.source_event_id, jobKey) as JobRow | undefined;
       if (existing) {
+        const existingRequest = parseCreateJobRequest({
+          source_event_id: existing.source_event_id,
+          objective: existing.objective,
+          workspace: JSON.parse(existing.workspace_json) as CreateJobRequest["workspace"],
+        });
+        const existingCanonicalPayloadJson = stableStringify(canonicalJobPayload(existingRequest));
+        if (existingCanonicalPayloadJson !== canonicalPayloadJson) {
+          throw new JobCreationError(
+            "job_idempotency_conflict",
+            `Job key ${jobKey} already exists with a different canonical payload`,
+          );
+        }
         return {
           row: existing,
+          outcome: "reused",
           duplicate: true,
-          payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
         };
       }
 
+      const group = this.getJobGroup(parsedRequest.source_event_id);
+      if (group?.sealed_at) {
+        throw new JobCreationError("job_group_closed", `Job group ${parsedRequest.source_event_id} is sealed`);
+      }
+      if (group?.notification_mode === "legacy" && jobKey !== legacyJobKey) {
+        throw new JobCreationError(
+          "job_group_closed",
+          `Legacy job group ${parsedRequest.source_event_id} does not accept additional job keys`,
+        );
+      }
+
       const jobId = `job_${ulid(at.getTime()).toLowerCase()}`;
-      const workspacePath = request.workspace.kind === "scratch"
+      const workspacePath = parsedRequest.workspace.kind === "scratch"
         ? path.join(workspaceRoot, "scratch", jobId)
         : path.join(
           workspaceRoot,
           "github",
-          request.workspace.repository.split("/")[0]!,
-          request.workspace.repository.split("/")[1]!,
+          parsedRequest.workspace.repository.split("/")[0]!,
+          parsedRequest.workspace.repository.split("/")[1]!,
           "worktrees",
           jobId,
         );
       const resultPath = path.join(resultDir, `${jobId}.json`);
       const timestamp = at.toISOString();
-      const group = this.getJobGroup(request.source_event_id);
-      if (group?.sealed_at) throw new Error(`Job group ${request.source_event_id} is sealed`);
       if (!group) {
         this.db.prepare(`
           INSERT INTO job_groups (
             source_event_id, sealed_at, notification_mode, attention_event_id,
             all_terminal_event_id, created_at, updated_at
-          ) VALUES (?, NULL, 'legacy', NULL, NULL, ?, ?)
-        `).run(request.source_event_id, timestamp, timestamp);
+          ) VALUES (?, NULL, ?, NULL, NULL, ?, ?)
+        `).run(
+          parsedRequest.source_event_id,
+          jobKey === legacyJobKey ? "legacy" : "grouped",
+          timestamp,
+          timestamp,
+        );
       }
       this.db.prepare(`
         INSERT INTO jobs (
           job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
           objective, workspace_json, status, available_at, workspace_path, result_path,
           agent_name, created_at, updated_at
-        ) VALUES (?, ?, 'legacy-default', ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
       `).run(
         jobId,
-        request.source_event_id,
+        parsedRequest.source_event_id,
+        jobKey,
         sourceEvent.source,
         workspaceId,
         channelId,
         threadTs,
         stringValue(subject.actor_id),
-        request.objective,
+        parsedRequest.objective,
         workspaceJson,
         timestamp,
         workspacePath,
@@ -436,8 +478,8 @@ export class DispatcherDatabase {
         timestamp,
         timestamp,
       );
-      return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
-    })();
+      return { row: this.getJobRequired(jobId), outcome: "created", duplicate: false };
+    }).immediate();
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -517,6 +559,26 @@ export class DispatcherDatabase {
       WHERE workspace_id = ? AND channel_id = ? AND thread_ts = ?
       ORDER BY created_at DESC LIMIT ?
     `).all(workspaceId, channelId, threadTs, limit) as JobRow[];
+  }
+
+  listEventJobs(sourceEventId: string, jobKey?: string): EventJobProjection[] {
+    const rows = jobKey === undefined
+      ? this.db.prepare(`
+          SELECT * FROM jobs WHERE source_event_id = ? ORDER BY created_at, job_id
+        `).all(sourceEventId) as JobRow[]
+      : this.db.prepare(`
+          SELECT * FROM jobs WHERE source_event_id = ? AND job_key = ? ORDER BY created_at, job_id
+        `).all(sourceEventId, jobKey) as JobRow[];
+    return rows.map((row) => ({
+      job_id: row.job_id,
+      job_key: row.job_key,
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      completed_at: row.completed_at,
+      last_error_code: row.last_error_code,
+      result_summary: this.jobResultSummary(row),
+    }));
   }
 
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
@@ -1018,6 +1080,18 @@ export class DispatcherDatabase {
     const row = this.getJobGroup(sourceEventId);
     if (!row) throw new Error(`Job group ${sourceEventId} was not found`);
     return row;
+  }
+
+  private jobResultSummary(row: JobRow): string | null {
+    if (!row.result_json) return null;
+    try {
+      const result = JSON.parse(row.result_json) as Record<string, unknown>;
+      if (typeof result.summary !== "string") return null;
+      const characters = Array.from(result.summary);
+      return characters.length <= 500 ? result.summary : `${characters.slice(0, 499).join("")}…`;
+    } catch {
+      return null;
+    }
   }
 
   private updateJob(

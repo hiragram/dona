@@ -51,6 +51,12 @@ export type JobWorkspace =
 
 export interface CreateJobRequest {
   source_event_id: string;
+  job_key?: string;
+  objective: string;
+  workspace: JobWorkspace;
+}
+
+export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
 }
@@ -167,6 +173,17 @@ export interface JobGroupRow {
 
 export interface CreateJobResult {
   row: JobRow;
+  outcome: "created" | "reused";
   duplicate: boolean;
-  payloadMismatch: boolean;
+}
+
+export interface EventJobProjection {
+  job_id: string;
+  job_key: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  last_error_code: string | null;
+  result_summary: string | null;
 }

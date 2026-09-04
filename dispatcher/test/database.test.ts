@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 
 import {
   DispatcherDatabase,
+  JobCreationError,
   migrateDispatcherDatabase,
   type DispatcherMigrationStep,
 } from "../src/database.js";
@@ -292,6 +293,80 @@ describe("DispatcherDatabase", () => {
     const duplicateClaim = database.claimJobGroupTransition(source.event_id, "attention", contender.event_id);
     assert.equal(duplicateClaim.claimed, false);
     assert.equal(duplicateClaim.row.attention_event_id, owner.event_id);
+    database.close();
+  });
+
+  test("creates distinct keyed jobs and reconciles reuse, conflict, and closed groups", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-keyed-jobs")).row;
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "research.primary",
+      objective: "  first objective  ",
+      workspace: { kind: "scratch" as const },
+    };
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "research.secondary",
+      objective: "second objective",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.equal(first.outcome, "created");
+    assert.equal(first.duplicate, false);
+    assert.equal(first.row.objective, "first objective");
+    assert.equal(second.outcome, "created");
+    assert.notEqual(first.row.job_id, second.row.job_id);
+    assert.notEqual(first.row.workspace_path, second.row.workspace_path);
+    assert.notEqual(first.row.result_path, second.row.result_path);
+    assert.notEqual(first.row.agent_name, second.row.agent_name);
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
+
+    const reused = database.createJob(
+      firstRequest,
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    assert.equal(reused.outcome, "reused");
+    assert.equal(reused.duplicate, true);
+    assert.equal(reused.row.job_id, first.row.job_id);
+
+    const persistedBeforeConflict = database.getJob(first.row.job_id);
+    assert.throws(
+      () => database.createJob(
+        { ...firstRequest, objective: "different" },
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError && error.code === "job_idempotency_conflict",
+    );
+    assert.deepEqual(database.getJob(first.row.job_id), persistedBeforeConflict);
+    assert.equal(database.listEventJobs(source.event_id).length, 2);
+
+    database.sealJobGroup(source.event_id);
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).outcome,
+      "reused",
+    );
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.after-seal",
+        objective: "third objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
+    assert.deepEqual(database.listEventJobs(source.event_id, "missing"), []);
+    assert.deepEqual(
+      database.listEventJobs(source.event_id, first.row.job_key).map(({ job_id }) => job_id),
+      [first.row.job_id],
+    );
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes(config.jobsWorkspaceRoot), false);
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes("first objective"), false);
     database.close();
   });
 
