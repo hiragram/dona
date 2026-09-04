@@ -39,6 +39,9 @@ test("完全integration routeだけがDraft PRと親epic labelを必須にする
     /構造化Issue route.*Issue作成.*feature branch.*integration PR作成.*すべて明示的/,
     /親Epic.*exact `epic` label.*integration PRをDraft/,
     /Issue作成だけ.*branchやPRの作成を推測しない/,
+    /単一Issue route.*branchやPRのwrite.*親子integration workflowへroutingせず/,
+    /branch\/PR操作を黙って未処理にもしない.*最初のwrite前/,
+    /別のcode submission workflow.*`epic` labelやDraft状態を推測しない/,
   ]);
   assertContract(design, "integration-only epic label", [
     /完全なintegration workflowでだけ.*親Epic.*exact `epic` label.*必須/,
@@ -66,6 +69,9 @@ test("integration resourceはepic親からDraft PRとnative graphの順に作る
     /label作成を許可しない/,
     /最初のwrite前に停止して確認/,
     /他のlabel.*明示的に依頼されたものだけ/,
+    /integration PRの必須状態がDraft.*plan/,
+    /readyまたはnon-draft.*最初のwrite前に停止して確認/,
+    /親Issueやbranchを先に作成してから.*衝突を発見しない/,
   ]);
   assert.match(
     order,
@@ -88,7 +94,9 @@ test("Draft integration PRを固定した親Epicへ一意に対応付ける", ()
 
   assertContract(pullRequest, "Draft PR creation", [
     /open\/closed\/merged.*同じhead\/base.*再取得/,
-    /一意に照合できるopen Draft PR/,
+    /open Draft PRを1件だけ.*execution contextへ採用/,
+    /PR create requestを送らず再取得検証/,
+    /既存PRを採用しない新規作成時だけ/,
     /PR create request.*`draft: true`.*Draft PRを作成/,
     /`gh pr create`.*`--draft`/,
     /`Closes #<親Issue番号>`.*1件だけ/,
@@ -104,7 +112,8 @@ test("Draft integration PRを固定した親Epicへ一意に対応付ける", ()
     /親Epicがroot.*exact `epic` label/,
     /全state.*author.*作成時刻帯.*Draft状態.*head SHA.*blind retryしない/,
     /一意に確定できなければ停止/,
-    /integration_pr_head_sha.*immutableなexecution context/,
+    /integration_pr_head_sha.*integration_pr_origin.*`created`または`resumed`/,
+    /integration_pr_origin.*immutableなexecution context/,
   ]);
   assertContract(recovery, "ambiguous PR reconciliation", [
     /同じhead\/baseのPRを全stateから再取得/,

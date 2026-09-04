@@ -6,6 +6,7 @@ Issue、feature branchのpush、integration PR作成をすべて明示的に依�
 
 - repository、default branch、最新remote default commit、親Epic title、全child title・body、native parent topology、最小`blocker -> blocked` edge、parallel laneを確定する。
 - repositoryのlabelをpaginationして再取得し、名前がexact `epic`の既存labelを一意に確定する。このworkflowはlabel作成を許可しない。exact `epic` labelが存在しない場合、またはユーザーの明示的なlabel方針と必須付与が衝突する場合は、最初のwrite前に停止して確認する。他のlabelは明示的に依頼されたものだけをplanへ含める。
+- integration PRの必須状態がDraftであることをplanへ明記する。ユーザーがreadyまたはnon-draftを明示している場合は、Draft必須contractと衝突するため最初のwrite前に停止して確認する。親Issueやbranchを先に作成してからPR状態の衝突を発見しない。
 - 全open/closed Issueを再取得し、正規化titleと成果から既存重複を検索する。重複候補の扱いが一意に決まらなければwriteしない。
 - topicを表すlowercase kebab-caseの短いslugから、`feature/<short-kebab-slug>`を作る。local/remote両方のbranch collisionを確認し、無関係な既存branchを上書き・再利用しない。
 - working treeが対象作業だけを含むことを確認する。default branchの最新remote commitを明示的なbranch起点として記録する。
@@ -32,13 +33,13 @@ Issue、feature branchのpush、integration PR作成をすべて明示的に依�
 
 ### 3. Draft integration PRを作成する
 
-PR write前にopen/closed/mergedを含む同じhead/baseのPRを再取得する。安全な再開として一意に照合できるopen Draft PRを除き、既存PRがあれば新規PRを作成せず停止する。
+PR write前にopen/closed/mergedを含む同じhead/baseのPRを再取得する。該当PRがなければ新規作成へ進む。後述するidentityを満たすopen Draft PRを1件だけ安全な再開対象として照合できた場合は、そのPRをexecution contextへ採用し、PR create requestを送らず再取得検証へ進む。それ以外の既存PRがあれば新規PRを作成せず停止する。
 
-exact feature branchをhead、default branchをbaseとするPR create requestへ`draft: true`を指定してDraft PRを作成する。`gh pr create`を使う場合は`--draft`を明示する。title・bodyは日本語で記述し、bodyの独立した1行にGitHub closing keywordをexactly `Closes #<親Issue番号>`として1件だけ含める。他Issueをtargetにするclosing keywordを含めない。このPRは、子Issueの実装PRをfeature branchへ集約し、最終的にfeature branchをdefault branchへ統合するためのものであり、ready化やmergeを自動実行しない。
+既存PRを採用しない新規作成時だけ、exact feature branchをhead、default branchをbaseとするPR create requestへ`draft: true`を指定してDraft PRを作成する。`gh pr create`を使う場合は`--draft`を明示する。title・bodyは日本語で記述し、bodyの独立した1行にGitHub closing keywordをexactly `Closes #<親Issue番号>`として1件だけ含める。他Issueをtargetにするclosing keywordを含めない。このPRは、子Issueの実装PRをfeature branchへ集約し、最終的にfeature branchをdefault branchへ統合するためのものであり、ready化やmergeを自動実行しない。
 
 作成responseだけに依存せず、PR URL・番号、author、base repository/ref、head repository/ref、state、`draft: true`、head SHAを再取得する。raw bodyのactive closing keywordが1件だけで、そのtargetがexecution contextの`parent_issue_number`と一致することに加え、GitHub GraphQLの`closingIssuesReferences`をpaginationして完全な集合がその親Issue1件だけであることを確認する。closing referenceのrepository、Issue番号、`fullDatabaseId`、URLを、固定したrepositoryと親EpicのIssue番号・REST `id`・URLへ照合する。`fullDatabaseId`とREST `id`は10進文字列へ正規化して比較し、親Epicがrootかつexact `epic` label付きであることも再確認する。PR作成がtimeoutなどで曖昧な場合は、同じhead/baseのPRを全stateから検索し、author、作成時刻帯、title、body、Draft状態、head SHA、`closingIssuesReferences`で照合して、blind retryしない。一意に確定できなければ停止する。
 
-PRと親Epicの対応を一意に検証できたら、`integration_pr_number`、`integration_pr_url`、`integration_pr_head_sha`をexecution contextへ固定する。子Issue作成前に、`parent_issue_number`、`parent_issue_rest_id`、`parent_issue_url`、`feature_branch`、`empty_commit_sha`、`integration_pr_number`、`integration_pr_url`、`integration_pr_head_sha`をimmutableなexecution contextとして確定し、以後のchild body間で不一致を作らない。
+新規作成または再開したPRと親Epicの対応を一意に検証できたら、`integration_pr_number`、`integration_pr_url`、`integration_pr_head_sha`と`integration_pr_origin`（`created`または`resumed`）をexecution contextへ固定する。子Issue作成前に、`parent_issue_number`、`parent_issue_rest_id`、`parent_issue_url`、`feature_branch`、`empty_commit_sha`、`integration_pr_number`、`integration_pr_url`、`integration_pr_head_sha`、`integration_pr_origin`をimmutableなexecution contextとして確定し、以後のchild body間で不一致を作らない。
 
 ### 4. 子Issueを作成する
 

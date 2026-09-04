@@ -21,6 +21,7 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 - Issueの設計、下書き、評価、提案を求められた場合、またはGitHubへのwriteが明示的に許可されていない場合は、**plan-only**を使う。Issue、relation、label、Project、Milestone、assignmentを作成・変更しない。
 - 明示的に依頼された種類のwriteだけを行う場合は、**create-or-update**を使う。対象を指定repository、テーマ、resource種別に限定する。close、delete、reparent、detach、dependency削除の許可を推測しない。
 - 構造化Issue routeでIssue作成、feature branchのpush、integration PR作成をすべて明示的に依頼された場合だけ、完全なintegration workflowを実行する。このrouteでは親Epicへ既存のexact `epic` labelを付け、integration PRをDraftで作成する。Issue作成だけの依頼からbranchやPRの作成を推測しない。既存backlogのtopology整理では、依頼された既存Issueだけを変更し、明示されていないbranchやPRを作成しない。
+- 単一Issue routeでIssue作成に加えてbranchやPRのwriteも明示されている場合、この親子integration workflowへroutingせず、依頼されたbranch/PR操作を黙って未処理にもしない。最初のwrite前に、単一Issueだけを作るか、親子構造を伴わない別のcode submission workflowを実行するか確認する。ここから`epic` labelやDraft状態を推測しない。
 - read-only調査後もmode、repository、またはwrite範囲に実質的な曖昧さが残る場合は、plan-onlyに留めるか、write前に質問する。
 
 ## repositoryの事実を確定する
