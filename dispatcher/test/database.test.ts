@@ -4,24 +4,283 @@ import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
 
-import { DispatcherDatabase } from "../src/database.js";
+import {
+  DispatcherDatabase,
+  migrateDispatcherDatabase,
+  type DispatcherMigrationStep,
+} from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
+const schemaV2Url = new URL("./fixtures/schema-v2.sql", import.meta.url);
+
+type SqliteRow = Record<string, string | number | null>;
+
+async function createSchemaV2Fixture(databasePath: string): Promise<SqliteRow[]> {
+  const fixture = new Database(databasePath);
+  fixture.pragma("foreign_keys = ON");
+  fixture.exec(await fs.readFile(schemaV2Url, "utf8"));
+  const timestamp = "2026-09-03T00:00:00.000Z";
+  const insertEvent = fixture.prepare(`
+    INSERT INTO events (
+      event_id, schema_version, source, external_event_id, event_type, occurred_at,
+      subject_json, payload_json, reply_target_json, trace_json, status, attempt_count,
+      available_at, dispatch_started_at, prompt_accepted_at, completed_at, result_json,
+      result_path, last_error_code, last_error_message, created_at, updated_at
+    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const sourceIds = ["queued", "running", "completed", "blocked", "needs_review", "cancelled"];
+  for (const [index, status] of sourceIds.entries()) {
+    const sourceEventStatus = status === "running" ? "waiting_agent" : "completed";
+    insertEvent.run(
+      `evt-source-${status}`,
+      "slack",
+      `external-${status}`,
+      "app_mention",
+      timestamp,
+      JSON.stringify({ actor_id: `U-${index}` }),
+      JSON.stringify({ text: `payload-${status}` }),
+      JSON.stringify({
+        kind: "slack_thread",
+        workspace_id: "T_TEST",
+        channel_id: "C_TEST",
+        thread_ts: `1756722030.00000${index}`,
+      }),
+      JSON.stringify({ fixture: true }),
+      sourceEventStatus,
+      index,
+      timestamp,
+      sourceEventStatus === "waiting_agent" ? timestamp : null,
+      sourceEventStatus === "waiting_agent" ? timestamp : null,
+      sourceEventStatus === "completed" ? timestamp : null,
+      sourceEventStatus === "completed" ? JSON.stringify({ status: "completed" }) : null,
+      sourceEventStatus === "completed" ? `/private/event-${status}.json` : null,
+      null,
+      null,
+      timestamp,
+      `2026-09-03T00:00:0${index}.000Z`,
+    );
+  }
+  insertEvent.run(
+    "evt-completion-completed",
+    "dona_job",
+    "job-completed:completed",
+    "job_completed",
+    timestamp,
+    JSON.stringify({ job_id: "job-completed" }),
+    JSON.stringify({ job_id: "job-completed", job_status: "completed" }),
+    JSON.stringify({ kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.000002" }),
+    JSON.stringify({ job_id: "job-completed" }),
+    "completed",
+    1,
+    timestamp,
+    timestamp,
+    timestamp,
+    timestamp,
+    JSON.stringify({ schema_version: 1, status: "completed" }),
+    "/private/completion.json",
+    null,
+    null,
+    timestamp,
+    timestamp,
+  );
+
+  const insertJob = fixture.prepare(`
+    INSERT INTO jobs (
+      job_id, source_event_id, source, workspace_id, channel_id, thread_ts, actor_id,
+      objective, workspace_json, status, attempt_count, available_at, workspace_path,
+      result_path, herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at,
+      prompt_accepted_at, completed_at, result_json, completion_event_id, steer_event_id,
+      steer_state, last_error_code, last_error_message, created_at, updated_at
+    ) VALUES (?, ?, 'slack', 'T_TEST', 'C_TEST', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const [index, status] of sourceIds.entries()) {
+    const terminal = ["completed", "blocked", "needs_review", "cancelled"].includes(status);
+    insertJob.run(
+      `job-${status}`,
+      `evt-source-${status}`,
+      `1756722030.00000${index}`,
+      `U-${index}`,
+      `objective-${status}`,
+      JSON.stringify({ kind: "scratch", fixture: status }),
+      status,
+      index + 1,
+      `2026-09-03T00:01:0${index}.000Z`,
+      `/private/workspace-${status}`,
+      `/private/result-${status}.json`,
+      status === "running" ? "herdr-workspace-1" : null,
+      status === "running" ? "w1:p1" : null,
+      `agent-${status}`,
+      status === "running" ? timestamp : null,
+      status === "running" ? timestamp : null,
+      terminal ? `2026-09-03T00:02:0${index}.000Z` : null,
+      terminal ? JSON.stringify({ schema_version: 1, job_id: `job-${status}`, status }) : null,
+      status === "completed" ? "evt-completion-completed" : null,
+      status === "needs_review" ? "evt-source-needs_review" : null,
+      status === "needs_review" ? "accepted" : null,
+      terminal && status !== "completed" ? `error-${status}` : null,
+      terminal && status !== "completed" ? `message-${status}` : null,
+      timestamp,
+      `2026-09-03T00:03:0${index}.000Z`,
+    );
+  }
+  const rows = fixture.prepare("SELECT * FROM jobs ORDER BY job_id").all() as SqliteRow[];
+  fixture.close();
+  return rows;
+}
+
+function withoutJobKey(row: SqliteRow): SqliteRow {
+  const { job_key: _jobKey, ...legacy } = row;
+  return legacy;
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
 describe("DispatcherDatabase", () => {
-  test("migrates an existing schema v1 database to the jobs schema", async () => {
+  test("transactionally migrates a real schema v2 fixture to v3 without losing job state", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
-    const legacy = new Database(config.databasePath);
-    legacy.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY); PRAGMA user_version = 1;");
-    legacy.close();
+    const before = await createSchemaV2Fixture(config.databasePath);
+
     const database = new DispatcherDatabase(config.databasePath);
-    assert.deepEqual(database.listJobs(), []);
+    assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 3, write: 3 });
+    const after = database.listJobs()
+      .map((row) => withoutJobKey(row as unknown as SqliteRow))
+      .sort((left, right) => String(left.job_id).localeCompare(String(right.job_id)));
+    assert.deepEqual(after, before);
+    assert.deepEqual(new Set(database.listJobs().map((row) => row.job_key)), new Set(["legacy-default"]));
+    assert.equal(database.getJobGroup("evt-source-completed")?.notification_mode, "legacy");
+    assert.equal(database.getJobGroup("evt-source-running")?.notification_mode, "grouped");
+    assert.equal(database.getJobGroup("evt-source-running")?.sealed_at, null);
+    assert.equal(database.getJobGroup("evt-source-queued")?.sealed_at, "2026-09-03T00:00:00.000Z");
+    assert.deepEqual(
+      database.listJobsNeedingNotification().map((row) => row.status).sort(),
+      ["blocked", "cancelled", "needs_review"],
+    );
+
+    const legacyCompletion = envelopeFromRow(database.get("evt-completion-completed")!);
+    assert.equal(legacyCompletion.source, "dona_job");
+    assert.equal("group" in legacyCompletion.payload, false);
+    database.close();
+
+    const restarted = new DispatcherDatabase(config.databasePath);
+    assert.equal(restarted.schemaCompatibility().actual, 3);
+    assert.deepEqual(
+      restarted.listJobs().map((row) => row.job_key),
+      Array.from({ length: before.length }, () => "legacy-default"),
+    );
+    assert.equal(restarted.getJob("job-completed")?.result_json, before.find((row) => row.job_id === "job-completed")?.result_json);
+    assert.equal(restarted.getJob("job-completed")?.completion_event_id, "evt-completion-completed");
+    assert.equal(restarted.listJobsNeedingNotification().some((row) => row.job_id === "job-completed"), false);
+    restarted.close();
+
+    const migrated = new Database(config.databasePath);
+    migrated.pragma("foreign_keys = ON");
+    assert.deepEqual(migrated.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+    assert.deepEqual(migrated.pragma("foreign_key_check"), []);
+    const migratedIndexes = new Set(
+      (migrated.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
+    );
+    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx"]) {
+      assert.equal(migratedIndexes.has(name), true);
+    }
+    assert.equal(
+      (migrated.pragma("index_list('job_groups')") as Array<{ name: string }>).some(
+        (index) => index.name === "job_groups_transition_idx",
+      ),
+      true,
+    );
+    assert.equal((migrated.pragma("foreign_key_list('job_groups')") as unknown[]).length, 3);
+    migrated.exec(`
+      INSERT INTO jobs (
+        job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
+        objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
+        herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
+        completed_at, result_json, completion_event_id, steer_event_id, steer_state,
+        last_error_code, last_error_message, created_at, updated_at
+      )
+      SELECT
+        'job-second-key', source_event_id, 'second', source, workspace_id, channel_id, thread_ts, actor_id,
+        objective, workspace_json, status, attempt_count, available_at, '/private/workspace-second',
+        '/private/result-second.json', herdr_workspace_id, herdr_pane_id, 'agent-second-key',
+        dispatch_started_at, prompt_accepted_at, completed_at, result_json, NULL, steer_event_id,
+        steer_state, last_error_code, last_error_message, created_at, updated_at
+      FROM jobs WHERE job_id = 'job-queued';
+    `);
+    assert.throws(() => migrated.exec(`
+      INSERT INTO jobs (
+        job_id, source_event_id, job_key, source, objective, workspace_json, status,
+        available_at, workspace_path, result_path, agent_name, created_at, updated_at
+      ) VALUES (
+        'job-duplicate-key', 'evt-source-queued', 'second', 'slack', 'duplicate', '{}', 'queued',
+        '2026-09-03T00:00:00.000Z', '/private/duplicate', '/private/duplicate.json',
+        'agent-duplicate-key', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z'
+      );
+    `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
+    migrated.close();
+  });
+
+  test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
+    for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const before = await createSchemaV2Fixture(config.databasePath);
+      const fixture = new Database(config.databasePath);
+      fixture.pragma("foreign_keys = ON");
+
+      assert.throws(
+        () => migrateDispatcherDatabase(fixture, (step) => {
+          if (step === failureStep) throw new Error(`injected-${failureStep}`);
+        }),
+        new RegExp(`injected-${failureStep}`),
+      );
+      assert.equal(fixture.pragma("user_version", { simple: true }), 2);
+      assert.deepEqual(fixture.prepare("SELECT * FROM jobs ORDER BY job_id").all(), before);
+      assert.equal(fixture.prepare("SELECT 1 FROM sqlite_master WHERE name = 'jobs_v3'").get(), undefined);
+      assert.equal(fixture.prepare("SELECT 1 FROM sqlite_master WHERE name = 'job_groups'").get(), undefined);
+      const rolledBackIndexes = new Set(
+        (fixture.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
+      );
+      assert.equal(rolledBackIndexes.has("jobs_thread_idx"), true);
+      assert.equal(rolledBackIndexes.has("jobs_run_idx"), true);
+      assert.equal(rolledBackIndexes.has("jobs_event_idx"), false);
+      assert.deepEqual(fixture.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      assert.deepEqual(fixture.pragma("foreign_key_check"), []);
+      fixture.close();
+    }
+  });
+
+  test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-source")).row;
+    const created = database.createJob(
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+      new Date("2026-09-03T01:00:00.000Z"),
+    );
+    assert.equal(created.row.job_key, "legacy-default");
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
+    assert.deepEqual(database.ensureJobGroup(source.event_id, "grouped").created, false);
+    assert.throws(() => database.ensureJobGroup(source.event_id, "legacy"), /already uses grouped/);
+
+    const sealed = database.sealJobGroup(source.event_id, new Date("2026-09-03T01:01:00.000Z"));
+    assert.equal(sealed.sealed_at, "2026-09-03T01:01:00.000Z");
+    assert.equal(
+      database.sealJobGroup(source.event_id, new Date("2026-09-03T01:02:00.000Z")).sealed_at,
+      "2026-09-03T01:01:00.000Z",
+    );
+    const owner = database.enqueue(eventEnvelope("Ev-group-owner")).row;
+    assert.equal(database.claimJobGroupTransition(source.event_id, "attention", owner.event_id).claimed, true);
+    const contender = database.enqueue(eventEnvelope("Ev-group-contender")).row;
+    const duplicateClaim = database.claimJobGroupTransition(source.event_id, "attention", contender.event_id);
+    assert.equal(duplicateClaim.claimed, false);
+    assert.equal(duplicateClaim.row.attention_event_id, owner.event_id);
     database.close();
   });
 

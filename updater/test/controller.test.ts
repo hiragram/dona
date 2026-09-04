@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { UpdateController } from "../src/controller.js";
+import { releaseCompatibilityMatches, UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
@@ -25,6 +25,19 @@ const sourceEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRV";
 const approvalEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRW";
 const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
 const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: false, output_truncated: false };
+
+test("requires a v2/v3 compatibility bridge before a schema-v3 writing release", () => {
+  const schemaV2 = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const bridge = { ...schemaV2, app_schema_read_max: 3 };
+  const schemaV3 = { ...bridge, app_schema_write: 3 };
+  assert.equal(releaseCompatibilityMatches(schemaV2, schemaV3), false);
+  assert.equal(releaseCompatibilityMatches(schemaV2, bridge), true);
+  assert.equal(releaseCompatibilityMatches(bridge, schemaV3), true);
+  assert.equal(releaseCompatibilityMatches(schemaV3, bridge), true);
+});
 
 class FakeGit implements GitPort {
   constructor(readonly target = targetSha, readonly reachable = true) {}
