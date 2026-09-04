@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Review Cycle"
+  short_description: "コード提出をCodex reviewとCIのcleanまで完走"
+  default_prompt: "$code-submission-review-cycle を使って、task変更を安全にPRへ提出し、current headのCodex reviewとCIがcleanになるまで処理してください。"
+
+policy:
+  allow_implicit_invocation: true

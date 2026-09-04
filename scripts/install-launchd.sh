@@ -1,6 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
+print -u2 "注意: このスクリプトはdeveloper checkoutを直接起動するlegacy方式です。production self-update構成は ./scripts/install-self-update.sh を使用してください。"
+
 SCRIPT_DIR=${0:A:h}
 REPO_DIR=${SCRIPT_DIR:h}
 DISPATCHER_DIR="$REPO_DIR/dispatcher"

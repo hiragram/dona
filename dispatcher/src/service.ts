@@ -6,11 +6,18 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { DispatcherWorker } from "./worker.js";
+import { UpdaterClient } from "./updater-client.js";
+import {
+  SlackAdapterNotificationClient,
+  UpdateNotificationDatabase,
+  UpdateNotificationWorker,
+} from "./update-notification.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath);
+  const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
     session: config.herdrSession,
@@ -25,16 +32,41 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
   );
-  const api = new DispatcherApi(database, worker, jobSupervisor, config, apiLogger);
+  const updateNotificationWorker = new UpdateNotificationWorker(
+    database,
+    updateNotificationDatabase,
+    new SlackAdapterNotificationClient(config),
+    config,
+    createLogger("dispatcher_update_notifications"),
+  );
+  const api = new DispatcherApi(
+    database,
+    worker,
+    jobSupervisor,
+    config,
+    apiLogger,
+    new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
+    {
+      async quiesce() {
+        worker.quiesceAfterCurrent();
+        await updateNotificationWorker.stop();
+        await jobSupervisor.stop();
+      },
+    },
+    updateNotificationWorker,
+  );
 
   try {
     await api.start();
     worker.start();
     jobSupervisor.start();
+    updateNotificationWorker.start();
   } catch (error) {
+    if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (worker.isRunning()) await worker.stop();
     database.close();
+    updateNotificationDatabase.close();
     throw error;
   }
 
@@ -47,9 +79,11 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       try {
         api.beginShutdown();
         await api.stop();
+        await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();
         database.close();
+        updateNotificationDatabase.close();
         resolve();
       } catch (error) {
         reject(error);

@@ -87,6 +87,10 @@ export class SlackSocketAdapter {
   }
 
   async stop(): Promise<void> {
+    await this.quiesce();
+  }
+
+  async quiesce(): Promise<void> {
     this.stopping = true;
     for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
     for (const timer of this.stableTimers.values()) clearTimeout(timer);
@@ -100,7 +104,12 @@ export class SlackSocketAdapter {
       ]);
     }
     await Promise.allSettled(this.sockets.map(({ client }) => client.disconnect()));
-    await Promise.allSettled([...this.inFlight]);
+    if (this.inFlight.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise((resolve) => setTimeout(resolve, this.config.shutdownGraceMs)),
+      ]);
+    }
   }
 
   isSocketReady(): boolean {
@@ -117,6 +126,11 @@ export class SlackSocketAdapter {
 
   connectionStates(): Record<string, ConnectionState> {
     return Object.fromEntries(this.states);
+  }
+
+  drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] } {
+    const unsafe = this.inFlight.size > 0 ? [`dispatcher_posts_or_acks:${this.inFlight.size}`] : [];
+    return { quiescing: this.stopping, drained: this.stopping && unsafe.length === 0, in_flight: this.inFlight.size, unsafe_states: unsafe };
   }
 
   private bind(socket: WorkspaceSocket): void {

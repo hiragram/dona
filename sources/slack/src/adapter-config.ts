@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -7,11 +8,13 @@ export interface SlackAdapterConfig {
   workspaces: string[];
   dispatcherSocketPath: string;
   healthSocketPath: string;
+  updateInternalTokenPath: string;
   dispatcherConnectTimeoutMs: number;
   dispatcherTimeoutMs: number;
   shutdownGraceMs: number;
   socketModeEnabled: true;
   logLevel: SlackLogLevel;
+  buildSha: string;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -32,6 +35,16 @@ function socketModeEnabled(value: string | undefined): true {
   throw new Error("SLACK_SOCKET_MODE_ENABLED must be true; HTTP event reception is not supported");
 }
 
+function buildSha(env: NodeJS.ProcessEnv): string {
+  const explicit = env.DONA_BUILD_SHA?.trim();
+  if (explicit) return explicit;
+  const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return "development";
+  const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as { sha?: unknown };
+  if (typeof parsed.sha !== "string" || !/^[0-9a-f]{40}$/.test(parsed.sha)) throw new Error("DONA release manifest SHA is invalid");
+  return parsed.sha;
+}
+
 export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAdapterConfig {
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
   const existing = loadRuntimeConfig(env);
@@ -43,6 +56,9 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     healthSocketPath: expandHome(
       env.SLACK_HEALTH_SOCKET_PATH ?? path.join(base, "run", "slack-adapter.sock"),
     ),
+    updateInternalTokenPath: expandHome(
+      env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
     dispatcherConnectTimeoutMs: positiveInteger(
       env.DONA_CONNECT_TIMEOUT_MS,
       500,
@@ -52,5 +68,6 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     shutdownGraceMs: positiveInteger(env.SLACK_SHUTDOWN_GRACE_MS, 3_000, "SLACK_SHUTDOWN_GRACE_MS"),
     socketModeEnabled: socketModeEnabled(env.SLACK_SOCKET_MODE_ENABLED),
     logLevel: existing.logLevel,
+    buildSha: buildSha(env),
   };
 }

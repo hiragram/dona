@@ -182,6 +182,34 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT * FROM events WHERE event_id = ?").get(eventId) as EventRow | undefined;
   }
 
+  getByExternalId(source: string, externalEventId: string): EventRow | undefined {
+    return this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
+      .get(source, externalEventId) as EventRow | undefined;
+  }
+
+  isEventCompleted(eventId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE event_id = ? AND status = 'completed'")
+      .get(eventId) !== undefined;
+  }
+
+  updateSafetyStatus(): { safe: boolean; unsafe_states: string[] } {
+    const unsafe: string[] = [];
+    const eventRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM events
+      WHERE status IN ('dispatching', 'waiting_agent') GROUP BY status
+    `).all() as Array<{ status: string; count: number }>;
+    for (const row of eventRows) unsafe.push(`events.${row.status}:${row.count}`);
+    const jobRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM jobs
+      WHERE status IN ('dispatching', 'cancelling') GROUP BY status
+    `).all() as Array<{ status: string; count: number }>;
+    for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
+    const steer = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE steer_state = 'dispatching'")
+      .get() as { count: number };
+    if (steer.count > 0) unsafe.push(`jobs.steer_acceptance_unknown:${steer.count}`);
+    return { safe: unsafe.length === 0, unsafe_states: unsafe };
+  }
+
   getBySequence(sequence: number): EventRow | undefined {
     return this.db.prepare("SELECT * FROM events WHERE sequence = ?").get(sequence) as EventRow | undefined;
   }
@@ -556,11 +584,43 @@ export class DispatcherDatabase {
     const head = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed')
+        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
         ORDER BY sequence LIMIT 1
       `)
       .get() as EventRow | undefined;
     return head && head.available_at <= at.toISOString() ? head : undefined;
+  }
+
+  updateEventsNeedingNotification(): EventRow[] {
+    return this.db.prepare(`
+      SELECT * FROM events
+      WHERE source = 'dona_update' AND status IN ('queued', 'retryable_failed')
+      ORDER BY sequence
+    `).all() as EventRow[];
+  }
+
+  saveDeterministicCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    const row = this.getRequired(eventId);
+    if (row.status === "completed") return;
+    this.transition(eventId, ["queued", "retryable_failed"], "completed", {
+      result_json: stableStringify(result),
+      result_path: resultPath,
+      completed_at: result.completed_at,
+      last_error_code: null,
+      last_error_message: null,
+    });
+  }
+
+  saveDeterministicFailure(eventId: string, result: ResultEnvelope, resultPath: string, code: string): void {
+    const row = this.getRequired(eventId);
+    if (["needs_review", "completed"].includes(row.status)) return;
+    this.transition(eventId, ["queued", "retryable_failed"], "needs_review", {
+      result_json: stableStringify(result),
+      result_path: resultPath,
+      completed_at: result.completed_at,
+      last_error_code: code,
+      last_error_message: result.summary ?? "Update notification requires review",
+    });
   }
 
   recoverStaleDispatching(at = new Date()): number {

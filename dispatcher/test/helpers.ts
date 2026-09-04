@@ -28,6 +28,11 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       jobCommandTimeoutMs: 100,
       ghPath: "gh",
       gitPath: "git",
+      updaterSocketPath: path.join(root, "update-control", "updater.sock"),
+      updateInternalTokenPath: path.join(root, "update-control", "dispatcher.token"),
+      updateNotificationDatabasePath: path.join(root, "update-notifications.sqlite3"),
+      slackAdapterSocketPath: path.join(root, "run", "slack-adapter.sock"),
+      buildSha: "development",
     },
   };
 }

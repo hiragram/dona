@@ -1,0 +1,7 @@
+interface:
+  display_name: "GitHub Issue設計"
+  short_description: "Issue依頼を規模判定し単一Issueまたはnative graphへ整理"
+  default_prompt: "$github-issue-decomposition を使って、GitHub Issueの依頼を規模判定し、単一IssueまたはEpicとnative graphとして設計してください。"
+
+policy:
+  allow_implicit_invocation: true

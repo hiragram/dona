@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,6 +21,11 @@ export interface DispatcherConfig {
   jobCommandTimeoutMs: number;
   ghPath: string;
   gitPath: string;
+  updaterSocketPath: string;
+  updateInternalTokenPath: string;
+  updateNotificationDatabasePath: string;
+  slackAdapterSocketPath: string;
+  buildSha: string;
 }
 
 function expandHome(value: string): string {
@@ -41,6 +47,16 @@ function nonEmpty(value: string | undefined, fallback: string, name: string): st
   const result = value?.trim() || fallback;
   if (!result) throw new Error(`${name} must not be empty`);
   return result;
+}
+
+function buildSha(env: NodeJS.ProcessEnv): string {
+  const explicit = env.DONA_BUILD_SHA?.trim();
+  if (explicit) return explicit;
+  const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return "development";
+  const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as { sha?: unknown };
+  if (typeof parsed.sha !== "string" || !/^[0-9a-f]{40}$/.test(parsed.sha)) throw new Error("DONA release manifest SHA is invalid");
+  return parsed.sha;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConfig {
@@ -82,5 +98,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     ghPath: nonEmpty(env.DONA_GH_PATH, "gh", "DONA_GH_PATH"),
     gitPath: nonEmpty(env.DONA_GIT_PATH, "git", "DONA_GIT_PATH"),
+    updaterSocketPath: expandHome(
+      env.DONA_UPDATER_SOCKET_PATH ?? path.join(base, "update-control", "updater.sock"),
+    ),
+    updateInternalTokenPath: expandHome(
+      env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
+    updateNotificationDatabasePath: expandHome(
+      env.DONA_UPDATE_NOTIFICATION_DATABASE_PATH ?? path.join(base, "update-notifications.sqlite3"),
+    ),
+    slackAdapterSocketPath: expandHome(
+      env.SLACK_HEALTH_SOCKET_PATH ?? path.join(base, "run", "slack-adapter.sock"),
+    ),
+    buildSha: buildSha(env),
   };
 }

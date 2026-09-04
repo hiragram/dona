@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.dona.slack-adapter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__RUNTIME_ROOT__/current/sources/slack/dist/index.js</string>
+  </array>
+  <key>WorkingDirectory</key><string>__RUNTIME_ROOT__/current/sources/slack</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DOTENV_CONFIG_PATH</key><string>__CONFIG_ROOT__/slack.env</string>
+    <key>DONA_RELEASE_MANIFEST_PATH</key><string>__RUNTIME_ROOT__/current/release-manifest.json</string>
+    <key>DONA_UPDATE_INTERNAL_TOKEN_PATH</key><string>__CONTROL_ROOT__/dispatcher.token</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__LOG_ROOT__/slack-adapter.log</string>
+  <key>StandardErrorPath</key><string>__LOG_ROOT__/slack-adapter.error.log</string>
+</dict>
+</plist>

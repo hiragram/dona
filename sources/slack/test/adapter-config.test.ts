@@ -25,4 +25,5 @@ describe("loadAdapterConfig", () => {
       /must be true/,
     );
   });
+
 });

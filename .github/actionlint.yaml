@@ -1,0 +1,4 @@
+# actionlint v1.7.7の内蔵一覧より新しいGitHub-hosted runner label。
+self-hosted-runner:
+  labels:
+    - macos-26

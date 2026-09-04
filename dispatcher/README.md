@@ -1,6 +1,6 @@
 # Dona Dispatcher
 
-AdapterからUnix Domain Socket上のHTTP/1.1でイベントを受け、SQLiteへ永続化した後にHerdrの`dona-main`へ1件ずつ投入します。長い作業は別のCodexワーカーへ委任でき、`dona-main`は次のイベント受付へ戻れます。
+AdapterからUnix Domain Socket上のHTTP/1.1でイベントを受け、SQLiteへ永続化した後にHerdrの`dona-main`へ1件ずつ投入します。長い作業は別のCodexワーカーへ委任でき、`dona-main`は次のイベント受付へ戻れます。セルフアップデートのterminal通知だけは専用の永続workerが処理し、停止・再起動される`dona-main`を経由しません。
 
 ## セットアップと起動
 
@@ -15,6 +15,7 @@ npm run dev
 ```text
 ~/Library/Application Support/Dona/
 ├── dona.sqlite3
+├── update-notifications.sqlite3
 ├── results/<event_id>.json
 ├── job-results/<job_id>.json
 └── run/dispatcher.sock
@@ -48,6 +49,11 @@ DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
 DONA_GH_PATH=gh
 DONA_GIT_PATH=git
+DONA_UPDATER_SOCKET_PATH=~/Library/Application Support/Dona/update-control/updater.sock
+DONA_UPDATE_INTERNAL_TOKEN_PATH=~/Library/Application Support/Dona/update-control/dispatcher.token
+DONA_UPDATE_NOTIFICATION_DATABASE_PATH=~/Library/Application Support/Dona/update-notifications.sqlite3
+SLACK_HEALTH_SOCKET_PATH=~/Library/Application Support/Dona/run/slack-adapter.sock
+DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
 
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
@@ -58,7 +64,9 @@ herdr --session dona agent prompt dona-main <prompt>
 herdr --session dona agent wait dona-main --until idle --until done --until blocked --timeout 120000
 ```
 
-バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、Herdrの32文字制限内に収まる`j<完全なULID>-<固定slug>`をagent名としてCodexを起動します。たとえば改善作業は`j01m1ne631mt99zdpwfmrwsvjdg-impr`です。slugは外部入力を転写せず、`impr`、`fix`、`impl`、`test`、`docs`、`rvw`、`rsch`、`updt`、`dply`、`rels`、`task`の固定語彙から選びます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みの旧agent名も再起動時にそのまま使います。GitHub jobではDispatcherが検証・選択したrepositoryとworktreeだけを、起動時の`projects = { "<path>" = { trust_level = "trusted" } }`overrideへ渡すため、対話的なproject trust確認でworkerが停止しません。これはsandboxやcommand approvalを無効化する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
+バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、Herdrの32文字制限内に収まる`j<完全なULID>-<固定slug>`をagent名としてCodexを起動します。たとえば改善作業は`j01m1ne631mt99zdpwfmrwsvjdg-impr`です。slugは外部入力を転写せず、`impr`、`fix`、`impl`、`test`、`docs`、`rvw`、`rsch`、`updt`、`dply`、`rels`、`task`の固定語彙から選びます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みの旧agent名も再起動時にそのまま使います。
+
+Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" } }`inline tableを起動時overrideに使い、scratch jobではDispatcherが生成した`<jobsWorkspaceRoot>/scratch/<job_id>`との完全一致を検証した当該workspace 1件だけ、GitHub jobでは従来どおり検証・選択したrepositoryとworktreeだけをtrustします。scratch root、job-results、global Codex configはtrust対象にしません。これはsandbox、command approval、network policyを変更する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
 
 ## Dona Dispatcher MCP
 
@@ -69,10 +77,20 @@ Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも�
 - `get_job_status`: 状態と結果を取得
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
+- `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
+- `apply_self_update`: exact plan hashと明示承認receiptを投入（destructive）
+- `get_self_update_status`: state、fence、SHA、health、outboxを取得（read-only）
+- `cancel_self_update`: activation前にcancel。外部mutation後はneeds_review（destructive）
+
+`apply_self_update`のacceptedはupdater DB commit後だけ返ります。元のSlack受付eventが`completed`になる前にupdaterはactivationをclaimしません。timeoutや接続切断でapply/cancelのacceptanceが不明な場合は、同じwriteを再送せずstatusを確認します。
+
+terminal updateは`source: dona_update`としてDispatcherへ戻ります。外部`POST /v1/events`はこのsourceを拒否し、0600 tokenを使う`POST /v1/internal/update-events`だけがtyped payloadを受けます。stable external IDで重複を吸収し、POST response喪失時はexternal IDとcanonical payload SHA-256をlookupしてから判断します。
+
+`dona_update`は通常のメインキューから除外され、`update-notifications.sqlite3`をtruthとする専用workerがSlack Adapterの`POST /v1/internal/update-notifications`へ通知します。通知IDは`request_id`とterminal fenceへ固定し、Slack message sectionの`block_id`を全thread pageで照合してから完了するため、応答喪失やworker再起動後も二重投稿を避けます。Slack投稿receiptを先に永続化し、その後で元eventのResult Envelopeをatomic publish・再読して`reported`へ進めます。恒久拒否は`needs_review`、通信失敗はbounded backoff付き`pending`として残ります。
 
 ビルド後はリポジトリの[`.codex/config.toml`](../.codex/config.toml)を読んだCodexが`dist/mcp/index.js`を起動します。`npm run dev`が起動するのは常駐DispatcherとSlack Adapterだけです。
 
-ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ワーカーはSlackへ直接書き込みません。
+ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -116,7 +134,10 @@ health check:
 ```sh
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/live
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/ready
+curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/version
 ```
+
+`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。build SHA、protocol 1、app schema 2、config 1、`update_notification_protocol: 1`だけをversion healthへ出し、pathやsecretは返しません。
 
 ## 運用CLI
 

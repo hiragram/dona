@@ -11,11 +11,13 @@ const config: SlackAdapterConfig = {
   workspaces: ["company"],
   dispatcherSocketPath: "/tmp/dispatcher.sock",
   healthSocketPath: "/tmp/slack-health.sock",
+  updateInternalTokenPath: "/tmp/dispatcher.token",
   dispatcherConnectTimeoutMs: 500,
   dispatcherTimeoutMs: 2_000,
   shutdownGraceMs: 200,
   socketModeEnabled: true,
   logLevel: "info",
+  buildSha: "development",
 };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -248,5 +250,31 @@ describe("SlackSocketAdapter", () => {
     assert.equal(client.starts, 1);
     assert.equal(adapter.connectionStates().company, "authentication_failed");
     await adapter.stop();
+  });
+
+  test("quiesce stops new ingress and exposes incomplete then completed ACK drain", async () => {
+    const client = new FakeSocketClient();
+    let finishDispatch: ((response: DispatcherResponse) => void) | undefined;
+    const adapter = new SlackSocketAdapter(
+      [{ workspace: "company", client }],
+      {
+        postEvent: () => new Promise<DispatcherResponse>((resolve) => void (finishDispatch = resolve)),
+        healthReady: async () => true,
+      },
+      { ...config, shutdownGraceMs: 10 },
+      logger,
+    );
+    await adapter.start();
+    let acked = false;
+    client.emit("slack_event", socketEnvelope("env-drain", async () => void (acked = true)));
+    await waitFor(() => finishDispatch !== undefined);
+    await adapter.quiesce();
+    assert.equal(adapter.drainStatus().drained, false);
+    let ignoredAck = false;
+    client.emit("slack_event", socketEnvelope("env-after-quiesce", async () => void (ignoredAck = true)));
+    finishDispatch!({ statusCode: 202, body: "{}" });
+    await waitFor(() => acked && adapter.drainStatus().drained);
+    assert.equal(ignoredAck, false);
+    assert.equal(client.disconnects, 1);
   });
 });

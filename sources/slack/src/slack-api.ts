@@ -24,11 +24,13 @@ export interface SlackThreadMessage {
   text: string;
   fileIds: string[];
   reactions: SlackReaction[];
+  blockIds: string[];
 }
 
 export interface SlackThread {
   messages: SlackThreadMessage[];
   hasMore: boolean;
+  nextCursor?: string;
 }
 
 export interface SlackPostResult {
@@ -123,7 +125,7 @@ export interface SlackApiClient {
   getChannel(channelId: string): Promise<SlackChannel>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
-  getThread(channelId: string, threadTs: string, limit: number): Promise<SlackThread>;
+  getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
   getReactions(channelId: string, messageTs: string): Promise<SlackReactionSnapshot>;
   getFile(fileId: string): Promise<SlackFileInfo>;
   postMessage(input: {
@@ -131,6 +133,7 @@ export interface SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    identityBlockId?: string;
   }): Promise<SlackPostResult>;
   setAgentSessionStatus(input: {
     channelId: string;
@@ -388,10 +391,16 @@ export class SlackWebApiClient implements SlackApiClient {
     return userFromResponse(response.user);
   }
 
-  async getThread(channelId: string, threadTs: string, limit: number): Promise<SlackThread> {
+  async getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread> {
     const response = await callSlack(() =>
-      this.client.conversations.replies({ channel: channelId, ts: threadTs, limit }),
+      this.client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        limit,
+        ...(cursor ? { cursor } : {}),
+      }),
     );
+    const nextCursor = optionalCursor(response.response_metadata?.next_cursor);
     return {
       messages: (response.messages ?? []).flatMap((message) => {
         if (!message.ts) return [];
@@ -403,6 +412,10 @@ export class SlackWebApiClient implements SlackApiClient {
             ...(message.bot_id ? { botId: message.bot_id } : {}),
             text: message.text ?? "",
             fileIds: (message.files ?? []).flatMap((file) => (file.id ? [file.id] : [])),
+            blockIds: (message.blocks ?? []).flatMap((block) => {
+              const blockId = (block as { block_id?: unknown }).block_id;
+              return typeof blockId === "string" ? [blockId] : [];
+            }),
             reactions: (message.reactions ?? []).flatMap((reaction) =>
               reaction.name
                 ? [
@@ -418,6 +431,7 @@ export class SlackWebApiClient implements SlackApiClient {
         ];
       }),
       hasMore: response.has_more ?? false,
+      ...(nextCursor ? { nextCursor } : {}),
     };
   }
 
@@ -565,6 +579,7 @@ export class SlackWebApiClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    identityBlockId?: string;
   }): Promise<SlackPostResult> {
     const base = {
       channel: input.channelId,
@@ -572,6 +587,13 @@ export class SlackWebApiClient implements SlackApiClient {
       mrkdwn: true as const,
       unfurl_links: false,
       unfurl_media: false,
+      ...(input.identityBlockId ? {
+        blocks: [{
+          type: "section" as const,
+          block_id: input.identityBlockId,
+          text: { type: "mrkdwn" as const, text: input.text },
+        }],
+      } : {}),
     };
     const response = await callSlack(() => {
       if (input.threadTs && input.replyBroadcast) {
