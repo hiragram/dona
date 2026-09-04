@@ -1285,8 +1285,11 @@ export class UpdateController {
       health.app_schema_write === compatibility.app_schema_write;
     const legacySingleSchemaProjection = compatibility.app_schema_read_min === compatibility.app_schema_read_max &&
       compatibility.app_schema_write === compatibility.app_schema_read_min && rangeAbsent;
+    const actualSchemaReadable = health.app_schema !== null &&
+      health.app_schema >= compatibility.app_schema_read_min &&
+      health.app_schema <= compatibility.app_schema_read_max;
     return health.ready && health.build_sha === sha && health.protocol === compatibility.protocol &&
-      health.app_schema === compatibility.app_schema_write && health.config === compatibility.config &&
+      actualSchemaReadable && health.config === compatibility.config &&
       (legacySingleSchemaProjection || rangeMatches) &&
       (!requireWorkspaces || health.workspaces_ready === true);
   }
