@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { validateHeaderName, validateHeaderValue } from "node:http";
 import { performance } from "node:perf_hooks";
+import { eventOwnerSchema } from "./event-routing.js";
+import type { ProviderOwner } from "./event-routing.js";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
@@ -60,6 +62,7 @@ export interface RawIngressRequest {
 export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
+  readonly resourceId?: string;
 }
 
 export interface NormalizedExternalEvent {
@@ -324,7 +327,7 @@ export class ExternalIngressProcessor {
     source: ExternalEventSource,
     registration: ExternalEventSourceRegistration,
     request: RawIngressRequest,
-    persist: (envelope: EventEnvelope) => EnqueueResult,
+    persist: (envelope: EventEnvelope, owner?: ProviderOwner) => EnqueueResult,
   ): Promise<ExternalIngressResult> {
     const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
@@ -340,6 +343,14 @@ export class ExternalIngressProcessor {
       throw new ExternalIngressAuthenticationError();
     }
 
+    const verifiedConnectionId = verified.connectionId;
+    let owner: ProviderOwner | undefined;
+    if (verified.resourceId !== undefined) {
+      const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
+        connection_id: verifiedConnectionId, resource_id: verified.resourceId });
+      if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
+      owner = parsed.data;
+    }
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
@@ -356,7 +367,7 @@ export class ExternalIngressProcessor {
     const envelope: EventEnvelope = {
       schema_version: 1,
       source,
-      external_event_id: scopedExternalEventId(source, verified.connectionId, normalized.providerEventId),
+      external_event_id: scopedExternalEventId(source, verifiedConnectionId, normalized.providerEventId),
       type: normalized.type,
       occurred_at: normalized.occurredAt,
       subject: normalized.subject,
@@ -364,7 +375,8 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
-    const result = persist(envelope);
+    if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
+    const result = persist(envelope, owner);
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

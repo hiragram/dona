@@ -18,7 +18,7 @@ describe("DispatcherDatabase", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const legacy = new Database(config.databasePath);
-    legacy.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY); PRAGMA user_version = 1;");
+    legacy.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY, source TEXT, reply_target_json TEXT); PRAGMA user_version = 1;");
     legacy.close();
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.listJobs(), []);
@@ -189,6 +189,8 @@ describe("DispatcherDatabase", () => {
     }, created.row.result_path);
     const notification = database.enqueueJobNotification(created.row.job_id);
     const duplicate = database.enqueueJobNotification(created.row.job_id);
+    assert.ok(notification);
+    assert.ok(duplicate);
     assert.equal(notification.row.source, "dona_job");
     assert.equal(notification.row.event_type, "job_completed");
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");

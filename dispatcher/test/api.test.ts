@@ -335,3 +335,27 @@ describe("DispatcherApi", () => {
     database.close();
   });
 });
+
+test("provider job API requires matching persisted owner for query and keeps legacy Slack query available", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const { externalEventSource } = await import("../src/ingress.js");
+  const owner = { kind: "provider_resource" as const, source: "fake", connection_id: "c", resource_id: "r" };
+  database.setProviderExecutionPolicy(owner, "changed", { background_job: true, workspace: "scratch" });
+  const source = database.enqueueProvider({ ...eventEnvelope("provider-api"), source: externalEventSource("fake"), type: "changed", subject: {}, reply_target: null }, owner).row;
+  const foreign = database.enqueueProvider({ ...eventEnvelope("other-api"), source: externalEventSource("fake"), type: "changed", subject: {}, reply_target: null }, { ...owner, connection_id: "other" }).row;
+  const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
+  await api.start();
+  try {
+    const created = await request(config.socketPath, "POST", "/v1/jobs", { source_event_id: source.event_id, objective: "調査", workspace: { kind: "scratch" } });
+    assert.equal(created.status, 202);
+    const job = created.body.job as { job_id: string };
+    assert.equal((await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}`)).status, 403);
+    assert.equal((await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}?source_event_id=${foreign.event_id}`)).status, 403);
+    assert.equal((await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}?source_event_id=${source.event_id}`)).status, 200);
+    const listed = await request(config.socketPath, "GET", `/v1/jobs?source_event_id=${source.event_id}`);
+    assert.equal((listed.body.jobs as unknown[]).length, 1);
+    const other = await request(config.socketPath, "GET", `/v1/jobs?source_event_id=${foreign.event_id}`);
+    assert.deepEqual(other.body.jobs, []);
+  } finally { await api.stop(); database.close(); }
+});
