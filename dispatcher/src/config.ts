@@ -19,6 +19,7 @@ export interface DispatcherConfig {
   jobConcurrency: number;
   jobAgentStartTimeoutMs: number;
   jobCommandTimeoutMs: number;
+  jobPromptReconcileMs: number;
   ghPath: string;
   gitPath: string;
   updaterSocketPath: string;
@@ -96,6 +97,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
       10_000,
       "DONA_JOB_COMMAND_TIMEOUT_MS",
     ),
+    jobPromptReconcileMs: positiveInteger(env.DONA_JOB_PROMPT_RECONCILE_MS, 5_000, "DONA_JOB_PROMPT_RECONCILE_MS"),
     ghPath: nonEmpty(env.DONA_GH_PATH, "gh", "DONA_GH_PATH"),
     gitPath: nonEmpty(env.DONA_GIT_PATH, "git", "DONA_GIT_PATH"),
     updaterSocketPath: expandHome(

@@ -236,6 +236,8 @@ export class JobSupervisor {
     }
     if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
+    const promptBaseline = await this.readPromptBaseline(preparing);
+    if (this.stopping) return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
     if (prompted.aborted || this.stopping) {
@@ -243,6 +245,10 @@ export class JobSupervisor {
       return;
     }
     if (!prompted.ok) {
+      if (!prompted.timedOut && prompted.errorCode === "agent_prompt_stalled") {
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
+        return;
+      }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
         const updated = this.database.recordJobSafePromptFailure(
           row.job_id,
@@ -268,6 +274,81 @@ export class JobSupervisor {
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
     await this.monitor(running);
+  }
+
+  private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {
+    try {
+      const observed = await this.runtime.get(row.agent_name, this.abortController.signal);
+      return observed.ok ? observed : undefined;
+    } catch (error) {
+      this.logger.warn("Could not read the Herdr agent before prompt submission", {
+        job_id: row.job_id,
+        error_code: errorCode(error),
+      });
+      return undefined;
+    }
+  }
+
+  private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
+    const deadline = Date.now() + this.config.jobPromptReconcileMs;
+    while (!this.stopping && Date.now() <= deadline) {
+      if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const observed = await this.runtime.get(row.agent_name, this.abortController.signal, remainingMs);
+      if (observed.aborted || this.stopping) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while prompt reconciliation was incomplete");
+        return;
+      }
+      if (!observed.ok) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, observed.timedOut ? "prompt_reconcile_timeout" : observed.errorCode ?? "prompt_reconcile_failed", commandMessage(observed));
+        return;
+      }
+      if (initial.agentIdentity && observed.agentIdentity && initial.agentIdentity !== observed.agentIdentity) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_agent_identity_changed", "Herdr agent identity changed during prompt reconciliation");
+        return;
+      }
+      const sameAgent = initial.agentIdentity !== undefined
+        && observed.agentIdentity !== undefined
+        && initial.agentIdentity === observed.agentIdentity;
+      const progressed = sameAgent
+        && initial.stateChangeSeq !== undefined
+        && observed.stateChangeSeq !== undefined
+        && observed.stateChangeSeq > initial.stateChangeSeq;
+      if (progressed && ["working", "idle", "done", "blocked"].includes(observed.agentStatus ?? "")) {
+        this.database.markJobRunning(row.job_id);
+        if (observed.agentStatus === "blocked") {
+          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+          return;
+        }
+        await this.monitor(this.database.getJob(row.job_id)!);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+    }
+    if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+    this.database.markJobNeedsReview(
+      row.job_id,
+      this.stopping ? "prompt_interrupted" : "prompt_acceptance_unproven",
+      this.stopping
+        ? "Dispatcher stopped while prompt reconciliation was incomplete"
+        : "Herdr prompt acceptance could not be proven without resubmission",
+    );
+  }
+
+  private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
+    try {
+      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      this.database.markJobRunning(row.job_id);
+      this.database.saveJobResult(row.job_id, result, row.result_path);
+      return true;
+    } catch (error) {
+      if (error instanceof JobResultNotFoundError) return false;
+      this.database.markJobNeedsReview(row.job_id, "invalid_result", error instanceof Error ? error.message : String(error));
+      return true;
+    }
   }
 
   private async monitor(row: JobRow): Promise<void> {
