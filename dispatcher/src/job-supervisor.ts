@@ -328,7 +328,9 @@ export class JobSupervisor {
           }
         } catch (error) {
           this.logger.warn("Job progress disabled after notification gate failure", { job_id:job.job_id, error_code:"job_progress_notification_gate_failed", error_message:error instanceof Error?error.message:String(error) });
-          this.progress=undefined;
+          const failedProgress=this.progress;
+          void failedProgress.drainDeliveries().then(()=>{if(this.progress===failedProgress)this.progress=undefined;this.wake();});
+          continue;
         }
       }
       try {

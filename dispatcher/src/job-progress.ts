@@ -190,6 +190,7 @@ export class JobProgressCoordinator {
   }
 
   private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return !row||(row.terminal_checked===1&&!this.deliveryOperations.has(jobId)); }
+  async drainDeliveries():Promise<void> { await Promise.allSettled([...this.deliveryOperations.values()]); }
 
   resolveDelivery(progressId: string, deliveryToken: string): { progress_id:string; workspace_id:string; channel_id:string; thread_ts:string; status:string } | undefined {
     const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId);
