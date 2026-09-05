@@ -2,6 +2,7 @@ import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
+import { ExternalIngressRegistry } from "./ingress.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
@@ -13,10 +14,13 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 
-export async function runService(config: DispatcherConfig): Promise<void> {
+export async function runService(
+  config: DispatcherConfig,
+  externalIngressRegistry = new ExternalIngressRegistry(),
+): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
-  const database = new DispatcherDatabase(config.databasePath);
+  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
@@ -54,6 +58,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       },
     },
     updateNotificationWorker,
+    externalIngressRegistry,
   );
 
   try {

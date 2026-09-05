@@ -94,7 +94,7 @@ describe("SlackSocketAdapter", () => {
     const responses: Array<DispatcherResponse | Error> = [
       { statusCode: 200, body: "{}" },
       new Error("offline"),
-      { statusCode: 400, body: "{}" },
+      { statusCode: 409, body: '{"outcome":"duplicate_conflict"}' },
       { statusCode: 503, body: "{}" },
     ];
     const dispatcher = {

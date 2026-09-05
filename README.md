@@ -13,6 +13,7 @@ stable updater -> immutable release -> ordered restart -> dona_update completion
 - [`dispatcher/`](./dispatcher/README.md): 永続キュー、`dona-main`への直列投入、バックグラウンドJob supervisor、別プロセスのstdio MCP
 - [`sources/slack/`](./sources/slack/README.md): Socket Mode Adapterと、同じKeychain認証を使う別プロセスのstdio MCP
 - [`updater/`](./updater/README.md): 更新対象から独立したstable controller、専用SQLite/outbox、immutable release、activation/rollback
+- [External event ingress contract](./docs/external-event-ingress.md): raw-byte認証、source登録、durable receipt、ACK gate、互換matrix
 
 Slack AdapterはHerdrやSQLiteを直接操作しません。Dispatcherからエージェントへの入口は一方向です。エージェントがSlack操作を選んだ場合は、別プロセスのDona Slack MCPを使います。
 

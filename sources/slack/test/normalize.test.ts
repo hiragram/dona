@@ -184,5 +184,6 @@ describe("normalizeSlackEvent", () => {
     assert.ok(result);
     assert.equal(result.usedReceivedAt, true);
     assert.equal(result.envelope.occurred_at, receivedAt.toISOString());
+    assert.deepEqual(result.envelope.trace, { occurred_at_source: "received_at" });
   });
 });
