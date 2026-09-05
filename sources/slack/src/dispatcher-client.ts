@@ -32,7 +32,7 @@ export class DispatcherClient {
     try {
       const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
       const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}&delivery_token=${encodeURIComponent(deliveryToken)}`, undefined, token);
-      if (response.statusCode !== 200) throw Object.assign(new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`), response.statusCode===425 ? {progressRetryable:true} : {progressPermanent:true});
+      if (response.statusCode !== 200) throw Object.assign(new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`), response.statusCode===425||response.statusCode>=500 ? {progressRetryable:true} : {progressPermanent:true});
       return JSON.parse(response.body);
     } catch (error) {
       const tagged=error as Error & {progressRetryable?:boolean;progressPermanent?:boolean};

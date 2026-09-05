@@ -52,6 +52,18 @@ test("definite pre-delivery failure returns to pending with backoff", async () =
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
+test("workspace Retry-After deadline is durable and defers other pending jobs", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-workspace-throttle-")); const file=path.join(root,"progress.sqlite3");
+  let store=new JobProgressStore(file);
+  try {
+    const start=new Date("2026-09-05T00:00:00Z"); store.ingest(valid,start); store.ingest({...valid,job_id:"job_other"},start);
+    const deadline=new Date("2026-09-05T00:00:30Z"); store.deferWorkspace("T1",deadline); store.defer("job_other",deadline); store.close();
+    store=new JobProgressStore(file); assert.equal(store.workspaceAvailableAt("T1")?.toISOString(),deadline.toISOString());
+    assert.equal(store.pending(new Date("2026-09-05T00:00:29Z"))?.job_id,"job_abc");
+    assert.equal(store.get("job_other")?.available_at,deadline.toISOString());
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("terminal sibling requeue preserves the per-job delivery interval", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-requeue-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));

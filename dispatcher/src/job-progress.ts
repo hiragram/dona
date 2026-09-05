@@ -53,9 +53,11 @@ export class JobProgressStore {
         updated_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','delivering','delivered','unknown')),
         available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT, terminal_checked INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL);
       PRAGMA user_version = 2;
     `))();
     if (version === 1) this.db.transaction(() => this.db.exec("ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 2;"))();
+    this.db.exec("CREATE TABLE IF NOT EXISTS job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_terminal_idx ON job_progress(terminal_checked,job_id)");
   }
@@ -87,6 +89,9 @@ export class JobProgressStore {
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
   retry(jobId: string, error: string, at = new Date(), retryAfterSeconds = 5): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+Math.max(5,retryAfterSeconds)*1_000).toISOString(),error.slice(0,500),jobId); }
+  defer(jobId:string,availableAt:Date):void { this.db.prepare("UPDATE job_progress SET available_at=? WHERE job_id=? AND status='pending' AND available_at<?").run(availableAt.toISOString(),jobId,availableAt.toISOString()); }
+  deferWorkspace(workspaceId:string,availableAt:Date):void { this.db.prepare(`INSERT INTO job_progress_throttles(workspace_id,available_at) VALUES(?,?) ON CONFLICT(workspace_id) DO UPDATE SET available_at=CASE WHEN available_at<excluded.available_at THEN excluded.available_at ELSE available_at END`).run(workspaceId,availableAt.toISOString()); }
+  workspaceAvailableAt(workspaceId:string):Date|undefined { const row=this.db.prepare("SELECT available_at FROM job_progress_throttles WHERE workspace_id=?").get(workspaceId) as {available_at:string}|undefined; return row?new Date(row.available_at):undefined; }
   terminal(jobId: string): void {
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
     this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
@@ -156,6 +161,8 @@ export class JobProgressCoordinator {
     const progress = this.store.pending(); if (!progress) return;
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
+    const workspaceAvailableAt=this.store.workspaceAvailableAt(job.workspace_id);
+    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.defer(progress.job_id,workspaceAvailableAt);return;}
     const group = this.jobs.getJobGroup(job.source_event_id);
     if (group?.notification_mode === "grouped" && group.attention_event_id !== null) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);
@@ -177,7 +184,11 @@ export class JobProgressCoordinator {
       const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean; retryAfterSeconds?:number };
       const definitelyUnsent = detail.definitelyUnsent || (!requestStarted && ["ENOENT","ECONNREFUSED"].includes(detail.code ?? ""));
       this.deliveryClaims.delete(`${job.job_id}:${progress.sequence}`);
-      if (definitelyUnsent) this.store.retry(progress.job_id, detail.message, new Date(), detail.retryAfterSeconds);
+      if (definitelyUnsent) {
+        const at=new Date();
+        if(detail.retryAfterSeconds!==undefined)this.store.deferWorkspace(job.workspace_id,new Date(at.getTime()+Math.max(5,detail.retryAfterSeconds)*1_000));
+        this.store.retry(progress.job_id, detail.message, at, detail.retryAfterSeconds);
+      }
       else this.store.unknown(progress.job_id, detail.message);
     } finally {
       finishDelivery();
