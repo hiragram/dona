@@ -456,7 +456,9 @@ export class JobSupervisor {
   }
 
   private async monitor(row: JobRow): Promise<void> {
-    await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
+    const initialProgress=this.progress;
+    try { await initialProgress?.ingest(this.database.getJob(row.job_id) ?? row); }
+    catch (error) { await this.failOpenProgress(initialProgress,row.job_id,"job_progress_initial_ingest_failed",error); }
     if (await this.tryComplete(row, false)) return;
     let keepPolling = true;
     const pollAbort = new AbortController();
@@ -469,20 +471,17 @@ export class JobSupervisor {
           try {
             const current = this.database.getJob(row.job_id) ?? row;
             if (["blocked", "completed", "failed", "cancelled", "needs_review"].includes(current.status)) {
-              await this.updateTerminalProgress(row.job_id);
               break;
             }
             await this.progress?.ingest(current);
           }
-          catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
+          catch (error) { await this.failOpenProgress(this.progress,row.job_id,"job_progress_poll_failed",error); }
         }
       }
     })();
-    const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
-    keepPolling = false;
-    pollAbort.abort();
-    await pollProgress;
-    this.abortController.signal.removeEventListener("abort", stopPoll);
+    let waited:HerdrCommandResult;
+    try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
+    finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
@@ -497,12 +496,10 @@ export class JobSupervisor {
         waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
-      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (waited.agentStatus === "blocked") {
       this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
-      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
@@ -510,9 +507,11 @@ export class JobSupervisor {
     }
   }
 
-  private async updateTerminalProgress(jobId: string): Promise<void> {
-    try { await this.progress?.ingest(this.database.getJob(jobId)!); }
-    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id:jobId, error_code:"job_progress_terminal_failed", error_message:error instanceof Error ? error.message : String(error) }); }
+  private async failOpenProgress(progress:JobProgressCoordinator|undefined,jobId:string,errorCode:string,error:unknown):Promise<void> {
+    this.logger.warn("Job progress disabled after worker polling failure",{job_id:jobId,error_code:errorCode,error_message:error instanceof Error?error.message:String(error)});
+    if(!progress)return;
+    await progress.drainDeliveries();
+    if(this.progress===progress)await this.disableProgress();
   }
 
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
@@ -530,8 +529,6 @@ export class JobSupervisor {
       );
       completed = this.database.getJob(row.job_id)!;
     }
-    try { await this.progress?.ingest(completed); }
-    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id: row.job_id, error_code: "job_progress_terminal_failed", error_message: error instanceof Error ? error.message : String(error) }); }
     this.logTransition(row, completed);
     return true;
   }
