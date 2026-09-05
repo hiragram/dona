@@ -221,6 +221,38 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("does not aggregate the full queue on every scheduler poll", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    createKeyedScratchJobs(database, config, "Ev-stats-throttle", 2, 0);
+    const originalJobQueueStats = database.jobQueueStats.bind(database);
+    let statsQueries = 0;
+    database.jobQueueStats = (excludedJobIds?: string[]) => {
+      statsQueries += 1;
+      return originalJobQueueStats(excludedJobIds);
+    };
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(_jobId, signal) {
+        return new Promise((resolve) => {
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => statsQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(statsQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("counts recovered running jobs before starting queued work", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

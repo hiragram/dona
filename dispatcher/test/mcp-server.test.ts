@@ -157,6 +157,67 @@ describe("Dona Dispatcher MCP server", () => {
     }
   });
 
+  test("accepts the HTTP objective code-point boundary for delegation and reconciliation", async () => {
+    const objective = "😀".repeat(100_000);
+    let createCalls = 0;
+    let listCalls = 0;
+    const notUsed = async (): Promise<Record<string, unknown>> => {
+      throw new Error("not used");
+    };
+    const api: DispatcherJobClient = {
+      async createJob(input) {
+        createCalls += 1;
+        assert.equal((input as { objective: string }).objective, objective);
+        return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
+      },
+      getJob: notUsed,
+      async listEventJobs(_sourceEventId, _jobKey, canonicalPayloadSha256) {
+        listCalls += 1;
+        assert.match(canonicalPayloadSha256 ?? "", /^[0-9a-f]{64}$/);
+        return { schema_version: 1, reconciliation: "matched", jobs: [] };
+      },
+      listThreadJobs: notUsed,
+      steerJob: notUsed,
+      cancelJob: notUsed,
+      planSelfUpdate: notUsed,
+      applySelfUpdate: notUsed,
+      getSelfUpdateStatus: notUsed,
+      cancelSelfUpdate: notUsed,
+    };
+    const server = createDispatcherMcpServer(api, logger);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const delegated = await client.callTool({
+        name: "delegate_job",
+        arguments: {
+          source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+          job_key: "unicode.boundary",
+          objective,
+          workspace_kind: "scratch",
+        },
+      });
+      assert.equal(delegated.isError, undefined);
+
+      const reconciled = await client.callTool({
+        name: "list_event_jobs",
+        arguments: {
+          source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+          job_key: "unicode.boundary",
+          objective,
+          workspace_kind: "scratch",
+        },
+      });
+      assert.equal(reconciled.isError, undefined);
+      assert.equal(createCalls, 1);
+      assert.equal(listCalls, 1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   test("reconciles an acceptance-unknown timeout without retrying the write", async () => {
     let createCalls = 0;
     let listCalls = 0;

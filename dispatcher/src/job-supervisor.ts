@@ -48,6 +48,8 @@ function maximumCount(counts: Iterable<number>): number {
   return maximum;
 }
 
+const schedulerStatsIntervalMs = 60_000;
+
 export interface JobControlResult {
   row: JobRow;
   duplicate: boolean;
@@ -65,6 +67,7 @@ export class JobSupervisor {
   private readonly controls = new Map<string, Promise<unknown>>();
   private fairCursorSourceEventId: string | undefined;
   private lastSchedulerState: string | undefined;
+  private nextSchedulerStatsAt = 0;
   private loopPromise: Promise<void> | undefined;
   private running = false;
   private stopping = false;
@@ -221,6 +224,9 @@ export class JobSupervisor {
   }
 
   private logSchedulerState(): void {
+    const now = Date.now();
+    if (now < this.nextSchedulerStatsAt) return;
+    this.nextSchedulerStatsAt = now + schedulerStatsIntervalMs;
     const queue = this.database.jobQueueStats([...this.active.keys()]);
     const activeCounts = new Map<string, number>();
     for (const active of this.active.values()) {
