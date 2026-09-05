@@ -216,6 +216,7 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/internal/job-progress") {
+        if (!(await this.authorizedUpdateRequest(request))) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
         const progressId = url.searchParams.get("progress_id") ?? "";
         const delivery = this.jobProgress?.resolveDelivery(progressId);
         if (!delivery) throw new ApiRequestError(404, "progress_not_deliverable", "Progress is not pending delivery");

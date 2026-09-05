@@ -45,15 +45,16 @@ export class JobProgressStore {
     fsSync.chmodSync(databasePath, 0o600);
     this.db.pragma("journal_mode = WAL"); this.db.pragma("synchronous = FULL"); this.db.pragma("busy_timeout = 2000");
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 1) throw new Error(`Job progress schema ${version} is newer than supported schema 1`);
+    if (version > 2) throw new Error(`Job progress schema ${version} is newer than supported schema 2`);
     if (version === 0) this.db.transaction(() => this.db.exec(`
       CREATE TABLE job_progress (
         job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL,
         updated_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','delivering','delivered','unknown')),
-        available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
+        available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT, terminal_checked INTEGER NOT NULL DEFAULT 0
       );
-      PRAGMA user_version = 1;
+      PRAGMA user_version = 2;
     `))();
+    if (version === 1) this.db.transaction(() => this.db.exec("ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 2;"))();
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='recovered ambiguous delivery' WHERE status='delivering'").run();
   }
@@ -65,13 +66,13 @@ export class JobProgressStore {
     this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at)
       VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,phase=excluded.phase,
       safe_summary=excluded.safe_summary,updated_at=excluded.updated_at,status='pending',available_at=excluded.available_at,
-      delivered_at=NULL,last_error=NULL WHERE excluded.sequence > job_progress.sequence AND job_progress.status != 'unknown'`)
+      delivered_at=NULL,last_error=NULL,terminal_checked=0 WHERE excluded.sequence > job_progress.sequence AND job_progress.status NOT IN ('unknown','delivering')`)
       .run(progress.job_id, progress.sequence, progress.phase, progress.safe_summary, progress.updated_at, timestamp);
     return this.get(progress.job_id)?.sequence === progress.sequence;
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
   all(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress ORDER BY job_id").all() as ProgressRow[]; }
-  recoverable(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress WHERE status!='delivered' ORDER BY job_id").all() as ProgressRow[]; }
+  recoverable(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress WHERE status!='delivered' OR terminal_checked=0 ORDER BY job_id").all() as ProgressRow[]; }
   pending(at = new Date()): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE status='pending' AND available_at<=? ORDER BY available_at LIMIT 1").get(at.toISOString()) as ProgressRow|undefined; }
   begin(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivering' WHERE job_id=? AND status='pending'").run(jobId); }
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
@@ -80,11 +81,12 @@ export class JobProgressStore {
   terminal(jobId: string): void {
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
     this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
+    this.db.prepare("UPDATE job_progress SET terminal_checked=1 WHERE job_id=?").run(jobId);
   }
   requeueLatest(jobIds: string[], at = new Date()): void {
     if (jobIds.length === 0) return;
     const placeholders = jobIds.map(() => "?").join(",");
-    const latest = this.db.prepare(`SELECT job_id FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY updated_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string}|undefined;
+    const latest = this.db.prepare(`SELECT job_id FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY delivered_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string}|undefined;
     if (latest) this.db.prepare("UPDATE job_progress SET status='pending',available_at=? WHERE job_id=? AND status='delivered'").run(at.toISOString(),latest.job_id);
   }
 }
@@ -133,6 +135,7 @@ export class JobProgressCoordinator {
       const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:progressId }));
       await new Promise<void>((resolve,reject) => { let settled=false; const chunks:Buffer[]=[]; let responseSize=0; const finish=(error?:Error)=>{if(settled)return;settled=true;error?reject(error):resolve();}; const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; response.on("data",(chunk:Buffer)=>{responseSize+=chunk.length;if(responseSize<=4096)chunks.push(chunk);}); response.once("aborted",()=>finish(Object.assign(new Error("response aborted"),{acceptanceUnknown:true}))); response.once("error",error=>finish(Object.assign(error,{acceptanceUnknown:true}))); response.once("end",()=>{let retryAfterSeconds:number|undefined;try{const parsed=JSON.parse(Buffer.concat(chunks).toString()) as {retry_after_seconds?:unknown};if(typeof parsed.retry_after_seconds==="number")retryAfterSeconds=parsed.retry_after_seconds;}catch{} response.statusCode===200?finish():finish(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403,429].includes(response.statusCode??0),retryAfterSeconds}));});}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",error=>finish(error)); request.end(body); });
       this.store.delivered(progress.job_id);
+      this.deliveryClaims.delete(`${job.job_id}:${progress.sequence}`);
     } catch (error) {
       const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean; retryAfterSeconds?:number };
       const definitelyUnsent = detail.definitelyUnsent || (!requestStarted && ["ENOENT","ECONNREFUSED"].includes(detail.code ?? ""));

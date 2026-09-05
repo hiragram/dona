@@ -106,7 +106,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 worker promptにはDispatcherが生成したjob専用progress pathだけを公開先として渡します。GitHub jobではcheckout外のworktree固有gitdir、scratch jobではworkspace内を使います。workerはallowlist済みphase、単調増加sequence、短い監査用summaryを一時ファイルからrenameして公開します。Dispatcherはjob IDを固定値と照合し、Slack workspace/channel/threadはworkerファイルではなくsource eventから永続化済みのjob bindingだけで決めます。自由な宛先は受け付けず、worker由来summaryはSlackへ転送せず、表示文言はallowlist済みphaseの固定ラベルだけから生成します。
 
-進捗は本体schema v3と分離した`job-progress.sqlite3` schema v1へ保存します。これは古いreleaseの本体DB read/write互換性を壊さず、rollback時は新しい進捗表示だけが停止する設計です。pending更新は最新sequenceへcoalesceされ、順序逆転とduplicateは無視されます。Slack write開始後のtimeout・切断は`unknown`として永続化し、blind retryしません。進捗障害はjob Result・終端通知を失敗させません。terminal jobの遅延progressは破棄されます。
+進捗は本体schema v3と分離した`job-progress.sqlite3` schema v2へ保存します。v1からはterminal照合markerだけを追加し、古いreleaseの本体DB read/write互換性を壊さず、rollback時は新しい進捗表示だけが停止する設計です。pending更新は最新sequenceへcoalesceされ、順序逆転とduplicateは無視されます。Slack write開始後のtimeout・切断は`unknown`として永続化し、blind retryしません。進捗障害はjob Result・終端通知を失敗させません。terminal jobの遅延progressは破棄されます。
 
 具体的な工程表示には`assistant.threads.setStatus` compatibility APIを使い、`agents.sessions.setStatus`のlifecycle (`processing` / `suspended` / `active`) や作成時だけの`title`とは分離します。compatibility APIが利用できない環境ではchat messageへfallbackせず、durable stateを保持したまま表示をdegradeします。
 

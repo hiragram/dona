@@ -38,6 +38,7 @@ async function main(): Promise<void> {
     socketPath: config.dispatcherSocketPath,
     connectTimeoutMs: config.dispatcherConnectTimeoutMs,
     timeoutMs: config.dispatcherTimeoutMs,
+    internalTokenPath: config.updateInternalTokenPath,
   });
   const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
   const updateNotifications = new SlackUpdateNotificationReporter(registry);

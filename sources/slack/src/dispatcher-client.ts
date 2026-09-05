@@ -1,4 +1,5 @@
 import http from "node:http";
+import fs from "node:fs/promises";
 
 export interface DispatcherResponse {
   statusCode: number;
@@ -9,6 +10,7 @@ export interface DispatcherClientOptions {
   socketPath: string;
   connectTimeoutMs: number;
   timeoutMs: number;
+  internalTokenPath?: string;
 }
 
 export class DispatcherClient {
@@ -27,12 +29,13 @@ export class DispatcherClient {
   }
 
   async resolveJobProgress(progressId: string): Promise<unknown> {
-    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}`);
+    const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
+    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}`, undefined, token);
     if (response.statusCode !== 200) throw new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`);
     return JSON.parse(response.body);
   }
 
-  private request(method: "GET" | "POST", path: string, body?: Buffer): Promise<DispatcherResponse> {
+  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer: NodeJS.Timeout | undefined;
@@ -51,12 +54,13 @@ export class DispatcherClient {
           socketPath: this.options.socketPath,
           method,
           path,
-          headers: body
-            ? {
+          headers: {
+            ...(body ? {
                 "content-type": "application/json",
                 "content-length": body.length,
-              }
-            : undefined,
+              } : {}),
+            ...(internalToken ? { "x-dona-update-token":internalToken } : {}),
+          },
         },
         (response) => {
           const chunks: Buffer[] = [];

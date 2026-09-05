@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 
 import { JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
 import { jobProgressPath } from "../src/job-prompt.js";
@@ -78,5 +79,13 @@ test("restart fences a delivery that may have reached Slack", async () => {
   let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();
   store = new JobProgressStore(file);
   try { assert.equal(store.get("job_abc")?.status,"unknown"); assert.equal(store.pending(),undefined); }
+  finally { store.close(); await fs.rm(root,{recursive:true}); }
+});
+
+test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
+  const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); PRAGMA user_version=1;"); legacy.close();
+  const store=new JobProgressStore(file);
+  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); } finally { check.close(); } }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });
