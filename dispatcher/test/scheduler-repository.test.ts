@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import Database from "better-sqlite3";
+import { envelopeFromRow } from "../src/prompt.js";
 import { DispatcherDatabase } from "../src/database.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
 import type { Actor, RevisionInput } from "../src/scheduler/repository.js";
@@ -159,8 +160,9 @@ test("cancelとrequest開始のraceでもreceiptとrequest-started fenceを消�
   const { repo } = setup(); repo.create("s1", input, due, actor, now); repo.materialize("s1", 1, due, later, due, actor);
   const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
   repo.transition("s1", 1, "cancel", actor, due);
-  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, "receipt_1").status, "sent");
+  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, "C_TEST:1756722030.123456").status, "sent");
   assert.equal(repo.get("s1")?.state, "cancelled"); assert.equal(repo.getOutbox(claim.outbox_id, due)?.request_started_at, due);
+  assert.equal(repo.getOutbox(claim.outbox_id, due)?.receipt_id, "C_TEST:1756722030.123456");
 });
 
 test("misfire 900秒境界、未決着overlap、expired auth、quotaを保存層で拒否/記録", () => {
@@ -416,4 +418,74 @@ test("送信結果auditはrun更新後の終端statusを保持する", () => {
   }
   const last = (repo.auditHistory("failure") as { operation: string; after_json: string }[]).filter(x => x.operation === "outbox_not_accepted").at(-1)!;
   assert.equal(JSON.parse(last.after_json).run.status, "failed");
+});
+
+test("claimで検出したauthorization失効もscheduleへ反映し直接再承認可能", () => {
+  const { repo } = setup(); const expiry = "2026-09-05T00:02:00Z";
+  repo.create("s1", { ...input, expires_at: expiry }, due, actor, now);
+  const run = repo.materialize("s1", 1, due, later, due, actor).run;
+  assert.equal(repo.claim(expiry), undefined);
+  assert.equal(repo.get("s1")?.state, "expired"); assert.equal(repo.getRun(run.run_id)?.reason, "authorization_expired");
+  repo.update("s1", 1, { ...input, authorization_id: "new_auth", authorization_revision: 2 }, later, actor, expiry);
+  assert.equal(repo.get("s1")?.state, "active");
+});
+
+test("run purge後もauditへmisfire/overlapのdecision codeを保持", () => {
+  const { repo } = setup(); repo.create("misfire", input, due, actor, now);
+  const misfire = repo.materialize("misfire", 1, due, later, "2026-09-05T00:16:01Z", actor).run;
+  repo.create("overlap", input, due, actor, now); repo.materialize("overlap", 1, due, later, due, actor);
+  const overlap = repo.materialize("overlap", 1, later, null, later, actor).run;
+  repo.purge("2026-10-10T00:00:00Z");
+  assert.equal(repo.getRun(misfire.run_id), undefined); assert.equal(repo.getRun(overlap.run_id), undefined);
+  for (const [name, run] of [["misfire", misfire], ["overlap", overlap]] as const) {
+    const row = (repo.auditHistory(name) as { after_json: string }[]).map(x => JSON.parse(x.after_json)).find(x => x.run?.run_id === run.run_id)!;
+    assert.equal(row.run.reason, name);
+  }
+});
+
+test("長期利用revisionのmetadataは作成日ではなく終了から30日保持", () => {
+  const { repo, raw } = setup();
+  repo.create("s1", { ...input, expires_at: "2026-10-05T00:00:00Z" }, due, actor, now);
+  const replaced = "2026-10-04T00:00:00Z";
+  repo.transition("s1", 1, "pause", actor, replaced);
+  repo.update("s1", 2, { ...input, authorization_id: "new_auth", authorization_revision: 3, approved_at: replaced,
+    expires_at: "2026-11-03T00:00:00Z" }, "2026-10-05T00:01:00Z", actor, replaced);
+  repo.purge("2026-10-11T00:00:00Z");
+  const old = raw.prepare("SELECT content, terminal_at FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 1").get() as { content: string | null; terminal_at: string };
+  assert.equal(old.content, null); assert.equal(old.terminal_at, replaced);
+  repo.purge("2026-11-02T23:59:59Z");
+  assert.ok(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 1").get());
+  repo.purge("2026-11-03T00:00:00Z");
+  assert.equal(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 1").get(), undefined);
+});
+
+test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持", () => {
+  const { repo, raw } = setup();
+  for (const action of ["slack.reminder.post", "work.read_only"] as const) {
+    const name = action === "work.read_only" ? "work" : "reminder";
+    repo.create(name, { ...input, action }, due, actor, now);
+    const run = repo.materialize(name, 1, due, later, due, actor).run;
+    if (action === "work.read_only") {
+      repo.setRunState(run.run_id, "materialized", "started", actor, due);
+      repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
+    }
+    const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", due);
+  }
+  repo.purge("2026-09-12T00:01:00Z");
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM schedule_revisions WHERE content IS NOT NULL").get() as { n: number }).n, 0);
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM connector_outbox WHERE status = 'needs_review' AND request_started_at IS NOT NULL").get() as { n: number }).n, 2);
+  assert.equal(count(raw, "schedule_runs"), 2);
+});
+
+test("専用routing未実装のscheduler eventが通常workerのqueueを妨げない", () => {
+  const { repo, dispatcher } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("work", 1, due, later, due, actor).run;
+  assert.equal(dispatcher.get(run.event_id!)?.status, "queued");
+  assert.equal(dispatcher.nextAvailable(new Date(due)), undefined);
+  const slack = dispatcher.enqueue(eventEnvelope("slack-after-scheduler"), new Date(due)).row;
+  assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
+  assert.equal(envelopeFromRow(dispatcher.nextAvailable(new Date(due))!).source, "slack");
+  dispatcher.markBlocked(run.event_id!, "専用routing待ち"); dispatcher.manualRetry(run.event_id!, true, new Date(due));
+  assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
 });

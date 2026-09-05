@@ -593,7 +593,7 @@ export class DispatcherDatabase {
     const head = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
+        WHERE status IN ('queued', 'retryable_failed') AND source NOT IN ('dona_update', 'scheduler')
         ORDER BY sequence LIMIT 1
       `)
       .get() as EventRow | undefined;

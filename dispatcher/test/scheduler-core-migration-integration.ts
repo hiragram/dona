@@ -20,7 +20,7 @@ try {
   const job = db.createJob({ source_event_id: event.event_id, objective: "probe", workspace: { kind: "scratch" } }, root, root).row;
   raw.transaction(() => {
     raw.exec(`INSERT INTO schedules VALUES ('s','T','U','active',1,NULL,NULL,'n','n',NULL);
-      INSERT INTO schedule_revisions VALUES ('s',1,'{}','hash','{}',1,NULL,NULL,'a',1,'fixed_objective_redacted_result','U','a','b','work.read_only','{}',NULL,'hash',NULL,'n')`);
+      INSERT INTO schedule_revisions VALUES ('s',1,'{}','hash','{}',1,NULL,NULL,'a',1,'fixed_objective_redacted_result','U','a','b','work.read_only','{}',NULL,'hash',NULL,'n',NULL)`);
     raw.prepare(`INSERT INTO schedule_runs(run_id,schedule_id,revision,occurrence_key,scheduled_for,status,event_id,job_id,created_at)
       VALUES ('r','s',1,'t','t','started',?,?,'n')`).run(event.event_id, job.job_id);
   })();

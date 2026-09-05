@@ -39,7 +39,7 @@ PR #82のexact head `56eeec85d271813e33984fd2c5eae9753a607190`を一時checkout�
 
 ## Transactionと外部write
 
-create/状態更新/新revisionとaudit、run物化とevent/outbox・high-watermark・auditはそれぞれ同じconnectionのtransaction。workは本文を持たない`source: scheduler`の内部eventへrun/revision参照を保存し、reminderはtyped outboxを作る。source型の追加だけでは外部HTTP ingressを許可しない。既存Slack専用createJobをscheduler対応に変更せず、`setRunState`が後続#11から渡されるjob参照とrun transitionを検証する。work結果本文のoutbox追加とrun完了もatomicなprimitiveを供給する。
+create/状態更新/新revisionとaudit、run物化とevent/outbox・high-watermark・auditはそれぞれ同じconnectionのtransaction。workは本文を持たない`source: scheduler`の内部eventへrun/revision参照を保存し、reminderはtyped outboxを作る。scheduler eventは通常workerの`nextAvailable`から除外して保留し、#11の専用routingが統合されるまで配送しない。source型の追加だけでは外部HTTP ingressを許可しない。既存Slack専用createJobをscheduler対応に変更せず、`setRunState`が後続#11から渡されるjob参照とrun transitionを検証する。work結果本文のoutbox追加とrun完了もatomicなprimitiveを供給する。
 
 duplicate wakeは既存runを返し、event/outboxを増やさない。run削除後はhigh-watermarkにより過去occurrenceの再作成を拒否する。900秒境界・未決着run/outboxのoverlapは保存直前にも確認するが、直近候補の選択・calendar計算・長期停止のcompact skipは#9の責任。workの開始前にgraceを過ぎた場合もrunを終端化してから拒否し、authorization失効を検出したscheduleはexpiredへ移してdue scanから外す。未送信outboxがgraceを過ぎた場合はclaim/recover/送信開始直前にrunとともに終端化し、永久的なoverlapを防ぐ。one-shotは次回なしで最後のrun/outboxが決着してからcompletedへ進め、quotaとretentionを解放する。recurringの空previewを終了と解釈しない。
 
@@ -49,7 +49,7 @@ cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果
 
 ## Retentionとrollback不能点
 
-`purge(now)`は明示的なtransaction primitive。置換／取消revisionとterminal/needs_review outbox本文は7日以内に消去し、authorization失効から7日が経過したrevision本文も消去する。outboxの読取りでも消去期限を過ぎた本文を返さない。未決着fenceは本文なしで保持する。terminal metadataは30日、auditは90日で消去し、runの削除とは独立してactive scheduleのhigh-watermarkを維持する。purgeの起動時／24時間ごとの呼出し、期限遅延healthは#13の配線が必要。
+`purge(now)`は明示的なtransaction primitive。置換／取消revisionとterminal/needs_review outbox本文は7日以内に消去し、authorization失効から7日が経過したrevision本文も消去する。outboxの読取りでも消去期限を過ぎた本文を返さない。未決着fenceは本文なしで保持する。revisionの終了は置換・失効・needs_review等の最初の実行不能時刻を`terminal_at`に記録する。revision metadataは作成日ではなくこの終了から30日保持し、その他のterminal metadataも終了から30日、decision codeを含むauditは90日で消去し、runの削除とは独立してactive scheduleのhigh-watermarkを維持する。purgeの起動時／24時間ごとの呼出し、期限遅延healthは#13の配線が必要。
 
 `redactedBackup()`は一貫したread transactionで本文・target・任意JSONを含まないmetadata/hash/fenceを出力する。SQLiteファイルをそのままコピーする方式はこのredacted backupではない。backupから本文を復元したりscheduleを自動再開するAPIは供給しない。
 
@@ -57,7 +57,7 @@ cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果
 
 ## 実行した検証
 
-- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加26件を含めて検証。
+- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加31件を含めて検証。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-codec-integration.ts <#6 checkout>/dispatcher/src/scheduler`: 上記#82 headの実codecでcanonical bytes、未知version、重複key、policy改変、owner_dm、物化一意性を確認。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-core-migration-integration.ts <fan-out checkout>/dispatcher/src/database.ts`: `feature/multi-job-fanout@e241fb41087a9b4a6aa5329cf1aaf60148e4c0d0`の実migrationでv2+scheduler→v3、3つの中間phaseでのrollback、v3新規→scheduler、旧v2 readerの拒否を確認。
 - repository testsは新規/v2/reopen/WAL/FK、DDL失敗、重複wake、revision競合、invalid transition、tenant境界、transaction失敗、2 connection claim、lease expiry、needs_review永続化、cancel race、retention、audit redaction/order、必要indexのquery planを検証する。

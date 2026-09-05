@@ -29,9 +29,11 @@ export function migrateScheduler(db: Database.Database): void {
         content_scope TEXT NOT NULL CHECK(content_scope IN ('fixed_body','fixed_objective_redacted_result')), approver_id TEXT NOT NULL, approved_at TEXT NOT NULL, expires_at TEXT NOT NULL,
         action TEXT NOT NULL CHECK(action IN ('slack.reminder.post','work.read_only')),
         target_json TEXT NOT NULL, content TEXT, content_hash TEXT NOT NULL,
-        content_delete_at TEXT, created_at TEXT NOT NULL,
+        content_delete_at TEXT, created_at TEXT NOT NULL, terminal_at TEXT,
         PRIMARY KEY(schedule_id, revision), CHECK(expires_at > approved_at)
       );
+      CREATE INDEX schedule_revisions_terminal_idx ON schedule_revisions(terminal_at);
+      CREATE INDEX schedule_revisions_expiry_idx ON schedule_revisions(expires_at);
       CREATE TABLE schedule_runs (
         run_id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, revision INTEGER NOT NULL,
         occurrence_key TEXT NOT NULL, scheduled_for TEXT NOT NULL,
