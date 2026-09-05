@@ -670,6 +670,21 @@ test("送信応答時の失効をreceiptと共に保持し再承認可能にす�
   assert.equal(repo.get("s1")?.state, "active");
 });
 
+test("時計後退中のfinishWriteとreconcileも保存済み時刻より前へ終端しない", () => {
+  const { repo } = setup();
+  for (const mode of ["finish", "reconcile"] as const) {
+    repo.create(mode, input, due, actor, now); const run = repo.materialize(mode, 1, due, later, due, actor).run;
+    const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    if (mode === "finish") repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", "2026-09-05T00:00:30Z", "receipt_finish");
+    else {
+      repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", due);
+      repo.reconcile(claim.outbox_id, "sent", "receipt_reconcile", { ...actor, role: "admin" }, "2026-09-05T00:00:30Z");
+    }
+    assert.equal(repo.getRun(run.run_id)?.terminal_at, due);
+    assert.equal(repo.getOutbox(claim.outbox_id, due)?.terminal_at, due);
+  }
+});
+
 test("通知先があるworkの結果欠落は完了transactionを拒否する", () => {
   const { repo, raw, dispatcher } = setup();
   repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);

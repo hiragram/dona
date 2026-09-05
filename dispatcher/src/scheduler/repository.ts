@@ -351,15 +351,17 @@ export class SchedulerRepository {
       const row = this.getOutbox(outboxId, now);
       if (!row || row.status !== "needs_review") throw new Error("invalid_transition");
       const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
+      const reconciledAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
+        row.terminal_at ?? row.created_at, run.created_at, run.started_at ?? run.created_at].sort().at(-1)!;
       this.checked(schedule.schedule_id, schedule.revision, actor);
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
-        claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`).run(outcome, receiptId, now, now, outboxId);
+        claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`).run(outcome, receiptId, reconciledAt, reconciledAt, outboxId);
       this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
-        .run(outcome === "sent" ? "completed" : "failed", now, run.run_id);
-      this.audit(schedule, schedule, `reconcile_${outcome}`, actor, now, this.getOutbox(outboxId, now)!);
-      this.completeIfDrained(run.schedule_id, now);
+        .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
+      this.audit(schedule, schedule, `reconcile_${outcome}`, actor, reconciledAt, this.getOutbox(outboxId, reconciledAt)!);
+      this.completeIfDrained(run.schedule_id, reconciledAt);
       // Admin reconciliation returns allowlisted metadata, never owner content or a private target.
-      const result = this.getOutbox(outboxId, now)!;
+      const result = this.getOutbox(outboxId, reconciledAt)!;
       return { outbox_id: result.outbox_id, run_id: result.run_id, kind: result.kind, idempotency_key: result.idempotency_key,
         content_hash: result.content_hash, status: result.status, attempt: result.attempt, available_at: result.available_at,
         lease_until: result.lease_until, request_started_at: result.request_started_at, receipt_id: result.receipt_id,
@@ -504,7 +506,9 @@ export class SchedulerRepository {
     return this.db.transaction(() => {
       const row = this.getOutbox(outboxId, now);
       if (!row || row.status !== "request_started" || row.claim_token !== token) throw new Error("claim_conflict");
-      if (outcome === "ambiguous") this.markAmbiguous(row, now);
+      const finishedAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
+        row.terminal_at ?? row.created_at].sort().at(-1)!;
+      if (outcome === "ambiguous") this.markAmbiguous(row, finishedAt);
       else {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
         const run = this.getRun(row.run_id)!;
@@ -516,26 +520,26 @@ export class SchedulerRepository {
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
-          status, add(now, retryDelay), retry ? null : row.request_started_at,
-          receiptId, retry ? null : now, row.content_delete_at === null ? add(now, 604800) : row.content_delete_at, now, outboxId);
+          status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
+          receiptId, retry ? null : finishedAt, row.content_delete_at === null ? add(finishedAt, 604800) : row.content_delete_at, finishedAt, outboxId);
       }
       if (outcome !== "ambiguous") {
-        this.expireUnsent(this.getOutbox(outboxId, now)!, now);
-        const finished = this.getOutbox(outboxId, now)!;
+        this.expireUnsent(this.getOutbox(outboxId, finishedAt)!, finishedAt);
+        const finished = this.getOutbox(outboxId, finishedAt)!;
         if (row.kind === "slack.reminder.post" && finished.terminal_at !== null) {
           this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ? AND status IN ('materialized','started')")
             .run(finished.status === "sent" ? "completed" : finished.status === "cancelled" ? "cancelled" : "failed",
-              finished.status === "cancelled" ? "cancelled" : null, now, row.run_id);
+              finished.status === "cancelled" ? "cancelled" : null, finishedAt, row.run_id);
         }
-        this.auditOutbox(row, `outbox_${outcome}`, now);
+        this.auditOutbox(row, `outbox_${outcome}`, finishedAt);
       }
-      this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, now);
+      this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, finishedAt);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;
-      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) {
-        this.expireSchedule(current, { tenant_id: current.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= finishedAt) {
+        this.expireSchedule(current, { tenant_id: current.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, finishedAt);
       }
-      this.completeIfDrained(current.schedule_id, now);
-      return this.getOutbox(outboxId, now)!;
+      this.completeIfDrained(current.schedule_id, finishedAt);
+      return this.getOutbox(outboxId, finishedAt)!;
     }).immediate();
   }
   redactedBackup(): Record<string, unknown[]> {
