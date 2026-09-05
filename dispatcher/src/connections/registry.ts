@@ -302,13 +302,14 @@ export class ConnectionRegistry {
         c.credentialRevision !== binding.credentialRevision || !c.allowlist.some((a) => a.resource === binding.resource && a.events.includes(envelope.type))) throw new ConnectionError("not_authorized");
       const now = this.tick(c.id);
       const s = this.sub(c.id, binding.resource, binding.generation);
-      if (s.revision !== c.revision || s.verifiedAt === null || !["active","expiring","stop_candidate"].includes(s.state) ||
-        (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
       // stop の外部call待ちに旧channelへ届いた通知も、cutover済みの新generationへbindingする。
-      const stopping = this.operations(c.id).some((o) => o.resource === binding.resource && o.generation === binding.generation && o.kind === "stop");
+      const stopping = this.operations(c.id).some((o) => o.resource === binding.resource && o.generation === binding.generation && o.kind === "stop" && o.state !== "done");
       const replacement = stopping ? this.subscriptions(c.id).filter((candidate) => candidate.resource === binding.resource &&
         candidate.generation > binding.generation && candidate.revision === c.revision && candidate.verifiedAt !== null &&
         ["active","expiring"].includes(candidate.state) && (candidate.expiresAt === null || candidate.expiresAt > now)).at(-1) : undefined;
+      const deliverableState=["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
+      if (s.revision !== c.revision || s.verifiedAt === null || !deliverableState ||
+        (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
       if (stopping && !replacement) throw new ConnectionError("not_authorized");
       const dispatchGeneration = replacement?.generation ?? binding.generation;
       const result = persist();
