@@ -295,7 +295,11 @@ export class JobSupervisor {
       if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
       const remainingMs = Math.max(1, deadline - Date.now());
       const observed = await this.runtime.get(row.agent_name, this.abortController.signal, remainingMs);
-      if (observed.aborted || this.stopping) return;
+      if (observed.aborted || this.stopping) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while prompt reconciliation was incomplete");
+        return;
+      }
       if (!observed.ok) {
         if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         this.database.markJobNeedsReview(row.job_id, observed.timedOut ? "prompt_reconcile_timeout" : observed.errorCode ?? "prompt_reconcile_failed", commandMessage(observed));
@@ -323,7 +327,14 @@ export class JobSupervisor {
       }
       await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
     }
-    this.database.markJobNeedsReview(row.job_id, "prompt_acceptance_unproven", "Herdr prompt acceptance could not be proven without resubmission");
+    if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+    this.database.markJobNeedsReview(
+      row.job_id,
+      this.stopping ? "prompt_interrupted" : "prompt_acceptance_unproven",
+      this.stopping
+        ? "Dispatcher stopped while prompt reconciliation was incomplete"
+        : "Herdr prompt acceptance could not be proven without resubmission",
+    );
   }
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {

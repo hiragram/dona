@@ -483,6 +483,32 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("stalled promptの再照合中断をdispatchingに残さない", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-stop");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get(_agentName, signal) {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        if (signal?.aborted) return { ...failed("aborted"), aborted: true };
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return { ...failed("aborted"), aborted: true };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "dispatching");
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(updated.status, "needs_review");
+    assert.equal(updated.last_error_code, "prompt_interrupted");
+    database.close();
+  });
+
   test("requires review when a terminal worker does not publish a result", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
