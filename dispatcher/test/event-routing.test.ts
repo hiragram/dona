@@ -354,6 +354,29 @@ for (const notificationState of ["queued", "completed", "needs_review"] as const
   migrated.close();
 });
 
+test("legacy migration restores every historical completion status for a job", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const db = new DispatcherDatabase(config.databasePath);
+  const source = db.enqueue(eventEnvelope("completion-history")).row;
+  const job = db.createJob({ source_event_id: source.event_id, objective: "調査", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  db.beginJobPreparation(job.job_id); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
+  db.markJobBlocked(job.job_id, "確認待ち");
+  const blocked = db.enqueueJobNotification(job.job_id)!.row;
+  db.beginJobCancellation(job.job_id, source.event_id); db.markJobCancelled(job.job_id, "中止");
+  const cancelled = db.enqueueJobNotification(job.job_id)!.row;
+  db.close();
+  const legacy = new Database(config.databasePath);
+  legacy.exec("DELETE FROM job_completions; DELETE FROM event_routing_migrations"); legacy.close();
+  const migrated = new DispatcherDatabase(config.databasePath);
+  const verify = new Database(config.databasePath);
+  const rows = verify.prepare("SELECT job_status, notification_event_id FROM job_completions ORDER BY job_status").all();
+  assert.deepEqual(rows, [
+    { job_status: "blocked", notification_event_id: blocked.event_id },
+    { job_status: "cancelled", notification_event_id: cancelled.event_id },
+  ]);
+  verify.close(); migrated.close();
+});
+
 test("completed migration reopens while another process holds the write lock without rescanning history", async () => {
   const { database, config } = await setup(); database.close();
   const writer = new Database(config.databasePath);

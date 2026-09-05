@@ -256,6 +256,11 @@ export class DispatcherDatabase {
     const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
     try { return this.db.transaction(() => {
       const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
+      const ownerMatches = (eventId: string): boolean => {
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved.owner) === stableStringify(binding.owner);
+      };
       const bindingMatches = (eventId: string): boolean => {
         if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
         const saved = readBinding(this.db, eventId);
@@ -264,7 +269,7 @@ export class DispatcherDatabase {
       const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
       if (delivery) {
         const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex") ||
-          !bindingMatches(delivery.event_id);
+          !ownerMatches(delivery.event_id);
         const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
         this.queueMetric(outcome);
         return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
@@ -283,7 +288,7 @@ export class DispatcherDatabase {
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
         const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
-        if (!bindingMatches(existing.event_id)) {
+        if (!ownerMatches(existing.event_id)) {
           return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
         }
         this.queueMetric(outcome);

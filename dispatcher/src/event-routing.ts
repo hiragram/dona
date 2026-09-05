@@ -109,30 +109,35 @@ export function migrateEventRouting(db: Database.Database, hook: () => void = ()
     db.exec(`INSERT OR IGNORE INTO job_bindings
       SELECT j.job_id, b.event_id, b.owner_json, b.execution_json, b.destination_json
       FROM jobs j JOIN event_bindings b ON b.event_id = j.source_event_id WHERE j.source = 'slack'`);
-    const completions = db.prepare(`SELECT j.*, b.owner_json, b.destination_json,
-      e.source AS notification_source, e.subject_json AS notification_subject,
-      e.reply_target_json AS notification_destination, e.status AS notification_status,
-      e.result_json AS notification_result, e.created_at AS notification_created_at
-      FROM jobs j JOIN job_bindings b ON b.job_id = j.job_id
-      JOIN events e ON e.event_id = j.completion_event_id
-      WHERE NOT EXISTS (SELECT 1 FROM job_completions c WHERE c.job_id = j.job_id AND c.job_status = j.status)`)
-      .all() as Array<JobRow & { owner_json: string; destination_json: string; notification_source: string;
-        notification_subject: string; notification_destination: string | null; notification_status: string;
+    const completions = db.prepare(`SELECT j.job_id, j.source_event_id, b.owner_json, b.destination_json,
+      e.event_id AS notification_event_id, e.event_type, e.subject_json AS notification_subject,
+      e.payload_json AS notification_payload, e.reply_target_json AS notification_destination,
+      e.status AS notification_status, e.result_json AS notification_result, e.created_at AS notification_created_at
+      FROM events e JOIN jobs j ON json_extract(e.subject_json, '$.job_id') = j.job_id
+      JOIN job_bindings b ON b.job_id = j.job_id
+      WHERE e.source = 'dona_job'
+      ORDER BY e.sequence`)
+      .all() as Array<Pick<JobRow, "job_id" | "source_event_id"> & { owner_json: string; destination_json: string;
+        notification_event_id: string; event_type: string; notification_subject: string; notification_payload: string;
+        notification_destination: string | null; notification_status: string;
         notification_result: string | null; notification_created_at: string }>;
     for (const row of completions) {
       const subject = JSON.parse(row.notification_subject) as Record<string, unknown>;
-      if (row.notification_source !== "dona_job" || subject.job_id !== row.job_id ||
+      const jobStatus = row.event_type.startsWith("job_") ? row.event_type.slice(4) : "";
+      const payload = JSON.parse(row.notification_payload) as Record<string, unknown>;
+      if (!jobStatus || payload.job_status !== jobStatus || subject.job_id !== row.job_id ||
         subject.source_event_id !== row.source_event_id || row.notification_destination !== row.destination_json) {
         throw new Error("Legacy completion owner mismatch");
       }
       const notificationState = row.notification_status === "completed" ? "accepted"
         : ["blocked", "dead_letter", "needs_review"].includes(row.notification_status) ? "needs_review" : "pending";
-      db.prepare(`INSERT INTO job_completions
+      db.prepare(`INSERT OR IGNORE INTO job_completions
         (job_id, event_id, owner_json, destination_json, result_json, job_status, materialized_at,
           notification_state, notification_event_id, notification_result_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(row.job_id, row.source_event_id, row.owner_json, row.destination_json, row.result_json, row.status,
-          row.notification_created_at, notificationState, row.completion_event_id, row.notification_result);
+        .run(row.job_id, row.source_event_id, row.owner_json, row.destination_json,
+          payload.result === undefined ? null : stableStringify(payload.result), jobStatus,
+          row.notification_created_at, notificationState, row.notification_event_id, row.notification_result);
     }
     db.prepare("INSERT INTO event_routing_migrations VALUES (1)").run();
   }).immediate();
