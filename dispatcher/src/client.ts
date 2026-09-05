@@ -14,8 +14,21 @@ export class DispatcherApiClient {
     return this.request("POST", "/v1/jobs", input);
   }
 
-  getJob(jobId: string): Promise<Record<string, unknown>> {
-    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
+  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>> {
+    const query = sourceEventId === undefined ? "" : `?${new URLSearchParams({ source_event_id: sourceEventId })}`;
+    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}${query}`);
+  }
+
+  listEventJobs(
+    sourceEventId: string,
+    jobKey?: string,
+    canonicalPayloadSha256?: string,
+  ): Promise<Record<string, unknown>> {
+    const query = new URLSearchParams();
+    if (jobKey !== undefined) query.set("job_key", jobKey);
+    if (canonicalPayloadSha256 !== undefined) query.set("canonical_payload_sha256", canonicalPayloadSha256);
+    const suffix = query.size === 0 ? "" : `?${query}`;
+    return this.request("GET", `/v1/events/${encodeURIComponent(sourceEventId)}/jobs${suffix}`);
   }
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {

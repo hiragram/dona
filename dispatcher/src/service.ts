@@ -16,7 +16,10 @@ import {
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
-  const database = new DispatcherDatabase(config.databasePath);
+  const database = new DispatcherDatabase(config.databasePath, {
+    jobsPerEventMax: config.jobsPerEventMax,
+    jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
+  });
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
@@ -24,8 +27,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger);
-  const jobSupervisor = new JobSupervisor(
+  let jobSupervisor!: JobSupervisor;
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
+  jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),
     config,

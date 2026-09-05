@@ -38,7 +38,7 @@ policyは次を固定します。
 - expected GitHub Actions check 3件と、任意のcommit signature gate
 - protocol/config/app schema read/write range
 
-candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)をexact SHAからplan時に読み、staging checkoutでも再照合します。現行app DBはschema v2のままで、live WAL DB fileをcopyするmigrationはありません。
+candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)をexact SHAからplan時に読み、staging checkoutでも再照合します。schema v3 writing releaseはv2〜v3をreadできるmetadataを持ちますが、v2-only releaseからの直接更新はcompatibility判定で拒否されます。先にwrite schema 2のcompatibility bridgeを配布してからv3へ進める必要があります。live WAL DB fileの単体copyをbackup扱いしません。
 
 ## APIとCLI
 

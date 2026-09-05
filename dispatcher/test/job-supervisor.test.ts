@@ -45,6 +45,39 @@ function createScratchJob(
   ).row;
 }
 
+function createKeyedScratchJobs(
+  database: DispatcherDatabase,
+  config: DispatcherConfig,
+  externalEventId: string,
+  count: number,
+  startOffsetMs: number,
+): { sourceEventId: string; jobs: JobRow[] } {
+  const source = database.enqueue(
+    eventEnvelope(externalEventId),
+    new Date(Date.UTC(2026, 8, 5, 0, 0, 0, startOffsetMs)),
+  ).row;
+  const jobs = Array.from({ length: count }, (_, index) => database.createJob(
+    {
+      source_event_id: source.event_id,
+      job_key: `job.${index + 1}`,
+      objective: `objective ${index + 1}`,
+      workspace: { kind: "scratch" },
+    },
+    config.jobsWorkspaceRoot,
+    config.jobResultsDir,
+    new Date(Date.UTC(2026, 8, 5, 0, 0, 0, startOffsetMs + index)),
+  ).row);
+  return { sourceEventId: source.event_id, jobs };
+}
+
+function waitUntilAbort(signal?: AbortSignal): Promise<HerdrCommandResult> {
+  return new Promise((resolve) => {
+    const aborted = (): void => resolve({ ...ok("working"), aborted: true });
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) aborted();
+  });
+}
+
 function markRunning(database: DispatcherDatabase, jobId: string): void {
   database.beginJobPreparation(jobId);
   database.setJobRuntime(jobId, "1", "w1:p1");
@@ -68,6 +101,555 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  test("fills global slots round-robin without exceeding the per-event limit", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 4;
+    config.jobConcurrencyPerEvent = 2;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-fair-first", 8, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-fair-second", 2, 100);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const schedulerStates: Array<Record<string, unknown>> = [];
+    const schedulerLogger: Logger = {
+      debug(message, fields) {
+        if (message === "Job scheduler state changed") schedulerStates.push(fields ?? {});
+      },
+      info() {}, warn() {}, error() {},
+    };
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(_jobId, signal) { return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, schedulerLogger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 4);
+    const promptedSources = prompted.map((jobId) => sourceByJob.get(jobId));
+    assert.equal(promptedSources.filter((sourceEventId) => sourceEventId === first.sourceEventId).length, 2);
+    assert.equal(promptedSources.filter((sourceEventId) => sourceEventId === second.sourceEventId).length, 2);
+    assert.equal(new Set(prompted).size, 4);
+    assert.ok(schedulerStates.some((fields) =>
+      fields.active_jobs === 4 && fields.active_max_per_event === 2 && fields.queued_jobs === 6
+    ));
+    assert.equal(JSON.stringify(schedulerStates).includes("source_event_id"), false);
+    assert.equal(JSON.stringify(schedulerStates).includes("objective 1"), false);
+    await supervisor.stop();
+    assert.equal(prompted.length, 4);
+    assert.equal(database.listJobs("queued").length, 6);
+    database.close();
+  });
+
+  test("advances the fair cursor so an older event cannot starve a later event", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-fair-cursor-first", 3, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-fair-cursor-second", 1, 100);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 1 && waiters.has(prompted[0]!));
+    assert.equal(sourceByJob.get(prompted[0]!), first.sourceEventId);
+    waiters.get(prompted[0]!)!(ok("done"));
+    await waitFor(() => prompted.length === 2);
+    assert.equal(sourceByJob.get(prompted[1]!), second.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not starve an old fan-out while new source events keep arriving", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const old = createKeyedScratchJobs(database, config, "Ev-continuous-old", 3, 0);
+    const sourceByJob = new Map(old.jobs.map((row) => [row.job_id, row.source_event_id]));
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    const addSource = (externalEventId: string, offsetMs: number): void => {
+      const created = createKeyedScratchJobs(database, config, externalEventId, 1, offsetMs);
+      sourceByJob.set(created.jobs[0]!.job_id, created.sourceEventId);
+      supervisor.wake();
+    };
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 1 && waiters.has(prompted[0]!));
+    assert.equal(sourceByJob.get(prompted[0]!), old.sourceEventId);
+    addSource("Ev-continuous-new-1", 100);
+    waiters.get(prompted[0]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 2 && waiters.has(prompted[1]!));
+    assert.equal(sourceByJob.get(prompted[1]!), old.sourceEventId);
+    addSource("Ev-continuous-new-2", 200);
+    waiters.get(prompted[1]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 3 && waiters.has(prompted[2]!));
+    assert.notEqual(sourceByJob.get(prompted[2]!), old.sourceEventId);
+    addSource("Ev-continuous-new-3", 300);
+    waiters.get(prompted[2]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 4);
+    assert.equal(sourceByJob.get(prompted[3]!), old.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("keeps cursor order when the cursor event is temporarily at its active limit", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-full-ring-first", 2, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-full-ring-second", 2, 100);
+    const third = createKeyedScratchJobs(database, config, "Ev-full-ring-third", 1, 200);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs, ...third.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 2 && waiters.size === 2);
+    assert.deepEqual(
+      new Set(prompted.map((jobId) => sourceByJob.get(jobId))),
+      new Set([first.sourceEventId, second.sourceEventId]),
+    );
+    const firstActiveJob = prompted.find((jobId) => sourceByJob.get(jobId) === first.sourceEventId)!;
+    waiters.get(firstActiveJob)!(ok("done"));
+    await waitFor(() => prompted.length === 3);
+    assert.equal(sourceByJob.get(prompted[2]!), third.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not aggregate the full queue on every scheduler poll", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    createKeyedScratchJobs(database, config, "Ev-stats-throttle", 2, 0);
+    const originalJobQueueStats = database.jobQueueStats.bind(database);
+    let statsQueries = 0;
+    database.jobQueueStats = (excludedJobIds?: string[]) => {
+      statsQueries += 1;
+      return originalJobQueueStats(excludedJobIds);
+    };
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(_jobId, signal) {
+        return new Promise((resolve) => {
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => statsQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(statsQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not rescan a retry backlog before its earliest backoff expires", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-first", 1, 0).jobs,
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-second", 1, 100).jobs,
+    ];
+    const failureAt = new Date();
+    for (const job of jobs) {
+      database.beginJobPreparation(job.job_id, failureAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failureAt);
+    }
+    const originalBeginRunnableCycle = database.beginRunnableCycle.bind(database);
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
+    const originalNextWaitingJobAt = database.nextWaitingJobAt.bind(database);
+    let cycleQueries = 0;
+    let runnableQueries = 0;
+    let retryTimeQueries = 0;
+    database.beginRunnableCycle = (...args): string | undefined => {
+      cycleQueries += 1;
+      return originalBeginRunnableCycle(...args);
+    };
+    database.nextRunnableJob = (...args): JobRow | undefined => {
+      runnableQueries += 1;
+      return originalNextRunnableJob(...args);
+    };
+    database.nextWaitingJobAt = (...args): Date | undefined => {
+      retryTimeQueries += 1;
+      return originalNextWaitingJobAt(...args);
+    };
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => retryTimeQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(cycleQueries, 1);
+    assert.equal(runnableQueries, 0);
+    assert.equal(retryTimeQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("keeps future retry backlog out of the fair runnable index", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const future = createKeyedScratchJobs(database, config, "Ev-future-retry", 8, 0);
+    const ready = createKeyedScratchJobs(database, config, "Ev-ready-after-backlog", 1, 100);
+    const failedAt = new Date("2026-09-05T00:00:01.000Z");
+    for (const job of future.jobs) {
+      database.beginJobPreparation(job.job_id, failedAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failedAt);
+    }
+
+    const beforeRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:05.999Z"));
+    assert.equal(beforeRetry?.job_id, ready.jobs[0]!.job_id);
+    assert.equal(database.getJob(future.jobs[0]!.job_id)?.status, "retryable_failed");
+
+    const afterRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:06.000Z"));
+    assert.equal(afterRetry?.job_id, future.jobs[0]!.job_id);
+    assert.equal(afterRetry?.status, "queued");
+    assert.deepEqual(
+      future.jobs.map((job) => database.getJob(job.job_id)?.status),
+      Array.from({ length: future.jobs.length }, () => "queued"),
+    );
+    database.close();
+  });
+
+  test("counts recovered running jobs before starting queued work", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const recovered = createKeyedScratchJobs(database, config, "Ev-recovered-running", 1, 0);
+    const next = createKeyedScratchJobs(database, config, "Ev-recovered-next", 1, 100);
+    const queued = createKeyedScratchJobs(database, config, "Ev-recovered-queued", 1, 200);
+    markRunning(database, recovered.jobs[0]!.job_id);
+    const waited: string[] = [];
+    const prompted: string[] = [];
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) { waited.push(jobId); return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => waited.length === 2);
+    assert.deepEqual(prompted, [next.jobs[0]!.job_id]);
+    assert.equal(database.getJob(queued.jobs[0]!.job_id)?.status, "queued");
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("releases a slot after worker start failure and retries after transient DB busy", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-start-failure", 1, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-after-failure", 1, 100);
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
+    let queryCount = 0;
+    database.nextRunnableJob = (
+      at?: Date,
+      afterSourceEventId?: string,
+      excludedSourceEventIds?: string[],
+      excludedJobIds?: string[],
+      throughSourceEventId?: string,
+    ): JobRow | undefined => {
+      queryCount += 1;
+      if (queryCount === 1) {
+        const error = new Error("database is busy") as Error & { code?: string };
+        error.code = "SQLITE_BUSY";
+        throw error;
+      }
+      return originalNextRunnableJob(
+        at,
+        afterSourceEventId,
+        excludedSourceEventIds,
+        excludedJobIds,
+        throughSourceEventId,
+      );
+    };
+    const warnings: Array<Record<string, unknown>> = [];
+    const busyLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(message, fields) {
+        if (message === "Job scheduling cycle failed") warnings.push(fields ?? {});
+      },
+    };
+    const prompted: string[] = [];
+    const runtime = fakeRuntime({
+      async prepare(row) {
+        if (row.job_id === first.jobs[0]!.job_id) throw new Error("worker start failed");
+        return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" };
+      },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(_jobId, signal) { return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, busyLogger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.includes(second.jobs[0]!.job_id));
+    assert.equal(database.getJob(first.jobs[0]!.job_id)?.status, "failed");
+    assert.deepEqual(warnings.map((fields) => fields.error_code), ["SQLITE_BUSY"]);
+    await supervisor.stop();
+    database.close();
+  });
+
+  for (const completionOrder of ["cancel-first", "wait-first"] as const) {
+    test(`drains overlapping cancel/wait before restart (${completionOrder})`, { timeout: 10_000 }, async (t) => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      config.jobConcurrency = 1;
+      config.jobConcurrencyPerEvent = 1;
+      const database = new DispatcherDatabase(config.databasePath);
+      const running = createKeyedScratchJobs(database, config, "Ev-cancel-drain-running", 1, 0);
+      const queued = createKeyedScratchJobs(database, config, "Ev-cancel-drain-queued", 2, 100);
+      const cancellation = database.enqueue(eventEnvelope("Ev-cancel-drain-request")).row;
+      const prompted: string[] = [];
+      let releaseWait: ((result: HerdrCommandResult) => void) | undefined;
+      let releaseCancel: ((result: HerdrCommandResult) => void) | undefined;
+      let waitSignal: AbortSignal | undefined;
+      const runtime = fakeRuntime({
+        async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+        async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+        async wait(_jobId, signal) {
+          waitSignal = signal;
+          return new Promise((resolve) => { releaseWait = resolve; });
+        },
+        async cancel() { return new Promise((resolve) => { releaseCancel = resolve; }); },
+      });
+      const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+      let restarted: JobSupervisor | undefined;
+      t.after(async () => {
+        releaseCancel?.(ok("idle"));
+        releaseWait?.({ ...ok("working"), aborted: true });
+        await supervisor.stop();
+        await restarted?.stop();
+        database.close();
+      });
+      supervisor.start();
+      await waitFor(() => releaseWait !== undefined);
+      const cancelling = supervisor.cancel(running.jobs[0]!.job_id, cancellation.event_id, "競合テスト");
+      await waitFor(() => releaseCancel !== undefined);
+      let drained = false;
+      const stopping = supervisor.stop().then(() => { drained = true; });
+      assert.equal(waitSignal?.aborted, true);
+      if (completionOrder === "cancel-first") {
+        releaseCancel!(ok("idle"));
+        await cancelling;
+      } else {
+        releaseWait!({ ...ok("working"), aborted: true });
+      }
+      // Flush promise continuations without advancing either controlled operation.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(drained, false, "drain must await both worker monitoring and accepted controls");
+      assert.deepEqual(prompted, [running.jobs[0]!.job_id]);
+      releaseCancel!(ok("idle"));
+      releaseWait!({ ...ok("working"), aborted: true });
+      await Promise.all([cancelling, stopping]);
+      assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
+      assert.ok(queued.jobs.every((row) => database.getJob(row.job_id)?.status === "queued"));
+
+      restarted = new JobSupervisor(database, fakeRuntime({
+        async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+        async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+        async wait(_jobId, signal) { return waitUntilAbort(signal); },
+      }), config, logger, () => undefined);
+      restarted.start();
+      await waitFor(() => database.getJob(queued.jobs[0]!.job_id)?.status === "running");
+      assert.deepEqual(prompted, [running.jobs[0]!.job_id, queued.jobs[0]!.job_id]);
+      assert.equal(database.listRunningJobs().length, 1);
+      assert.equal(database.getJob(queued.jobs[1]!.job_id)?.status, "queued");
+      assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
+      await restarted.stop();
+    });
+  }
+
+  test("preserves an established fair cursor across repeated mid-cycle SQLITE_BUSY", { timeout: 10_000 }, async (t) => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-mid-busy-a", 2, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-mid-busy-b", 1, 100);
+    const third = createKeyedScratchJobs(database, config, "Ev-mid-busy-c", 1, 200);
+    const selected: string[] = [];
+    const original = database.nextRunnableJob.bind(database);
+    let busy = true;
+    let busyCount = 0;
+    database.nextRunnableJob = (...args) => {
+      if (args[1] === first.sourceEventId && busy) {
+        busyCount += 1;
+        throw Object.assign(new Error("injected mid-cycle busy"), { code: "SQLITE_BUSY" });
+      }
+      const row = original(...args);
+      if (row) selected.push(row.job_id);
+      return row;
+    };
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    t.after(async () => { await supervisor.stop(); database.close(); });
+    supervisor.start();
+    await waitFor(() => busyCount >= 2 && waiters.has(first.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    busy = false;
+    await waitFor(() => waiters.has(second.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 2);
+    waiters.get(first.jobs[0]!.job_id)!(failed("worker_failed"));
+    await waitFor(() => waiters.has(third.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id, third.jobs[0]!.job_id]);
+    assert.equal(database.getJob(first.jobs[0]!.job_id)?.status, "needs_review");
+    assert.equal(database.getJob(first.jobs[1]!.job_id)?.status, "queued");
+    assert.equal(database.listRunningJobs().length, 2);
+    await supervisor.stop();
+  });
+
+  test("resumes a retry deadline scan after SQLITE_BUSY without an early retry", { timeout: 10_000 }, async (t) => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const start = new Date("2026-09-05T00:01:00.000Z");
+    t.mock.timers.enable({ apis: ["Date"], now: start });
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-retry-busy-a", 1, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-retry-busy-b", 1, 100);
+    for (const row of [...first.jobs, ...second.jobs]) {
+      database.beginJobPreparation(row.job_id);
+      database.recordJobPreparationFailure(row.job_id, "start_failed", "retry later", 5, start);
+    }
+    const deadline = new Date(database.getJob(first.jobs[0]!.job_id)!.available_at).getTime();
+    let waitingScans = 0;
+    const originalWaiting = database.nextWaitingJobAt.bind(database);
+    database.nextWaitingJobAt = (...args) => { waitingScans += 1; return originalWaiting(...args); };
+    let busy = true;
+    let busyCount = 0;
+    let candidateScans = 0;
+    const selected: string[] = [];
+    const original = database.nextRunnableJob.bind(database);
+    database.nextRunnableJob = (...args) => {
+      candidateScans += 1;
+      if (Date.now() >= deadline && busy) {
+        busyCount += 1;
+        throw Object.assign(new Error("injected retry deadline busy"), { code: "SQLITE_BUSY" });
+      }
+      const row = original(...args);
+      if (row) selected.push(row.job_id);
+      return row;
+    };
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    }), config, logger, () => undefined);
+    t.after(async () => { await supervisor.stop(); database.close(); });
+    supervisor.start();
+    await waitFor(() => waitingScans === 1);
+    const before = candidateScans;
+    t.mock.timers.setTime(deadline - 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 3));
+    assert.equal(candidateScans, before);
+    assert.deepEqual(selected, []);
+    t.mock.timers.setTime(deadline);
+    await waitFor(() => busyCount >= 2);
+    assert.deepEqual(selected, []);
+    assert.equal(database.listRunningJobs().length, 0);
+    busy = false;
+    await waitFor(() => waiters.has(first.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    waiters.get(first.jobs[0]!.job_id)!(failed("worker_failed"));
+    await waitFor(() => waiters.has(second.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    assert.equal(database.getJob(second.jobs[0]!.job_id)?.attempt_count, 2);
+    await supervisor.stop();
+  });
+
   test("runs a background job and queues a dona_job completion event", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -91,6 +673,7 @@ describe("JobSupervisor", () => {
         promptCount += 1;
         promptTarget = agentName;
         assert.match(prompt, /\[DONA_JOB_BEGIN\]/);
+        assert.match(prompt, /"job_key":"legacy-default"/);
         const result = {
           schema_version: 1,
           job_id: job.job_id,
@@ -119,6 +702,157 @@ describe("JobSupervisor", () => {
     const notification = database.get(database.getJob(job.job_id)!.completion_event_id!);
     assert.equal(notification?.source, "dona_job");
     assert.equal(notification?.event_type, "job_completed");
+    database.close();
+  });
+
+  test("emits progress without completing a running sibling after the source group is sealed", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-progress")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const completed = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "completed",
+      objective: "finish first",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const running = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "running",
+      objective: "keep running",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    for (const job of [completed, running]) markRunning(database, job.job_id);
+    database.saveJobResult(completed.job_id, {
+      schema_version: 1,
+      job_id: completed.job_id,
+      status: "completed",
+      summary: "first done",
+      completed_at: "2026-09-05T04:00:00.000Z",
+    }, completed.result_path);
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T04:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    let wakeCount = 0;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
+    }), config, logger, () => { wakeCount += 1; });
+    supervisor.start();
+    await waitFor(() => database.getJob(completed.job_id)?.completion_event_id !== null);
+    await supervisor.stop();
+
+    const notification = database.get(database.getJob(completed.job_id)!.completion_event_id!)!;
+    const group = JSON.parse(notification.payload_json).group as Record<string, unknown>;
+    assert.equal(group.transition, "progress");
+    assert.equal(group.pending, 1);
+    assert.equal(database.getJob(running.job_id)?.status, "running");
+    assert.equal(database.getJob(running.job_id)?.completion_event_id, null);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, null);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    assert.ok(wakeCount >= 1);
+    database.close();
+  });
+
+  test("claims exactly one all-terminal event for concurrently observable successful siblings", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-successes")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs = ["one", "two"].map((jobKey) => database.createJob({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `finish ${jobKey}`,
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    for (const job of jobs) {
+      markRunning(database, job.job_id);
+      database.saveJobResult(job.job_id, {
+        schema_version: 1,
+        job_id: job.job_id,
+        status: "completed",
+        summary: `${job.job_key} done`,
+        completed_at: "2026-09-05T05:00:00.000Z",
+      }, job.result_path);
+    }
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T05:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => jobs.every((job) => database.getJob(job.job_id)?.completion_event_id !== null));
+    await supervisor.stop();
+
+    const notifications = jobs.map((job) => database.get(database.getJob(job.job_id)!.completion_event_id!)!);
+    const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
+    assert.deepEqual(transitions.sort(), ["all_terminal", "progress"]);
+    const owner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "all_terminal")!;
+    const ownerGroup = JSON.parse(owner.payload_json).group as { total: number; jobs: Array<{ job_id: string }> };
+    assert.equal(ownerGroup.total, 2);
+    assert.deepEqual(ownerGroup.jobs.map(({ job_id }) => job_id).sort(), jobs.map(({ job_id }) => job_id).sort());
+    assert.deepEqual(
+      ownerGroup.jobs.map(({ job_id }) => JSON.parse(database.getJob(job_id)!.result_json!).summary).sort(),
+      ["one done", "two done"],
+    );
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, owner.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, null);
+    database.close();
+  });
+
+  test("claims one attention event for mixed failed, blocked, and needs-review siblings", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-attention-mix")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs = ["failed", "blocked", "needs-review"].map((jobKey) => database.createJob({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `attention ${jobKey}`,
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    for (const job of jobs) markRunning(database, job.job_id);
+    database.saveJobResult(jobs[0]!.job_id, {
+      schema_version: 1,
+      job_id: jobs[0]!.job_id,
+      status: "failed",
+      summary: "reported failure",
+      completed_at: "2026-09-05T06:00:00.000Z",
+    }, jobs[0]!.result_path);
+    database.markJobBlocked(jobs[1]!.job_id, "approval required");
+    database.markJobNeedsReview(jobs[2]!.job_id, "acceptance_unknown", "manual review required");
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T06:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => jobs.every((job) => database.getJob(job.job_id)?.completion_event_id !== null));
+    await supervisor.stop();
+
+    const notifications = jobs.map((job) => database.get(database.getJob(job.job_id)!.completion_event_id!)!);
+    const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
+    assert.equal(transitions.filter((transition) => transition === "attention").length, 1);
+    assert.equal(transitions.filter((transition) => transition === "progress").length, 2);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    const attentionOwner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "attention")!;
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attentionOwner.event_id);
+    assert.deepEqual(
+      (JSON.parse(attentionOwner.payload_json).group as Record<string, unknown>).status_counts,
+      { blocked: 1, failed: 1, needs_review: 1 },
+    );
     database.close();
   });
 

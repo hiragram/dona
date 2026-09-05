@@ -5,13 +5,14 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import type { DispatcherDatabase } from "./database.js";
+import { JobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
 import {
+  jobKeyPattern,
   parseCancelJobRequest,
   parseCreateJobRequest,
   parseEventEnvelope,
@@ -193,13 +194,17 @@ export class DispatcherApi {
         } catch {
           ready = false;
         }
+        const appSchema = this.database.schemaCompatibility();
         sendJson(response, ready ? 200 : 503, {
           schema_version: 1,
           status: ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: 2,
+          app_schema: appSchema.actual,
+          app_schema_read_min: appSchema.read_min,
+          app_schema_read_max: appSchema.read_max,
+          app_schema_write: appSchema.write,
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
@@ -209,6 +214,33 @@ export class DispatcherApi {
         const eventId = decodeURIComponent(url.pathname.split("/")[3]!);
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(eventId)) throw new ApiRequestError(400, "invalid_request", "event_id is invalid");
         sendJson(response, 200, { schema_version: 1, event_id: eventId, terminal: this.database.isEventCompleted(eventId) });
+        return;
+      }
+      if (request.method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)) {
+        const sourceEventId = decodeURIComponent(url.pathname.split("/")[3]!);
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        const requestedJobKey = url.searchParams.get("job_key");
+        const jobKey = requestedJobKey?.trim();
+        if (jobKey !== undefined && !jobKeyPattern.test(jobKey)) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is invalid");
+        }
+        const canonicalPayloadSha256 = url.searchParams.get("canonical_payload_sha256") ?? undefined;
+        if (canonicalPayloadSha256 !== undefined && !/^[0-9a-f]{64}$/.test(canonicalPayloadSha256)) {
+          throw new ApiRequestError(400, "invalid_request", "canonical_payload_sha256 is invalid");
+        }
+        if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
+        }
+        sendJson(response, 200, {
+          schema_version: 1,
+          source_event_id: sourceEventId,
+          jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
+            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
+            : {}),
+        });
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/update-safety") {
@@ -478,17 +510,24 @@ export class DispatcherApi {
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
+        if (error instanceof JobCreationError) {
+          if (error.limitDetails) {
+            this.logger.warn("Job creation rejected by resource limit", {
+              error_code: error.code,
+              resource: error.limitDetails.resource,
+              current_value: error.limitDetails.current,
+              attempted_value: error.limitDetails.attempted,
+              limit_value: error.limitDetails.maximum,
+            });
+          }
+          throw new ApiRequestError(409, error.code, error.message);
+        }
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
-      }
-      if (result.payloadMismatch) {
-        this.logger.warn("Duplicate job request differs from persisted job", {
-          job_id: result.row.job_id,
-          source_event_id: result.row.source_event_id,
-        });
       }
       this.jobs.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         duplicate: result.duplicate,
         job: result.row,
       });
@@ -514,6 +553,17 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId !== null) {
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        try {
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId, true);
+        } catch {
+          throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
+        }
+      }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }

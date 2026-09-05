@@ -27,6 +27,12 @@ export const jobStatuses = [
 
 export type JobStatus = (typeof jobStatuses)[number];
 
+export const jobGroupNotificationModes = ["grouped", "legacy"] as const;
+
+export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
+
+export type JobGroupTransition = "progress" | "attention" | "all_terminal";
+
 export interface EventEnvelope {
   schema_version: 1;
   source: "slack" | "dona_job" | "dona_update";
@@ -45,6 +51,12 @@ export type JobWorkspace =
 
 export interface CreateJobRequest {
   source_event_id: string;
+  job_key?: string;
+  objective: string;
+  workspace: JobWorkspace;
+}
+
+export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
 }
@@ -120,6 +132,7 @@ export interface EnqueueResult {
 export interface JobRow {
   job_id: string;
   source_event_id: string;
+  job_key: string;
   source: string;
   workspace_id: string | null;
   channel_id: string | null;
@@ -148,8 +161,44 @@ export interface JobRow {
   updated_at: string;
 }
 
+export interface JobGroupRow {
+  source_event_id: string;
+  sealed_at: string | null;
+  notification_mode: JobGroupNotificationMode;
+  attention_event_id: string | null;
+  all_terminal_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobGroupSnapshot {
+  source_event_id: string;
+  total: number;
+  pending: number;
+  status_counts: Partial<Record<JobStatus, number>>;
+  jobs: Array<{
+    job_id: string;
+    job_key: string;
+    status: JobStatus;
+  }>;
+  transition: JobGroupTransition;
+}
+
 export interface CreateJobResult {
   row: JobRow;
+  outcome: "created" | "reused";
   duplicate: boolean;
-  payloadMismatch: boolean;
 }
+
+export interface EventJobProjection {
+  job_id: string;
+  job_key: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  last_error_code: string | null;
+  result_summary: string | null;
+}
+
+export type EventJobReconciliation = "not_found" | "matched" | "conflict" | "unverified_legacy";

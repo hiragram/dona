@@ -44,7 +44,10 @@ DONA_HERDR_PATH=herdr
 DONA_AGENT_MISSING_GRACE_MS=5000
 DONA_JOBS_WORKSPACE_ROOT=~/.dona/workspaces
 DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results
+DONA_JOBS_PER_EVENT_MAX=8
+DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES=400000
 DONA_JOB_CONCURRENCY=4
+DONA_JOB_CONCURRENCY_PER_EVENT=2
 DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
 DONA_GH_PATH=gh
@@ -55,6 +58,10 @@ DONA_UPDATE_NOTIFICATION_DATABASE_PATH=~/Library/Application Support/Dona/update
 SLACK_HEALTH_SOCKET_PATH=~/Library/Application Support/Dona/run/slack-adapter.sock
 DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
+
+1つのsource eventから作成できるjobは既定8件（hard upper bound 32）で、作成時に正規化されたobjectiveのUTF-8 byte総量は既定400,000 bytesです。件数には`cancelled`/`failed`も含み、quota到達後も既存`job_key`のidempotency照合は先に処理します。実行はglobal 4件、source eventごと2件を上限とし、複数eventの待機jobはsource event単位のround-robinで選びます。設定値は起動時に正の整数と安全上限を検証します。
+
+構造化ログ`Job scheduler state changed`はglobal/per-eventのqueue・active件数を集約値だけで出し、quota拒否はstable `job_group_limit_exceeded`と対象resource・数値だけを記録します。`job_key`、objective、workspace path、actor由来値はこれらの観測fieldへ含めません。
 
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
 
@@ -72,9 +79,10 @@ Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" }
 
 Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
 
-- `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任
+- `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
+- `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合。元の`objective`とworkspaceも渡すとcanonical payloadの`matched` / `conflict`を判定
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
-- `get_job_status`: 状態と結果を取得
+- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。 状態と結果を取得
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
 - `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
@@ -91,6 +99,12 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 ビルド後はリポジトリの[`.codex/config.toml`](../.codex/config.toml)を読んだCodexが`dist/mcp/index.js`を起動します。`npm run dev`が起動するのは常駐DispatcherとSlack Adapterだけです。
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
+
+明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約するため、owner 1件の`payload.result`だけを全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+
+Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
+
+新規jobは作成時canonical payloadのSHA-256を`workspace_json`内のDispatcher予約metadataへ保存し、後続steerで`objective`が変わってもcreate/reuse判定を固定します。v2から移行した`legacy-default` rowには作成時payloadが存在しないためhashを推測せず、payload付き照合では`unverified_legacy`を返して従来の単一job reuseを維持します。予約metadataはworker promptと`dona_job` payloadのworkspace projectionから除外されます。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -137,7 +151,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" 
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/version
 ```
 
-`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。build SHA、protocol 1、app schema 2、config 1、`update_notification_protocol: 1`だけをversion healthへ出し、pathやsecretは返しません。
+`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。version healthはbuild SHA、protocol 1、実DB schema 3、read range 2〜3、write schema 3、config 1、`update_notification_protocol: 1`だけを出し、pathやsecretは返しません。
 
 ## 運用CLI
 
@@ -167,7 +181,7 @@ npm exec -- tsx src/cli.ts job show job_...
 - `blocked`: 自動解除せず、キュー全体を停止します。
 - `needs_review` / `completed` / `dead_letter`: 自動変更しません。
 
-ジョブは複数同時に動きますが、同じ`dona-main`へのイベント投入は従来どおり1件ずつです。ジョブの`preparing`は再起動時に`retryable_failed`へ戻します。prompt、steer、cancelの受理が曖昧な状態は`needs_review`へ移し、自動再投入しません。`running`は結果ファイルとHerdr agent状態の監視を再開し、最初のpromptを再送しません。
+ジョブはglobal/per-event上限の小さい方を守って複数同時に動きますが、同じ`dona-main`へのイベント投入は従来どおり1件ずつです。source event間はround-robinで選び、1つのfan-outが継続的に全slotを占有しません。ジョブの`preparing`は再起動時に`retryable_failed`へ戻します。prompt、steer、cancelの受理が曖昧な状態は`needs_review`へ移し、自動再投入しません。`running`は結果ファイルとHerdr agent状態の監視を再開し、最初のpromptを再送しません。
 
 Result Envelopeは完成パスの最大1 MiB、schema version、event ID、status、UTC完了日時を検証します。`actions`は保存するだけで実行しません。agentの画面テキストは結果判定に使いません。
 
@@ -179,3 +193,17 @@ npm run typecheck
 npm run build
 npm audit --audit-level=high
 ```
+
+### 複数jobのcallerとfollow-up
+
+独立目的ごとに初回write前に安定した`job_key`を決めて`delegate_job`を呼びます。成功responseの`action`は`tool` / `source_event_id` / `job_key` / `job_id` / `outcome`（created/reused）だけで、Result actionsには成功callだけを残します。objective、path、secret、conflictや未実行案は成功actionに含めません。後続のvalidation/conflict/limit失敗でも成功済jobをcancelせず、partial successを利用者とResult summaryへ明示します。
+
+create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only reconcileします。createは`list_event_jobs`へ同じevent/keyと元payloadを渡して照合し、matchedでもcreated/reusedの喪失responseを推測しません。statusとreceiptは`get_job_status`で確認し、0件・conflict・unverified_legacy・受理不明なら人間へ確認します。
+
+後続入力は先に`list_thread_jobs`を使います。0件なら操作せず、1件なら依頼意図との一致を確認します。複数候補かつ明示`job_id`なしなら質問し、本文類似・最新時刻・job_keyから選択せずbroadcastしません。外部自由文のID、command/path/token/private URLを未検証で制御引数へ使いません。対象確定後だけ現在のfollow-up `source_event_id`と明示`job_id`でsteer/status/cancelし、cross-threadを拒否します。
+
+委任後はgroup terminalまでprocessingを保ち、個別progressでは投稿・active遷移をしません。attentionはsuspended、all_terminalは結果集約後activeです。通知のstatus取得にも現在の通知event_idを使います。group DB lifecycleはDispatcherの既存実装が所有します。
+
+MCPのcreate/steer/cancel応答とthread候補はDB rowのallowlist projectionで、objective・workspace/result path・runtime identityを除外します。thread候補は最大100件で、`truncated: true`なら省略の可能性があるため最新1件を選びません。詳細Resultは明示status取得時だけ返します。HTTPのsource_event_id省略status取得は既存ローカルCLI互換用であり、MCPはevent IDを必須にします。
+
+詳細statusの`last_error_message`は最大2,000文字に制限し、既知のobjective/path/runtime値と典型的なcredential・URL・絶対pathを秘匿して返します。`blocked`/`needs_review`でResultがなくても理由を確認できます。自由文の完全な秘密検出を保証するものではなく、未信頼の説明データとして扱い、外部投稿前にも確認します。候補・create/control応答には含めません。

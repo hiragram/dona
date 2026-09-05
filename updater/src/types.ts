@@ -194,6 +194,9 @@ export interface HealthSnapshot {
   build_sha: string | null;
   protocol: number | null;
   app_schema: number | null;
+  app_schema_read_min?: number;
+  app_schema_read_max?: number;
+  app_schema_write?: number;
   config: number | null;
   update_notification_protocol?: number;
   workspaces_ready?: boolean;

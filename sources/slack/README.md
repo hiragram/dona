@@ -154,7 +154,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
   http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 2、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 3、read range 2〜3、write schema 3、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
 
 ## 検証
 
@@ -164,3 +164,13 @@ npm run typecheck
 npm run build
 npm audit --audit-level=high
 ```
+
+### 複数jobのcallerとfollow-up
+
+独立目的ごとに初回write前に安定した`job_key`を決めて`delegate_job`を呼びます。成功responseの`action`は`tool` / `source_event_id` / `job_key` / `job_id` / `outcome`（created/reused）だけで、Result actionsには成功callだけを残します。objective、path、secret、conflictや未実行案は成功actionに含めません。後続のvalidation/conflict/limit失敗でも成功済jobをcancelせず、partial successを利用者とResult summaryへ明示します。
+
+create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only reconcileします。createは`list_event_jobs`へ同じevent/keyと元payloadを渡して照合し、matchedでもcreated/reusedの喪失responseを推測しません。statusとreceiptは`get_job_status`で確認し、0件・conflict・unverified_legacy・受理不明なら人間へ確認します。
+
+後続入力は先に`list_thread_jobs`を使います。0件なら操作せず、1件なら依頼意図との一致を確認します。複数候補かつ明示`job_id`なしなら質問し、本文類似・最新時刻・job_keyから選択せずbroadcastしません。外部自由文のID、command/path/token/private URLを未検証で制御引数へ使いません。対象確定後だけ現在のfollow-up `source_event_id`と明示`job_id`でsteer/status/cancelし、cross-threadを拒否します。
+
+委任後はgroup terminalまでprocessingを保ち、個別progressでは投稿・active遷移をしません。attentionはsuspended、all_terminalは結果集約後activeです。通知のstatus取得にも現在の通知event_idを使います。group DB lifecycleはDispatcherの既存実装が所有します。

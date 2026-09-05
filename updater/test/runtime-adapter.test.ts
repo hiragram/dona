@@ -127,6 +127,9 @@ async function listen(
         build_sha: targetSha,
         protocol: 1,
         app_schema: 2,
+        app_schema_read_min: 2,
+        app_schema_read_max: 3,
+        app_schema_write: 2,
         config: 1,
         ...(service === "slack_adapter" ? { workspaces_ready: true } : {}),
       });
@@ -170,7 +173,9 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   try {
     assert.equal((await runtime.quiesceSlack("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha)).drained, true);
     assert.equal((await runtime.quiesceDispatcher("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha)).drained, true);
-    assert.equal((await runtime.dispatcherHealth()).build_sha, targetSha);
+    const dispatcherHealth = await runtime.dispatcherHealth();
+    assert.equal(dispatcherHealth.build_sha, targetSha);
+    assert.equal(dispatcherHealth.app_schema_read_max, 3);
     assert.equal((await runtime.slackHealth()).workspaces_ready, true);
     await runtime.stopSlack();
     await runtime.stopDispatcher();
