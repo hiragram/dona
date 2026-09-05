@@ -290,6 +290,32 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("keeps future retry backlog out of the fair runnable index", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const future = createKeyedScratchJobs(database, config, "Ev-future-retry", 8, 0);
+    const ready = createKeyedScratchJobs(database, config, "Ev-ready-after-backlog", 1, 100);
+    const failedAt = new Date("2026-09-05T00:00:01.000Z");
+    for (const job of future.jobs) {
+      database.beginJobPreparation(job.job_id, failedAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failedAt);
+    }
+
+    const beforeRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:05.999Z"));
+    assert.equal(beforeRetry?.job_id, ready.jobs[0]!.job_id);
+    assert.equal(database.getJob(future.jobs[0]!.job_id)?.status, "retryable_failed");
+
+    const afterRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:06.000Z"));
+    assert.equal(afterRetry?.job_id, future.jobs[0]!.job_id);
+    assert.equal(afterRetry?.status, "queued");
+    assert.deepEqual(
+      future.jobs.map((job) => database.getJob(job.job_id)?.status),
+      Array.from({ length: future.jobs.length }, () => "queued"),
+    );
+    database.close();
+  });
+
   test("counts recovered running jobs before starting queued work", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

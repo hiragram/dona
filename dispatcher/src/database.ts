@@ -42,6 +42,11 @@ const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 const jobGroupSnapshotJobLimit = 32;
 const jobAttentionStatuses = new Set<JobStatus>(["blocked", "failed", "needs_review"]);
 const jobNotificationStatuses = new Set<JobStatus>(["blocked", "completed", "failed", "cancelled", "needs_review"]);
+const jobsRunnableFairIndexSql = `
+  CREATE INDEX jobs_runnable_fair_idx
+    ON jobs(source_event_id, created_at, job_id, available_at)
+    WHERE status = 'queued'
+`;
 export type JobCreationErrorCode =
   | "job_idempotency_conflict"
   | "job_group_closed"
@@ -96,6 +101,21 @@ function nowUtc(): string {
 function retryAt(attemptCount: number, now: Date): string {
   const delay = retryDelaysMs[Math.min(Math.max(attemptCount - 1, 0), retryDelaysMs.length - 1)]!;
   return new Date(now.getTime() + delay).toISOString();
+}
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim().replace(/;$/, "");
+}
+
+function ensureJobsRunnableFairIndex(db: Database.Database): void {
+  const existing = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+  `).get() as { sql: string | null } | undefined;
+  if (existing?.sql && normalizedSql(existing.sql) === normalizedSql(jobsRunnableFairIndexSql)) return;
+  db.transaction(() => {
+    db.exec("DROP INDEX IF EXISTS jobs_runnable_fair_idx");
+    db.exec(jobsRunnableFairIndexSql);
+  })();
 }
 
 export function migrateDispatcherDatabase(
@@ -230,9 +250,7 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
       CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
-      CREATE INDEX jobs_runnable_fair_idx
-        ON jobs(source_event_id, created_at, job_id, available_at)
-        WHERE status IN ('queued', 'retryable_failed');
+      ${jobsRunnableFairIndexSql};
     `);
     migrationHook("indexes_recreated");
 
@@ -275,11 +293,7 @@ export function migrateDispatcherDatabase(
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   })();
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS jobs_runnable_fair_idx
-      ON jobs(source_event_id, created_at, job_id, available_at)
-      WHERE status IN ('queued', 'retryable_failed');
-  `);
+  ensureJobsRunnableFairIndex(db);
 }
 
 export class DispatcherDatabase {
@@ -731,6 +745,12 @@ export class DispatcherDatabase {
     excludedSourceEventIds: string[] = [],
     excludedJobIds: string[] = [],
   ): JobRow | undefined {
+    const timestamp = at.toISOString();
+    this.db.prepare(`
+      UPDATE jobs INDEXED BY jobs_run_idx
+      SET status = 'queued', updated_at = ?
+      WHERE status = 'retryable_failed' AND available_at <= ?
+    `).run(timestamp, timestamp);
     const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
     const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
     const excludedSources = excludedSourceEventIds.length > 0
@@ -739,18 +759,18 @@ export class DispatcherDatabase {
     const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
     const statement = this.db.prepare(`
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
-      WHERE status IN ('queued', 'retryable_failed') AND available_at <= ?
+      WHERE status = 'queued' AND available_at <= ?
         AND source_event_id > ?
         ${excludedSources}
         ${excludedJobs}
       ORDER BY source_event_id, created_at, job_id
       LIMIT 1
     `);
-    const parameters = [at.toISOString(), afterSourceEventId, ...excludedSourceEventIds, ...excludedJobIds];
+    const parameters = [timestamp, afterSourceEventId, ...excludedSourceEventIds, ...excludedJobIds];
     const next = statement.get(...parameters) as JobRow | undefined;
     if (next || afterSourceEventId === "") return next;
     return statement.get(
-      at.toISOString(),
+      timestamp,
       "",
       ...excludedSourceEventIds,
       ...excludedJobIds,

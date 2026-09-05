@@ -207,13 +207,26 @@ describe("DispatcherDatabase", () => {
     const runnablePlan = migrated.prepare(`
       EXPLAIN QUERY PLAN
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
-      WHERE status IN ('queued', 'retryable_failed') AND available_at <= ?
+      WHERE status = 'queued' AND available_at <= ?
         AND source_event_id > ?
       ORDER BY source_event_id, created_at, job_id
       LIMIT 1
     `).all("2026-09-04T00:00:00.000Z", "") as Array<{ detail: string }>;
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const runnableIndexSql = migrated.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(runnableIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(runnableIndexSql, /retryable_failed/);
+    const retryPromotionPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      UPDATE jobs INDEXED BY jobs_run_idx
+      SET status = 'queued', updated_at = ?
+      WHERE status = 'retryable_failed' AND available_at <= ?
+    `).all("2026-09-04T00:00:00.000Z", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     const retryPlan = migrated.prepare(`
       EXPLAIN QUERY PLAN
       SELECT available_at FROM jobs INDEXED BY jobs_run_idx
@@ -256,12 +269,24 @@ describe("DispatcherDatabase", () => {
         'agent-duplicate-key', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z'
       );
     `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
-    migrated.exec("DROP INDEX jobs_runnable_fair_idx");
+    migrated.exec(`
+      DROP INDEX jobs_runnable_fair_idx;
+      CREATE INDEX jobs_runnable_fair_idx
+        ON jobs(source_event_id, created_at, job_id, available_at)
+        WHERE status IN ('queued', 'retryable_failed');
+    `);
     migrated.close();
 
     const existingV3 = new DispatcherDatabase(config.databasePath);
     assert.doesNotThrow(() => existingV3.nextRunnableJob(new Date("2026-09-04T00:00:00.000Z")));
     existingV3.close();
+    const reopened = new Database(config.databasePath);
+    const repairedIndexSql = reopened.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(repairedIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(repairedIndexSql, /retryable_failed/);
+    reopened.close();
   });
 
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
