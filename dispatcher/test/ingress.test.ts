@@ -700,6 +700,18 @@ test("binds owner from authenticated transport metadata before normalization and
    database.close();
 });
 
+test("managed bindingとprovider ownerのresource不一致を認証失敗にする",async()=>{
+  const definition=registration();
+  const registered={...definition,async authenticate(raw:RawIngressRequest){
+    const verified=await definition.authenticate(raw);
+    return {...verified,resourceId:"resource-2",connection:{account:"tenant1",revision:1,credentialRevision:1,resource:"resource-1",generation:1}};
+  }};
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[],method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),/authentication/i);
+});
+
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath,{defaults:{depth:1,bytes:1_048_576,rate:100,burst:100,coalescing:true}});

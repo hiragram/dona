@@ -61,7 +61,7 @@ export class ConnectionRegistry {
     const config = parseConfig(input);
     return this.db.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM connections WHERE id=?").get(config.id)) throw new ConnectionError("revision_conflict");
-      if (this.db.prepare(`SELECT 1 FROM events WHERE source=? AND status IN ('queued','retryable_failed','blocked','needs_review','dead_letter')
+      if (this.db.prepare(`SELECT 1 FROM events WHERE source=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review','dead_letter')
         AND NOT EXISTS (SELECT 1 FROM connection_event_bindings binding WHERE binding.event_id=events.event_id) LIMIT 1`).get(config.provider)) throw new ConnectionError("operation_pending");
       const now = this.clock.now();
       if (!Number.isSafeInteger(now) || now < 0) throw new ConnectionError("clock_skew");
@@ -316,6 +316,12 @@ export class ConnectionRegistry {
       const prior = this.db.prepare("SELECT connection_id,revision,resource,generation FROM connection_event_bindings WHERE event_id=?").get(result.row.event_id) as {connection_id: string; revision: number; resource: string; generation: number} | undefined;
       if (prior && (prior.connection_id !== c.id || prior.resource !== binding.resource)) throw new ConnectionError("not_authorized");
       if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?,?,?)").run(result.row.event_id, c.id, c.revision, binding.resource, dispatchGeneration);
+      else if (prior.revision !== c.revision && result.outcome === "duplicate_same" && result.row.status === "completed" &&
+        result.row.result_json?.includes("Connection revision superseded before dispatch")) {
+        this.db.prepare("UPDATE connection_event_bindings SET revision=?,generation=? WHERE event_id=?").run(c.revision,dispatchGeneration,result.row.event_id);
+        this.db.prepare(`UPDATE events SET status='queued',result_json=NULL,completed_at=NULL,available_at=?,updated_at=? WHERE event_id=?`)
+          .run(new Date(now).toISOString(),new Date(now).toISOString(),result.row.event_id);
+      }
       else if (prior.revision === c.revision && prior.generation < dispatchGeneration) this.db.prepare("UPDATE connection_event_bindings SET generation=? WHERE event_id=?")
         .run(dispatchGeneration, result.row.event_id);
       this.db.prepare("UPDATE connection_subscriptions SET last_delivery_at=? WHERE connection_id=? AND resource=? AND generation=?")
@@ -329,13 +335,16 @@ export class ConnectionRegistry {
       { revision: c.revision, version: 0, checkpoint: null };
   }
   assertPolling(binding: DeliveryBinding): void {
-    if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
-    const c = this.current(binding.connectionId, binding.revision, binding.resource);
-    const s = this.sub(c.id, binding.resource, binding.generation);
-    const now = this.tick(c.id);
-    if (!c.capability.cursor || c.state !== "active" || c.account !== binding.account || c.credentialRevision !== binding.credentialRevision ||
-      s.revision !== c.revision || s.verifiedAt === null || !["active","expiring","stop_candidate"].includes(s.state) ||
-      (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
+    this.db.transaction(() => {
+      if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
+      const c = this.current(binding.connectionId, binding.revision, binding.resource);
+      const now = this.tick(c.id);
+      const current = this.current(binding.connectionId, binding.revision, binding.resource);
+      const s = this.sub(current.id, binding.resource, binding.generation);
+      if (!current.capability.cursor || current.state !== "active" || current.account !== binding.account || current.credentialRevision !== binding.credentialRevision ||
+        s.revision !== current.revision || s.verifiedAt === null || !["active","expiring","stop_candidate"].includes(s.state) ||
+        (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
+    }).immediate();
   }
   rebindCursor(id: string, resource: string, expected: Cursor, revision: number): void {
     this.db.transaction(() => {

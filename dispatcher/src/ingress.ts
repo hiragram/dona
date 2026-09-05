@@ -358,9 +358,11 @@ export class ExternalIngressProcessor {
 
     const verifiedConnectionId = verified.connectionId;
     let owner: ProviderOwner | undefined;
-    if (verified.resourceId !== undefined) {
+    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) throw new ExternalIngressAuthenticationError();
+    const verifiedResourceId = verifiedBinding?.resource ?? verified.resourceId;
+    if (verifiedResourceId !== undefined) {
       const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
-        connection_id: verifiedConnectionId, resource_id: verified.resourceId });
+        connection_id: verifiedConnectionId, resource_id: verifiedResourceId });
       if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
       owner = parsed.data;
     }

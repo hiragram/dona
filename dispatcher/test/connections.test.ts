@@ -528,6 +528,23 @@ test("binding済みbacklogは同じproviderの別connection登録を妨げない
   assert.equal(db.connections.register({...config,id:"second"}).id,"second");
 });
 
+test("未bindingのin-flight eventがあるsourceのregisterを拒否する",(t)=>{
+  const {db,clock}=fixture(t);const source=externalEventSource("other");
+  const legacy=db.enqueue({...event(),source,external_event_id:"in-flight"},new Date(clock.now()),{connectionId:"legacy"}).row;
+  db.beginDispatch(legacy.event_id,"fixture",new Date(clock.now()));
+  assert.throws(()=>db.connections.register({...config,id:"other",provider:"other"}),/operation_pending/);
+});
+
+test("旧revisionで退避済みの同一event再送を現revisionへ復旧する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const original=db.enqueueExternal(event(),binding()).row;
+  db.connections.revise("pilot",1,{...config,credentialRevision:2});await lifecycle.verify("pilot","folder1",1);
+  const current={...binding(),revision:2,credentialRevision:2};
+  assert.equal(db.enqueueExternal(event(),current).outcome,"duplicate_same");
+  assert.equal(db.get(original.event_id)?.status,"queued");
+  assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,original.event_id);
+});
+
 test("pollingは不正Envelopeをcursor commit前に拒否する",async(t)=>{
   const {pollConnectionBatch}=await import("../src/connections/poll.js");
   const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
