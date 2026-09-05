@@ -7,9 +7,6 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
 }
 
 export function jobProgressPath(row: JobRow): string {
-  if (workspaceFromJob(row).kind === "github") {
-    return path.resolve(row.workspace_path, "../../repository/.git/worktrees", path.basename(row.workspace_path), "dona-job-progress.json");
-  }
   return path.join(row.workspace_path, ".dona-job-progress.json");
 }
 
