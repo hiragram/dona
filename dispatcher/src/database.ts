@@ -257,7 +257,7 @@ export class DispatcherDatabase {
     try { return this.db.transaction(() => {
       const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
       const bindingMatches = (eventId: string): boolean => {
-        if (!binding) return true;
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
         const saved = readBinding(this.db, eventId);
         return saved !== undefined && stableStringify(saved) === stableStringify(binding);
       };

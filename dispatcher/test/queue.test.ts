@@ -124,8 +124,11 @@ test("coalescing and delivery replay require the complete authenticated binding"
   const combined=db.enqueue(provider("bound-delivery"),at,{...signal,binding:binding("resource-a")});
   assert.equal(combined.admission,"coalesced"); assert.equal(combined.row.event_id,first.event_id);
   assert.equal(db.enqueue(provider("bound-delivery"),at,{...signal,binding:binding("resource-b")}).outcome,"duplicate_conflict");
+  assert.equal(db.enqueue(provider("bound-delivery"),at,signal).outcome,"duplicate_conflict");
   const otherResource=db.enqueue(provider("bound-other"),at,{...signal,binding:binding("resource-b")});
   assert.equal(otherResource.admission,undefined); assert.notEqual(otherResource.row.event_id,first.event_id);
+  const unowned=db.enqueue(provider("bound-unowned"),at,signal);
+  assert.equal(unowned.admission,undefined); assert.notEqual(unowned.row.event_id,otherResource.row.event_id);
   const changedPolicy=db.enqueue(provider("bound-policy"),at,{...signal,binding:binding("resource-b",false)});
   assert.equal(changedPolicy.admission,undefined); assert.notEqual(changedPolicy.row.event_id,otherResource.row.event_id);
   db.close();
