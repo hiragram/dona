@@ -203,9 +203,11 @@ describe("DispatcherDatabase", () => {
     const migratedIndexes = new Set(
       (migrated.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
     );
-    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx", "jobs_runnable_fair_idx"]) {
+    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx", "jobs_runnable_fair_idx", "jobs_workspace_job_idx"]) {
       assert.equal(migratedIndexes.has(name), true);
     }
+    const workspacePlan=migrated.prepare("EXPLAIN QUERY PLAN SELECT job_id FROM jobs WHERE workspace_id=? AND job_id>? ORDER BY job_id LIMIT 500").all("T1","") as Array<{detail:string}>;
+    assert.equal(workspacePlan.some((step)=>step.detail.includes("jobs_workspace_job_idx")),true);
     const runnablePlan = migrated.prepare(`
       EXPLAIN QUERY PLAN
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx

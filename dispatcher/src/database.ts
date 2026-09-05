@@ -117,6 +117,7 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
     db.exec(jobsRunnableFairIndexSql);
   })();
 }
+function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec("CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id)");}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -294,6 +295,7 @@ export function migrateDispatcherDatabase(
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   })();
   ensureJobsRunnableFairIndex(db);
+  ensureJobsWorkspaceJobIndex(db);
 }
 
 export class DispatcherDatabase {
