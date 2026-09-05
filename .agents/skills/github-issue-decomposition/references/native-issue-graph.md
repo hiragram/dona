@@ -54,7 +54,7 @@ partial success後は必ず新しいread snapshotから再開する。受理済�
 write responseを信用するだけでなく、再取得して以下を確認する。
 
 1. **resource:** 計画した各nodeが期待するtitle、body、state、scope内labelでちょうど1件だけ存在する。再利用nodeは意図したownershipと無関係なmetadataを維持している。完全なintegration workflowでは、親Epicだけが既存のexact `epic` labelを持ち、他のlabelが意図せず変更されていないことを確認する。
-2. **parent topology:** Epicの完全な`sub_issues`集合がplanと一致し、意図した各childの`parent`がそのEpicを返す。再利用childも両方向から確認する。完全なintegration workflowではEpic自身にnative parentがないroot Issueであり、Draft integration PRのpagination済み`closingIssuesReferences`がそのIssue番号・REST `id`・URLだけへ一意に対応することも確認する。
+2. **parent topology:** Epicの完全な`sub_issues`集合がplanと一致し、意図した各childの`parent`がそのEpicを返す。再利用childも両方向から確認する。完全なintegration workflowではEpic自身にnative parentがないroot Issueであり、Draft integration PRのpagination済み`closingIssuesReferences`内の親targetがそのIssue番号・REST `id`・URLへ一意に対応し、集合全体が親Epicとintegration完了対象childだけであることも確認する。
 3. **dependency topology:** 各blocked nodeの`blocked_by`に全direct blockerがあり、各blockerの`blocking`に対応するblocked nodeがある。件数だけでなく完全な有向edge集合を比較する。
 4. **DAG特性:** cycleが存在しない。direct `A -> C`ごとに、`A`から`C`への別pathを検索する。別pathがあれば推移冗長なため、計画graphからそのedgeを除く。
 5. **scope:** 同一titleの重複、意図しないIssue、label、Project、Milestone、assignee、parent変更、close、dependency削除が発生していない。

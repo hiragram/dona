@@ -75,7 +75,7 @@ test("integration resourceはepic親からDraft PRとnative graphの順に作る
   ]);
   assert.match(
     order,
-    /`親Epic Issue（epic label） -> feature branch -> 空commit -> Draft integration PR -> 子Issue -> native graph`/,
+    /`親Epic Issue（epic label） -> feature branch -> 空commit -> Draft integration PR -> 子Issue -> integration PR closing relationship reconcile -> native graph`/,
   );
   assertContract(parent, "parent identity and additive label", [
     /作成requestの`labels`.*exact `epic`.*明示的に依頼されたlabelだけ/,
@@ -89,7 +89,7 @@ test("integration resourceはepic親からDraft PRとnative graphの順に作る
 
 test("Draft integration PRを固定した親Epicへ一意に対応付ける", () => {
   const workflow = read("references/integration-feature-workflow.md");
-  const pullRequest = section(workflow, "3. Draft integration PRを作成する");
+  const pullRequest = section(workflow, "3. 標準templateからDraft integration PRを作成する");
   const recovery = section(workflow, "partial failureと安全な再開");
 
   assertContract(pullRequest, "Draft PR creation", [
@@ -128,19 +128,21 @@ test("最終passは親label・PR対応とnative topologyを一緒に再検証す
 
   assertContract(skill, "top-level verification", [
     /parentの完全な`sub_issues`一覧.*各childの`parent`/,
-    /親Epicがroot Issue.*exact `epic` label.*Draft integration PRの唯一のclosing target/,
+    /親Epicがroot Issue.*exact `epic` label.*Draft integration PRの親closing target/,
+    /closing target全体が親Epicとintegration完了対象childだけ/,
     /blocked Issueの`blocked_by`.*blockerの`blocking`/,
   ]);
   assertContract(graph, "native topology verification", [
     /親Epicだけが既存のexact `epic` label.*他のlabelが意図せず変更されていない/,
     /Epic自身にnative parentがないroot Issue/,
     /Draft integration PRのpagination済み`closingIssuesReferences`.*Issue番号・REST `id`・URL.*一意/,
+    /集合全体が親Epicとintegration完了対象childだけ/,
     /完全な`sub_issues`集合.*各childの`parent`/,
     /`blocked_by`.*`blocking`.*完全な有向edge集合/,
   ]);
   assertContract(reporting, "reported evidence", [
     /Issue番号・REST `id`・URL・root状態・exact `epic` label/,
-    /Draft状態・head SHA・唯一のexact `Closes #<親Issue番号>`.*`closingIssuesReferences`/,
+    /Draft状態・head SHA・exact `Closes #<親Issue番号>`.*`closingIssuesReferences`.*親Epicとintegration完了対象child/,
     /両方向で検証したnative parent topology.*最小blocker edge.*parallel lane/,
   ]);
 });
