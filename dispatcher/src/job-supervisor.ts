@@ -125,7 +125,7 @@ export class JobSupervisor {
     }
   }
 
-  disableProgress(): void { this.progress = undefined; }
+  disableProgress(): void { this.progress = undefined; this.runtime.disableProgress?.(); }
 
   wake(): void {
     this.nextRunnableScanAt = 0;
@@ -399,7 +399,7 @@ export class JobSupervisor {
     if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     const dispatching = this.database.beginJobDispatch(row.job_id);
-    const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
+    const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching, this.progress !== undefined), this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
       return;

@@ -194,8 +194,9 @@ export class SlackHealthServer {
         });
         const retryableSlackRejection = error instanceof SlackApiError && error.errorCode === "rate_limited";
         const permanentSlackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error", "rate_limited"].includes(error.errorCode);
+        const permanentProgressRejection = (error as Error & { progressPermanent?:boolean }).progressPermanent === true;
         const definitelyUnsent = retryableSlackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
-        send(response, permanentSlackRejection ? 409 : definitelyUnsent ? 429 : 503, { schema_version: 1,
+        send(response, permanentSlackRejection || permanentProgressRejection ? 409 : definitelyUnsent ? 429 : 503, { schema_version: 1,
           ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
           error: { code: error instanceof SlackApiError ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }

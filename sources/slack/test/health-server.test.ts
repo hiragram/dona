@@ -338,4 +338,25 @@ describe("SlackHealthServer", () => {
       await server.stop();
     }
   });
+
+  test("returns conflict for a permanent progress configuration failure", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-health-progress-")); roots.push(root);
+    const socketPath = path.join(root, "run", "slack.sock");
+    const tokenPath = path.join(root, "control", "dispatcher.token"); const token = "a".repeat(64);
+    await fs.mkdir(path.dirname(tokenPath), { recursive:true, mode:0o700 }); await fs.writeFile(tokenPath, token, { mode:0o600 });
+    const server = new SlackHealthServer(socketPath, {
+      isSocketReady:()=>true, isStopping:()=>false, connectionStates:()=>({ company:"connected" }),
+      async quiesce(){}, drainStatus:()=>({ quiescing:false, drained:false, in_flight:0, unsafe_states:[] }),
+    }, { healthReady:async()=>true }, logger, "2".repeat(40), undefined, tokenPath, {
+      async deliver() { throw Object.assign(new Error("unknown workspace"), { definitelyUnsent:true, progressPermanent:true }); },
+    } as never);
+    await server.start();
+    try {
+      const response = await request(socketPath, "/v1/internal/job-progress", "POST", {
+        schema_version:1, progress_id:"job_abc:1", delivery_token:"b".repeat(64),
+      }, { "x-dona-update-token":token });
+      assert.equal(response.status, 409);
+      assert.deepEqual(response.body.error, { code:"progress_not_sent" });
+    } finally { await server.stop(); }
+  });
 });

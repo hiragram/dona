@@ -44,7 +44,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
   jobSupervisor = new JobSupervisor(
     database,
-    new HerdrJobAgentRuntime(config),
+    new HerdrJobAgentRuntime(config, jobProgress !== undefined),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),

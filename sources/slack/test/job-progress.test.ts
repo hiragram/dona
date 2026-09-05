@@ -22,10 +22,16 @@ test("reporter uses assistant thread status rather than session title", async ()
   assert.deepEqual(observed, { channelId: "C123", threadTs: "1234567890.123", status: resolved.status });
 });
 
-test("reporter treats resolver and workspace failures as definitely unsent", async () => {
+test("reporter treats resolver and workspace failures as permanent and definitely unsent", async () => {
   const registry = { getByTeamId() { throw new Error("unknown workspace"); } };
   await assert.rejects(new SlackJobProgressReporter(registry as never, async () => resolved).deliver(request),
-    (error: Error & { definitelyUnsent?:boolean }) => error.definitelyUnsent === true);
+    (error: Error & { definitelyUnsent?:boolean;progressPermanent?:boolean }) => error.definitelyUnsent === true && error.progressPermanent === true);
   await assert.rejects(new SlackJobProgressReporter(registry as never, async () => { throw new Error("resolver unavailable"); }).deliver(request),
-    (error: Error & { definitelyUnsent?:boolean }) => error.definitelyUnsent === true);
+    (error: Error & { definitelyUnsent?:boolean;progressPermanent?:boolean }) => error.definitelyUnsent === true && error.progressPermanent === true);
+});
+
+test("reporter permanently rejects a workspace without assistant thread progress", async () => {
+  const registry = { getByTeamId() { return { client:{} }; } };
+  await assert.rejects(new SlackJobProgressReporter(registry as never, async () => resolved).deliver(request),
+    (error: Error & { progressPermanent?:boolean }) => error.progressPermanent === true);
 });

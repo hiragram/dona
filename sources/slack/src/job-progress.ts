@@ -27,11 +27,11 @@ export class SlackJobProgressReporter {
   async deliver(input: JobProgressRequest): Promise<{ progress_id: string }> {
     let resolved: ReturnType<typeof parseResolvedProgress>;
     try { resolved = parseResolvedProgress(await this.resolve(input.progress_id,input.delivery_token)); }
-    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true }); }
+    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true, progressPermanent:true }); }
     let connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>;
     try { connection = this.registry.getByTeamId(resolved.workspace_id); }
-    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true }); }
-    if (!connection.client.setAssistantThreadProgress) throw Object.assign(new Error("progress API is unavailable"), { definitelyUnsent:true });
+    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true, progressPermanent:true }); }
+    if (!connection.client.setAssistantThreadProgress) throw Object.assign(new Error("progress API is unavailable"), { definitelyUnsent:true, progressPermanent:true });
     await connection.client.setAssistantThreadProgress({
       channelId: resolved.channel_id,
       threadTs: resolved.thread_ts,

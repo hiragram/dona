@@ -13,6 +13,7 @@ export interface PreparedJobRuntime {
 }
 
 export interface JobAgentRuntime {
+  disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
@@ -27,8 +28,9 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
-  const args = ["--add-dir", config.jobResultsDir, "--add-dir", path.dirname(jobProgressPath(row))];
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, progressEnabled = true): string[] {
+  const args = ["--add-dir", config.jobResultsDir];
+  if (progressEnabled) args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {
@@ -177,7 +179,8 @@ async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> 
 }
 
 export class HerdrJobAgentRuntime implements JobAgentRuntime {
-  constructor(private readonly config: DispatcherConfig) {}
+  constructor(private readonly config: DispatcherConfig, private progressEnabled = true) {}
+  disableProgress(): void { this.progressEnabled = false; }
 
   async prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime> {
     const workspace = workspaceFromJob(row);
@@ -187,8 +190,10 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
     await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobResultsDir, 0o700);
-    await fs.mkdir(path.dirname(jobProgressPath(row)), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(jobProgressPath(row)), 0o700);
+    if (this.progressEnabled) {
+      await fs.mkdir(path.dirname(jobProgressPath(row)), { recursive: true, mode: 0o700 });
+      await fs.chmod(path.dirname(jobProgressPath(row)), 0o700);
+    }
 
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
@@ -221,7 +226,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config),
+          "--", ...codexAgentArguments(row, this.config, this.progressEnabled),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,

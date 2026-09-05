@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
+import { buildJobPrompt } from "../src/job-prompt.js";
 import { codexAgentArguments, HerdrJobAgentRuntime } from "../src/job-runtime.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -14,6 +15,19 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("omits the progress directory and prompt contract when progress is disabled", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-runtime-no-progress")).row;
+    const job = database.createJob({ source_event_id:source.event_id, objective:"調査する", workspace:{ kind:"scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const args = codexAgentArguments(job, config, false);
+    assert.equal(args.includes(path.dirname(job.workspace_path)), false);
+    const prompt = buildJobPrompt(job, false);
+    assert.equal(prompt.includes("progress_path"), false);
+    assert.equal(prompt.includes("工程が変わるたび"), false);
+    database.close();
+  });
+
   test("trusts only the Dispatcher-selected GitHub repository and worktree for the invocation", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
