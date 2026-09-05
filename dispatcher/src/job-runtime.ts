@@ -14,23 +14,35 @@ export interface PreparedJobRuntime {
 
 export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
-  get(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  prompt(jobId: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  wait(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  cancel(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+}
+
+function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
+  const expected = path.join(config.jobsWorkspaceRoot, "scratch", row.job_id);
+  if (row.workspace_path !== expected) {
+    throw new Error("Scratch workspace path does not match the Dispatcher-generated job path");
+  }
 }
 
 export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
   const args = ["--add-dir", config.jobResultsDir];
   const workspace = workspaceFromJob(row);
-  if (workspace.kind === "github") {
+  let trustedPaths: string[];
+  if (workspace.kind === "scratch") {
+    assertScratchWorkspacePath(row, config);
+    trustedPaths = [row.workspace_path];
+  } else {
     const [owner, repo] = workspace.repository.split("/") as [string, string];
     const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", owner, repo, "repository");
-    const projects = [repositoryPath, row.workspace_path]
-      .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
-      .join(", ");
-    args.push("-c", `projects = { ${projects} }`);
+    trustedPaths = [repositoryPath, row.workspace_path];
   }
+  const projects = trustedPaths
+    .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
+    .join(", ");
+  args.push("-c", `projects = { ${projects} }`);
   return args;
 }
 
@@ -168,6 +180,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
   constructor(private readonly config: DispatcherConfig) {}
 
   async prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime> {
+    const workspace = workspaceFromJob(row);
+    if (workspace.kind === "scratch") assertScratchWorkspacePath(row, this.config);
+
     await fs.mkdir(this.config.jobsWorkspaceRoot, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
     await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
@@ -183,7 +198,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       }
     }
 
-    const workspace = workspaceFromJob(row);
     const created = workspace.kind === "scratch"
       ? await this.createScratchWorkspace(row, signal)
       : await this.createGitHubWorktree(row, workspace.repository, workspace.base_ref, signal);
@@ -217,13 +231,13 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
-  get(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", jobId], this.config.jobCommandTimeoutMs, signal);
+  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "get", agentName], this.config.jobCommandTimeoutMs, signal);
   }
 
-  prompt(jobId: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr([
-      "agent", "prompt", jobId, text,
+      "agent", "prompt", agentName, text,
       "--wait",
       "--until", "working",
       "--until", "idle",
@@ -233,9 +247,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     ], this.config.jobCommandTimeoutMs + 5_000, signal);
   }
 
-  wait(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr([
-      "agent", "wait", jobId,
+      "agent", "wait", agentName,
       "--until", "idle",
       "--until", "done",
       "--until", "blocked",
@@ -243,8 +257,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     ], this.config.agentWaitTimeoutMs + 5_000, signal);
   }
 
-  cancel(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "send-keys", jobId, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
   }
 
   private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -257,12 +271,13 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
   }
 
   private async createScratchWorkspace(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    assertScratchWorkspacePath(row, this.config);
     await fs.mkdir(row.workspace_path, { recursive: true, mode: 0o700 });
     await fs.chmod(row.workspace_path, 0o700);
     return this.herdr([
       "workspace", "create",
       "--cwd", row.workspace_path,
-      "--label", row.job_id,
+      "--label", row.agent_name,
       "--no-focus",
     ], this.config.jobCommandTimeoutMs + 5_000, signal);
   }
@@ -338,7 +353,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     if (await exists(path.join(row.workspace_path, ".git"))) {
       return this.herdr([
-        "workspace", "create", "--cwd", row.workspace_path, "--label", row.job_id, "--no-focus",
+        "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     return this.herdr([
@@ -347,7 +362,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--branch", `dona/${row.job_id}`,
       "--base", baseRef,
       "--path", row.workspace_path,
-      "--label", row.job_id,
+      "--label", row.agent_name,
       "--no-focus",
     ], 120_000, signal);
   }

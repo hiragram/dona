@@ -129,7 +129,7 @@ export class JobSupervisor {
       }
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
-      const prompted = await this.runtime.prompt(jobId, instruction, this.abortController.signal);
+      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal);
       if (prompted.ok) {
         this.database.markJobSteerAccepted(jobId, sourceEventId);
         return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -162,7 +162,7 @@ export class JobSupervisor {
         this.wake();
         return { row: this.database.getJob(jobId)!, duplicate: false };
       }
-      const cancelled = await this.runtime.cancel(jobId, this.abortController.signal);
+      const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
@@ -330,7 +330,7 @@ export class JobSupervisor {
     if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     const dispatching = this.database.beginJobDispatch(row.job_id);
-    const prompted = await this.runtime.prompt(row.job_id, buildJobPrompt(dispatching), this.abortController.signal);
+    const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
       return;
@@ -365,7 +365,7 @@ export class JobSupervisor {
 
   private async monitor(row: JobRow): Promise<void> {
     if (await this.tryComplete(row, false)) return;
-    const waited = await this.runtime.wait(row.job_id, this.abortController.signal);
+    const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
