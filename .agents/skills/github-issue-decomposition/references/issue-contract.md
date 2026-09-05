@@ -53,7 +53,7 @@ acceptance criteriaだけでIssueを独立してreviewできるようにする�
 - 実装PRのmerge先となるexact feature branch名。例: `feature/foo-bar`。
 - feature branchからdefault branchへのintegration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 実装PRのbaseはdefault branchではなく、上記feature branchであること。
-- Issue全体の完了点を、`実装PRを上記feature branchへmergeした時点`または`integration PRをdefault branchへmergeした時点`のどちらかへ明示的に固定する。前者はchild単独のacceptanceとtestがfeature branch上で完結するときだけ選び、実装PRで`Closes #<child>`を使用できる。後者を選ぶ場合、child実装PRは部分対応として`Closes`を使用しない。branch名、integration PR link、base指定だけを完了点の証拠にしない。
+- Issue全体の完了点を、`実装PRを上記feature branchへmergeした時点`または`integration PRをdefault branchへmergeした時点`のどちらかへ明示的に固定する。前者はchild単独のacceptanceとtestがfeature branch上で完結するときだけ選び、実装PRで`Closes #<child>`を使用できる。ただしnon-default branch向けkeywordはGitHubの自動closeを保証しないため、実装PRをmergeする実行者がbase/head/merge commitとchild Issue identityを照合してexact childを手動closeし、Issueの`state`、`closedAt`、close eventを再取得するまでを完了contractに含める。後者を選ぶ場合、child実装PRは部分対応として`Closes`を使用せず、default branch向けintegration PR本文へそのchildの`Closes #<child>`を追加し、`closingIssuesReferences`を再取得して自動close対象であることを検証する。branch名、integration PR link、base指定、またはnon-default PR本文のkeywordだけを完了点やIssue closeの証拠にしない。
 
 ## Decision/ADR Issueの記述
 

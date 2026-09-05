@@ -8,7 +8,8 @@ Issue に記載済みの背景、要件、受け入れ条件は重複して記�
 <!--
 この PR の実際のマージ先へのマージによって Issue 全体を完了してよい場合だけ、次の形式で記載してください。
 default branch 以外への PR でも、マージ先の契約と current Issue の内容から完了を確認できる場合は使用できます。
-GitHub 上の closing relationship と自動 close の可否は別途確認し、部分対応や単なる関連付けの場合はこの行を削除してください。
+GitHub 上の closing relationship と自動 close の可否は別途確認してください。non-default branch で自動 close されない場合は、merge 確認後に誰がどの Issue を手動 close し、何を再取得して完了を証明するかを「動作確認方法」へ記載してください。
+部分対応、単なる関連付け、または後続の default-branch PR の merge まで Issue 全体が完了しない場合は、この行を削除してください。
 -->
 
 Closes #xx

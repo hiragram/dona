@@ -103,10 +103,16 @@ test("integration childは実際のmerge先とIssue完了点を明示する", ()
 
   assert.match(issueContract, /Issue全体の完了点.*実装PRを上記feature branchへmergeした時点.*integration PRをdefault branchへmergeした時点/);
   assert.match(issueContract, /前者.*child単独のacceptanceとtest.*feature branch上で完結.*実装PRで`Closes #<child>`を使用できる/);
-  assert.match(issueContract, /後者.*child実装PR.*部分対応.*`Closes`を使用しない/);
-  assert.match(issueContract, /branch名.*integration PR link.*base指定だけを完了点の証拠にしない/);
+  assert.match(issueContract, /non-default branch向けkeyword.*自動closeを保証しない.*実装PRをmergeする実行者.*base\/head\/merge commit.*手動close.*`state`.*`closedAt`.*close event/);
+  assert.match(issueContract, /後者.*child実装PR.*部分対応.*`Closes`を使用せず.*integration PR本文.*`Closes #<child>`.*`closingIssuesReferences`/);
+  assert.match(issueContract, /branch名.*integration PR link.*base指定.*non-default PR本文のkeywordだけを完了点やIssue closeの証拠にしない/);
 
   assert.match(integrationWorkflow, /childごとにIssue全体の完了点.*feature branchへの実装PR merge.*default branchへのintegration PR merge/);
-  assert.match(integrationWorkflow, /`child_completion_point`.*Issue番号.*execution context/);
-  assert.match(integrationWorkflow, /全child Issue.*merge-target branch.*integration PR link.*`child_completion_point`.*`Closes`可否/);
+  assert.match(integrationWorkflow, /`close_owner`.*`post_merge_close_action`.*`state`.*`closedAt`.*close event/);
+  assert.match(integrationWorkflow, /`child_completion_point`.*close mechanism.*Issue番号.*execution context/);
+  assert.match(integrationWorkflow, /integration PRのchild closing relationshipをreconcileする/);
+  assert.match(integrationWorkflow, /current default branchのexact SHA.*標準`.github\/PULL_REQUEST_TEMPLATE.md`.*`完了する Issue`.*`Closes #<child>`/s);
+  assert.match(integrationWorkflow, /write直前.*snapshot.*blind retry.*`closingIssuesReferences`全page/s);
+  assert.match(integrationWorkflow, /親Issueとintegration完了対象child.*exactly 1件.*feature-merge完了child.*存在しない/s);
+  assert.match(integrationWorkflow, /全child Issue.*merge-target branch.*integration PR link.*`child_completion_point`.*`Closes`可否.*`close_owner`/);
 });
