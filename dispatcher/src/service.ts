@@ -50,6 +50,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => worker.wake(),
     jobProgress,
   );
+  if (!jobProgressStore) await jobSupervisor.disableProgress();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,

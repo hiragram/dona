@@ -120,7 +120,7 @@ export class JobProgressStore {
     }
     return latest !== undefined;
   }
-  private queuePreparing(jobId:string,at:Date):void { const timestamp=at.toISOString(); this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at,terminal_checked) VALUES(?,0,'preparing','準備中',?,'pending',?,0) ON CONFLICT(job_id) DO NOTHING`).run(jobId,timestamp,timestamp); }
+  private queuePreparing(jobId:string,at:Date):void { const timestamp=at.toISOString(); this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at,terminal_checked) VALUES(?,0,'preparing','準備中',?,'pending',?,0) ON CONFLICT(job_id) DO UPDATE SET phase='preparing',safe_summary='準備中',updated_at=excluded.updated_at,status='pending',available_at=excluded.available_at,delivered_at=NULL,last_error=NULL,terminal_checked=0 WHERE job_progress.status='unknown'`).run(jobId,timestamp,timestamp); }
 }
 
 export class JobProgressCoordinator {
@@ -153,7 +153,7 @@ export class JobProgressCoordinator {
     }
   }
   async recover(): Promise<void> {
-    await this.drainAdapter();
+    if(!await this.drainAdapterUntilSettled("startup"))return;
     this.store.recoverDeliveries();
     for (const progress of this.store.recoverable()) {
       const job = this.jobs.getJob(progress.job_id);

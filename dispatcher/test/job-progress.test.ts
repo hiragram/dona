@@ -85,6 +85,16 @@ test("terminal sibling without progress receives a fixed preparing fallback", as
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("terminal sibling replaces a drained unknown row with fixed preparing fallback", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-unknown-fallback-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.ingest({...valid,job_id:"job_next",sequence:2});store.begin("job_next");store.unknown("job_next","drained ambiguous delivery");
+    store.requeueLatestAndMarkTerminal("job_done",["job_next"],new Date("2026-09-05T00:00:00Z"));
+    const next=store.get("job_next");assert.equal(next?.status,"pending");assert.equal(next?.sequence,2);assert.equal(next?.phase,"preparing");
+    assert.equal(store.ingest({...valid,job_id:"job_next",sequence:3,phase:"testing"}),true);
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("an attention-claimed group rejects later progress delivery", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
