@@ -50,6 +50,8 @@ exact trigger集合、reaction、review/comment集合、head/base SHA、default 
 - **superseded:** Pull Request head SHA、base ref、base SHA、repository default branch ref、title hash、body hash、merge-target contract hash、closing relationship hash、closing issue scope hashのいずれかがround recordから変わった。旧roundをclean扱いしない。base ref/SHAまたはdefault branch refが変わった場合は新しいexact base SHAから標準templateを再取得し、merge-target contractとautomatic closing reference条件を再評価してtitle／本文をreconcile・再取得・検証する。title/body hash、merge-target contract hash、closing relationship hash、closing issue scope hashのいずれかだけが変わった場合もcurrent template、task事実、current Issue内容の完了条件へreconcileする。current head/base/default-branch/title/body/merge-target contract/closing relationship/closing issue scope identityを固定し直した後にfresh roundを作る。
 - **stalled:** 30分state変化がない。duplicate triggerを書かず、人間によるretrigger判断を待つ。
 
+clean signalだけでProjectを更新しない。`SKILL.md`の完了条件（current head/base CI等を含む）が揃った後に、[Issue lifecycle手順](../../../../docs/operations/github-project-issue-lifecycle.md)で担当Issueだけを`Merge Ready`へ更新・再読する。足場PRのcleanでEpicを進めない。
+
 ## feedbackを処理する
 
 1. findingごとに対象diff、現在のcode、call site、schema、test、repository指示、明示された要件を照合する。
