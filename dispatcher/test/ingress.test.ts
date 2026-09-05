@@ -117,13 +117,14 @@ function request(
   source: string,
   body: Buffer,
   extraHeaders: Record<string, string> = {},
+  query = "",
 ): Promise<{ status: number; body: Record<string, unknown>; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
         socketPath,
         method: "POST",
-        path: `/v1/ingress/${encodeURIComponent(source)}`,
+        path: `/v1/ingress/${encodeURIComponent(source)}${query}`,
         headers: {
           ...extraHeaders,
           "content-type": "application/octet-stream",
@@ -167,7 +168,7 @@ describe("external ingress contract", () => {
       onAuthenticate(raw) {
         authenticatedBody = raw.body;
         assert.equal(raw.method, "POST");
-        assert.equal(raw.path, "/v1/ingress/fake");
+        assert.equal(raw.requestTarget, "/v1/ingress/fake?tenant=abc");
         assert.match(raw.receivedAt, /Z$/);
         assert.ok(raw.headers.some(([name]) => name === "X-Fake-Signature"));
       },
@@ -197,7 +198,7 @@ describe("external ingress contract", () => {
     await api.start();
 
     const body = fakeBody();
-    const response = await request(config.socketPath, "fake", body, signedHeaders(body));
+    const response = await request(config.socketPath, "fake", body, signedHeaders(body), "?tenant=abc");
     assert.equal(response.status, 202);
     assert.equal(response.body.outcome, "created");
     assert.deepEqual(steps, ["authenticate", "normalize", "acknowledge"]);

@@ -491,7 +491,7 @@ export class DispatcherApi {
       body: await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs),
       headers: rawHeaders(request),
       method: "POST",
-      path: url.pathname,
+      requestTarget: request.url!,
       receivedAt,
     });
 

@@ -53,7 +53,7 @@ export interface RawIngressRequest {
   readonly body: Buffer;
   readonly headers: ReadonlyArray<readonly [name: string, value: string]>;
   readonly method: "POST";
-  readonly path: string;
+  readonly requestTarget: string;
   readonly receivedAt: string;
 }
 
