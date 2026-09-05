@@ -14,6 +14,7 @@ import { eventEnvelope } from "./helpers.js";
 const now = "2026-09-05T00:00:00Z";
 const due = "2026-09-05T00:01:00Z";
 const later = "2026-09-06T00:01:00Z";
+const afterLater = "2026-09-07T00:01:00Z";
 const actor: Actor = { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: null };
 const input: RevisionInput = {
   recurrence_json: '{"interval":1,"kind":"daily","local_time":"00:01:00","start_date":"2026-09-05","timezone":"Asia/Tokyo","tzdb_version":"2025b","version":1}\n',
@@ -197,7 +198,7 @@ test("cancelとrequest開始のraceでもreceiptとrequest-started fenceを消�
 test("misfire 900秒境界、未決着overlap、expired auth、quotaを保存層で拒否/記録", () => {
   const { repo } = setup(); repo.create("s1", input, due, actor, now);
   assert.equal(repo.materialize("s1", 1, due, later, "2026-09-05T00:16:00Z", actor).run.status, "materialized");
-  assert.equal(repo.materialize("s1", 1, later, null, later, actor).run.reason, "overlap");
+  assert.equal(repo.materialize("s1", 1, later, afterLater, later, actor).run.reason, "overlap");
   repo.create("s2", input, due, actor, now);
   assert.equal(repo.materialize("s2", 1, due, later, "2026-09-05T00:16:01Z", actor).run.reason, "misfire");
   repo.create("s3", { ...input, expires_at: due }, due, actor, now);
@@ -304,7 +305,7 @@ test("grace超過の初回claimと送信開始直前の超過をterminal化し�
   const first = repo.materialize("late_claim", 1, due, later, due, actor).run;
   assert.equal(repo.claim("2026-09-05T00:16:01Z"), undefined);
   assert.equal(repo.getRun(first.run_id)?.status, "skipped"); assert.equal(repo.getRun(first.run_id)?.reason, "misfire");
-  assert.equal(repo.materialize("late_claim", 1, later, null, later, actor).run.status, "materialized");
+  assert.equal(repo.materialize("late_claim", 1, later, afterLater, later, actor).run.status, "materialized");
 
   repo.create("late_start", input, due, actor, now);
   const second = repo.materialize("late_start", 1, due, later, due, actor).run;
@@ -352,7 +353,7 @@ test("needs_reviewの未解決fenceを再承認で迂回できずadmin reconcile
   const result = repo.reconcile(claim.outbox_id, "failed", "proof", { ...actor, role: "admin" }, due);
   assert.ok(!("content" in result)); assert.ok(!("target_json" in result)); assert.equal(repo.get("s1")?.state, "needs_review");
   repo.update("s1", 1, renewed, later, actor, due);
-  assert.equal(repo.materialize("s1", 2, later, null, later, actor).run.status, "materialized");
+  assert.equal(repo.materialize("s1", 2, later, afterLater, later, actor).run.status, "materialized");
 });
 
 test("公開run遷移はreminderのstartedとcompletedを拒否しoutboxを保持", () => {
@@ -410,7 +411,26 @@ test("未送信one-shotのpauseは原子的にdrainしてcompletedとなりresum
   const result = repo.transition("paused_once", 1, "pause", actor, due);
   assert.equal(result.state, "completed"); assert.equal(result.terminal_at, due);
   assert.throws(() => repo.transition("paused_once", 2, "resume", actor, due), /invalid_transition/);
-  assert.deepEqual((repo.auditHistory("paused_once") as { operation: string }[]).slice(-2).map(x => x.operation), ["pause", "complete"]);
+  assert.deepEqual((repo.auditHistory("paused_once") as { operation: string }[]).slice(-3).map(x => x.operation), ["outbox_cancelled", "pause", "complete"]);
+});
+
+test("recurring materializeは将来next_dueを必須にしてNULLを拒否", () => {
+  const { repo, raw } = setup(); repo.create("recurring_null", input, due, actor, now);
+  assert.throws(() => repo.materialize("recurring_null", 1, due, null, due, actor), /invalid_next_due/);
+  assert.equal(count(raw, "schedule_runs"), 0); assert.equal(repo.get("recurring_null")?.next_due, due);
+});
+
+test("時計後退中のwork完了もrun・outbox・one-shot scheduleの終端時刻を開始前へ戻さない", () => {
+  const { dispatcher } = setup();
+  const once = { ...input, action: "work.read_only" as const, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  repo.create("clock_work", once, due, actor, now); const run = repo.materialize("clock_work", 1, due, null, due, actor).run;
+  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  repo.setRunState(run.run_id, "started", "completed", actor, "2026-09-05T00:00:30Z", null, "結果");
+  const completed = repo.getRun(run.run_id)!; assert.equal(completed.terminal_at, due); assert.equal(completed.started_at, due);
+  const outbox = repo.claim(due)!; assert.equal(outbox.created_at, due);
+  repo.requestStarted(outbox.outbox_id, outbox.claim_token!, due); repo.finishWrite(outbox.outbox_id, outbox.claim_token!, "sent", due, "receipt");
+  assert.equal(repo.get("clock_work")?.terminal_at, due);
 });
 
 test("one-shot workの結果通知と通知なし、graceでskipしたone-shotを完了可能", () => {
@@ -440,7 +460,7 @@ test("workの開始拒否を永続化し後続occurrenceを塞がない", () => 
   const run = repo.materialize("work_late", 1, due, later, due, actor).run;
   assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, "2026-09-05T00:16:01Z"), /run_not_authorized/);
   assert.equal(repo.getRun(run.run_id)?.status, "skipped"); assert.equal(repo.getRun(run.run_id)?.reason, "misfire");
-  assert.equal(repo.materialize("work_late", 1, later, null, later, actor).run.status, "materialized");
+  assert.equal(repo.materialize("work_late", 1, later, afterLater, later, actor).run.status, "materialized");
   repo.create("work_expired", { ...input, action: "work.read_only", expires_at: "2026-09-05T00:01:30Z" }, due, actor, now);
   const expired = repo.materialize("work_expired", 1, due, later, due, actor).run;
   assert.throws(() => repo.setRunState(expired.run_id, "materialized", "started", actor, "2026-09-05T00:01:30Z"), /run_not_authorized/);
@@ -472,7 +492,7 @@ test("run取消・失敗後の未受理requestをpendingへ戻さない", () => 
     repo.setRunState(run.run_id, "materialized", status, actor, due);
     assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", due).status, "cancelled");
     assert.equal(repo.getRun(run.run_id)?.status, status);
-    assert.equal(repo.materialize(status, 1, later, null, later, actor).run.status, "materialized");
+    assert.equal(repo.materialize(status, 1, later, afterLater, later, actor).run.status, "materialized");
   }
 });
 
@@ -507,7 +527,7 @@ test("run purge後もauditへmisfire/overlapのdecision codeを保持", () => {
   const { repo } = setup(); repo.create("misfire", input, due, actor, now);
   const misfire = repo.materialize("misfire", 1, due, later, "2026-09-05T00:16:01Z", actor).run;
   repo.create("overlap", input, due, actor, now); repo.materialize("overlap", 1, due, later, due, actor);
-  const overlap = repo.materialize("overlap", 1, later, null, later, actor).run;
+  const overlap = repo.materialize("overlap", 1, later, afterLater, later, actor).run;
   repo.purge("2026-10-10T00:00:00Z");
   assert.equal(repo.getRun(misfire.run_id), undefined); assert.equal(repo.getRun(overlap.run_id), undefined);
   for (const [name, run] of [["misfire", misfire], ["overlap", overlap]] as const) {
@@ -678,7 +698,7 @@ test("開始済みworkは失効・pause・再承認後も完了し通知だけ�
     assert.equal(repo.getRun(run.run_id)?.status, "completed");
     assert.ok((repo.auditHistory(mode) as { operation: string }[]).some(x => x.operation.startsWith("work_result_suppressed_")));
     if (mode === "expiry") repo.update(mode, 1, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 2 }, later, actor, expiry);
-    if (mode === "replace" || mode === "expiry") assert.equal(repo.materialize(mode, mode === "replace" ? 3 : 2, later, null, later, actor).run.status, "materialized");
+    if (mode === "replace" || mode === "expiry") assert.equal(repo.materialize(mode, mode === "replace" ? 3 : 2, later, afterLater, later, actor).run.status, "materialized");
   }
   assert.equal(count(raw, "connector_outbox"), 0);
 });
