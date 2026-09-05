@@ -28,9 +28,9 @@ export class DispatcherClient {
     );
   }
 
-  async resolveJobProgress(progressId: string): Promise<unknown> {
+  async resolveJobProgress(progressId: string, deliveryToken: string): Promise<unknown> {
     const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
-    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}`, undefined, token);
+    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}&delivery_token=${encodeURIComponent(deliveryToken)}`, undefined, token);
     if (response.statusCode !== 200) throw new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`);
     return JSON.parse(response.body);
   }

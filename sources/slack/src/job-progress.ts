@@ -6,25 +6,27 @@ const timestampPattern = /^\d{10,}\.?\d*$/;
 export interface JobProgressRequest {
   schema_version: 1;
   progress_id: string;
+  delivery_token: string;
 }
 
 export function parseJobProgressRequest(input: unknown): JobProgressRequest {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("progress must be an object");
   const value = input as Record<string, unknown>;
-  const keys = ["schema_version", "progress_id"];
+  const keys = ["schema_version", "progress_id", "delivery_token"];
   if (Object.keys(value).some((key) => !keys.includes(key)) || keys.some((key) => !(key in value)) ||
-    value.schema_version !== 1 || typeof value.progress_id !== "string" || !/^job_[0-9a-z]+:\d+$/.test(value.progress_id)) {
+    value.schema_version !== 1 || typeof value.progress_id !== "string" || !/^job_[0-9a-z]+:\d+$/.test(value.progress_id) ||
+    typeof value.delivery_token !== "string" || !/^[0-9a-f]{64}$/.test(value.delivery_token)) {
     throw new Error("progress is invalid");
   }
   return value as unknown as JobProgressRequest;
 }
 
 export class SlackJobProgressReporter {
-  constructor(private readonly registry: SlackWorkspaceRegistry, private readonly resolve: (progressId:string)=>Promise<unknown>) {}
+  constructor(private readonly registry: SlackWorkspaceRegistry, private readonly resolve: (progressId:string,deliveryToken:string)=>Promise<unknown>) {}
 
   async deliver(input: JobProgressRequest): Promise<{ progress_id: string }> {
     let resolved: ReturnType<typeof parseResolvedProgress>;
-    try { resolved = parseResolvedProgress(await this.resolve(input.progress_id)); }
+    try { resolved = parseResolvedProgress(await this.resolve(input.progress_id,input.delivery_token)); }
     catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true }); }
     let connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>;
     try { connection = this.registry.getByTeamId(resolved.workspace_id); }

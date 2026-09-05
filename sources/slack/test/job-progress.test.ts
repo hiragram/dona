@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { parseJobProgressRequest, SlackJobProgressReporter } from "../src/job-progress.js";
 
-const request = { schema_version: 1 as const, progress_id: "job_abc:2" };
+const request = { schema_version: 1 as const, progress_id: "job_abc:2", delivery_token:"a".repeat(64) };
 const resolved = { workspace_id: "T123", channel_id: "C123", thread_ts: "1234567890.123", status: "2件中1件目: テスト中" };
 
 test("progress transport rejects arbitrary destinations and control characters", () => {

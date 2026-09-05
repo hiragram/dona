@@ -192,11 +192,12 @@ export class SlackHealthServer {
           error_code: "job_progress_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
-        const slackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error"].includes(error.errorCode);
-        const definitelyUnsent = slackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
-        send(response, definitelyUnsent ? 429 : 503, { schema_version: 1,
+        const retryableSlackRejection = error instanceof SlackApiError && error.errorCode === "rate_limited";
+        const permanentSlackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error", "rate_limited"].includes(error.errorCode);
+        const definitelyUnsent = retryableSlackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
+        send(response, permanentSlackRejection ? 409 : definitelyUnsent ? 429 : 503, { schema_version: 1,
           ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
-          error: { code: slackRejection ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
+          error: { code: error instanceof SlackApiError ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }
       return;
     }
