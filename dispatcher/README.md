@@ -181,3 +181,7 @@ npm run typecheck
 npm run build
 npm audit --audit-level=high
 ```
+
+### Trigger-only job routing
+
+provider event の認証 owner、永続 execution policy、通知先 `none` の Result 保存、MCP owner query、および migration/live 検証境界は [trigger-only routing](../docs/trigger-only-routing.md) を参照してください。

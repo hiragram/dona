@@ -869,3 +869,22 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 });
+
+test("release metadata prevents self-update into routing code that cannot safely roll back", async () => {
+  const { parseCompatibilityMetadata } = await import("../src/validation.js");
+  const target = parseCompatibilityMetadata(JSON.parse(await fs.readFile(new URL("../../config/release-compatibility.json", import.meta.url), "utf8")));
+  assert.equal(target.rollback_safe, false);
+  const { root, policy } = await tempPolicy(); roots.push(root); await installPointers(policy);
+  const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+  const store = new ReleaseStore(policy);
+  const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
+  const git = new FakeGit();
+  git.refresh = async (current: string) => ({ current_sha: current, target_sha: targetSha, target_reachable: true, ci_trusted: true, target_compatibility: target });
+  const controller = new UpdateController(database, policy, git, new FakeBuild(), store, runtime, new FakeDispatcher(), logger);
+  await assert.rejects(controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /approved_policy/);
+  const alignedPolicy = { ...policy, compatibility: target };
+  const aligned = new UpdateController(database, alignedPolicy, git, new FakeBuild(), store, runtime, new FakeDispatcher(), logger);
+  await assert.rejects(aligned.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /not_rollback_compatible/);
+  assert.deepEqual(runtime.calls, []);
+  database.close();
+});

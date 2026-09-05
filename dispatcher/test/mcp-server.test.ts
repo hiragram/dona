@@ -62,6 +62,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.deepEqual(listed.tools.map(({ name }) => name), [
         "delegate_job",
         "list_thread_jobs",
+        "list_owner_jobs",
         "get_job_status",
         "steer_job",
         "cancel_job",

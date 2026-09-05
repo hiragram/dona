@@ -12,6 +12,7 @@ import { DispatcherDatabase } from "../src/database.js";
 import {
   externalEventSource,
   ExternalIngressRegistry,
+  ExternalIngressProcessor,
   scopedExternalEventId,
   type ExternalEventSourceRegistration,
   type RawIngressRequest,
@@ -622,6 +623,30 @@ describe("external ingress contract", () => {
       /hard limit/,
     );
   });
+});
+
+test("binds owner from authenticated transport metadata before normalization and persists it before ACK", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const verified = { connectionId: "connection-trusted", resourceId: "resource-trusted", principal: { kind: "fake_installation" } };
+  const registered = registration({ authenticate: async () => verified });
+  const originalNormalize = registered.normalize;
+  registered.normalize = (raw, principal) => {
+    const result = originalNormalize(raw, principal);
+    // normalizer が返す payload/subject と auth identity を分離する。
+    verified.connectionId = "payload-connection"; verified.resourceId = "payload-resource";
+    return result;
+  };
+  const owner = { kind: "provider_resource" as const, source: "fake", connection_id: "connection-trusted", resource_id: "resource-trusted" };
+  database.setProviderExecutionPolicy(owner, "fake.changed", { background_job: true, workspace: "scratch" });
+  const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  const result = await processor.process(externalEventSource("fake"), registered, {
+    body: fakeBody(), headers: [], method: "POST", requestTarget: "/v1/ingress/fake", receivedAt: new Date().toISOString(),
+  }, (envelope, context) => database.enqueueProvider(envelope, context.owner, new Date(), context));
+  assert.deepEqual(database.getEventBinding(result.receipt.eventId)?.owner, owner);
+  assert.equal(database.getEventBinding(result.receipt.eventId)?.execution.background_job, true);
+  assert.equal(database.get(result.receipt.eventId)?.reply_target_json, null);
+  database.close();
 });
 
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
