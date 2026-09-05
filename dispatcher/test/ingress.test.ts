@@ -12,6 +12,7 @@ import { DispatcherDatabase } from "../src/database.js";
 import {
   externalEventSource,
   ExternalIngressRegistry,
+  ExternalIngressProcessor,
   scopedExternalEventId,
   type ExternalEventSourceRegistration,
   type RawIngressRequest,
@@ -648,7 +649,8 @@ test("永続connection bindingを認証結果からcommitへ渡しdisable/revisi
   await api.start();
   try {
     const body=fakeBody();
-    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,202);
+    const initial=await request(config.socketPath,"fake",body,signedHeaders(body));
+    assert.equal(initial.status,202,JSON.stringify(initial.body));
     generation=0;
     assert.equal((await request(config.socketPath,"fake",fakeBody({providerEventId:"invalid-binding"}),signedHeaders(fakeBody({providerEventId:"invalid-binding"})))).status,401);
     generation=1;now+=100;
@@ -673,6 +675,29 @@ test("永続connection bindingを認証結果からcommitへ渡しdisable/revisi
     const normalRoute=await rawHttp("POST","/v1/events",{schema_version:1,source:"fake",external_event_id:"bypass",type:"fake.changed",occurred_at:"2026-09-05T00:00:00.000Z",subject:{},payload:{},reply_target:null});
     assert.equal(normalRoute.status,400);assert.equal(database.list().length,2);
   } finally {await api.stop();database.close();}
+});
+test("binds owner from authenticated transport metadata before normalization and persists it before ACK", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const verified = { connectionId: "connection-trusted", resourceId: "resource-trusted", principal: { kind: "fake_installation" } };
+  const registered = registration({ authenticate: async () => verified });
+  const originalNormalize = registered.normalize;
+  registered.normalize = (raw, principal) => {
+    const result = originalNormalize(raw, principal);
+    // normalizer が返す payload/subject と auth identity を分離する。
+    verified.connectionId = "payload-connection"; verified.resourceId = "payload-resource";
+    return result;
+  };
+  const owner = { kind: "provider_resource" as const, source: "fake", connection_id: "connection-trusted", resource_id: "resource-trusted" };
+  database.setProviderExecutionPolicy(owner, "fake.changed", { background_job: true, workspace: "scratch" });
+  const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  const result = await processor.process(externalEventSource("fake"), registered, {
+    body: fakeBody(), headers: [], method: "POST", requestTarget: "/v1/ingress/fake", receivedAt: new Date().toISOString(),
+  }, (envelope, context) => database.enqueueProvider(envelope, context.owner, new Date(), context));
+  assert.deepEqual(database.getEventBinding(result.receipt.eventId)?.owner, owner);
+  assert.equal(database.getEventBinding(result.receipt.eventId)?.execution.background_job, true);
+  assert.equal(database.get(result.receipt.eventId)?.reply_target_json, null);
+   database.close();
 });
 
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{

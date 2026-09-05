@@ -135,6 +135,7 @@ export class JobSupervisor {
 
   cancel(jobId: string, sourceEventId: string, reason = "Cancelled by Dona"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
       if (before.status === "cancelled") return { row: before, duplicate: true };
@@ -174,6 +175,7 @@ export class JobSupervisor {
     for (const job of this.database.listJobsNeedingNotification()) {
       try {
         const event = this.database.enqueueJobNotification(job.job_id);
+        if (!event) continue;
         this.logger.info("Job notification event enqueued", {
           job_id: job.job_id,
           job_status: job.status,

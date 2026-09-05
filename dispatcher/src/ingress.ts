@@ -2,6 +2,8 @@ import type { QueueAdmissionContext, AdmissionCode } from "./queue.js";
 import { createHash } from "node:crypto";
 import { validateHeaderName, validateHeaderValue } from "node:http";
 import { performance } from "node:perf_hooks";
+import { eventOwnerSchema } from "./event-routing.js";
+import type { ProviderOwner } from "./event-routing.js";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
@@ -64,8 +66,9 @@ export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
   readonly connection?: Omit<DeliveryBinding, "connectionId">;
+  readonly resourceId?: string;
 }
-type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding };
+type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding; readonly owner?: ProviderOwner };
 
 export interface NormalizedExternalEvent {
   readonly providerEventId: string;
@@ -354,6 +357,13 @@ export class ExternalIngressProcessor {
     }
 
     const verifiedConnectionId = verified.connectionId;
+    let owner: ProviderOwner | undefined;
+    if (verified.resourceId !== undefined) {
+      const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
+        connection_id: verifiedConnectionId, resource_id: verified.resourceId });
+      if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
+      owner = parsed.data;
+    }
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
@@ -378,11 +388,13 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
+    if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
     const signal = registration.queueSignal?.(normalized, verified);
     const result = persist(envelope, {
       connectionId: verifiedConnectionId,
       ...(signal ? { coalesce: signal } : {}),
       ...(verifiedBinding ? { binding: verifiedBinding } : {}),
+      ...(owner ? { owner } : {}),
     });
     const receipt: PersistReceipt = {
       schemaVersion: 1,

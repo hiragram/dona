@@ -20,7 +20,9 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
-import { stableStringify } from "./validation.js";
+import { parseJobResultEnvelope, parseResultEnvelope, stableStringify } from "./validation.js";
+import { eventOwnerSchema, executionPolicySchema, insertBinding, legacySlackBinding, migrateEventRouting, readBinding } from "./event-routing.js";
+import type { EventBinding, ExecutionPolicy, ProviderOwner } from "./event-routing.js";
 
 import { ConnectionRegistry, type CursorBatch } from "./connections/registry.js";
 import { migrateConnections, connectionDispatchPredicate, connectionDispatchPredicateFor } from "./connections/schema.js";
@@ -81,6 +83,7 @@ export class DispatcherDatabase {
         this.migrate();
         if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
         migrateConnections(this.db);
+        migrateEventRouting(this.db);
       }).immediate();
     } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
@@ -247,13 +250,17 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, owner?: ProviderOwner, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+    const queueContext: QueueAdmissionContext | undefined = context ? {
+      connectionId: context.connectionId,
+      ...(context.coalesce ? { coalesce: context.coalesce } : {}),
+    } : binding ? { connectionId: binding.connectionId } : undefined;
     if (!binding) {
       if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
-      return this.enqueue(envelope, at, context);
+      return this.enqueueProvider(envelope, owner, at, queueContext);
     }
     try {
-      return this.connections.delivery(binding, envelope, () => this.enqueue(envelope, at, context ?? { connectionId: binding.connectionId }));
+      return this.connections.delivery(binding, envelope, () => this.enqueueProvider(envelope, owner, at, queueContext));
     } catch (error) {
       if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
       throw error;
@@ -269,7 +276,11 @@ export class DispatcherDatabase {
     }
   }
 
-  enqueue(envelope: EventEnvelope, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+  enqueue(envelope: EventEnvelope, at = new Date(), input?: QueueAdmissionContext | EventBinding | (QueueAdmissionContext & { binding: EventBinding })): EnqueueResult {
+    const binding = input && "connectionId" in input && "binding" in input ? input.binding :
+      input && "owner" in input ? input as EventBinding : undefined;
+    const context = input && "connectionId" in input ? input as QueueAdmissionContext :
+      binding?.owner.kind === "provider_resource" ? { connectionId: binding.owner.connection_id } : undefined;
     const timestamp = at.toISOString();
     const subjectJson = stableStringify(envelope.subject);
     const payloadJson = stableStringify(envelope.payload);
@@ -284,9 +295,20 @@ export class DispatcherDatabase {
     const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
     try { return this.db.transaction(() => {
       const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
+      const ownerMatches = (eventId: string): boolean => {
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved.owner) === stableStringify(binding.owner);
+      };
+      const bindingMatches = (eventId: string): boolean => {
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved) === stableStringify(binding);
+      };
       const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
       if (delivery) {
-        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex");
+        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex") ||
+          !ownerMatches(delivery.event_id);
         const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
         this.queueMetric(outcome);
         return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
@@ -305,6 +327,9 @@ export class DispatcherDatabase {
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
         const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
+        if (!ownerMatches(existing.event_id)) {
+          return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
+        }
         this.queueMetric(outcome);
         return {
           row: existing,
@@ -331,10 +356,11 @@ export class DispatcherDatabase {
       const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
       const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
       if (sourceTokens < 1) reject("queue_rate");
-      const coalesced = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
+      const coalescedCandidate = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
         WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
         AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
         ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
+      const coalesced = coalescedCandidate && bindingMatches(coalescedCandidate.event_id) ? coalescedCandidate : undefined;
       if (coalesced && coalesced.delivery_count >= this.queuePolicy.maxDeliveries) reject("queue_deliveries");
       const usage = this.db.prepare(`SELECT l.class, count(*) depth, coalesce(sum(q.bytes),0) bytes FROM queue_events q
         JOIN events e USING(event_id) JOIN queue_lanes l USING(lane) WHERE e.status!='completed' GROUP BY l.class`).all() as {class:string;depth:number;bytes:number}[];
@@ -386,6 +412,8 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
+      const resolvedBinding = binding ?? legacySlackBinding(row);
+      if (resolvedBinding) insertBinding(this.db, eventId, resolvedBinding);
       this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
       this.queueMetric("created");
       return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
@@ -456,14 +484,11 @@ export class DispatcherDatabase {
     const workspaceId = stringValue(replyTarget.workspace_id);
     const channelId = stringValue(replyTarget.channel_id);
     const threadTs = stringValue(replyTarget.thread_ts);
-    if (
-      sourceEvent.source !== "slack" ||
-      stringValue(replyTarget.kind) !== "slack_thread" ||
-      !workspaceId ||
-      !channelId ||
-      !threadTs
-    ) {
-      throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target`);
+    const binding = this.getEventBinding(sourceEvent.event_id);
+    if (!binding) throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target or authenticated provider owner`);
+    if (!binding.execution.background_job) throw new Error("Background job capability denied");
+    if (binding.owner.kind === "provider_resource" && request.workspace.kind !== "scratch") {
+      throw new Error("Provider job policy permits only scratch workspace");
     }
 
     return this.db.transaction(() => {
@@ -514,8 +539,10 @@ export class DispatcherDatabase {
         timestamp,
         timestamp,
       );
+      this.db.prepare("INSERT INTO job_bindings SELECT ?, event_id, owner_json, execution_json, destination_json FROM event_bindings WHERE event_id = ?")
+        .run(jobId, sourceEvent.event_id);
       return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
-    })();
+    }).immediate();
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -551,6 +578,7 @@ export class DispatcherDatabase {
       SELECT * FROM jobs
       WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
         AND completion_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM job_completions c WHERE c.job_id = jobs.job_id AND c.job_status = jobs.status AND c.notification_state = 'none')
       ORDER BY updated_at LIMIT ?
     `).all(limit) as JobRow[];
   }
@@ -662,6 +690,9 @@ export class DispatcherDatabase {
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string): void {
+    result = parseJobResultEnvelope(result, jobId);
+    const job = this.getJobRequired(jobId);
+    if (job.result_path !== resultPath) throw new Error("Job result path mismatch");
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     this.updateJob(jobId, ["running"], status, {
       result_json: stableStringify(result),
@@ -729,14 +760,34 @@ export class DispatcherDatabase {
     });
   }
 
-  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult {
+  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult | undefined {
+    return this.db.transaction(() => this.materializeJobCompletion(jobId, at)).immediate();
+  }
+
+  private materializeJobCompletion(jobId: string, at: Date): EnqueueResult | undefined {
     const job = this.getJobRequired(jobId);
+    const binding = this.getEventBinding(job.source_event_id);
+    if (!binding) throw new Error("Unknown completion owner");
+    this.assertJobSourceMatchesThread(jobId, job.source_event_id);
+    if (!["blocked", "completed", "failed", "cancelled", "needs_review"].includes(job.status)) throw new Error("Job is not terminal");
+    const savedCompletion = this.getJobCompletion(jobId);
+    if (savedCompletion && binding.destination.kind === "none") return undefined;
+    this.db.prepare(`INSERT OR IGNORE INTO job_completions
+      (job_id, event_id, owner_json, destination_json, result_json, job_status, materialized_at, notification_state)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(jobId, job.source_event_id, stableStringify(binding.owner), stableStringify(binding.destination), job.result_json,
+        job.status, at.toISOString(), binding.destination.kind === "none" ? "none" : "pending");
+    if (binding.destination.kind === "none") return undefined;
     if (job.completion_event_id) {
       const existing = this.get(job.completion_event_id);
       if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
+      const subject = JSON.parse(existing.subject_json) as Record<string, unknown>;
+      if (existing.source !== "dona_job" || subject.job_id !== jobId || subject.source_event_id !== job.source_event_id ||
+        existing.reply_target_json !== stableStringify(binding.destination)) throw new Error("Completion owner mismatch");
+      this.linkJobCompletionNotification(jobId, job.status, existing);
       return { row: existing, outcome: "duplicate_same", duplicate: true, payloadMismatch: false };
     }
-    const sourceEvent = this.getRequired(job.source_event_id);
+
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const envelope: EventEnvelope = {
       schema_version: 1,
@@ -760,31 +811,69 @@ export class DispatcherDatabase {
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
         ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
       },
-      reply_target: sourceEvent.reply_target_json
-        ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
-        : null,
+      reply_target: binding.destination,
       trace: { job_id: job.job_id, source_event_id: job.source_event_id },
     };
     const enqueued = this.enqueue(envelope, at);
     this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
       .run(enqueued.row.event_id, at.toISOString(), jobId);
+    this.linkJobCompletionNotification(jobId, job.status, enqueued.row);
     return enqueued;
   }
 
-  private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
+  private linkJobCompletionNotification(jobId: string, jobStatus: string, event: EventRow): void {
+    const notificationState = event.status === "completed" ? "accepted" :
+      ["needs_review", "dead_letter", "blocked"].includes(event.status) ? "needs_review" : "pending";
+    this.db.prepare(`UPDATE job_completions
+      SET notification_event_id = ?, notification_state = ?, notification_result_json = ?
+      WHERE job_id = ? AND job_status = ?`)
+      .run(event.event_id, notificationState, event.result_json, jobId, jobStatus);
+  }
+
+  getEventBinding(eventId: string): EventBinding | undefined { return readBinding(this.db, eventId); }
+
+  // trusted local configuration API。HTTP/MCP/payload からこの policy を変更しない。
+  setProviderExecutionPolicy(ownerInput: ProviderOwner, eventType: string, policy: ExecutionPolicy): void {
+    const owner = eventOwnerSchema.parse(ownerInput);
+    if (owner.kind !== "provider_resource" || !eventType.trim() || eventType.length > 128) throw new Error("Invalid provider policy");
+    this.db.prepare(`INSERT INTO provider_execution_policies VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(source, connection_id, resource_id, event_type) DO UPDATE SET policy_json = excluded.policy_json`)
+      .run(owner.source, owner.connection_id, owner.resource_id, eventType, stableStringify(executionPolicySchema.parse(policy)));
+  }
+
+  enqueueProvider(envelope: EventEnvelope, ownerInput: ProviderOwner | undefined, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+    if (!ownerInput) return this.enqueue(envelope, at, context);
+    const owner = eventOwnerSchema.parse(ownerInput);
+    if (owner.kind !== "provider_resource" || owner.source !== envelope.source || envelope.reply_target !== null) throw new Error("Invalid provider binding");
+    return this.db.transaction(() => {
+      const policy = this.db.prepare(`SELECT policy_json FROM provider_execution_policies
+        WHERE source = ? AND connection_id = ? AND resource_id = ? AND event_type = ?`)
+        .get(owner.source, owner.connection_id, owner.resource_id, envelope.type) as { policy_json: string } | undefined;
+      const binding = { owner, destination: { kind: "none" as const },
+        execution: policy ? executionPolicySchema.parse(JSON.parse(policy.policy_json)) : { background_job: false, workspace: "scratch" as const } };
+      return this.enqueue(envelope, at, { ...(context ?? { connectionId: owner.connection_id }), binding });
+    }).immediate();
+  }
+
+  listOwnerJobs(sourceEventId: string): JobRow[] {
+    const binding = this.getEventBinding(sourceEventId);
+    if (!binding) throw new Error("Unknown event owner");
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_bindings b ON b.job_id = j.job_id
+      WHERE b.owner_json = ? ORDER BY j.created_at DESC LIMIT 100`).all(stableStringify(binding.owner)) as JobRow[];
+  }
+
+  assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
     const job = this.getJobRequired(jobId);
-    const sourceEvent = this.getRequired(sourceEventId);
-    const replyTarget = sourceEvent.reply_target_json
-      ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
-      : {};
-    if (
-      sourceEvent.source !== "slack" ||
-      stringValue(replyTarget.workspace_id) !== job.workspace_id ||
-      stringValue(replyTarget.channel_id) !== job.channel_id ||
-      stringValue(replyTarget.thread_ts) !== job.thread_ts
-    ) {
-      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s Slack thread`);
+    const source = this.getEventBinding(sourceEventId);
+    const binding = this.db.prepare("SELECT owner_json FROM job_bindings WHERE job_id = ? AND event_id = ?")
+      .get(jobId, job.source_event_id) as { owner_json: string } | undefined;
+    if (!source || !binding || stableStringify(source.owner) !== binding.owner_json) {
+      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s Slack thread or provider owner`);
     }
+  }
+
+  getJobCompletion(jobId: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM job_completions WHERE job_id = ? AND job_status = (SELECT status FROM jobs WHERE job_id = ?)").get(jobId, jobId) as Record<string, unknown> | undefined;
   }
 
   hasBlockedEvent(): boolean {
@@ -925,7 +1014,7 @@ export class DispatcherDatabase {
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordSafePromptFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
@@ -941,7 +1030,7 @@ export class DispatcherDatabase {
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordWaitingError(eventId: string, code: string, message: string, at = new Date()): void {
@@ -954,6 +1043,7 @@ export class DispatcherDatabase {
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    result = parseResultEnvelope(result, eventId);
     this.transition(eventId, ["waiting_agent"], "completed", {
       result_json: stableStringify(result),
       result_path: resultPath,
@@ -964,6 +1054,7 @@ export class DispatcherDatabase {
   }
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    result = parseResultEnvelope(result, eventId);
     this.transition(eventId, ["waiting_agent"], "dead_letter", {
       result_json: stableStringify(result),
       result_path: resultPath,

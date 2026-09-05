@@ -532,7 +532,7 @@ export class DispatcherApi {
         rawRequest,
         (envelope, context) => {
           if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
-          const persisted = this.database.enqueueExternal(envelope, context.binding, new Date(), context);
+          const persisted = this.database.enqueueExternal(envelope, context.binding, context.owner, new Date(), context);
           if (persisted.outcome !== "duplicate_conflict") this.worker.wake();
           return persisted;
         },
@@ -718,6 +718,12 @@ export class DispatcherApi {
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId) {
+        try { sendJson(response, 200, { schema_version: 1, jobs: this.database.listOwnerJobs(sourceEventId) }); }
+        catch { throw new ApiRequestError(403, "owner_mismatch", "Unknown event owner"); }
+        return;
+      }
       const workspaceId = url.searchParams.get("workspace_id");
       const channelId = url.searchParams.get("channel_id");
       const threadTs = url.searchParams.get("thread_ts");
@@ -737,6 +743,13 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId || job.source !== "slack") {
+        try {
+          if (!sourceEventId) throw new Error("Owner required");
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
+        } catch { throw new ApiRequestError(403, "owner_mismatch", "Job owner does not match"); }
+      }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }
