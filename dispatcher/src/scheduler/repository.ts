@@ -183,6 +183,13 @@ export class SchedulerRepository {
     this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, content_delete_at = ?, updated_at = ?,
       claim_token = NULL, lease_until = NULL WHERE run_id IN (SELECT run_id FROM schedule_runs WHERE schedule_id = ?)
       AND status IN ('pending','claimed')`).run(now, add(now, 604800), now, scheduleId);
+    if (reason === "authorization_expired") {
+      for (const row of suppressed) {
+        const deadline = add(this.revision(this.getRun(row.run_id)!).expires_at, 604800);
+        this.db.prepare("UPDATE connector_outbox SET content_delete_at = MIN(content_delete_at, ?) WHERE outbox_id = ?")
+          .run(deadline, row.outbox_id);
+      }
+    }
     this.db.prepare(`UPDATE schedule_runs SET status = 'cancelled', reason = ?, terminal_at = ?
       WHERE schedule_id = ? AND status = 'materialized' AND NOT EXISTS
       (SELECT 1 FROM connector_outbox o WHERE o.run_id = schedule_runs.run_id AND o.status IN ('request_started','needs_review','sent'))`).run(reason, now, scheduleId);
@@ -358,9 +365,10 @@ export class SchedulerRepository {
           content_delete_at = ?, claim_token = NULL, lease_until = NULL
           WHERE run_id = ? AND status IN ('pending','claimed')`).run(operationAt, operationAt, add(operationAt, 604800), runId);
       }
-      this.db.prepare(`UPDATE schedule_runs SET status = ?, job_id = COALESCE(?, job_id), started_at =
-        CASE WHEN ? = 'started' THEN ? ELSE started_at END, terminal_at = ? WHERE run_id = ?`)
-        .run(next, jobId, next, operationAt, next === "started" ? null : operationAt, runId);
+      this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = CASE WHEN ? = 'cancelled' THEN 'cancelled' ELSE reason END,
+        job_id = COALESCE(?, job_id), started_at = CASE WHEN ? = 'started' THEN ? ELSE started_at END,
+        terminal_at = ? WHERE run_id = ?`)
+        .run(next, next, jobId, next, operationAt, next === "started" ? null : operationAt, runId);
       for (const row of suppressed) this.auditOutbox(row, `outbox_run_${next}`, operationAt);
       this.audit(current, current, `run_${next}`, actor, operationAt, undefined, this.getRun(runId)!);
       if (workCompletion && hasTarget && notificationReason !== null) {

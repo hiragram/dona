@@ -751,7 +751,7 @@ test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻�
 });
 
 test("authorization失効はschedule時刻を戻さず未開始workへ専用reasonを一度だけ残す", () => {
-  const { repo } = setup();
+  const { repo, raw } = setup();
   repo.create("expire_clock", { ...input, expires_at: due }, due, actor, now);
   assert.equal(repo.transition("expire_clock", 1, "pause", actor, "2026-09-05T00:02:00Z").state, "expired");
   repo.purge(due);
@@ -773,6 +773,14 @@ test("authorization失効はschedule時刻を戻さず未開始workへ専用reas
   assert.equal(repo.claim(expiry), undefined);
   assert.equal((repo.auditHistory("expire_reminder") as { operation: string }[])
     .filter(row => row.operation === "outbox_authorization_expired").length, 1);
+
+  repo.create("late_expiry", { ...input, expires_at: expiry }, due, actor, now);
+  repo.materialize("late_expiry", 1, due, later, due, actor);
+  const lateOutbox = raw.prepare("SELECT outbox_id FROM connector_outbox JOIN schedule_runs USING(run_id) WHERE schedule_id = 'late_expiry'")
+    .get() as { outbox_id: string };
+  repo.purge("2026-09-20T00:00:00Z");
+  assert.equal(repo.getOutbox(lateOutbox.outbox_id, "2026-09-20T00:00:00Z")?.content, null);
+  assert.equal(repo.getOutbox(lateOutbox.outbox_id, "2026-09-20T00:00:00Z")?.content_delete_at, "2026-09-12T00:02:00Z");
 });
 
 test("schedule時刻が進んだ後の時計後退では古いwork runを開始しない", () => {
@@ -803,6 +811,7 @@ test("時計後退中のrun取消もoutbox終端と本文削除期限を単調�
   repo.create("cancel_clock", input, due, actor, now);
   const run = repo.materialize("cancel_clock", 1, due, later, due, actor).run;
   repo.setRunState(run.run_id, "materialized", "cancelled", actor, "2026-09-05T00:00:30Z");
+  assert.equal(repo.getRun(run.run_id)?.reason, "cancelled");
   assert.equal(repo.claim(due), undefined);
   const stored = raw.prepare("SELECT terminal_at, content_delete_at FROM connector_outbox WHERE run_id = ?")
     .get(run.run_id) as { terminal_at: string; content_delete_at: string };
