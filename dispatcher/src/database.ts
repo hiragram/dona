@@ -307,18 +307,23 @@ export class DispatcherDatabase {
         const saved = readBinding(this.db, eventId);
         return saved !== undefined && stableStringify(saved) === stableStringify(binding);
       };
+      let restoring: EventRow | undefined;
       const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
       if (delivery) {
+        const delivered = this.get(delivery.event_id)!;
         const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex") ||
           !ownerMatches(delivery.event_id);
+        if (!mismatch && delivered.status === "completed" && delivered.last_error_code === "connection_revision_superseded") restoring = delivered;
+        else {
         const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
         this.queueMetric(outcome);
-        return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
+        return { row: delivered, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
+        }
       }
       const existing = this.db
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
-      if (existing) {
+      if (existing && !restoring) {
         const ignoreReceivedAtDifference = envelope.source === "slack" &&
           usesSlackReceivedAtFallback(envelope.trace) && storedSlackReceivedAtFallback(existing);
         const mismatch =
@@ -332,6 +337,8 @@ export class DispatcherDatabase {
         if (!ownerMatches(existing.event_id)) {
           return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
         }
+        if (!mismatch && existing.status === "completed" && existing.last_error_code === "connection_revision_superseded") restoring = existing;
+        else {
         this.queueMetric(outcome);
         return {
           row: existing,
@@ -339,6 +346,7 @@ export class DispatcherDatabase {
           duplicate: true,
           payloadMismatch: mismatch,
         };
+        }
       }
 
       if (this.claimsClosed) reject("queue_quiescing");
@@ -358,7 +366,7 @@ export class DispatcherDatabase {
       const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
       const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
       if (sourceTokens < 1) reject("queue_rate");
-      const coalescedCandidate = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
+      const coalescedCandidate = !restoring && policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
         WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
         AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
         ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
@@ -388,8 +396,8 @@ export class DispatcherDatabase {
         this.queueMetric("coalesced");
         return { row: coalesced, outcome: "created", duplicate: false, payloadMismatch: false, admission: "coalesced", committedAt: timestamp } as EnqueueResult;
       }
-      const eventId = `evt_${ulid(at.getTime())}`;
-      const result = this.db
+      const eventId = restoring?.event_id ?? `evt_${ulid(at.getTime())}`;
+      const result = restoring ? undefined : this.db
         .prepare(`
           INSERT INTO events (
             event_id, schema_version, source, external_event_id, event_type,
@@ -412,13 +420,20 @@ export class DispatcherDatabase {
           timestamp,
           timestamp,
         );
-      const row = this.getBySequence(Number(result.lastInsertRowid));
+      if (restoring) this.db.prepare(`UPDATE events SET status='queued',available_at=?,updated_at=?,result_json=NULL,completed_at=NULL,
+        last_error_code=NULL,last_error_message=NULL WHERE event_id=?`).run(timestamp,timestamp,eventId);
+      const row = restoring ? this.get(eventId) : this.getBySequence(Number(result!.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
       const resolvedBinding = binding ?? legacySlackBinding(row);
-      if (resolvedBinding) insertBinding(this.db, eventId, resolvedBinding);
-      this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
+      if (resolvedBinding) {
+        if (restoring) this.db.prepare("DELETE FROM event_bindings WHERE event_id=?").run(eventId);
+        insertBinding(this.db, eventId, resolvedBinding);
+      }
+      if (restoring) this.db.prepare(`UPDATE queue_events SET lane=?,bytes=?,coalesce_key=?,fingerprint=?,requires_fetch=? WHERE event_id=?`)
+        .run(identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1,eventId);
+      else this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
       this.queueMetric("created");
-      return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
+      return { row, outcome: restoring ? "duplicate_same" as const : "created" as const, duplicate: !!restoring, payloadMismatch: false };
     }).immediate();
     } catch (error) {
       if (error instanceof QueueAdmissionError) this.queueMetric(error.code);

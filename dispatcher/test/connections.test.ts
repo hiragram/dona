@@ -539,6 +539,7 @@ test("旧revisionで退避済みの同一event再送を現revisionへ復旧す�
   const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   const original=db.enqueueExternal(event(),binding()).row;
   db.connections.revise("pilot",1,{...config,credentialRevision:2});await lifecycle.verify("pilot","folder1",1);
+  assert.equal(db.get(original.event_id)?.last_error_code,"connection_revision_superseded");
   const current={...binding(),revision:2,credentialRevision:2};
   assert.equal(db.enqueueExternal(event(),current).outcome,"duplicate_same");
   assert.equal(db.get(original.event_id)?.status,"queued");

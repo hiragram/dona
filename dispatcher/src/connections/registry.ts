@@ -45,15 +45,15 @@ export class ConnectionRegistry {
   manages(source: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM connections WHERE provider=? LIMIT 1").get(source);
   }
-  private completeUndispatched(id: string, revision: number, now: number, summary: string): number {
+  private completeUndispatched(id: string, revision: number, now: number, summary: string, disposition: string): number {
     const completedAt = new Date(now).toISOString();
     const rows = this.db.prepare(`SELECT events.event_id FROM events JOIN connection_event_bindings binding USING(event_id)
       WHERE binding.connection_id=? AND binding.revision=? AND events.status IN ('queued','retryable_failed')`)
       .all(id, revision) as {event_id:string}[];
     for (const {event_id} of rows) {
       const result = { schema_version: 1, event_id, status: "completed", summary, actions: [], memory_candidates: [], completed_at: completedAt };
-      this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,
-        last_error_message=NULL,updated_at=? WHERE event_id=?`).run(stableStringify(result), completedAt, completedAt, event_id);
+      this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=?,
+        last_error_message=NULL,updated_at=? WHERE event_id=?`).run(stableStringify(result), completedAt, disposition, completedAt, event_id);
     }
     return rows.length;
   }
@@ -84,7 +84,7 @@ export class ConnectionRegistry {
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
-      const superseded = this.completeUndispatched(id, revision, now, "Connection revision superseded before dispatch");
+      const superseded = this.completeUndispatched(id, revision, now, "Connection revision superseded before dispatch", "connection_revision_superseded");
       this.db.prepare("UPDATE connections SET config_json=?,revision=revision+1,state=CASE WHEN state='disabled' THEN 'disabled' ELSE 'degraded' END WHERE id=?")
         .run(stableStringify(config), id);
       if (config.capability.cursor) for (const entry of config.allowlist) {
@@ -101,7 +101,7 @@ export class ConnectionRegistry {
       if (c.revision !== revision) throw new ConnectionError("revision_conflict");
       if (c.state === "disabled") return;
       const now = this.tick(id, true);
-      const superseded = this.completeUndispatched(id, revision, now, "Connection disabled before dispatch");
+      const superseded = this.completeUndispatched(id, revision, now, "Connection disabled before dispatch", "connection_disabled");
       this.db.prepare("UPDATE connections SET state='disabled' WHERE id=?").run(id);
       if (superseded) this.audit(c, "queued_events_superseded", now);
       this.audit(c, "disabled", now);
@@ -178,7 +178,7 @@ export class ConnectionRegistry {
           const quarantined = previous.state === "verification_pending" && previous.verifiedAt === null && previous.error === "verification_failed";
           const renewable = ["active","expiring"].includes(previous.state) && previous.expiresAt !== null &&
             now >= previous.expiresAt - previous.renewalWindowMs;
-          if (previous.revision !== revision || c.capability.renewal !== "replace" || (!quarantined && !renewable)) {
+          if ((!quarantined && previous.revision !== revision) || c.capability.renewal !== "replace" || (!quarantined && !renewable)) {
             throw new ConnectionError("invalid_transition");
           }
         }
@@ -316,12 +316,8 @@ export class ConnectionRegistry {
       const prior = this.db.prepare("SELECT connection_id,revision,resource,generation FROM connection_event_bindings WHERE event_id=?").get(result.row.event_id) as {connection_id: string; revision: number; resource: string; generation: number} | undefined;
       if (prior && (prior.connection_id !== c.id || prior.resource !== binding.resource)) throw new ConnectionError("not_authorized");
       if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?,?,?)").run(result.row.event_id, c.id, c.revision, binding.resource, dispatchGeneration);
-      else if (prior.revision !== c.revision && result.outcome === "duplicate_same" && result.row.status === "completed" &&
-        result.row.result_json?.includes("Connection revision superseded before dispatch")) {
+      else if (prior.revision !== c.revision && result.outcome === "duplicate_same" && result.row.status === "queued")
         this.db.prepare("UPDATE connection_event_bindings SET revision=?,generation=? WHERE event_id=?").run(c.revision,dispatchGeneration,result.row.event_id);
-        this.db.prepare(`UPDATE events SET status='queued',result_json=NULL,completed_at=NULL,available_at=?,updated_at=? WHERE event_id=?`)
-          .run(new Date(now).toISOString(),new Date(now).toISOString(),result.row.event_id);
-      }
       else if (prior.revision === c.revision && prior.generation < dispatchGeneration) this.db.prepare("UPDATE connection_event_bindings SET generation=? WHERE event_id=?")
         .run(dispatchGeneration, result.row.event_id);
       this.db.prepare("UPDATE connection_subscriptions SET last_delivery_at=? WHERE connection_id=? AND resource=? AND generation=?")
