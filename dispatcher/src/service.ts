@@ -24,8 +24,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger);
-  const jobSupervisor = new JobSupervisor(
+  let jobSupervisor!: JobSupervisor;
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
+  jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),
     config,
