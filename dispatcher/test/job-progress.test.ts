@@ -97,6 +97,17 @@ test("terminal sibling replaces a drained unknown row with fixed preparing fallb
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("terminal fallback waits for an in-flight sibling delivery to settle unknown", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-sibling-race-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.ingest({...valid,job_id:"job_next",sequence:2}); store.begin("job_next");
+    const done={job_id:"job_done",source_event_id:"evt_group",status:"completed",workspace_path:path.join(root,"job_done"),workspace_json:JSON.stringify({kind:"scratch"})}; const next={...done,job_id:"job_next",status:"running"};
+    const coordinator=new JobProgressCoordinator({listEventJobs:()=>[done,next]} as never,store,{} as never,{warn(){}} as never); let release!:()=>void; const gate=new Promise<void>((resolve)=>{release=resolve;});
+    (coordinator as unknown as {deliveryOperations:Map<string,Promise<void>>}).deliveryOperations.set("job_next",gate); const terminal=coordinator.ingest(done as never); await new Promise((resolve)=>setTimeout(resolve,5));
+    store.unknown("job_next","acceptance unknown"); release(); await terminal; const fallback=store.get("job_next"); assert.equal(fallback?.status,"pending"); assert.equal(fallback?.phase,"preparing");
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("an attention-claimed group rejects later progress delivery", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
@@ -228,6 +239,6 @@ test("migrates progress schema 1 with a terminal reconciliation marker", async (
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); INSERT INTO job_progress VALUES ('job_legacy',1,'testing','token=untrusted','2026-09-05T00:00:00Z','delivered','2026-09-05T00:00:00Z',NULL,NULL); PRAGMA user_version=1;"); legacy.close();
   const store=new JobProgressStore(file);
-  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); assert.equal((check.prepare("SELECT safe_summary FROM job_progress WHERE job_id='job_legacy'").get() as {safe_summary:string}).safe_summary,"テスト中"); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
+  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); const row=check.prepare("SELECT safe_summary,updated_at FROM job_progress WHERE job_id='job_legacy'").get() as {safe_summary:string;updated_at:string}; assert.equal(row.safe_summary,"テスト中"); assert.equal(row.updated_at,"1970-01-01T00:00:00.000Z"); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });

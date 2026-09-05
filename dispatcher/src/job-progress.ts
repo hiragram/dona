@@ -57,7 +57,7 @@ export class JobProgressStore {
       CREATE TABLE job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL);
       PRAGMA user_version = 2;
     `))();
-    if (version === 1) this.db.transaction(() => this.db.exec(`ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; UPDATE job_progress SET safe_summary=CASE phase WHEN 'preparing' THEN '準備中' WHEN 'implementing' THEN '実装中' WHEN 'testing' THEN 'テスト中' WHEN 'reviewing' THEN 'レビュー中' WHEN 'waiting_ci' THEN 'CI待ち' WHEN 'reconciling' THEN '状態を照合中' ELSE '準備中' END; PRAGMA user_version = 2;`))();
+    if (version === 1) this.db.transaction(() => this.db.exec(`ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; UPDATE job_progress SET safe_summary=CASE phase WHEN 'preparing' THEN '準備中' WHEN 'implementing' THEN '実装中' WHEN 'testing' THEN 'テスト中' WHEN 'reviewing' THEN 'レビュー中' WHEN 'waiting_ci' THEN 'CI待ち' WHEN 'reconciling' THEN '状態を照合中' ELSE '準備中' END, updated_at='1970-01-01T00:00:00.000Z'; PRAGMA user_version = 2;`))();
     this.db.exec("CREATE TABLE IF NOT EXISTS job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_terminal_idx ON job_progress(terminal_checked,job_id)");
@@ -85,7 +85,7 @@ export class JobProgressStore {
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
   all(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress ORDER BY job_id").all() as ProgressRow[]; }
-  recoverable(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress WHERE terminal_checked=0 ORDER BY job_id").all() as ProgressRow[]; }
+  recoverable(afterJobId="",limit=500): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress WHERE terminal_checked=0 AND job_id>? ORDER BY job_id LIMIT ?").all(afterJobId,limit) as ProgressRow[]; }
   pending(at = new Date()): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE status='pending' AND available_at<=? ORDER BY available_at LIMIT 1").get(at.toISOString()) as ProgressRow|undefined; }
   begin(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivering' WHERE job_id=? AND status='pending'").run(jobId); }
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
@@ -136,10 +136,11 @@ export class JobProgressCoordinator {
   async ingest(row: JobRow): Promise<void> {
     if (terminalStatuses.has(row.status)) {
       this.invalidProgressWarnings.delete(row.job_id);
-      await this.deliveryOperations.get(row.job_id);
+      const siblings=this.jobs.listEventJobs(row.source_event_id);
+      await this.drainDeliveries(siblings.map((item)=>item.job_id));
       this.store.terminal(row.job_id);
       await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(() => { this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
-      const runningSiblings = this.jobs.listEventJobs(row.source_event_id).filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
+      const runningSiblings = siblings.filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
       this.store.requeueLatestAndMarkTerminal(row.job_id,runningSiblings);
       return;
     }
@@ -169,10 +170,7 @@ export class JobProgressCoordinator {
   async recover(): Promise<void> {
     if(this.store.hasDelivering()&&!await this.drainAdapterUntilSettled("startup"))return;
     this.store.recoverDeliveries();
-    for (const progress of this.store.recoverable()) {
-      const job = this.jobs.getJob(progress.job_id);
-      if (job && terminalStatuses.has(job.status)) await this.ingest(job);
-    }
+    let after="";for(;;){const batch=this.store.recoverable(after,500);for(const progress of batch){const job=this.jobs.getJob(progress.job_id);if(job&&terminalStatuses.has(job.status))await this.ingest(job);}if(batch.length<500)break;after=batch.at(-1)!.job_id;}
   }
   async report(): Promise<void> {
     const progress = this.store.pending(); if (!progress) return;

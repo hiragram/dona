@@ -131,7 +131,7 @@ export class JobSupervisor {
     try {
       let after="";
       for (;;) {
-        const batch=this.database.listNonterminalJobs(after,500);
+        const batch=this.database.listJobsAfter(after,500);
         const cleanup = await Promise.allSettled(batch.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
         cleanup.forEach((result,index)=>{if(result.status==="rejected")this.logger.warn("Disabled job progress cleanup failed",{job_id:batch[index]!.job_id,error_code:"job_progress_disable_cleanup_failed"});});
         if(batch.length<500)break;
