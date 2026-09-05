@@ -793,6 +793,9 @@ test("outbox本文の7日保持は作成時でなく終端またはneeds_review�
   const reviewed = repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", sixthDay);
   assert.equal(reviewed.content_delete_at, "2026-09-18T00:01:00Z");
   assert.equal(repo.getOutbox(claim.outbox_id, "2026-09-17T00:01:00Z")?.content, input.content);
+  repo.reconcile(claim.outbox_id, "failed", "retention_proof", { ...actor, role: "admin" }, "2026-09-17T00:01:00Z");
+  assert.equal(repo.getOutbox(claim.outbox_id, "2026-09-17T00:01:00Z")?.content_delete_at, "2026-09-18T00:01:00Z");
+  assert.equal(repo.getOutbox(claim.outbox_id, "2026-09-19T00:01:00Z")?.content, null);
 });
 
 test("時計後退中のrun取消もoutbox終端と本文削除期限を単調化する", () => {
@@ -805,6 +808,18 @@ test("時計後退中のrun取消もoutbox終端と本文削除期限を単調�
     .get(run.run_id) as { terminal_at: string; content_delete_at: string };
   assert.equal(stored.terminal_at, due);
   assert.equal(stored.content_delete_at, "2026-09-12T00:01:00Z");
+});
+
+test("claimed outboxのrun取消はclaim時刻より前へ終端を戻さない", () => {
+  const { repo, raw } = setup();
+  repo.create("claimed_cancel", input, due, actor, now);
+  const run = repo.materialize("claimed_cancel", 1, due, later, due, actor).run;
+  repo.claim(due);
+  repo.setRunState(run.run_id, "materialized", "cancelled", actor, "2026-09-05T00:00:30Z");
+  const stored = raw.prepare("SELECT terminal_at, content_delete_at FROM connector_outbox WHERE run_id = ?")
+    .get(run.run_id) as { terminal_at: string; content_delete_at: string };
+  assert.equal(stored.terminal_at, "2026-09-05T00:02:00Z");
+  assert.equal(stored.content_delete_at, "2026-09-12T00:02:00Z");
 });
 
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {

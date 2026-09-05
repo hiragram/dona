@@ -351,21 +351,23 @@ export class SchedulerRepository {
       }
       const suppressed = next === "cancelled" || next === "failed"
         ? this.db.prepare("SELECT * FROM connector_outbox WHERE run_id = ? AND status IN ('pending','claimed')").all(runId) as Outbox[] : [];
+      const operationAt = [transitionAt, ...suppressed.flatMap(row =>
+        [row.created_at, row.updated_at, row.lease_until ?? row.created_at])].sort().at(-1)!;
       if (suppressed.length > 0) {
         this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
           content_delete_at = ?, claim_token = NULL, lease_until = NULL
-          WHERE run_id = ? AND status IN ('pending','claimed')`).run(transitionAt, transitionAt, add(transitionAt, 604800), runId);
+          WHERE run_id = ? AND status IN ('pending','claimed')`).run(operationAt, operationAt, add(operationAt, 604800), runId);
       }
       this.db.prepare(`UPDATE schedule_runs SET status = ?, job_id = COALESCE(?, job_id), started_at =
         CASE WHEN ? = 'started' THEN ? ELSE started_at END, terminal_at = ? WHERE run_id = ?`)
-        .run(next, jobId, next, transitionAt, next === "started" ? null : transitionAt, runId);
-      for (const row of suppressed) this.auditOutbox(row, `outbox_run_${next}`, transitionAt);
-      this.audit(current, current, `run_${next}`, actor, transitionAt, undefined, this.getRun(runId)!);
+        .run(next, jobId, next, operationAt, next === "started" ? null : operationAt, runId);
+      for (const row of suppressed) this.auditOutbox(row, `outbox_run_${next}`, operationAt);
+      this.audit(current, current, `run_${next}`, actor, operationAt, undefined, this.getRun(runId)!);
       if (workCompletion && hasTarget && notificationReason !== null) {
-        this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, transitionAt, undefined, this.getRun(runId)!);
+        this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, operationAt, undefined, this.getRun(runId)!);
       }
-      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= transitionAt) this.expireSchedule(current, actor, transitionAt);
-      this.completeIfDrained(run.schedule_id, transitionAt);
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= operationAt) this.expireSchedule(current, actor, operationAt);
+      this.completeIfDrained(run.schedule_id, operationAt);
       return this.getRun(runId)!;
     }).immediate();
     if (!result) throw new Error("run_not_authorized");
@@ -384,8 +386,8 @@ export class SchedulerRepository {
         schedule.created_at, schedule.updated_at, schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
       this.checked(schedule.schedule_id, schedule.revision, actor);
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
-        content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
-        .run(outcome, receiptId, reconciledAt, reconciledAt, add(reconciledAt, 604800), outboxId);
+        content_delete_at = MIN(COALESCE(content_delete_at, ?), ?), claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
+        .run(outcome, receiptId, reconciledAt, reconciledAt, add(reconciledAt, 604800), add(reconciledAt, 604800), outboxId);
       this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
         .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
       this.audit(schedule, schedule, `reconcile_${outcome}`, actor, reconciledAt, this.getOutbox(outboxId, reconciledAt)!);
