@@ -49,6 +49,15 @@ function maximumCount(counts: Iterable<number>): number {
   return maximum;
 }
 
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, milliseconds);
+    function finish(): void { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); }
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
 const schedulerStatsIntervalMs = 60_000;
 
 export interface JobControlResult {
@@ -399,8 +408,11 @@ export class JobSupervisor {
     let keepPolling = true;
     const pollProgress = (async () => {
       while (keepPolling && !this.stopping) {
-        await new Promise((resolve) => setTimeout(resolve, this.config.queuePollMs));
-        if (keepPolling) await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
+        await abortableDelay(this.config.queuePollMs, this.abortController.signal);
+        if (keepPolling && !this.stopping) {
+          try { await this.progress?.ingest(this.database.getJob(row.job_id) ?? row); }
+          catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
+        }
       }
     })();
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
@@ -420,10 +432,12 @@ export class JobSupervisor {
         waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
+      await this.progress?.ingest(this.database.getJob(row.job_id)!);
       return;
     }
     if (waited.agentStatus === "blocked") {
       this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+      await this.progress?.ingest(this.database.getJob(row.job_id)!);
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {

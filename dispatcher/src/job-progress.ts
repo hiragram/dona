@@ -42,7 +42,9 @@ export class JobProgressStore {
   private readonly db: Database.Database;
   constructor(databasePath: string) {
     fsSync.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+    fsSync.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
+    fsSync.chmodSync(databasePath, 0o600);
     this.db.pragma("journal_mode = WAL"); this.db.pragma("synchronous = FULL"); this.db.pragma("busy_timeout = 2000");
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version > 1) throw new Error(`Job progress schema ${version} is newer than supported schema 1`);
