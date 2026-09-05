@@ -1,3 +1,4 @@
+import type { QueueAdmissionContext, AdmissionCode } from "./queue.js";
 import { createHash } from "node:crypto";
 import { validateHeaderName, validateHeaderValue } from "node:http";
 import { performance } from "node:perf_hooks";
@@ -64,6 +65,7 @@ export interface VerifiedIngressPrincipal {
   readonly principal: Readonly<Record<string, unknown>>;
   readonly connection?: Omit<DeliveryBinding, "connectionId">;
 }
+type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding };
 
 export interface NormalizedExternalEvent {
   readonly providerEventId: string;
@@ -83,6 +85,8 @@ export interface PersistReceipt {
   readonly externalEventId: string;
   readonly outcome: EnqueueResult["outcome"];
   readonly committedAt: string;
+  readonly admission?: AdmissionCode;
+  readonly ackAllowed?: boolean;
 }
 
 export interface ExternalIngressAcknowledgement {
@@ -108,6 +112,7 @@ export interface ExternalEventSourceRegistration {
     verified: VerifiedIngressPrincipal,
   ): Promise<unknown> | unknown;
   parseNormalized(input: unknown): NormalizedExternalEvent;
+  queueSignal?(event: NormalizedExternalEvent, verified: VerifiedIngressPrincipal): QueueAdmissionContext["coalesce"];
   buildAcknowledgement(receipt: PersistReceipt): ExternalIngressAcknowledgement;
 }
 
@@ -327,7 +332,7 @@ export class ExternalIngressProcessor {
     source: ExternalEventSource,
     registration: ExternalEventSourceRegistration,
     request: RawIngressRequest,
-    persist: (envelope: EventEnvelope, binding?: DeliveryBinding) => EnqueueResult,
+    persist: (envelope: EventEnvelope, context: IngressPersistenceContext) => EnqueueResult,
   ): Promise<ExternalIngressResult> {
     const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
@@ -343,6 +348,7 @@ export class ExternalIngressProcessor {
       throw new ExternalIngressAuthenticationError();
     }
 
+    const verifiedConnectionId = verified.connectionId;
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
@@ -359,7 +365,7 @@ export class ExternalIngressProcessor {
     const envelope: EventEnvelope = {
       schema_version: 1,
       source,
-      external_event_id: scopedExternalEventId(source, verified.connectionId, normalized.providerEventId),
+      external_event_id: scopedExternalEventId(source, verifiedConnectionId, normalized.providerEventId),
       type: normalized.type,
       occurred_at: normalized.occurredAt,
       subject: normalized.subject,
@@ -367,15 +373,22 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
-    const result = persist(envelope, verified.connection ? { ...verified.connection, connectionId: verified.connectionId } : undefined);
+    const signal = registration.queueSignal?.(normalized, verified);
+    const result = persist(envelope, {
+      connectionId: verifiedConnectionId,
+      ...(signal ? { coalesce: signal } : {}),
+      ...(verified.connection ? { binding: { ...verified.connection, connectionId: verified.connectionId } } : {}),
+    });
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,
       sequence: result.row.sequence,
       source,
-      externalEventId: result.row.external_event_id,
+      externalEventId: envelope.external_event_id,
       outcome: result.outcome,
-      committedAt: result.row.created_at,
+      committedAt: result.committedAt ?? result.row.created_at,
+      admission: result.admission ?? result.outcome,
+      ackAllowed: result.outcome !== "duplicate_conflict",
     };
     if (result.outcome === "duplicate_conflict") return { receipt, acknowledgement: null };
 

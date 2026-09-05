@@ -212,7 +212,7 @@ test("DB busyはclaimを残さずprovider writeを呼ばない", async (t) => {
 test("disableとdeliveryの競合および未bindingのmanaged sourceはfail closed", async (t) => {
   const {db,file,clock,lifecycle}=fixture(t); await lifecycle.createOrRenew("pilot","folder1");
   const peer=new DispatcherDatabase(file,clock); t.after(()=>peer.close());
-  const legacy=db.enqueue(event("unbound"));
+  const legacy=db.enqueue(event("unbound"),new Date(clock.now()),{connectionId:"pilot"});
   assert.equal(db.nextAvailable(),undefined);
   assert.throws(()=>db.beginDispatch(legacy.row.event_id,"fixture"),/no longer dispatchable/);
   await Promise.all([Promise.resolve().then(()=>peer.connections.disable("pilot",1)),Promise.resolve().then(()=>assert.throws(()=>db.enqueueExternal(event(),binding()),/disabled/))]);
@@ -448,10 +448,11 @@ test("旧generationのqueued eventを新generationへ移してからstopする",
   let duringStop: string | undefined;
   driver.stop = async () => { duringStop = db.enqueueExternal(event("during-stop"), binding()).row.event_id; };
   await lifecycle.stop("pilot","folder1",1);
-  assert.equal(db.beginDispatch(duringStop!,"during-stop",new Date(clock.now())).status,"dispatching");
   assert.equal(db.connections.subscriptions("pilot")[0]!.state,"stopped");
   assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,accepted.row.event_id);
   assert.equal(db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())).status,"dispatching");
+  db.manualComplete(accepted.row.event_id,new Date(clock.now()));
+  assert.equal(db.beginDispatch(duringStop!,"during-stop",new Date(clock.now())).status,"dispatching");
 });
 
 test("window改訂時の再verifyは表示とrenewal判定に同じ保存値を使う",async(t)=>{
@@ -493,10 +494,12 @@ test("stop後もblocked/needs_review/dead_letterと進行中eventを手動retry�
     raw.prepare("UPDATE events SET status=? WHERE event_id=?").run(status,row.event_id);return {status,id:row.event_id};
   });
   clock.value+=9000;driver.cutover=true;await lifecycle.createOrRenew("pilot","folder1");await lifecycle.stop("pilot","folder1",1);
+  for(const item of events)if(["dispatching","waiting_agent"].includes(item.status))raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(item.id);
   for(const item of events){
-    if(["dispatching","waiting_agent"].includes(item.status))raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(item.id);
     db.manualRetry(item.id,true,new Date(clock.now()));
+    assert.equal(db.nextAvailable(new Date(clock.now()))?.event_id,item.id,item.status);
     assert.equal(db.beginDispatch(item.id,"fixture",new Date(clock.now())).status,"dispatching");
+    db.manualComplete(item.id,new Date(clock.now()));
   }
 });
 

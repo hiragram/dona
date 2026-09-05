@@ -153,7 +153,7 @@ describe("DispatcherApi", () => {
     await fs.mkdir(path.dirname(config.updateInternalTokenPath), { recursive: true, mode: 0o700 });
     const token = "a".repeat(64);
     await fs.writeFile(config.updateInternalTokenPath, token, { mode: 0o600 });
-    const database = new DispatcherDatabase(config.databasePath);
+    const database = new DispatcherDatabase(config.databasePath, { defaults: { depth: 1 } });
     const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
     await api.start();
     const envelope = {
@@ -186,6 +186,13 @@ describe("DispatcherApi", () => {
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.outcome, "duplicate_same");
     assert.equal(duplicate.body.event_id, first.body.event_id);
+    const overload = await request(config.socketPath, "POST", "/v1/internal/update-events",
+      { ...envelope, external_event_id: envelope.external_event_id.replace(":terminal:1", ":terminal:2") },
+      "application/json", { "x-dona-update-token": token });
+    assert.equal(overload.status, 503);
+    assert.equal(overload.body.ack_allowed, false);
+    assert.equal((overload.body.error as { code: string }).code, "queue_depth");
+    assert.equal(database.list().length, 1);
     const mismatched = structuredClone(envelope);
     mismatched.payload.active_sha = "3".repeat(40);
     assert.equal((await request(

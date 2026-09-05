@@ -16,6 +16,8 @@ function usage(): never {
   dona-dispatcher connection attach <id> <revision> <subscription.json> --confirm
   dona-dispatcher connection disable <id> <revision> --confirm
   dona-dispatcher serve
+  dona-dispatcher queue status
+  dona-dispatcher queue deliveries <event_id>
   dona-dispatcher event list [--status STATUS]
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
@@ -43,10 +45,15 @@ async function main(): Promise<void> {
     console.log(JSON.stringify(runConnectionCli(config.databasePath, args.slice(1)), null, 2));
     return;
   }
-  if (!["event", "job"].includes(args[0]!)) usage();
+  if (!["event", "job", "queue"].includes(args[0]!)) usage();
   const command = args[1];
-  const database = new DispatcherDatabase(config.databasePath);
+  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   try {
+    if (args[0] === "queue") {
+      if (command === "status") { console.log(JSON.stringify(database.queueHealth(),null,2)); return; }
+      if (command === "deliveries") { console.log(JSON.stringify(database.queueDispatchMetadata(eventIdAt(args,2)),null,2)); return; }
+      usage();
+    }
     if (args[0] === "job") {
       if (command === "list") {
         const statusIndex = args.indexOf("--status");

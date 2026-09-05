@@ -661,3 +661,46 @@ test("永続connection bindingを認証結果からcommitへ渡しdisable/revisi
     assert.equal(normalRoute.status,400);assert.equal(database.list().length,1);
   } finally {await api.stop();database.close();}
 });
+
+test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
+  const {root,config}=await tempConfig();roots.push(root);
+  const database=new DispatcherDatabase(config.databasePath,{defaults:{depth:1,bytes:1_048_576,rate:100,burst:100,coalescing:true}});
+  let ackCount=0;const receipts:any[]=[];
+  const definition=registration();
+  const registry=new ExternalIngressRegistry([{
+    ...definition,
+    queueSignal(){return {resourceKey:"resource",signalKey:"changed",requiresFetch:true};},
+    buildAcknowledgement(receipt){ackCount++;receipts.push(receipt);return definition.buildAcknowledgement(receipt);},
+  }]);
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
+  await api.start();
+  try {
+    const first=fakeBody();assert.ok((await request(config.socketPath,"fake",first,signedHeaders(first))).status<300);
+    const second=fakeBody({providerEventId:"delivery-2"});
+    assert.ok((await request(config.socketPath,"fake",second,signedHeaders(second))).status<300);
+    assert.equal(receipts[1].admission,"coalesced");assert.equal(receipts[1].ackAllowed,true);
+    const mismatch=fakeBody({providerEventId:"delivery-3",payload:{value:"different"}});
+    const rejected=await request(config.socketPath,"fake",mismatch,signedHeaders(mismatch));
+    assert.equal(rejected.status,429);assert.equal(rejected.body.ack_allowed,false);
+    assert.equal((rejected.body.error as any).code,"queue_depth");assert.equal(ackCount,2);
+    const unauth=fakeBody({providerEventId:"bad"});
+    assert.equal((await request(config.socketPath,"fake",unauth,{...signedHeaders(unauth),"X-Fake-Signature":"wrong"})).status,401);
+    assert.equal(database.list().length,1);assert.equal(database.queueDispatchMetadata(database.list()[0]!.event_id).requires_fetch,true);
+  } finally {await api.stop();database.close();}
+});
+
+test("normalizer mutation cannot replace the authenticated queue connection",async()=>{
+  const {root,config}=await tempConfig();roots.push(root);
+  const database=new DispatcherDatabase(config.databasePath);const definition=registration();
+  const registry=new ExternalIngressRegistry([{...definition,normalize(raw,verified){
+    (verified as {connectionId:string}).connectionId="forged";
+    return definition.normalize(raw,verified);
+  }}]);
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
+  await api.start();
+  try {
+    const body=fakeBody();assert.ok((await request(config.socketPath,"fake",body,signedHeaders(body))).status<300);
+    assert.ok(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"connection-a","delivery-1")));
+    assert.equal(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"forged","delivery-1")),undefined);
+  } finally {await api.stop();database.close();}
+});
