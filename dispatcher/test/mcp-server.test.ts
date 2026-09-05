@@ -19,8 +19,8 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "createJob", args: [input] });
         return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
       },
-      async getJob(jobId) {
-        calls.push({ method: "getJob", args: [jobId] });
+      async getJob(jobId, sourceEventId) {
+        calls.push({ method: "getJob", args: [jobId, sourceEventId] });
         return { schema_version: 1, job: { job_id: jobId, status: "running" } };
       },
       async listEventJobs(...args) {
@@ -104,13 +104,13 @@ describe("Dona Dispatcher MCP server", () => {
 
       const status = await client.callTool({
         name: "get_job_status",
-        arguments: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" },
+        arguments: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
       });
       assert.equal(status.isError, undefined);
       assert.equal((status.structuredContent as { job: { status: string } }).job.status, "running");
       assert.deepEqual(calls[1], {
         method: "getJob",
-        args: ["job_01m1es03xy5cf8d9pm5cwx4srv"],
+        args: ["job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV"],
       });
 
       const body = {

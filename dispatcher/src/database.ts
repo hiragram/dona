@@ -1128,14 +1128,14 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
+  assertJobSourceMatchesThread(jobId: string, sourceEventId: string, allowNotification = false): void {
     const job = this.getJobRequired(jobId);
     const sourceEvent = this.getRequired(sourceEventId);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
     if (
-      sourceEvent.source !== "slack" ||
+      (sourceEvent.source !== "slack" && !(allowNotification && sourceEvent.source === "dona_job")) ||
       stringValue(replyTarget.workspace_id) !== job.workspace_id ||
       stringValue(replyTarget.channel_id) !== job.channel_id ||
       stringValue(replyTarget.thread_ts) !== job.thread_ts

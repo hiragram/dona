@@ -157,6 +157,7 @@ export class JobSupervisor {
     return this.serialized(jobId, async () => {
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
+      this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
       if (before.status === "cancelled") return { row: before, duplicate: true };
       const cancelling = this.database.beginJobCancellation(jobId, sourceEventId);
       if (["queued", "retryable_failed"].includes(before.status)) {
