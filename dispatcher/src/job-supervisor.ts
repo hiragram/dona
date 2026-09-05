@@ -115,6 +115,7 @@ export class JobSupervisor {
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
+    await Promise.allSettled([...this.controls.values()]);
     await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
     this.running = false;
   }

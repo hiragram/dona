@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import { afterEach, describe, test } from "node:test";
 
@@ -631,6 +633,60 @@ describe("DispatcherDatabase", () => {
     competingConnection.close();
     database.close();
   });
+
+  for (const resource of ["jobs_per_event", "objective_utf8_bytes_per_event"] as const) {
+    test(`serializes independent process INSERTs competing for the last ${resource} allowance`, { timeout: 15_000 }, async (t) => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const limits = {
+        jobsPerEventMax: resource === "jobs_per_event" ? 2 : 8,
+        jobObjectiveTotalMaxBytes: resource === "jobs_per_event" ? 400_000 : 6,
+      };
+      const database = new DispatcherDatabase(config.databasePath, limits);
+      t.after(() => database.close());
+      const source = database.enqueue(eventEnvelope(`Ev-process-${resource}`)).row;
+      const request = (jobKey: string) => ({
+        source_event_id: source.event_id, job_key: jobKey,
+        objective: "あ", workspace: { kind: "scratch" as const },
+      });
+      const seed = database.createJob(request("seed"), config.jobsWorkspaceRoot, config.jobResultsDir);
+      const children = ["competitor.one", "competitor.two"].map((key) => {
+        const child = fork(new URL("./fixtures/job-admission-child.ts", import.meta.url), [], {
+          execArgv: ["--import", "tsx"], stdio: ["ignore", "ignore", "inherit", "ipc"],
+        });
+        t.after(() => { if (child.exitCode === null) child.kill(); });
+        const ready = once(child, "message");
+        const exited = once(child, "exit");
+        child.send({
+          databasePath: config.databasePath, limits, request: request(key),
+          workspaceRoot: config.jobsWorkspaceRoot, resultDir: config.jobResultsDir,
+        });
+        return { child, ready, exited, key };
+      });
+      assert.deepEqual((await Promise.all(children.map(({ ready }) => ready))).map(([value]) => value), [{ ready: true }, { ready: true }]);
+      const results = children.map(({ child }) => once(child, "message"));
+      for (const { child } of children) child.send({ go: true });
+      const outcomes = (await Promise.all(results)).map(([value]) => value);
+      assert.deepEqual(await Promise.all(children.map(({ exited }) => exited)), [[0, null], [0, null]]);
+      assert.equal(outcomes.filter((value) => value.outcome === "created").length, 1);
+      const rejected = outcomes.filter((value) => value.code === "job_group_limit_exceeded");
+      assert.equal(rejected.length, 1);
+      assert.deepEqual(rejected[0].details, {
+        resource,
+        current: resource === "jobs_per_event" ? 2 : 6,
+        attempted: resource === "jobs_per_event" ? 3 : 9,
+        maximum: resource === "jobs_per_event" ? 2 : 6,
+      });
+      const rows = database.listEventJobs(source.event_id);
+      assert.equal(rows.length, 2);
+      assert.equal(rows.reduce((sum, row) => sum + Buffer.byteLength(database.getJob(row.job_id)!.objective, "utf8"), 0), 6);
+      assert.equal(database.createJob(request("seed"), config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id, seed.row.job_id);
+      const winnerIndex = outcomes.findIndex((value) => value.outcome === "created");
+      const reused = database.createJob(request(children[winnerIndex]!.key), config.jobsWorkspaceRoot, config.jobResultsDir);
+      assert.equal(reused.outcome, "reused");
+      assert.equal(reused.row.job_id, outcomes[winnerIndex].jobId);
+    });
+  }
 
   test("allows the default eight jobs and rejects the ninth", async () => {
     const { root, config } = await tempConfig();
