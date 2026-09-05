@@ -33,18 +33,73 @@ describe("DispatcherDatabase", () => {
     for (let index = 0; index < 9; index += 1) {
       const duplicate = database.enqueue(eventEnvelope("Ev-1"));
       assert.equal(duplicate.duplicate, true);
+      assert.equal(duplicate.outcome, "duplicate_same");
       assert.equal(duplicate.row.event_id, first.row.event_id);
       assert.equal(duplicate.row.sequence, first.row.sequence);
     }
     const changed = eventEnvelope("Ev-1");
     changed.payload.text = "different";
-    assert.equal(database.enqueue(changed).payloadMismatch, true);
+    const conflict = database.enqueue(changed);
+    assert.equal(conflict.payloadMismatch, true);
+    assert.equal(conflict.outcome, "duplicate_conflict");
 
     const redelivery = eventEnvelope("Ev-1");
     redelivery.trace = { socket_envelope_id: "new-delivery-envelope" };
     assert.equal(database.enqueue(redelivery).payloadMismatch, false);
     assert.equal(database.list().length, 1);
     database.close();
+  });
+
+  test("ignores changing receive time only for Slack events marked with timestamp fallback", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = eventEnvelope("Ev-fallback-time");
+    first.occurred_at = "2026-09-05T00:00:00.000Z";
+    first.trace = { socket_envelope_id: "env-first", occurred_at_source: "received_at" };
+    const created = database.enqueue(first);
+
+    const redelivery = eventEnvelope("Ev-fallback-time");
+    redelivery.occurred_at = "2026-09-05T00:01:00.000Z";
+    redelivery.trace = { socket_envelope_id: "env-retry", occurred_at_source: "received_at" };
+    const duplicate = database.enqueue(redelivery);
+    assert.equal(duplicate.outcome, "duplicate_same");
+    assert.equal(duplicate.payloadMismatch, false);
+    assert.equal(duplicate.row.event_id, created.row.event_id);
+    assert.equal(duplicate.row.occurred_at, first.occurred_at);
+
+    const unmarked = eventEnvelope("Ev-fallback-time");
+    unmarked.occurred_at = "2026-09-05T00:02:00.000Z";
+    assert.equal(database.enqueue(unmarked).outcome, "duplicate_conflict");
+    database.close();
+  });
+
+  test("keeps schema v2 and reads existing source variants and nullable reply targets", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const slack = eventEnvelope("Ev-compat-slack");
+    const job = { ...eventEnvelope("Ev-compat-job"), source: "dona_job" as const, reply_target: null };
+    const update = { ...eventEnvelope("Ev-compat-update"), source: "dona_update" as const, reply_target: null };
+    database.enqueue(slack);
+    database.enqueue(job);
+    database.enqueue(update);
+    database.close();
+
+    const raw = new Database(config.databasePath);
+    assert.equal(raw.pragma("user_version", { simple: true }), 2);
+    raw.close();
+
+    const reopened = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(
+      reopened.list().map((row) => ({ source: envelopeFromRow(row).source, replyTarget: envelopeFromRow(row).reply_target })),
+      [
+        { source: "slack", replyTarget: slack.reply_target },
+        { source: "dona_job", replyTarget: null },
+        { source: "dona_update", replyTarget: null },
+      ],
+    );
+    reopened.close();
   });
 
   test("selects events by insertion sequence and recovers stale dispatching safely", async () => {

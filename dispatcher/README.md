@@ -86,6 +86,8 @@ Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも�
 
 terminal updateは`source: dona_update`としてDispatcherへ戻ります。外部`POST /v1/events`はこのsourceを拒否し、0600 tokenを使う`POST /v1/internal/update-events`だけがtyped payloadを受けます。stable external IDで重複を吸収し、POST response喪失時はexternal IDとcanonical payload SHA-256をlookupしてから判断します。
 
+外部providerは`POST /v1/ingress/:source`の登録contractを使い、raw bytesのprovider認証、strict normalization、SQLite commit receipt、provider ACKをこの順序で処理します。登録のないsourceと`slack` / `dona_job` / `dona_update`の予約名は拒否します。詳細、互換matrix、provider追加手順は[External event ingress contract](../docs/external-event-ingress.md)を参照してください。
+
 `dona_update`は通常のメインキューから除外され、`update-notifications.sqlite3`をtruthとする専用workerがSlack Adapterの`POST /v1/internal/update-notifications`へ通知します。通知IDは`request_id`とterminal fenceへ固定し、Slack message sectionの`block_id`を全thread pageで照合してから完了するため、応答喪失やworker再起動後も二重投稿を避けます。Slack投稿receiptを先に永続化し、その後で元eventのResult Envelopeをatomic publish・再読して`reported`へ進めます。恒久拒否は`needs_review`、通信失敗はbounded backoff付き`pending`として残ります。
 
 ビルド後はリポジトリの[`.codex/config.toml`](../.codex/config.toml)を読んだCodexが`dist/mcp/index.js`を起動します。`npm run dev`が起動するのは常駐DispatcherとSlack Adapterだけです。

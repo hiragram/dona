@@ -27,9 +27,18 @@ export const jobStatuses = [
 
 export type JobStatus = (typeof jobStatuses)[number];
 
+export type BuiltInEventSource = "slack" | "dona_job" | "dona_update";
+
+declare const externalEventSourceBrand: unique symbol;
+export type ExternalEventSource = string & {
+  readonly [externalEventSourceBrand]: "ExternalEventSource";
+};
+
+export type EventSource = BuiltInEventSource | ExternalEventSource;
+
 export interface EventEnvelope {
   schema_version: 1;
-  source: "slack" | "dona_job" | "dona_update";
+  source: EventSource;
   external_event_id: string;
   type: string;
   occurred_at: string;
@@ -113,6 +122,7 @@ export interface EventRow {
 
 export interface EnqueueResult {
   row: EventRow;
+  outcome: "created" | "duplicate_same" | "duplicate_conflict";
   duplicate: boolean;
   payloadMismatch: boolean;
 }

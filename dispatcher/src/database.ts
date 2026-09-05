@@ -33,6 +33,21 @@ function retryAt(attemptCount: number, now: Date): string {
   return new Date(now.getTime() + delay).toISOString();
 }
 
+function usesSlackReceivedAtFallback(trace: Record<string, unknown> | undefined): boolean {
+  return trace?.occurred_at_source === "received_at";
+}
+
+function storedSlackReceivedAtFallback(row: EventRow): boolean {
+  if (row.source !== "slack" || row.trace_json === null) return false;
+  try {
+    const trace = JSON.parse(row.trace_json) as unknown;
+    return trace !== null && typeof trace === "object" && !Array.isArray(trace) &&
+      (trace as Record<string, unknown>).occurred_at_source === "received_at";
+  } catch {
+    return false;
+  }
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
@@ -138,14 +153,22 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
       if (existing) {
+        const ignoreReceivedAtDifference = envelope.source === "slack" &&
+          usesSlackReceivedAtFallback(envelope.trace) && storedSlackReceivedAtFallback(existing);
         const mismatch =
           existing.schema_version !== envelope.schema_version ||
           existing.event_type !== envelope.type ||
-          existing.occurred_at !== envelope.occurred_at ||
+          (!ignoreReceivedAtDifference && existing.occurred_at !== envelope.occurred_at) ||
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
-        return { row: existing, duplicate: true, payloadMismatch: mismatch };
+        const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
+        return {
+          row: existing,
+          outcome,
+          duplicate: true,
+          payloadMismatch: mismatch,
+        };
       }
 
       const eventId = `evt_${ulid(at.getTime())}`;
@@ -174,7 +197,7 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
-      return { row, duplicate: false, payloadMismatch: false };
+      return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
     })();
   }
 
@@ -516,7 +539,7 @@ export class DispatcherDatabase {
     if (job.completion_event_id) {
       const existing = this.get(job.completion_event_id);
       if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
-      return { row: existing, duplicate: true, payloadMismatch: false };
+      return { row: existing, outcome: "duplicate_same", duplicate: true, payloadMismatch: false };
     }
     const sourceEvent = this.getRequired(job.source_event_id);
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
