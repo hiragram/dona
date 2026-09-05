@@ -287,3 +287,19 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 });
+
+test("quiesce during awaited preflight prevents the subsequent claim and prompt", async () => {
+  const {root,config}=await tempConfig();roots.push(root);
+  const database=new DispatcherDatabase(config.databasePath);
+  const row=database.enqueue(eventEnvelope("shutdown-race")).row;
+  let release!:()=>void;let entered=false;let prompts=0;
+  const herdr:HerdrClient={
+    async get(){entered=true;await new Promise<void>(resolve=>{release=resolve;});return ok("idle");},
+    async prompt(){prompts++;return ok("working");},async wait(){return ok("done");},
+  };
+  const worker=new DispatcherWorker(database,herdr,config,logger);worker.start();
+  await waitFor(()=>entered);worker.quiesceAfterCurrent();release();
+  await waitFor(()=>!worker.isRunning());await worker.stop();
+  assert.equal(prompts,0);assert.equal(database.get(row.event_id)?.status,"queued");
+  assert.equal(database.queueHealth().in_flight,0);database.close();
+});
