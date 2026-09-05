@@ -78,6 +78,7 @@ test("restart fences a delivery that may have reached Slack", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-recover-")); const file=path.join(root,"progress.sqlite3");
   let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();
   store = new JobProgressStore(file);
+  store.recoverDeliveries();
   try { assert.equal(store.get("job_abc")?.status,"unknown"); assert.equal(store.pending(),undefined); }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });

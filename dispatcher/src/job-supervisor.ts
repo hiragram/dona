@@ -320,6 +320,7 @@ export class JobSupervisor {
 
   private publishNotifications(): void {
     for (const job of this.database.listJobsNeedingNotification()) {
+      if (this.progress && !this.progress.notificationReady(job.job_id)) continue;
       try {
         const event = this.database.enqueueJobNotification(job.job_id);
         this.logger.info("Job notification event enqueued", {
