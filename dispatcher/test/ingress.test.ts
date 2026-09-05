@@ -319,6 +319,53 @@ describe("external ingress contract", () => {
     database.close();
   });
 
+  test("rejects non-JSON normalized value trees before persistence", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const definition = registration();
+    let attempt = 0;
+    const registry = new ExternalIngressRegistry([{
+      ...definition,
+      parseNormalized(input) {
+        const parsed = definition.parseNormalized(input);
+        attempt += 1;
+        if (attempt === 1) return { ...parsed, payload: { value: 1n } };
+        if (attempt === 2) {
+          const circular: Record<string, unknown> = {};
+          circular.self = circular;
+          return { ...parsed, payload: circular };
+        }
+        if (attempt === 3) return { ...parsed, subject: { resourceId: undefined } };
+        if (attempt === 4) return { ...parsed, trace: { deliveryAttempt: Number.NaN } };
+        return parsed;
+      },
+    }]);
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+    await api.start();
+
+    const body = fakeBody();
+    for (let index = 0; index < 4; index += 1) {
+      assert.equal((await request(config.socketPath, "fake", body, signedHeaders(body))).status, 400);
+      assert.equal(database.list().length, 0);
+    }
+    assert.equal((await request(config.socketPath, "fake", body, signedHeaders(body))).status, 202);
+    assert.equal(database.list().length, 1);
+
+    await api.stop();
+    database.close();
+  });
+
   test("shares one processing deadline across authentication and normalization", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

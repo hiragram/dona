@@ -178,6 +178,42 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isJsonCompatible(value: unknown, ancestors = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || ancestors.has(value)) return false;
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value);
+      if (keys.some((key) => typeof key !== "string") || keys.length !== value.length + 1) return false;
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor?.enumerable || !("value" in descriptor) || !isJsonCompatible(descriptor.value, ancestors)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor) || !isJsonCompatible(descriptor.value, ancestors)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
 function validatePrincipal(input: VerifiedIngressPrincipal): VerifiedIngressPrincipal {
   if (!connectionIdPattern.test(input.connectionId) || !isJsonObject(input.principal)) {
     throw new ExternalIngressAuthenticationError();
@@ -206,7 +242,10 @@ function validateNormalized(input: NormalizedExternalEvent): NormalizedExternalE
     !isUtcRfc3339Timestamp(input.occurredAt) ||
     !isJsonObject(input.subject) || !isJsonObject(input.payload) ||
     (input.replyTarget !== null && !isJsonObject(input.replyTarget)) ||
-    (input.trace !== undefined && !isJsonObject(input.trace))
+    (input.trace !== undefined && !isJsonObject(input.trace)) ||
+    !isJsonCompatible(input.subject) || !isJsonCompatible(input.payload) ||
+    (input.replyTarget !== null && !isJsonCompatible(input.replyTarget)) ||
+    (input.trace !== undefined && !isJsonCompatible(input.trace))
   ) {
     throw new ExternalIngressValidationError();
   }
