@@ -104,8 +104,13 @@ export class JobProgressStore {
   requeueLatest(jobIds: string[], at = new Date()): void {
     if (jobIds.length === 0) return;
     const placeholders = jobIds.map(() => "?").join(",");
-    const latest = this.db.prepare(`SELECT job_id FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY delivered_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string}|undefined;
-    if (latest) this.db.prepare("UPDATE job_progress SET status='pending',available_at=? WHERE job_id=? AND status='delivered'").run(at.toISOString(),latest.job_id);
+    const latest = this.db.prepare(`SELECT job_id,delivered_at FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY delivered_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string;delivered_at?:string}|undefined;
+    if (latest) {
+      const availableAt = latest.delivered_at
+        ? new Date(Math.max(at.getTime(), Date.parse(latest.delivered_at) + 30_000)).toISOString()
+        : at.toISOString();
+      this.db.prepare("UPDATE job_progress SET status='pending',available_at=? WHERE job_id=? AND status='delivered'").run(availableAt,latest.job_id);
+    }
   }
 }
 
@@ -201,7 +206,7 @@ export class JobProgressCoordinator {
       terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) return undefined;
     const siblings = this.jobs.listEventJobs(job.source_event_id);
     const group = this.jobs.getJobGroup(job.source_event_id);
-    if (group?.notification_mode === "grouped" && !group.sealed_at) return undefined;
+    if (group?.notification_mode === "grouped" && (!group.sealed_at || group.attention_event_id !== null)) return undefined;
     const index = siblings.findIndex((item) => item.job_id === job.job_id) + 1;
     return { progress_id:progressId, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts,
       status:siblings.length > 1 ? `${siblings.length}件中${index}件目: ${phaseLabels[progress.phase]}` : phaseLabels[progress.phase] };

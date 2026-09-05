@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 
-import { JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
+import { JobProgressCoordinator, JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
 import { jobProgressPath } from "../src/job-prompt.js";
 
 const valid = { schema_version: 1 as const, job_id: "job_abc", sequence: 1, phase: "testing" as const,
@@ -49,6 +49,37 @@ test("definite pre-delivery failure returns to pending with backoff", async () =
     assert.equal(store.get("job_abc")?.status, "pending");
     assert.equal(store.pending(new Date("2026-09-05T00:00:29Z")), undefined);
     assert.equal(store.pending(new Date("2026-09-05T00:00:30Z"))?.job_id, "job_abc");
+  } finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
+test("terminal sibling requeue preserves the per-job delivery interval", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-requeue-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try {
+    store.ingest(valid, new Date("2026-09-05T00:00:00Z"));
+    store.begin("job_abc");
+    store.delivered("job_abc", new Date("2026-09-05T00:00:10Z"));
+    store.requeueLatest(["job_abc"], new Date("2026-09-05T00:00:20Z"));
+    assert.equal(store.pending(new Date("2026-09-05T00:00:39Z")), undefined);
+    assert.equal(store.pending(new Date("2026-09-05T00:00:40Z"))?.job_id, "job_abc");
+  } finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
+test("an attention-claimed group rejects later progress delivery", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try {
+    store.ingest(valid); store.begin("job_abc");
+    const job = { job_id:"job_abc", source_event_id:"evt_abc", status:"running", workspace_id:"T1", channel_id:"C1", thread_ts:"1.1" };
+    const jobs = {
+      getJob: () => job,
+      listEventJobs: () => [job],
+      getJobGroup: () => ({ notification_mode:"grouped", sealed_at:"2026-09-05T00:00:00Z", attention_event_id:"evt_attention" }),
+    };
+    const coordinator = new JobProgressCoordinator(jobs as never, store, {} as never, {} as never);
+    const progressId = "job_abc:1";
+    (coordinator as unknown as { deliveryClaims:Map<string,string> }).deliveryClaims.set(progressId,"capability");
+    assert.equal(coordinator.resolveDelivery(progressId,"capability"), undefined);
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
