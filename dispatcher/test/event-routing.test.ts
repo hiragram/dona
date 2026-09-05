@@ -50,8 +50,7 @@ test("persisted capability is bound at admission; payload and later policy canno
   assert.equal(database.enqueueProvider(envelope(), owner).row.event_id, source.event_id);
   assert.throws(create, /capability denied/);
   const supplied = envelope("payload-escalation"); supplied.payload = { background_job: true, connection_id: owner.connection_id, resource_id: owner.resource_id };
-  const unknown = database.enqueue(supplied).row;
-  assert.throws(() => database.createJob({ source_event_id: unknown.event_id, objective: "調査", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir), /authenticated provider owner/);
+  assert.throws(() => database.enqueue(supplied), /queue_identity/);
   for (const binding of [{ ...owner, connection_id: "other" }, { ...owner, resource_id: "other" }]) {
     const event = database.enqueueProvider(envelope("policy-test", binding), binding).row;
     assert.equal(database.getEventBinding(event.event_id)?.execution.background_job, false);
@@ -178,7 +177,7 @@ test("additive routing migration preserves v2 Slack rows and rolls back on fault
   migrateEventRouting(raw);
   assert.deepEqual(raw.prepare("SELECT * FROM events").all(), snapshots);
   assert.deepEqual(raw.prepare("SELECT * FROM jobs").get(), before);
-  assert.equal(raw.pragma("user_version", { simple: true }), 2);
+  assert.equal(raw.pragma("user_version", { simple: true }), 4);
   assert.equal(raw.pragma("integrity_check", { simple: true }), "ok"); assert.deepEqual(raw.pragma("foreign_key_check"), []);
   raw.close();
 });
@@ -222,6 +221,7 @@ test("completion commit/restart and notification acceptance unknown preserve job
   db.beginJobPreparation(job.job_id); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
   db.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "結果", completed_at: new Date().toISOString() }, job.result_path);
   const materialized = db.enqueueJobNotification(job.job_id)!;
+  db.manualComplete(event.event_id);
   const jobResult = db.getJob(job.job_id)!.result_json;
   db.close(); // completion commit の直後にprocessが消失した境界。
   const restarted = new DispatcherDatabase(config.databasePath);
@@ -278,6 +278,7 @@ for (const notificationState of ["queued", "completed", "needs_review"] as const
   db.beginJobPreparation(job.job_id); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
   db.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "job結果", completed_at: new Date().toISOString() }, job.result_path);
   const notification = db.enqueueJobNotification(job.job_id)!.row;
+  db.manualComplete(event.event_id);
   if (notificationState !== "queued") {
     db.beginDispatch(notification.event_id, "notification-result");
     if (notificationState === "needs_review") db.markNeedsReview(notification.event_id, "acceptance_unknown", "照合待ち");

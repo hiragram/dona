@@ -20,7 +20,7 @@ export async function runService(
 ): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
-  const database = new DispatcherDatabase(config.databasePath);
+  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,

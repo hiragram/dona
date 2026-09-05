@@ -1,3 +1,4 @@
+import { QueueAdmissionError } from "./queue.js";
 import fs from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
@@ -176,6 +177,7 @@ export class DispatcherApi {
   private quiesceComplete = false;
   private quiesceError: string | undefined;
   private readonly externalIngress: ExternalIngressProcessor;
+  private readonly ingressLimits = new Map<string, {tokens:number; time:number}>();
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -222,6 +224,7 @@ export class DispatcherApi {
 
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.database.closeClaims();
   }
 
   async stop(): Promise<void> {
@@ -243,6 +246,10 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (request.method === "GET" && url.pathname === "/v1/queue") {
+        sendJson(response, 200, this.database.queueHealth());
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -272,7 +279,7 @@ export class DispatcherApi {
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: 2,
+          app_schema: 4,
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
@@ -298,6 +305,7 @@ export class DispatcherApi {
           quiescing: this.shuttingDown,
           drained: this.shuttingDown && this.quiesceComplete && unsafeStates.length === 0 &&
             !this.worker.isRunning() && !this.jobs.isRunning(),
+          queue: this.database.queueHealth(),
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
         });
@@ -338,6 +346,7 @@ export class DispatcherApi {
           service: "dispatcher",
           quiescing: true,
           drained,
+          queue: this.database.queueHealth(),
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
         });
@@ -369,10 +378,12 @@ export class DispatcherApi {
       }
       const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
+      if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
       let result;
       try {
         result = this.database.enqueue(envelope);
       } catch (error) {
+        if (error instanceof QueueAdmissionError) throw error;
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
         );
@@ -426,6 +437,9 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("acknowledgement_unavailable", "Event was persisted but acknowledgement could not be built"));
       } else if (error instanceof RequestValidationError) {
         sendJson(response, 400, errorBody("invalid_request", error.message));
+      } else if (error instanceof QueueAdmissionError) {
+        const internalCompletion = request.method === "POST" && request.url?.split("?")[0] === "/v1/internal/update-events";
+        sendJson(response, error.code === "queue_identity" ? 400 : internalCompletion ? 503 : 429, { schema_version: 1, ack_allowed: false, error: { code: error.code, message: "Event was not admitted; reconcile delivery identity before retry" } });
       } else if (error instanceof PersistenceUnavailableError) {
         this.logger.error("Event could not be persisted", {
           error_code: "persistence_unavailable",
@@ -480,6 +494,13 @@ export class DispatcherApi {
       );
     }
 
+    const monotonicNow = performance.now();
+    const bucket = this.ingressLimits.get(resolved.source) ?? { tokens: 100, time: monotonicNow };
+    bucket.tokens = Math.min(100, bucket.tokens + Math.max(0,monotonicNow-bucket.time)/100);
+    bucket.time = monotonicNow;
+    this.ingressLimits.set(resolved.source,bucket);
+    if (bucket.tokens < 1) { request.resume(); throw new QueueAdmissionError("queue_rate"); }
+    bucket.tokens--;
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
     if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
@@ -501,14 +522,16 @@ export class DispatcherApi {
         resolved.source,
         resolved.registration,
         rawRequest,
-        (envelope, owner) => {
-          const persisted = this.database.enqueueProvider(envelope, owner);
+        (envelope, context) => {
+          if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
+          const persisted = this.database.enqueueProvider(envelope, context.owner, new Date(), context);
           if (persisted.outcome !== "duplicate_conflict") this.worker.wake();
           return persisted;
         },
       );
     } catch (error) {
       if (
+        error instanceof QueueAdmissionError ||
         error instanceof ExternalIngressAuthenticationError ||
         error instanceof ExternalIngressValidationError ||
         error instanceof ExternalIngressTimeoutError ||

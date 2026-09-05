@@ -7,6 +7,7 @@ import type { HerdrClient, HerdrCommandResult } from "./herdr.js";
 import type { Logger } from "./logger.js";
 import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
+import { QueueClaimUnavailableError } from "./queue.js";
 import type { EventRow } from "./types.js";
 
 class WakeSignal {
@@ -84,11 +85,13 @@ export class DispatcherWorker {
 
   quiesceAfterCurrent(): void {
     this.quiescing = true;
+    this.database.closeClaims();
     this.wake();
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.database.closeClaims();
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
@@ -99,7 +102,7 @@ export class DispatcherWorker {
     while (!this.stopping) {
       if (this.quiescing) break;
       let handled = false;
-      if (!this.database.hasBlockedEvent()) {
+      {
         const waiting = this.database.nextWaiting();
         if (waiting) {
           handled = true;
@@ -120,7 +123,7 @@ export class DispatcherWorker {
   private async dispatch(row: EventRow): Promise<void> {
     const started = Date.now();
     const preflight = await this.herdr.get(this.abortController.signal);
-    if (this.stopping || preflight.aborted) return;
+    if (this.stopping || this.quiescing || preflight.aborted) return;
     if (!preflight.ok || !preflight.agentStatus) {
       const updated = this.database.recordPreDispatchFailure(
         row.event_id,
@@ -132,8 +135,7 @@ export class DispatcherWorker {
       return;
     }
     if (preflight.agentStatus === "blocked") {
-      this.database.markBlocked(row.event_id, "dona-main was blocked before prompt submission");
-      this.logCurrentTransition(row, started);
+      // 未promptのeventへmain agentの状態を転記しない。
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
@@ -141,7 +143,9 @@ export class DispatcherWorker {
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {
       await fs.access(resultPath);
-      const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+      if (this.stopping || this.quiescing) return;
+      const dispatching = this.tryClaim(row.event_id, resultPath);
+      if (!dispatching) return;
       this.database.markNeedsReview(
         row.event_id,
         "result_path_exists",
@@ -162,8 +166,12 @@ export class DispatcherWorker {
       }
     }
 
-    const dispatching = this.database.beginDispatch(row.event_id, resultPath);
-    const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
+    if (this.stopping || this.quiescing) return;
+    const dispatching = this.tryClaim(row.event_id, resultPath);
+    if (!dispatching) return;
+    const metadata = this.database.queueDispatchMetadata(row.event_id);
+    const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row)) +
+      (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(metadata)}\nこのsignalは処理時点のresourceをfetchする必要があります。deliveryの集約をfetch完了とみなさないでください。` : "");
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
@@ -201,6 +209,15 @@ export class DispatcherWorker {
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
+  }
+
+  private tryClaim(eventId: string, resultPath: string): EventRow | undefined {
+    try {
+      return this.database.beginDispatch(eventId, resultPath);
+    } catch (error) {
+      if (error instanceof QueueClaimUnavailableError) return undefined;
+      throw error;
+    }
   }
 
   private async resumeWaiting(row: EventRow): Promise<void> {

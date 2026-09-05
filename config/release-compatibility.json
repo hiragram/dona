@@ -2,8 +2,8 @@
   "schema_version": 1,
   "protocol": 1,
   "config": 1,
-  "app_schema_read_min": 2,
-  "app_schema_read_max": 2,
-  "app_schema_write": 2,
+  "app_schema_read_min": 4,
+  "app_schema_read_max": 4,
+  "app_schema_write": 4,
   "rollback_safe": false
 }

@@ -22,6 +22,8 @@ describe("DispatcherDatabase", () => {
     initial.close();
     const legacy = new Database(config.databasePath);
     legacy.exec(`
+      DROP TABLE queue_deliveries; DROP TABLE queue_events; DROP TABLE queue_lanes;
+      DROP TABLE queue_sources; DROP TABLE queue_metrics; DROP TABLE queue_selector;
       DROP TRIGGER completion_notification_projection;
       DROP TABLE job_completions; DROP TABLE job_bindings; DROP TABLE jobs;
       DROP TABLE event_bindings; DROP TABLE provider_execution_policies; DROP TABLE event_routing_migrations;
@@ -83,7 +85,7 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("keeps schema v2 and reads existing source variants and nullable reply targets", async () => {
+  test("reads existing source variants and nullable reply targets with queue schema v4", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -96,7 +98,7 @@ describe("DispatcherDatabase", () => {
     database.close();
 
     const raw = new Database(config.databasePath);
-    assert.equal(raw.pragma("user_version", { simple: true }), 2);
+    assert.equal(raw.pragma("user_version", { simple: true }), 4);
     raw.close();
 
     const reopened = new DispatcherDatabase(config.databasePath);
@@ -121,6 +123,8 @@ describe("DispatcherDatabase", () => {
     database.beginDispatch(first.event_id, `${config.resultsDir}/${first.event_id}.json`);
     assert.equal(database.recoverStaleDispatching(), 1);
     assert.equal(database.get(first.event_id)?.status, "needs_review");
+    assert.equal(database.nextAvailable(), undefined);
+    database.manualComplete(first.event_id);
     assert.equal(database.nextAvailable()?.event_id, second.event_id);
     database.close();
   });
