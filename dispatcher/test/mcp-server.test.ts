@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
+import { DispatcherClientError } from "../src/client.js";
 import type { Logger } from "../src/logger.js";
 import { createDispatcherMcpServer, type DispatcherJobClient } from "../src/mcp/server.js";
 
@@ -12,6 +13,7 @@ const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 describe("Dona Dispatcher MCP server", () => {
   test("advertises job tools and maps GitHub delegation to the UDS client", async () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
+    let planError: Error | undefined;
     const api: DispatcherJobClient = {
       async createJob(input) {
         calls.push({ method: "createJob", args: [input] });
@@ -35,6 +37,7 @@ describe("Dona Dispatcher MCP server", () => {
       },
       async planSelfUpdate(input) {
         calls.push({ method: "planSelfUpdate", args: [input] });
+        if (planError) throw planError;
         return { schema_version: 1, plan: {} };
       },
       async applySelfUpdate(input) {
@@ -91,6 +94,18 @@ describe("Dona Dispatcher MCP server", () => {
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
         }],
       }]);
+
+      const body = {
+        schema_version: 1,
+        error: { code: "request_failed", message: "target_does_not_pass_fixed_ci_trust_gate" },
+      };
+      planError = new DispatcherClientError(409, JSON.stringify(body), body);
+      const rejected = await client.callTool({
+        name: "plan_self_update",
+        arguments: { source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
+      });
+      assert.equal(rejected.isError, true);
+      assert.deepEqual(rejected.structuredContent, body);
     } finally {
       await client.close();
       await server.close();

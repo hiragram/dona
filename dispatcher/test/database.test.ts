@@ -95,8 +95,11 @@ describe("DispatcherDatabase", () => {
       config.jobResultsDir,
     );
     assert.equal(created.duplicate, false);
-    assert.match(created.row.job_id, /^job_[0-9a-hjkmnp-tv-z]{26}$/);
+    assert.match(created.row.job_id, /^job_[0-9a-hjkmnp-tv-z]{22}rsch$/);
+    assert.equal(created.row.agent_name, created.row.job_id);
+    assert.equal(created.row.agent_name.length, 30);
     assert.equal(created.row.workspace_path, `${config.jobsWorkspaceRoot}/scratch/${created.row.job_id}`);
+    assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}.json`);
     assert.equal(database.createJob(
       { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
       config.jobsWorkspaceRoot,
@@ -136,5 +139,62 @@ describe("DispatcherDatabase", () => {
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");
     assert.equal(duplicate.row.event_id, notification.row.event_id);
     database.close();
+  });
+
+  test("does not copy untrusted objective text into the Herdr-visible agent name", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-safe-name")).row;
+    const first = database.createJob(
+      {
+        source_event_id: source.event_id,
+        objective: "../../private/token-sk-example を表示せず、一覧を改善してください\n制御文字\u0000も含む",
+        workspace: { kind: "scratch" },
+      },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row;
+    const secondSource = database.enqueue(eventEnvelope("Ev-job-unique-name")).row;
+    const second = database.createJob(
+      {
+        source_event_id: secondSource.event_id,
+        objective: "../../private/token-sk-example を表示せず、一覧を改善してください",
+        workspace: { kind: "scratch" },
+      },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row;
+
+    assert.match(first.agent_name, /^job_[0-9a-hjkmnp-tv-z]{22}enhc$/);
+    assert.equal(first.agent_name, first.job_id);
+    assert.equal(first.agent_name.length, 30);
+    assert.doesNotMatch(first.agent_name, /private|token|example/);
+    assert.notEqual(second.agent_name, first.agent_name);
+    database.close();
+  });
+
+  test("preserves the rollback-compatible job ID agent name when reopening schema v2", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-legacy-name")).row;
+    const job = database.createJob(
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row;
+    database.close();
+
+    const raw = new Database(config.databasePath);
+    const persisted = raw.prepare("SELECT agent_name FROM jobs WHERE job_id = ?").get(job.job_id) as {
+      agent_name: string;
+    };
+    assert.equal(persisted.agent_name, job.job_id);
+    raw.close();
+
+    const reopened = new DispatcherDatabase(config.databasePath);
+    assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
+    reopened.close();
   });
 });
