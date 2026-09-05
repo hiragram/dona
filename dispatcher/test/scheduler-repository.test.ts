@@ -885,7 +885,7 @@ test("cancel時刻を単調化しcaller skip不一致とSlack credential本文�
   for (const [index, token] of ["xoxe-secret", "xoxc-secret", "xoxd-secret"].entries()) {
     assert.throws(() => repo.create(`token_prefix_${index}`, { ...input, content: token }, due, actor, now), /content_requires_redaction/);
   }
-  for (const [index, content] of ["<!channel> 全体通知", "<!here> 通知", "<@U123> 個別通知"].entries()) {
+  for (const [index, content] of ["<!channel> 全体通知", "<!here> 通知", "<@U123> 個別通知", "<!subteam^S12345> グループ通知"].entries()) {
     assert.throws(() => repo.create(`mention_${index}`, { ...input, content }, due, actor, now), /content_requires_redaction/);
   }
   assert.throws(() => repo.create("target_token", { ...input,

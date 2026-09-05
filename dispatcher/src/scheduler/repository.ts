@@ -60,10 +60,10 @@ function validateReceipt(value: string): void {
 }
 function hasCredentialPattern(value: string): boolean { return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
 function safeContent(value: string, limit: number): void {
-  if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
 function truncateResultContent(value: string): string {
-  if (!value || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
   const points = [...value];
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
