@@ -624,6 +624,44 @@ describe("external ingress contract", () => {
   });
 });
 
+test("永続connection bindingを認証結果からcommitへ渡しdisable/revision不一致ではACKしない", async () => {
+  const {root, config} = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const connection = {id:"connection-a",provider:"fake",account:"tenant1",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"resource-1",events:["fake.changed"]}],capability:{kind:"manual" as const,cursor:false}};
+  database.connections.register(connection);
+  database.connections.attachManual(connection.id,1,"resource-1","fixture-subscription",null);
+  database.connections.observe(connection.id,1,"resource-1",1,{providerId:"fixture-subscription",expiresAt:null,verified:true,cutoverConfirmed:false});
+  let revision=1; let ackCount=0;
+  const base=registration({onAcknowledge:()=>{ackCount++;}});
+  const registry=new ExternalIngressRegistry([{...base,async authenticate(raw){
+    const verified=await base.authenticate(raw);
+    return {...verified,connection:{account:"tenant1",revision,credentialRevision:1,resource:"resource-1",generation:1}};
+  }}]);
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
+  await api.start();
+  try {
+    const body=fakeBody();
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,202);
+    revision=2;
+    const rejected=await request(config.socketPath,"fake",body,signedHeaders(body));
+    assert.equal(rejected.status,403);
+    assert.deepEqual(rejected.body,{schema_version:1,error:{code:"connection_not_authorized",message:"Connection binding is not authorized"}});
+    revision=1;database.connections.disable(connection.id,1);
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,403);
+    assert.equal(ackCount,1);assert.equal(database.list().length,1);
+    const rawHttp=(method:string,route:string,payload?:unknown)=>new Promise<{status:number;body:Record<string,unknown>}>((resolve,reject)=>{
+      const req=http.request({socketPath:config.socketPath,method,path:route,headers:{"content-type":"application/json"}},response=>{
+        const chunks:Buffer[]=[];response.on("data",chunk=>chunks.push(chunk));response.on("end",()=>resolve({status:response.statusCode!,body:JSON.parse(Buffer.concat(chunks).toString())}));
+      });req.on("error",reject);req.end(payload===undefined?undefined:JSON.stringify(payload));
+    });
+    const health=await rawHttp("GET","/health/ready");
+    assert.equal(health.status,200);assert.equal((health.body.connections as {disabled:number}).disabled,1);
+    const normalRoute=await rawHttp("POST","/v1/events",{schema_version:1,source:"fake",external_event_id:"bypass",type:"fake.changed",occurred_at:"2026-09-05T00:00:00.000Z",subject:{},payload:{},reply_target:null});
+    assert.equal(normalRoute.status,400);assert.equal(database.list().length,1);
+  } finally {await api.stop();database.close();}
+});
+
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath,{defaults:{depth:1,bytes:1_048_576,rate:100,burst:100,coalescing:true}});

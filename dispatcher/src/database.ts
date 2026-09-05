@@ -22,6 +22,10 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { stableStringify } from "./validation.js";
 
+import { ConnectionRegistry, type CursorBatch } from "./connections/registry.js";
+import { migrateConnections, connectionDispatchPredicate } from "./connections/schema.js";
+import { ConnectionError, type Clock, type DeliveryBinding } from "./connections/domain.js";
+
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
@@ -50,14 +54,21 @@ function storedSlackReceivedAtFallback(row: EventRow): boolean {
   }
 }
 
+export class EventNotDispatchableError extends Error {
+  constructor(eventId: string) { super(`Event ${eventId} is no longer dispatchable`); this.name = "EventNotDispatchableError"; }
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
+  readonly connections: ConnectionRegistry;
   private claimsClosed = false;
   readonly queuePolicy: QueuePolicy;
 
-  constructor(databasePath: string, queuePolicy: unknown = {}) {
-    this.queuePolicy = queuePolicySchema.parse(queuePolicy);
+  constructor(databasePath: string, queuePolicyOrClock: unknown = {}, clock?: Clock) {
+    const legacyClock = queuePolicyOrClock !== null && typeof queuePolicyOrClock === "object" &&
+      typeof (queuePolicyOrClock as { now?: unknown }).now === "function" ? queuePolicyOrClock as Clock : undefined;
+    this.queuePolicy = queuePolicySchema.parse(legacyClock ? {} : queuePolicyOrClock);
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -69,8 +80,10 @@ export class DispatcherDatabase {
       this.db.transaction(() => {
         this.migrate();
         if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
+        migrateConnections(this.db);
       }).immediate();
     } catch (error) { this.db.close(); throw error; }
+    this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
   }
 
   private migrate(): void {
@@ -232,6 +245,18 @@ export class DispatcherDatabase {
   assertReadableWritable(): void {
     this.db.prepare("SELECT 1").get();
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
+  }
+
+  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+    if (!binding) {
+      if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
+      return this.enqueue(envelope, at, context);
+    }
+    return this.connections.delivery(binding, envelope, () => this.enqueue(envelope, at, context ?? { connectionId: binding.connectionId }));
+  }
+
+  commitConnectionBatch(batch: CursorBatch): EnqueueResult[] {
+    return this.connections.commitBatch(batch, (envelope) => this.enqueue(envelope, new Date(), { connectionId: batch.binding.connectionId }));
   }
 
   enqueue(envelope: EventEnvelope, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
@@ -767,12 +792,12 @@ export class DispatcherDatabase {
     const weights = this.queuePolicy.weights;
     const slots = Object.entries(weights).flatMap(([c,w]) => Array<string>(w).fill(c));
     const step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;
-    const candidates = this.db.prepare(`SELECT e.*,l.class,l.last_selected FROM events e
+    const candidates = this.db.prepare(`SELECT events.*,l.class,l.last_selected FROM events
       JOIN queue_events q USING(event_id) JOIN queue_lanes l USING(lane)
-      WHERE e.status IN ('queued','retryable_failed') AND e.source!='dona_update' AND e.available_at<=?
+      WHERE events.status IN ('queued','retryable_failed') AND events.source!='dona_update' AND events.available_at<=? AND ${connectionDispatchPredicate}
       AND NOT EXISTS (SELECT 1 FROM queue_events older JOIN events prior ON prior.event_id=older.event_id
-        WHERE older.lane=q.lane AND prior.sequence<e.sequence AND prior.status!='completed')
-      ORDER BY l.last_selected,e.sequence`).all(at.toISOString()) as (EventRow & {class:string})[];
+        WHERE older.lane=q.lane AND prior.sequence<events.sequence AND prior.status!='completed')
+      ORDER BY l.last_selected,events.sequence`).all(at.toISOString(), at.getTime()) as (EventRow & {class:string})[];
     for (let offset=0;offset<slots.length;offset++) {
       const candidate = candidates.find(row=>row.class===slots[(step+offset)%slots.length]);
       if (candidate) return candidate;
@@ -835,10 +860,10 @@ export class DispatcherDatabase {
           status = 'dispatching', attempt_count = attempt_count + 1,
           dispatch_started_at = ?, prompt_accepted_at = NULL,
           result_path = ?, last_error_code = NULL, last_error_message = NULL, updated_at = ?
-        WHERE event_id = ? AND status IN ('queued', 'retryable_failed')
+        WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
-      .run(timestamp, resultPath, timestamp, eventId).changes;
-    if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
+      .run(timestamp, resultPath, timestamp, eventId, at.getTime()).changes;
+    if (changed !== 1) throw new EventNotDispatchableError(eventId);
     const slots = Object.entries(this.queuePolicy.weights).flatMap(([c,w])=>Array<string>(w).fill(c));
     const lane = this.db.prepare("SELECT l.lane,l.class FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=?").get(eventId) as {lane:string;class:string};
     let step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;

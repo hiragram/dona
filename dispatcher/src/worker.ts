@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import type { DispatcherDatabase } from "./database.js";
+import { EventNotDispatchableError, type DispatcherDatabase } from "./database.js";
 import type { HerdrClient, HerdrCommandResult } from "./herdr.js";
 import type { Logger } from "./logger.js";
 import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
@@ -154,6 +154,7 @@ export class DispatcherWorker {
       this.logCurrentTransition(dispatching, started);
       return;
     } catch (error) {
+      if (error instanceof EventNotDispatchableError) return;
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         const updated = this.database.recordPreDispatchFailure(
           row.event_id,
