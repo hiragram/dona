@@ -201,9 +201,51 @@ describe("DispatcherDatabase", () => {
     const migratedIndexes = new Set(
       (migrated.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
     );
-    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx"]) {
+    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx", "jobs_runnable_fair_idx"]) {
       assert.equal(migratedIndexes.has(name), true);
     }
+    const runnablePlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+        AND source_event_id > ?
+        AND source_event_id <= ?
+      ORDER BY source_event_id, created_at, job_id
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z", "", "evt_zzzz") as Array<{ detail: string }>;
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const runnableIndexSql = migrated.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(runnableIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(runnableIndexSql, /retryable_failed/);
+    const cycleEndPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+      ORDER BY source_event_id DESC
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const retryPromotionPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      UPDATE jobs INDEXED BY jobs_run_idx
+      SET status = 'queued', updated_at = ?
+      WHERE status = 'retryable_failed' AND available_at <= ?
+    `).all("2026-09-04T00:00:00.000Z", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const retryPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT available_at FROM jobs INDEXED BY jobs_run_idx
+      WHERE status = ? AND available_at > ?
+      ORDER BY available_at, created_at
+      LIMIT 1
+    `).all("retryable_failed", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     assert.equal(
       (migrated.pragma("index_list('job_groups')") as Array<{ name: string }>).some(
         (index) => index.name === "job_groups_transition_idx",
@@ -237,7 +279,24 @@ describe("DispatcherDatabase", () => {
         'agent-duplicate-key', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z'
       );
     `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
+    migrated.exec(`
+      DROP INDEX jobs_runnable_fair_idx;
+      CREATE INDEX jobs_runnable_fair_idx
+        ON jobs(source_event_id, created_at, job_id, available_at)
+        WHERE status IN ('queued', 'retryable_failed');
+    `);
     migrated.close();
+
+    const existingV3 = new DispatcherDatabase(config.databasePath);
+    assert.doesNotThrow(() => existingV3.nextRunnableJob(new Date("2026-09-04T00:00:00.000Z")));
+    existingV3.close();
+    const reopened = new Database(config.databasePath);
+    const repairedIndexSql = reopened.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(repairedIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(repairedIndexSql, /retryable_failed/);
+    reopened.close();
   });
 
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
@@ -520,6 +579,132 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("enforces count admission transactionally while preserving idempotent reuse", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const limits = { jobsPerEventMax: 3, jobObjectiveTotalMaxBytes: 400_000 };
+    const database = new DispatcherDatabase(config.databasePath, limits);
+    const competingConnection = new DispatcherDatabase(config.databasePath, limits);
+    const source = database.enqueue(eventEnvelope("Ev-job-count-limit")).row;
+    const request = (jobKey: string) => ({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `objective ${jobKey}`,
+      workspace: { kind: "scratch" as const },
+    });
+
+    const first = database.createJob(request("job.one"), config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = competingConnection.createJob(
+      request("job.two"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    const cancellation = database.enqueue(eventEnvelope("Ev-job-count-cancel")).row;
+    database.beginJobCancellation(first.row.job_id, cancellation.event_id);
+    database.markJobCancelled(first.row.job_id, "test cancellation");
+    database.beginJobPreparation(second.row.job_id);
+    database.recordJobPreparationFailure(second.row.job_id, "worker_start_failed", "failed", 1);
+    const third = competingConnection.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    assert.equal(database.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row.job_id, third.row.job_id);
+    assert.throws(
+      () => competingConnection.createJob(
+        request("job.four"),
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "jobs_per_event" &&
+        error.limitDetails.attempted === 4,
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    competingConnection.close();
+    database.close();
+  });
+
+  test("allows the default eight jobs and rejects the ninth", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-default-job-limit")).row;
+    for (let index = 1; index <= 8; index += 1) {
+      database.createJob({
+        source_event_id: source.event_id,
+        job_key: `default.${index}`,
+        objective: `objective ${index}`,
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    }
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "default.9",
+        objective: "ninth objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_limit_exceeded",
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 8);
+    database.close();
+  });
+
+  test("enforces canonical objective UTF-8 bytes without counting queued steer text", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: 8,
+      jobObjectiveTotalMaxBytes: 6,
+    });
+    const source = database.enqueue(eventEnvelope("Ev-job-byte-limit")).row;
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "unicode.one",
+      objective: "あ",
+      workspace: { kind: "scratch" as const },
+    };
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const followUp = database.enqueue(eventEnvelope("Ev-job-byte-steer")).row;
+    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "追加条件".repeat(100));
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.two",
+      objective: "ab",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.three",
+      objective: "c",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.throws(
+      () => database.createJob({
+        ...firstRequest,
+        job_key: "unicode.four",
+        objective: "d",
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "objective_utf8_bytes_per_event" &&
+        error.limitDetails.current === 6 &&
+        error.limitDetails.attempted === 7,
+    );
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id,
+      first.row.job_id,
+    );
+    database.close();
+  });
+
   test("claims one attention transition and a later all-terminal transition after explicit cancel", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -583,16 +768,39 @@ describe("DispatcherDatabase", () => {
   test("keeps grouped snapshots bounded and redacts job content", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
-    const database = new DispatcherDatabase(config.databasePath);
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: 32,
+      jobObjectiveTotalMaxBytes: 400_000,
+    });
     const source = database.enqueue(eventEnvelope("Ev-bounded-group")).row;
     database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
     database.markWaiting(source.event_id);
-    const jobs = Array.from({ length: 35 }, (_, index) => database.createJob({
+    const jobs = Array.from({ length: 32 }, (_, index) => database.createJob({
       source_event_id: source.event_id,
       job_key: `job-${index.toString().padStart(2, "0")}`,
       objective: `SECRET-OBJECTIVE-${index}`,
       workspace: { kind: "scratch" },
     }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    const preQuotaDatabase = new Database(config.databasePath);
+    const seed = preQuotaDatabase.prepare("SELECT * FROM jobs WHERE job_id = ?")
+      .get(jobs[0]!.job_id) as SqliteRow;
+    const columns = Object.keys(seed);
+    const insertPreQuotaJob = preQuotaDatabase.prepare(`
+      INSERT INTO jobs (${columns.join(", ")})
+      VALUES (${columns.map((column) => `@${column}`).join(", ")})
+    `);
+    for (let index = 32; index < 35; index += 1) {
+      insertPreQuotaJob.run({
+        ...seed,
+        job_id: `job-pre-quota-${index}`,
+        job_key: `job-${index.toString().padStart(2, "0")}`,
+        objective: `SECRET-OBJECTIVE-${index}`,
+        workspace_path: `${config.jobsWorkspaceRoot}/scratch/job-pre-quota-${index}`,
+        result_path: `${config.jobResultsDir}/job-pre-quota-${index}.json`,
+        agent_name: `job-pre-quota-${index}`,
+      });
+    }
+    preQuotaDatabase.close();
     const attentionJob = jobs[0]!;
     database.beginJobPreparation(attentionJob.job_id);
     database.setJobRuntime(attentionJob.job_id, "secret-workspace-id", "secret-pane-id");

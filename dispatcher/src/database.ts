@@ -4,6 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 
+import { jobResourceDefaults, jobResourceHardLimits } from "./config.js";
 import type {
   CreateJobRequest,
   CreateJobResult,
@@ -26,6 +27,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import {
   canonicalJobPayloadSha256,
+  jobCreationObjectiveBytesFromWorkspace,
   jobCreationPayloadSha256FromWorkspace,
   legacyJobKey,
   parseCreateJobRequest,
@@ -40,13 +42,40 @@ const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 const jobGroupSnapshotJobLimit = 32;
 const jobAttentionStatuses = new Set<JobStatus>(["blocked", "failed", "needs_review"]);
 const jobNotificationStatuses = new Set<JobStatus>(["blocked", "completed", "failed", "cancelled", "needs_review"]);
+const jobsRunnableFairIndexSql = `
+  CREATE INDEX jobs_runnable_fair_idx
+    ON jobs(source_event_id, created_at, job_id, available_at)
+    WHERE status = 'queued'
+`;
 export type JobCreationErrorCode =
   | "job_idempotency_conflict"
   | "job_group_closed"
   | "job_group_limit_exceeded";
 
+export interface JobAdmissionLimits {
+  jobsPerEventMax: number;
+  jobObjectiveTotalMaxBytes: number;
+}
+
+export interface JobCreationLimitDetails {
+  resource: "jobs_per_event" | "objective_utf8_bytes_per_event";
+  current: number;
+  attempted: number;
+  maximum: number;
+}
+
+export interface JobQueueStats {
+  queuedJobs: number;
+  queuedSourceEvents: number;
+  queuedMaxPerEvent: number;
+}
+
 export class JobCreationError extends Error {
-  constructor(readonly code: JobCreationErrorCode, message: string) {
+  constructor(
+    readonly code: JobCreationErrorCode,
+    message: string,
+    readonly limitDetails?: JobCreationLimitDetails,
+  ) {
     super(message);
     this.name = "JobCreationError";
   }
@@ -72,6 +101,21 @@ function nowUtc(): string {
 function retryAt(attemptCount: number, now: Date): string {
   const delay = retryDelaysMs[Math.min(Math.max(attemptCount - 1, 0), retryDelaysMs.length - 1)]!;
   return new Date(now.getTime() + delay).toISOString();
+}
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim().replace(/;$/, "");
+}
+
+function ensureJobsRunnableFairIndex(db: Database.Database): void {
+  const existing = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+  `).get() as { sql: string | null } | undefined;
+  if (existing?.sql && normalizedSql(existing.sql) === normalizedSql(jobsRunnableFairIndexSql)) return;
+  db.transaction(() => {
+    db.exec("DROP INDEX IF EXISTS jobs_runnable_fair_idx");
+    db.exec(jobsRunnableFairIndexSql);
+  })();
 }
 
 export function migrateDispatcherDatabase(
@@ -206,6 +250,7 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
       CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
+      ${jobsRunnableFairIndexSql};
     `);
     migrationHook("indexes_recreated");
 
@@ -248,12 +293,31 @@ export function migrateDispatcherDatabase(
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   })();
+  ensureJobsRunnableFairIndex(db);
 }
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  private readonly jobAdmissionLimits: JobAdmissionLimits;
 
-  constructor(databasePath: string) {
+  constructor(
+    databasePath: string,
+    jobAdmissionLimits: JobAdmissionLimits = jobResourceDefaults,
+  ) {
+    if (
+      !Number.isSafeInteger(jobAdmissionLimits.jobsPerEventMax) ||
+      jobAdmissionLimits.jobsPerEventMax <= 0 ||
+      jobAdmissionLimits.jobsPerEventMax > jobResourceHardLimits.jobsPerEventMax
+    ) {
+      throw new Error(`jobsPerEventMax must be a positive integer at most ${jobResourceHardLimits.jobsPerEventMax}`);
+    }
+    if (
+      !Number.isSafeInteger(jobAdmissionLimits.jobObjectiveTotalMaxBytes) ||
+      jobAdmissionLimits.jobObjectiveTotalMaxBytes <= 0
+    ) {
+      throw new Error("jobObjectiveTotalMaxBytes must be a positive integer");
+    }
+    this.jobAdmissionLimits = { ...jobAdmissionLimits };
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -392,7 +456,12 @@ export class DispatcherDatabase {
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
     const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
-    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace, canonicalPayloadSha256);
+    const objectiveUtf8Bytes = Buffer.byteLength(parsedRequest.objective, "utf8");
+    const workspaceJson = serializeJobWorkspace(
+      parsedRequest.workspace,
+      canonicalPayloadSha256,
+      objectiveUtf8Bytes,
+    );
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -455,6 +524,43 @@ export class DispatcherDatabase {
         throw new JobCreationError(
           "job_group_closed",
           `Legacy job group ${parsedRequest.source_event_id} does not accept additional job keys`,
+        );
+      }
+
+      const admittedJobs = this.db.prepare(`
+        SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
+      `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
+      if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {
+        throw new JobCreationError(
+          "job_group_limit_exceeded",
+          "Job group jobs-per-event limit exceeded",
+          {
+            resource: "jobs_per_event",
+            current: admittedJobs.length,
+            attempted: admittedJobs.length + 1,
+            maximum: this.jobAdmissionLimits.jobsPerEventMax,
+          },
+        );
+      }
+      const currentObjectiveBytes = admittedJobs.reduce((total, row) => {
+        const workspace = JSON.parse(row.workspace_json) as unknown;
+        // Older v3 and migrated v2 rows do not have the immutable byte count. Queued steers only append,
+        // so the persisted objective is a fail-closed upper bound rather than an unsafe undercount.
+        return total + (
+          jobCreationObjectiveBytesFromWorkspace(workspace) ?? Buffer.byteLength(row.objective, "utf8")
+        );
+      }, 0);
+      const attemptedObjectiveBytes = currentObjectiveBytes + objectiveUtf8Bytes;
+      if (attemptedObjectiveBytes > this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) {
+        throw new JobCreationError(
+          "job_group_limit_exceeded",
+          "Job group objective UTF-8 byte limit exceeded",
+          {
+            resource: "objective_utf8_bytes_per_event",
+            current: currentObjectiveBytes,
+            attempted: attemptedObjectiveBytes,
+            maximum: this.jobAdmissionLimits.jobObjectiveTotalMaxBytes,
+          },
         );
       }
 
@@ -627,13 +733,121 @@ export class DispatcherDatabase {
     return storedSha256 === canonicalPayloadSha256 ? "matched" : "conflict";
   }
 
-  listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
+  listRunningJobs(): JobRow[] {
     return this.db.prepare(`
-      SELECT * FROM jobs
-      WHERE (status IN ('queued', 'retryable_failed') AND available_at <= ?)
-         OR status = 'running'
-      ORDER BY created_at LIMIT ?
-    `).all(at.toISOString(), limit) as JobRow[];
+      SELECT * FROM jobs WHERE status = 'running' ORDER BY created_at, job_id
+    `).all() as JobRow[];
+  }
+
+  beginRunnableCycle(at = new Date()): string | undefined {
+    const timestamp = at.toISOString();
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE jobs INDEXED BY jobs_run_idx
+        SET status = 'queued', updated_at = ?
+        WHERE status = 'retryable_failed' AND available_at <= ?
+      `).run(timestamp, timestamp);
+      const row = this.db.prepare(`
+        SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
+        WHERE status = 'queued' AND available_at <= ?
+        ORDER BY source_event_id DESC
+        LIMIT 1
+      `).get(timestamp) as Pick<JobRow, "source_event_id"> | undefined;
+      return row?.source_event_id;
+    })();
+  }
+
+  nextRunnableJob(
+    at = new Date(),
+    afterSourceEventId = "",
+    excludedSourceEventIds: string[] = [],
+    excludedJobIds: string[] = [],
+    throughSourceEventId?: string,
+  ): JobRow | undefined {
+    const timestamp = at.toISOString();
+    const cycleEndSourceEventId = throughSourceEventId ?? this.beginRunnableCycle(at);
+    if (cycleEndSourceEventId === undefined) return undefined;
+    const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedSources = excludedSourceEventIds.length > 0
+      ? `AND source_event_id NOT IN (${sourcePlaceholders})`
+      : "";
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const statement = this.db.prepare(`
+      SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+        AND source_event_id > ?
+        AND source_event_id <= ?
+        ${excludedSources}
+        ${excludedJobs}
+      ORDER BY source_event_id, created_at, job_id
+      LIMIT 1
+    `);
+    return statement.get(
+      timestamp,
+      afterSourceEventId,
+      cycleEndSourceEventId,
+      ...excludedSourceEventIds,
+      ...excludedJobIds,
+    ) as JobRow | undefined;
+  }
+
+  nextWaitingJobAt(
+    after: Date,
+    excludedSourceEventIds: string[] = [],
+    excludedJobIds: string[] = [],
+  ): Date | undefined {
+    const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedSources = excludedSourceEventIds.length > 0
+      ? `AND source_event_id NOT IN (${sourcePlaceholders})`
+      : "";
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const statement = this.db.prepare(`
+      SELECT available_at FROM jobs INDEXED BY jobs_run_idx
+      WHERE status = ? AND available_at > ?
+        ${excludedSources}
+        ${excludedJobs}
+      ORDER BY available_at, created_at
+      LIMIT 1
+    `);
+    const nextForStatus = (status: "queued" | "retryable_failed") => statement.get(
+      status,
+      after.toISOString(),
+      ...excludedSourceEventIds,
+      ...excludedJobIds,
+    ) as Pick<JobRow, "available_at"> | undefined;
+    const candidates = [nextForStatus("queued"), nextForStatus("retryable_failed")]
+      .filter((row): row is Pick<JobRow, "available_at"> => row !== undefined)
+      .sort((left, right) => left.available_at.localeCompare(right.available_at));
+    return candidates[0] ? new Date(candidates[0].available_at) : undefined;
+  }
+
+  jobQueueStats(excludedJobIds: string[] = []): JobQueueStats {
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const row = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(job_count), 0) AS queued_jobs,
+        COUNT(*) AS queued_source_events,
+        COALESCE(MAX(job_count), 0) AS queued_max_per_event
+      FROM (
+        SELECT source_event_id, COUNT(*) AS job_count
+        FROM jobs
+        WHERE status IN ('queued', 'retryable_failed')
+          ${excludedJobs}
+        GROUP BY source_event_id
+      )
+    `).get(...excludedJobIds) as {
+      queued_jobs: number;
+      queued_source_events: number;
+      queued_max_per_event: number;
+    };
+    return {
+      queuedJobs: row.queued_jobs,
+      queuedSourceEvents: row.queued_source_events,
+      queuedMaxPerEvent: row.queued_max_per_event,
+    };
   }
 
   listJobsNeedingNotification(limit = 100): JobRow[] {

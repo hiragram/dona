@@ -45,6 +45,39 @@ function createScratchJob(
   ).row;
 }
 
+function createKeyedScratchJobs(
+  database: DispatcherDatabase,
+  config: DispatcherConfig,
+  externalEventId: string,
+  count: number,
+  startOffsetMs: number,
+): { sourceEventId: string; jobs: JobRow[] } {
+  const source = database.enqueue(
+    eventEnvelope(externalEventId),
+    new Date(Date.UTC(2026, 8, 5, 0, 0, 0, startOffsetMs)),
+  ).row;
+  const jobs = Array.from({ length: count }, (_, index) => database.createJob(
+    {
+      source_event_id: source.event_id,
+      job_key: `job.${index + 1}`,
+      objective: `objective ${index + 1}`,
+      workspace: { kind: "scratch" },
+    },
+    config.jobsWorkspaceRoot,
+    config.jobResultsDir,
+    new Date(Date.UTC(2026, 8, 5, 0, 0, 0, startOffsetMs + index)),
+  ).row);
+  return { sourceEventId: source.event_id, jobs };
+}
+
+function waitUntilAbort(signal?: AbortSignal): Promise<HerdrCommandResult> {
+  return new Promise((resolve) => {
+    const aborted = (): void => resolve({ ...ok("working"), aborted: true });
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) aborted();
+  });
+}
+
 function markRunning(database: DispatcherDatabase, jobId: string): void {
   database.beginJobPreparation(jobId);
   database.setJobRuntime(jobId, "1", "w1:p1");
@@ -68,6 +101,392 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  test("fills global slots round-robin without exceeding the per-event limit", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 4;
+    config.jobConcurrencyPerEvent = 2;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-fair-first", 8, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-fair-second", 2, 100);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const schedulerStates: Array<Record<string, unknown>> = [];
+    const schedulerLogger: Logger = {
+      debug(message, fields) {
+        if (message === "Job scheduler state changed") schedulerStates.push(fields ?? {});
+      },
+      info() {}, warn() {}, error() {},
+    };
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(_jobId, signal) { return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, schedulerLogger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 4);
+    const promptedSources = prompted.map((jobId) => sourceByJob.get(jobId));
+    assert.equal(promptedSources.filter((sourceEventId) => sourceEventId === first.sourceEventId).length, 2);
+    assert.equal(promptedSources.filter((sourceEventId) => sourceEventId === second.sourceEventId).length, 2);
+    assert.equal(new Set(prompted).size, 4);
+    assert.ok(schedulerStates.some((fields) =>
+      fields.active_jobs === 4 && fields.active_max_per_event === 2 && fields.queued_jobs === 6
+    ));
+    assert.equal(JSON.stringify(schedulerStates).includes("source_event_id"), false);
+    assert.equal(JSON.stringify(schedulerStates).includes("objective 1"), false);
+    await supervisor.stop();
+    assert.equal(prompted.length, 4);
+    assert.equal(database.listJobs("queued").length, 6);
+    database.close();
+  });
+
+  test("advances the fair cursor so an older event cannot starve a later event", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-fair-cursor-first", 3, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-fair-cursor-second", 1, 100);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 1 && waiters.has(prompted[0]!));
+    assert.equal(sourceByJob.get(prompted[0]!), first.sourceEventId);
+    waiters.get(prompted[0]!)!(ok("done"));
+    await waitFor(() => prompted.length === 2);
+    assert.equal(sourceByJob.get(prompted[1]!), second.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not starve an old fan-out while new source events keep arriving", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const old = createKeyedScratchJobs(database, config, "Ev-continuous-old", 3, 0);
+    const sourceByJob = new Map(old.jobs.map((row) => [row.job_id, row.source_event_id]));
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    const addSource = (externalEventId: string, offsetMs: number): void => {
+      const created = createKeyedScratchJobs(database, config, externalEventId, 1, offsetMs);
+      sourceByJob.set(created.jobs[0]!.job_id, created.sourceEventId);
+      supervisor.wake();
+    };
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 1 && waiters.has(prompted[0]!));
+    assert.equal(sourceByJob.get(prompted[0]!), old.sourceEventId);
+    addSource("Ev-continuous-new-1", 100);
+    waiters.get(prompted[0]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 2 && waiters.has(prompted[1]!));
+    assert.equal(sourceByJob.get(prompted[1]!), old.sourceEventId);
+    addSource("Ev-continuous-new-2", 200);
+    waiters.get(prompted[1]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 3 && waiters.has(prompted[2]!));
+    assert.notEqual(sourceByJob.get(prompted[2]!), old.sourceEventId);
+    addSource("Ev-continuous-new-3", 300);
+    waiters.get(prompted[2]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 4);
+    assert.equal(sourceByJob.get(prompted[3]!), old.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("keeps cursor order when the cursor event is temporarily at its active limit", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-full-ring-first", 2, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-full-ring-second", 2, 100);
+    const third = createKeyedScratchJobs(database, config, "Ev-full-ring-third", 1, 200);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs, ...third.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 2 && waiters.size === 2);
+    assert.deepEqual(
+      new Set(prompted.map((jobId) => sourceByJob.get(jobId))),
+      new Set([first.sourceEventId, second.sourceEventId]),
+    );
+    const firstActiveJob = prompted.find((jobId) => sourceByJob.get(jobId) === first.sourceEventId)!;
+    waiters.get(firstActiveJob)!(ok("done"));
+    await waitFor(() => prompted.length === 3);
+    assert.equal(sourceByJob.get(prompted[2]!), third.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not aggregate the full queue on every scheduler poll", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    createKeyedScratchJobs(database, config, "Ev-stats-throttle", 2, 0);
+    const originalJobQueueStats = database.jobQueueStats.bind(database);
+    let statsQueries = 0;
+    database.jobQueueStats = (excludedJobIds?: string[]) => {
+      statsQueries += 1;
+      return originalJobQueueStats(excludedJobIds);
+    };
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(_jobId, signal) {
+        return new Promise((resolve) => {
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => statsQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(statsQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not rescan a retry backlog before its earliest backoff expires", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-first", 1, 0).jobs,
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-second", 1, 100).jobs,
+    ];
+    const failureAt = new Date();
+    for (const job of jobs) {
+      database.beginJobPreparation(job.job_id, failureAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failureAt);
+    }
+    const originalBeginRunnableCycle = database.beginRunnableCycle.bind(database);
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
+    const originalNextWaitingJobAt = database.nextWaitingJobAt.bind(database);
+    let cycleQueries = 0;
+    let runnableQueries = 0;
+    let retryTimeQueries = 0;
+    database.beginRunnableCycle = (...args): string | undefined => {
+      cycleQueries += 1;
+      return originalBeginRunnableCycle(...args);
+    };
+    database.nextRunnableJob = (...args): JobRow | undefined => {
+      runnableQueries += 1;
+      return originalNextRunnableJob(...args);
+    };
+    database.nextWaitingJobAt = (...args): Date | undefined => {
+      retryTimeQueries += 1;
+      return originalNextWaitingJobAt(...args);
+    };
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => retryTimeQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(cycleQueries, 1);
+    assert.equal(runnableQueries, 0);
+    assert.equal(retryTimeQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("keeps future retry backlog out of the fair runnable index", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const future = createKeyedScratchJobs(database, config, "Ev-future-retry", 8, 0);
+    const ready = createKeyedScratchJobs(database, config, "Ev-ready-after-backlog", 1, 100);
+    const failedAt = new Date("2026-09-05T00:00:01.000Z");
+    for (const job of future.jobs) {
+      database.beginJobPreparation(job.job_id, failedAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failedAt);
+    }
+
+    const beforeRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:05.999Z"));
+    assert.equal(beforeRetry?.job_id, ready.jobs[0]!.job_id);
+    assert.equal(database.getJob(future.jobs[0]!.job_id)?.status, "retryable_failed");
+
+    const afterRetry = database.nextRunnableJob(new Date("2026-09-05T00:00:06.000Z"));
+    assert.equal(afterRetry?.job_id, future.jobs[0]!.job_id);
+    assert.equal(afterRetry?.status, "queued");
+    assert.deepEqual(
+      future.jobs.map((job) => database.getJob(job.job_id)?.status),
+      Array.from({ length: future.jobs.length }, () => "queued"),
+    );
+    database.close();
+  });
+
+  test("counts recovered running jobs before starting queued work", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const recovered = createKeyedScratchJobs(database, config, "Ev-recovered-running", 1, 0);
+    const next = createKeyedScratchJobs(database, config, "Ev-recovered-next", 1, 100);
+    const queued = createKeyedScratchJobs(database, config, "Ev-recovered-queued", 1, 200);
+    markRunning(database, recovered.jobs[0]!.job_id);
+    const waited: string[] = [];
+    const prompted: string[] = [];
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) { waited.push(jobId); return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => waited.length === 2);
+    assert.deepEqual(prompted, [next.jobs[0]!.job_id]);
+    assert.equal(database.getJob(queued.jobs[0]!.job_id)?.status, "queued");
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("releases a slot after worker start failure and retries after transient DB busy", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-start-failure", 1, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-after-failure", 1, 100);
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
+    let queryCount = 0;
+    database.nextRunnableJob = (
+      at?: Date,
+      afterSourceEventId?: string,
+      excludedSourceEventIds?: string[],
+      excludedJobIds?: string[],
+      throughSourceEventId?: string,
+    ): JobRow | undefined => {
+      queryCount += 1;
+      if (queryCount === 1) {
+        const error = new Error("database is busy") as Error & { code?: string };
+        error.code = "SQLITE_BUSY";
+        throw error;
+      }
+      return originalNextRunnableJob(
+        at,
+        afterSourceEventId,
+        excludedSourceEventIds,
+        excludedJobIds,
+        throughSourceEventId,
+      );
+    };
+    const warnings: Array<Record<string, unknown>> = [];
+    const busyLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(message, fields) {
+        if (message === "Job scheduling cycle failed") warnings.push(fields ?? {});
+      },
+    };
+    const prompted: string[] = [];
+    const runtime = fakeRuntime({
+      async prepare(row) {
+        if (row.job_id === first.jobs[0]!.job_id) throw new Error("worker start failed");
+        return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" };
+      },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(_jobId, signal) { return waitUntilAbort(signal); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, busyLogger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.includes(second.jobs[0]!.job_id));
+    assert.equal(database.getJob(first.jobs[0]!.job_id)?.status, "failed");
+    assert.deepEqual(warnings.map((fields) => fields.error_code), ["SQLITE_BUSY"]);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("does not start a queued sibling during a running-job cancel and drain race", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const running = createKeyedScratchJobs(database, config, "Ev-cancel-drain-running", 1, 0);
+    const queued = createKeyedScratchJobs(database, config, "Ev-cancel-drain-queued", 1, 100);
+    const cancellation = database.enqueue(eventEnvelope("Ev-cancel-drain-request")).row;
+    const prompted: string[] = [];
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(_jobId, signal) { return waitUntilAbort(signal); },
+      async cancel() { return ok("idle"); },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => database.getJob(running.jobs[0]!.job_id)?.status === "running");
+    await supervisor.cancel(running.jobs[0]!.job_id, cancellation.event_id, "cancel before drain");
+    await supervisor.stop();
+
+    assert.deepEqual(prompted, [running.jobs[0]!.job_id]);
+    assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
+    assert.equal(database.getJob(queued.jobs[0]!.job_id)?.status, "queued");
+    database.close();
+  });
+
   test("runs a background job and queues a dona_job completion event", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

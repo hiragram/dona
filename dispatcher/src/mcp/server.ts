@@ -5,6 +5,7 @@ import { DispatcherClientError } from "../client.js";
 import type { Logger } from "../logger.js";
 import {
   canonicalJobPayloadSha256,
+  jobObjectiveCharacterMax,
   jobKeyPattern,
   legacyJobKey,
   parseCreateJobRequest,
@@ -40,6 +41,10 @@ const jobKey = z.string().trim().regex(jobKeyPattern);
 const createJobKey = jobKey.refine(
   (value) => value !== legacyJobKey,
   `${legacyJobKey} is reserved; omit job_key for legacy behavior`,
+);
+const jobObjective = z.string().trim().min(1).refine(
+  (value) => Array.from(value).length <= jobObjectiveCharacterMax,
+  `must be at most ${jobObjectiveCharacterMax} characters`,
 );
 
 function success(data: Record<string, unknown>) {
@@ -95,7 +100,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     inputSchema: {
       source_event_id: eventId,
       job_key: createJobKey.optional().describe("同じsource event内でcallerがwrite前に決める安定key。省略時のみlegacy-default"),
-      objective: z.string().min(1).max(100_000),
+      objective: jobObjective,
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
@@ -120,7 +125,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     inputSchema: {
       source_event_id: eventId,
       job_key: jobKey.optional(),
-      objective: z.string().min(1).max(100_000).optional(),
+      objective: jobObjective.optional(),
       workspace_kind: z.enum(["scratch", "github"]).optional(),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),

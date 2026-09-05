@@ -4,10 +4,14 @@ import { describe, test } from "node:test";
 import {
   canonicalJobPayload,
   canonicalJobPayloadSha256,
+  jobObjectiveCharacterMax,
+  jobCreationObjectiveBytesFromWorkspace,
+  jobCreationPayloadSha256FromWorkspace,
   parseCreateJobRequest,
   parseEventEnvelope,
   parseInternalUpdateEventEnvelope,
   parseResultEnvelope,
+  serializeJobWorkspace,
   stableStringify,
 } from "../src/validation.js";
 import { eventEnvelope } from "./helpers.js";
@@ -106,5 +110,31 @@ describe("job creation validation", () => {
       stableStringify(canonicalJobPayload(second)),
     );
     assert.equal(canonicalJobPayloadSha256(first), canonicalJobPayloadSha256(second));
+  });
+
+  test("counts objective characters independently from UTF-8 bytes", () => {
+    const base = {
+      source_event_id: "evt_source",
+      job_key: "unicode.boundary",
+      workspace: { kind: "scratch" },
+    };
+    const objective = "😀".repeat(jobObjectiveCharacterMax);
+    const parsed = parseCreateJobRequest({ ...base, objective });
+    assert.equal(Array.from(parsed.objective).length, jobObjectiveCharacterMax);
+    assert.equal(Buffer.byteLength(parsed.objective, "utf8"), 400_000);
+    assert.throws(
+      () => parseCreateJobRequest({ ...base, objective: `${objective}😀` }),
+      /at most 100000 characters/,
+    );
+  });
+
+  test("keeps rollback-sensitive creation metadata strict and stores resource metadata separately", () => {
+    const canonicalPayloadSha256 = "a".repeat(64);
+    const serialized = serializeJobWorkspace({ kind: "scratch" }, canonicalPayloadSha256, 12);
+    const workspace = JSON.parse(serialized) as Record<string, unknown>;
+    assert.deepEqual(workspace.__dona_job_creation, { canonical_payload_sha256: canonicalPayloadSha256 });
+    assert.deepEqual(workspace.__dona_job_resource, { objective_utf8_bytes: 12 });
+    assert.equal(jobCreationPayloadSha256FromWorkspace(workspace), canonicalPayloadSha256);
+    assert.equal(jobCreationObjectiveBytesFromWorkspace(workspace), 12);
   });
 });

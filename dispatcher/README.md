@@ -44,7 +44,10 @@ DONA_HERDR_PATH=herdr
 DONA_AGENT_MISSING_GRACE_MS=5000
 DONA_JOBS_WORKSPACE_ROOT=~/.dona/workspaces
 DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results
+DONA_JOBS_PER_EVENT_MAX=8
+DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES=400000
 DONA_JOB_CONCURRENCY=4
+DONA_JOB_CONCURRENCY_PER_EVENT=2
 DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
 DONA_GH_PATH=gh
@@ -55,6 +58,10 @@ DONA_UPDATE_NOTIFICATION_DATABASE_PATH=~/Library/Application Support/Dona/update
 SLACK_HEALTH_SOCKET_PATH=~/Library/Application Support/Dona/run/slack-adapter.sock
 DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
+
+1つのsource eventから作成できるjobは既定8件（hard upper bound 32）で、作成時に正規化されたobjectiveのUTF-8 byte総量は既定400,000 bytesです。件数には`cancelled`/`failed`も含み、quota到達後も既存`job_key`のidempotency照合は先に処理します。実行はglobal 4件、source eventごと2件を上限とし、複数eventの待機jobはsource event単位のround-robinで選びます。設定値は起動時に正の整数と安全上限を検証します。
+
+構造化ログ`Job scheduler state changed`はglobal/per-eventのqueue・active件数を集約値だけで出し、quota拒否はstable `job_group_limit_exceeded`と対象resource・数値だけを記録します。`job_key`、objective、workspace path、actor由来値はこれらの観測fieldへ含めません。
 
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
 
@@ -174,7 +181,7 @@ npm exec -- tsx src/cli.ts job show job_...
 - `blocked`: 自動解除せず、キュー全体を停止します。
 - `needs_review` / `completed` / `dead_letter`: 自動変更しません。
 
-ジョブは複数同時に動きますが、同じ`dona-main`へのイベント投入は従来どおり1件ずつです。ジョブの`preparing`は再起動時に`retryable_failed`へ戻します。prompt、steer、cancelの受理が曖昧な状態は`needs_review`へ移し、自動再投入しません。`running`は結果ファイルとHerdr agent状態の監視を再開し、最初のpromptを再送しません。
+ジョブはglobal/per-event上限の小さい方を守って複数同時に動きますが、同じ`dona-main`へのイベント投入は従来どおり1件ずつです。source event間はround-robinで選び、1つのfan-outが継続的に全slotを占有しません。ジョブの`preparing`は再起動時に`retryable_failed`へ戻します。prompt、steer、cancelの受理が曖昧な状態は`needs_review`へ移し、自動再投入しません。`running`は結果ファイルとHerdr agent状態の監視を再開し、最初のpromptを再送しません。
 
 Result Envelopeは完成パスの最大1 MiB、schema version、event ID、status、UTC完了日時を検証します。`actions`は保存するだけで実行しません。agentの画面テキストは結果判定に使いません。
 

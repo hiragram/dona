@@ -253,6 +253,59 @@ describe("DispatcherApi", () => {
     database.close();
   });
 
+  test("returns a stable quota error and logs only bounded resource fields", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobsPerEventMax = 1;
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: config.jobsPerEventMax,
+      jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
+    });
+    const warnings: Array<Record<string, unknown>> = [];
+    const quotaLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(message, fields) {
+        if (message === "Job creation rejected by resource limit") warnings.push(fields ?? {});
+      },
+    };
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      quotaLogger,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-job-quota-api"));
+    const sourceEventId = String(accepted.body.event_id);
+    const requestBody = {
+      source_event_id: sourceEventId,
+      job_key: "private.key",
+      objective: "private objective",
+      workspace: { kind: "scratch" },
+    };
+    assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 202);
+    assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 200);
+    const rejected = await request(config.socketPath, "POST", "/v1/jobs", {
+      ...requestBody,
+      job_key: "private.second",
+    });
+
+    assert.equal(rejected.status, 409);
+    assert.equal((rejected.body.error as Record<string, unknown>).code, "job_group_limit_exceeded");
+    assert.deepEqual(warnings, [{
+      error_code: "job_group_limit_exceeded",
+      resource: "jobs_per_event",
+      current_value: 1,
+      attempted_value: 2,
+      limit_value: 1,
+    }]);
+    assert.equal(JSON.stringify(warnings).includes("private"), false);
+    assert.equal(database.listEventJobs(sourceEventId).length, 1);
+    await api.stop();
+    database.close();
+  });
+
   test("recovers a committed job after the create response body is lost without resending the write", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
