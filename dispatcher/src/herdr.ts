@@ -117,7 +117,7 @@ export class HerdrProcessClient implements HerdrClient {
   }
 
   get(signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.run(["--session", this.options.session, "agent", "get", this.options.agentName], this.commandTimeoutMs, signal);
+    return this.run(["--session", this.options.session, "agent", "get", this.options.agentName], this.commandTimeoutMs, signal, true);
   }
 
   prompt(text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -165,10 +165,16 @@ export class HerdrProcessClient implements HerdrClient {
       ],
       this.options.waitTimeoutMs + 5_000,
       signal,
+      true,
     );
   }
 
-  private run(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  private run(
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+    settleBeforeClose = false,
+  ): Promise<HerdrCommandResult> {
     return new Promise((resolve) => {
       const child = spawn(this.options.executable, args, {
         shell: false,
@@ -196,12 +202,12 @@ export class HerdrProcessClient implements HerdrClient {
       const abort = (): void => {
         aborted = true;
         terminate();
-        finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
+        if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
       };
       const timer = setTimeout(() => {
         timedOut = true;
         terminate();
-        finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
+        if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
       }, timeoutMs);
       timer.unref();
       signal?.addEventListener("abort", abort, { once: true });

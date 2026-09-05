@@ -121,6 +121,7 @@ function runProcess(
   args: string[],
   timeoutMs: number,
   signal?: AbortSignal,
+  settleBeforeClose = false,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -146,12 +147,12 @@ function runProcess(
     const abort = (): void => {
       aborted = true;
       terminate();
-      finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
       terminate();
-      finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     }, timeoutMs);
     timer.unref();
     signal?.addEventListener("abort", abort, { once: true });
@@ -262,7 +263,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
   }
 
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal);
+    return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal, true);
   }
 
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -291,12 +292,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
   }
 
-  private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  private herdr(
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+    settleBeforeClose = false,
+  ): Promise<HerdrCommandResult> {
     return runProcess(
       this.config.herdrPath,
       ["--session", this.config.herdrSession, ...args],
       timeoutMs,
       signal,
+      settleBeforeClose,
     );
   }
 
