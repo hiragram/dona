@@ -186,8 +186,8 @@ test("recovery tolerates an Adapter that has not started yet", async () => {
 
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
-  const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); PRAGMA user_version=1;"); legacy.close();
+  const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); INSERT INTO job_progress VALUES ('job_legacy',1,'testing','token=untrusted','2026-09-05T00:00:00Z','delivered','2026-09-05T00:00:00Z',NULL,NULL); PRAGMA user_version=1;"); legacy.close();
   const store=new JobProgressStore(file);
-  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
+  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); assert.equal((check.prepare("SELECT safe_summary FROM job_progress WHERE job_id='job_legacy'").get() as {safe_summary:string}).safe_summary,"テスト中"); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });

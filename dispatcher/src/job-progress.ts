@@ -56,7 +56,7 @@ export class JobProgressStore {
       CREATE TABLE job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL);
       PRAGMA user_version = 2;
     `))();
-    if (version === 1) this.db.transaction(() => this.db.exec("ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 2;"))();
+    if (version === 1) this.db.transaction(() => this.db.exec(`ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; UPDATE job_progress SET safe_summary=CASE phase WHEN 'preparing' THEN '準備中' WHEN 'implementing' THEN '実装中' WHEN 'testing' THEN 'テスト中' WHEN 'reviewing' THEN 'レビュー中' WHEN 'waiting_ci' THEN 'CI待ち' WHEN 'reconciling' THEN '状態を照合中' ELSE '準備中' END; PRAGMA user_version = 2;`))();
     this.db.exec("CREATE TABLE IF NOT EXISTS job_progress_throttles (workspace_id TEXT PRIMARY KEY, available_at TEXT NOT NULL)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_terminal_idx ON job_progress(terminal_checked,job_id)");
@@ -165,7 +165,9 @@ export class JobProgressCoordinator {
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
     const workspaceAvailableAt=this.store.workspaceAvailableAt(job.workspace_id);
-    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.deferJobs(this.jobs.listJobs(undefined,1_000_000).filter((item)=>item.workspace_id===job.workspace_id&&!terminalStatuses.has(item.status)).map((item)=>item.job_id),workspaceAvailableAt);return;}
+    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){
+      let after="";for(;;){const batch=this.jobs.listNonterminalWorkspaceJobIds(job.workspace_id,after,500);this.store.deferJobs(batch,workspaceAvailableAt);if(batch.length<500)break;after=batch.at(-1)!;}return;
+    }
     const group = this.jobs.getJobGroup(job.source_event_id);
     if (group?.notification_mode === "grouped" && group.attention_event_id !== null) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);
@@ -219,14 +221,14 @@ export class JobProgressCoordinator {
 
   private async drainAdapter():Promise<void> {
     const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");
-    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200||[403,404,503].includes(response.statusCode??0)?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});const abort=()=>request.destroy(Object.assign(new Error("progress drain aborted"),{name:"AbortError"}));this.drainAbort.signal.addEventListener("abort",abort,{once:true});request.once("close",()=>this.drainAbort.signal.removeEventListener("abort",abort));request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED"].includes(error.code??"")?resolve():reject(error));request.end();});
+    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200||[404,503].includes(response.statusCode??0)?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});const abort=()=>request.destroy(Object.assign(new Error("progress drain aborted"),{name:"AbortError"}));this.drainAbort.signal.addEventListener("abort",abort,{once:true});request.once("close",()=>this.drainAbort.signal.removeEventListener("abort",abort));request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED"].includes(error.code??"")?resolve():reject(error));request.end();});
   }
 
   private async drainAdapterUntilSettled(jobId:string):Promise<boolean> {
     for(;;){
       if(this.drainAbort.signal.aborted)return false;
       try {await this.drainAdapter();return true;}
-      catch {if(this.drainAbort.signal.aborted)return false;this.logger.warn("Ambiguous progress drain will be retried",{job_id:jobId,error_code:"job_progress_drain_retry"});await new Promise<void>((resolve)=>{const timer=setTimeout(resolve,5_000);this.drainAbort.signal.addEventListener("abort",()=>{clearTimeout(timer);resolve();},{once:true});});}
+      catch {if(this.drainAbort.signal.aborted)return false;this.logger.warn("Ambiguous progress drain will be retried",{job_id:jobId,error_code:"job_progress_drain_retry"});await new Promise<void>((resolve)=>{let settled=false;const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);this.drainAbort.signal.removeEventListener("abort",finish);resolve();};const timer=setTimeout(finish,5_000);this.drainAbort.signal.addEventListener("abort",finish,{once:true});});}
     }
   }
 
