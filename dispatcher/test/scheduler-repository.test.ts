@@ -729,6 +729,16 @@ test("materializeは保存済みschedule時刻以上でrunとauditを作成す�
     .find(row => row.operation === "materialize")?.created_at, advancedAt);
 });
 
+test("outbox送信直前の期限判定は保存済みschedule時刻を使用する", () => {
+  const { repo } = setup();
+  repo.create("outbox_clock", input, due, actor, now);
+  const first = repo.materialize("outbox_clock", 1, due, later, due, actor).run;
+  repo.materialize("outbox_clock", 1, later, afterLater, later, actor);
+  assert.equal(repo.claim(due), undefined);
+  assert.equal(repo.getRun(first.run_id)?.status, "skipped");
+  assert.equal(repo.getRun(first.run_id)?.reason, "misfire");
+});
+
 test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻さない", () => {
   const { repo, raw } = setup();
   repo.create("request_clock", input, due, actor, now);
@@ -872,6 +882,9 @@ test("cancel時刻を単調化しcaller skip不一致とSlack credential本文�
   assert.throws(() => repo.materialize("bad_skip", 1, due, later, due, actor, "misfire"), /invalid_skip_reason/);
   assert.throws(() => repo.create("xapp_body", { ...input, content: "prefix xapp-secret" }, due, actor, now), /content_requires_redaction/);
   assert.throws(() => repo.create("webhook_body", { ...input, content: "https://hooks.slack.com/services/T/B/secret" }, due, actor, now), /content_requires_redaction/);
+  for (const [index, token] of ["xoxe-secret", "xoxc-secret", "xoxd-secret"].entries()) {
+    assert.throws(() => repo.create(`token_prefix_${index}`, { ...input, content: token }, due, actor, now), /content_requires_redaction/);
+  }
   for (const [index, content] of ["<!channel> 全体通知", "<!here> 通知", "<@U123> 個別通知"].entries()) {
     assert.throws(() => repo.create(`mention_${index}`, { ...input, content }, due, actor, now), /content_requires_redaction/);
   }

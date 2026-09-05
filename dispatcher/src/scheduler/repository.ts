@@ -58,7 +58,7 @@ function validateReceipt(value: string): void {
   // Slack message timestamps contain a decimal point; URLs and bodies are not receipt IDs.
   if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || hasCredentialPattern(value)) throw new Error("invalid_receipt");
 }
-function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
+function hasCredentialPattern(value: string): boolean { return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
@@ -445,12 +445,12 @@ export class SchedulerRepository {
       run.created_at, run.started_at ?? run.created_at, schedule.created_at, schedule.updated_at].sort().at(-1)!;
     const snapshot = this.revision(run);
     const ageOrigin = run.scheduled_for;
-    const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(now) - Date.parse(row.created_at) > 900000;
+    const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(terminalAt) - Date.parse(row.created_at) > 900000;
     const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
-      : snapshot.expires_at <= now ? "authorization_expired"
+      : snapshot.expires_at <= terminalAt ? "authorization_expired"
       : workRetryExpired ? "retry_expired"
-      : row.kind === "slack.reminder.post" && Date.parse(now) - Date.parse(ageOrigin) > 900000 ? "misfire"
-      : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= now) ? "cancelled"
+      : row.kind === "slack.reminder.post" && Date.parse(terminalAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
+      : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= terminalAt) ? "cancelled"
       : null;
     if (reason === null) return false;
     if (reason === "authorization_expired") {
