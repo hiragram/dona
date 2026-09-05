@@ -108,7 +108,14 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - 完了済みジョブとは別の新しい依頼なら、新しい`delegate_job`を作成できる。
 - どのジョブへの入力か曖昧なときは推測でsteerせず、Slackで確認する。
 
-`source: "dona_job"`イベントを受けた場合は、`payload.job_status`と`payload.result`を確認する。
+`source: "dona_job"`イベントを受けた場合は、`payload.job_status`、`payload.result`、任意の`payload.group`を確認する。`payload.group`がある場合はgroup transitionをjob単体のstatusより優先し、次のように処理する。
+
+- `group.transition: "progress"`: siblingが残っている中間通知なので、Agent Sessionを`active`や`suspended`へ変更しない。原則としてSlackへ投稿せず、このevent自身のResult Envelopeだけを`completed`として公開する。
+- `group.transition: "attention"`: `group.status_counts`とboundedな`group.jobs`を基に全siblingの状態を一度だけ簡潔に報告し、Agent Sessionを`suspended`へする。必要な失敗理由は対象jobの`get_job_status`で確認し、running siblingを自動cancelしない。
+- `group.transition: "all_terminal"`: 最終投稿の前に`list_event_jobs(group.source_event_id)`で全jobのdurable summaryを取得し、`group.jobs`の各`job_id`へ`get_job_status`を使って、先に完了したjobを含む`result_json`の`summary`、必要な`output`、`artifacts`を確認して集約する。現在のeventの`payload.result`だけを全体結果として扱わない。報告後にAgent Sessionを`active`へ戻す。
+- `group.jobs`は最大32件のbounded snapshotである。`group.total`が配列長より大きい場合は`list_event_jobs`のsummaryで省略分を補い、詳細Resultを無制限に取得せず、報告がboundedであることを明記する。group snapshot、`list_event_jobs`、`get_job_status`で確認できない事実を補わず、objective、workspace path、result path、runtime identityをSlackへ出さない。
+
+`payload.group`がないlegacy eventだけは、従来どおり次のjob単体ルールで処理する。
 
 - `completed`: `result.summary`と必要なら`result.output`、`result.artifacts`を基に、元の`reply_target`へ結果を投稿する。確認できていない内容を付け足さない。投稿後はAgent Sessionを`active`へ戻す。
 - `failed`または`needs_review`: 自動再実行しない。失敗理由または二重実行リスクを元スレッドへ説明し、人間の判断が必要ならAgent Sessionを`suspended`にする。

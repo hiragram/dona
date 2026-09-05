@@ -418,6 +418,7 @@ describe("JobSupervisor", () => {
       async prompt(_jobId, prompt) {
         promptCount += 1;
         assert.match(prompt, /\[DONA_JOB_BEGIN\]/);
+        assert.match(prompt, /"job_key":"legacy-default"/);
         const result = {
           schema_version: 1,
           job_id: job.job_id,
@@ -445,6 +446,157 @@ describe("JobSupervisor", () => {
     const notification = database.get(database.getJob(job.job_id)!.completion_event_id!);
     assert.equal(notification?.source, "dona_job");
     assert.equal(notification?.event_type, "job_completed");
+    database.close();
+  });
+
+  test("emits progress without completing a running sibling after the source group is sealed", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-progress")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const completed = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "completed",
+      objective: "finish first",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const running = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "running",
+      objective: "keep running",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    for (const job of [completed, running]) markRunning(database, job.job_id);
+    database.saveJobResult(completed.job_id, {
+      schema_version: 1,
+      job_id: completed.job_id,
+      status: "completed",
+      summary: "first done",
+      completed_at: "2026-09-05T04:00:00.000Z",
+    }, completed.result_path);
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T04:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    let wakeCount = 0;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
+    }), config, logger, () => { wakeCount += 1; });
+    supervisor.start();
+    await waitFor(() => database.getJob(completed.job_id)?.completion_event_id !== null);
+    await supervisor.stop();
+
+    const notification = database.get(database.getJob(completed.job_id)!.completion_event_id!)!;
+    const group = JSON.parse(notification.payload_json).group as Record<string, unknown>;
+    assert.equal(group.transition, "progress");
+    assert.equal(group.pending, 1);
+    assert.equal(database.getJob(running.job_id)?.status, "running");
+    assert.equal(database.getJob(running.job_id)?.completion_event_id, null);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, null);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    assert.ok(wakeCount >= 1);
+    database.close();
+  });
+
+  test("claims exactly one all-terminal event for concurrently observable successful siblings", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-successes")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs = ["one", "two"].map((jobKey) => database.createJob({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `finish ${jobKey}`,
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    for (const job of jobs) {
+      markRunning(database, job.job_id);
+      database.saveJobResult(job.job_id, {
+        schema_version: 1,
+        job_id: job.job_id,
+        status: "completed",
+        summary: `${job.job_key} done`,
+        completed_at: "2026-09-05T05:00:00.000Z",
+      }, job.result_path);
+    }
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T05:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => jobs.every((job) => database.getJob(job.job_id)?.completion_event_id !== null));
+    await supervisor.stop();
+
+    const notifications = jobs.map((job) => database.get(database.getJob(job.job_id)!.completion_event_id!)!);
+    const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
+    assert.deepEqual(transitions.sort(), ["all_terminal", "progress"]);
+    const owner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "all_terminal")!;
+    const ownerGroup = JSON.parse(owner.payload_json).group as { total: number; jobs: Array<{ job_id: string }> };
+    assert.equal(ownerGroup.total, 2);
+    assert.deepEqual(ownerGroup.jobs.map(({ job_id }) => job_id).sort(), jobs.map(({ job_id }) => job_id).sort());
+    assert.deepEqual(
+      ownerGroup.jobs.map(({ job_id }) => JSON.parse(database.getJob(job_id)!.result_json!).summary).sort(),
+      ["one done", "two done"],
+    );
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, owner.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, null);
+    database.close();
+  });
+
+  test("claims one attention event for mixed failed, blocked, and needs-review siblings", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-attention-mix")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs = ["failed", "blocked", "needs-review"].map((jobKey) => database.createJob({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `attention ${jobKey}`,
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    for (const job of jobs) markRunning(database, job.job_id);
+    database.saveJobResult(jobs[0]!.job_id, {
+      schema_version: 1,
+      job_id: jobs[0]!.job_id,
+      status: "failed",
+      summary: "reported failure",
+      completed_at: "2026-09-05T06:00:00.000Z",
+    }, jobs[0]!.result_path);
+    database.markJobBlocked(jobs[1]!.job_id, "approval required");
+    database.markJobNeedsReview(jobs[2]!.job_id, "acceptance_unknown", "manual review required");
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T06:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => jobs.every((job) => database.getJob(job.job_id)?.completion_event_id !== null));
+    await supervisor.stop();
+
+    const notifications = jobs.map((job) => database.get(database.getJob(job.job_id)!.completion_event_id!)!);
+    const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
+    assert.equal(transitions.filter((transition) => transition === "attention").length, 1);
+    assert.equal(transitions.filter((transition) => transition === "progress").length, 2);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    const attentionOwner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "attention")!;
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attentionOwner.event_id);
+    assert.deepEqual(
+      (JSON.parse(attentionOwner.payload_json).group as Record<string, unknown>).status_counts,
+      { blocked: 1, failed: 1, needs_review: 1 },
+    );
     database.close();
   });
 

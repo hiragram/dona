@@ -17,6 +17,7 @@ import type {
   JobResultEnvelope,
   JobGroupNotificationMode,
   JobGroupRow,
+  JobGroupSnapshot,
   JobGroupTransition,
   JobRow,
   JobStatus,
@@ -37,6 +38,9 @@ import {
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+const jobGroupSnapshotJobLimit = 32;
+const jobAttentionStatuses = new Set<JobStatus>(["blocked", "failed", "needs_review"]);
+const jobNotificationStatuses = new Set<JobStatus>(["blocked", "completed", "failed", "cancelled", "needs_review"]);
 export type JobCreationErrorCode =
   | "job_idempotency_conflict"
   | "job_group_closed"
@@ -80,6 +84,9 @@ export const dispatcherSchemaCompatibility = {
 export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled";
 // Runtime callers leave this unset. Tests use it to prove that every v2 rebuild phase rolls back atomically.
 export type DispatcherMigrationHook = (step: DispatcherMigrationStep) => void;
+export type JobNotificationStep = "event_enqueued" | "transition_claimed" | "job_linked";
+// Runtime callers leave this unset. Tests use it to prove notification publication is one transaction.
+export type JobNotificationHook = (step: JobNotificationStep) => void;
 
 function nowUtc(): string {
   return new Date().toISOString();
@@ -631,18 +638,17 @@ export class DispatcherDatabase {
   }
 
   sealJobGroup(sourceEventId: string, at = new Date()): JobGroupRow {
-    const timestamp = at.toISOString();
-    const changed = this.db.prepare(`
-      UPDATE job_groups SET sealed_at = ?, updated_at = ?
-      WHERE source_event_id = ? AND sealed_at IS NULL
-    `).run(timestamp, timestamp, sourceEventId).changes;
-    if (changed === 0) this.getJobGroupRequired(sourceEventId);
-    return this.getJobGroupRequired(sourceEventId);
+    return this.db.transaction(() => {
+      const timestamp = at.toISOString();
+      const changed = this.sealJobGroupIfPresent(sourceEventId, timestamp);
+      if (changed === 0) this.getJobGroupRequired(sourceEventId);
+      return this.getJobGroupRequired(sourceEventId);
+    }).immediate();
   }
 
   claimJobGroupTransition(
     sourceEventId: string,
-    transition: JobGroupTransition,
+    transition: Exclude<JobGroupTransition, "progress">,
     eventId: string,
     at = new Date(),
   ): { row: JobGroupRow; claimed: boolean } {
@@ -657,7 +663,7 @@ export class DispatcherDatabase {
         WHERE source_event_id = ? AND ${field} IS NULL
       `).run(eventId, timestamp, sourceEventId).changes;
       return { row: this.getJobGroupRequired(sourceEventId), claimed: changed === 1 };
-    })();
+    }).immediate();
   }
 
   listJobs(status?: JobStatus, limit = 100): JobRow[] {
@@ -807,10 +813,16 @@ export class DispatcherDatabase {
 
   listJobsNeedingNotification(limit = 100): JobRow[] {
     return this.db.prepare(`
-      SELECT * FROM jobs
-      WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
-        AND completion_event_id IS NULL
-      ORDER BY updated_at LIMIT ?
+      SELECT jobs.* FROM jobs
+      JOIN job_groups ON job_groups.source_event_id = jobs.source_event_id
+      WHERE jobs.status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
+        AND jobs.completion_event_id IS NULL
+        AND (job_groups.notification_mode = 'legacy' OR job_groups.sealed_at IS NOT NULL)
+      ORDER BY
+        CASE WHEN jobs.status IN ('blocked', 'failed', 'needs_review') THEN 0 ELSE 1 END,
+        jobs.updated_at,
+        jobs.job_id
+      LIMIT ?
     `).all(limit) as JobRow[];
   }
 
@@ -988,27 +1000,45 @@ export class DispatcherDatabase {
     });
   }
 
-  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult {
+  enqueueJobNotification(
+    jobId: string,
+    at = new Date(),
+    notificationHook: JobNotificationHook = () => {},
+  ): EnqueueResult {
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
       const timestamp = at.toISOString();
-      const group = this.getJobGroupRequired(job.source_event_id);
-      if (group.notification_mode === "grouped") {
-        if (group.attention_event_id || group.all_terminal_event_id) {
-          throw new Error(`Job group ${job.source_event_id} already has grouped notification ownership`);
-        }
-        this.db.prepare(`
-          UPDATE job_groups SET notification_mode = 'legacy', updated_at = ?
-          WHERE source_event_id = ? AND notification_mode = 'grouped'
-        `).run(timestamp, job.source_event_id);
-      }
+      let group = this.getJobGroupRequired(job.source_event_id);
       if (job.completion_event_id) {
         const existing = this.get(job.completion_event_id);
         if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
         return { row: existing, duplicate: true, payloadMismatch: false };
       }
+      if (!jobNotificationStatuses.has(job.status)) {
+        throw new Error(`Job ${jobId} in status ${job.status} does not need a notification`);
+      }
+      const isUnverifiedMigratedLegacyJob =
+        job.job_key === legacyJobKey &&
+        jobCreationPayloadSha256FromWorkspace(JSON.parse(job.workspace_json) as unknown) === undefined;
+      const groupJobCount = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id = ?")
+        .get(job.source_event_id) as { count: number };
+      if (group.notification_mode === "grouped" && isUnverifiedMigratedLegacyJob && groupJobCount.count === 1) {
+        const changed = this.db.prepare(`
+          UPDATE job_groups SET notification_mode = 'legacy', updated_at = ?
+          WHERE source_event_id = ? AND notification_mode = 'grouped'
+            AND attention_event_id IS NULL AND all_terminal_event_id IS NULL
+        `).run(timestamp, job.source_event_id).changes;
+        if (changed !== 1) throw new Error(`Legacy job group ${job.source_event_id} could not be normalized`);
+        group = this.getJobGroupRequired(job.source_event_id);
+      }
+      if (group.notification_mode === "grouped" && !group.sealed_at) {
+        throw new Error(`Job group ${job.source_event_id} is not sealed`);
+      }
       const sourceEvent = this.getRequired(job.source_event_id);
       const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
+      const snapshot = group.notification_mode === "grouped"
+        ? this.buildJobGroupSnapshot(job.source_event_id, group, job)
+        : undefined;
       const envelope: EventEnvelope = {
         schema_version: 1,
         source: "dona_job",
@@ -1025,8 +1055,10 @@ export class DispatcherDatabase {
         },
         payload: {
           job_id: job.job_id,
+          job_key: job.job_key,
           job_status: job.status,
           workspace: parseJobWorkspace(JSON.parse(job.workspace_json)) as Record<string, unknown>,
+          ...(snapshot ? { group: snapshot } : {}),
           ...(result ? { result } : {}),
           ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
           ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
@@ -1037,10 +1069,24 @@ export class DispatcherDatabase {
         trace: { job_id: job.job_id, source_event_id: job.source_event_id },
       };
       const enqueued = this.enqueue(envelope, at);
+      if (enqueued.payloadMismatch) {
+        throw new Error(`Job ${jobId} notification conflicts with an existing completion event`);
+      }
+      notificationHook("event_enqueued");
+      if (snapshot && snapshot.transition !== "progress") {
+        const field = snapshot.transition === "attention" ? "attention_event_id" : "all_terminal_event_id";
+        const claimed = this.db.prepare(`
+          UPDATE job_groups SET ${field} = ?, updated_at = ?
+          WHERE source_event_id = ? AND ${field} IS NULL
+        `).run(enqueued.row.event_id, timestamp, job.source_event_id).changes;
+        if (claimed !== 1) throw new Error(`Job group ${job.source_event_id} lost ${snapshot.transition} ownership`);
+      }
+      notificationHook("transition_claimed");
       this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
         .run(enqueued.row.event_id, timestamp, jobId);
+      notificationHook("job_linked");
       return enqueued;
-    })();
+    }).immediate();
   }
 
   private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
@@ -1113,16 +1159,23 @@ export class DispatcherDatabase {
   }
 
   recoverStaleDispatching(at = new Date()): number {
-    return this.db
-      .prepare(`
+    return this.db.transaction(() => {
+      const timestamp = at.toISOString();
+      this.db.prepare(`
+        UPDATE job_groups SET sealed_at = ?, updated_at = ?
+        WHERE sealed_at IS NULL AND source_event_id IN (
+          SELECT event_id FROM events WHERE status = 'dispatching'
+        )
+      `).run(timestamp, timestamp);
+      return this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
           last_error_code = 'stale_dispatching',
           last_error_message = 'Dispatcher restarted while prompt acceptance was unknown',
           updated_at = ?
         WHERE status = 'dispatching'
-      `)
-      .run(at.toISOString()).changes;
+      `).run(timestamp).changes;
+    }).immediate();
   }
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
@@ -1178,8 +1231,9 @@ export class DispatcherDatabase {
           WHERE event_id = ?
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
+      if (status === "dead_letter") this.sealJobGroupIfPresent(eventId, at.toISOString());
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordSafePromptFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
@@ -1194,8 +1248,9 @@ export class DispatcherDatabase {
             last_error_message = ?, updated_at = ? WHERE event_id = ?
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
+      this.sealJobGroupIfPresent(eventId, at.toISOString());
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordWaitingError(eventId: string, code: string, message: string, at = new Date()): void {
@@ -1247,36 +1302,44 @@ export class DispatcherDatabase {
   }
 
   manualComplete(eventId: string, at = new Date()): EventRow {
-    const row = this.getRequired(eventId);
-    if (row.status === "completed") return row;
-    const result: ResultEnvelope = {
-      schema_version: 1,
-      event_id: eventId,
-      status: "completed",
-      summary: "Manually marked completed after operator review",
-      actions: [],
-      memory_candidates: [],
-      completed_at: at.toISOString(),
-    };
-    this.db
-      .prepare(`
-        UPDATE events SET status = 'completed', result_json = ?, completed_at = ?,
-          last_error_code = NULL, last_error_message = NULL, updated_at = ?
-        WHERE event_id = ?
-      `)
-      .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
-    return this.getRequired(eventId);
+    return this.db.transaction(() => {
+      const row = this.getRequired(eventId);
+      if (row.status === "completed") return row;
+      const timestamp = at.toISOString();
+      const result: ResultEnvelope = {
+        schema_version: 1,
+        event_id: eventId,
+        status: "completed",
+        summary: "Manually marked completed after operator review",
+        actions: [],
+        memory_candidates: [],
+        completed_at: timestamp,
+      };
+      this.db.prepare(`
+          UPDATE events SET status = 'completed', result_json = ?, completed_at = ?,
+            last_error_code = NULL, last_error_message = NULL, updated_at = ?
+          WHERE event_id = ?
+        `).run(stableStringify(result), timestamp, timestamp, eventId);
+      if (["dispatching", "waiting_agent"].includes(row.status)) {
+        this.sealJobGroupIfPresent(eventId, timestamp);
+      }
+      return this.getRequired(eventId);
+    }).immediate();
   }
 
   manualDeadLetter(eventId: string, at = new Date()): EventRow {
-    this.getRequired(eventId);
-    this.db
-      .prepare(`
+    return this.db.transaction(() => {
+      const row = this.getRequired(eventId);
+      const timestamp = at.toISOString();
+      this.db.prepare(`
         UPDATE events SET status = 'dead_letter', last_error_code = 'operator_dead_letter',
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
-      `)
-      .run(at.toISOString(), eventId);
-    return this.getRequired(eventId);
+      `).run(timestamp, eventId);
+      if (["dispatching", "waiting_agent"].includes(row.status)) {
+        this.sealJobGroupIfPresent(eventId, timestamp);
+      }
+      return this.getRequired(eventId);
+    }).immediate();
   }
 
   private getRequired(eventId: string): EventRow {
@@ -1309,6 +1372,54 @@ export class DispatcherDatabase {
     }
   }
 
+  private buildJobGroupSnapshot(
+    sourceEventId: string,
+    group: JobGroupRow,
+    notificationJob: JobRow,
+  ): JobGroupSnapshot {
+    const counts = this.db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM jobs WHERE source_event_id = ? GROUP BY status
+    `).all(sourceEventId) as Array<{ status: JobStatus; count: number }>;
+    const statusCounts: Partial<Record<JobStatus, number>> = {};
+    let total = 0;
+    let pending = 0;
+    let onlySuccessfulTerminalStatuses = true;
+    for (const row of counts) {
+      statusCounts[row.status] = row.count;
+      total += row.count;
+      if (row.status !== "completed" && row.status !== "cancelled") pending += row.count;
+      if (row.status !== "completed" && row.status !== "cancelled") onlySuccessfulTerminalStatuses = false;
+    }
+
+    let transition: JobGroupTransition = "progress";
+    if (jobAttentionStatuses.has(notificationJob.status) && group.attention_event_id === null) {
+      transition = "attention";
+    } else if (total > 0 && onlySuccessfulTerminalStatuses && group.all_terminal_event_id === null) {
+      transition = "all_terminal";
+    }
+
+    const jobs = this.db.prepare(`
+      SELECT job_id, job_key, status FROM jobs
+      WHERE source_event_id = ? ORDER BY created_at, job_id LIMIT ?
+    `).all(sourceEventId, jobGroupSnapshotJobLimit) as JobGroupSnapshot["jobs"];
+    return {
+      source_event_id: sourceEventId,
+      total,
+      pending,
+      status_counts: statusCounts,
+      jobs,
+      transition,
+    };
+  }
+
+  private sealJobGroupIfPresent(sourceEventId: string, timestamp: string): number {
+    return this.db.prepare(`
+      UPDATE job_groups SET sealed_at = ?, updated_at = ?
+      WHERE source_event_id = ? AND sealed_at IS NULL
+    `).run(timestamp, timestamp, sourceEventId).changes;
+  }
+
   private updateJob(
     jobId: string,
     from: JobStatus[],
@@ -1331,14 +1442,23 @@ export class DispatcherDatabase {
     to: EventStatus,
     values: Record<string, string | null>,
   ): void {
-    const timestamp = nowUtc();
-    const assignments = [...Object.keys(values).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
-    const params = [...Object.values(values), to, timestamp, eventId, ...from];
-    const placeholders = from.map(() => "?").join(", ");
-    const changed = this.db
-      .prepare(`UPDATE events SET ${assignments.join(", ")} WHERE event_id = ? AND status IN (${placeholders})`)
-      .run(...params).changes;
-    if (changed !== 1) throw new Error(`Invalid status transition for event ${eventId} to ${to}`);
+    this.db.transaction(() => {
+      const current = this.getRequired(eventId);
+      const timestamp = nowUtc();
+      const assignments = [...Object.keys(values).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
+      const params = [...Object.values(values), to, timestamp, eventId, ...from];
+      const placeholders = from.map(() => "?").join(", ");
+      const changed = this.db
+        .prepare(`UPDATE events SET ${assignments.join(", ")} WHERE event_id = ? AND status IN (${placeholders})`)
+        .run(...params).changes;
+      if (changed !== 1) throw new Error(`Invalid status transition for event ${eventId} to ${to}`);
+      const leftAgentOwnedState =
+        ["dispatching", "waiting_agent"].includes(current.status) &&
+        !["dispatching", "waiting_agent"].includes(to);
+      if (leftAgentOwnedState || ["completed", "blocked", "needs_review", "dead_letter"].includes(to)) {
+        this.sealJobGroupIfPresent(eventId, timestamp);
+      }
+    }).immediate();
   }
 }
 

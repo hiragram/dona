@@ -99,6 +99,17 @@ describe("Dona Dispatcher MCP server", () => {
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
         }],
       }]);
+
+      const status = await client.callTool({
+        name: "get_job_status",
+        arguments: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" },
+      });
+      assert.equal(status.isError, undefined);
+      assert.equal((status.structuredContent as { job: { status: string } }).job.status, "running");
+      assert.deepEqual(calls[1], {
+        method: "getJob",
+        args: ["job_01m1es03xy5cf8d9pm5cwx4srv"],
+      });
     } finally {
       await client.close();
       await server.close();

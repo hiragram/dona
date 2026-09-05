@@ -31,7 +31,7 @@ export const jobGroupNotificationModes = ["grouped", "legacy"] as const;
 
 export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
 
-export type JobGroupTransition = "attention" | "all_terminal";
+export type JobGroupTransition = "progress" | "attention" | "all_terminal";
 
 export interface EventEnvelope {
   schema_version: 1;
@@ -169,6 +169,19 @@ export interface JobGroupRow {
   all_terminal_event_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface JobGroupSnapshot {
+  source_event_id: string;
+  total: number;
+  pending: number;
+  status_counts: Partial<Record<JobStatus, number>>;
+  jobs: Array<{
+    job_id: string;
+    job_key: string;
+    status: JobStatus;
+  }>;
+  transition: JobGroupTransition;
 }
 
 export interface CreateJobResult {
