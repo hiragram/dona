@@ -268,6 +268,7 @@ describe("JobSupervisor", () => {
       },
       async get() {
         gets += 1;
+        if (gets === 1) assert.equal(database.getJob(job.job_id)?.status, "preparing");
         return {
           ...ok(gets === 1 ? "idle" : "working"),
           agentIdentity: '["w1","p1","agent"]',
@@ -287,8 +288,10 @@ describe("JobSupervisor", () => {
     });
     const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
     supervisor.start();
-    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await waitFor(() => ["completed", "needs_review"].includes(database.getJob(job.job_id)?.status ?? ""));
     await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(updated.status, "completed", `${updated.last_error_code}: ${updated.last_error_message}`);
     assert.equal(prompts, 1);
     assert.equal(gets, 2);
     assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
@@ -297,11 +300,25 @@ describe("JobSupervisor", () => {
 
   test("stalled promptのidentity差し替えは再送せずneeds_reviewにする", async () => {
     const { root, config } = await tempConfig(); roots.push(root); config.jobPromptReconcileMs = 100;
-    const database = new DispatcherDatabase(config.databasePath); const job = createScratchJob(database, config, "Ev-stalled-swap"); let prompts=0; let gets=0;
-    const runtime=fakeRuntime({async prepare(){return {herdrWorkspaceId:"w1",herdrPaneId:"p1"};},async prompt(){prompts++;return failed("agent_prompt_stalled");},async get(){gets++;return {...ok("idle"),agentIdentity:gets===1?"old":"new",stateChangeSeq:gets};}});
-    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);supervisor.start();
-    await waitFor(()=>database.getJob(job.job_id)?.status==="needs_review");await supervisor.stop();
-    assert.equal(prompts,1);assert.equal(database.getJob(job.job_id)?.last_error_code,"prompt_agent_identity_changed");assert.equal(database.getJob(job.job_id)?.prompt_accepted_at,null);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-swap");
+    let prompts = 0;
+    let gets = 0;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompts += 1; return failed("agent_prompt_stalled"); },
+      async get() {
+        gets += 1;
+        return { ...ok("idle"), agentIdentity: gets === 1 ? "old" : "new", stateChangeSeq: gets };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    await supervisor.stop();
+    assert.equal(prompts, 1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "prompt_agent_identity_changed");
+    assert.equal(database.getJob(job.job_id)?.prompt_accepted_at, null);
     database.close();
   });
 
@@ -384,10 +401,12 @@ describe("JobSupervisor", () => {
       const database = new DispatcherDatabase(config.databasePath);
       const job = createScratchJob(database, config, `Ev-stalled-${errorCode}`);
       let prompted = false;
+      let reconcileTimeoutMs: number | undefined;
       const runtime = fakeRuntime({
         async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
         async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
-        async get() {
+        async get(_agentName, _signal, timeoutMs) {
+          if (prompted) reconcileTimeoutMs = timeoutMs;
           return prompted
             ? failed(errorCode, timedOut)
             : { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
@@ -399,6 +418,7 @@ describe("JobSupervisor", () => {
       await supervisor.stop();
       assert.equal(database.getJob(job.job_id)?.last_error_code, expected);
       assert.equal(database.getJob(job.job_id)?.prompt_accepted_at, null);
+      assert.ok(reconcileTimeoutMs !== undefined && reconcileTimeoutMs <= config.jobPromptReconcileMs);
       database.close();
     }
   });

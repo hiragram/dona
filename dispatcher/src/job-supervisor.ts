@@ -236,8 +236,9 @@ export class JobSupervisor {
     }
     if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
+    const promptBaseline = await this.readPromptBaseline(preparing);
+    if (this.stopping) return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
-    const promptBaseline = await this.readPromptBaseline(dispatching);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
@@ -292,7 +293,8 @@ export class JobSupervisor {
     const deadline = Date.now() + this.config.jobPromptReconcileMs;
     while (!this.stopping && Date.now() <= deadline) {
       if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
-      const observed = await this.runtime.get(row.agent_name, this.abortController.signal);
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const observed = await this.runtime.get(row.agent_name, this.abortController.signal, remainingMs);
       if (observed.aborted || this.stopping) return;
       if (!observed.ok) {
         this.database.markJobNeedsReview(row.job_id, observed.timedOut ? "prompt_reconcile_timeout" : observed.errorCode ?? "prompt_reconcile_failed", commandMessage(observed));

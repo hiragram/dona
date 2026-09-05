@@ -14,7 +14,7 @@ export interface PreparedJobRuntime {
 
 export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
@@ -81,6 +81,21 @@ function findAgentStatus(input: unknown): AgentStatus | undefined {
   return undefined;
 }
 
+function findAgentSessionId(input: unknown): string | undefined {
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const session = record.agent_session;
+  if (session !== null && typeof session === "object") {
+    const sessionRecord = session as Record<string, unknown>;
+    if (sessionRecord.kind === "id" && typeof sessionRecord.value === "string") return sessionRecord.value;
+  }
+  for (const value of Object.values(record)) {
+    const nested = findAgentSessionId(value);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
 function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentStatus">): HerdrCommandResult {
   const parsed = parseJson(base.ok ? base.stdout : base.stderr || base.stdout);
   const error = findValue(parsed, ["error_code", "code"]);
@@ -88,12 +103,15 @@ function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentSt
   const workspaceId = findValue(parsed, ["workspace_id"]);
   const paneId = findValue(parsed, ["pane_id"]);
   const agentName = findValue(parsed, ["agent_name", "name"]);
+  const agentSessionId = findAgentSessionId(parsed);
   const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...base,
     ...(typeof error === "string" ? { errorCode: error } : {}),
     ...(agentStatus ? { agentStatus } : {}),
-    ...(workspaceId !== undefined || paneId !== undefined || agentName !== undefined ? { agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null]) } : {}),
+    ...(agentSessionId === undefined ? {} : {
+      agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null, agentSessionId]),
+    }),
     ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
 }
@@ -237,8 +255,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", agentName], this.config.jobCommandTimeoutMs, signal);
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal);
   }
 
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {

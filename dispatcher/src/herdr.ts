@@ -50,6 +50,21 @@ function findAgentStatus(input: unknown): AgentStatus | undefined {
   return undefined;
 }
 
+function findAgentSessionId(input: unknown): string | undefined {
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const session = record.agent_session;
+  if (session !== null && typeof session === "object") {
+    const sessionRecord = session as Record<string, unknown>;
+    if (sessionRecord.kind === "id" && typeof sessionRecord.value === "string") return sessionRecord.value;
+  }
+  for (const value of Object.values(record)) {
+    const nested = findAgentSessionId(value);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
 function parseJson(value: string): unknown {
   try {
     return JSON.parse(value);
@@ -65,12 +80,15 @@ function decorateResult(result: Omit<HerdrCommandResult, "errorCode" | "agentSta
   const agentName = findString(parsed, ["agent_name", "name"]);
   const paneId = findString(parsed, ["pane_id"]);
   const workspaceId = findString(parsed, ["workspace_id"]);
+  const agentSessionId = findAgentSessionId(parsed);
   const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...result,
     ...(errorCode === undefined ? {} : { errorCode }),
     ...(agentStatus === undefined ? {} : { agentStatus }),
-    ...(agentName || paneId || workspaceId ? { agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null]) } : {}),
+    ...(agentSessionId === undefined ? {} : {
+      agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null, agentSessionId]),
+    }),
     ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
 }
