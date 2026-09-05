@@ -50,18 +50,6 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => worker.wake(),
     jobProgress,
   );
-  jobSupervisor.recoverStaleJobs();
-  try { await jobProgress?.recover(); }
-  catch (error) {
-    apiLogger.warn("Job progress disabled after recovery failure", {
-      error_code: "job_progress_recovery_failed",
-      error_message: error instanceof Error ? error.message : String(error),
-    });
-    jobProgressStore?.close();
-    jobProgressStore = undefined;
-    jobProgress = undefined;
-    jobSupervisor.disableProgress();
-  }
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -89,6 +77,19 @@ export async function runService(config: DispatcherConfig): Promise<void> {
 
   try {
     await api.start();
+    jobSupervisor.recoverStaleJobs();
+    try { await jobProgress?.recover(); }
+    catch (error) {
+      apiLogger.warn("Job progress disabled after recovery failure", {
+        error_code: "job_progress_recovery_failed",
+        error_message: error instanceof Error ? error.message : String(error),
+      });
+      jobProgressStore?.close();
+      jobProgressStore = undefined;
+      jobProgress = undefined;
+      jobSupervisor.disableProgress();
+      api.disableJobProgress();
+    }
     worker.start();
     jobSupervisor.start();
     updateNotificationWorker.start();

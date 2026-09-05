@@ -63,6 +63,10 @@ export class JobProgressStore {
   ingest(progress: JobProgressEnvelope, at = new Date()): boolean {
     const existing = this.get(progress.job_id);
     if (existing && progress.sequence <= existing.sequence) return false;
+    if (existing?.phase === progress.phase) {
+      if (existing.status !== "delivering" && existing.status !== "unknown") this.db.prepare("UPDATE job_progress SET sequence=?,safe_summary=?,updated_at=? WHERE job_id=?").run(progress.sequence,progress.safe_summary,progress.updated_at,progress.job_id);
+      return false;
+    }
     const timestamp = at.toISOString();
     this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at)
       VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,phase=excluded.phase,
@@ -82,8 +86,8 @@ export class JobProgressStore {
   terminal(jobId: string): void {
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
     this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
-    this.db.prepare("UPDATE job_progress SET terminal_checked=1 WHERE job_id=?").run(jobId);
   }
+  markTerminalChecked(jobId: string): void { this.db.prepare("UPDATE job_progress SET terminal_checked=1 WHERE job_id=?").run(jobId); }
   requeueLatest(jobIds: string[], at = new Date()): void {
     if (jobIds.length === 0) return;
     const placeholders = jobIds.map(() => "?").join(",");
@@ -94,14 +98,17 @@ export class JobProgressStore {
 
 export class JobProgressCoordinator {
   private readonly deliveryClaims = new Map<string,string>();
+  private readonly deliveryOperations = new Map<string,Promise<void>>();
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
     if (terminalStatuses.has(row.status)) {
+      await this.deliveryOperations.get(row.job_id);
       this.store.terminal(row.job_id);
       await fs.unlink(jobProgressPath(row)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
       const runningSiblings = this.jobs.listEventJobs(row.source_event_id).filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
       this.store.requeueLatest(runningSiblings);
+      this.store.markTerminalChecked(row.job_id);
       return;
     }
     try {
@@ -128,6 +135,9 @@ export class JobProgressCoordinator {
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);
+    let finishDelivery!: () => void;
+    const deliveryOperation = new Promise<void>((resolve) => { finishDelivery = resolve; });
+    this.deliveryOperations.set(progress.job_id, deliveryOperation);
     let requestStarted = false;
     try {
       const token = await readPrivateToken(this.config.updateInternalTokenPath);
@@ -145,6 +155,9 @@ export class JobProgressCoordinator {
       this.deliveryClaims.delete(`${job.job_id}:${progress.sequence}`);
       if (definitelyUnsent) this.store.retry(progress.job_id, detail.message, new Date(), detail.retryAfterSeconds);
       else this.store.unknown(progress.job_id, detail.message);
+    } finally {
+      finishDelivery();
+      this.deliveryOperations.delete(progress.job_id);
     }
   }
 

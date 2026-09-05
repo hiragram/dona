@@ -70,7 +70,7 @@ test("store is monotonic, coalesces pending updates, and fences unknown delivery
 test("terminal fence suppresses an undelivered progress update", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-terminal-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
-  try { store.ingest(valid); store.terminal("job_abc"); assert.equal(store.pending(), undefined); assert.deepEqual(store.recoverable(), []); }
+  try { store.ingest(valid); store.terminal("job_abc"); store.markTerminalChecked("job_abc"); assert.equal(store.pending(), undefined); assert.deepEqual(store.recoverable(), []); }
   finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
