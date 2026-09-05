@@ -45,6 +45,18 @@ export class ConnectionRegistry {
   manages(source: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM connections WHERE provider=? LIMIT 1").get(source);
   }
+  private completeUndispatched(id: string, revision: number, now: number, summary: string): number {
+    const completedAt = new Date(now).toISOString();
+    const rows = this.db.prepare(`SELECT events.event_id FROM events JOIN connection_event_bindings binding USING(event_id)
+      WHERE binding.connection_id=? AND binding.revision=? AND events.status IN ('queued','retryable_failed')`)
+      .all(id, revision) as {event_id:string}[];
+    for (const {event_id} of rows) {
+      const result = { schema_version: 1, event_id, status: "completed", summary, actions: [], memory_candidates: [], completed_at: completedAt };
+      this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,
+        last_error_message=NULL,updated_at=? WHERE event_id=?`).run(stableStringify(result), completedAt, completedAt, event_id);
+    }
+    return rows.length;
+  }
   register(input: unknown): Connection {
     const config = parseConfig(input);
     return this.db.transaction(() => {
@@ -68,24 +80,14 @@ export class ConnectionRegistry {
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
-      const completedAt = new Date(now).toISOString();
-      const superseded = this.db.prepare(`SELECT events.event_id FROM events
-        JOIN connection_event_bindings binding USING(event_id)
-        WHERE binding.connection_id=? AND binding.revision=? AND events.status IN ('queued','retryable_failed')`)
-        .all(id, revision) as {event_id:string}[];
-      for (const {event_id} of superseded) {
-        const result = { schema_version: 1, event_id, status: "completed", summary: "Connection revision superseded before dispatch",
-          actions: [], memory_candidates: [], completed_at: completedAt };
-        this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,
-          last_error_message=NULL,updated_at=? WHERE event_id=?`).run(stableStringify(result), completedAt, completedAt, event_id);
-      }
+      const superseded = this.completeUndispatched(id, revision, now, "Connection revision superseded before dispatch");
       this.db.prepare("UPDATE connections SET config_json=?,revision=revision+1,state=CASE WHEN state='disabled' THEN 'disabled' ELSE 'degraded' END WHERE id=?")
         .run(stableStringify(config), id);
       if (config.capability.cursor) for (const entry of config.allowlist) {
         this.db.prepare("INSERT OR IGNORE INTO connection_cursors VALUES(?,?,?,0,NULL)").run(id, entry.resource, revision + 1);
       }
       const result = this.get(id);
-      if (superseded.length) this.audit(result, "queued_events_superseded", now);
+      if (superseded) this.audit(result, "queued_events_superseded", now);
       this.audit(result, "revised", now); return result;
     }).immediate();
   }
@@ -95,7 +97,9 @@ export class ConnectionRegistry {
       if (c.revision !== revision) throw new ConnectionError("revision_conflict");
       if (c.state === "disabled") return;
       const now = this.tick(id, true);
+      const superseded = this.completeUndispatched(id, revision, now, "Connection disabled before dispatch");
       this.db.prepare("UPDATE connections SET state='disabled' WHERE id=?").run(id);
+      if (superseded) this.audit(c, "queued_events_superseded", now);
       this.audit(c, "disabled", now);
     }).immediate();
   }
@@ -247,8 +251,10 @@ export class ConnectionRegistry {
         observed.verified && !expired ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0, now, expired ? "expired" : null, id, resource, generation);
       if (observed.verified && !expired) {
         this.db.prepare("UPDATE connections SET state='active' WHERE id=? AND state!='disabled'").run(id);
-        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1
-          WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND state IN ('active','expiring')`).run(id, resource, generation, revision);
+        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1,
+          error=CASE WHEN error='verification_failed' THEN NULL ELSE error END
+          WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND
+            (state IN ('active','expiring') OR (state='verification_pending' AND error='verification_failed'))`).run(id, resource, generation, revision);
       }
       if ((!observed.verified || expired) && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state!='disabled'").run(id);
       this.audit(c, "observed", now);

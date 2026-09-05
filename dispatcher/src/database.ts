@@ -252,7 +252,12 @@ export class DispatcherDatabase {
       if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
       return this.enqueue(envelope, at, context);
     }
-    return this.connections.delivery(binding, envelope, () => this.enqueue(envelope, at, context ?? { connectionId: binding.connectionId }));
+    try {
+      return this.connections.delivery(binding, envelope, () => this.enqueue(envelope, at, context ?? { connectionId: binding.connectionId }));
+    } catch (error) {
+      if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
+      throw error;
+    }
   }
 
   commitConnectionBatch(batch: CursorBatch): EnqueueResult[] {

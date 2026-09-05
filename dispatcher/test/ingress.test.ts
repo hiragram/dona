@@ -696,6 +696,7 @@ test("queue receipts expose coalescing and reject overload before provider ACK",
     const rejected=await request(config.socketPath,"fake",mismatch,signedHeaders(mismatch));
     assert.equal(rejected.status,429);assert.equal(rejected.body.ack_allowed,false);
     assert.equal((rejected.body.error as any).code,"queue_depth");assert.equal(ackCount,2);
+    assert.equal((database.queueHealth().metrics as {code:string;count:number}[]).find(metric=>metric.code==="queue_depth")?.count,1);
     const unauth=fakeBody({providerEventId:"bad"});
     assert.equal((await request(config.socketPath,"fake",unauth,{...signedHeaders(unauth),"X-Fake-Signature":"wrong"})).status,401);
     assert.equal(database.list().length,1);assert.equal(database.queueDispatchMetadata(database.list()[0]!.event_id).requires_fetch,true);

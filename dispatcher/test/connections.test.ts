@@ -75,7 +75,7 @@ test("create→verify→renew→overlap dedup→cutover→stop→disable は永�
   assert.equal(db.nextAvailable(),undefined);
   assert.throws(() => db.beginDispatch(first.row.event_id,"fixture.json"),/no longer dispatchable/);
   const reopened = new DispatcherDatabase(file,clock);
-  try { assert.equal(reopened.connections.get("pilot").state,"disabled"); assert.equal(reopened.get(first.row.event_id)!.status,"queued"); }
+  try { assert.equal(reopened.connections.get("pilot").state,"disabled"); assert.equal(reopened.get(first.row.event_id)!.status,"completed"); }
   finally { reopened.close(); }
 });
 
@@ -222,11 +222,13 @@ test("DB busyはclaimを残さずprovider writeを呼ばない", async (t) => {
 test("disableとdeliveryの競合および未bindingのmanaged sourceはfail closed", async (t) => {
   const {db,file,clock,lifecycle}=fixture(t); await lifecycle.createOrRenew("pilot","folder1");
   const peer=new DispatcherDatabase(file,clock); t.after(()=>peer.close());
+  const accepted=db.enqueueExternal(event(),binding());
   const legacy=db.enqueue(event("unbound"),new Date(clock.now()),{connectionId:"pilot"});
   assert.equal(db.nextAvailable(),undefined);
   assert.throws(()=>db.beginDispatch(legacy.row.event_id,"fixture"),/no longer dispatchable/);
   await Promise.all([Promise.resolve().then(()=>peer.connections.disable("pilot",1)),Promise.resolve().then(()=>assert.throws(()=>db.enqueueExternal(event(),binding()),/disabled/))]);
-  assert.equal(db.list().length,1);
+  assert.equal(db.list().length,2);assert.equal(db.get(accepted.row.event_id)!.status,"completed");
+  assert.equal(db.get(legacy.row.event_id)!.status,"queued");
 });
 
 test("additive migrationはlegacy user_version/event/jobを保ちrollbackとFKを検証", (t) => {
@@ -439,13 +441,23 @@ test("不正observationもquarantineしhealthに反映する",async(t)=>{
 });
 
 test("quarantine済み最新generationは明示create認可で置換できる",async(t)=>{
-  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");driver.cutover=true;
   driver.inspect=async()=>{throw new Error("provider-resource-gone");};
   await assert.rejects(lifecycle.verify("pilot","folder1",1),/not_authorized/);
   assert.equal(db.connections.subscriptions("pilot")[0]!.error,"verification_failed");
   driver.inspect=async(_c,s)=>({providerId:s.providerId!,expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false});
   const replacement=await lifecycle.createOrRenew("pilot","folder1");
   assert.equal(replacement.generation,2);assert.equal(db.connections.subscriptions("pilot")[1]!.state,"active");
+  assert.equal(db.connections.subscriptions("pilot")[0]!.state,"stop_candidate");
+  assert.equal(db.connections.health().degraded,0);assert.equal(db.connections.health().pending,0);
+});
+
+test("複数resourceは同じprovider IDを共有できる",(t)=>{
+  const {db}=fixture(t);db.connections.register({id:"manual",provider:"drive",account:"account1",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"folder1",events:["changed"]},{resource:"folder2",events:["changed"]}],capability:{kind:"manual",cursor:false}});
+  db.connections.attachManual("manual",1,"folder1","shared-installation",null);
+  db.connections.attachManual("manual",1,"folder2","shared-installation",null);
+  assert.deepEqual(db.connections.subscriptions("manual").map(s=>s.providerId),["shared-installation","shared-installation"]);
 });
 
 test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{

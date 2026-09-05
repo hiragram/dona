@@ -327,7 +327,7 @@ test("connection eligibilityをpreflight中に失ってもworkerは後続Slack�
   };
   const worker=new DispatcherWorker(database,herdr,config,logger);worker.start();
   try {await waitFor(()=>database.get(slack.event_id)?.status==="completed");assert.equal(worker.isRunning(),true);
-    assert.equal(database.get(provider.event_id)!.status,mutation==="revise"?"completed":"queued");assert.deepEqual(prompted,[slack.event_id]);}
+    assert.equal(database.get(provider.event_id)!.status,mutation==="expire"?"queued":"completed");assert.deepEqual(prompted,[slack.event_id]);}
   finally {await worker.stop();database.close();}
   }
 });
