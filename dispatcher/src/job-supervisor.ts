@@ -306,6 +306,7 @@ export class JobSupervisor {
         return;
       }
       if (initial.agentIdentity && observed.agentIdentity && initial.agentIdentity !== observed.agentIdentity) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         this.database.markJobNeedsReview(row.job_id, "prompt_agent_identity_changed", "Herdr agent identity changed during prompt reconciliation");
         return;
       }

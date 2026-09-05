@@ -350,6 +350,38 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("stalled prompt後のidentity差し替え直前に完成したResultを優先する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-swap-result");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "old", stateChangeSeq: 1 };
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return { ...ok("idle"), agentIdentity: "new", stateChangeSeq: 2 };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await supervisor.stop();
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
   test("stalled prompt後にResultが先行した場合はagentを待たず回収する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
