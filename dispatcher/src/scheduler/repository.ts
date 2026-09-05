@@ -172,9 +172,9 @@ export class SchedulerRepository {
   private suppress(scheduleId: string, now: string, reason: "cancelled" | "revision_replaced"): void {
     const suppressed = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
       WHERE r.schedule_id = ? AND o.status IN ('pending','claimed')`).all(scheduleId) as Outbox[];
-    this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, content_delete_at = MIN(COALESCE(content_delete_at, ?), ?), updated_at = ?,
+    this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, content_delete_at = ?, updated_at = ?,
       claim_token = NULL, lease_until = NULL WHERE run_id IN (SELECT run_id FROM schedule_runs WHERE schedule_id = ?)
-      AND status IN ('pending','claimed')`).run(now, add(now, 604800), add(now, 604800), now, scheduleId);
+      AND status IN ('pending','claimed')`).run(now, add(now, 604800), now, scheduleId);
     this.db.prepare(`UPDATE schedule_runs SET status = 'cancelled', reason = ?, terminal_at = ?
       WHERE schedule_id = ? AND status = 'materialized' AND NOT EXISTS
       (SELECT 1 FROM connector_outbox o WHERE o.run_id = schedule_runs.run_id AND o.status IN ('request_started','needs_review','sent'))`).run(reason, now, scheduleId);
@@ -288,6 +288,7 @@ export class SchedulerRepository {
       const valid = expected === "materialized" ? ["started", "cancelled", "failed"] : expected === "started" ? ["completed", "failed", "cancelled"] : [];
       if (!valid.includes(next)) throw new Error("invalid_transition");
       const runSnapshot = this.revision(run);
+      const transitionAt = [now, run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at].sort().at(-1)!;
       if (next === "started") {
         const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
           : runSnapshot.expires_at <= now ? "authorization_expired"
@@ -295,12 +296,12 @@ export class SchedulerRepository {
         if (reason !== null) {
           if (reason === "authorization_expired") this.expireSchedule(current, actor, now);
           const status = reason === "misfire" ? "skipped" : "cancelled";
-          this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ?").run(status, reason, now, runId);
+          this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ?").run(status, reason, transitionAt, runId);
           this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
-            content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL
-            WHERE run_id = ? AND status IN ('pending','claimed')`).run(now, now, add(now, 604800), runId);
-          this.audit(current, this.get(current.schedule_id)!, `run_${status}`, actor, now, undefined, this.getRun(runId)!);
-          this.completeIfDrained(run.schedule_id, now);
+            content_delete_at = ?, claim_token = NULL, lease_until = NULL
+            WHERE run_id = ? AND status IN ('pending','claimed')`).run(transitionAt, transitionAt, add(transitionAt, 604800), runId);
+          this.audit(current, this.get(current.schedule_id)!, `run_${status}`, actor, transitionAt, undefined, this.getRun(runId)!);
+          this.completeIfDrained(run.schedule_id, transitionAt);
           return undefined;
         }
       }
@@ -313,7 +314,6 @@ export class SchedulerRepository {
       const notificationReason = current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
         : runSnapshot.expires_at <= now ? "authorization_expired" : null;
-      const transitionAt = [now, run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at].sort().at(-1)!;
       const workCompletion = next === "completed" && runSnapshot.action === "work.read_only";
       const hasTarget = (JSON.parse(runSnapshot.target_json) as Target).kind !== "none";
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
@@ -325,8 +325,8 @@ export class SchedulerRepository {
         ? this.db.prepare("SELECT * FROM connector_outbox WHERE run_id = ? AND status IN ('pending','claimed')").all(runId) as Outbox[] : [];
       if (suppressed.length > 0) {
         this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
-          content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL
-          WHERE run_id = ? AND status IN ('pending','claimed')`).run(now, now, add(now, 604800), runId);
+          content_delete_at = ?, claim_token = NULL, lease_until = NULL
+          WHERE run_id = ? AND status IN ('pending','claimed')`).run(transitionAt, transitionAt, add(transitionAt, 604800), runId);
       }
       this.db.prepare(`UPDATE schedule_runs SET status = ?, job_id = COALESCE(?, job_id), started_at =
         CASE WHEN ? = 'started' THEN ? ELSE started_at END, terminal_at = ? WHERE run_id = ?`)
@@ -355,7 +355,8 @@ export class SchedulerRepository {
         row.terminal_at ?? row.created_at, run.created_at, run.started_at ?? run.created_at].sort().at(-1)!;
       this.checked(schedule.schedule_id, schedule.revision, actor);
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
-        claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`).run(outcome, receiptId, reconciledAt, reconciledAt, outboxId);
+        content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
+        .run(outcome, receiptId, reconciledAt, reconciledAt, add(reconciledAt, 604800), outboxId);
       this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
         .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
       this.audit(schedule, schedule, `reconcile_${outcome}`, actor, reconciledAt, this.getOutbox(outboxId, reconciledAt)!);
@@ -422,7 +423,7 @@ export class SchedulerRepository {
     if (reason === "authorization_expired") this.expireSchedule(schedule,
       { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
     this.db.prepare(`UPDATE connector_outbox SET status = ?, terminal_at = ?, updated_at = ?,
-      content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
+      content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
       .run(reason === "retry_expired" ? "failed" : "cancelled", now, now, add(now, 604800), row.outbox_id);
     if (row.kind === "slack.reminder.post" && ["materialized", "started"].includes(run.status)) this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ?
       WHERE run_id = ?`).run(reason === "misfire" ? "skipped" : "cancelled", reason, now, row.run_id);
@@ -432,8 +433,8 @@ export class SchedulerRepository {
   }
   private insertOutbox(runId: string, kind: Outbox["kind"], targetJson: string, content: string, now: string): void {
     this.db.prepare(`INSERT INTO connector_outbox(outbox_id, run_id, kind, idempotency_key, target_json, content, content_hash,
-      status, available_at, created_at, updated_at, content_delete_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?,?)`).run(
-      `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now, add(now, 604800));
+      status, available_at, created_at, updated_at, content_delete_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?,NULL)`).run(
+      `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now);
   }
   claim(now: string, leaseSeconds = 60): Outbox | undefined {
     utc(now); if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 300) throw new Error("invalid_lease");
@@ -489,12 +490,14 @@ export class SchedulerRepository {
     this.audit(before ?? schedule, schedule, operation, { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now, this.getOutbox(row.outbox_id, now)!);
   }
   private markAmbiguous(row: Outbox, now: string): void {
-    this.db.prepare("UPDATE connector_outbox SET status = 'needs_review', content_delete_at = COALESCE(content_delete_at, ?), updated_at = ? WHERE outbox_id = ?")
+    this.db.prepare("UPDATE connector_outbox SET status = 'needs_review', content_delete_at = ?, updated_at = ? WHERE outbox_id = ?")
       .run(add(now, 604800), now, row.outbox_id);
     const run = this.getRun(row.run_id)!;
     const before = this.get(run.schedule_id)!;
     this.suppress(run.schedule_id, now, "cancelled");
-    this.db.prepare("UPDATE schedule_runs SET status = 'needs_review', reason = 'ambiguous_write' WHERE run_id = ?").run(run.run_id);
+    if (row.kind === "slack.reminder.post") {
+      this.db.prepare("UPDATE schedule_runs SET status = 'needs_review', reason = 'ambiguous_write' WHERE run_id = ?").run(run.run_id);
+    }
     this.db.prepare("UPDATE schedules SET state = 'needs_review', updated_at = ? WHERE schedule_id = ? AND state NOT IN ('cancelled','completed')").run(now, run.schedule_id);
     this.retireRevisions(run.schedule_id, now);
     this.auditOutbox(row, "outbox_needs_review", now, before);
@@ -521,7 +524,7 @@ export class SchedulerRepository {
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
           status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
-          receiptId, retry ? null : finishedAt, row.content_delete_at === null ? add(finishedAt, 604800) : row.content_delete_at, finishedAt, outboxId);
+          receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
       }
       if (outcome !== "ambiguous") {
         this.expireUnsent(this.getOutbox(outboxId, finishedAt)!, finishedAt);

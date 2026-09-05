@@ -685,6 +685,42 @@ test("時計後退中のfinishWriteとreconcileも保存済み時刻より前へ
   }
 });
 
+test("outbox本文の7日保持は作成時でなく終端またはneeds_review遷移から数える", () => {
+  const { repo } = setup();
+  repo.create("retention_origin", { ...input, expires_at: "2026-09-30T00:00:00Z" }, due, actor, now);
+  repo.materialize("retention_origin", 1, due, later, due, actor);
+  const sixthDay = "2026-09-11T00:01:00Z";
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  const reviewed = repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", sixthDay);
+  assert.equal(reviewed.content_delete_at, "2026-09-18T00:01:00Z");
+  assert.equal(repo.getOutbox(claim.outbox_id, "2026-09-17T00:01:00Z")?.content, input.content);
+});
+
+test("時計後退中のrun取消もoutbox終端と本文削除期限を単調化する", () => {
+  const { repo, raw } = setup();
+  repo.create("cancel_clock", input, due, actor, now);
+  const run = repo.materialize("cancel_clock", 1, due, later, due, actor).run;
+  repo.setRunState(run.run_id, "materialized", "cancelled", actor, "2026-09-05T00:00:30Z");
+  assert.equal(repo.claim(due), undefined);
+  const stored = raw.prepare("SELECT terminal_at, content_delete_at FROM connector_outbox WHERE run_id = ?")
+    .get(run.run_id) as { terminal_at: string; content_delete_at: string };
+  assert.equal(stored.terminal_at, due);
+  assert.equal(stored.content_delete_at, "2026-09-12T00:01:00Z");
+});
+
+test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {
+  const { repo, dispatcher, raw } = setup();
+  repo.create("work_ambiguous", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("work_ambiguous", 1, due, later, due, actor).run;
+  startWork(repo, dispatcher, raw, run, due);
+  repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", due);
+  assert.equal(repo.getRun(run.run_id)?.status, "completed");
+  repo.reconcile(claim.outbox_id, "failed", "not_accepted", { ...actor, role: "admin" }, due);
+  assert.equal(repo.getRun(run.run_id)?.status, "completed");
+});
+
 test("通知先があるworkの結果欠落は完了transactionを拒否する", () => {
   const { repo, raw, dispatcher } = setup();
   repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
