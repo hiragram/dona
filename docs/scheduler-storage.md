@@ -41,11 +41,11 @@ PR #82のexact head `56eeec85d271813e33984fd2c5eae9753a607190`を一時checkout�
 
 create/状態更新/新revisionとaudit、run物化とevent/outbox・high-watermark・auditはそれぞれ同じconnectionのtransaction。workは本文を持たない`source: scheduler`の内部eventへrun/revision参照を保存し、reminderはtyped outboxを作る。source型の追加だけでは外部HTTP ingressを許可しない。既存Slack専用createJobをscheduler対応に変更せず、`setRunState`が後続#11から渡されるjob参照とrun transitionを検証する。work結果本文のoutbox追加とrun完了もatomicなprimitiveを供給する。
 
-duplicate wakeは既存runを返し、event/outboxを増やさない。run削除後はhigh-watermarkにより過去occurrenceの再作成を拒否する。900秒境界・未決着run/outboxのoverlapは保存直前にも確認するが、直近候補の選択・calendar計算・長期停止のcompact skipは#9の責任。
+duplicate wakeは既存runを返し、event/outboxを増やさない。run削除後はhigh-watermarkにより過去occurrenceの再作成を拒否する。900秒境界・未決着run/outboxのoverlapは保存直前にも確認するが、直近候補の選択・calendar計算・長期停止のcompact skipは#9の責任。未送信outboxがgraceを過ぎた場合はclaim/recover/送信開始直前にrunとともに終端化し、永久的なoverlapを防ぐ。one-shotは次回なしで最後のrun/outboxが決着してからcompletedへ進め、quotaとretentionを解放する。recurringの空previewを終了と解釈しない。
 
 claimは`BEGIN IMMEDIATE`で排他的に取得する。送信前のlease切れは新tokenで再claimでき、旧tokenは拒否する。`requestStarted`を外部requestより先にcommitする。timeout/切断は`finishWrite(..., 'ambiguous')`、crash後のrequest-started lease切れは`recover`でneeds_reviewを永続化し、scheduleを止める。回復しても再送状態へ戻さない。未受理の確証を呼出し側が得た場合だけ`not_accepted`を渡し、最大3 attempts、1秒/5秒・Retry-Afterの下限を保存する。
 
-cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果不明のまま消さず、sent receiptまたはneeds_reviewと取消時刻を両方保持する。`reconcile`は確認済みreceiptでsent/failedへ進めるだけで、再送やresumeをしない。Actorのroleと本人承認は外部authorityで検証済みの値を渡す内部APIであり、この層がSlack権限を照会するわけではない。run開始・各write直前のcurrent access照会、redaction完了の確認、queued eventの取消確認、running workへのcancel要求は#9〜#12の呼出し側が必要。
+cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果不明のまま消さず、sent receiptまたはneeds_reviewと取消時刻を両方保持する。`reconcile`は同tenant adminに限定し、確認済みreceiptでsent/failedへ進めるだけで、再送やresumeをしない。未解決needs_review fenceがある間は新revisionへの更新も拒否する。outbox監査は現在のschedule状態とは別に、対象runの固定revision・本文hash・receiptを記録する。Actorのroleと本人承認は外部authorityで検証済みの値を渡す内部APIであり、この層がSlack権限を照会するわけではない。run開始・各write直前のcurrent access照会、redaction完了の確認、queued eventの取消確認、running workへのcancel要求は#9〜#12の呼出し側が必要。
 
 ## Retentionとrollback不能点
 
@@ -57,7 +57,7 @@ cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果
 
 ## 実行した検証
 
-- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加14件を含めて検証。
+- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加22件を含めて検証。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-codec-integration.ts <#6 checkout>/dispatcher/src/scheduler`: 上記#82 headの実codecでcanonical bytes、未知version、重複key、policy改変、owner_dm、物化一意性を確認。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-core-migration-integration.ts <fan-out checkout>/dispatcher/src/database.ts`: `feature/multi-job-fanout@e241fb41087a9b4a6aa5329cf1aaf60148e4c0d0`の実migrationでv2+scheduler→v3、3つの中間phaseでのrollback、v3新規→scheduler、旧v2 readerの拒否を確認。
 - repository testsは新規/v2/reopen/WAL/FK、DDL失敗、重複wake、revision競合、invalid transition、tenant境界、transaction失敗、2 connection claim、lease expiry、needs_review永続化、cancel race、retention、audit redaction/order、必要indexのquery planを検証する。
