@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
 const externalSourcePattern = /^[a-z][a-z0-9._-]{0,63}$/;
 const connectionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const utcRfc3339Pattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
 const reservedSources = new Set(["slack", "dona_job", "dona_update"]);
 const reservedAcknowledgementHeaders = new Set([
   "connection",
@@ -86,6 +87,12 @@ export interface ExternalIngressAcknowledgement {
   readonly body: Record<string, unknown>;
 }
 
+export interface PreparedExternalIngressAcknowledgement {
+  readonly statusCode: number;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly encodedBody: Buffer;
+}
+
 export interface ExternalEventSourceRegistration {
   readonly source: string;
   readonly maxBodyBytes: number;
@@ -102,7 +109,7 @@ export interface ExternalEventSourceRegistration {
 
 export interface ExternalIngressResult {
   readonly receipt: PersistReceipt;
-  readonly acknowledgement: ExternalIngressAcknowledgement | null;
+  readonly acknowledgement: PreparedExternalIngressAcknowledgement | null;
 }
 
 export function externalEventSource(value: string): ExternalEventSource {
@@ -177,11 +184,25 @@ function validatePrincipal(input: VerifiedIngressPrincipal): VerifiedIngressPrin
   return input;
 }
 
+function isUtcRfc3339Timestamp(value: string): boolean {
+  const match = utcRfc3339Pattern.exec(value);
+  if (!match) return false;
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return false;
+  const parsed = new Date(timestamp);
+  return parsed.getUTCFullYear() === Number(match[1]) &&
+    parsed.getUTCMonth() + 1 === Number(match[2]) &&
+    parsed.getUTCDate() === Number(match[3]) &&
+    parsed.getUTCHours() === Number(match[4]) &&
+    parsed.getUTCMinutes() === Number(match[5]) &&
+    parsed.getUTCSeconds() === Number(match[6]);
+}
+
 function validateNormalized(input: NormalizedExternalEvent): NormalizedExternalEvent {
   if (
     !input.providerEventId.trim() || input.providerEventId.length > 512 ||
     !input.type.trim() || input.type.length > 128 ||
-    !utcRfc3339Pattern.test(input.occurredAt) || Number.isNaN(Date.parse(input.occurredAt)) ||
+    !isUtcRfc3339Timestamp(input.occurredAt) ||
     !isJsonObject(input.subject) || !isJsonObject(input.payload) ||
     (input.replyTarget !== null && !isJsonObject(input.replyTarget)) ||
     (input.trace !== undefined && !isJsonObject(input.trace))
@@ -191,17 +212,39 @@ function validateNormalized(input: NormalizedExternalEvent): NormalizedExternalE
   return input;
 }
 
-function validateAcknowledgement(input: ExternalIngressAcknowledgement): ExternalIngressAcknowledgement {
-  if (!Number.isInteger(input.statusCode) || input.statusCode < 200 || input.statusCode > 299 || !isJsonObject(input.body)) {
+function validateAcknowledgement(input: ExternalIngressAcknowledgement): PreparedExternalIngressAcknowledgement {
+  if (
+    !Number.isInteger(input.statusCode) || input.statusCode < 200 || input.statusCode > 299 ||
+    input.statusCode === 204 || input.statusCode === 205 || !isJsonObject(input.body)
+  ) {
     throw new ExternalIngressAcknowledgementError();
   }
-  if (input.headers && Object.entries(input.headers).some(([name, value]) =>
-    !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
-    reservedAcknowledgementHeaders.has(name.toLowerCase()) ||
-    /[\r\n]/.test(value))) {
+  const headers: Record<string, string> = {};
+  if (input.headers !== undefined) {
+    if (!isJsonObject(input.headers)) throw new ExternalIngressAcknowledgementError();
+    for (const [name, value] of Object.entries(input.headers)) {
+      if (
+        typeof value !== "string" || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
+        reservedAcknowledgementHeaders.has(name.toLowerCase()) || /[\r\n]/.test(value)
+      ) {
+        throw new ExternalIngressAcknowledgementError();
+      }
+      headers[name] = value;
+    }
+  }
+  let encodedBody: Buffer;
+  try {
+    const serialized = JSON.stringify(input.body);
+    if (serialized === undefined) throw new Error("Acknowledgement body is not JSON serializable");
+    encodedBody = Buffer.from(serialized);
+  } catch {
     throw new ExternalIngressAcknowledgementError();
   }
-  return input;
+  return {
+    statusCode: input.statusCode,
+    ...(Object.keys(headers).length === 0 ? {} : { headers: Object.freeze(headers) }),
+    encodedBody,
+  };
 }
 
 async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -218,6 +261,12 @@ async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   }
 }
 
+function remainingProcessingTime(deadline: number): number {
+  const remaining = deadline - performance.now();
+  if (remaining <= 0) throw new ExternalIngressTimeoutError();
+  return remaining;
+}
+
 export class ExternalIngressProcessor {
   constructor(private readonly registry: ExternalIngressRegistry) {}
 
@@ -231,9 +280,15 @@ export class ExternalIngressProcessor {
     request: RawIngressRequest,
     persist: (envelope: EventEnvelope) => EnqueueResult,
   ): Promise<ExternalIngressResult> {
+    const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
     try {
-      verified = validatePrincipal(await within(Promise.resolve(registration.authenticate(request)), registration.processingTimeoutMs));
+      const authenticated = await within(
+        Promise.resolve().then(() => registration.authenticate(request)),
+        remainingProcessingTime(processingDeadline),
+      );
+      verified = validatePrincipal(authenticated);
+      remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;
       throw new ExternalIngressAuthenticationError();
@@ -242,10 +297,11 @@ export class ExternalIngressProcessor {
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
-        Promise.resolve(registration.normalize(request, verified)),
-        registration.processingTimeoutMs,
+        Promise.resolve().then(() => registration.normalize(request, verified)),
+        remainingProcessingTime(processingDeadline),
       );
       normalized = validateNormalized(registration.parseNormalized(candidate));
+      remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;
       throw new ExternalIngressValidationError();
@@ -274,7 +330,7 @@ export class ExternalIngressProcessor {
     };
     if (result.outcome === "duplicate_conflict") return { receipt, acknowledgement: null };
 
-    let acknowledgement: ExternalIngressAcknowledgement;
+    let acknowledgement: PreparedExternalIngressAcknowledgement;
     try {
       acknowledgement = validateAcknowledgement(registration.buildAcknowledgement(receipt));
     } catch {

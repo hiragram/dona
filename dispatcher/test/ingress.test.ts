@@ -302,12 +302,58 @@ describe("external ingress contract", () => {
     assert.equal((await request(config.socketPath, "fake", providerFieldMix, signedHeaders(providerFieldMix))).status, 400);
     const wrongTime = fakeBody({ occurredAt: "2026-09-05T09:00:00+09:00" });
     assert.equal((await request(config.socketPath, "fake", wrongTime, signedHeaders(wrongTime))).status, 400);
+    for (const occurredAt of ["2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z"]) {
+      const impossibleDate = fakeBody({ occurredAt });
+      assert.equal((await request(config.socketPath, "fake", impossibleDate, signedHeaders(impossibleDate))).status, 400);
+    }
     const invalidUtf8 = Buffer.from([0xff, 0xfe]);
     assert.equal((await request(config.socketPath, "fake", invalidUtf8, signedHeaders(invalidUtf8))).status, 400);
     const invalidJson = Buffer.from("{");
     assert.equal((await request(config.socketPath, "fake", invalidJson, signedHeaders(invalidJson))).status, 400);
     assert.equal((await request(config.socketPath, "dona_update", valid, signedHeaders(valid))).status, 404);
     assert.equal((await request(config.socketPath, "unknown", valid, signedHeaders(valid))).status, 404);
+    assert.equal(database.list().length, 0);
+
+    await api.stop();
+    database.close();
+  });
+
+  test("shares one processing deadline across authentication and normalization", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    let acknowledgements = 0;
+    const definition = registration({
+      async authenticate() {
+        await new Promise((resolve) => setTimeout(resolve, 55));
+        return { connectionId: "connection-a", principal: { kind: "fake_installation" } };
+      },
+      onAcknowledge() { acknowledgements += 1; },
+    });
+    const registry = new ExternalIngressRegistry([{
+      ...definition,
+      processingTimeoutMs: 80,
+      async normalize(raw, verified) {
+        await new Promise((resolve) => setTimeout(resolve, 55));
+        return definition.normalize(raw, verified);
+      },
+    }]);
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+    await api.start();
+
+    const body = fakeBody();
+    assert.equal((await request(config.socketPath, "fake", body, signedHeaders(body))).status, 408);
+    assert.equal(acknowledgements, 0);
     assert.equal(database.list().length, 0);
 
     await api.stop();
@@ -418,6 +464,54 @@ describe("external ingress contract", () => {
     assert.equal(database.list().length, 1);
 
     await secondApi.stop();
+    database.close();
+  });
+
+  test("rejects body-forbidden statuses and unserializable ACK bodies after persistence", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const definition = registration();
+    let attempt = 0;
+    const registry = new ExternalIngressRegistry([{
+      ...definition,
+      buildAcknowledgement(receipt) {
+        attempt += 1;
+        if (attempt === 1) return { statusCode: 204, body: {} };
+        if (attempt === 2) return { statusCode: 205, body: {} };
+        if (attempt === 3) return { statusCode: 202, body: { value: 1n } };
+        if (attempt === 4) {
+          const circular: Record<string, unknown> = {};
+          circular.self = circular;
+          return { statusCode: 202, body: circular };
+        }
+        return definition.buildAcknowledgement(receipt);
+      },
+    }]);
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+    await api.start();
+
+    const body = fakeBody();
+    for (let index = 0; index < 4; index += 1) {
+      assert.equal((await request(config.socketPath, "fake", body, signedHeaders(body))).status, 503);
+      assert.equal(database.list().length, 1, "the commit survives invalid acknowledgement output");
+    }
+    const reconciled = await request(config.socketPath, "fake", body, signedHeaders(body));
+    assert.equal(reconciled.status, 200);
+    assert.equal(reconciled.body.outcome, "duplicate_same");
+    assert.equal(database.list().length, 1);
+
+    await api.stop();
     database.close();
   });
 

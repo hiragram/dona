@@ -15,7 +15,7 @@ import {
   ExternalIngressRegistry,
   ExternalIngressTimeoutError,
   ExternalIngressValidationError,
-  type ExternalIngressAcknowledgement,
+  type PreparedExternalIngressAcknowledgement,
   type RawIngressRequest,
 } from "./ingress.js";
 import { envelopeFromRow } from "./prompt.js";
@@ -55,15 +55,14 @@ function errorBody(code: string, message: string): unknown {
 
 function sendExternalAcknowledgement(
   response: ServerResponse,
-  acknowledgement: ExternalIngressAcknowledgement,
+  acknowledgement: PreparedExternalIngressAcknowledgement,
 ): void {
-  const encoded = Buffer.from(JSON.stringify(acknowledgement.body));
   response.writeHead(acknowledgement.statusCode, {
     ...acknowledgement.headers,
     "content-type": "application/json; charset=utf-8",
-    "content-length": encoded.length,
+    "content-length": acknowledgement.encodedBody.length,
   });
-  response.end(encoded);
+  response.end(acknowledgement.encodedBody);
 }
 
 async function readBody(request: IncomingMessage, limit: number, timeoutMs?: number): Promise<Buffer> {
