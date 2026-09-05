@@ -35,3 +35,11 @@ test("reporter permanently rejects a workspace without assistant thread progress
   await assert.rejects(new SlackJobProgressReporter(registry as never, async () => resolved).deliver(request),
     (error: Error & { progressPermanent?:boolean }) => error.progressPermanent === true);
 });
+
+test("reporter preserves the temporary group-seal resolver state", async () => {
+  const registry = { getByTeamId() { throw new Error("must not resolve workspace"); } };
+  await assert.rejects(new SlackJobProgressReporter(registry as never, async () => {
+    throw Object.assign(new Error("group not sealed"), { progressRetryable:true });
+  }).deliver(request), (error:Error & {progressRetryable?:boolean;progressPermanent?:boolean}) =>
+    error.progressRetryable === true && error.progressPermanent === false);
+});

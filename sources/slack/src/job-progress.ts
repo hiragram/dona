@@ -27,7 +27,7 @@ export class SlackJobProgressReporter {
   async deliver(input: JobProgressRequest): Promise<{ progress_id: string }> {
     let resolved: ReturnType<typeof parseResolvedProgress>;
     try { resolved = parseResolvedProgress(await this.resolve(input.progress_id,input.delivery_token)); }
-    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true, progressPermanent:true }); }
+    catch (error) { const retryable=(error as Error & {progressRetryable?:boolean}).progressRetryable===true; throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true, progressPermanent:!retryable, progressRetryable:retryable }); }
     let connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>;
     try { connection = this.registry.getByTeamId(resolved.workspace_id); }
     catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { definitelyUnsent:true, progressPermanent:true }); }

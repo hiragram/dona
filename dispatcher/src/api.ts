@@ -102,6 +102,7 @@ export interface ApiQuiesceController {
 
 export interface ApiJobProgressResolver {
   resolveDelivery(progressId: string, deliveryToken: string): Record<string, string> | undefined;
+  deliveryDeferred?(progressId: string, deliveryToken: string): boolean;
 }
 
 export class DispatcherApi {
@@ -222,6 +223,7 @@ export class DispatcherApi {
         const progressId = url.searchParams.get("progress_id") ?? "";
         const deliveryToken = url.searchParams.get("delivery_token") ?? "";
         const delivery = this.jobProgress?.resolveDelivery(progressId, deliveryToken);
+        if (!delivery && this.jobProgress?.deliveryDeferred?.(progressId, deliveryToken)) throw new ApiRequestError(425, "progress_deferred", "Progress delivery is waiting for the group seal");
         if (!delivery) throw new ApiRequestError(404, "progress_not_deliverable", "Progress is not pending delivery");
         sendJson(response, 200, { schema_version: 1, ...delivery });
         return;

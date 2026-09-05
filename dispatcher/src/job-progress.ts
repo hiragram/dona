@@ -213,4 +213,12 @@ export class JobProgressCoordinator {
     return { progress_id:progressId, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts,
       status:siblings.length > 1 ? `${siblings.length}件中${index}件目: ${phaseLabels[progress.phase]}` : phaseLabels[progress.phase] };
   }
+
+  deliveryDeferred(progressId:string, deliveryToken:string):boolean {
+    const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId); if(!match)return false;
+    const progress=this.store.get(match[1]!); const job=this.jobs.getJob(match[1]!);
+    if(this.deliveryClaims.get(progressId)!==deliveryToken||!progress||progress.status!=="delivering"||progress.sequence!==Number(match[2])||!job)return false;
+    const group=this.jobs.getJobGroup(job.source_event_id);
+    return group?.notification_mode==="grouped"&&!group.sealed_at&&group.attention_event_id===null;
+  }
 }

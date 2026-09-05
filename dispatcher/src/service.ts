@@ -87,7 +87,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       jobProgressStore?.close();
       jobProgressStore = undefined;
       jobProgress = undefined;
-      jobSupervisor.disableProgress();
+      await jobSupervisor.disableProgress();
       api.disableJobProgress();
     }
     worker.start();

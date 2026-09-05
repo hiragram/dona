@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
@@ -7,6 +8,7 @@ import type { DispatcherConfig } from "../src/config.js";
 import type { HerdrCommandResult } from "../src/herdr.js";
 import type { JobAgentRuntime } from "../src/job-runtime.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
+import { jobProgressPath } from "../src/job-prompt.js";
 import type { Logger } from "../src/logger.js";
 import type { JobRow } from "../src/types.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
@@ -1100,5 +1102,15 @@ describe("JobSupervisor", () => {
     assert.equal(updated.last_error_code, "timeout");
     assert.equal(cancelCount, 1);
     database.close();
+  });
+
+  test("runtime progress disable removes directories for nonterminal workers", async () => {
+    const { root,config }=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-disable-progress"); const progressDir=path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir,{recursive:true}); await fs.writeFile(path.join(progressDir,"progress.json"),"{}");
+    let disabled=false; const runtime=fakeRuntime({ disableProgress(){disabled=true;} });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    await supervisor.disableProgress();
+    assert.equal(disabled,true); await assert.rejects(fs.access(progressDir),{code:"ENOENT"}); database.close();
   });
 });

@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
 import type { JobAgentRuntime } from "./job-runtime.js";
-import { buildJobPrompt } from "./job-prompt.js";
+import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
@@ -125,7 +126,11 @@ export class JobSupervisor {
     }
   }
 
-  disableProgress(): void { this.progress = undefined; this.runtime.disableProgress?.(); }
+  async disableProgress(): Promise<void> {
+    this.progress = undefined; this.runtime.disableProgress?.();
+    const nonterminal = this.database.listJobs(undefined, 1_000_000).filter((job)=>!["blocked","completed","failed","cancelled","needs_review"].includes(job.status));
+    await Promise.all(nonterminal.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
+  }
 
   wake(): void {
     this.nextRunnableScanAt = 0;
@@ -329,7 +334,7 @@ export class JobSupervisor {
         } catch (error) {
           this.logger.warn("Job progress disabled after notification gate failure", { job_id:job.job_id, error_code:"job_progress_notification_gate_failed", error_message:error instanceof Error?error.message:String(error) });
           const failedProgress=this.progress;
-          void failedProgress.drainDeliveries().then(()=>{if(this.progress===failedProgress)this.progress=undefined;this.wake();});
+          void failedProgress.drainDeliveries().then(async()=>{if(this.progress===failedProgress)await this.disableProgress();this.wake();});
           continue;
         }
       }

@@ -83,6 +83,19 @@ test("an attention-claimed group rejects later progress delivery", async () => {
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
+test("an unsealed group reports delivery as deferred rather than permanent", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-deferred-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.ingest(valid); store.begin("job_abc");
+    const job={ job_id:"job_abc",source_event_id:"evt_abc",status:"running",workspace_id:"T1",channel_id:"C1",thread_ts:"1.1" };
+    const jobs={ getJob:()=>job,listEventJobs:()=>[job],getJobGroup:()=>({notification_mode:"grouped",sealed_at:null,attention_event_id:null}) };
+    const coordinator=new JobProgressCoordinator(jobs as never,store,{} as never,{} as never); const progressId="job_abc:1";
+    (coordinator as unknown as {deliveryClaims:Map<string,string>}).deliveryClaims.set(progressId,"capability");
+    assert.equal(coordinator.resolveDelivery(progressId,"capability"),undefined);
+    assert.equal(coordinator.deliveryDeferred(progressId,"capability"),true);
+  } finally { store.close(); await fs.rm(root,{recursive:true}); }
+});
+
 test("reporter suppresses pending progress after group attention is claimed", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-pending-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
