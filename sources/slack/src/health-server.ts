@@ -175,11 +175,16 @@ export class SlackHealthServer {
         return;
       }
       if (this.adapter.isStopping()) {
-        send(response, 503, { schema_version: 1, error: { code: "shutting_down" } });
+        send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
         return;
       }
       try {
-        const operation = this.jobProgress.deliver(parseJobProgressRequest(await this.readJson(request)));
+        const input = parseJobProgressRequest(await this.readJson(request));
+        if (this.adapter.isStopping()) {
+          send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
+          return;
+        }
+        const operation = this.jobProgress.deliver(input);
         const result = await (this.adapter.trackExternal?.(operation) ?? operation);
         send(response, 200, { schema_version: 1, ...result });
       } catch (error) {

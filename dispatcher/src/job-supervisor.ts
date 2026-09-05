@@ -432,7 +432,10 @@ export class JobSupervisor {
         if (keepPolling && !this.stopping) {
           try {
             const current = this.database.getJob(row.job_id) ?? row;
-            if (["blocked", "completed", "failed", "cancelled", "needs_review"].includes(current.status)) break;
+            if (["blocked", "completed", "failed", "cancelled", "needs_review"].includes(current.status)) {
+              await this.updateTerminalProgress(row.job_id);
+              break;
+            }
             await this.progress?.ingest(current);
           }
           catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
