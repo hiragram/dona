@@ -58,6 +58,7 @@ export interface AdapterHealthState {
   connectionStates(): Record<string, string>;
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
+  trackExternal?<T>(operation: Promise<T>): Promise<T>;
 }
 
 export class SlackHealthServer {
@@ -178,7 +179,8 @@ export class SlackHealthServer {
         return;
       }
       try {
-        const result = await this.jobProgress.deliver(parseJobProgressRequest(await this.readJson(request)));
+        const operation = this.jobProgress.deliver(parseJobProgressRequest(await this.readJson(request)));
+        const result = await (this.adapter.trackExternal?.(operation) ?? operation);
         send(response, 200, { schema_version: 1, ...result });
       } catch (error) {
         this.logger.error("Slack job progress failed", {

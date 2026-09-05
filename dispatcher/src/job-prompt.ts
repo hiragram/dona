@@ -1,5 +1,4 @@
 import path from "node:path";
-import fs from "node:fs";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
 
@@ -8,22 +7,9 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
 }
 
 export function jobProgressPath(row: JobRow): string {
-  const dotGit = path.join(row.workspace_path, ".git");
-  try {
-    const stats = fs.lstatSync(dotGit);
-    if (stats.isDirectory() && !stats.isSymbolicLink()) return path.join(dotGit, "dona-job-progress.json");
-    if (stats.isFile() && !stats.isSymbolicLink()) {
-      if (stats.size > 4096) throw new Error("git metadata is too large");
-      const descriptor = fs.openSync(dotGit, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-      try {
-        const buffer = Buffer.alloc(4097);
-        const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-        if (bytes > 4096) throw new Error("git metadata is too large");
-        const match = /^gitdir: (.+)\s*$/.exec(buffer.subarray(0, bytes).toString("utf8"));
-        if (match) return path.join(path.resolve(row.workspace_path, match[1]!), "dona-job-progress.json");
-      } finally { fs.closeSync(descriptor); }
-    }
-  } catch { /* scratch workspace has no git metadata */ }
+  if (workspaceFromJob(row).kind === "github") {
+    return path.resolve(row.workspace_path, "../../repository/.git/worktrees", path.basename(row.workspace_path), "dona-job-progress.json");
+  }
   return path.join(row.workspace_path, ".dona-job-progress.json");
 }
 
