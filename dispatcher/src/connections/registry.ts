@@ -170,7 +170,7 @@ export class ConnectionRegistry {
         if (!replacement) throw new ConnectionError("invalid_transition");
         this.db.prepare(`UPDATE connection_event_bindings SET generation=?
           WHERE connection_id=? AND resource=? AND generation=? AND revision=?
-          AND event_id IN (SELECT event_id FROM events WHERE status IN ('queued','retryable_failed'))`)
+          AND event_id IN (SELECT event_id FROM events WHERE status!='completed')`)
           .run(replacement.generation, id, resource, generation, revision);
         next = generation;
       }
@@ -368,8 +368,13 @@ export class ConnectionRegistry {
     const staleLeases = (this.db.prepare("SELECT count(*) AS n FROM connection_operations WHERE state='inflight' AND lease_until<=?").get(now) as {n:number}).n;
     const degraded = connections.filter((c) => c.state === "degraded" || (c.state !== "disabled" &&
       relevant(c.id).some((s) => s.error === "verification_failed"))).length;
-    const pending = connections.filter((c) => c.state === "verification_pending" || (c.state !== "disabled" &&
-      relevant(c.id).some((s) => s.state === "verification_pending"))).length;
+    const pending = connections.filter((row) => {
+      if (row.state === "disabled") return false;
+      const c = this.get(row.id), subscriptions = relevant(row.id);
+      return c.state === "verification_pending" || subscriptions.some((s) => s.state === "verification_pending") ||
+        c.allowlist.some((entry) => !subscriptions.some((s) => s.resource === entry.resource && s.revision === c.revision &&
+          s.verifiedAt !== null && ["active","expiring"].includes(s.state) && (s.expiresAt === null || s.expiresAt > now)));
+    }).length;
     return { ready: degraded + pending + expiring + unknown + staleLeases === 0, degraded, pending, expiring, unknown, disabled: count("disabled"), staleLeases };
   }
 }

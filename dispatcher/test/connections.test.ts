@@ -484,3 +484,31 @@ test("verify中crashはpendingを残し、並行verifyの遅延結果をfenceす
   assert.equal(db.connections.subscriptions("pilot")[0]!.expiresAt,clock.now()+20000);
   assert.equal(db.connections.get("pilot").state,"active");
 });
+
+test("stop後もblocked/needs_review/dead_letterと進行中eventを手動retryできる",async(t)=>{
+  const {db,driver,lifecycle,clock,file}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const raw=new Database(file);t.after(()=>raw.close());
+  const events=["blocked","needs_review","dead_letter","dispatching","waiting_agent"].map((status)=>{
+    const row=db.enqueueExternal(event(status),binding()).row;
+    raw.prepare("UPDATE events SET status=? WHERE event_id=?").run(status,row.event_id);return {status,id:row.event_id};
+  });
+  clock.value+=9000;driver.cutover=true;await lifecycle.createOrRenew("pilot","folder1");await lifecycle.stop("pilot","folder1",1);
+  for(const item of events){
+    if(["dispatching","waiting_agent"].includes(item.status))raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(item.id);
+    db.manualRetry(item.id,true,new Date(clock.now()));
+    assert.equal(db.beginDispatch(item.id,"fixture",new Date(clock.now())).status,"dispatching");
+  }
+});
+
+test("allowlistのsubscription未作成/未再検証resourceをhealth pendingに含める",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);
+  db.connections.revise("pilot",1,{...config,allowlist:[...config.allowlist,{resource:"folder2",events:["changed"]}]});
+  driver.create=async(_c,op)=>({providerId:op.resource,expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false});
+  await lifecycle.createOrRenew("pilot","folder1");
+  assert.equal(db.connections.get("pilot").state,"active");assert.equal(db.connections.health().pending,1);assert.equal(db.connections.health().ready,false);
+  await lifecycle.createOrRenew("pilot","folder2");
+  assert.equal(db.connections.health().pending,0);assert.equal(db.connections.health().ready,true);
+  const {revision:_revision,state:_state,...configuration}=db.connections.get("pilot");
+  db.connections.revise("pilot",2,configuration);await lifecycle.verify("pilot","folder1",1);
+  assert.equal(db.connections.health().pending,1);assert.equal(db.connections.health().ready,false);
+});

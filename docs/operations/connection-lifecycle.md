@@ -33,6 +33,7 @@ NotionのUI型、GitHubのinstallation設定、FigmaのAPI管理、Driveの期�
 - lookupがgeneration/provider IDを確定した後だけ状態を復元する。createのlookupがnot-foundでも元の要求が遅延中の可能性があるため自動再createしない。stopのlookupの `null` はdriverが権威あるreadで停止を確定できた場合だけ返す。不確実なreadは例外にする。
 - overlap中は検証済みold/newからの通知を同じconnection-scoped IDでdedupする。新generationの `cutoverConfirmed` が得られて初めてoldを `stop_candidate` にする。実stopは別の明示認可を必要とする。停止応答不明も再stopせずlookupする。
 - stopのclaim時は旧generationのqueued/retryable eventを、同revisionの検証済み・期限内の新generationへ原子的に移す。外部stop待ちに届いた旧channelの通知も新generationへbindingする。有効な移行先がなければstopを開始しない。再verifyで設定revisionを採用するとrenewal windowも更新し、表示とclaim判定に同じ保存値を使う。
+- binding移行はcompleted以外の全状態を対象にし、blocked/needs_review/dead_letterや進行中eventが後で失敗した場合も、運用者による明示retryの経路を保つ。eventの状態・結果自体は変更しない。healthのpendingは、allowlist内にsubscription未作成または現revisionで未検証のresourceがある場合も検出する。
 - disable → `disabled`。自動enable/delete/recreateはない。時計後退時もdisableはでき、監査時刻は後退させない。他の更新は `clock_skew` で拒否する。
 
 `ConnectionLifecycle` は `Driver` と `OperationAuthority` をconstructorで受ける。authorityはexact connection/revision/resource/kindの運用許可を確認する。一般MCPやpayloadのbooleanをauthorityにしない。credential availabilityを確認した後、認可中の設定変更をclaimで再検証する。renewalは運用側が対象を選んで `createOrRenew` を呼ぶ。自動常駐schedulerやprovider固有CLI/credential設定はこの共通層には追加しない。
