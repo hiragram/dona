@@ -77,6 +77,8 @@ export class ConnectionRegistry {
       const current = this.get(id);
       if (current.revision !== revision) throw new ConnectionError("revision_conflict");
       if (this.operations(id).some((operation) => operation.state !== "done") || this.subscriptions(id).some((s) => s.state === "stop_candidate")) throw new ConnectionError("operation_pending");
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND status IN ('dispatching','waiting_agent') LIMIT 1`).get(id, revision)) throw new ConnectionError("operation_pending");
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
@@ -146,9 +148,11 @@ export class ConnectionRegistry {
     }).immediate();
   }
   assertVerifiable(id: string, revision: number, resource: string, generation: number): Subscription {
-    this.current(id, revision, resource);
+    const c = this.current(id, revision, resource);
     const s = this.sub(id, resource, generation);
     if (s.providerId === null || ["stopped","stop_candidate"].includes(s.state)) throw new ConnectionError("invalid_transition");
+    if (c.capability.kind === "manual" && s.revision !== revision && this.subscriptions(id).some((candidate) =>
+      candidate.resource === resource && candidate.generation !== generation && candidate.revision === revision)) throw new ConnectionError("invalid_transition");
     if (this.operations(id).some((o) => o.resource === resource && o.generation === generation && o.state !== "done")) throw new ConnectionError("operation_pending");
     return s;
   }
@@ -328,12 +332,10 @@ export class ConnectionRegistry {
     if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
     const c = this.current(binding.connectionId, binding.revision, binding.resource);
     const s = this.sub(c.id, binding.resource, binding.generation);
-    const now = this.clock.now();
+    const now = this.tick(c.id);
     if (!c.capability.cursor || c.state !== "active" || c.account !== binding.account || c.credentialRevision !== binding.credentialRevision ||
       s.revision !== c.revision || s.verifiedAt === null || !["active","expiring","stop_candidate"].includes(s.state) ||
       (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
-    const row = this.db.prepare("SELECT last_clock FROM connections WHERE id=?").get(c.id) as {last_clock:number};
-    if (!Number.isSafeInteger(now) || now < row.last_clock) throw new ConnectionError("clock_skew");
   }
   rebindCursor(id: string, resource: string, expected: Cursor, revision: number): void {
     this.db.transaction(() => {

@@ -261,7 +261,12 @@ export class DispatcherDatabase {
   }
 
   commitConnectionBatch(batch: CursorBatch): EnqueueResult[] {
-    return this.connections.commitBatch(batch, (envelope) => this.enqueue(envelope, new Date(), { connectionId: batch.binding.connectionId }));
+    try {
+      return this.connections.commitBatch(batch, (envelope) => this.enqueue(envelope, new Date(), { connectionId: batch.binding.connectionId }));
+    } catch (error) {
+      if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
+      throw error;
+    }
   }
 
   enqueue(envelope: EventEnvelope, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {

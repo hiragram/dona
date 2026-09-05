@@ -460,6 +460,39 @@ test("複数resourceは同じprovider IDを共有できる",(t)=>{
   assert.deepEqual(db.connections.subscriptions("manual").map(s=>s.providerId),["shared-installation","shared-installation"]);
 });
 
+test("manual旧generationはcurrent generation作成後に再bindingできない",(t)=>{
+  const {db}=fixture(t);const manual={id:"manual",provider:"drive",account:"account1",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"folder1",events:["changed"]}],capability:{kind:"manual" as const,cursor:false}};
+  db.connections.register(manual);db.connections.attachManual("manual",1,"folder1","old-id",null);
+  db.connections.observe("manual",1,"folder1",1,{providerId:"old-id",expiresAt:null,verified:true,cutoverConfirmed:false});
+  db.connections.revise("manual",1,{...manual,credentialRevision:2});db.connections.attachManual("manual",2,"folder1","new-id",null);
+  assert.throws(()=>db.connections.beginVerification("manual",2,"folder1",1),/invalid_transition/);
+});
+
+test("in-flight eventがあるconnectionのrevision更新を拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()));
+  assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
+});
+
+test("cursor batchのqueue拒否metricをrollback後も保持する",async(t)=>{
+  const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  (db.queuePolicy.defaults as {depth:number}).depth=1;db.enqueueExternal(event(),binding());
+  const batch={binding:binding(),expected:db.connections.cursor("pilot","folder1"),checkpoint:"next",complete:true,
+    events:[{providerEventId:"second",envelope:event("second")}]};
+  assert.throws(()=>db.commitConnectionBatch(batch),(error:any)=>error.code==="queue_depth");
+  assert.equal((db.queueHealth().metrics as {code:string;count:number}[]).find(metric=>metric.code==="queue_depth")?.count,1);
+});
+
+test("pollingは各pageのclock high-waterを保存する",async(t)=>{
+  const {pollConnectionBatch}=await import("../src/connections/poll.js");
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");let reads=0;
+  await assert.rejects(pollConnectionBatch(db,binding(),async()=>{
+    reads++;clock.value--;return {done:false as const,nextPage:"page2",events:[]};
+  }),/clock_skew/);
+  assert.equal(reads,1);assert.equal(db.connections.cursor("pilot","folder1").version,0);
+});
+
 test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{
   const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   clock.value+=9000;driver.cutover=true;await lifecycle.createOrRenew("pilot","folder1");
