@@ -173,6 +173,10 @@ export class SlackHealthServer {
         send(response, 403, { schema_version: 1, error: { code: "forbidden" } });
         return;
       }
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, error: { code: "shutting_down" } });
+        return;
+      }
       try {
         const result = await this.jobProgress.deliver(parseJobProgressRequest(await this.readJson(request)));
         send(response, 200, { schema_version: 1, ...result });

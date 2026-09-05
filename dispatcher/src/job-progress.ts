@@ -77,7 +77,10 @@ export class JobProgressStore {
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
   retry(jobId: string, error: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+5_000).toISOString(),error.slice(0,500),jobId); }
-  terminal(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status IN ('pending','delivering')").run(jobId); }
+  terminal(jobId: string): void {
+    this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
+    this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
+  }
   requeueLatest(jobIds: string[], at = new Date()): void {
     if (jobIds.length === 0) return;
     const placeholders = jobIds.map(() => "?").join(",");
@@ -92,13 +95,19 @@ export class JobProgressCoordinator {
   async ingest(row: JobRow): Promise<void> {
     if (terminalStatuses.has(row.status)) {
       this.store.terminal(row.job_id);
+      await fs.unlink(jobProgressPath(row)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
       const runningSiblings = this.jobs.listEventJobs(row.source_event_id).filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
       this.store.requeueLatest(runningSiblings);
       return;
     }
     try {
-      const text = await fs.readFile(jobProgressPath(row), "utf8");
-      if (text.length > 4096) throw new Error("progress file too large");
+      const progressPath = jobProgressPath(row);
+      const stats = await fs.lstat(progressPath);
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 4096) throw new Error("progress file must be a bounded regular file");
+      const handle = await fs.open(progressPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+      let text: string;
+      try { const buffer=Buffer.alloc(4097); const read=await handle.read(buffer,0,buffer.length,0); if(read.bytesRead>4096) throw new Error("progress file too large"); text=buffer.subarray(0,read.bytesRead).toString("utf8"); }
+      finally { await handle.close(); }
       this.store.ingest(parseJobProgress(JSON.parse(text), row.job_id));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.logger.warn("Job progress ignored", { job_id: row.job_id, error_code: "invalid_job_progress" });
