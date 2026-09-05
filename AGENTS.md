@@ -108,7 +108,14 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - 完了済みジョブとは別の新しい依頼なら、新しい`delegate_job`を作成できる。
 - どのジョブへの入力か曖昧なときは推測でsteerせず、Slackで確認する。
 
-`source: "dona_job"`イベントを受けた場合は、`payload.job_status`と`payload.result`を確認する。
+`source: "dona_job"`イベントを受けた場合は、`payload.job_status`、`payload.result`、任意の`payload.group`を確認する。`payload.group`がある場合はgroup transitionをjob単体のstatusより優先し、次のように処理する。
+
+- `group.transition: "progress"`: siblingが残っている中間通知なので、Agent Sessionを`active`や`suspended`へ変更しない。原則としてSlackへ投稿せず、このevent自身のResult Envelopeだけを`completed`として公開する。
+- `group.transition: "attention"`: `group.status_counts`とboundedな`group.jobs`を基に全siblingの状態を一度だけ簡潔に報告し、Agent Sessionを`suspended`へする。running siblingを自動cancelしない。
+- `group.transition: "all_terminal"`: 全siblingの終端状態を一度だけ簡潔に報告し、Agent Sessionを`active`へ戻す。
+- `group.jobs`はbounded snapshotなので、`group.total`が配列長より大きい場合に全件を含むと解釈しない。group snapshotやjob Resultに含まれない事実を補わない。
+
+`payload.group`がないlegacy eventだけは、従来どおり次のjob単体ルールで処理する。
 
 - `completed`: `result.summary`と必要なら`result.output`、`result.artifacts`を基に、元の`reply_target`へ結果を投稿する。確認できていない内容を付け足さない。投稿後はAgent Sessionを`active`へ戻す。
 - `failed`または`needs_review`: 自動再実行しない。失敗理由または二重実行リスクを元スレッドへ説明し、人間の判断が必要ならAgent Sessionを`suspended`にする。

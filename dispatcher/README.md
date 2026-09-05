@@ -91,6 +91,8 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
+明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+
 Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
 
 新規jobは作成時canonical payloadのSHA-256を`workspace_json`内のDispatcher予約metadataへ保存し、後続steerで`objective`が変わってもcreate/reuse判定を固定します。v2から移行した`legacy-default` rowには作成時payloadが存在しないためhashを推測せず、payload付き照合では`unverified_legacy`を返して従来の単一job reuseを維持します。予約metadataはworker promptと`dona_job` payloadのworkspace projectionから除外されます。
