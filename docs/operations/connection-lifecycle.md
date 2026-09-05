@@ -68,7 +68,7 @@ register/revise/attach/disableはローカルregistryへの明示write。provide
 
 ## migration・rollback
 
-専用 `connection_schema.version=1` とadditive table/index/FKを1 transactionで作る。既存 `PRAGMA user_version=2`、events/jobs schemaとrowは変更しない。二度目の起動はcomponent versionを確認する。将来versionは拒否する。
+専用 `connection_schema.version=1` とadditive table/index/FKを1 transactionで作る。現行queue schemaの `PRAGMA user_version=4`、events/jobs schemaとrowは変更しない。二度目の起動はcomponent versionを確認する。将来versionは拒否する。
 
 旧版は既存event/jobとDBを読めるが、connection binding/disableを認識しない。**旧版へのrollbackはprovider受信・provider eventのdispatchを停止した状態でのみ可能**。data read互換とprovider運用互換を同一視しない。稼働中の旧版へこのDBを差し替えない。バックアップは停止中またはSQLite backup APIでWALを含む整合snapshotを取り、rollback時も追加tableを消さない。delete/recreateを復旧手順にしない。
 

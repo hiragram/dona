@@ -23,7 +23,7 @@ import { jobAgentName } from "./job-agent-name.js";
 import { stableStringify } from "./validation.js";
 
 import { ConnectionRegistry, type CursorBatch } from "./connections/registry.js";
-import { migrateConnections, connectionDispatchPredicate } from "./connections/schema.js";
+import { migrateConnections, connectionDispatchPredicate, connectionDispatchPredicateFor } from "./connections/schema.js";
 import { ConnectionError, type Clock, type DeliveryBinding } from "./connections/domain.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -796,8 +796,9 @@ export class DispatcherDatabase {
       JOIN queue_events q USING(event_id) JOIN queue_lanes l USING(lane)
       WHERE events.status IN ('queued','retryable_failed') AND events.source!='dona_update' AND events.available_at<=? AND ${connectionDispatchPredicate}
       AND NOT EXISTS (SELECT 1 FROM queue_events older JOIN events prior ON prior.event_id=older.event_id
-        WHERE older.lane=q.lane AND prior.sequence<events.sequence AND prior.status!='completed')
-      ORDER BY l.last_selected,events.sequence`).all(at.toISOString(), at.getTime()) as (EventRow & {class:string})[];
+        WHERE older.lane=q.lane AND prior.sequence<events.sequence AND prior.status!='completed'
+          AND ${connectionDispatchPredicateFor("prior")})
+      ORDER BY l.last_selected,events.sequence`).all(at.toISOString(), at.getTime(), at.getTime()) as (EventRow & {class:string})[];
     for (let offset=0;offset<slots.length;offset++) {
       const candidate = candidates.find(row=>row.class===slots[(step+offset)%slots.length]);
       if (candidate) return candidate;

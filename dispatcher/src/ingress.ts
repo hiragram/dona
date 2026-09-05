@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
-import type { DeliveryBinding } from "./connections/domain.js";
+import { deliverySchema, type DeliveryBinding } from "./connections/domain.js";
 
 const externalSourcePattern = /^[a-z][a-z0-9._-]{0,63}$/;
 const connectionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -349,6 +349,10 @@ export class ExternalIngressProcessor {
     }
 
     const verifiedConnectionId = verified.connectionId;
+    const verifiedBinding = verified.connection === undefined ? undefined : deliverySchema.parse({
+      ...verified.connection,
+      connectionId: verifiedConnectionId,
+    });
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
@@ -377,7 +381,7 @@ export class ExternalIngressProcessor {
     const result = persist(envelope, {
       connectionId: verifiedConnectionId,
       ...(signal ? { coalesce: signal } : {}),
-      ...(verified.connection ? { binding: { ...verified.connection, connectionId: verified.connectionId } } : {}),
+      ...(verifiedBinding ? { binding: verifiedBinding } : {}),
     });
     const receipt: PersistReceipt = {
       schemaVersion: 1,

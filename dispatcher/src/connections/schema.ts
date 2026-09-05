@@ -55,10 +55,15 @@ export function migrateConnections(db: Database.Database): void {
 }
 
 // queue の選別と queued→dispatching の同じ SQL 文に適用する。disable/revision 更新と直列化される。
-export const connectionDispatchPredicate = `(NOT EXISTS (SELECT 1 FROM connections managed WHERE managed.provider=events.source)
-  OR EXISTS (SELECT 1 FROM connection_event_bindings bound WHERE bound.event_id=events.event_id)) AND NOT EXISTS (
+export function connectionDispatchPredicateFor(eventAlias: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(eventAlias)) throw new Error("Unsafe SQL alias");
+  return `(NOT EXISTS (SELECT 1 FROM connections managed WHERE managed.provider=${eventAlias}.source)
+  OR EXISTS (SELECT 1 FROM connection_event_bindings bound WHERE bound.event_id=${eventAlias}.event_id)) AND NOT EXISTS (
   SELECT 1 FROM connection_event_bindings b JOIN connections c ON c.id=b.connection_id
   LEFT JOIN connection_subscriptions s ON s.connection_id=b.connection_id AND s.resource=b.resource AND s.generation=b.generation
-  WHERE b.event_id=events.event_id AND (c.state!='active' OR c.revision!=b.revision OR s.revision!=b.revision
+  WHERE b.event_id=${eventAlias}.event_id AND (c.state!='active' OR c.revision!=b.revision OR s.revision!=b.revision
     OR s.verified_at IS NULL OR s.state NOT IN ('active','expiring','stop_candidate') OR s.expires_at<=?)
 )`;
+}
+
+export const connectionDispatchPredicate = connectionDispatchPredicateFor("events");

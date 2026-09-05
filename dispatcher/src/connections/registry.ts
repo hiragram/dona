@@ -361,7 +361,7 @@ export class ConnectionRegistry {
   }
   health(): { ready: boolean; degraded: number; pending: number; expiring: number; unknown: number; disabled: number; staleLeases: number } {
     const now = this.clock.now();
-    const connections = this.db.prepare("SELECT id,state FROM connections").all() as {id: string; state: string}[];
+    const connections = this.db.prepare("SELECT id,state,last_clock FROM connections").all() as {id: string; state: string; last_clock: number}[];
     const relevant = (id: string) => {
       const c = this.get(id);
       return this.subscriptions(id).filter((s) => s.state !== "stopped" && s.revision === c.revision && c.allowlist.some((entry) => entry.resource === s.resource));
@@ -377,7 +377,7 @@ export class ConnectionRegistry {
     const unknown = (this.db.prepare("SELECT count(*) AS n FROM connection_operations WHERE state='unknown'").get() as {n:number}).n;
     const staleLeases = (this.db.prepare("SELECT count(*) AS n FROM connection_operations WHERE state='inflight' AND lease_until<=?").get(now) as {n:number}).n;
     const degraded = connections.filter((c) => c.state === "degraded" || (c.state !== "disabled" &&
-      relevant(c.id).some((s) => s.error === "verification_failed"))).length;
+      (c.last_clock > now || relevant(c.id).some((s) => s.error === "verification_failed")))).length;
     const pending = connections.filter((row) => {
       if (row.state === "disabled") return false;
       const c = this.get(row.id), subscriptions = relevant(row.id);

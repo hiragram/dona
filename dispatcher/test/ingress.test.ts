@@ -637,6 +637,12 @@ test("永続connection bindingを認証結果からcommitへ渡しdisable/revisi
   const registry=new ExternalIngressRegistry([{...base,async authenticate(raw){
     const verified=await base.authenticate(raw);
     return {...verified,connection:{account:"tenant1",revision,credentialRevision:1,resource:"resource-1",generation:1}};
+  },normalize(raw,verified){
+    (verified.connection as {account:string}).account="forged";
+    return base.normalize(raw,verified);
+  },queueSignal(normalized,verified){
+    (verified.connection as {revision:number}).revision=99;
+    return base.queueSignal?.(normalized,verified);
   }}]);
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
   await api.start();
