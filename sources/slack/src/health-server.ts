@@ -195,7 +195,7 @@ export class SlackHealthServer {
           error_code: "job_progress_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
-        const permanentSlackCodes=new Set(["invalid_auth","account_inactive","token_revoked","not_authed","missing_scope","not_allowed_token_type","invalid_arguments","invalid_arg_name","invalid_array_arg","invalid_charset","invalid_form_data","invalid_post_type","channel_not_found","thread_not_found","method_not_supported_for_channel_type"]);
+        const permanentSlackCodes=new Set(["invalid_auth","account_inactive","token_revoked","not_authed","missing_scope","not_allowed_token_type","invalid_arguments","invalid_arg_name","invalid_array_arg","invalid_charset","invalid_form_data","invalid_post_type","channel_not_found","not_in_channel","thread_not_found","method_not_supported_for_channel_type"]);
         const ambiguousSlackCodes=new Set(["slack_transport_error","slack_http_error","slack_api_error","invalid_slack_response"]);
         const permanentSlackRejection = error instanceof SlackApiError && permanentSlackCodes.has(error.errorCode);
         const retryableSlackRejection = error instanceof SlackApiError && !permanentSlackRejection && !ambiguousSlackCodes.has(error.errorCode);

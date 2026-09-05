@@ -177,6 +177,18 @@ test("terminal ingest removes the job-bound progress directory", async () => {
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("unchanged invalid progress is warned once and a changed file is warned again", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-warning-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    const row={job_id:"job_abc",source_event_id:"evt_abc",status:"running",workspace_path:path.join(root,"job_abc"),workspace_json:JSON.stringify({kind:"scratch"})};
+    const progressFile=jobProgressPath(row as never); await fs.mkdir(path.dirname(progressFile),{recursive:true}); await fs.writeFile(progressFile,"{");
+    let warnings=0; const logger={warn(){warnings+=1;}}; const coordinator=new JobProgressCoordinator({} as never,store,{} as never,logger as never);
+    await coordinator.ingest(row as never); await coordinator.ingest(row as never); assert.equal(warnings,1);
+    await new Promise((resolve)=>setTimeout(resolve,5)); await fs.writeFile(progressFile,"not json");
+    await coordinator.ingest(row as never); assert.equal(warnings,2);
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("restart fences a delivery that may have reached Slack", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-recover-")); const file=path.join(root,"progress.sqlite3");
   let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();

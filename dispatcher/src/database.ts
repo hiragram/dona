@@ -118,7 +118,11 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
   })();
 }
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec("CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id)");}
-function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec("CREATE INDEX IF NOT EXISTS jobs_status_job_idx ON jobs(status,job_id)");}
+function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
+  CREATE INDEX IF NOT EXISTS jobs_status_job_idx ON jobs(status,job_id);
+  CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
+    WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
+`);}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,

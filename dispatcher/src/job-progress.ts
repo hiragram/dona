@@ -127,6 +127,7 @@ export class JobProgressCoordinator {
   private readonly deliveryClaims = new Map<string,string>();
   private readonly deliveryOperations = new Map<string,Promise<void>>();
   private readonly terminalReconciliations = new Map<string,Promise<void>>();
+  private readonly invalidProgressWarnings = new Map<string,string>();
   private readonly drainAbort = new AbortController();
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
@@ -148,8 +149,18 @@ export class JobProgressCoordinator {
       try { const opened=await handle.stat(); if(!opened.isFile() || opened.size>4096) throw new Error("opened progress must be a bounded regular file"); const buffer=Buffer.alloc(4097); const read=await handle.read(buffer,0,buffer.length,0); if(read.bytesRead>4096) throw new Error("progress file too large"); text=buffer.subarray(0,read.bytesRead).toString("utf8"); }
       finally { await handle.close(); }
       this.store.ingest(parseJobProgress(JSON.parse(text), row.job_id));
+      this.invalidProgressWarnings.delete(row.job_id);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.logger.warn("Job progress ignored", { job_id: row.job_id, error_code: "invalid_job_progress" });
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.invalidProgressWarnings.delete(row.job_id);
+      } else {
+        const stats=await fs.lstat(jobProgressPath(row)).catch(()=>undefined);
+        const fingerprint=`${error instanceof Error?error.message:String(error)}:${stats?.size??"missing"}:${stats?.mtimeMs??"missing"}`;
+        if(this.invalidProgressWarnings.get(row.job_id)!==fingerprint){
+          this.invalidProgressWarnings.set(row.job_id,fingerprint);
+          this.logger.warn("Job progress ignored", { job_id: row.job_id, error_code: "invalid_job_progress" });
+        }
+      }
     }
   }
   async recover(): Promise<void> {
