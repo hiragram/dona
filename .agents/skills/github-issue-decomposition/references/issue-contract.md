@@ -33,6 +33,8 @@ Epicには以下を記載する。
 
 Phaseはrolloutの説明には使えるが、それだけをdependency graphの根拠にしてはならない。
 
+完全なintegration workflowでは、親Epicだけに既存のexact `epic` labelを付ける。単一Issue route、Issue-onlyの構造化route、子Issueへは、このcontractを理由に`epic`や他のlabelを自動付与しない。存在しないlabelも自動作成しない。
+
 ## 実装sub-issue
 
 各実装childには以下を記載する。
@@ -51,7 +53,7 @@ acceptance criteriaだけでIssueを独立してreviewできるようにする�
 完全なintegration workflowでは、各child本文へ以下も固定して記載する。
 
 - 実装PRのmerge先となるexact feature branch名。例: `feature/foo-bar`。
-- feature branchからdefault branchへのintegration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
+- feature branchからdefault branchへのDraft integration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 実装PRのbaseはdefault branchではなく、上記feature branchであること。
 - Issue全体の完了点を、`実装PRを上記feature branchへmergeした時点`または`integration PRをdefault branchへmergeした時点`のどちらかへ明示的に固定する。前者はchild単独のacceptanceとtestがfeature branch上で完結するときだけ選び、実装PRで`Closes #<child>`を使用できる。ただしnon-default branch向けkeywordはGitHubの自動closeを保証しないため、実装PRをmergeするauthenticated identityを`close_owner`へ固定し、target Issueの`viewerCanClose: true`相当のcurrent permission evidenceを事前確認したうえで、base/head/merge commitとchild Issue identityを照合してexact childを手動closeし、Issueの`state`、`closedAt`、close eventを再取得するまでを完了contractに含める。permissionがfalse・unknown・別identityならこの完了点で`Closes`を使用しない。後者を選ぶ場合、child実装PRは部分対応として`Closes`を使用せず、default branch向けintegration PR本文へそのchildの`Closes #<child>`を追加し、`closingIssuesReferences`を再取得して自動close対象であることを検証する。branch名、integration PR link、base指定、またはnon-default PR本文のkeywordだけを完了点やIssue closeの証拠にしない。
 

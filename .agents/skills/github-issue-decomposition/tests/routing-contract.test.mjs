@@ -113,7 +113,7 @@ test("integration childは実際のmerge先とIssue完了点を明示する", ()
   assert.match(integrationWorkflow, /`close_owner`.*`post_merge_close_action`.*`state`.*`closedAt`.*close event/);
   assert.match(integrationWorkflow, /authenticated identity.*`close_owner`.*`viewerCanClose: true`.*permission.*false・unknown・別identity/);
   assert.match(integrationWorkflow, /`child_completion_point`.*close mechanism.*Issue番号.*execution context/);
-  assert.match(integrationWorkflow, /標準templateからnon-draft integration PRを作成する/);
+  assert.match(integrationWorkflow, /標準templateからDraft integration PRを作成する/);
   assert.match(integrationWorkflow, /PR作成前.*current default branchのexact SHA.*標準`.github\/PULL_REQUEST_TEMPLATE.md`.*全見出し.*順序.*未解決placeholder/s);
   assert.match(integrationWorkflow, /再取得.*raw title\/body.*標準templateの全見出し.*exactly 1件の`Closes #<親Issue番号>`/s);
   assert.match(skill, /integration PR -> 子Issue -> integration PR closing relationship reconcile -> native graph/);
