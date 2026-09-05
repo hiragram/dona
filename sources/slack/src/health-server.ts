@@ -186,7 +186,8 @@ export class SlackHealthServer {
           error_message: error instanceof Error ? error.message : String(error),
         });
         const slackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error"].includes(error.errorCode);
-        send(response, slackRejection ? 429 : 503, { schema_version: 1, error: { code: slackRejection ? error.errorCode : "job_progress_failed" } });
+        const definitelyUnsent = slackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
+        send(response, definitelyUnsent ? 429 : 503, { schema_version: 1, error: { code: slackRejection ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }
       return;
     }

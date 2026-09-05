@@ -83,6 +83,7 @@ export class JobSupervisor {
   private loopPromise: Promise<void> | undefined;
   private running = false;
   private stopping = false;
+  private staleJobsRecovered = false;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -99,13 +100,7 @@ export class JobSupervisor {
 
   start(): void {
     if (this.loopPromise) return;
-    const recovered = this.database.recoverStaleJobs();
-    if (recovered.retryable || recovered.needsReview) {
-      this.logger.warn("Recovered stale jobs", {
-        retryable_count: recovered.retryable,
-        needs_review_count: recovered.needsReview,
-      });
-    }
+    this.recoverStaleJobs();
     this.running = true;
     this.loopPromise = this.loop().catch((error: unknown) => {
       this.logger.error("Job supervisor stopped unexpectedly", {
@@ -114,6 +109,18 @@ export class JobSupervisor {
       });
       throw error;
     });
+  }
+
+  recoverStaleJobs(): void {
+    if (this.staleJobsRecovered) return;
+    this.staleJobsRecovered = true;
+    const recovered = this.database.recoverStaleJobs();
+    if (recovered.retryable || recovered.needsReview) {
+      this.logger.warn("Recovered stale jobs", {
+        retryable_count: recovered.retryable,
+        needs_review_count: recovered.needsReview,
+      });
+    }
   }
 
   wake(): void {
@@ -413,7 +420,9 @@ export class JobSupervisor {
       while (keepPolling && !this.stopping) {
         await abortableDelay(this.config.queuePollMs, pollAbort.signal);
         if (keepPolling && !this.stopping) {
-          try { await this.progress?.ingest(this.database.getJob(row.job_id) ?? row); }
+          const current = this.database.getJob(row.job_id) ?? row;
+          if (["blocked", "completed", "failed", "cancelled", "needs_review"].includes(current.status)) break;
+          try { await this.progress?.ingest(current); }
           catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
         }
       }

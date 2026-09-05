@@ -50,7 +50,7 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
-    new SlackJobProgressReporter(registry),
+    new SlackJobProgressReporter(registry, (progressId) => dispatcher.resolveJobProgress(progressId)),
   );
   await health.start();
   try {

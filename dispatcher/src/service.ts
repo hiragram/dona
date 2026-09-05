@@ -41,7 +41,6 @@ export async function runService(config: DispatcherConfig): Promise<void> {
   const jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  await jobProgress?.recover();
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
   jobSupervisor = new JobSupervisor(
     database,
@@ -51,6 +50,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => worker.wake(),
     jobProgress,
   );
+  jobSupervisor.recoverStaleJobs();
+  await jobProgress?.recover();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -73,6 +74,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       },
     },
     updateNotificationWorker,
+    jobProgress,
   );
 
   try {

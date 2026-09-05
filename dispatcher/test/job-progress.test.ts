@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
+import { jobProgressPath } from "../src/job-prompt.js";
 
 const valid = { schema_version: 1 as const, job_id: "job_abc", sequence: 1, phase: "testing" as const,
   safe_summary: "テスト中", updated_at: "2026-09-05T00:00:00.000Z" };
@@ -25,6 +26,14 @@ test("summary is normalized and secret-like content falls back to phase", () => 
   assert.equal(safeProgressText({ ...valid, safe_summary: "password=hunter2" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "api_key=secret" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "AKIAIOSFODNN7EXAMPLE" }), "テスト中");
+});
+
+test("git metadata lookup is bounded and falls back inside the workspace", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-git-"));
+  try {
+    await fs.writeFile(path.join(root, ".git"), `gitdir: /${"x".repeat(5000)}`);
+    assert.equal(jobProgressPath({ workspace_path: root } as never), path.join(root, ".dona-job-progress.json"));
+  } finally { await fs.rm(root, { recursive: true }); }
 });
 
 test("definite pre-delivery failure returns to pending with backoff", async () => {

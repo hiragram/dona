@@ -26,6 +26,12 @@ export class DispatcherClient {
     );
   }
 
+  async resolveJobProgress(progressId: string): Promise<unknown> {
+    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}`);
+    if (response.statusCode !== 200) throw new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`);
+    return JSON.parse(response.body);
+  }
+
   private request(method: "GET" | "POST", path: string, body?: Buffer): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;

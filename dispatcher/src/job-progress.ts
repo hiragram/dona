@@ -125,15 +125,12 @@ export class JobProgressCoordinator {
     const progress = this.store.pending(); if (!progress) return;
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
-    const siblings = this.jobs.listEventJobs(job.source_event_id);
-    const index = siblings.findIndex((item) => item.job_id === job.job_id) + 1;
-    const status = siblings.length > 1 ? `${siblings.length}件中${index}件目: ${progress.safe_summary}` : progress.safe_summary;
     this.store.begin(progress.job_id);
     let requestStarted = false;
     try {
       const token = await readPrivateToken(this.config.updateInternalTokenPath);
       if (!token) { this.store.retry(progress.job_id, "missing internal token"); return; }
-      const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:`${job.job_id}:${progress.sequence}`, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts, status }));
+      const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:`${job.job_id}:${progress.sequence}` }));
       await new Promise<void>((resolve,reject) => { let settled=false; const finish=(error?:Error)=>{if(settled)return;settled=true;error?reject(error):resolve();}; const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; response.resume(); response.once("aborted",()=>finish(Object.assign(new Error("response aborted"),{acceptanceUnknown:true}))); response.once("error",error=>finish(Object.assign(error,{acceptanceUnknown:true}))); response.once("end",()=>response.statusCode===200?finish():finish(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403,429].includes(response.statusCode??0)})));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",error=>finish(error)); request.end(body); });
       this.store.delivered(progress.job_id);
     } catch (error) {
@@ -142,5 +139,18 @@ export class JobProgressCoordinator {
       if (definitelyUnsent) this.store.retry(progress.job_id, detail.message);
       else this.store.unknown(progress.job_id, detail.message);
     }
+  }
+
+  resolveDelivery(progressId: string): { progress_id:string; workspace_id:string; channel_id:string; thread_ts:string; status:string } | undefined {
+    const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId);
+    if (!match) return undefined;
+    const progress = this.store.get(match[1]!);
+    const job = this.jobs.getJob(match[1]!);
+    if (!progress || progress.status !== "delivering" || progress.sequence !== Number(match[2]) || !job ||
+      terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) return undefined;
+    const siblings = this.jobs.listEventJobs(job.source_event_id);
+    const index = siblings.findIndex((item) => item.job_id === job.job_id) + 1;
+    return { progress_id:progressId, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts,
+      status:siblings.length > 1 ? `${siblings.length}件中${index}件目: ${progress.safe_summary}` : progress.safe_summary };
   }
 }
