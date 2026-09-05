@@ -10,12 +10,14 @@ export type CursorPage = {
 // page token は一時変数だけ。最終 page の取得・検証成功まで永続checkpointを触らない。
 export async function pollConnectionBatch(database: DispatcherDatabase, binding: DeliveryBinding,
   fetchPage: (checkpoint: string | null, page: string | null) => Promise<CursorPage>,
-  limits = { pages: 100, events: 10_000, timeoutMs: 30_000 }): Promise<void> {
-  if (![limits.pages,limits.events,limits.timeoutMs].every((n)=>Number.isSafeInteger(n)&&n>0) || limits.timeoutMs>60_000) throw new ConnectionError("invalid_input");
+  limits: {pages:number;events:number;timeoutMs:number;bytes?:number} = { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 }): Promise<void> {
+  const byteLimit=limits.bytes??16_777_216;
+  if (![limits.pages,limits.events,limits.timeoutMs,byteLimit].every((n)=>Number.isSafeInteger(n)&&n>0) || limits.timeoutMs>60_000) throw new ConnectionError("invalid_input");
   database.connections.assertPolling(binding);
   const expected=database.connections.cursor(binding.connectionId,binding.resource);
   if (expected.revision !== binding.revision) throw new ConnectionError("cursor_conflict");
   const events: {providerEventId:string;envelope:CursorBatch["events"][number]["envelope"]}[]=[];
+  let encodedBytes=0;
   let page: string | null=null;
   const seen=new Set<string>();
   const deadline=performance.now()+limits.timeoutMs;
@@ -35,6 +37,8 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
       if(event.envelope.schema_version!==1) throw new ConnectionError("incomplete_batch");
       validateNormalizedExternalEvent({providerEventId:event.providerEventId,type:event.envelope.type,occurredAt:event.envelope.occurred_at,
         subject:event.envelope.subject,payload:event.envelope.payload,replyTarget:event.envelope.reply_target,trace:event.envelope.trace});
+      encodedBytes+=Buffer.byteLength(JSON.stringify(event));
+      if(encodedBytes>byteLimit) throw new ConnectionError("incomplete_batch");
       return event;
     })); }
     catch { throw new ConnectionError("incomplete_batch"); }

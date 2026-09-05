@@ -256,10 +256,10 @@ export class ConnectionRegistry {
         now, expired ? "expired" : observed.verified ? null : "verification_failed", id, resource, generation);
       if (observed.verified && !expired) {
         this.db.prepare("UPDATE connections SET state='active' WHERE id=? AND state!='disabled'").run(id);
-        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1,
+        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET revision=?,state='stop_candidate',verification_epoch=verification_epoch+1,
           error=CASE WHEN error='verification_failed' THEN NULL ELSE error END
-          WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND
-            state IN ('active','expiring','verification_pending')`).run(id, resource, generation, revision);
+          WHERE connection_id=? AND resource=? AND generation<? AND
+            state IN ('active','expiring','verification_pending')`).run(revision,id,resource,generation);
       }
       this.audit(c, "observed", now);
     }).immediate();

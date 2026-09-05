@@ -553,6 +553,9 @@ test("pollingは不正Envelopeをcursor commit前に拒否する",async(t)=>{
     {providerEventId:"bad",envelope:{...event("bad"),schema_version:2} as unknown as EventEnvelope},
   ]})),/incomplete_batch/);
   assert.equal(db.connections.cursor("pilot","folder1").version,0);assert.equal(db.list().length,0);
+  await assert.rejects(pollConnectionBatch(db,binding(),async()=>({done:true,checkpoint:"next",events:[
+    {providerEventId:"large",envelope:{...event("large"),payload:{value:"x".repeat(200)}}},
+  ]}),{pages:2,events:2,timeoutMs:1000,bytes:100}),/incomplete_batch/);
 });
 
 test("polling eventはprovider ownerとpolicy snapshotを永続化する",async(t)=>{
