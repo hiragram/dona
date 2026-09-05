@@ -57,6 +57,7 @@ export class JobProgressStore {
     `))();
     if (version === 1) this.db.transaction(() => this.db.exec("ALTER TABLE job_progress ADD COLUMN terminal_checked INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 2;"))();
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_terminal_idx ON job_progress(terminal_checked,job_id)");
   }
   recoverDeliveries(): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error='recovered ambiguous delivery' WHERE status='delivering'").run(); }
   close(): void { this.db.close(); }
@@ -96,13 +97,13 @@ export class JobProgressStore {
       if (jobIds.length > 0) {
         const placeholders=jobIds.map(()=>"?").join(",");
         const pending=this.db.prepare(`SELECT 1 FROM job_progress WHERE job_id IN (${placeholders}) AND status='pending' LIMIT 1`).get(...jobIds);
-        if (!pending) this.requeueLatest(jobIds,at);
+        if (!pending && !this.requeueLatest(jobIds,at)) this.queuePreparing(jobIds[0]!,at);
       }
       this.markTerminalChecked(jobId);
     })();
   }
-  requeueLatest(jobIds: string[], at = new Date()): void {
-    if (jobIds.length === 0) return;
+  requeueLatest(jobIds: string[], at = new Date()): boolean {
+    if (jobIds.length === 0) return false;
     const placeholders = jobIds.map(() => "?").join(",");
     const latest = this.db.prepare(`SELECT job_id,delivered_at FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY delivered_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string;delivered_at?:string}|undefined;
     if (latest) {
@@ -111,7 +112,9 @@ export class JobProgressStore {
         : at.toISOString();
       this.db.prepare("UPDATE job_progress SET status='pending',available_at=? WHERE job_id=? AND status='delivered'").run(availableAt,latest.job_id);
     }
+    return latest !== undefined;
   }
+  private queuePreparing(jobId:string,at:Date):void { const timestamp=at.toISOString(); this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at,terminal_checked) VALUES(?,0,'preparing','準備中',?,'pending',?,0) ON CONFLICT(job_id) DO NOTHING`).run(jobId,timestamp,timestamp); }
 }
 
 export class JobProgressCoordinator {

@@ -65,6 +65,14 @@ test("terminal sibling requeue preserves the per-job delivery interval", async (
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
+test("terminal sibling without progress receives a fixed preparing fallback", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-fallback-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.requeueLatestAndMarkTerminal("job_done",["job_next"],new Date("2026-09-05T00:00:00Z"));
+    const next=store.pending(); assert.equal(next?.job_id,"job_next"); assert.equal(next?.sequence,0); assert.equal(next?.phase,"preparing");
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("an attention-claimed group rejects later progress delivery", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
@@ -149,6 +157,6 @@ test("migrates progress schema 1 with a terminal reconciliation marker", async (
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); PRAGMA user_version=1;"); legacy.close();
   const store=new JobProgressStore(file);
-  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); } finally { check.close(); } }
+  try { const check=new Database(file,{readonly:true}); try { assert.equal(check.pragma("user_version",{simple:true}),2); assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='job_progress_terminal_idx'").get()); } finally { check.close(); } }
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });
