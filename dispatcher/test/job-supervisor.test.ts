@@ -52,7 +52,10 @@ function createKeyedScratchJobs(
   count: number,
   startOffsetMs: number,
 ): { sourceEventId: string; jobs: JobRow[] } {
-  const source = database.enqueue(eventEnvelope(externalEventId)).row;
+  const source = database.enqueue(
+    eventEnvelope(externalEventId),
+    new Date(Date.UTC(2026, 8, 5, 0, 0, 0, startOffsetMs)),
+  ).row;
   const jobs = Array.from({ length: count }, (_, index) => database.createJob(
     {
       source_event_id: source.event_id,
@@ -177,6 +180,47 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("keeps cursor order when the cursor event is temporarily at its active limit", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-full-ring-first", 2, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-full-ring-second", 2, 100);
+    const third = createKeyedScratchJobs(database, config, "Ev-full-ring-third", 1, 200);
+    const sourceByJob = new Map(
+      [...first.jobs, ...second.jobs, ...third.jobs].map((row) => [row.job_id, row.source_event_id]),
+    );
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 2 && waiters.size === 2);
+    assert.deepEqual(
+      new Set(prompted.map((jobId) => sourceByJob.get(jobId))),
+      new Set([first.sourceEventId, second.sourceEventId]),
+    );
+    const firstActiveJob = prompted.find((jobId) => sourceByJob.get(jobId) === first.sourceEventId)!;
+    waiters.get(firstActiveJob)!(ok("done"));
+    await waitFor(() => prompted.length === 3);
+    assert.equal(sourceByJob.get(prompted[2]!), third.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("counts recovered running jobs before starting queued work", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -213,16 +257,21 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const first = createKeyedScratchJobs(database, config, "Ev-start-failure", 1, 0);
     const second = createKeyedScratchJobs(database, config, "Ev-after-failure", 1, 100);
-    const originalListRunnableJobs = database.listRunnableJobs.bind(database);
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
     let queryCount = 0;
-    database.listRunnableJobs = (at?: Date): JobRow[] => {
+    database.nextRunnableJob = (
+      at?: Date,
+      afterSourceEventId?: string,
+      excludedSourceEventIds?: string[],
+      excludedJobIds?: string[],
+    ): JobRow | undefined => {
       queryCount += 1;
       if (queryCount === 1) {
         const error = new Error("database is busy") as Error & { code?: string };
         error.code = "SQLITE_BUSY";
         throw error;
       }
-      return originalListRunnableJobs(at);
+      return originalNextRunnableJob(at, afterSourceEventId, excludedSourceEventIds, excludedJobIds);
     };
     const warnings: Array<Record<string, unknown>> = [];
     const busyLogger: Logger = {

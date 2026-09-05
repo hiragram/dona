@@ -5,10 +5,13 @@ import {
   canonicalJobPayload,
   canonicalJobPayloadSha256,
   jobObjectiveCharacterMax,
+  jobCreationObjectiveBytesFromWorkspace,
+  jobCreationPayloadSha256FromWorkspace,
   parseCreateJobRequest,
   parseEventEnvelope,
   parseInternalUpdateEventEnvelope,
   parseResultEnvelope,
+  serializeJobWorkspace,
   stableStringify,
 } from "../src/validation.js";
 import { eventEnvelope } from "./helpers.js";
@@ -123,5 +126,15 @@ describe("job creation validation", () => {
       () => parseCreateJobRequest({ ...base, objective: `${objective}😀` }),
       /at most 100000 characters/,
     );
+  });
+
+  test("keeps rollback-sensitive creation metadata strict and stores resource metadata separately", () => {
+    const canonicalPayloadSha256 = "a".repeat(64);
+    const serialized = serializeJobWorkspace({ kind: "scratch" }, canonicalPayloadSha256, 12);
+    const workspace = JSON.parse(serialized) as Record<string, unknown>;
+    assert.deepEqual(workspace.__dona_job_creation, { canonical_payload_sha256: canonicalPayloadSha256 });
+    assert.deepEqual(workspace.__dona_job_resource, { objective_utf8_bytes: 12 });
+    assert.equal(jobCreationPayloadSha256FromWorkspace(workspace), canonicalPayloadSha256);
+    assert.equal(jobCreationObjectiveBytesFromWorkspace(workspace), 12);
   });
 });

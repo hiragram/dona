@@ -189,20 +189,11 @@ export class JobSupervisor {
   }
 
   private scheduleRunnableJobs(): void {
-    const rows = this.database.listRunnableJobs();
-    for (const row of rows) {
-      if (row.status === "running" && !this.active.has(row.job_id)) this.launch(row);
+    for (const row of this.database.listRunningJobs()) {
+      if (!this.active.has(row.job_id)) this.launch(row);
     }
 
     const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
-    const waiting = rows.filter((row) => row.status !== "running" && !this.active.has(row.job_id));
-    const selected = this.selectFairJobs(waiting, availableSlots);
-    for (const row of selected) this.launch(row);
-    this.logSchedulerState(waiting.filter((row) => !this.active.has(row.job_id)));
-  }
-
-  private selectFairJobs(rows: JobRow[], availableSlots: number): JobRow[] {
-    if (availableSlots <= 0 || rows.length === 0) return [];
     const effectivePerEventLimit = Math.min(
       this.config.jobConcurrency,
       this.config.jobConcurrencyPerEvent,
@@ -211,54 +202,34 @@ export class JobSupervisor {
     for (const active of this.active.values()) {
       activeCounts.set(active.sourceEventId, (activeCounts.get(active.sourceEventId) ?? 0) + 1);
     }
-    const queues = new Map<string, JobRow[]>();
-    for (const row of rows) {
-      const queue = queues.get(row.source_event_id) ?? [];
-      queue.push(row);
-      queues.set(row.source_event_id, queue);
-    }
-
-    const sourceEventIds = [...queues.keys()];
-    const selected: JobRow[] = [];
-    while (selected.length < availableSlots) {
-      const eligible = sourceEventIds.filter((sourceEventId) =>
-        (queues.get(sourceEventId)?.length ?? 0) > 0 &&
-        (activeCounts.get(sourceEventId) ?? 0) < effectivePerEventLimit
+    for (let selected = 0; selected < availableSlots; selected += 1) {
+      const excludedSourceEventIds = [...activeCounts]
+        .filter(([, count]) => count >= effectivePerEventLimit)
+        .map(([sourceEventId]) => sourceEventId);
+      const row = this.database.nextRunnableJob(
+        new Date(),
+        this.fairCursorSourceEventId,
+        excludedSourceEventIds,
+        [...this.active.keys()],
       );
-      if (eligible.length === 0) break;
-      const cursorIndex = this.fairCursorSourceEventId === undefined
-        ? -1
-        : eligible.indexOf(this.fairCursorSourceEventId);
-      const startIndex = cursorIndex < 0 ? 0 : (cursorIndex + 1) % eligible.length;
-      let selectedInRound = false;
-      for (let offset = 0; offset < eligible.length && selected.length < availableSlots; offset += 1) {
-        const sourceEventId = eligible[(startIndex + offset) % eligible.length]!;
-        if ((activeCounts.get(sourceEventId) ?? 0) >= effectivePerEventLimit) continue;
-        const row = queues.get(sourceEventId)?.shift();
-        if (!row) continue;
-        selected.push(row);
-        activeCounts.set(sourceEventId, (activeCounts.get(sourceEventId) ?? 0) + 1);
-        this.fairCursorSourceEventId = sourceEventId;
-        selectedInRound = true;
-      }
-      if (!selectedInRound) break;
+      if (!row) break;
+      this.launch(row);
+      activeCounts.set(row.source_event_id, (activeCounts.get(row.source_event_id) ?? 0) + 1);
+      this.fairCursorSourceEventId = row.source_event_id;
     }
-    return selected;
+    this.logSchedulerState();
   }
 
-  private logSchedulerState(waiting: JobRow[]): void {
-    const queuedCounts = new Map<string, number>();
-    for (const row of waiting) {
-      queuedCounts.set(row.source_event_id, (queuedCounts.get(row.source_event_id) ?? 0) + 1);
-    }
+  private logSchedulerState(): void {
+    const queue = this.database.jobQueueStats([...this.active.keys()]);
     const activeCounts = new Map<string, number>();
     for (const active of this.active.values()) {
       activeCounts.set(active.sourceEventId, (activeCounts.get(active.sourceEventId) ?? 0) + 1);
     }
     const fields = {
-      queued_jobs: waiting.length,
-      queued_source_events: queuedCounts.size,
-      queued_max_per_event: maximumCount(queuedCounts.values()),
+      queued_jobs: queue.queuedJobs,
+      queued_source_events: queue.queuedSourceEvents,
+      queued_max_per_event: queue.queuedMaxPerEvent,
       active_jobs: this.active.size,
       active_source_events: activeCounts.size,
       active_max_per_event: maximumCount(activeCounts.values()),

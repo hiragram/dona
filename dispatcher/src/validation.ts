@@ -24,6 +24,7 @@ export const legacyJobKey = "legacy-default";
 export const jobObjectiveCharacterMax = 100_000;
 export const jobObjectiveUtf8ByteMax = jobObjectiveCharacterMax * 4;
 const jobCreationMetadataKey = "__dona_job_creation";
+const jobResourceMetadataKey = "__dona_job_resource";
 
 const eventEnvelopeSchema = z
   .object({
@@ -100,7 +101,9 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
 ]);
 const jobCreationMetadataSchema = z.object({
   canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
-  objective_utf8_bytes: z.number().int().positive().max(jobObjectiveUtf8ByteMax).optional(),
+}).strict();
+const jobResourceMetadataSchema = z.object({
+  objective_utf8_bytes: z.number().int().positive().max(jobObjectiveUtf8ByteMax),
 }).strict();
 
 const createJobSchema = z.object({
@@ -210,10 +213,10 @@ export function serializeJobWorkspace(
 ): string {
   return stableStringify({
     ...workspace,
-    [jobCreationMetadataKey]: {
-      canonical_payload_sha256: canonicalPayloadSha256,
-      ...(objectiveUtf8Bytes === undefined ? {} : { objective_utf8_bytes: objectiveUtf8Bytes }),
-    },
+    [jobCreationMetadataKey]: { canonical_payload_sha256: canonicalPayloadSha256 },
+    ...(objectiveUtf8Bytes === undefined
+      ? {}
+      : { [jobResourceMetadataKey]: { objective_utf8_bytes: objectiveUtf8Bytes } }),
   });
 }
 
@@ -231,8 +234,8 @@ export function jobCreationPayloadSha256FromWorkspace(input: unknown): string | 
 
 export function jobCreationObjectiveBytesFromWorkspace(input: unknown): number | undefined {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
-  const parsed = jobCreationMetadataSchema.safeParse(
-    (input as Record<string, unknown>)[jobCreationMetadataKey],
+  const parsed = jobResourceMetadataSchema.safeParse(
+    (input as Record<string, unknown>)[jobResourceMetadataKey],
   );
   return parsed.success ? parsed.data.objective_utf8_bytes : undefined;
 }

@@ -54,6 +54,12 @@ export interface JobCreationLimitDetails {
   maximum: number;
 }
 
+export interface JobQueueStats {
+  queuedJobs: number;
+  queuedSourceEvents: number;
+  queuedMaxPerEvent: number;
+}
+
 export class JobCreationError extends Error {
   constructor(
     readonly code: JobCreationErrorCode,
@@ -695,13 +701,69 @@ export class DispatcherDatabase {
     return storedSha256 === canonicalPayloadSha256 ? "matched" : "conflict";
   }
 
-  listRunnableJobs(at = new Date()): JobRow[] {
+  listRunningJobs(): JobRow[] {
     return this.db.prepare(`
+      SELECT * FROM jobs WHERE status = 'running' ORDER BY created_at, job_id
+    `).all() as JobRow[];
+  }
+
+  nextRunnableJob(
+    at = new Date(),
+    afterSourceEventId = "",
+    excludedSourceEventIds: string[] = [],
+    excludedJobIds: string[] = [],
+  ): JobRow | undefined {
+    const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedSources = excludedSourceEventIds.length > 0
+      ? `AND source_event_id NOT IN (${sourcePlaceholders})`
+      : "";
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const statement = this.db.prepare(`
       SELECT * FROM jobs
-      WHERE (status IN ('queued', 'retryable_failed') AND available_at <= ?)
-         OR status = 'running'
-      ORDER BY created_at, job_id
-    `).all(at.toISOString()) as JobRow[];
+      WHERE status IN ('queued', 'retryable_failed') AND available_at <= ?
+        AND source_event_id > ?
+        ${excludedSources}
+        ${excludedJobs}
+      ORDER BY source_event_id, created_at, job_id
+      LIMIT 1
+    `);
+    const parameters = [at.toISOString(), afterSourceEventId, ...excludedSourceEventIds, ...excludedJobIds];
+    const next = statement.get(...parameters) as JobRow | undefined;
+    if (next || afterSourceEventId === "") return next;
+    return statement.get(
+      at.toISOString(),
+      "",
+      ...excludedSourceEventIds,
+      ...excludedJobIds,
+    ) as JobRow | undefined;
+  }
+
+  jobQueueStats(excludedJobIds: string[] = []): JobQueueStats {
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const row = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(job_count), 0) AS queued_jobs,
+        COUNT(*) AS queued_source_events,
+        COALESCE(MAX(job_count), 0) AS queued_max_per_event
+      FROM (
+        SELECT source_event_id, COUNT(*) AS job_count
+        FROM jobs
+        WHERE status IN ('queued', 'retryable_failed')
+          ${excludedJobs}
+        GROUP BY source_event_id
+      )
+    `).get(...excludedJobIds) as {
+      queued_jobs: number;
+      queued_source_events: number;
+      queued_max_per_event: number;
+    };
+    return {
+      queuedJobs: row.queued_jobs,
+      queuedSourceEvents: row.queued_source_events,
+      queuedMaxPerEvent: row.queued_max_per_event,
+    };
   }
 
   listJobsNeedingNotification(limit = 100): JobRow[] {
