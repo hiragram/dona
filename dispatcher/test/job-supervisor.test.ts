@@ -1104,6 +1104,65 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("recovers cancelled worker cleanup sequentially", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [0, 1, 2].map((index) => {
+      const job = createScratchJob(database, config, `Ev-cancelled-recovery-${index}`);
+      markRunning(database, job.job_id);
+      database.beginJobCancellation(job.job_id, job.source_event_id);
+      database.markJobCancelled(job.job_id, "cancelled before restart");
+      return job;
+    });
+    await Promise.all(jobs.map(async (job) => {
+      const progressDir = path.dirname(jobProgressPath(job));
+      await fs.mkdir(progressDir, { recursive: true });
+      await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    }));
+    let concurrent = 0;
+    let maximum = 0;
+    const runtime = fakeRuntime({
+      async wait(_agentName, signal) {
+        concurrent += 1;
+        maximum = Math.max(maximum, concurrent);
+        const result = await waitUntilAbort(signal);
+        concurrent -= 1;
+        return result;
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => maximum > 0);
+    assert.equal(maximum, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("interrupts cancelled worker cleanup backoff during shutdown", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-cancelled-backoff-shutdown");
+    markRunning(database, job.job_id);
+    database.beginJobCancellation(job.job_id, job.source_event_id);
+    database.markJobCancelled(job.job_id, "cancelled before restart");
+    const progressDir = path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let waited = false;
+    const runtime = fakeRuntime({ async wait() { waited = true; return failed("timeout", true); } });
+    const supervisor = new JobSupervisor(database, runtime, { ...config, queuePollMs: 60_000 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => waited);
+    await Promise.race([
+      supervisor.stop(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("shutdown timed out")), 500)),
+    ]);
+    await fs.access(progressDir);
+    database.close();
+  });
+
   test("runtime progress disable removes directories for nonterminal workers", async () => {
     const { root,config }=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath);
     const job=createScratchJob(database,config,"Ev-disable-progress"); const progressDir=path.dirname(jobProgressPath(job));

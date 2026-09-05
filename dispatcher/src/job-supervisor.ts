@@ -226,23 +226,25 @@ export class JobSupervisor {
     });
   }
 
-  private trackCancelledWorkerCleanup(row:JobRow):void {
-    if(this.cancelledCleanupJobIds.has(row.job_id))return;
+  private trackCancelledWorkerCleanup(row:JobRow):Promise<void>|undefined {
+    if(this.cancelledCleanupJobIds.has(row.job_id))return undefined;
     this.cancelledCleanupJobIds.add(row.job_id);
     const operation=(async()=>{
       if(this.stopping)return;
       for(;;){
         try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted||this.stopping)return;if(waited.ok&&waited.agentStatus!=="blocked")break;if(!waited.ok&&!waited.timedOut&&waited.errorCode!=="timeout")break;}
         catch {if(this.stopping)return;}
-        await new Promise<void>((resolve)=>{const timer=setTimeout(resolve,this.config.queuePollMs);timer.unref();});
+        await abortableDelay(this.config.queuePollMs,this.abortController.signal);
+        if(this.stopping)return;
       }
       await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});
     })();
     this.cancelledWorkerCleanups.add(operation);void operation.finally(()=>{this.cancelledWorkerCleanups.delete(operation);this.cancelledCleanupJobIds.delete(row.job_id);}).catch(()=>undefined);
+    return operation;
   }
 
   private trackRecoveredCancelledWorkerCleanups():void {
-    const recovery=(async()=>{let after="";for(;;){const batch=this.database.listStatusJobsAfter("cancelled",after,500);for(const row of batch){try{await fs.access(path.dirname(jobProgressPath(row)));this.trackCancelledWorkerCleanup(row);}catch{} }if(batch.length<500)break;after=batch.at(-1)!.job_id;}})();
+    const recovery=(async()=>{let after="";for(;;){const batch=this.database.listStatusJobsAfter("cancelled",after,500);for(const row of batch){if(this.stopping)return;try{await fs.access(path.dirname(jobProgressPath(row)));await this.trackCancelledWorkerCleanup(row);}catch{} }if(batch.length<500)break;after=batch.at(-1)!.job_id;}})();
     this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>this.cancelledWorkerCleanups.delete(recovery)).catch(()=>undefined);
   }
 
