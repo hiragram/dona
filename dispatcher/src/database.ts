@@ -118,6 +118,7 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
   })();
 }
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec("CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id)");}
+function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec("CREATE INDEX IF NOT EXISTS jobs_status_job_idx ON jobs(status,job_id)");}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -296,6 +297,7 @@ export function migrateDispatcherDatabase(
   })();
   ensureJobsRunnableFairIndex(db);
   ensureJobsWorkspaceJobIndex(db);
+  ensureJobsStatusJobIndex(db);
 }
 
 export class DispatcherDatabase {
@@ -696,6 +698,7 @@ export class DispatcherDatabase {
   listNonterminalWorkspaceJobIds(workspaceId:string,afterJobId="",limit=500):string[] {
     return (this.db.prepare(`SELECT job_id FROM jobs WHERE workspace_id=? AND job_id>? AND status NOT IN ('blocked','completed','failed','cancelled','needs_review') ORDER BY job_id LIMIT ?`).all(workspaceId,afterJobId,limit) as Array<{job_id:string}>).map((row)=>row.job_id);
   }
+  listNonterminalJobs(afterJobId="",limit=500):JobRow[] {return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status NOT IN ('blocked','completed','failed','cancelled','needs_review') ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];}
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
     return this.db.prepare(`

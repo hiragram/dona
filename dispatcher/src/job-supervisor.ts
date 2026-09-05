@@ -128,7 +128,7 @@ export class JobSupervisor {
 
   async disableProgress(): Promise<void> {
     this.progress = undefined; this.runtime.disableProgress?.();
-    const nonterminal = this.database.listJobs(undefined, 1_000_000).filter((job)=>!["blocked","completed","failed","cancelled","needs_review"].includes(job.status));
+    const nonterminal:JobRow[]=[];let after="";for(;;){const batch=this.database.listNonterminalJobs(after,500);nonterminal.push(...batch);if(batch.length<500)break;after=batch.at(-1)!.job_id;}
     const cleanup = await Promise.allSettled(nonterminal.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
     cleanup.forEach((result,index)=>{if(result.status==="rejected")this.logger.warn("Disabled job progress cleanup failed",{job_id:nonterminal[index]!.job_id,error_code:"job_progress_disable_cleanup_failed"});});
   }
