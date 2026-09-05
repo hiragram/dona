@@ -41,6 +41,9 @@ export interface Outbox {
   request_started_at: string | null; receipt_id: string | null; created_at: string; updated_at: string;
   terminal_at: string | null; content_delete_at: string | null;
 }
+export type ReconciledOutbox = Pick<Outbox, "outbox_id" | "run_id" | "kind" | "idempotency_key" | "content_hash" |
+  "status" | "attempt" | "available_at" | "lease_until" | "request_started_at" | "receipt_id" | "created_at" |
+  "updated_at" | "terminal_at" | "content_delete_at">;
 interface Revision extends Omit<RevisionInput, "target" | "content"> {
   schedule_id: string; revision: number; target_json: string; content: string | null;
   content_scope: "fixed_body" | "fixed_objective_redacted_result"; content_hash: string; recurrence_hash: string; content_delete_at: string | null;
@@ -184,6 +187,7 @@ export class SchedulerRepository {
       this.insertRevision(scheduleId, expectedRevision + 1, input, now);
       this.db.prepare("UPDATE schedules SET revision = revision + 1, state = 'active', next_due = ?, updated_at = ? WHERE schedule_id = ?")
         .run(nextDue, now, scheduleId);
+      this.db.prepare("UPDATE schedules SET terminal_at = NULL WHERE schedule_id = ?").run(scheduleId);
       const after = this.get(scheduleId)!; this.audit(before, after, "update", actor, now); return after;
     }).immediate();
   }
@@ -207,7 +211,9 @@ export class SchedulerRepository {
         .run(state, revision, now, state === "cancelled" ? now : null, scheduleId);
       if (operation !== "resume") this.suppress(scheduleId, now, "cancelled");
       if (operation === "cancel") this.retireRevisions(scheduleId, now);
-      const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, now); return after;
+      const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, now);
+      this.completeIfDrained(scheduleId, now);
+      return this.get(scheduleId)!;
     }).immediate();
   }
   materialize(scheduleId: string, expectedRevision: number, scheduledFor: string, nextDue: string | null,
@@ -321,7 +327,7 @@ export class SchedulerRepository {
     if (!result) throw new Error("run_not_authorized");
     return result;
   }
-  reconcile(outboxId: string, outcome: "sent" | "failed", receiptId: string, actor: Actor, now: string): Outbox {
+  reconcile(outboxId: string, outcome: "sent" | "failed", receiptId: string, actor: Actor, now: string): ReconciledOutbox {
     utc(now); validateReceipt(receiptId);
     if (actor.role !== "admin") throw new Error("admin_required");
     if (outcome !== "sent" && outcome !== "failed") throw new Error("invalid_outcome");
@@ -336,8 +342,13 @@ export class SchedulerRepository {
         .run(outcome === "sent" ? "completed" : "failed", now, run.run_id);
       this.audit(schedule, schedule, `reconcile_${outcome}`, actor, now, this.getOutbox(outboxId, now)!);
       this.completeIfDrained(run.schedule_id, now);
-      // Admin reconciliation returns metadata, never the owner's body.
-      return { ...this.getOutbox(outboxId, now)!, content: null };
+      // Admin reconciliation returns allowlisted metadata, never owner content or a private target.
+      const result = this.getOutbox(outboxId, now)!;
+      return { outbox_id: result.outbox_id, run_id: result.run_id, kind: result.kind, idempotency_key: result.idempotency_key,
+        content_hash: result.content_hash, status: result.status, attempt: result.attempt, available_at: result.available_at,
+        lease_until: result.lease_until, request_started_at: result.request_started_at, receipt_id: result.receipt_id,
+        created_at: result.created_at, updated_at: result.updated_at, terminal_at: result.terminal_at,
+        content_delete_at: result.content_delete_at };
     }).immediate();
   }
   private retireRevisions(scheduleId: string, now: string, revision?: number): void {
@@ -353,7 +364,8 @@ export class SchedulerRepository {
   }
   private expireSchedule(before: Schedule, actor: Actor, now: string): void {
     this.suppress(before.schedule_id, now, "cancelled");
-    this.db.prepare("UPDATE schedules SET state = 'expired', updated_at = ? WHERE schedule_id = ?").run(now, before.schedule_id);
+    this.db.prepare("UPDATE schedules SET state = 'expired', updated_at = ?, terminal_at = COALESCE(terminal_at, ?) WHERE schedule_id = ?")
+      .run(now, now, before.schedule_id);
     this.retireRevisions(before.schedule_id, now, before.revision);
     this.audit(before, this.get(before.schedule_id)!, "expire", actor, now);
   }
@@ -362,7 +374,7 @@ export class SchedulerRepository {
   }
   private completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
-    if (!["active", "expired", "needs_review"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
+    if (!["active", "paused", "expired", "needs_review"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
     const unsettled = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o

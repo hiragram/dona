@@ -344,7 +344,7 @@ test("needs_reviewの未解決fenceを再承認で迂回できずadmin reconcile
   assert.throws(() => repo.reconcile(claim.outbox_id, "failed", "proof", actor, due), /admin_required/);
   assert.throws(() => repo.reconcile(claim.outbox_id, "failed", "proof", { ...actor, role: "admin", tenant_id: "T_OTHER" }, due), /unauthorized/);
   const result = repo.reconcile(claim.outbox_id, "failed", "proof", { ...actor, role: "admin" }, due);
-  assert.equal(result.content, null); assert.equal(repo.get("s1")?.state, "needs_review");
+  assert.ok(!("content" in result)); assert.ok(!("target_json" in result)); assert.equal(repo.get("s1")?.state, "needs_review");
   repo.update("s1", 1, renewed, later, actor, due);
   assert.equal(repo.materialize("s1", 2, later, null, later, actor).run.status, "materialized");
 });
@@ -394,6 +394,17 @@ test("one-shotは最後のrun/outbox決着後に完了しquotaとretentionを解
   for (let i = 0; i < 20; i++) repo.create(`quota_${i}`, once, due, actor, now);
   repo.purge("2026-10-06T00:00:00Z");
   assert.equal(repo.get("once"), undefined); assert.equal(count(raw, "schedules"), 20);
+});
+
+test("未送信one-shotのpauseは原子的にdrainしてcompletedとなりresumeできない", () => {
+  const { dispatcher } = setup();
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  repo.create("paused_once", once, due, actor, now); repo.materialize("paused_once", 1, due, null, due, actor);
+  const result = repo.transition("paused_once", 1, "pause", actor, due);
+  assert.equal(result.state, "completed"); assert.equal(result.terminal_at, due);
+  assert.throws(() => repo.transition("paused_once", 2, "resume", actor, due), /invalid_transition/);
+  assert.deepEqual((repo.auditHistory("paused_once") as { operation: string }[]).slice(-2).map(x => x.operation), ["pause", "complete"]);
 });
 
 test("one-shot workの結果通知と通知なし、graceでskipしたone-shotを完了可能", () => {
@@ -560,6 +571,17 @@ test("purgeはcurrent authorization失効とauditを原子的に反映する", (
     assert.equal(repo.get(id)?.state, "expired");
     assert.equal((repo.auditHistory(id) as { operation: string }[]).filter(x => x.operation === "expire").length, 1);
   }
+});
+
+test("runのないcurrent expired revisionも30日後にscheduleと共にpurge", () => {
+  const { repo, raw } = setup();
+  repo.create("expired_empty", { ...input, expires_at: due }, due, actor, now);
+  repo.purge(due);
+  assert.equal(repo.get("expired_empty")?.state, "expired"); assert.equal(repo.get("expired_empty")?.terminal_at, due);
+  repo.purge("2026-10-04T00:00:59Z");
+  assert.ok(repo.get("expired_empty")); assert.ok(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 'expired_empty'").get());
+  repo.purge("2026-10-05T00:01:00Z");
+  assert.equal(repo.get("expired_empty"), undefined); assert.equal(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 'expired_empty'").get(), undefined);
 });
 
 test("送信応答時の失効をreceiptと共に保持し再承認可能にする", () => {
