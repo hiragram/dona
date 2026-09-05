@@ -11,6 +11,8 @@ export interface HerdrCommandResult {
   aborted: boolean;
   errorCode?: string;
   agentStatus?: AgentStatus;
+  agentIdentity?: string;
+  stateChangeSeq?: number;
 }
 
 export interface HerdrClient {
@@ -60,11 +62,25 @@ function decorateResult(result: Omit<HerdrCommandResult, "errorCode" | "agentSta
   const parsed = parseJson(result.ok ? result.stdout : result.stderr || result.stdout);
   const errorCode = findString(parsed, ["error_code", "code"]);
   const agentStatus = findAgentStatus(parsed);
+  const agentName = findString(parsed, ["agent_name", "name"]);
+  const paneId = findString(parsed, ["pane_id"]);
+  const workspaceId = findString(parsed, ["workspace_id"]);
+  const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...result,
     ...(errorCode === undefined ? {} : { errorCode }),
     ...(agentStatus === undefined ? {} : { agentStatus }),
+    ...(agentName || paneId || workspaceId ? { agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null]) } : {}),
+    ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
+}
+
+function findValue(input: unknown, keys: readonly string[]): unknown {
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  for (const key of keys) if (record[key] !== undefined) return record[key];
+  for (const value of Object.values(record)) { const found = findValue(value, keys); if (found !== undefined) return found; }
+  return undefined;
 }
 
 export interface HerdrProcessOptions {

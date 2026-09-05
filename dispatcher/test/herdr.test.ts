@@ -18,7 +18,7 @@ describe("HerdrProcessClient", () => {
     const executable = path.join(root, "fake-herdr");
     await fs.writeFile(
       executable,
-      "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"result\":{\"agent\":{\"agent_status\":\"idle\"}}}'\n",
+      "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"result\":{\"agent\":{\"agent_name\":\"dona-main\",\"workspace_id\":\"w1\",\"pane_id\":\"p1\",\"agent_status\":\"idle\",\"state_change_seq\":7}}}'\n",
       { mode: 0o700 },
     );
     const client = new HerdrProcessClient({
@@ -30,6 +30,8 @@ describe("HerdrProcessClient", () => {
     const result = await client.get();
     assert.equal(result.ok, true);
     assert.equal(result.agentStatus, "idle");
+    assert.equal(result.agentIdentity, '["w1","p1","dona-main"]');
+    assert.equal(result.stateChangeSeq, 7);
   });
 
   test("waits for a state change when submitting a prompt", async () => {

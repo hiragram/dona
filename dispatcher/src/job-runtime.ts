@@ -85,10 +85,16 @@ function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentSt
   const parsed = parseJson(base.ok ? base.stdout : base.stderr || base.stdout);
   const error = findValue(parsed, ["error_code", "code"]);
   const agentStatus = findAgentStatus(parsed);
+  const workspaceId = findValue(parsed, ["workspace_id"]);
+  const paneId = findValue(parsed, ["pane_id"]);
+  const agentName = findValue(parsed, ["agent_name", "name"]);
+  const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...base,
     ...(typeof error === "string" ? { errorCode: error } : {}),
     ...(agentStatus ? { agentStatus } : {}),
+    ...(workspaceId !== undefined || paneId !== undefined || agentName !== undefined ? { agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null]) } : {}),
+    ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
 }
 
