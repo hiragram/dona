@@ -187,6 +187,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
     await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobResultsDir, 0o700);
+    if (workspace.kind === "github" && await exists(path.join(row.workspace_path,".git"))) await this.excludeProgressFile(row,signal);
 
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
@@ -207,6 +208,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!created.ok || workspaceId === undefined || paneId === undefined) {
       throw commandError("Herdr workspace creation failed", created);
     }
+    if (workspace.kind === "github") await this.excludeProgressFile(row,signal);
 
     let started: HerdrCommandResult | undefined;
     const deadline = Date.now() + 5_000;
@@ -229,6 +231,14 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     } while (true);
     if (!started?.ok) throw commandError("Herdr agent start failed", started!);
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
+  }
+
+  private async excludeProgressFile(row:JobRow,signal?:AbortSignal):Promise<void> {
+    const located=await runProcess(this.config.gitPath,["-C",row.workspace_path,"rev-parse","--git-path","info/exclude"],this.config.jobCommandTimeoutMs,signal);
+    if(!located.ok)throw commandError("Git progress exclude lookup failed",located);
+    const excludePath=path.resolve(row.workspace_path,located.stdout.trim());
+    const current=await fs.readFile(excludePath,"utf8").catch((error:NodeJS.ErrnoException)=>error.code==="ENOENT"?"":Promise.reject(error));
+    if(!current.split(/\r?\n/u).includes(".dona-job-progress.json"))await fs.appendFile(excludePath,`${current.endsWith("\n")||current.length===0?"":"\n"}.dona-job-progress.json\n`,{encoding:"utf8",mode:0o600});
   }
 
   get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
