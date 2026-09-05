@@ -297,6 +297,7 @@ export class JobSupervisor {
       const observed = await this.runtime.get(row.agent_name, this.abortController.signal, remainingMs);
       if (observed.aborted || this.stopping) return;
       if (!observed.ok) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         this.database.markJobNeedsReview(row.job_id, observed.timedOut ? "prompt_reconcile_timeout" : observed.errorCode ?? "prompt_reconcile_failed", commandMessage(observed));
         return;
       }

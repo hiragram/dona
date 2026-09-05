@@ -451,6 +451,38 @@ describe("JobSupervisor", () => {
     }
   });
 
+  test("stalled prompt後のread失敗直前に完成したResultを回収する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-result-at-timeout");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return failed("timeout", true);
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await supervisor.stop();
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
   test("requires review when a terminal worker does not publish a result", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
