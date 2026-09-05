@@ -1,4 +1,4 @@
-import { DAY_MS, dayNumber, formatUtc, utcInstant } from './calendar.js';
+import { DAY_MS, MAX_YEAR, dayNumber, utcInstant } from './calendar.js';
 import type { UtcInstant } from './calendar.js';
 import { parseDefinition } from './domain.js';
 import type { ScheduleDefinition } from './domain.js';
@@ -43,6 +43,10 @@ export function previewOccurrences(input: ScheduleDefinition, request: PreviewRe
   const before = Date.parse(utcInstant(request.before_or_equal));
   const horizon = before - after;
   if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > definition.policy.limits.preview_count || horizon < DAY_MS || horizon > definition.policy.limits.preview_days * DAY_MS) throw new ScheduleError('invalid_preview_limit');
+  return calculateOccurrences(definition, after, before, request.limit);
+}
+
+function calculateOccurrences(definition: ScheduleDefinition, after: number, before: number, limit: number): OccurrencePreview {
   const recurrence = definition.recurrence;
   const occurrences: Occurrence[] = [];
   function append(utc: UtcInstant, local: string): void {
@@ -75,14 +79,20 @@ export function previewOccurrences(input: ScheduleDefinition, request: PreviewRe
     occurrences.sort((a, b) => a.occurrence_at < b.occurrence_at ? -1 : a.occurrence_at > b.occurrence_at ? 1 : 0);
   }
   const unique = occurrences.filter((v, i) => i === 0 || occurrences[i - 1]!.occurrence_at !== v.occurrence_at);
-  const truncated = unique.length > request.limit;
-  const page = unique.slice(0, request.limit);
+  const truncated = unique.length > limit;
+  const page = unique.slice(0, limit);
   return { occurrences: page, truncated, cursor: truncated ? page.at(-1)!.occurrence_at : null };
 }
 
 // 「次回」は指定した有限horizon内だけ。nullは未来全体の不存在を意味しない。
 export function nextOccurrence(definition: ScheduleDefinition, after: string, beforeOrEqual?: string): Occurrence | null {
   const start = utcInstant(after);
-  const end = beforeOrEqual ?? formatUtc(Date.parse(start) + 366 * DAY_MS);
-  return previewOccurrences(definition, { after: start, before_or_equal: end, limit: 1 }).occurrences[0] ?? null;
+  if (beforeOrEqual !== undefined) {
+    return previewOccurrences(definition, { after: start, before_or_equal: beforeOrEqual, limit: 1 }).occurrences[0] ?? null;
+  }
+  const parsed = parseDefinition(definition);
+  const afterMs = Date.parse(start);
+  const end = Math.min(afterMs + parsed.policy.limits.preview_days * DAY_MS, Date.parse(`${MAX_YEAR}-12-31T23:59:59Z`));
+  // 既定窓だけは公開範囲末尾の1日未満も検索する。明示previewの最小horizonは維持。
+  return calculateOccurrences(parsed, afterMs, end, 1).occurrences[0] ?? null;
 }

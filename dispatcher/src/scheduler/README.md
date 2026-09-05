@@ -29,7 +29,7 @@ const preview = previewOccurrences(definition, {
 - `ScheduleDefinition`はschedule/revision、tenant/owner、typed action、recurrence、policyを保持する。targetは解決済みの明示値を要求し、default宛先を推測しない。reminderはthread/channel/owner DM、workは固定のread-only objectiveと任意の結果通知を表す。cross tenant・他ownerのDM、本文/目的のcode point上限を検証する。型が妥当であることは実際のSlackアクセス権を保証しない。
 - `validateCreation(definition, clock)`は作成時のonce未来境界とrecurring start_dateの当日〜366日を検証する。保存済みrecordの読込は`parseDefinition`を使う。`SystemClock`だけが現在時刻を取得し秒へ切り捨て、`FakeClock`は秒単位のadvance（負数でrewind）とsetを提供する。既存の非schedulerコードの時計は変更していない。
 - previewは`(after, before_or_equal]`、1〜366 UTC日・1〜100件。上限超過を補正せず`invalid_preview_limit`とする。horizonのcivil dateだけを最大369日走査し、gap/無効日を除外、overlapは早いUTCだけを選択する。UTCに整列・重複除去後にlimitを適用する。
-- `truncated`は指定horizon内にlimitを超える候補がある場合のみtrue。cursorはそのとき最後に返したUTC、その他はnull。続きのrequestにも1〜366日のhorizon条件を適用するため、元の終了境界まで1日未満なら新しい有効な検索窓を明示して必要な終了境界で結果を絞る。`nextOccurrence`も有限horizon内だけを返し、省略時は366日。nullは将来全体の不存在を意味しない。
+- `truncated`は指定horizon内にlimitを超える候補がある場合のみtrue。cursorはそのとき最後に返したUTC、その他はnull。続きのrequestにも1〜366日のhorizon条件を適用するため、元の終了境界まで1日未満なら新しい有効な検索窓を明示して必要な終了境界で結果を絞る。`nextOccurrence`も有限horizon内だけを返し、省略時は366日と公開範囲末尾の早い方まで（末尾の1日未満も検索）。nullは将来全体の不存在を意味しない。
 - `OccurrenceKey`は`[schedule_id, UTC instant]`のJSON tuple。revisionを跨いでも同じ時刻のkeyを変えず、別fieldにrevision・local・timezone・tzdbを残す。永続high-watermark/一意制約は#7以降で必要。計算器単体は再配送抑止を実行しない。
 - once codecはADRどおり`version, kind, at`だけ。`resolveOneShot`でlocal入力をpreviewする場合、gapはtyped error、overlapは早いUTC。そのUTCを確認後にonceへ保存する。onceのoccurrence local identityは保存値に基づくUTCで、元の入力timezoneを復元したと主張しない。
 

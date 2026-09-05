@@ -236,3 +236,14 @@ test('Gregorian最小/最大年と遠いanchorも有限horizon内で扱う', () 
   const edge = previewOccurrences(definition(daily({ start_date: '2499-12-28', timezone: 'America/New_York', local_time: '23:59:59' })), { after: '2499-12-29T00:00:00Z', before_or_equal: '2499-12-31T23:59:59Z', limit: 100 });
   assert.equal(edge.occurrences.length, 3);
 });
+
+
+test('nextOccurrenceの既定horizonは公開上限まで、末尾の1日未満も検索', () => {
+  const d = definition(daily({ start_date: '2499-07-01', timezone: 'UTC' }));
+  assert.equal(nextOccurrence(d, '2499-07-01T09:00:00Z')!.occurrence_at, '2499-07-02T09:00:00Z');
+  assert.equal(nextOccurrence(d, '2499-12-31T00:00:00Z')!.occurrence_at, '2499-12-31T09:00:00Z');
+  assert.equal(nextOccurrence(d, '2499-12-31T09:00:00Z'), null);
+  assert.equal(nextOccurrence(d, '2499-12-31T23:59:59Z'), null);
+  throwsCode(() => nextOccurrence(d, '2500-01-01T00:00:00Z'), 'out_of_range');
+  throwsCode(() => previewOccurrences(d, { after: '2499-12-31T00:00:00Z', before_or_equal: '2499-12-31T23:59:59Z', limit: 1 }), 'invalid_preview_limit');
+});
