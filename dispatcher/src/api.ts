@@ -438,7 +438,8 @@ export class DispatcherApi {
       } else if (error instanceof RequestValidationError) {
         sendJson(response, 400, errorBody("invalid_request", error.message));
       } else if (error instanceof QueueAdmissionError) {
-        sendJson(response, error.code === "queue_identity" ? 400 : 429, { schema_version: 1, ack_allowed: false, error: { code: error.code, message: "Event was not admitted; reconcile delivery identity before retry" } });
+        const internalCompletion = request.method === "POST" && request.url?.split("?")[0] === "/v1/internal/update-events";
+        sendJson(response, error.code === "queue_identity" ? 400 : internalCompletion ? 503 : 429, { schema_version: 1, ack_allowed: false, error: { code: error.code, message: "Event was not admitted; reconcile delivery identity before retry" } });
       } else if (error instanceof PersistenceUnavailableError) {
         this.logger.error("Event could not be persisted", {
           error_code: "persistence_unavailable",

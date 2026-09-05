@@ -7,6 +7,7 @@ import type { HerdrClient, HerdrCommandResult } from "./herdr.js";
 import type { Logger } from "./logger.js";
 import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
+import { QueueClaimUnavailableError } from "./queue.js";
 import type { EventRow } from "./types.js";
 
 class WakeSignal {
@@ -134,8 +135,7 @@ export class DispatcherWorker {
       return;
     }
     if (preflight.agentStatus === "blocked") {
-      this.database.markBlocked(row.event_id, "dona-main was blocked before prompt submission");
-      this.logCurrentTransition(row, started);
+      // 未promptのeventへmain agentの状態を転記しない。
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
@@ -144,7 +144,8 @@ export class DispatcherWorker {
     try {
       await fs.access(resultPath);
       if (this.stopping || this.quiescing) return;
-      const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+      const dispatching = this.tryClaim(row.event_id, resultPath);
+      if (!dispatching) return;
       this.database.markNeedsReview(
         row.event_id,
         "result_path_exists",
@@ -166,7 +167,8 @@ export class DispatcherWorker {
     }
 
     if (this.stopping || this.quiescing) return;
-    const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+    const dispatching = this.tryClaim(row.event_id, resultPath);
+    if (!dispatching) return;
     const metadata = this.database.queueDispatchMetadata(row.event_id);
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row)) +
       (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(metadata)}\nこのsignalは処理時点のresourceをfetchする必要があります。deliveryの集約をfetch完了とみなさないでください。` : "");
@@ -207,6 +209,15 @@ export class DispatcherWorker {
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
+  }
+
+  private tryClaim(eventId: string, resultPath: string): EventRow | undefined {
+    try {
+      return this.database.beginDispatch(eventId, resultPath);
+    } catch (error) {
+      if (error instanceof QueueClaimUnavailableError) return undefined;
+      throw error;
+    }
   }
 
   private async resumeWaiting(row: EventRow): Promise<void> {

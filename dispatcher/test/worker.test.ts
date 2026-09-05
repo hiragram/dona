@@ -1,3 +1,4 @@
+import { externalEventSource } from "../src/ingress.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -251,14 +252,17 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 
-  test("moves the first event to blocked and leaves following events queued", async () => {
+  test("does not propagate the blocked main agent into another lane", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const first = database.enqueue(eventEnvelope("Ev-1")).row;
-    const second = database.enqueue(eventEnvelope("Ev-2")).row;
+    const second = database.enqueue({...eventEnvelope("Ev-2"),source:externalEventSource("fake")},new Date(),{connectionId:"b"}).row;
+    database.markBlocked(first.event_id,"existing blocked conversation");
+    let checks = 0;
     const herdr: HerdrClient = {
       async get() {
+        checks++;
         return ok("blocked");
       },
       async prompt() {
@@ -270,7 +274,7 @@ describe("DispatcherWorker", () => {
     };
     const worker = new DispatcherWorker(database, herdr, config, logger);
     worker.start();
-    await waitFor(() => database.get(first.event_id)?.status === "blocked");
+    await waitFor(() => checks >= 2);
     await new Promise((resolve) => setTimeout(resolve, 30));
     await worker.stop();
     assert.equal(database.get(second.event_id)?.status, "queued");
@@ -302,4 +306,27 @@ test("quiesce during awaited preflight prevents the subsequent claim and prompt"
   await waitFor(()=>!worker.isRunning());await worker.stop();
   assert.equal(prompts,0);assert.equal(database.get(row.event_id)?.status,"queued");
   assert.equal(database.queueHealth().in_flight,0);database.close();
+});
+
+
+test("a higher priority arrival during preflight reselects without crashing or submitting the stale candidate", async () => {
+  const {root,config}=await tempConfig();roots.push(root);
+  await fs.mkdir(config.resultsDir,{recursive:true});
+  const database=new DispatcherDatabase(config.databasePath);
+  const provider=database.enqueue({...eventEnvelope("provider"),source:externalEventSource("fake")},new Date(),{connectionId:"a"}).row;
+  let slackId:string|undefined;const prompts:string[]=[];
+  const herdr:HerdrClient={
+    async get(){
+      if(!slackId)slackId=database.enqueue(eventEnvelope("priority-arrival")).row.event_id;
+      return ok("idle");
+    },
+    async prompt(prompt){
+      const fields=promptFields(prompt);prompts.push(fields.eventId);
+      await fs.writeFile(fields.resultPath,JSON.stringify({schema_version:1,event_id:fields.eventId,status:"completed",completed_at:new Date().toISOString()}));
+      return ok("working");
+    },async wait(){return ok("done");},
+  };
+  const worker=new DispatcherWorker(database,herdr,config,logger);worker.start();
+  await waitFor(()=>database.get(provider.event_id)?.status==="completed");await worker.stop();
+  assert.deepEqual(prompts,[slackId,provider.event_id]);database.close();
 });

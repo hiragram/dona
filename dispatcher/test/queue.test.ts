@@ -134,8 +134,8 @@ test("quota table covers payload bytes, source/tenant depth, burst, clocks and d
 function stripQueue(raw:Database.Database){raw.exec("DROP TABLE queue_deliveries; DROP TABLE queue_events; DROP TABLE queue_lanes; DROP TABLE queue_sources; DROP TABLE queue_metrics; DROP TABLE queue_selector; PRAGMA user_version=2;");}
 test("v2 migration preserves every event field, rolls back DDL and checks indexes/integrity",async()=>{
   const {db,config}=await fixture();
-  const first=db.enqueue(eventEnvelope("one"),at).row;
-  db.manualComplete(first.event_id,at);
+  const first=db.enqueue({...eventEnvelope("one"),trace:{opaque:"x".repeat(8192)}},at).row;
+  db.markBlocked(first.event_id,"migration fixture");
   db.enqueue(provider("legacy"),at,context);
   const before=db.list();db.close();
   const raw=new Database(config.databasePath);stripQueue(raw);
@@ -146,25 +146,57 @@ test("v2 migration preserves every event field, rolls back DDL and checks indexe
   assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='queue_events'").get(),undefined);
   check.exec("DROP TABLE queue_metrics");check.close();
   const migrated=new DispatcherDatabase(config.databasePath);
-  assert.deepEqual(migrated.list(),before);migrated.close();
+  assert.deepEqual(migrated.list(),before);
+  const actualLegacy=migrated.enqueue(provider("new-legacy"),at,{connectionId:"legacy"}).row;
+  migrated.close();
   const verify=new Database(config.databasePath);
   assert.equal(verify.pragma("integrity_check",{simple:true}),"ok");assert.deepEqual(verify.pragma("foreign_key_check"),[]);
   assert.ok(verify.prepare("SELECT name FROM sqlite_master WHERE name='queue_events_coalesce'").get());
-  assert.equal(verify.pragma("user_version",{simple:true}),4);verify.close();
+  assert.equal(verify.pragma("user_version",{simple:true}),4);
+  const historical=verify.prepare("SELECT q.lane FROM queue_events q JOIN events e USING(event_id) WHERE e.external_event_id='legacy'").get() as {lane:string};
+  const current=verify.prepare("SELECT lane FROM queue_events WHERE event_id=?").get(actualLegacy.event_id) as {lane:string};
+  const bytes=(verify.prepare("SELECT bytes FROM queue_events WHERE event_id=?").get(first.event_id) as {bytes:number}).bytes;
+  assert.ok(bytes>8192);
+  assert.match(historical.lane,/^legacy:/);assert.notEqual(historical.lane,current.lane);verify.close();
 });
 
-test("independent producers serialize quotas and independent claim attempts dispatch once",async()=>{
-  const {db,config,root}=await fixture({...policy,defaults:{...policy.defaults,depth:2}});db.close();
-  const script=path.join(root,"producer.mjs");
-  const databaseModule=new URL("../src/database.ts",import.meta.url).href;
-  await fs.writeFile(script,`import { DispatcherDatabase } from ${JSON.stringify(databaseModule)};\nconst d=new DispatcherDatabase(process.argv[2],${JSON.stringify({...policy,defaults:{...policy.defaults,depth:2}})});\ntry { d.enqueue({...${JSON.stringify(provider("dynamic"))},external_event_id:process.argv[3]},new Date(${JSON.stringify(at.toISOString())}),${JSON.stringify(context)});process.stdout.write('created'); } catch(e) {process.stdout.write(e.code??e.message);} finally {d.close();}`);
-  const results=await Promise.all(Array.from({length:6},(_,i)=>promisify(execFile)(process.execPath,["--import","tsx",script,config.databasePath,String(i)])));
-  assert.equal(results.filter(r=>r.stdout==="created").length,2);
-  assert.equal(results.filter(r=>r.stdout==="queue_depth").length,4);
-  const a=new DispatcherDatabase(config.databasePath,policy),b=new DispatcherDatabase(config.databasePath,policy);
-  const row=a.nextAvailable(at)!;assert.equal(b.nextAvailable(at)?.event_id,row.event_id);
-  a.beginDispatch(row.event_id,"test",at);assert.throws(()=>b.beginDispatch(row.event_id,"test",at),/no longer/);
-  assert.equal(b.nextAvailable(at),undefined);a.close();b.close();
+test("independent producers serialize connection/global reservations and claims dispatch once", async () => {
+  for (const scope of ["connection", "global"] as const) {
+    const options = scope === "connection"
+      ? { ...policy, defaults: { ...policy.defaults, depth: 2 } }
+      : { ...policy, depth: 8, reservations: { slack: 2, internal: 2, update: 2 } };
+    const { db, config, root } = await fixture(options);
+    db.close();
+    const script = path.join(root, "producer.mjs");
+    const databaseModule = new URL("../src/database.ts", import.meta.url).href;
+    await fs.writeFile(script, `
+      import { DispatcherDatabase } from ${JSON.stringify(databaseModule)};
+      const database = new DispatcherDatabase(process.argv[2], ${JSON.stringify(options)});
+      const event = { ...${JSON.stringify(provider("dynamic"))}, external_event_id: process.argv[3] };
+      if (${JSON.stringify(scope)} === "global") event.source = 'fake-' + process.argv[3];
+      try {
+        database.enqueue(event, new Date(${JSON.stringify(at.toISOString())}), ${JSON.stringify(context)});
+        process.stdout.write('created');
+      } catch (error) { process.stdout.write(error.code ?? error.message); }
+      finally { database.close(); }
+    `);
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+      promisify(execFile)(process.execPath, ["--import", "tsx", script, config.databasePath, String(i)])));
+    assert.equal(results.filter(result => result.stdout === "created").length, 2, scope);
+    assert.equal(results.filter(result => result.stdout === "queue_depth").length, 4, scope);
+    const a = new DispatcherDatabase(config.databasePath, options);
+    const b = new DispatcherDatabase(config.databasePath, options);
+    const row = a.nextAvailable(at)!;
+    assert.equal(b.nextAvailable(at)?.event_id, row.event_id);
+    a.beginDispatch(row.event_id, "test", at);
+    assert.throws(() => b.beginDispatch(row.event_id, "test", at), /no longer/);
+    assert.equal(b.nextAvailable(at), undefined);
+    if (scope === "global") {
+      assert.equal(a.enqueue(eventEnvelope("reserved"), at).outcome, "created");
+    }
+    a.close();
+    b.close();
+  }
 });
 
 test("DB busy is explicit, crash after coalesce commit is durable, shutdown closes claims",async()=>{
@@ -189,4 +221,17 @@ test("source quota spans connections and property names do not select inherited 
   db.enqueue(provider("a"),at,{connectionId:"a"});
   assert.throws(()=>db.enqueue(provider("b"),at,{connectionId:"b"}),code("queue_depth"));
   assert.equal(db.enqueue(provider("other","constructor"),at,context).outcome,"created");db.close();
+});
+
+
+test("disabling coalescing preserves required final fetch on every standalone signal", async () => {
+  const {db}=await fixture({...policy,defaults:{...policy.defaults,coalescing:false}});
+  const first=db.enqueue(provider("first"),at,signal);
+  const second=db.enqueue(provider("second"),at,signal);
+  assert.notEqual(first.row.event_id,second.row.event_id);
+  assert.equal(first.admission,undefined);
+  assert.equal(db.queueDispatchMetadata(first.row.event_id).requires_fetch,true);
+  assert.equal(db.queueDispatchMetadata(second.row.event_id).requires_fetch,true);
+  const plain=db.enqueue(provider("plain"),at,context);
+  assert.equal(db.queueDispatchMetadata(plain.row.event_id).requires_fetch,false);db.close();
 });

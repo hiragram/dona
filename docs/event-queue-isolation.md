@@ -39,7 +39,7 @@ provider registrationが`queueSignal(normalized, verified)`から`{resourceKey, 
 
 追加delivery IDとtimestamp、fingerprintはleaderへの外部キー付き`queue_deliveries`へ保存する。commit直後のcrash後も同deliveryは`duplicate_same`へ収束する。従来のpersist outcomeを保持し、receiptの`admission: coalesced`と`ackAllowed`で意味を補足する。receiptのexternal IDは受信delivery自身、event ID/sequenceはleader。`committedAt`は当該deliveryの保存時刻。ACK formatterはcommit成功後だけ呼ぶ。
 
-`queueDispatchMetadata(eventId)`は`requires_fetch`、delivery数、追加delivery一覧を返す。通常workerはfetchが必要なsignalのpromptへこの情報を加える。最初のdeliveryは元event rowに保持する。#49等の別routingでもこのmetadataを引き継ぎ、signal受領/集約をfetch完了とみなさない。
+fetch必要性は集約可否と別columnへ保存し、coalescing無効でも保持する。`queueDispatchMetadata(eventId)`は`requires_fetch`、delivery数、追加delivery一覧を返す。通常workerはfetchが必要なsignalのpromptへこの情報を加える。最初のdeliveryは元event rowに保持する。#49等の別routingでもこのmetadataを引き継ぎ、signal受領/集約をfetch完了とみなさない。
 
 | code | ACK | 意味 |
 |---|---|---|
@@ -50,6 +50,8 @@ provider registrationが`queueSignal(normalized, verified)`から`{resourceKey, 
 | `queue_lanes` / `queue_deliveries` | 不可、429 | cardinality上限 |
 | `queue_quiescing` | 不可 | 新規admission/claim停止 |
 | `queue_identity` | 不可、400 | 認証済みconnection/keyの契約不成立 |
+
+internal update通知の一時的なqueue拒否は503を返し、updaterの既存照合・retry経路へ送る。429を恒久拒否とするupdater契約へ流さない。
 
 HTTP前段のshutdown判定は既存`shutting_down` / 503も保持する。DB busy等の保存失敗も既存persistence failureのnon-ACKを維持する。拒否を成功ACKやsilent dropに変換しない。provider固有retry方針はprovider側のcontractで判断する。応答喪失時は自動再送せず、`getByExternalId`とreceiptを照合する。
 
@@ -63,11 +65,11 @@ quiesce/shutdownは同期的にclaim gateを閉じ、await中のpreflightから�
 
 ## Migrationとrollback境界
 
-このfeature baseはapp schema 2。event rowのsequence/status/resultを変更せずqueue tables/indexをbackfillし、全DDL/backfillと`user_version=4`を同一transactionでcommitする。旧provider rowのconnectionは復元不能なのでsource別の固定`legacy` laneへ隔離する。既存Slack/internalはworkspaceからbackfillする。既存の超過backlogは消さず、そのusageを数えて新規admissionを止める。
+このfeature baseはapp schema 2。event rowのsequence/status/resultを変更せずqueue tables/indexをbackfillし、全DDL/backfillと`user_version=4`を同一transactionでcommitする。旧provider rowのconnectionは復元不能なのでsource別の固定`legacy:` prefix付きlaneへ隔離する。通常laneはhex hashのみなので実在connection名と衝突しない。既存Slack/internalはworkspaceからbackfillする。既存の超過backlogは消さず、そのusageを数えて新規admissionを止める。
 
 schema 3は別系統の#46 jobs migrationなので本実装では受理しない。#46との最終integration時には両migrationとjobs codecを統合した検証が必要であり、このPRはjobs schema 3互換を主張しない。
 
-旧版はschema 4を拒否する。`config/release-compatibility.json`とversion healthはwrite/read 4、rollback不可を明示し、schema 2の既存self-update policyを黙って適合扱いしない。production deployやpolicy変更は本作業に含めない。rollbackには停止した隔離環境で取得した移行前DBの復元を含む別の移行判断が必要。migration後DBのversionだけ下げて旧版へ戻してはいけない。
+旧版はschema 4を拒否する。`config/release-compatibility.json`とversion healthはwrite/read 4、rollback不可を明示し、schema 2の既存self-update policyを黙って適合扱いしない。`scripts/write-release-manifest.mjs`も`non_rollback_migration_requires_release_workflow`で生成を拒否する。明示的なmigration計画・承認・復元経路を後続integrationで実装して検証するまで、このfeatureをrelease対象にしない。production deployやpolicy変更は本作業に含めない。rollbackには停止した隔離環境で取得した移行前DBの復元を含む別の移行判断が必要。migration後DBのversionだけ下げて旧版へ戻してはいけない。
 
 ## 検証と未検証のlive smoke
 

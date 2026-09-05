@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
+import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, QueueClaimUnavailableError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -154,7 +154,8 @@ export class DispatcherDatabase {
         CREATE TABLE queue_events (
           event_id TEXT PRIMARY KEY REFERENCES events(event_id),
           lane TEXT NOT NULL REFERENCES queue_lanes(lane), bytes INTEGER NOT NULL,
-          coalesce_key TEXT, fingerprint TEXT NOT NULL, delivery_count INTEGER NOT NULL DEFAULT 1
+          coalesce_key TEXT, fingerprint TEXT NOT NULL, delivery_count INTEGER NOT NULL DEFAULT 1,
+          requires_fetch INTEGER NOT NULL DEFAULT 0 CHECK(requires_fetch IN (0,1))
         );
         CREATE INDEX queue_events_lane ON queue_events(lane, event_id);
         CREATE INDEX queue_events_coalesce ON queue_events(lane, coalesce_key);
@@ -171,7 +172,12 @@ export class DispatcherDatabase {
       for (const row of this.db.prepare("SELECT * FROM events ORDER BY sequence").all() as EventRow[]) {
         // 旧provider rowのconnectionは復元不能なのでsource単位のlegacy laneへ隔離する。
         const event: EventEnvelope = { schema_version: 1, source: row.source as EventEnvelope["source"], external_event_id: row.external_event_id, type: row.event_type, occurred_at: row.occurred_at, subject: JSON.parse(row.subject_json), payload: JSON.parse(row.payload_json), reply_target: row.reply_target_json === null ? null : JSON.parse(row.reply_target_json) };
+        if (row.trace_json !== null) event.trace = JSON.parse(row.trace_json);
         const identity = queueIdentity(event, { connectionId: "legacy" });
+        if (identity.queueClass === "external") {
+          identity.lane = `legacy:${createHash("sha256").update(row.source).digest("hex")}`;
+          identity.connection = "unverified_legacy";
+        }
         this.db.prepare("INSERT OR IGNORE INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
           .run(identity.lane, row.source, identity.connection, identity.queueClass, this.queuePolicy.defaults.burst, Date.parse(row.created_at));
         this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,fingerprint) VALUES (?,?,?,?)")
@@ -190,8 +196,8 @@ export class DispatcherDatabase {
   }
 
   queueDispatchMetadata(eventId: string) {
-    const metadata = this.db.prepare("SELECT coalesce_key, delivery_count FROM queue_events WHERE event_id=?").get(eventId) as {coalesce_key:string|null;delivery_count:number} | undefined;
-    return { schema_version: 1, requires_fetch: metadata?.coalesce_key !== null && metadata?.coalesce_key !== undefined,
+    const metadata = this.db.prepare("SELECT requires_fetch, delivery_count FROM queue_events WHERE event_id=?").get(eventId) as {requires_fetch:number;delivery_count:number} | undefined;
+    return { schema_version: 1, requires_fetch: metadata?.requires_fetch === 1,
       delivery_count: metadata?.delivery_count ?? 1, deliveries: this.coalescedDeliveries(eventId) };
   }
 
@@ -345,7 +351,7 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
-      this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint) VALUES (?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint);
+      this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
       this.queueMetric("created");
       return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
     }).immediate();
@@ -821,7 +827,7 @@ export class DispatcherDatabase {
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
     return this.db.transaction(() => {
-    if (this.claimsClosed || this.nextAvailable(at)?.event_id !== eventId) throw new Error("Event is no longer selected or claims are closed");
+    if (this.claimsClosed || this.nextAvailable(at)?.event_id !== eventId) throw new QueueClaimUnavailableError();
     const timestamp = at.toISOString();
     const changed = this.db
       .prepare(`
