@@ -47,6 +47,7 @@ DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results
 DONA_JOB_CONCURRENCY=4
 DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
+DONA_JOB_PROMPT_RECONCILE_MS=5000
 DONA_GH_PATH=gh
 DONA_GIT_PATH=git
 DONA_UPDATER_SOCKET_PATH=~/Library/Application Support/Dona/update-control/updater.sock
@@ -56,7 +57,7 @@ SLACK_HEALTH_SOCKET_PATH=~/Library/Application Support/Dona/run/slack-adapter.so
 DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
 
-Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
+Dispatcherはshellを介さずHerdrを呼びます。2026-09-05時点のlatest stable v0.8.2はupstream #3506を含まず、prompt後5秒のactivity gateで`agent_prompt_stalled`になり得ます。対応stableは未公開のためversionを推測してminimumには固定しません。起動前診断ではv0.8.2をaffectedとして扱い、#3506を含むstableが公開された時点でrelease identityを確認してminimumを更新します。
 
 ```text
 herdr --session dona agent get dona-main
@@ -163,6 +164,7 @@ npm exec -- tsx src/cli.ts job show job_...
 - `queued` / `retryable_failed`: sequence先頭から再開します。先頭イベントがbackoff中なら後続を追い越しません。
 - `waiting_agent`: Result Envelopeとagent状態の確認を再開し、promptは再送しません。
 - prompt受理後にagentが見つからない状態が`DONA_AGENT_MISSING_GRACE_MS`（既定5秒）を超えた場合は、二重投入を避けて`needs_review`へ移します。
+- `agent_prompt_stalled`はacceptance unknownです。同じpromptやEnterを再送せず、`DONA_JOB_PROMPT_RECONCILE_MS`内でResult Envelopeと同一agentのidentity/`state_change_seq`をread-only照合します。valid Resultまたはsequence進行だけを受理証拠とし、identity swap、無変化、矛盾、read timeoutは`needs_review`へ隔離します。画面自由文は証拠にしません。
 - staleな`dispatching`: 起動時に`needs_review`へ移します。
 - `blocked`: 自動解除せず、キュー全体を停止します。
 - `needs_review` / `completed` / `dead_letter`: 自動変更しません。
