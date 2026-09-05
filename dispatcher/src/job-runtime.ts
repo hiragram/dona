@@ -14,10 +14,10 @@ export interface PreparedJobRuntime {
 
 export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
-  get(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  prompt(jobId: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  wait(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  cancel(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
 function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
@@ -231,13 +231,13 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
-  get(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", jobId], this.config.jobCommandTimeoutMs, signal);
+  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "get", agentName], this.config.jobCommandTimeoutMs, signal);
   }
 
-  prompt(jobId: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr([
-      "agent", "prompt", jobId, text,
+      "agent", "prompt", agentName, text,
       "--wait",
       "--until", "working",
       "--until", "idle",
@@ -247,9 +247,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     ], this.config.jobCommandTimeoutMs + 5_000, signal);
   }
 
-  wait(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr([
-      "agent", "wait", jobId,
+      "agent", "wait", agentName,
       "--until", "idle",
       "--until", "done",
       "--until", "blocked",
@@ -257,8 +257,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     ], this.config.agentWaitTimeoutMs + 5_000, signal);
   }
 
-  cancel(jobId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "send-keys", jobId, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
   }
 
   private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -277,7 +277,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return this.herdr([
       "workspace", "create",
       "--cwd", row.workspace_path,
-      "--label", row.job_id,
+      "--label", row.agent_name,
       "--no-focus",
     ], this.config.jobCommandTimeoutMs + 5_000, signal);
   }
@@ -353,7 +353,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     if (await exists(path.join(row.workspace_path, ".git"))) {
       return this.herdr([
-        "workspace", "create", "--cwd", row.workspace_path, "--label", row.job_id, "--no-focus",
+        "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     return this.herdr([
@@ -362,7 +362,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--branch", `dona/${row.job_id}`,
       "--base", baseRef,
       "--path", row.workspace_path,
-      "--label", row.job_id,
+      "--label", row.agent_name,
       "--no-focus",
     ], 120_000, signal);
   }
