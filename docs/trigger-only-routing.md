@@ -11,7 +11,7 @@ owner は次の closed union。
 - `slack_thread`: `workspace_id`、`channel_id`、`thread_ts`
 - `provider_resource`: `source`、`connection_id`、`resource_id`
 
-`event_bindings` と `job_bindings` は owner、execution policy、destination を保存し、UPDATE trigger で変更を拒否する。既存の有効な Slack event/job は migration 時に backfill する。判定不能な legacy owner を推測して補わない。
+`event_bindings` と `job_bindings` は owner、execution policy、destination を保存し、UPDATE trigger で変更を拒否する。既存の有効な Slack event/job と作成済み completion の Result/通知状態は migration 時に backfill する。完了markerを同一transactionで保存し、通常の起動では履歴走査とwrite lockを取得しない。判定不能な legacy owner を推測して補わない。
 
 provider の background job 許可は `provider_execution_policies` の `(source, connection_id, resource_id, event_type)` に完全一致する設定から取得する。未設定は拒否。trusted local configuration API `setProviderExecutionPolicy` は HTTP/MCP に公開しない。許可の snapshot は admission 時に固定され、後日の policy 更新や再送では既存 event を昇格させない。provider job の workspace は `scratch` に限定する。Slack の GitHub workspace は従来どおり。
 
@@ -43,7 +43,7 @@ routing migration は追加テーブルと trigger の transaction。既存 jobs
 
 本 branch の job engine は schema v2。#46 は別の未統合 feature branch であり、取り込み・merge・fan-out の再実装はしていない。`migrateEventRouting` は #46 schema v3 にも適用でき、`dispatcher/test/fixtures/jobs-v3.sql` は採取元 SHA を記録した実際の #46 migration SQL。fixture は両 schema の row 保持、rollback、`integrity_check`、`foreign_key_check` を検証する。
 
-schema v3 DB をこの branch の旧 v2 job engine で運転できるという意味ではない。#46 を統合する際は、その job engine と `job_key`/group admission を保持し、schema migration 後に routing migration を適用する。双方を統合した runtime の E2E は別 gate。routing テーブルが存在する DB を旧版へ戻して provider job を運転する rollback も未対応であり、schema version の数値だけで runtime 互換と判定しない。
+schema v3 DB をこの branch の旧 v2 job engine で運転できるという意味ではない。#46 を統合する際は、その job engine と `job_key`/group admission を保持し、schema migration 後に routing migration を適用する。双方を統合した runtime の E2E は別 gate。routing テーブルが存在する DB を旧版へ戻して provider job を運転する rollback も未対応であり、schema version の数値だけで runtime 互換と判定しない。`config/release-compatibility.json` は `rollback_safe: false` とし、既存 updater はこの candidate を適用前に拒否する。production policy を書き換えて回避せず、安全な旧版互換または別途承認された移行手順が整うまで self-update 対象にしない。
 
 ## 検証と live smoke の残境界
 

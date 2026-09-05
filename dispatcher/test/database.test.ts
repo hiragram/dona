@@ -17,11 +17,20 @@ describe("DispatcherDatabase", () => {
   test("migrates an existing schema v1 database to the jobs schema", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
+    const initial = new DispatcherDatabase(config.databasePath);
+    const existingEvent = initial.enqueue(eventEnvelope("legacy-v1")).row;
+    initial.close();
     const legacy = new Database(config.databasePath);
-    legacy.exec("CREATE TABLE events (event_id TEXT PRIMARY KEY, source TEXT, reply_target_json TEXT); PRAGMA user_version = 1;");
+    legacy.exec(`
+      DROP TRIGGER completion_notification_projection;
+      DROP TABLE job_completions; DROP TABLE job_bindings; DROP TABLE jobs;
+      DROP TABLE event_bindings; DROP TABLE provider_execution_policies; DROP TABLE event_routing_migrations;
+      PRAGMA user_version = 1;
+    `);
     legacy.close();
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.listJobs(), []);
+    assert.deepEqual(database.get(existingEvent.event_id), existingEvent);
     database.close();
   });
 

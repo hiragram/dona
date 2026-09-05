@@ -173,6 +173,7 @@ test("additive routing migration preserves v2 Slack rows and rolls back on fault
   const before = database.getJob(job.job_id); database.close();
   const raw = new Database(config.databasePath);
   const snapshots = raw.prepare("SELECT * FROM events").all();
+  raw.exec("DELETE FROM event_routing_migrations");
   assert.throws(() => migrateEventRouting(raw, () => { throw new Error("migration crash"); }), /migration crash/);
   migrateEventRouting(raw);
   assert.deepEqual(raw.prepare("SELECT * FROM events").all(), snapshots);
@@ -192,7 +193,7 @@ test("routing migration on real #46 job_key/group schema preserves runtime, resu
   db.enqueueJobNotification(job.job_id); db.close();
   const raw = new Database(config.databasePath);
   // #46 先行の状態を作るため、#49 の追加テーブルだけを除いて元のmigration SQLを適用。
-  raw.exec("DROP TRIGGER completion_notification_projection; DROP TABLE job_completions; DROP TABLE job_bindings; DROP TABLE event_bindings; DROP TABLE provider_execution_policies;");
+  raw.exec("DROP TABLE event_routing_migrations; DROP TRIGGER completion_notification_projection; DROP TABLE job_completions; DROP TABLE job_bindings; DROP TABLE event_bindings; DROP TABLE provider_execution_policies;");
   raw.exec(await fs.readFile(new URL("./fixtures/jobs-v3.sql", import.meta.url), "utf8"));
   const jobs = raw.prepare("SELECT * FROM jobs").all();
   const groups = raw.prepare("SELECT * FROM job_groups").all();
@@ -203,6 +204,10 @@ test("routing migration on real #46 job_key/group schema preserves runtime, resu
   assert.deepEqual(raw.prepare("SELECT * FROM jobs").all(), jobs);
   assert.deepEqual(raw.prepare("SELECT * FROM job_groups").all(), groups);
   assert.deepEqual(raw.prepare("SELECT * FROM events").all(), events);
+  const projection = raw.prepare("SELECT * FROM job_completions").get() as Record<string, unknown>;
+  assert.equal(projection.result_json, (jobs[0] as Record<string, unknown>).result_json);
+  assert.equal(projection.notification_event_id, (jobs[0] as Record<string, unknown>).completion_event_id);
+  assert.equal(projection.notification_state, "pending");
   assert.equal(raw.pragma("user_version", { simple: true }), 3);
   assert.equal(raw.pragma("integrity_check", { simple: true }), "ok"); assert.deepEqual(raw.pragma("foreign_key_check"), []);
   assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM job_bindings").get() as { n: number }).n, 1);
@@ -263,4 +268,47 @@ test("simultaneous processes admit one provider event/job and materialize one co
   assert.equal((raw.prepare("SELECT count(*) AS n FROM job_completions").get() as { n: number }).n, 1);
   assert.equal(database.listJobs().length, 1); assert.equal(database.list().length, 1);
   raw.close(); database.close();
+});
+
+for (const notificationState of ["queued", "completed", "needs_review"] as const) test(`legacy completion migration restores ${notificationState} notification and job Result`, async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const db = new DispatcherDatabase(config.databasePath);
+  const event = db.enqueue(eventEnvelope(`legacy-${notificationState}`)).row;
+  const job = db.createJob({ source_event_id: event.event_id, objective: "既存", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  db.beginJobPreparation(job.job_id); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
+  db.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "job結果", completed_at: new Date().toISOString() }, job.result_path);
+  const notification = db.enqueueJobNotification(job.job_id)!.row;
+  if (notificationState !== "queued") {
+    db.beginDispatch(notification.event_id, "notification-result");
+    if (notificationState === "needs_review") db.markNeedsReview(notification.event_id, "acceptance_unknown", "照合待ち");
+    else {
+      db.markWaiting(notification.event_id);
+      db.saveCompleted(notification.event_id, { schema_version: 1, event_id: notification.event_id, status: "completed", summary: "通知結果", actions: [], completed_at: new Date().toISOString() }, "notification-result");
+    }
+  }
+  const expectedJob = db.getJob(job.job_id)!;
+  const expectedNotification = db.get(notification.event_id)!;
+  db.close();
+  const legacy = new Database(config.databasePath);
+  legacy.exec("DELETE FROM job_completions; DELETE FROM event_routing_migrations");
+  legacy.close();
+  const migrated = new DispatcherDatabase(config.databasePath);
+  const projection = migrated.getJobCompletion(job.job_id)!;
+  assert.equal(projection.result_json, expectedJob.result_json);
+  assert.equal(projection.notification_result_json, expectedNotification.result_json);
+  assert.equal(projection.notification_event_id, notification.event_id);
+  assert.equal(projection.notification_state, notificationState === "completed" ? "accepted" : notificationState === "queued" ? "pending" : "needs_review");
+  assert.deepEqual(migrated.getJob(job.job_id), expectedJob);
+  assert.deepEqual(migrated.get(notification.event_id), expectedNotification);
+  assert.deepEqual(migrated.listJobsNeedingNotification(), []);
+  migrated.close();
+});
+
+test("completed migration reopens while another process holds the write lock without rescanning history", async () => {
+  const { database, config } = await setup(); database.close();
+  const writer = new Database(config.databasePath);
+  const reader = new Database(config.databasePath); reader.pragma("busy_timeout = 1");
+  writer.exec("BEGIN IMMEDIATE");
+  try { migrateEventRouting(reader, () => { throw new Error("Migration must not run twice"); }); }
+  finally { writer.exec("ROLLBACK"); reader.close(); writer.close(); }
 });
