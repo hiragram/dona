@@ -237,6 +237,7 @@ export class JobSupervisor {
     if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     const dispatching = this.database.beginJobDispatch(row.job_id);
+    const promptBaseline = await this.readPromptBaseline(dispatching);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
@@ -244,7 +245,7 @@ export class JobSupervisor {
     }
     if (!prompted.ok) {
       if (!prompted.timedOut && prompted.errorCode === "agent_prompt_stalled") {
-        await this.reconcileStalledPrompt(dispatching, prompted);
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
         return;
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
@@ -272,6 +273,19 @@ export class JobSupervisor {
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
     await this.monitor(running);
+  }
+
+  private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {
+    try {
+      const observed = await this.runtime.get(row.agent_name, this.abortController.signal);
+      return observed.ok ? observed : undefined;
+    } catch (error) {
+      this.logger.warn("Could not read the Herdr agent before prompt submission", {
+        job_id: row.job_id,
+        error_code: errorCode(error),
+      });
+      return undefined;
+    }
   }
 
   private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {

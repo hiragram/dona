@@ -250,25 +250,55 @@ describe("JobSupervisor", () => {
   });
 
   test("stalled promptは再送せず同一agentのsequence進行から監視へ移る", async () => {
-    const { root, config } = await tempConfig(); roots.push(root); config.jobPromptReconcileMs = 100;
-    const database = new DispatcherDatabase(config.databasePath); const job = createScratchJob(database, config, "Ev-stalled-progress");
-    let prompts = 0; let gets = 0;
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobPromptReconcileMs = 100;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-progress");
+    let prompts = 0;
+    let gets = 0;
     const runtime = fakeRuntime({
-      async prepare() { await fs.mkdir(config.jobResultsDir,{recursive:true}); return {herdrWorkspaceId:"w1",herdrPaneId:"p1"}; },
-      async prompt() { prompts++; return {...failed("agent_prompt_stalled"),agentIdentity:'["w1","p1","agent"]',agentStatus:"idle",stateChangeSeq:10}; },
-      async get() { gets++; return {...ok("working"),agentIdentity:'["w1","p1","agent"]',stateChangeSeq:11}; },
-      async wait() { await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()})); return ok("done"); },
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() {
+        prompts += 1;
+        return failed("agent_prompt_stalled");
+      },
+      async get() {
+        gets += 1;
+        return {
+          ...ok(gets === 1 ? "idle" : "working"),
+          agentIdentity: '["w1","p1","agent"]',
+          stateChangeSeq: gets === 1 ? 10 : 11,
+        };
+      },
+      async wait() {
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return ok("done");
+      },
     });
-    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);supervisor.start();
-    await waitFor(()=>database.getJob(job.job_id)?.status==="completed");await supervisor.stop();
-    assert.equal(prompts,1);assert.equal(gets,1);assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await supervisor.stop();
+    assert.equal(prompts, 1);
+    assert.equal(gets, 2);
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
     database.close();
   });
 
   test("stalled promptのidentity差し替えは再送せずneeds_reviewにする", async () => {
     const { root, config } = await tempConfig(); roots.push(root); config.jobPromptReconcileMs = 100;
-    const database = new DispatcherDatabase(config.databasePath); const job = createScratchJob(database, config, "Ev-stalled-swap"); let prompts=0;
-    const runtime=fakeRuntime({async prepare(){return {herdrWorkspaceId:"w1",herdrPaneId:"p1"};},async prompt(){prompts++;return {...failed("agent_prompt_stalled"),agentIdentity:"old",stateChangeSeq:1};},async get(){return {...ok("idle"),agentIdentity:"new",stateChangeSeq:2};}});
+    const database = new DispatcherDatabase(config.databasePath); const job = createScratchJob(database, config, "Ev-stalled-swap"); let prompts=0; let gets=0;
+    const runtime=fakeRuntime({async prepare(){return {herdrWorkspaceId:"w1",herdrPaneId:"p1"};},async prompt(){prompts++;return failed("agent_prompt_stalled");},async get(){gets++;return {...ok("idle"),agentIdentity:gets===1?"old":"new",stateChangeSeq:gets};}});
     const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);supervisor.start();
     await waitFor(()=>database.getJob(job.job_id)?.status==="needs_review");await supervisor.stop();
     assert.equal(prompts,1);assert.equal(database.getJob(job.job_id)?.last_error_code,"prompt_agent_identity_changed");assert.equal(database.getJob(job.job_id)?.prompt_accepted_at,null);
@@ -292,6 +322,7 @@ describe("JobSupervisor", () => {
         return { ...failed("agent_prompt_stalled"), agentIdentity: "agent", stateChangeSeq: 1 };
       },
       async get() {
+        if (promptCount === 0) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
         await fs.writeFile(job.result_path, JSON.stringify({
           schema_version: 1,
           job_id: job.job_id,
@@ -326,7 +357,11 @@ describe("JobSupervisor", () => {
         promptCount += 1;
         return { ...failed("agent_prompt_stalled"), agentIdentity: "agent", stateChangeSeq: 1 };
       },
-      async get() { return { ...ok("working"), stateChangeSeq: 2 }; },
+      async get() {
+        return promptCount === 0
+          ? { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }
+          : { ...ok("working"), stateChangeSeq: 2 };
+      },
     });
     const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
     supervisor.start();
@@ -348,10 +383,15 @@ describe("JobSupervisor", () => {
       roots.push(root);
       const database = new DispatcherDatabase(config.databasePath);
       const job = createScratchJob(database, config, `Ev-stalled-${errorCode}`);
+      let prompted = false;
       const runtime = fakeRuntime({
         async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
-        async prompt() { return { ...failed("agent_prompt_stalled"), agentIdentity: "agent", stateChangeSeq: 1 }; },
-        async get() { return failed(errorCode, timedOut); },
+        async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+        async get() {
+          return prompted
+            ? failed(errorCode, timedOut)
+            : { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        },
       });
       const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
       supervisor.start();
