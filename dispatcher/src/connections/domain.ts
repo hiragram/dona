@@ -27,7 +27,7 @@ export type SubscriptionState = "verification_pending" | "active" | "expiring" |
 export interface Subscription {
   connectionId: string; resource: string; generation: number; revision: number;
   providerId: string | null; state: SubscriptionState;
-  createdAt: number; verifiedAt: number | null; expiresAt: number | null; renewalWindowMs: number;
+  createdAt: number; verifiedAt: number | null; expiresAt: number | null; renewalWindowMs: number; verificationEpoch: number;
   lastDeliveryAt: number | null; lastReconcileAt: number | null; error: string | null;
 }
 export interface Clock { now(): number; }

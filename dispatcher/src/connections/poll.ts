@@ -13,6 +13,7 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
   if (![limits.pages,limits.events,limits.timeoutMs].every((n)=>Number.isSafeInteger(n)&&n>0) || limits.timeoutMs>60_000) throw new ConnectionError("invalid_input");
   database.connections.assertPolling(binding);
   const expected=database.connections.cursor(binding.connectionId,binding.resource);
+  if (expected.revision !== binding.revision) throw new ConnectionError("cursor_conflict");
   const events: {providerEventId:string;envelope:CursorBatch["events"][number]["envelope"]}[]=[];
   let page: string | null=null;
   const seen=new Set<string>();

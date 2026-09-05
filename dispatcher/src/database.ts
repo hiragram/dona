@@ -52,6 +52,10 @@ function storedSlackReceivedAtFallback(row: EventRow): boolean {
   }
 }
 
+export class EventNotDispatchableError extends Error {
+  constructor(eventId: string) { super(`Event ${eventId} is no longer dispatchable`); this.name = "EventNotDispatchableError"; }
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
@@ -689,7 +693,7 @@ export class DispatcherDatabase {
         WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
       .run(timestamp, resultPath, timestamp, eventId, at.getTime()).changes;
-    if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
+    if (changed !== 1) throw new EventNotDispatchableError(eventId);
     return this.get(eventId)!;
   }
 

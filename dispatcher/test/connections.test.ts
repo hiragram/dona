@@ -33,7 +33,7 @@ class FakeDriver implements Driver {
     return result;
   }
   async lookup(_c: Connection, operation: Operation) { return this.observations.get(operation.id) ?? null; }
-  async inspect(_c: Connection, subscription: Subscription) {
+  async inspect(_c: Connection, subscription: Subscription): Promise<ProviderObservation> {
     return { providerId: subscription.providerId!, expiresAt: this.clock.now() + 10_000, verified: true, cutoverConfirmed: this.cutover };
   }
   async stop() { this.stops++; }
@@ -385,6 +385,8 @@ test("resource Aの検証失敗はBの成功後もquarantineを維持する",asy
   assert.throws(()=>db.enqueueExternal(event("blocked"),b),/not_authorized/);
   assert.throws(()=>db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())),/no longer dispatchable/);
   assert.equal(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+  assert.equal(db.connections.health().ready,false);
+  assert.equal(db.connections.health().degraded,1);
 });
 
 test("未commitの初期cursorもrevision変更後は明示rebindが必要",async(t)=>{
@@ -404,4 +406,81 @@ test("同じcapabilityの別provider driverはcredential確認前に拒否する
   driver.credentialAvailable=async()=>{reads++;return true;};
   await assert.rejects(lifecycle.createOrRenew("pilot","folder1"),/capability_mismatch/);
   assert.equal(reads,0);assert.equal(driver.creates,0);assert.equal(db.connections.operations("pilot").length,0);
+});
+
+test("cursor rebind前にはprovider fetchを1回も実行しない",async(t)=>{
+  const {pollConnectionBatch}=await import("../src/connections/poll.js");
+  const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  db.connections.revise("pilot",1,{...config,credentialRevision:2});await lifecycle.verify("pilot","folder1",1);
+  let reads=0;
+  await assert.rejects(pollConnectionBatch(db,{...binding(),revision:2,credentialRevision:2},async()=>{
+    reads++;return {done:true,checkpoint:"next",events:[]};
+  }),/cursor_conflict/);
+  assert.equal(reads,0);
+});
+
+test("不正observationもquarantineしhealthに反映する",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  driver.inspect=async()=>({providerId:"wrong-id",expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false});
+  await assert.rejects(lifecycle.verify("pilot","folder1",1),/not_authorized/);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+  assert.equal(db.connections.health().ready,false);assert.equal(db.connections.health().degraded,1);
+  assert.throws(()=>db.enqueueExternal(event(),binding()),/not_authorized/);
+});
+
+test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  clock.value+=9000;driver.cutover=true;await lifecycle.createOrRenew("pilot","folder1");
+  let inspections=0;driver.inspect=async()=>{inspections++;throw new Error("should not read");};
+  await assert.rejects(lifecycle.verify("pilot","folder1",1),/invalid_transition/);
+  assert.throws(()=>db.connections.revise("pilot",1,config),/operation_pending/);
+  await lifecycle.stop("pilot","folder1",1);
+  await assert.rejects(lifecycle.verify("pilot","folder1",1),/invalid_transition/);
+  db.connections.revise("pilot",1,{...config,allowlist:[{resource:"folder2",events:["changed"]}]});
+  await assert.rejects(lifecycle.verify("pilot","folder1",2),/not_authorized/);
+  assert.equal(inspections,0);
+});
+
+test("旧generationのqueued eventを新generationへ移してからstopする",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());clock.value+=9000;driver.cutover=true;
+  await lifecycle.createOrRenew("pilot","folder1");
+  let duringStop: string | undefined;
+  driver.stop = async () => { duringStop = db.enqueueExternal(event("during-stop"), binding()).row.event_id; };
+  await lifecycle.stop("pilot","folder1",1);
+  assert.equal(db.beginDispatch(duringStop!,"during-stop",new Date(clock.now())).status,"dispatching");
+  assert.equal(db.connections.subscriptions("pilot")[0]!.state,"stopped");
+  assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,accepted.row.event_id);
+  assert.equal(db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())).status,"dispatching");
+});
+
+test("window改訂時の再verifyは表示とrenewal判定に同じ保存値を使う",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const revised={...config,capability:{...managed,kind:"managed" as const,renewal:"replace" as const,windowMs:5000}};
+  db.connections.revise("pilot",1,revised);driver.capability=revised.capability;await lifecycle.verify("pilot","folder1",1);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.renewalWindowMs,5000);
+  clock.value+=4999;assert.equal(db.connections.health().expiring,0);
+  assert.throws(()=>db.connections.claim("pilot",2,"folder1",20),/invalid_transition/);
+  clock.value++;assert.equal(db.connections.health().expiring,1);
+  assert.equal(db.connections.claim("pilot",2,"folder1",20).generation,2);
+});
+
+test("verify中crashはpendingを残し、並行verifyの遅延結果をfenceする",async(t)=>{
+  const {db,lifecycle,driver,clock,file}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  db.connections.beginVerification("pilot",1,"folder1",1);
+  const reopened=new DispatcherDatabase(file,clock);t.after(()=>reopened.close());
+  assert.equal(reopened.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+  assert.throws(()=>reopened.enqueueExternal(event(),binding()),/not_authorized/);
+  let finishOld!: (value:ProviderObservation)=>void;let calls=0;
+  driver.inspect=async()=>{
+    if(++calls===1)return new Promise<ProviderObservation>(resolve=>{finishOld=resolve;});
+    return {providerId:"channel1",expiresAt:clock.now()+20000,verified:true,cutoverConfirmed:false};
+  };
+  const older=lifecycle.verify("pilot","folder1",1);
+  while(!finishOld)await new Promise(resolve=>setTimeout(resolve,0));
+  await lifecycle.verify("pilot","folder1",1);
+  finishOld({providerId:"wrong-id",expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false});
+  await assert.rejects(older,/not_authorized/);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.expiresAt,clock.now()+20000);
+  assert.equal(db.connections.get("pilot").state,"active");
 });

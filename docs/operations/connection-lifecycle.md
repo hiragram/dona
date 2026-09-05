@@ -23,14 +23,16 @@ event bindingはresource/generationも保持し、dispatch開始時にsubscripti
 NotionのUI型、GitHubのinstallation設定、FigmaのAPI管理、Driveの期限付きchannelのような差を、各pilotがこのcapabilityへ明示mappingする。すべてのproviderへrenewalを強制しない。windowはsubscriptionごとに保存する。
 
 - register → `verification_pending`。inspectで認証・provider IDを確認すると `active`。
-- 未解決のcreate/stopがある間はrevision更新を拒否する。まずlookupで既存operationを解消する。緊急停止にはrevision更新を待たずdisableを使う。
+- 未解決のcreate/stopまたはstop_candidateがある間はrevision更新を拒否する。まずlookupや認可済みstopで既存操作・停止候補を解消する。緊急停止にはrevision更新を待たずdisableを使う。
 - allowlist/credential revision更新 → `degraded`。旧revisionの通知/queued event/cursor commitは拒否する。更新前のgenerationを新credentialでread-only verifyし、新revisionへ再bindingできる。provider/accountは変更不可。初期cursorも登録時に保存し、未commitの場合も含めて `rebindCursor` に旧checkpoint/versionを指定し、tokenを保持したまま明示再bindingする。
 - resourceのinspect失敗は、そのsubscriptionのverifiedAtを消してquarantineする。他resourceの成功でconnectionがactiveへ戻っても、失敗resourceのdelivery/dispatchは再開しない。
+- verifyはallowlist・遷移可否を確認し、provider read前にpending状態とverification epochを保存する。期限切れやprovider ID不一致のobservationも失敗として隔離する。再起動時もpendingを保持し、並行verifyの遅延結果はepochで拒否する。healthはquarantine/pendingのresourceも集計する。
 - expiry-window内はinspection/healthで `expiring`。期限切れ通知は拒否する。
 - claimは `BEGIN IMMEDIATE` 内でgenerationとoperation ID/leaseを永続化する。driverへoperation IDをidempotency/lookup keyとして渡す。1 resourceの未解決操作がある間は次操作を作らない。
 - timeout、create成功後response loss、claim後crashは `renewal_unknown` / operation `unknown`。lease expiryはlookup権限だけを与え、再create権限を与えない。driverの遅延responseを追って二度commitしない。
 - lookupがgeneration/provider IDを確定した後だけ状態を復元する。createのlookupがnot-foundでも元の要求が遅延中の可能性があるため自動再createしない。stopのlookupの `null` はdriverが権威あるreadで停止を確定できた場合だけ返す。不確実なreadは例外にする。
 - overlap中は検証済みold/newからの通知を同じconnection-scoped IDでdedupする。新generationの `cutoverConfirmed` が得られて初めてoldを `stop_candidate` にする。実stopは別の明示認可を必要とする。停止応答不明も再stopせずlookupする。
+- stopのclaim時は旧generationのqueued/retryable eventを、同revisionの検証済み・期限内の新generationへ原子的に移す。外部stop待ちに届いた旧channelの通知も新generationへbindingする。有効な移行先がなければstopを開始しない。再verifyで設定revisionを採用するとrenewal windowも更新し、表示とclaim判定に同じ保存値を使う。
 - disable → `disabled`。自動enable/delete/recreateはない。時計後退時もdisableはでき、監査時刻は後退させない。他の更新は `clock_skew` で拒否する。
 
 `ConnectionLifecycle` は `Driver` と `OperationAuthority` をconstructorで受ける。authorityはexact connection/revision/resource/kindの運用許可を確認する。一般MCPやpayloadのbooleanをauthorityにしない。credential availabilityを確認した後、認可中の設定変更をclaimで再検証する。renewalは運用側が対象を選んで `createOrRenew` を呼ぶ。自動常駐schedulerやprovider固有CLI/credential設定はこの共通層には追加しない。
@@ -38,6 +40,8 @@ NotionのUI型、GitHubのinstallation設定、FigmaのAPI管理、Driveの期�
 ## cursor batch
 
 `pollConnectionBatch` は各page前にbindingを検査し、最終pageまで成功した場合だけ `DispatcherDatabase.commitConnectionBatch` を呼ぶ。途中page失敗、timeout、page循環、page/event上限超過ではeventとcheckpointをcommitしない。checkpointは同じSQLite handle上でbatch内eventのdurable enqueueと原子的に進める。ここでの処理完了はingress batchのdurable commitであり、後続jobのbusiness処理完了ではない。
+
+cursor revision不一致は最初のfetch前に拒否する。workerのpreflight中にconnectionがdisable/reviseされたり期限が切れたりした場合、dispatch開始の条件不一致はそのeventのskipとして処理し、後続eventを止めない。
 
 compare対象は `{revision, version, checkpoint}`。duplicate conflictやSQLite例外でbatch全体をrollbackする。commit直後response lossでは保存済みversion/event receiptをread-only照合し、古いbatchをblind再送しない。空の最終pageも認証/allowlist/期限を検査する。fetch driverは秘密を含まない正規化済みeventと、generationに依存しないprovider event IDを返す。
 

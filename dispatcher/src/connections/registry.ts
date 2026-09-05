@@ -9,11 +9,11 @@ import { ConnectionError, deliverySchema, identifier, parseConfig, systemClock,
 
 type SubscriptionRow = { connection_id: string; resource: string; generation: number; revision: number;
   provider_id: string | null; state: Subscription["state"]; created_at: number; verified_at: number | null;
-  expires_at: number | null; renewal_window_ms: number; last_delivery_at: number | null; last_reconcile_at: number | null; error: string | null };
+  expires_at: number | null; renewal_window_ms: number; verification_epoch: number; last_delivery_at: number | null; last_reconcile_at: number | null; error: string | null };
 function subscription(row: SubscriptionRow): Subscription {
   return { connectionId: row.connection_id, resource: row.resource, generation: row.generation, revision: row.revision,
     providerId: row.provider_id, state: row.state, createdAt: row.created_at, verifiedAt: row.verified_at,
-    expiresAt: row.expires_at, renewalWindowMs: row.renewal_window_ms, lastDeliveryAt: row.last_delivery_at, lastReconcileAt: row.last_reconcile_at, error: row.error };
+    expiresAt: row.expires_at, renewalWindowMs: row.renewal_window_ms, verificationEpoch: row.verification_epoch, lastDeliveryAt: row.last_delivery_at, lastReconcileAt: row.last_reconcile_at, error: row.error };
 }
 export interface Cursor { revision: number; version: number; checkpoint: string | null; }
 export interface CursorBatch {
@@ -64,7 +64,7 @@ export class ConnectionRegistry {
     return this.db.transaction(() => {
       const current = this.get(id);
       if (current.revision !== revision) throw new ConnectionError("revision_conflict");
-      if (this.operations(id).some((operation) => operation.state !== "done")) throw new ConnectionError("operation_pending");
+      if (this.operations(id).some((operation) => operation.state !== "done") || this.subscriptions(id).some((s) => s.state === "stop_candidate")) throw new ConnectionError("operation_pending");
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
@@ -95,10 +95,11 @@ export class ConnectionRegistry {
       this.audit(c, "credential_unavailable", now);
     }).immediate();
   }
-  quarantine(id: string, revision: number, resource: string, generation: number): void {
+  quarantine(id: string, revision: number, resource: string, generation: number, epoch?: number): void {
     this.db.transaction(() => {
       const c = this.get(id);
       if (c.revision !== revision || c.state === "disabled") return;
+      if (epoch !== undefined && this.sub(id, resource, generation).verificationEpoch !== epoch) return;
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET verified_at=NULL,error='verification_failed',last_reconcile_at=?
         WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
@@ -115,6 +116,24 @@ export class ConnectionRegistry {
   }
   subscriptions(id: string): Subscription[] {
     return (this.db.prepare("SELECT * FROM connection_subscriptions WHERE connection_id=? ORDER BY resource,generation").all(id) as SubscriptionRow[]).map(subscription);
+  }
+  beginVerification(id: string, revision: number, resource: string, generation: number): Subscription {
+    return this.db.transaction(() => {
+      this.assertVerifiable(id, revision, resource, generation);
+      const now = this.tick(id);
+      this.db.prepare(`UPDATE connection_subscriptions SET state='verification_pending',verified_at=NULL,
+        verification_epoch=verification_epoch+1,last_reconcile_at=?,error=NULL
+        WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
+      this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state='active'").run(id);
+      return this.sub(id, resource, generation);
+    }).immediate();
+  }
+  assertVerifiable(id: string, revision: number, resource: string, generation: number): Subscription {
+    this.current(id, revision, resource);
+    const s = this.sub(id, resource, generation);
+    if (s.providerId === null || ["stopped","stop_candidate"].includes(s.state)) throw new ConnectionError("invalid_transition");
+    if (this.operations(id).some((o) => o.resource === resource && o.generation === generation && o.state !== "done")) throw new ConnectionError("operation_pending");
+    return s;
   }
   private sub(id: string, resource: string, generation: number): Subscription {
     const result = this.subscriptions(id).find((entry) => entry.resource === resource && entry.generation === generation);
@@ -136,7 +155,7 @@ export class ConnectionRegistry {
       if (kind === "create") {
         if (previous) {
           if (previous.revision !== revision || c.capability.renewal !== "replace" || previous.state !== "active" ||
-              previous.expiresAt === null || now < previous.expiresAt - c.capability.windowMs) throw new ConnectionError("invalid_transition");
+              previous.expiresAt === null || now < previous.expiresAt - previous.renewalWindowMs) throw new ConnectionError("invalid_transition");
         }
         next = (previous?.generation ?? 0) + 1;
         this.db.prepare(`INSERT INTO connection_subscriptions(connection_id,resource,generation,revision,state,created_at,renewal_window_ms)
@@ -145,6 +164,14 @@ export class ConnectionRegistry {
         if (!generation) throw new ConnectionError("invalid_input");
         const target = this.sub(id, resource, generation);
         if (target.revision !== revision || target.state !== "stop_candidate") throw new ConnectionError("invalid_transition");
+        const replacement = this.subscriptions(id).filter((s) => s.resource === resource && s.generation > generation &&
+          s.revision === revision && s.verifiedAt !== null && ["active","expiring"].includes(s.state) &&
+          (s.expiresAt === null || s.expiresAt > now)).at(-1);
+        if (!replacement) throw new ConnectionError("invalid_transition");
+        this.db.prepare(`UPDATE connection_event_bindings SET generation=?
+          WHERE connection_id=? AND resource=? AND generation=? AND revision=?
+          AND event_id IN (SELECT event_id FROM events WHERE status IN ('queued','retryable_failed'))`)
+          .run(replacement.generation, id, resource, generation, revision);
         next = generation;
       }
       const operation: Operation = { id: randomUUID(), connectionId: id, revision, resource, generation: next, kind, leaseUntil: now + leaseMs };
@@ -172,11 +199,12 @@ export class ConnectionRegistry {
     if (!identifier.safeParse(observed.providerId).success || typeof observed.verified !== "boolean" || typeof observed.cutoverConfirmed !== "boolean" ||
       (observed.expiresAt !== null && (!Number.isSafeInteger(observed.expiresAt) || observed.expiresAt <= now))) throw new ConnectionError("invalid_input");
   }
-  observe(id: string, revision: number, resource: string, generation: number, observed: ProviderObservation, operation?: Operation): void {
+  observe(id: string, revision: number, resource: string, generation: number, observed: ProviderObservation, operation?: Operation, verificationEpoch?: number): void {
     this.db.transaction(() => {
       const c = this.current(id, revision, resource); const now = this.tick(id);
       this.validateObservation(observed, now);
       const s = this.sub(id, resource, generation);
+      if (verificationEpoch !== undefined && s.verificationEpoch !== verificationEpoch) throw new ConnectionError("revision_conflict");
       if ((s.revision !== revision && operation !== undefined) || s.state === "stopped" || s.state === "stop_candidate" ||
           (s.providerId !== null && s.providerId !== observed.providerId)) throw new ConnectionError("invalid_transition");
       if (c.capability.kind === "managed" && c.capability.renewal === "replace" && observed.expiresAt === null) throw new ConnectionError("invalid_input");
@@ -187,12 +215,12 @@ export class ConnectionRegistry {
         if (saved.state === "done") return;
         this.db.prepare("UPDATE connection_operations SET state='done' WHERE id=?").run(operation.id);
       }
-      this.db.prepare(`UPDATE connection_subscriptions SET revision=?,provider_id=?,state=?,verified_at=?,expires_at=?,last_reconcile_at=?,error=NULL
+      this.db.prepare(`UPDATE connection_subscriptions SET revision=?,provider_id=?,state=?,verified_at=?,expires_at=?,renewal_window_ms=?,last_reconcile_at=?,error=NULL
         WHERE connection_id=? AND resource=? AND generation=?`).run(revision, observed.providerId, observed.verified ? "active" : "verification_pending",
-        observed.verified ? now : null, observed.expiresAt, now, id, resource, generation);
+        observed.verified ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0, now, id, resource, generation);
       if (observed.verified) {
         this.db.prepare("UPDATE connections SET state='active' WHERE id=?").run(id);
-        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate'
+        if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1
           WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND state IN ('active','expiring')`).run(id, resource, generation, revision);
       }
       if (!observed.verified && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
@@ -239,13 +267,20 @@ export class ConnectionRegistry {
       const s = this.sub(c.id, binding.resource, binding.generation);
       if (s.revision !== c.revision || s.verifiedAt === null || !["active","expiring","stop_candidate"].includes(s.state) ||
         (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
+      // stop の外部call待ちに旧channelへ届いた通知も、cutover済みの新generationへbindingする。
+      const stopping = this.operations(c.id).some((o) => o.resource === binding.resource && o.generation === binding.generation && o.kind === "stop");
+      const replacement = stopping ? this.subscriptions(c.id).filter((candidate) => candidate.resource === binding.resource &&
+        candidate.generation > binding.generation && candidate.revision === c.revision && candidate.verifiedAt !== null &&
+        ["active","expiring"].includes(candidate.state) && (candidate.expiresAt === null || candidate.expiresAt > now)).at(-1) : undefined;
+      if (stopping && !replacement) throw new ConnectionError("not_authorized");
+      const dispatchGeneration = replacement?.generation ?? binding.generation;
       const result = persist();
       if (result.outcome === "duplicate_conflict") return result;
       const prior = this.db.prepare("SELECT connection_id,revision,resource,generation FROM connection_event_bindings WHERE event_id=?").get(result.row.event_id) as {connection_id: string; revision: number; resource: string; generation: number} | undefined;
       if (prior && (prior.connection_id !== c.id || prior.resource !== binding.resource)) throw new ConnectionError("not_authorized");
-      if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?,?,?)").run(result.row.event_id, c.id, c.revision, binding.resource, binding.generation);
-      else if (prior.revision === c.revision && prior.generation < binding.generation) this.db.prepare("UPDATE connection_event_bindings SET generation=? WHERE event_id=?")
-        .run(binding.generation, result.row.event_id);
+      if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?,?,?)").run(result.row.event_id, c.id, c.revision, binding.resource, dispatchGeneration);
+      else if (prior.revision === c.revision && prior.generation < dispatchGeneration) this.db.prepare("UPDATE connection_event_bindings SET generation=? WHERE event_id=?")
+        .run(dispatchGeneration, result.row.event_id);
       this.db.prepare("UPDATE connection_subscriptions SET last_delivery_at=? WHERE connection_id=? AND resource=? AND generation=?")
         .run(now, c.id, binding.resource, binding.generation);
       return result;
@@ -317,17 +352,24 @@ export class ConnectionRegistry {
   health(): { ready: boolean; degraded: number; pending: number; expiring: number; unknown: number; disabled: number; staleLeases: number } {
     const now = this.clock.now();
     const connections = this.db.prepare("SELECT id,state FROM connections").all() as {id: string; state: string}[];
+    const relevant = (id: string) => {
+      const c = this.get(id);
+      return this.subscriptions(id).filter((s) => s.state !== "stopped" && c.allowlist.some((entry) => entry.resource === s.resource));
+    };
     let expiring = 0;
     for (const {id} of connections) {
       const c = this.get(id);
       if (c.state === "disabled") continue;
-      for (const s of this.subscriptions(id)) if (s.state === "active" && s.expiresAt !== null &&
+      for (const s of relevant(id)) if (s.state === "active" && s.expiresAt !== null &&
         now >= s.expiresAt - s.renewalWindowMs) expiring++;
     }
     const count = (state: string) => connections.filter((c) => c.state === state).length;
     const unknown = (this.db.prepare("SELECT count(*) AS n FROM connection_operations WHERE state='unknown'").get() as {n:number}).n;
     const staleLeases = (this.db.prepare("SELECT count(*) AS n FROM connection_operations WHERE state='inflight' AND lease_until<=?").get(now) as {n:number}).n;
-    const degraded = count("degraded"), pending = count("verification_pending");
+    const degraded = connections.filter((c) => c.state === "degraded" || (c.state !== "disabled" &&
+      relevant(c.id).some((s) => s.error === "verification_failed"))).length;
+    const pending = connections.filter((c) => c.state === "verification_pending" || (c.state !== "disabled" &&
+      relevant(c.id).some((s) => s.state === "verification_pending"))).length;
     return { ready: degraded + pending + expiring + unknown + staleLeases === 0, degraded, pending, expiring, unknown, disabled: count("disabled"), staleLeases };
   }
 }

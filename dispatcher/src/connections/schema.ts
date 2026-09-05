@@ -20,7 +20,7 @@ export function migrateConnections(db: Database.Database): void {
         generation INTEGER NOT NULL CHECK(generation>0), revision INTEGER NOT NULL,
         provider_id TEXT, state TEXT NOT NULL CHECK(state IN
           ('verification_pending','active','expiring','renewal_unknown','stop_candidate','stopped')),
-        created_at INTEGER NOT NULL, verified_at INTEGER, expires_at INTEGER, renewal_window_ms INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, verified_at INTEGER, expires_at INTEGER, renewal_window_ms INTEGER NOT NULL DEFAULT 0, verification_epoch INTEGER NOT NULL DEFAULT 0,
         last_delivery_at INTEGER, last_reconcile_at INTEGER, error TEXT,
         PRIMARY KEY(connection_id,resource,generation), UNIQUE(connection_id,provider_id)
       );

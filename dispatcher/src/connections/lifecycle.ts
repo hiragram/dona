@@ -41,13 +41,16 @@ export class ConnectionLifecycle {
   }
   async verify(id: string, resource: string, generation: number): Promise<void> {
     const c = await this.connection(id);
-    const subscription = this.registry.subscriptions(id).find((s) => s.resource === resource && s.generation === generation);
-    if (!subscription || subscription.providerId === null) throw new ConnectionError("not_found");
-    let result;
-    try { result = await this.bounded(() => this.driver.inspect(c, subscription)); }
-    catch { this.registry.quarantine(id, c.revision, resource, generation); throw new ConnectionError("not_authorized"); }
-    this.registry.observe(id, c.revision, resource, generation, result);
+    const subscription = this.registry.beginVerification(id, c.revision, resource, generation);
+    try {
+      const result = await this.bounded(() => this.driver.inspect(c, subscription));
+      this.registry.observe(id, c.revision, resource, generation, result, undefined, subscription.verificationEpoch);
+    } catch {
+      this.registry.quarantine(id, c.revision, resource, generation, subscription.verificationEpoch);
+      throw new ConnectionError("not_authorized");
+    }
   }
+
   async reconcile(id: string, operationId: string): Promise<void> {
     const c = await this.connection(id);
     const operation = this.registry.operations(id).find((o) => o.id === operationId);
