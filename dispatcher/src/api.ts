@@ -553,6 +553,17 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId !== null) {
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        try {
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId, true);
+        } catch {
+          throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
+        }
+      }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }

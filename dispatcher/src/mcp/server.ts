@@ -13,7 +13,7 @@ import {
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
-  getJob(jobId: string): Promise<Record<string, unknown>>;
+  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
     jobKey?: string,
@@ -54,6 +54,24 @@ function success(data: Record<string, unknown>) {
   };
 }
 
+// DB rowのobjective、path、runtime identityをcallerへ漏らさない。
+function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
+  const project = (value: unknown) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const row = value as Record<string, unknown>;
+    const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id"];
+    if (includeResult) keys.push("result_json");
+    return Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]]));
+  };
+  return {
+    schema_version: 1,
+    ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
+    ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
+    ...(response.job !== undefined ? { job: project(response.job) } : {}),
+    ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.jobs.length >= 100 } : {}),
+  };
+}
+
 function dispatcherApiError(error: unknown): { code: string; message: string } | undefined {
   if (!(error instanceof DispatcherClientError) || !error.body || typeof error.body !== "object" || Array.isArray(error.body)) {
     return undefined;
@@ -87,7 +105,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     {
       instructions:
         "Donaのバックグラウンドジョブ制御ツール。長い調査や開発作業をdelegate_jobへ委任し、Slackイベントの処理自体は速やかに完了してください。" +
-        "同じSlack threadの後続入力はlist_thread_jobsとget_job_statusで対象を確認してからsteer_jobへ渡します。" +
+        "同じSlack threadの後続入力は先にlist_thread_jobsで確認し、複数候補かつ明示job_idなしなら質問します。本文類似・最新時刻・job_keyで選択せずbroadcastしません。" +
         "self-updateはplan_self_updateでexact SHAのplanを確認し、人間がそのplanを明示承認した場合だけapply_self_updateを呼びます。" +
         "apply/cancelのtimeoutはacceptance unknownとして扱い、同じwriteをblind retryしないでください。" +
         "DispatcherはHerdr/Codexへの投入と永続化を担当します。生のHerdrコマンドを別経路で実行しないでください。",
@@ -96,7 +114,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("delegate_job", {
     title: "Delegate background job",
-    description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。同じsource eventでは安定したjob_keyごとに1つの論理jobへ収束します。",
+    description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。独立目的ごとに初回write前に安定job_keyを決めます。created/reused成功時のactionだけをResult actionsへ記録します。後続validation/conflict/limit失敗でも成功済jobをcancelせずpartial successを利用者とResultへ明示します。timeoutはblind retryせずlist_event_jobsでread-only reconcileします。委任後はgroup terminalまでprocessingを保ち、progressでは投稿・active遷移しません。",
     inputSchema: {
       source_event_id: eventId,
       job_key: createJobKey.optional().describe("同じsource event内でcallerがwrite前に決める安定key。省略時のみlegacy-default"),
@@ -113,7 +131,13 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
-      return success(await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace }));
+      const response = await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace });
+      const data = projectJobResponse(response);
+      const job = data.job as Record<string, unknown> | undefined;
+      if (job && typeof job.job_id === "string" && (response.outcome === "created" || response.outcome === "reused")) {
+        data.action = { tool: "delegate_job", source_event_id, job_key: job_key ?? legacyJobKey, job_id: job.job_id, outcome: response.outcome };
+      }
+      return success(data);
     } catch (error) {
       return failure(error, logger, "delegate_job");
     }
@@ -163,12 +187,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("list_thread_jobs", {
     title: "List Slack thread jobs",
-    description: "同じSlack threadから委任されたジョブを新しい順に取得します。",
+    description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
     inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ workspace_id, channel_id, thread_ts }) => {
     try {
-      return success(await client.listThreadJobs(workspace_id, channel_id, thread_ts));
+      return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
     } catch (error) {
       return failure(error, logger, "list_thread_jobs");
     }
@@ -176,12 +200,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "ジョブの状態、workspace path、結果、エラーを取得します。",
-    inputSchema: { job_id: jobId },
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。group通知では現在の通知event_idを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
+    inputSchema: { job_id: jobId, source_event_id: eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ job_id }) => {
+  }, async ({ job_id, source_event_id }) => {
     try {
-      return success(await client.getJob(job_id));
+      return success(projectJobResponse(await client.getJob(job_id, source_event_id), true));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }
@@ -189,12 +213,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("steer_job", {
     title: "Steer background job",
-    description: "同じSlack threadの後続メッセージを、稼働中ワーカーのCodex turnへsteerします。",
+    description: "list_thread_jobsで対象確定後だけ、現在のsource_event_idと明示job_idで同じthreadのワーカーへsteerします。複数候補で対象不明なら質問し、broadcastしません。timeoutはblind retryせずget_job_statusのreceiptでread-only reconcileします。",
     inputSchema: { job_id: jobId, source_event_id: eventId, instruction: z.string().min(1).max(100_000) },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ job_id, source_event_id, instruction }) => {
     try {
-      return success(await client.steerJob(job_id, { source_event_id, instruction }));
+      return success(projectJobResponse(await client.steerJob(job_id, { source_event_id, instruction })));
     } catch (error) {
       return failure(error, logger, "steer_job");
     }
@@ -202,12 +226,12 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("cancel_job", {
     title: "Cancel background job",
-    description: "同じSlack threadのジョブへCtrl+Cを送り、cancelledとして記録します。",
+    description: "list_thread_jobsで対象確定後だけ、現在のsource_event_idと明示job_idで同じthreadのジョブをcancelします。複数候補で対象不明なら質問し、成功済siblingをrollbackしません。timeoutはblind retryせずget_job_statusでread-only reconcileします。",
     inputSchema: { job_id: jobId, source_event_id: eventId, reason: z.string().min(1).max(2_000).optional() },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, async ({ job_id, source_event_id, reason }) => {
     try {
-      return success(await client.cancelJob(job_id, { source_event_id, ...(reason ? { reason } : {}) }));
+      return success(projectJobResponse(await client.cancelJob(job_id, { source_event_id, ...(reason ? { reason } : {}) })));
     } catch (error) {
       return failure(error, logger, "cancel_job");
     }
