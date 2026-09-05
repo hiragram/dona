@@ -355,7 +355,9 @@ test("one-shot workの結果通知と通知なし、graceでskipしたone-shot�
   repo.setRunState(notified.run_id, "materialized", "started", actor, due);
   repo.setRunState(notified.run_id, "started", "completed", actor, due, null, "結果");
   assert.equal(repo.get("result")?.state, "active");
-  assert.equal(repo.claim("2026-09-05T00:16:01Z"), undefined);
+  const delayedResult = repo.claim("2026-09-05T00:16:01Z")!;
+  repo.requestStarted(delayedResult.outbox_id, delayedResult.claim_token!, "2026-09-05T00:16:01Z");
+  repo.finishWrite(delayedResult.outbox_id, delayedResult.claim_token!, "sent", "2026-09-05T00:16:01Z", "receipt");
   assert.equal(repo.getRun(notified.run_id)?.status, "completed"); assert.equal(repo.get("result")?.state, "completed");
   repo.create("skipped", once, due, actor, now);
   repo.materialize("skipped", 1, due, null, "2026-09-05T00:16:01Z", actor);
@@ -538,4 +540,77 @@ test("時計後退後の再承認next_dueはhigh-watermarkを越える必要が�
   assert.equal(repo.get("s1")?.revision, 2);
   repo.update("s1", 2, renewed, later, actor, now);
   assert.equal(repo.get("s1")?.next_due, later);
+});
+
+test("開始済みworkは失効・pause・再承認後も完了し通知だけを抑止", () => {
+  const { repo, raw } = setup(); const expiry = "2026-09-05T00:02:00Z";
+  for (const mode of ["expiry", "pause", "replace", "cancel"] as const) {
+    repo.create(mode, { ...input, action: "work.read_only", expires_at: expiry }, due, actor, now);
+    const run = repo.materialize(mode, 1, due, later, due, actor).run;
+    repo.setRunState(run.run_id, "materialized", "started", actor, due);
+    if (mode === "pause" || mode === "replace") repo.transition(mode, 1, "pause", actor, due);
+    if (mode === "cancel") repo.transition(mode, 1, "cancel", actor, due);
+    if (mode === "replace") repo.update(mode, 2, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 3 }, later, actor, due);
+    repo.setRunState(run.run_id, "started", "completed", actor, mode === "expiry" ? expiry : due, null, mode === "pause" ? null : "結果");
+    assert.equal(repo.getRun(run.run_id)?.status, "completed");
+    assert.ok((repo.auditHistory(mode) as { operation: string }[]).some(x => x.operation.startsWith("work_result_suppressed_")));
+    if (mode === "expiry") repo.update(mode, 1, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 2 }, later, actor, expiry);
+    if (mode === "replace" || mode === "expiry") assert.equal(repo.materialize(mode, mode === "replace" ? 3 : 2, later, null, later, actor).run.status, "materialized");
+  }
+  assert.equal(count(raw, "connector_outbox"), 0);
+});
+
+test("期限を跨いだ配送済みone-shotはpurge順序によらずcompletedになる", () => {
+  const { dispatcher } = setup(); const expiry = "2026-09-05T00:02:00Z";
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: x => x, policy: x => x });
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null, expires_at: expiry };
+  for (const mode of ["direct", "purged"]) {
+    repo.create(mode, once, due, actor, now); repo.materialize(mode, 1, due, null, due, actor);
+    const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    if (mode === "purged") repo.purge(expiry);
+    assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", expiry, "receipt").status, "sent");
+    assert.equal(repo.get(mode)?.state, "completed"); assert.equal(repo.get(mode)?.terminal_at, expiry);
+  }
+});
+
+test("revision purge後もauditの固定actionを確認できる", () => {
+  const { repo, raw } = setup();
+  for (const action of ["work.read_only", "slack.reminder.post"] as const) {
+    const name = action === "work.read_only" ? "work" : "reminder";
+    repo.create(name, { ...input, action }, due, actor, now); repo.transition(name, 1, "cancel", actor, due);
+    repo.purge("2026-10-06T00:00:00Z");
+    assert.equal(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = ?").get(name), undefined);
+    assert.ok((repo.auditHistory(name) as { after_json: string }[]).every(x => JSON.parse(x.after_json).action === action));
+    assert.ok(repo.auditHistory(name).length > 0);
+  }
+});
+
+test("redacted backupはclaimed/request_startedの書込みcapabilityを含まない", () => {
+  const { repo } = setup(); repo.create("s1", input, due, actor, now); repo.materialize("s1", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  for (const started of [false, true]) {
+    if (started) repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    const backup = JSON.stringify(repo.redactedBackup());
+    assert.ok(!backup.includes("claim_token")); assert.ok(!backup.includes(claim.claim_token!));
+    assert.ok(backup.includes(claim.outbox_id)); assert.ok(backup.includes("lease_until")); assert.ok(backup.includes("request_started_at"));
+  }
+});
+
+test("長期停止のcompact skipと直近occurrence物化はatomicかつidempotent", () => {
+  const { repo, raw } = setup(); repo.create("s1", input, due, actor, now);
+  const selected = "2026-09-09T00:01:00Z", wake = "2026-09-09T00:06:00Z", next = "2026-09-10T00:01:00Z";
+  const skipped = { from: due, through: "2026-09-08T00:01:00Z", count: 4 };
+  assert.throws(() => repo.materialize("s1", 1, selected, next, wake, actor), /compact_skip_required/);
+  assert.throws(() => repo.materialize("s1", 1, selected, next, wake, actor, null, { ...skipped, through: selected }), /invalid_compact_skip/);
+  raw.exec("CREATE TRIGGER fail_compact BEFORE INSERT ON schedule_audit WHEN NEW.operation = 'materialize' BEGIN SELECT RAISE(ABORT, 'injected'); END");
+  assert.throws(() => repo.materialize("s1", 1, selected, next, wake, actor, null, skipped), /injected/);
+  assert.equal(count(raw, "schedule_runs"), 0); assert.equal(count(raw, "connector_outbox"), 0); assert.equal(repo.get("s1")?.next_due, due);
+  raw.exec("DROP TRIGGER fail_compact");
+  const result = repo.materialize("s1", 1, selected, next, wake, actor, null, skipped);
+  assert.equal(result.run.status, "materialized"); assert.equal(repo.get("s1")?.high_watermark, selected);
+  assert.equal(repo.materialize("s1", 1, selected, next, wake, actor, null, skipped).duplicate, true);
+  assert.equal(count(raw, "schedule_runs"), 1); assert.equal(count(raw, "connector_outbox"), 1);
+  const audit = (repo.auditHistory("s1") as { operation: string; after_json: string }[]).filter(x => x.operation === "materialize");
+  assert.equal(audit.length, 1); assert.deepEqual(JSON.parse(audit[0]!.after_json).compact_skip, { ...skipped, reason: "misfire" });
+  assert.throws(() => repo.materialize("s1", 1, due, next, wake, actor), /invalid_occurrence/);
 });

@@ -12,6 +12,7 @@ export interface StorageCodecs {
   recurrence(text: string): string;
   policy(text: string): string;
 }
+export interface CompactSkip { from: string; through: string; count: number }
 export interface Actor { tenant_id: string; actor_id: string; role: "owner" | "admin"; source_event_id: string | null }
 // #6 owns parsing/normalization and recurrence calculation. These are its prepared storage values,
 // not an API accepting untrusted JSON. No recurrence parser or calendar implementation lives here.
@@ -132,7 +133,7 @@ export class SchedulerRepository {
       input.timezone, input.tzdb_version, input.authorization_id, input.authorization_revision, input.action === "slack.reminder.post" ? "fixed_body" : "fixed_objective_redacted_result", input.approver_id, input.approved_at, input.expires_at,
       input.action, JSON.stringify(target), input.content, digest(input.content), now);
   }
-  private audit(before: Schedule | undefined, after: Schedule, operation: string, actor: Actor, now: string, outbox?: Outbox, run?: Run): void {
+  private audit(before: Schedule | undefined, after: Schedule, operation: string, actor: Actor, now: string, outbox?: Outbox, run?: Run, compactSkip?: CompactSkip): void {
     // Explicit allowlist: no caller-provided before/after JSON, targets, bodies or error text.
     const auditRun = outbox ? this.getRun(outbox.run_id)! : run;
     const snapshot = this.revision(auditRun ?? after);
@@ -140,7 +141,8 @@ export class SchedulerRepository {
     this.db.prepare(`INSERT INTO schedule_audit(schedule_id, revision, tenant_id, actor_id, source_event_id,
       operation, before_json, after_json, created_at) VALUES (?,?,?,?,?,?,?,?,?)`).run(after.schedule_id, snapshot.revision,
       after.tenant_id, actor.actor_id, actor.source_event_id, operation, before ? JSON.stringify(metadata(before)) : null,
-      JSON.stringify({ ...metadata(after), operation_revision: snapshot.revision, policy_version: snapshot.policy_version, tzdb_version: snapshot.tzdb_version, content_hash: outbox?.content_hash ?? snapshot.content_hash, recurrence_hash: snapshot.recurrence_hash,
+      JSON.stringify({ ...metadata(after), operation_revision: snapshot.revision, action: snapshot.action, policy_version: snapshot.policy_version, tzdb_version: snapshot.tzdb_version, content_hash: outbox?.content_hash ?? snapshot.content_hash, recurrence_hash: snapshot.recurrence_hash,
+        ...(compactSkip ? { compact_skip: { from: compactSkip.from, through: compactSkip.through, count: compactSkip.count, reason: "misfire" } } : {}),
         ...(auditRun ? { run: { run_id: auditRun.run_id, revision: auditRun.revision, status: auditRun.status, reason: auditRun.reason, event_id: auditRun.event_id, job_id: auditRun.job_id } } : {}),
         ...(outbox ? { outbox: { outbox_id: outbox.outbox_id, run_id: outbox.run_id, kind: outbox.kind, status: outbox.status,
           attempt: outbox.attempt, request_started_at: outbox.request_started_at, receipt_id: outbox.receipt_id } } : {}) }), now);
@@ -209,7 +211,7 @@ export class SchedulerRepository {
     }).immediate();
   }
   materialize(scheduleId: string, expectedRevision: number, scheduledFor: string, nextDue: string | null,
-    now: string, actor: Actor, skip: "misfire" | "overlap" | null = null): { run: Run; duplicate: boolean } {
+    now: string, actor: Actor, skip: "misfire" | "overlap" | null = null, compactSkip?: CompactSkip): { run: Run; duplicate: boolean } {
     utc(now); utc(scheduledFor); if (nextDue !== null) utc(nextDue);
     const result = this.db.transaction(() => {
       // An old caller may retry after the scheduler revision advanced. Identity/authorization still
@@ -221,8 +223,14 @@ export class SchedulerRepository {
       if (existing) return { run: existing, duplicate: true };
       if (before.revision !== expectedRevision) throw new Error("revision_conflict");
       if (nextDue !== null && (nextDue <= scheduledFor || nextDue <= now)) throw new Error("invalid_next_due");
-      if (before.state !== "active" || scheduledFor > now || scheduledFor !== before.next_due || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
+      if (before.state !== "active" || scheduledFor > now || (before.next_due === null || scheduledFor < before.next_due) || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
       const revision = this.revision(before);
+      if (scheduledFor !== before.next_due) {
+        if (!compactSkip || (JSON.parse(revision.recurrence_json) as { kind: string }).kind === "once") throw new Error("compact_skip_required");
+        utc(compactSkip.from); utc(compactSkip.through);
+        if (compactSkip.from !== before.next_due || compactSkip.through < compactSkip.from || compactSkip.through >= scheduledFor ||
+            Date.parse(now) - Date.parse(compactSkip.through) <= 900000 || !Number.isSafeInteger(compactSkip.count) || compactSkip.count < 1) throw new Error("invalid_compact_skip");
+      } else if (compactSkip) throw new Error("invalid_compact_skip");
       if (revision.expires_at <= now || revision.content === null) {
         this.expireSchedule(before, actor, now);
         return undefined;
@@ -245,7 +253,7 @@ export class SchedulerRepository {
       }
       this.db.prepare("UPDATE schedules SET high_watermark = ?, next_due = ?, updated_at = ? WHERE schedule_id = ?")
         .run(scheduledFor, nextDue, now, scheduleId);
-      this.audit(before, this.get(scheduleId)!, "materialize", actor, now, undefined, this.getRun(runId)!);
+      this.audit(before, this.get(scheduleId)!, "materialize", actor, now, undefined, this.getRun(runId)!, compactSkip);
       this.completeIfDrained(scheduleId, now);
       return { run: this.getRun(runId)!, duplicate: false };
     }).immediate();
@@ -284,14 +292,15 @@ export class SchedulerRepository {
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
       const runSnapshot = this.revision(run);
-      if (next === "completed" && runSnapshot.action === "work.read_only" &&
-          (JSON.parse(runSnapshot.target_json) as Target).kind !== "none" && resultContent === null) throw new Error("result_content_required");
-      if (resultContent !== null) {
-        if (next !== "completed" || current.state !== "active" || current.revision !== run.revision) throw new Error("result_not_authorized");
-        const revision = this.revision(current);
-        if (revision.action !== "work.read_only" || revision.expires_at <= now) throw new Error("result_not_authorized");
-        const target = JSON.parse(revision.target_json) as Target;
-        if (target.kind !== "none") this.insertOutbox(runId, "slack.work_result.post", revision.target_json, resultContent, now);
+      const notificationReason = current.state !== "active" ? "cancelled"
+        : current.revision !== run.revision ? "revision_replaced"
+        : runSnapshot.expires_at <= now ? "authorization_expired" : null;
+      const workCompletion = next === "completed" && runSnapshot.action === "work.read_only";
+      const hasTarget = (JSON.parse(runSnapshot.target_json) as Target).kind !== "none";
+      if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
+      if (workCompletion && hasTarget && notificationReason === null) {
+        if (resultContent === null) throw new Error("result_content_required");
+        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, resultContent, now);
       }
       if (next === "cancelled" || next === "failed") {
         this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
@@ -302,6 +311,10 @@ export class SchedulerRepository {
         CASE WHEN ? = 'started' THEN ? ELSE started_at END, terminal_at = ? WHERE run_id = ?`)
         .run(next, jobId, next, now, next === "started" ? null : now, runId);
       this.audit(current, current, `run_${next}`, actor, now, undefined, this.getRun(runId)!);
+      if (workCompletion && hasTarget && notificationReason !== null) {
+        this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, now, undefined, this.getRun(runId)!);
+      }
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) this.expireSchedule(current, actor, now);
       this.completeIfDrained(run.schedule_id, now);
       return this.getRun(runId)!;
     }).immediate();
@@ -348,7 +361,7 @@ export class SchedulerRepository {
   }
   private completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
-    if (before.state !== "active" || before.next_due !== null || before.high_watermark === null ||
+    if (!["active", "expired"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
     const unsettled = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o
@@ -362,10 +375,10 @@ export class SchedulerRepository {
     if (row.status !== "pending" && row.status !== "claimed") return false;
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
     const snapshot = this.revision(run);
-    const ageOrigin = row.kind === "slack.reminder.post" ? run.scheduled_for : run.terminal_at;
+    const ageOrigin = run.scheduled_for;
     const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
       : snapshot.expires_at <= now ? "authorization_expired"
-      : ageOrigin === null || Date.parse(now) - Date.parse(ageOrigin) > 900000 ? "misfire"
+      : row.kind === "slack.reminder.post" && Date.parse(now) - Date.parse(ageOrigin) > 900000 ? "misfire"
       : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= now) ? "cancelled"
       : null;
     if (reason === null) return false;
@@ -479,6 +492,7 @@ export class SchedulerRepository {
         }
         this.auditOutbox(row, `outbox_${outcome}`, now);
       }
+      this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, now);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;
       if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) {
         this.expireSchedule(current, { tenant_id: current.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
@@ -495,7 +509,7 @@ export class SchedulerRepository {
         content_hash, recurrence_hash, content_delete_at, created_at, terminal_at FROM schedule_revisions`).all(),
       runs: this.db.prepare("SELECT * FROM schedule_runs").all(),
       outbox: this.db.prepare(`SELECT outbox_id, run_id, kind, idempotency_key, content_hash, status, attempt,
-        available_at, claim_token, lease_until, request_started_at, receipt_id, created_at, updated_at, terminal_at, content_delete_at
+        available_at, lease_until, request_started_at, receipt_id, created_at, updated_at, terminal_at, content_delete_at
         FROM connector_outbox`).all(),
       audit: this.db.prepare("SELECT * FROM schedule_audit ORDER BY sequence").all(),
     }))();
