@@ -169,7 +169,7 @@ export class SchedulerRepository {
       const row = this.get(scheduleId)!; this.audit(undefined, row, "create", actor, now); return row;
     }).immediate();
   }
-  private suppress(scheduleId: string, now: string, reason: "cancelled" | "revision_replaced"): void {
+  private suppress(scheduleId: string, now: string, reason: "cancelled" | "revision_replaced" | "authorization_expired"): void {
     const suppressed = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
       WHERE r.schedule_id = ? AND o.status IN ('pending','claimed')`).all(scheduleId) as Outbox[];
     this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, content_delete_at = ?, updated_at = ?,
@@ -385,12 +385,13 @@ export class SchedulerRepository {
     }
   }
   private expireSchedule(before: Schedule, actor: Actor, now: string): void {
-    this.suppress(before.schedule_id, now, "cancelled");
+    const expiredAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
+    this.suppress(before.schedule_id, expiredAt, "authorization_expired");
     this.db.prepare("UPDATE schedules SET state = 'expired', updated_at = ?, terminal_at = COALESCE(terminal_at, ?) WHERE schedule_id = ?")
-      .run(now, now, before.schedule_id);
-    this.retireRevisions(before.schedule_id, now, before.revision);
-    this.audit(before, this.get(before.schedule_id)!, "expire", actor, now);
-    this.completeIfDrained(before.schedule_id, now);
+      .run(expiredAt, expiredAt, before.schedule_id);
+    this.retireRevisions(before.schedule_id, expiredAt, before.revision);
+    this.audit(before, this.get(before.schedule_id)!, "expire", actor, expiredAt);
+    this.completeIfDrained(before.schedule_id, expiredAt);
   }
   private runCanSend(row: Outbox, run: Run): boolean {
     return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : run.status === "completed";
@@ -412,6 +413,8 @@ export class SchedulerRepository {
   private expireUnsent(row: Outbox, now: string): boolean {
     if (row.status !== "pending" && row.status !== "claimed") return false;
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
+    const terminalAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
+      run.created_at, run.started_at ?? run.created_at, schedule.created_at, schedule.updated_at].sort().at(-1)!;
     const snapshot = this.revision(run);
     const ageOrigin = run.scheduled_for;
     const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(now) - Date.parse(row.created_at) > 900000;
@@ -423,14 +426,14 @@ export class SchedulerRepository {
       : null;
     if (reason === null) return false;
     if (reason === "authorization_expired") this.expireSchedule(schedule,
-      { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
+      { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, terminalAt);
     this.db.prepare(`UPDATE connector_outbox SET status = ?, terminal_at = ?, updated_at = ?,
       content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
-      .run(reason === "retry_expired" ? "failed" : "cancelled", now, now, add(now, 604800), row.outbox_id);
+      .run(reason === "retry_expired" ? "failed" : "cancelled", terminalAt, terminalAt, add(terminalAt, 604800), row.outbox_id);
     if (row.kind === "slack.reminder.post" && ["materialized", "started"].includes(run.status)) this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ?
-      WHERE run_id = ?`).run(reason === "misfire" ? "skipped" : "cancelled", reason, now, row.run_id);
-    this.auditOutbox(row, `outbox_${reason}`, now);
-    this.completeIfDrained(run.schedule_id, now);
+      WHERE run_id = ?`).run(reason === "misfire" ? "skipped" : "cancelled", reason, terminalAt, row.run_id);
+    this.auditOutbox(row, `outbox_${reason}`, terminalAt);
+    this.completeIfDrained(run.schedule_id, terminalAt);
     return true;
   }
   private insertOutbox(runId: string, kind: Outbox["kind"], targetJson: string, content: string, now: string): void {
@@ -465,10 +468,11 @@ export class SchedulerRepository {
       const run = this.getRun(row.run_id)!;
       if (!this.runCanSend(row, run)) throw new Error("write_not_authorized");
       if (row.attempt >= 3) throw new Error("attempt_limit");
+      const startedAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at].sort().at(-1)!;
       this.db.prepare("UPDATE connector_outbox SET status = 'request_started', request_started_at = ?, attempt = attempt + 1, updated_at = ? WHERE outbox_id = ?")
-        .run(now, now, outboxId);
-      this.auditOutbox(row, "outbox_request_started", now);
-      return this.getOutbox(outboxId, now)!;
+        .run(startedAt, startedAt, outboxId);
+      this.auditOutbox(row, "outbox_request_started", startedAt);
+      return this.getOutbox(outboxId, startedAt)!;
     }).immediate();
     if (!result) throw new Error("write_not_authorized");
     return result;

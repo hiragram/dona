@@ -686,6 +686,32 @@ test("時計後退中のfinishWriteとreconcileも保存済み時刻より前へ
   }
 });
 
+test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻さない", () => {
+  const { repo, raw } = setup();
+  repo.create("request_clock", input, due, actor, now);
+  repo.materialize("request_clock", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  const started = repo.requestStarted(claim.outbox_id, claim.claim_token!, "2026-09-05T00:00:30Z");
+  assert.equal(started.request_started_at, due);
+  assert.equal(started.updated_at, due);
+  assert.equal((raw.prepare("SELECT MAX(created_at) AS value FROM schedule_audit WHERE schedule_id = 'request_clock'").get() as { value: string }).value, due);
+});
+
+test("authorization失効はschedule時刻を戻さず未開始workへ専用reasonを残す", () => {
+  const { repo } = setup();
+  repo.create("expire_clock", { ...input, expires_at: due }, due, actor, now);
+  repo.transition("expire_clock", 1, "pause", actor, "2026-09-05T00:02:00Z");
+  repo.purge(due);
+  assert.equal(repo.get("expire_clock")?.terminal_at, "2026-09-05T00:02:00Z");
+
+  const expiry = "2026-09-05T00:02:00Z";
+  repo.create("expire_work", { ...input, action: "work.read_only", expires_at: expiry }, due, actor, now);
+  const run = repo.materialize("expire_work", 1, due, later, due, actor).run;
+  repo.purge(expiry);
+  assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+  assert.equal(repo.getRun(run.run_id)?.reason, "authorization_expired");
+});
+
 test("outbox本文の7日保持は作成時でなく終端またはneeds_review遷移から数える", () => {
   const { repo } = setup();
   repo.create("retention_origin", { ...input, expires_at: "2026-09-30T00:00:00Z" }, due, actor, now);
