@@ -27,6 +27,7 @@ export function parseJobProgress(input: unknown, expectedJobId: string): JobProg
     (value.sequence as number) < 1 || !jobProgressPhases.includes(value.phase as never) ||
     typeof value.safe_summary !== "string" || value.safe_summary.length < 1 || value.safe_summary.length > 80 ||
     /[\u0000-\u001f\u007f]/u.test(value.safe_summary) || typeof value.updated_at !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value.updated_at) ||
     !Number.isFinite(Date.parse(value.updated_at))) throw new Error("progress is invalid");
   return value as unknown as JobProgressEnvelope;
 }

@@ -16,6 +16,8 @@ test("progress schema binds the job and allowlisted phase", () => {
   assert.throws(() => parseJobProgress({ ...valid, job_id: "job_other" }, "job_abc"));
   assert.throws(() => parseJobProgress({ ...valid, phase: "shell" }, "job_abc"));
   assert.throws(() => parseJobProgress({ ...valid, destination: "C123" }, "job_abc"));
+  assert.throws(() => parseJobProgress({ ...valid, updated_at:"Sat, 05 Sep 2026 00:00:00 GMT (secret-token)" }, "job_abc"));
+  assert.throws(() => parseJobProgress({ ...valid, updated_at:"2026-09-05T09:00:00+09:00" }, "job_abc"));
 });
 
 test("worker summary is never sent and phase is rendered as a fixed label", () => {
