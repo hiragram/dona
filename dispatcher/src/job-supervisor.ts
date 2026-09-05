@@ -384,7 +384,10 @@ export class JobSupervisor {
           error_message: error instanceof Error ? error.message : String(error),
         });
       })
-      .finally(() => {
+      .finally(async () => {
+        if (!this.progress) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
+          this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
+        });
         this.active.delete(row.job_id);
         this.wake();
       });

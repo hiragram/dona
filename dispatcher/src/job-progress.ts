@@ -144,6 +144,7 @@ export class JobProgressCoordinator {
       this.store.requeueLatestAndMarkTerminal(row.job_id,runningSiblings);
       return;
     }
+    let parsed:JobProgressEnvelope;
     try {
       const progressPath = jobProgressPath(row);
       const stats = await fs.lstat(progressPath);
@@ -152,8 +153,7 @@ export class JobProgressCoordinator {
       let text: string;
       try { const opened=await handle.stat(); if(!opened.isFile() || opened.size>4096) throw new Error("opened progress must be a bounded regular file"); const buffer=Buffer.alloc(4097); const read=await handle.read(buffer,0,buffer.length,0); if(read.bytesRead>4096) throw new Error("progress file too large"); text=buffer.subarray(0,read.bytesRead).toString("utf8"); }
       finally { await handle.close(); }
-      this.store.ingest(parseJobProgress(JSON.parse(text), row.job_id));
-      this.invalidProgressWarnings.delete(row.job_id);
+      parsed=parseJobProgress(JSON.parse(text), row.job_id);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         this.invalidProgressWarnings.delete(row.job_id);
@@ -165,7 +165,10 @@ export class JobProgressCoordinator {
           this.logger.warn("Job progress ignored", { job_id: row.job_id, error_code: "invalid_job_progress" });
         }
       }
+      return;
     }
+    this.store.ingest(parsed);
+    this.invalidProgressWarnings.delete(row.job_id);
   }
   async recover(): Promise<void> {
     if(this.store.hasDelivering()&&!await this.drainAdapterUntilSettled("startup"))return;
