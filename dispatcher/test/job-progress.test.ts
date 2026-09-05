@@ -108,6 +108,14 @@ test("terminal fallback waits for an in-flight sibling delivery to settle unknow
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("terminal reconciliation preserves a delivering row for startup after shutdown abort", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-shutdown-fence-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.ingest({...valid,job_id:"job_next"}); store.begin("job_next"); const done={job_id:"job_done",source_event_id:"evt_group",status:"completed",workspace_path:path.join(root,"job_done"),workspace_json:JSON.stringify({kind:"scratch"})}; const next={...done,job_id:"job_next",status:"running"};
+    await new JobProgressCoordinator({listEventJobs:()=>[done,next]} as never,store,{} as never,{warn(){}} as never).ingest(done as never); assert.equal(store.get("job_next")?.status,"delivering"); assert.equal(store.get("job_done"),undefined);
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("an attention-claimed group rejects later progress delivery", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));

@@ -138,6 +138,7 @@ export class JobProgressCoordinator {
       this.invalidProgressWarnings.delete(row.job_id);
       const siblings=this.jobs.listEventJobs(row.source_event_id);
       await this.drainDeliveries(siblings.map((item)=>item.job_id));
+      if(siblings.some((item)=>this.store.get(item.job_id)?.status==="delivering"))return;
       this.store.terminal(row.job_id);
       await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(() => { this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
       const runningSiblings = siblings.filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);

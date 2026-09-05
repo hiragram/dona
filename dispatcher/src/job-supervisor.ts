@@ -227,7 +227,7 @@ export class JobSupervisor {
   private trackCancelledWorkerCleanup(row:JobRow):void {
     const operation=(async()=>{
       while(!this.stopping){
-        try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted||waited.ok||(!waited.timedOut&&waited.errorCode!=="timeout"))break;}
+        try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted)break;if(waited.ok&&waited.agentStatus!=="blocked")break;if(!waited.ok&&!waited.timedOut&&waited.errorCode!=="timeout")break;}
         catch {await abortableDelay(this.config.queuePollMs,this.abortController.signal);}
       }
       await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});
