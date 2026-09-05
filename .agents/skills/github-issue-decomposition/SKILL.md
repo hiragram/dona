@@ -23,6 +23,10 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 - Issue作成、feature branchのpush、integration PR作成をすべて明示的に依頼された場合だけ、完全なintegration workflowを実行する。Issue作成だけの依頼からbranchやPRの作成を推測しない。既存backlogのtopology整理では、依頼された既存Issueだけを変更し、明示されていないbranchやPRを作成しない。
 - read-only調査後もmode、repository、またはwrite範囲に実質的な曖昧さが残る場合は、plan-onlyに留めるか、write前に質問する。
 
+## 起票と着手を区別する
+
+Issue起票・分解・integration足場の作成だけで`Dona Job ID`やStatusを更新しない。後続の実装着手では[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を使い、Epicとchildを独立して扱う。起票した全childへのjob ID一括記入や、足場PR cleanだけによるEpicの`Merge Ready`化は行わない。
+
 ## repositoryの事実を確定する
 
 1. repositoryと現在のdefault branchを特定する。最新状態、適用される`AGENTS.md`、Issue template、既存Skill/agent設定、label、関連code境界を設計根拠とし、無関係なPRやbranchの変更を持ち込まない。

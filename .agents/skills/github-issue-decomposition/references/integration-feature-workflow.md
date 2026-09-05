@@ -2,6 +2,8 @@
 
 Issue、feature branchのpush、integration PR作成をすべて明示的に依頼されたcreate-or-update modeでのみ、この手順を使う。Skillの有効化や「Issueを作成して」という依頼だけでは、このworkflowの実行権限にならない。write範囲が曖昧な場合はplan-onlyに留めるか、質問する。
 
+このworkflowによる起票・足場作成をIssueの実装着手と混同しない。[Issue lifecycle手順](../../../../docs/operations/github-project-issue-lifecycle.md)に従い、全childへのjob ID一括記入や、足場PR cleanだけでEpicを`Merge Ready`へ進める操作を行わない。
+
 ## 実行前に固定するplan
 
 - repository、default branch、最新remote default commit、親Epic title、全child title・body、native parent topology、最小`blocker -> blocked` edge、parallel laneを確定する。
