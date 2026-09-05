@@ -702,8 +702,7 @@ test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻�
 test("authorization失効はschedule時刻を戻さず未開始workへ専用reasonを一度だけ残す", () => {
   const { repo } = setup();
   repo.create("expire_clock", { ...input, expires_at: due }, due, actor, now);
-  repo.transition("expire_clock", 1, "pause", actor, "2026-09-05T00:02:00Z");
-  assert.throws(() => repo.transition("expire_clock", 2, "resume", actor, now), /authorization_expired/);
+  assert.equal(repo.transition("expire_clock", 1, "pause", actor, "2026-09-05T00:02:00Z").state, "expired");
   repo.purge(due);
   assert.equal(repo.get("expire_clock")?.terminal_at, "2026-09-05T00:02:00Z");
 
@@ -809,6 +808,8 @@ test("cancel時刻を単調化しcaller skip不一致とSlack credential本文�
   assert.throws(() => repo.materialize("bad_skip", 1, due, later, due, actor, "misfire"), /invalid_skip_reason/);
   assert.throws(() => repo.create("xapp_body", { ...input, content: "prefix xapp-secret" }, due, actor, now), /content_requires_redaction/);
   assert.throws(() => repo.create("webhook_body", { ...input, content: "https://hooks.slack.com/services/T/B/secret" }, due, actor, now), /content_requires_redaction/);
+  assert.throws(() => repo.create("target_token", { ...input,
+    target: { kind: "thread", workspace_id: "T_TEST", channel_id: "xoxb-secret", thread_ts: "1.000001" } }, due, actor, now), /invalid_target/);
   assert.equal((raw.prepare("SELECT count(*) AS n FROM schedule_runs WHERE schedule_id = 'bad_skip'").get() as { n: number }).n, 0);
 });
 
@@ -818,7 +819,8 @@ test("開始済みworkは失効・pause・再承認後も完了し通知だけ�
     repo.create(mode, { ...input, action: "work.read_only", expires_at: expiry }, due, actor, now);
     const run = repo.materialize(mode, 1, due, later, due, actor).run;
     startWork(repo, dispatcher, raw, run, due);
-    if (mode === "pause" || mode === "replace") repo.transition(mode, 1, "pause", actor, due);
+    if (mode === "pause") repo.transition(mode, 1, "pause", actor, "2026-09-05T00:01:30Z");
+    if (mode === "replace") repo.transition(mode, 1, "pause", actor, due);
     if (mode === "cancel") repo.transition(mode, 1, "cancel", actor, due);
     if (mode === "replace") repo.update(mode, 2, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 3 }, later, actor, due);
     repo.setRunState(run.run_id, "started", "completed", actor, mode === "expiry" ? expiry : mode === "pause" ? "2026-09-05T00:00:30Z" : due,
@@ -826,7 +828,7 @@ test("開始済みworkは失効・pause・再承認後も完了し通知だけ�
     assert.equal(repo.getRun(run.run_id)?.status, "completed");
     assert.ok((repo.auditHistory(mode) as { operation: string }[]).some(x => x.operation.startsWith("work_result_suppressed_")));
     if (mode === "pause") assert.equal((repo.auditHistory(mode) as { operation: string; created_at: string }[])
-      .find(x => x.operation === "work_result_suppressed_cancelled")?.created_at, due);
+      .find(x => x.operation === "work_result_suppressed_cancelled")?.created_at, "2026-09-05T00:01:30Z");
     if (mode === "expiry") repo.update(mode, 1, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 2 }, later, actor, expiry);
     if (mode === "replace" || mode === "expiry") assert.equal(repo.materialize(mode, mode === "replace" ? 3 : 2, later, afterLater, later, actor).run.status, "materialized");
   }

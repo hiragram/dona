@@ -116,7 +116,10 @@ export class SchedulerRepository {
     else {
       if (!["thread", "channel", "owner_dm"].includes(input.target.kind)) throw new Error("invalid_target");
       id(input.target.workspace_id); id(input.target.channel_id);
-      if (input.target.workspace_id !== tenant || (input.target.kind === "thread" && !/^\d{1,20}\.\d{6}$/.test(input.target.thread_ts)) || (input.target.kind === "owner_dm" && input.target.owner_id !== owner)) throw new Error("invalid_target");
+      if (hasCredentialPattern(input.target.workspace_id) || hasCredentialPattern(input.target.channel_id) ||
+          (input.target.kind === "owner_dm" && hasCredentialPattern(input.target.owner_id)) ||
+          input.target.workspace_id !== tenant || (input.target.kind === "thread" && !/^\d{1,20}\.\d{6}$/.test(input.target.thread_ts)) ||
+          (input.target.kind === "owner_dm" && input.target.owner_id !== owner)) throw new Error("invalid_target");
     }
     if (!this.codecs) throw new Error("domain_codecs_required");
     if (this.codecs.recurrence(input.recurrence_json) !== input.recurrence_json ||
@@ -213,6 +216,10 @@ export class SchedulerRepository {
       const old = this.revision(before);
       const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
       if (operation === "resume" && (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
+      if (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt)) {
+        this.expireSchedule(before, actor, transitionAt);
+        return this.get(scheduleId)!;
+      }
       // Every mutation advances the concurrency revision; copying a paused snapshot never extends its authorization.
       const revision = expectedRevision + 1;
       this.db.prepare(`INSERT INTO schedule_revisions SELECT schedule_id, ?, recurrence_json, recurrence_hash, policy_json,
@@ -292,7 +299,8 @@ export class SchedulerRepository {
       const valid = expected === "materialized" ? ["started", "cancelled", "failed"] : expected === "started" ? ["completed", "failed", "cancelled"] : [];
       if (!valid.includes(next)) throw new Error("invalid_transition");
       const runSnapshot = this.revision(run);
-      const transitionAt = [now, run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at].sort().at(-1)!;
+      const transitionAt = [now, run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at,
+        current.created_at, current.updated_at, current.terminal_at ?? current.created_at].sort().at(-1)!;
       if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
       if (next === "started") {
         const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
