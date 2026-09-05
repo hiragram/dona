@@ -334,6 +334,54 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("seals queued grouped events on every manual terminal path", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+
+    for (const [suffix, terminal] of [
+      ["completed", "complete"],
+      ["dead-letter", "dead-letter"],
+    ] as const) {
+      const source = database.enqueue(eventEnvelope(`Ev-manual-${suffix}`)).row;
+      const job = database.createJob({
+        source_event_id: source.event_id,
+        job_key: "only",
+        objective: "complete before the source event",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id, `workspace-${suffix}`, `pane-${suffix}`);
+      database.beginJobDispatch(job.job_id);
+      database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id, {
+        schema_version: 1,
+        job_id: job.job_id,
+        status: "completed",
+        summary: "completed before manual source termination",
+        completed_at: "2026-09-05T04:00:00.000Z",
+      }, job.result_path);
+      assert.deepEqual(database.listJobsNeedingNotification(), []);
+
+      const terminalAt = new Date("2026-09-05T04:01:00.000Z");
+      if (terminal === "complete") {
+        database.manualComplete(source.event_id, terminalAt);
+        database.manualComplete(source.event_id, new Date("2026-09-05T04:02:00.000Z"));
+      } else {
+        database.manualDeadLetter(source.event_id, terminalAt);
+      }
+
+      assert.equal(database.getJobGroup(source.event_id)?.sealed_at, terminalAt.toISOString());
+      assert.deepEqual(database.listJobsNeedingNotification().map(({ job_id }) => job_id), [job.job_id]);
+      const notification = database.enqueueJobNotification(job.job_id);
+      assert.equal(
+        (envelopeFromRow(notification.row).payload.group as Record<string, unknown>).transition,
+        "all_terminal",
+      );
+    }
+    database.close();
+  });
+
   test("creates distinct keyed jobs and reconciles reuse, conflict, and closed groups", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

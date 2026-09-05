@@ -309,6 +309,44 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
+  test("validates target health against the compatibility persisted in the approved plan", async () => {
+    const f = await fixture();
+    const schemaV2Compatibility = { ...f.policy.compatibility };
+    const bridgeCompatibility: Compatibility = {
+      ...schemaV2Compatibility,
+      app_schema_read_max: 3,
+    };
+    f.policy.compatibility = bridgeCompatibility;
+    f.git.targetCompatibility = bridgeCompatibility;
+    f.build.compatibility = bridgeCompatibility;
+    f.runtime.setHealthCompatibility(targetSha, bridgeCompatibility);
+
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-bridge",
+    });
+    f.dispatcher.terminal = true;
+
+    // A restarted controller may load a different current policy, but target
+    // runtime evidence stays bound to the compatibility persisted in the plan.
+    f.policy.compatibility = schemaV2Compatibility;
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "succeeded", JSON.stringify({
+      error: row.last_error_code,
+      calls: f.runtime.calls,
+      operations: f.database.runtimeOperations(row.request_id),
+    }));
+    assert.deepEqual(JSON.parse(row.compatibility_json), bridgeCompatibility);
+    f.database.close();
+  });
+
   test("performs one compatible rollback only for a proven wrong target SHA", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

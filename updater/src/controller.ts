@@ -232,6 +232,7 @@ export class UpdateController {
       this.runtime.dispatcherHealth(), this.runtime.slackHealth(), this.runtime.mainAgentStatus(expectedRelease),
       observation.current_sha ? this.releases.releaseManifest(observation.current_sha) : Promise.resolve(null),
     ]);
+    const targetCompatibility = JSON.parse(claimed.compatibility_json) as ReleaseManifest["compatibility"];
     if (
       observation.current_sha === claimed.target_sha &&
       observation.previous_sha === claimed.current_sha &&
@@ -240,8 +241,8 @@ export class UpdateController {
       observation.receipt.to_sha === claimed.target_sha &&
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
-      this.healthMatches(dispatcherHealth, claimed.target_sha, false) &&
-      this.healthMatches(slackHealth, claimed.target_sha, true) &&
+      this.healthMatches(dispatcherHealth, claimed.target_sha, false, targetCompatibility) &&
+      this.healthMatches(slackHealth, claimed.target_sha, true, targetCompatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) &&
       this.mainAgentMatchesReceipt(claimed, mainAgent)
     ) {
@@ -344,6 +345,7 @@ export class UpdateController {
 
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
+    const targetCompatibility = JSON.parse(initial.compatibility_json) as ReleaseManifest["compatibility"];
     let mainAgentPaneId = this.database.runtimeOperation(row.request_id, "stop_main_agent")?.target_ref;
     this.assertLease(row);
     if (row.state === "rolling_back") {
@@ -523,6 +525,7 @@ export class UpdateController {
       }
       const dispatcherStart = await this.ensureServiceStarted(
         row, "start_target_dispatcher", "dispatcher", row.target_sha, () => this.runtime.startDispatcher(),
+        targetCompatibility,
       );
       if (dispatcherStart === "deferred") return;
       if (dispatcherStart === "wrong_sha") {
@@ -531,6 +534,7 @@ export class UpdateController {
       }
       const slackStart = await this.ensureServiceStarted(
         row, "start_target_slack", "slack_adapter", row.target_sha, () => this.runtime.startSlack(),
+        targetCompatibility,
       );
       if (slackStart === "deferred") return;
       if (slackStart === "wrong_sha") {
@@ -562,8 +566,8 @@ export class UpdateController {
         await this.rollback(row, "slack_wrong_target_sha", {});
         return;
       }
-      if (!this.healthMatches(dispatcherHealth, row.target_sha, false) ||
-        !this.healthMatches(slackHealth, row.target_sha, true) ||
+      if (!this.healthMatches(dispatcherHealth, row.target_sha, false, targetCompatibility) ||
+        !this.healthMatches(slackHealth, row.target_sha, true, targetCompatibility) ||
         !this.notificationReporterReady(dispatcherHealth, slackHealth) ||
         !this.mainAgentMatchesReceipt(row, mainAgent)) {
         this.deferOrReview(row, "ambiguous_runtime_observation", "Target runtime has not reached the exact verified state");
@@ -744,7 +748,7 @@ export class UpdateController {
   private async waitForHealth(
     service: HealthSnapshot["service"],
     sha: string,
-    compatibility: ReleaseManifest["compatibility"] = this.policy.compatibility,
+    compatibility: ReleaseManifest["compatibility"],
   ): Promise<HealthSnapshot> {
     const deadline = Date.now() + this.policy.timeouts.health_ms;
     let latest: HealthSnapshot;
@@ -1210,7 +1214,7 @@ export class UpdateController {
     service: HealthSnapshot["service"],
     sha: string,
     execute: () => Promise<CommandResult>,
-    compatibility: ReleaseManifest["compatibility"] = this.policy.compatibility,
+    compatibility: ReleaseManifest["compatibility"],
   ): Promise<"started" | "deferred" | "wrong_sha"> {
     const existing = this.database.runtimeOperation(row.request_id, kind);
     if (existing && (existing.target_ref !== service || existing.expected_sha !== sha)) {
@@ -1276,7 +1280,7 @@ export class UpdateController {
     health: HealthSnapshot,
     sha: string,
     requireWorkspaces: boolean,
-    compatibility: ReleaseManifest["compatibility"] = this.policy.compatibility,
+    compatibility: ReleaseManifest["compatibility"],
   ): boolean {
     const rangeAbsent = health.app_schema_read_min === undefined && health.app_schema_read_max === undefined &&
       health.app_schema_write === undefined;
