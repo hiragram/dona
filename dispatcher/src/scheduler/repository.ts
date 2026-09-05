@@ -56,8 +56,9 @@ function utc(value: string): void {
 function id(value: string): void { if (!/^[A-Za-z0-9_:-]{1,160}$/.test(value)) throw new Error("invalid_identity"); }
 function validateReceipt(value: string): void {
   // Slack message timestamps contain a decimal point; URLs and bodies are not receipt IDs.
-  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || /xox[baprs]-|xapp-/i.test(value)) throw new Error("invalid_receipt");
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || hasCredentialPattern(value)) throw new Error("invalid_receipt");
 }
+function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-/i.test(value); }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || /xox[baprs]-|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
@@ -105,6 +106,7 @@ export class SchedulerRepository {
   }
   private validateRevision(input: RevisionInput, owner: string, tenant: string, now: string): void {
     utc(now); utc(input.approved_at); utc(input.expires_at); id(input.authorization_id); id(input.approver_id);
+    if (hasCredentialPattern(input.authorization_id)) throw new Error("invalid_authorization");
     if (!Number.isSafeInteger(input.authorization_revision) || input.authorization_revision < 1) throw new Error("invalid_authorization");
     if (input.policy_version !== 1 || input.approver_id !== owner || input.approved_at > now || input.expires_at <= now ||
         Date.parse(input.expires_at) - Date.parse(input.approved_at) > 2592000000) throw new Error("invalid_authorization");
@@ -355,11 +357,12 @@ export class SchedulerRepository {
     }).immediate();
   }
   private retireRevisions(scheduleId: string, now: string, revision?: number): void {
-    const rows = this.db.prepare("SELECT revision, expires_at, terminal_at, content_delete_at FROM schedule_revisions WHERE schedule_id = ?" +
+    const rows = this.db.prepare("SELECT revision, expires_at, created_at, terminal_at, content_delete_at FROM schedule_revisions WHERE schedule_id = ?" +
       (revision === undefined ? "" : " AND revision = ?")).all(...(revision === undefined ? [scheduleId] : [scheduleId, revision])) as
-      { revision: number; expires_at: string; terminal_at: string | null; content_delete_at: string | null }[];
+      { revision: number; expires_at: string; created_at: string; terminal_at: string | null; content_delete_at: string | null }[];
     for (const row of rows) {
-      const endedAt = row.terminal_at ?? [row.expires_at, now].sort()[0]!;
+      const candidate = [row.expires_at, now].sort()[0]!;
+      const endedAt = row.terminal_at ?? (candidate < row.created_at ? row.created_at : candidate);
       const deadline = add(endedAt, 604800);
       this.db.prepare("UPDATE schedule_revisions SET terminal_at = ?, content_delete_at = ? WHERE schedule_id = ? AND revision = ?")
         .run(endedAt, row.content_delete_at !== null && row.content_delete_at < deadline ? row.content_delete_at : deadline, scheduleId, row.revision);
@@ -371,6 +374,7 @@ export class SchedulerRepository {
       .run(now, now, before.schedule_id);
     this.retireRevisions(before.schedule_id, now, before.revision);
     this.audit(before, this.get(before.schedule_id)!, "expire", actor, now);
+    this.completeIfDrained(before.schedule_id, now);
   }
   private runCanSend(row: Outbox, run: Run): boolean {
     return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : run.status === "completed";

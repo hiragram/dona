@@ -540,6 +540,8 @@ test("retire済みrevisionは時計後退でもterminalと削除期限を巻き�
   repo.update("clock", 2, { ...input, authorization_id: "clock_new", authorization_revision: 3 }, later, actor, "2026-09-05T00:00:10Z");
   const after = raw.prepare("SELECT terminal_at, content_delete_at FROM schedule_revisions WHERE schedule_id = 'clock' AND revision = 1").get();
   assert.deepEqual(after, before);
+  const current = raw.prepare("SELECT created_at, terminal_at FROM schedule_revisions WHERE schedule_id = 'clock' AND revision = 2").get() as { created_at: string; terminal_at: string };
+  assert.equal(current.terminal_at, current.created_at);
 });
 
 test("receiptの任意位置に埋め込まれたSlack tokenを保存前に拒否", () => {
@@ -550,6 +552,14 @@ test("receiptの任意位置に埋め込まれたSlack tokenを保存前に拒�
     assert.throws(() => repo.reconcile(claim.outbox_id, "failed", receipt, { ...actor, role: "admin" }, due), /invalid_receipt/);
   }
   assert.equal((raw.prepare("SELECT receipt_id FROM connector_outbox WHERE outbox_id = ?").get(claim.outbox_id) as { receipt_id: string | null }).receipt_id, null);
+});
+
+test("authorization IDに埋め込まれたSlack tokenを保存前に拒否", () => {
+  const { repo, raw } = setup();
+  for (const authorization_id of ["xoxb-secret", "proof:xapp-secret"]) {
+    assert.throws(() => repo.create(`secret_${authorization_id.length}`, { ...input, authorization_id }, due, actor, now), /invalid_authorization/);
+  }
+  assert.equal(count(raw, "schedules"), 0); assert.ok(!JSON.stringify(repo.redactedBackup()).includes("xox"));
 });
 
 test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持", () => {
@@ -608,6 +618,17 @@ test("runのないcurrent expired revisionも30日後にscheduleと共にpurge",
   assert.ok(repo.get("expired_empty")); assert.ok(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 'expired_empty'").get());
   repo.purge("2026-10-05T00:01:00Z");
   assert.equal(repo.get("expired_empty"), undefined); assert.equal(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 'expired_empty'").get(), undefined);
+});
+
+test("purge起点の失効もdrained one-shotをcompletedへ進めquotaを即時解放", () => {
+  const { dispatcher } = setup();
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null, expires_at: "2026-09-05T00:02:00Z" };
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  repo.create("purge_once", once, due, actor, now); repo.materialize("purge_once", 1, due, null, due, actor);
+  repo.purge(once.expires_at);
+  assert.equal(repo.get("purge_once")?.state, "completed"); assert.equal(repo.get("purge_once")?.terminal_at, once.expires_at);
+  assert.deepEqual((repo.auditHistory("purge_once") as { operation: string }[]).slice(-2).map(x => x.operation), ["expire", "complete"]);
+  for (let i = 0; i < 20; i++) repo.create(`purge_quota_${i}`, once, due, actor, now);
 });
 
 test("送信応答時の失効をreceiptと共に保持し再承認可能にする", () => {
