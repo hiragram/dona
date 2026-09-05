@@ -104,7 +104,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ### background jobのAgent Status進捗
 
-worker promptにはDispatcherが生成した`<result_path>.progress.json`だけを進捗公開先として渡します。workerはallowlist済みphase、単調増加sequence、短い表示専用summaryを一時ファイルからrenameして公開します。Dispatcherはjob IDを固定値と照合し、Slack workspace/channel/threadはworkerファイルではなくsource eventから永続化済みのjob bindingだけで決めます。自由な宛先、command、path、URL、tokenらしいsummaryは受け付けず、安全なphase名へfallbackします。
+worker promptにはDispatcherが生成したjob専用workspace内の`.dona-job-progress.json`だけを進捗公開先として渡します。workerはallowlist済みphase、単調増加sequence、短い表示専用summaryを一時ファイルからrenameして公開します。Dispatcherはjob IDを固定値と照合し、Slack workspace/channel/threadはworkerファイルではなくsource eventから永続化済みのjob bindingだけで決めます。自由な宛先、command、path、URL、tokenらしいsummaryは受け付けず、安全なphase名へfallbackします。
 
 進捗は本体schema v3と分離した`job-progress.sqlite3` schema v1へ保存します。これは古いreleaseの本体DB read/write互換性を壊さず、rollback時は新しい進捗表示だけが停止する設計です。pending更新は最新sequenceへcoalesceされ、順序逆転とduplicateは無視されます。Slack write開始後のtimeout・切断は`unknown`として永続化し、blind retryしません。進捗障害はjob Result・終端通知を失敗させません。terminal jobの遅延progressは破棄されます。
 

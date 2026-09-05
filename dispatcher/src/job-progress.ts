@@ -9,6 +9,7 @@ import type { DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import { jobProgressPhases, type JobProgressEnvelope, type JobRow } from "./types.js";
 import { readPrivateToken } from "./private-token.js";
+import { jobProgressPath } from "./job-prompt.js";
 
 const terminalStatuses = new Set(["blocked", "completed", "failed", "cancelled", "needs_review"]);
 const secretLike = /(?:xox[baprs]-|xapp-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|bearer\s+|(?:token|password|passwd|secret|api[_-]?key|access[_-]?key)\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
@@ -96,7 +97,7 @@ export class JobProgressCoordinator {
       return;
     }
     try {
-      const text = await fs.readFile(`${row.result_path}.progress.json`, "utf8");
+      const text = await fs.readFile(jobProgressPath(row), "utf8");
       if (text.length > 4096) throw new Error("progress file too large");
       this.store.ingest(parseJobProgress(JSON.parse(text), row.job_id));
     } catch (error) {

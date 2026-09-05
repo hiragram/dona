@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
 
@@ -5,8 +6,12 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
   return parseJobWorkspace(JSON.parse(row.workspace_json));
 }
 
+export function jobProgressPath(row: JobRow): string {
+  return path.join(row.workspace_path, ".dona-job-progress.json");
+}
+
 export function buildJobPrompt(row: JobRow): string {
-  const progressPath = `${row.result_path}.progress.json`;
+  const progressPath = jobProgressPath(row);
   const jobJson = JSON.stringify({
     schema_version: 1,
     job_id: row.job_id,

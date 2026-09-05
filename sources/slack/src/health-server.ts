@@ -181,8 +181,8 @@ export class SlackHealthServer {
           error_code: "job_progress_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
-        const rateLimited = error instanceof SlackApiError && error.errorCode === "rate_limited";
-        send(response, rateLimited ? 429 : 503, { schema_version: 1, error: { code: rateLimited ? "rate_limited" : "job_progress_failed" } });
+        const slackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error"].includes(error.errorCode);
+        send(response, slackRejection ? 429 : 503, { schema_version: 1, error: { code: slackRejection ? error.errorCode : "job_progress_failed" } });
       }
       return;
     }

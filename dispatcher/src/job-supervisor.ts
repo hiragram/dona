@@ -406,9 +406,12 @@ export class JobSupervisor {
     await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
     if (await this.tryComplete(row, false)) return;
     let keepPolling = true;
+    const pollAbort = new AbortController();
+    const stopPoll = (): void => pollAbort.abort();
+    this.abortController.signal.addEventListener("abort", stopPoll, { once: true });
     const pollProgress = (async () => {
       while (keepPolling && !this.stopping) {
-        await abortableDelay(this.config.queuePollMs, this.abortController.signal);
+        await abortableDelay(this.config.queuePollMs, pollAbort.signal);
         if (keepPolling && !this.stopping) {
           try { await this.progress?.ingest(this.database.getJob(row.job_id) ?? row); }
           catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
@@ -417,7 +420,9 @@ export class JobSupervisor {
     })();
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
     keepPolling = false;
+    pollAbort.abort();
     await pollProgress;
+    this.abortController.signal.removeEventListener("abort", stopPoll);
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
@@ -446,12 +451,11 @@ export class JobSupervisor {
   }
 
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
+    let completed: JobRow;
     try {
       const result = await readJobResultEnvelope(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
-      await this.progress?.ingest(this.database.getJob(row.job_id)!);
-      this.logTransition(row, this.database.getJob(row.job_id)!);
-      return true;
+      completed = this.database.getJob(row.job_id)!;
     } catch (error) {
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
       this.database.markJobNeedsReview(
@@ -459,8 +463,12 @@ export class JobSupervisor {
         error instanceof JobResultNotFoundError ? "result_missing" : "invalid_result",
         error instanceof Error ? error.message : String(error),
       );
-      return true;
+      completed = this.database.getJob(row.job_id)!;
     }
+    try { await this.progress?.ingest(completed); }
+    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id: row.job_id, error_code: "job_progress_terminal_failed", error_message: error instanceof Error ? error.message : String(error) }); }
+    this.logTransition(row, completed);
+    return true;
   }
 
   private logTransition(from: JobRow, to: JobRow): void {
