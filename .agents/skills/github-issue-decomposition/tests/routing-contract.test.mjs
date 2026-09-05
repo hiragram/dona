@@ -118,8 +118,13 @@ test("integration childは実際のmerge先とIssue完了点を明示する", ()
   assert.match(integrationWorkflow, /再取得.*raw title\/body.*標準templateの全見出し.*exactly 1件の`Closes #<親Issue番号>`/s);
   assert.match(skill, /integration PR -> 子Issue -> integration PR closing relationship reconcile -> native graph/);
   assert.match(integrationWorkflow, /integration PRのchild closing relationshipをreconcileする/);
+  assert.match(integrationWorkflow, /execution contextだけから対象集合を決めず.*全childのcurrent contract.*再取得/);
+  assert.match(integrationWorkflow, /feature-merge完了として除外するchildを含む全child.*raw title\/body hash.*current `child_completion_point`.*close mechanism/s);
+  assert.match(integrationWorkflow, /全childのcurrent contractからintegration完了対象集合を再計算.*immutable execution context.*1件でも変更.*write前に停止/s);
   assert.match(integrationWorkflow, /current default branchのexact SHA.*標準`.github\/PULL_REQUEST_TEMPLATE.md`.*`完了する Issue`.*`Closes #<child>`/s);
-  assert.match(integrationWorkflow, /write直前.*snapshot.*blind retry.*`closingIssuesReferences`全page/s);
+  assert.match(integrationWorkflow, /write直前.*PR、親Issue、全childのsnapshot.*対象集合をもう一度再計算.*差分.*古いbodyを送信せず停止/s);
+  assert.match(integrationWorkflow, /更新後.*全childのidentity.*current `child_completion_point`.*close mechanism.*snapshotと対象集合が不変/s);
+  assert.match(integrationWorkflow, /blind retry.*`closingIssuesReferences`全page/s);
   assert.match(integrationWorkflow, /親Issueとintegration完了対象child.*exactly 1件.*feature-merge完了child.*存在しない/s);
   assert.match(integrationWorkflow, /全child Issue.*merge-target branch.*integration PR link.*`child_completion_point`.*`Closes`可否.*`close_owner`/);
 });

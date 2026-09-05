@@ -50,12 +50,12 @@ PRを一意に検証できたら、`integration_pr_number`と`integration_pr_url
 
 ### 5. integration PRのchild closing relationshipをreconcileする
 
-`child_completion_point`が`default branchへのintegration PR merge`であるchildだけをIssue番号でsort・重複排除し、integration PRのclosing targetへ追加する。対象が0件でも、integration PRが親Issue以外の意図しないclosing targetを持たないことを読み取りで検証する。
+execution contextだけから対象集合を決めず、全childのcurrent contractを再取得してから、`child_completion_point`が`default branchへのintegration PR merge`であるchildだけをIssue番号でsort・重複排除し、integration PRのclosing targetへ追加する。対象が0件でも、integration PRが親Issue以外の意図しないclosing targetを持たないことを読み取りで検証する。
 
-1. integration PRのcurrent raw title/body、`updatedAt`、base/head SHA、state、draft状態と、GraphQL `closingIssuesReferences`全pageを再取得する。親Issueおよび対象childのrepository、node ID、number、state、`updatedAt`、raw title/body hashも取得し、immutable execution contextと一致するcanonical snapshotへ固定する。取得やpaginationが不完全、PRが別base/head、対象Issue identityが変化、または人間の同時編集とのreconcileが一意でなければwriteしない。
+1. integration PRのcurrent raw title/body、`updatedAt`、base/head SHA、state、draft状態と、GraphQL `closingIssuesReferences`全pageを再取得する。親Issueと、feature-merge完了として除外するchildを含む全childについてrepository、node ID、number、state、`updatedAt`、raw title/body hash、current `child_completion_point`、close mechanismを取得する。全childのcurrent contractからintegration完了対象集合を再計算し、全child集合・各identity・各完了contractがimmutable execution contextと一致するcanonical snapshotへ固定する。1件でも変更、欠落、追加、曖昧なcontractがあれば対象集合を古いcontextから推測せず、write前に停止する。取得やpaginationが不完全、PRが別base/head、または人間の同時編集とのreconcileが一意でない場合もwriteしない。
 2. current default branchのexact SHAから標準`.github/PULL_REQUEST_TEMPLATE.md`を再取得する。既存bodyのtemplate構造、人間の追記、`Closes #<親Issue番号>`を保持し、`完了する Issue`欄へ対象childごとにexactly 1件の`Closes #<child>`を追加する。feature branchへの実装PR mergeで完了するchildや、許可していないIssueのclosing keywordを追加しない。標準templateを取得・解釈できない、必要欄がない、または既存記述と競合する場合は更新せず停止する。
-3. write直前にPRと全対象Issueのsnapshotを再取得する。差分があれば古いbodyを送信せず、最新stateからreconcileをやり直す。body更新の結果がtimeout・切断で曖昧ならblind retryせず、raw body、`updatedAt`、base/headとclosing relationshipを再取得して受理を一意に照合する。
-4. 更新後のraw bodyと`closingIssuesReferences`全pageを再取得し、親Issueとintegration完了対象childがexactly 1件ずつ存在し、feature-merge完了childや未知のIssueが存在しないこと、default branchへのmergeでGitHubが自動closeするrelationshipになったことを検証する。不一致ならnative graphや後続reviewへ進まず停止する。
+3. write直前にPR、親Issue、全childのsnapshotを再取得し、全childのcurrent contractから対象集合をもう一度再計算する。identity、完了contract、対象集合のいずれかに差分があれば古いbodyを送信せず停止する。body更新の結果がtimeout・切断で曖昧ならblind retryせず、raw body、`updatedAt`、base/headとclosing relationshipを再取得して受理を一意に照合する。
+4. 更新後のraw bodyと`closingIssuesReferences`全pageに加えて全childのidentity・current `child_completion_point`・close mechanismを再取得し、snapshotと対象集合が不変であること、親Issueとintegration完了対象childがexactly 1件ずつ存在し、feature-merge完了childや未知のIssueが存在しないこと、default branchへのmergeでGitHubが自動closeするrelationshipになったことを検証する。不一致ならnative graphや後続reviewへ進まず停止する。
 
 ### 6. native graphを設定する
 

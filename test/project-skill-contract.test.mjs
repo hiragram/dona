@@ -259,10 +259,13 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /branch名だけ.*古いIssue内容.*relationshipの有無だけでIssue完了を判断しない/,
     /既存Pull Request.*`closingIssuesReferences`.*全page取得.*canonical list.*SHA-256 hash/,
     /keyword由来.*Development欄.*manual link.*許可済みclosing target.*current Issue identity.*merge-target contract.*一致.*検証/,
-    /default branch向けkeyword target.*relationship欠落.*許可していないrelationship.*non-default base.*relationship.*不一致.*停止/,
+    /default branch向け.*current raw本文.*keyword target.*pending additionに該当しないrelationship欠落.*許可していないrelationship.*non-default base.*relationship.*不一致.*停止/,
     /raw本文.*automatic closing reference.*許可できないrelationship.*CAS reconcile.*`body-derived pending removal`.*本文writeを許可/,
+    /current raw本文にはない.*default branch向けkeyword.*生成本文へ新しく追加.*`body-derived pending addition`.*planned title\/body hash.*canonical list.*write前snapshot.*本文writeを許可/,
+    /current raw本文に既にkeyword.*手動link由来.*許可・identity・contractが不完全.*pending additionへ分類しない/,
     /manual link由来.*title由来.*由来不明.*自動unlinkしない/,
-    /本文更新後.*`closingIssuesReferences`全page.*pending removal.*消えなければ.*停止/,
+    /本文更新後.*`closingIssuesReferences`全page.*pending removalが消え.*pending additionがexactly 1件ずつ現れ.*canonical relationship集合.*完全一致/,
+    /additionの欠落・重複.*自動retry・unlinkせず.*reviewを行わず停止/,
     /許可するclosing target.*`updatedAt`.*raw title\/body.*canonical issue scope list.*SHA-256 hash/,
     /新規Pull Request.*生成したtitle／本文.*merge-target contract hash.*closing targetのIssue scope canonical hash.*local `HEAD`.*upstream.*remote head ref\/SHA.*selected base ref\/SHA.*repository default branch ref.*template取得元のbase SHA.*template blob\/hash.*snapshot/,
     /作成write直前.*current値.*同じhead\/base.*open\/closed\/merged Pull Request.*再取得/,
@@ -296,7 +299,7 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /各closing target.*current selected baseへのmerge.*Issue全体を完了.*closing relationshipと期待状態.*一致/,
     /non-default base.*relationshipを作らない.*`manual_close_after_verified_merge`.*`close_owner` identity.*target Issue.*permission evidence.*実行者.*事前照合.*事後再取得.*contractとPR本文に明記/,
     /cross-repository target.*target repository側の権限を確認済み/,
-    /本文由来のpending removal.*残っていない/,
+    /本文由来のpending addition\/removal.*残っていない/,
   ]);
 });
 
