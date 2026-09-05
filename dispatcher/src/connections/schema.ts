@@ -62,7 +62,7 @@ export function connectionDispatchPredicateFor(eventAlias: string): string {
   SELECT 1 FROM connection_event_bindings b JOIN connections c ON c.id=b.connection_id
   LEFT JOIN connection_subscriptions s ON s.connection_id=b.connection_id AND s.resource=b.resource AND s.generation=b.generation
   WHERE b.event_id=${eventAlias}.event_id AND (c.state!='active' OR c.revision!=b.revision OR s.revision!=b.revision
-    OR s.verified_at IS NULL OR s.state NOT IN ('active','expiring','stop_candidate') OR s.expires_at<=?)
+    OR c.last_clock>? OR s.verified_at IS NULL OR s.state NOT IN ('active','expiring','stop_candidate') OR s.expires_at<=?)
 )`;
 }
 

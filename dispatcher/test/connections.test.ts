@@ -145,7 +145,7 @@ test("capability matrix: UI/manualはcreate不可、non-renewableは期限更新
 });
 
 test("allowlistとcredential revisionを同時bindingし変更時はfail closed", async (t) => {
-  const {db,lifecycle} = fixture(t); await lifecycle.createOrRenew("pilot","folder1");
+  const {db,lifecycle,clock} = fixture(t); await lifecycle.createOrRenew("pilot","folder1");
   for (const b of [{...binding(),account:"other"},{...binding(),credentialRevision:2},{...binding(),resource:"other"},{...binding(),revision:2}])
     assert.throws(()=>db.enqueueExternal(event(),b));
   assert.throws(()=>db.enqueueExternal({...event(),type:"deleted"},binding()),/not_authorized/);
@@ -159,7 +159,7 @@ test("allowlistとcredential revisionを同時bindingし変更時はfail closed"
   assert.throws(()=>db.beginDispatch(accepted.row.event_id,"fixture"),/no longer dispatchable/);
   const fresh = db.enqueueExternal(event("fresh"),{...binding(),revision:2,credentialRevision:2});
   assert.equal(fresh.outcome,"created");
-  assert.equal(db.nextAvailable()!.event_id,fresh.row.event_id);
+  assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,fresh.row.event_id);
   assert.equal(db.get(accepted.row.event_id)!.status,"queued");
 });
 
@@ -196,12 +196,15 @@ test("batch中のduplicate conflictは前のeventもrollbackする", async (t) =
 
 test("expiry-windowの境界、clock rewind、期限切れdeliveryを拒否", async (t) => {
   const {db,clock,lifecycle}=fixture(t); await lifecycle.createOrRenew("pilot","folder1");
+  const queued=db.enqueueExternal(event(),binding());
   const initial=clock.value; clock.value+=8999;
   assert.throws(()=>db.connections.claim("pilot",1,"folder1",10),/invalid_transition/);
   clock.value++; assert.equal(db.connections.health().expiring,1);
   const operation=db.connections.claim("pilot",1,"folder1",10); assert.equal(operation.generation,2);
   clock.value=initial-1;
   assert.equal(db.connections.health().ready,false);assert.equal(db.connections.health().degraded,1);
+  assert.equal(db.nextAvailable(new Date(clock.now())),undefined);
+  assert.throws(()=>db.beginDispatch(queued.row.event_id,"fixture",new Date(clock.now())),/no longer dispatchable/);
   assert.throws(()=>db.enqueueExternal(event(),binding()),/clock_skew/);
   clock.value=initial+10000; assert.throws(()=>db.enqueueExternal(event(),binding()),/not_authorized/);
 });
@@ -431,6 +434,16 @@ test("不正observationもquarantineしhealthに反映する",async(t)=>{
   assert.equal(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
   assert.equal(db.connections.health().ready,false);assert.equal(db.connections.health().degraded,1);
   assert.throws(()=>db.enqueueExternal(event(),binding()),/not_authorized/);
+});
+
+test("quarantine済み最新generationは明示create認可で置換できる",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  driver.inspect=async()=>{throw new Error("provider-resource-gone");};
+  await assert.rejects(lifecycle.verify("pilot","folder1",1),/not_authorized/);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.error,"verification_failed");
+  driver.inspect=async(_c,s)=>({providerId:s.providerId!,expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false});
+  const replacement=await lifecycle.createOrRenew("pilot","folder1");
+  assert.equal(replacement.generation,2);assert.equal(db.connections.subscriptions("pilot")[1]!.state,"active");
 });
 
 test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{

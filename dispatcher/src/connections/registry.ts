@@ -154,8 +154,12 @@ export class ConnectionRegistry {
       let next: number;
       if (kind === "create") {
         if (previous) {
-          if (previous.revision !== revision || c.capability.renewal !== "replace" || ! ["active","expiring"].includes(previous.state) ||
-              previous.expiresAt === null || now < previous.expiresAt - previous.renewalWindowMs) throw new ConnectionError("invalid_transition");
+          const quarantined = previous.state === "verification_pending" && previous.verifiedAt === null && previous.error === "verification_failed";
+          const renewable = ["active","expiring"].includes(previous.state) && previous.expiresAt !== null &&
+            now >= previous.expiresAt - previous.renewalWindowMs;
+          if (previous.revision !== revision || c.capability.renewal !== "replace" || (!quarantined && !renewable)) {
+            throw new ConnectionError("invalid_transition");
+          }
         }
         next = (previous?.generation ?? 0) + 1;
         this.db.prepare(`INSERT INTO connection_subscriptions(connection_id,resource,generation,revision,state,created_at,renewal_window_ms)

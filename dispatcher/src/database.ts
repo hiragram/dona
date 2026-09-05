@@ -798,7 +798,7 @@ export class DispatcherDatabase {
       AND NOT EXISTS (SELECT 1 FROM queue_events older JOIN events prior ON prior.event_id=older.event_id
         WHERE older.lane=q.lane AND prior.sequence<events.sequence AND prior.status!='completed'
           AND ${connectionDispatchPredicateFor("prior")})
-      ORDER BY l.last_selected,events.sequence`).all(at.toISOString(), at.getTime(), at.getTime()) as (EventRow & {class:string})[];
+      ORDER BY l.last_selected,events.sequence`).all(at.toISOString(), at.getTime(), at.getTime(), at.getTime(), at.getTime()) as (EventRow & {class:string})[];
     for (let offset=0;offset<slots.length;offset++) {
       const candidate = candidates.find(row=>row.class===slots[(step+offset)%slots.length]);
       if (candidate) return candidate;
@@ -863,7 +863,7 @@ export class DispatcherDatabase {
           result_path = ?, last_error_code = NULL, last_error_message = NULL, updated_at = ?
         WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
-      .run(timestamp, resultPath, timestamp, eventId, at.getTime()).changes;
+      .run(timestamp, resultPath, timestamp, eventId, at.getTime(), at.getTime()).changes;
     if (changed !== 1) throw new EventNotDispatchableError(eventId);
     const slots = Object.entries(this.queuePolicy.weights).flatMap(([c,w])=>Array<string>(w).fill(c));
     const lane = this.db.prepare("SELECT l.lane,l.class FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=?").get(eventId) as {lane:string;class:string};
