@@ -140,11 +140,12 @@ export class JobSupervisor {
 
   async stop(): Promise<void> {
     this.stopping = true;
-    this.progress?.stop();
+    const progressStop=this.progress?.stop();
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
     await this.progressLoopPromise;
+    await progressStop;
     await Promise.allSettled([...this.controls.values()]);
     await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
     this.running = false;

@@ -90,6 +90,7 @@ export class JobProgressStore {
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
   retry(jobId: string, error: string, at = new Date(), retryAfterSeconds = 5): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+Math.max(5,retryAfterSeconds)*1_000).toISOString(),error.slice(0,500),jobId); }
   defer(jobId:string,availableAt:Date):void { this.db.prepare("UPDATE job_progress SET available_at=? WHERE job_id=? AND status='pending' AND available_at<?").run(availableAt.toISOString(),jobId,availableAt.toISOString()); }
+  deferJobs(jobIds:string[],availableAt:Date):void {if(jobIds.length===0)return;const placeholders=jobIds.map(()=>"?").join(",");this.db.prepare(`UPDATE job_progress SET available_at=? WHERE job_id IN (${placeholders}) AND status='pending' AND available_at<?`).run(availableAt.toISOString(),...jobIds,availableAt.toISOString());}
   deferWorkspace(workspaceId:string,availableAt:Date):void { this.db.prepare(`INSERT INTO job_progress_throttles(workspace_id,available_at) VALUES(?,?) ON CONFLICT(workspace_id) DO UPDATE SET available_at=CASE WHEN available_at<excluded.available_at THEN excluded.available_at ELSE available_at END`).run(workspaceId,availableAt.toISOString()); }
   workspaceAvailableAt(workspaceId:string):Date|undefined { const row=this.db.prepare("SELECT available_at FROM job_progress_throttles WHERE workspace_id=?").get(workspaceId) as {available_at:string}|undefined; return row?new Date(row.available_at):undefined; }
   terminal(jobId: string): void {
@@ -164,7 +165,7 @@ export class JobProgressCoordinator {
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
     const workspaceAvailableAt=this.store.workspaceAvailableAt(job.workspace_id);
-    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.defer(progress.job_id,workspaceAvailableAt);return;}
+    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.deferJobs(this.jobs.listJobs(undefined,1_000_000).filter((item)=>item.workspace_id===job.workspace_id).map((item)=>item.job_id),workspaceAvailableAt);return;}
     const group = this.jobs.getJobGroup(job.source_event_id);
     if (group?.notification_mode === "grouped" && group.attention_event_id !== null) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);
@@ -206,19 +207,19 @@ export class JobProgressCoordinator {
 
   reconcileTerminal(job:JobRow): Promise<void> {
     const existing=this.terminalReconciliations.get(job.source_event_id); if(existing)return existing;
-    const operation=(async()=>{await this.drainDeliveries();for(const item of this.jobs.listEventJobs(job.source_event_id)){const row=this.jobs.getJob(item.job_id);if(row&&terminalStatuses.has(row.status)&&!this.jobNotificationReady(row.job_id))await this.ingest(row);}})();
+    const operation=(async()=>{const items=this.jobs.listEventJobs(job.source_event_id);await this.drainDeliveries(items.map((item)=>item.job_id));for(const item of items){const row=this.jobs.getJob(item.job_id);if(row&&terminalStatuses.has(row.status)&&!this.jobNotificationReady(row.job_id))await this.ingest(row);}})();
     this.terminalReconciliations.set(job.source_event_id,operation);
     void operation.finally(()=>this.terminalReconciliations.delete(job.source_event_id)).catch(()=>undefined);
     return operation;
   }
 
   private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return row!==undefined&&row.terminal_checked===1&&!this.deliveryOperations.has(jobId); }
-  async drainDeliveries():Promise<void> { await Promise.allSettled([...this.deliveryOperations.values()]); }
-  stop():void {this.drainAbort.abort();}
+  async drainDeliveries(jobIds?:string[]):Promise<void> { const operations=jobIds?jobIds.flatMap((jobId)=>{const operation=this.deliveryOperations.get(jobId);return operation?[operation]:[]}):[...this.deliveryOperations.values()];await Promise.allSettled(operations); }
+  async stop():Promise<void> {this.drainAbort.abort();await Promise.allSettled([...this.terminalReconciliations.values()]);await this.drainDeliveries();}
 
   private async drainAdapter():Promise<void> {
     const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");
-    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200||[403,404,503].includes(response.statusCode??0)?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});const abort=()=>request.destroy(Object.assign(new Error("progress drain aborted"),{name:"AbortError"}));this.drainAbort.signal.addEventListener("abort",abort,{once:true});request.once("close",()=>this.drainAbort.signal.removeEventListener("abort",abort));request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED","ECONNRESET"].includes(error.code??"")?resolve():reject(error));request.end();});
+    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200||[403,404,503].includes(response.statusCode??0)?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});const abort=()=>request.destroy(Object.assign(new Error("progress drain aborted"),{name:"AbortError"}));this.drainAbort.signal.addEventListener("abort",abort,{once:true});request.once("close",()=>this.drainAbort.signal.removeEventListener("abort",abort));request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED"].includes(error.code??"")?resolve():reject(error));request.end();});
   }
 
   private async drainAdapterUntilSettled(jobId:string):Promise<boolean> {
