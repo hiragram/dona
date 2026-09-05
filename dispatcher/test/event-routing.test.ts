@@ -232,11 +232,30 @@ test("completion commit/restart and notification acceptance unknown preserve job
   recovered.recoverStaleDispatching();
   assert.equal(recovered.get(materialized.row.event_id)!.status, "needs_review");
   assert.equal(recovered.getJobCompletion(job.job_id)!.notification_state, "needs_review");
+  recovered.manualRetry(materialized.row.event_id, true);
+  assert.equal(recovered.getJobCompletion(job.job_id)!.notification_state, "pending");
+  assert.equal(recovered.getJobCompletion(job.job_id)!.notification_result_json, null);
   assert.equal(recovered.getJob(job.job_id)!.result_json, jobResult);
-  assert.deepEqual(recovered.listJobsNeedingNotification(), []);
   assert.equal(recovered.enqueueJobNotification(job.job_id)!.row.event_id, materialized.row.event_id);
   assert.equal(recovered.list().filter((row) => row.source === "dona_job").length, 1);
   recovered.close();
+});
+
+test("routing migration upgrades the legacy notification projection trigger", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  new DispatcherDatabase(config.databasePath).close();
+  const legacy = new Database(config.databasePath);
+  legacy.exec(`DROP TRIGGER completion_notification_projection;
+    CREATE TRIGGER completion_notification_projection AFTER UPDATE OF status, result_json ON events
+    BEGIN UPDATE job_completions SET notification_state = CASE WHEN NEW.status = 'completed' THEN 'accepted'
+      WHEN NEW.status IN ('needs_review', 'dead_letter', 'blocked') THEN 'needs_review' ELSE notification_state END,
+      notification_result_json = NEW.result_json WHERE notification_event_id = NEW.event_id; END;`);
+  legacy.close();
+  new DispatcherDatabase(config.databasePath).close();
+  const upgraded = new Database(config.databasePath);
+  const sql = (upgraded.prepare("SELECT sql FROM sqlite_master WHERE name = 'completion_notification_projection'").get() as { sql: string }).sql;
+  assert.match(sql, /retryable_failed/); assert.match(sql, /THEN 'pending'/);
+  upgraded.close();
 });
 
 test("relinking an existing completed notification atomically restores its projection", async () => {

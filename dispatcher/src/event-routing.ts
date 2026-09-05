@@ -42,6 +42,18 @@ export function legacySlackBinding(row: Pick<EventRow, "source" | "reply_target_
 
 /** jobs/group schema を変更しない独立した additive migration。v2/v3 の両方へ適用可能。 */
 export function migrateEventRouting(db: Database.Database, hook: () => void = () => {}): void {
+  const projectionTrigger = () => `CREATE TRIGGER IF NOT EXISTS completion_notification_projection AFTER UPDATE OF status, result_json ON events
+    BEGIN UPDATE job_completions SET
+      notification_state = CASE WHEN NEW.status = 'completed' THEN 'accepted'
+        WHEN NEW.status IN ('needs_review', 'dead_letter', 'blocked') THEN 'needs_review'
+        WHEN NEW.status IN ('queued', 'retryable_failed', 'dispatching', 'waiting_agent') THEN 'pending'
+        ELSE notification_state END,
+      notification_result_json = NEW.result_json
+    WHERE notification_event_id = NEW.event_id; END`;
+  const trigger = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'completion_notification_projection' AND type = 'trigger'").get() as { sql: string } | undefined;
+  if (trigger && !trigger.sql.includes("retryable_failed")) db.transaction(() => {
+    db.exec(`DROP TRIGGER completion_notification_projection; ${projectionTrigger()}`);
+  }).immediate();
   const migrated = () => {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'event_routing_migrations' AND type = 'table'").get()) return false;
     const row = db.prepare("SELECT version FROM event_routing_migrations").get() as { version: number } | undefined;
@@ -80,12 +92,7 @@ export function migrateEventRouting(db: Database.Database, hook: () => void = ()
       CREATE UNIQUE INDEX IF NOT EXISTS job_completion_notification_idx
         ON job_completions(notification_event_id) WHERE notification_event_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS job_binding_owner_idx ON job_bindings(owner_json);
-      CREATE TRIGGER IF NOT EXISTS completion_notification_projection AFTER UPDATE OF status, result_json ON events
-        BEGIN UPDATE job_completions SET
-          notification_state = CASE WHEN NEW.status = 'completed' THEN 'accepted'
-            WHEN NEW.status IN ('needs_review', 'dead_letter', 'blocked') THEN 'needs_review' ELSE notification_state END,
-          notification_result_json = NEW.result_json
-        WHERE notification_event_id = NEW.event_id; END;
+      ${projectionTrigger()};
       CREATE TRIGGER IF NOT EXISTS event_binding_immutable BEFORE UPDATE ON event_bindings
         BEGIN SELECT RAISE(ABORT, 'event_binding_immutable'); END;
       CREATE TRIGGER IF NOT EXISTS completion_projection_immutable
