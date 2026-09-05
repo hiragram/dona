@@ -205,3 +205,5 @@ create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only re
 委任後はgroup terminalまでprocessingを保ち、個別progressでは投稿・active遷移をしません。attentionはsuspended、all_terminalは結果集約後activeです。通知のstatus取得にも現在の通知event_idを使います。group DB lifecycleはDispatcherの既存実装が所有します。
 
 MCPのcreate/steer/cancel応答とthread候補はDB rowのallowlist projectionで、objective・workspace/result path・runtime identityを除外します。thread候補は最大100件で、`truncated: true`なら省略の可能性があるため最新1件を選びません。詳細Resultは明示status取得時だけ返します。HTTPのsource_event_id省略status取得は既存ローカルCLI互換用であり、MCPはevent IDを必須にします。
+
+詳細statusの`last_error_message`は最大2,000文字に制限し、既知のobjective/path/runtime値と典型的なcredential・URL・絶対pathを秘匿して返します。`blocked`/`needs_review`でResultがなくても理由を確認できます。自由文の完全な秘密検出を保証するものではなく、未信頼の説明データとして扱い、外部投稿前にも確認します。候補・create/control応答には含めません。

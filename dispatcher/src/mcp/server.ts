@@ -54,6 +54,21 @@ function success(data: Record<string, unknown>) {
   };
 }
 
+// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
+function projectJobError(row: Record<string, unknown>): string | null {
+  if (typeof row.last_error_message !== "string") return null;
+  let message = row.last_error_message;
+  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
+    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const value of privateValues) message = message.split(value).join("[redacted]");
+  return message
+    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
+    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
+    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
+    .slice(0, 2_000);
+}
+
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
 function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
   const project = (value: unknown) => {
@@ -61,7 +76,10 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
     const row = value as Record<string, unknown>;
     const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id"];
     if (includeResult) keys.push("result_json");
-    return Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]]));
+    return {
+      ...Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]])),
+      ...(includeResult ? { last_error_message: projectJobError(row) } : {}),
+    };
   };
   return {
     schema_version: 1,

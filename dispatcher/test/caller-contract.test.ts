@@ -180,3 +180,24 @@ test("MCP bounds thread projection and signals possible omitted candidates", asy
     assert.doesNotMatch(JSON.stringify(result.data), /private|secret/);
   } finally { await f.close(); }
 });
+
+for (const status of ["blocked", "needs_review"] as const) {
+  test(`MCP status retains bounded ${status} reason without a Result`, async () => {
+    const f = await fixture();
+    try {
+      const created = await f.call("delegate_job", { source_event_id: f.source, job_key: "error.audit", objective: "private objective", workspace_kind: "scratch" });
+      const id = created.data.job.job_id;
+      const row = f.database.getJob(id)!;
+      const reason = `Human approval is required; acceptance unknown. ${row.objective} ${row.workspace_path} ${row.result_path} ${row.agent_name} token=hidden-value https://private.invalid/download /private/key ${"x".repeat(3_000)}`;
+      if (status === "blocked") f.database.markJobBlocked(id, reason, ["queued"]);
+      else f.database.markJobNeedsReview(id, "steer_acceptance_unknown", reason);
+      const result = (await f.call("get_job_status", { source_event_id: f.source, job_id: id })).data.job;
+      assert.equal(result.result_json, null);
+      assert.equal(result.status, status);
+      assert.match(result.last_error_message, /Human approval is required; acceptance unknown/);
+      assert.ok(result.last_error_message.length <= 2_000);
+      assert.doesNotMatch(result.last_error_message, /private|hidden-value|https:|job_/);
+      assert.equal((await f.call("list_thread_jobs", { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" })).data.jobs[0].last_error_message, undefined);
+    } finally { await f.close(); }
+  });
+}
