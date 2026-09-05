@@ -623,3 +623,30 @@ describe("external ingress contract", () => {
     );
   });
 });
+
+test("永続connection bindingを認証結果からcommitへ渡しdisable/revision不一致ではACKしない", async () => {
+  const {root, config} = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const connection = {id:"connection-a",provider:"fake",account:"tenant1",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"resource-1",events:["fake.changed"]}],capability:{kind:"manual" as const,cursor:false}};
+  database.connections.register(connection);
+  database.connections.attachManual(connection.id,1,"resource-1","fixture-subscription",null);
+  database.connections.observe(connection.id,1,"resource-1",1,{providerId:"fixture-subscription",expiresAt:null,verified:true,cutoverConfirmed:false});
+  let revision=1; let ackCount=0;
+  const base=registration({onAcknowledge:()=>{ackCount++;}});
+  const registry=new ExternalIngressRegistry([{...base,async authenticate(raw){
+    const verified=await base.authenticate(raw);
+    return {...verified,connection:{account:"tenant1",revision,credentialRevision:1,resource:"resource-1",generation:1}};
+  }}]);
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
+  await api.start();
+  try {
+    const body=fakeBody();
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,202);
+    revision=2;
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,403);
+    revision=1;database.connections.disable(connection.id,1);
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,403);
+    assert.equal(ackCount,1);assert.equal(database.list().length,1);
+  } finally {await api.stop();database.close();}
+});

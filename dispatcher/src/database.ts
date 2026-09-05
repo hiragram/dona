@@ -20,6 +20,10 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { stableStringify } from "./validation.js";
 
+import { ConnectionRegistry, type CursorBatch } from "./connections/registry.js";
+import { migrateConnections, connectionDispatchPredicate } from "./connections/schema.js";
+import { ConnectionError, type Clock, type DeliveryBinding } from "./connections/domain.js";
+
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
@@ -51,7 +55,9 @@ function storedSlackReceivedAtFallback(row: EventRow): boolean {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
-  constructor(databasePath: string) {
+  readonly connections: ConnectionRegistry;
+
+  constructor(databasePath: string, clock?: Clock) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -60,6 +66,8 @@ export class DispatcherDatabase {
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    migrateConnections(this.db);
+    this.connections = new ConnectionRegistry(this.db, clock);
   }
 
   private migrate(): void {
@@ -139,6 +147,18 @@ export class DispatcherDatabase {
   assertReadableWritable(): void {
     this.db.prepare("SELECT 1").get();
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
+  }
+
+  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding): EnqueueResult {
+    if (!binding) {
+      if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
+      return this.enqueue(envelope);
+    }
+    return this.connections.delivery(binding, envelope, () => this.enqueue(envelope));
+  }
+
+  commitConnectionBatch(batch: CursorBatch): EnqueueResult[] {
+    return this.connections.commitBatch(batch, (envelope) => this.enqueue(envelope));
   }
 
   enqueue(envelope: EventEnvelope, at = new Date()): EnqueueResult {
@@ -606,7 +626,7 @@ export class DispatcherDatabase {
     const head = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
+        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update' AND ${connectionDispatchPredicate}
         ORDER BY sequence LIMIT 1
       `)
       .get() as EventRow | undefined;
@@ -666,7 +686,7 @@ export class DispatcherDatabase {
           status = 'dispatching', attempt_count = attempt_count + 1,
           dispatch_started_at = ?, prompt_accepted_at = NULL,
           result_path = ?, last_error_code = NULL, last_error_message = NULL, updated_at = ?
-        WHERE event_id = ? AND status IN ('queued', 'retryable_failed')
+        WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
       .run(timestamp, resultPath, timestamp, eventId).changes;
     if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);

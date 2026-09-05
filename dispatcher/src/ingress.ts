@@ -4,6 +4,8 @@ import { performance } from "node:perf_hooks";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
+import type { DeliveryBinding } from "./connections/domain.js";
+
 const externalSourcePattern = /^[a-z][a-z0-9._-]{0,63}$/;
 const connectionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
@@ -60,6 +62,7 @@ export interface RawIngressRequest {
 export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
+  readonly connection?: Omit<DeliveryBinding, "connectionId">;
 }
 
 export interface NormalizedExternalEvent {
@@ -324,7 +327,7 @@ export class ExternalIngressProcessor {
     source: ExternalEventSource,
     registration: ExternalEventSourceRegistration,
     request: RawIngressRequest,
-    persist: (envelope: EventEnvelope) => EnqueueResult,
+    persist: (envelope: EventEnvelope, binding?: DeliveryBinding) => EnqueueResult,
   ): Promise<ExternalIngressResult> {
     const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
@@ -364,7 +367,7 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
-    const result = persist(envelope);
+    const result = persist(envelope, verified.connection ? { ...verified.connection, connectionId: verified.connectionId } : undefined);
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

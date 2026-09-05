@@ -181,3 +181,5 @@ npm run typecheck
 npm run build
 npm audit --audit-level=high
 ```
+
+外部connection/subscription/cursorのSQLite registry、typed driver、CLI、renewal復旧とlive smokeの境界は[運用手順](../docs/operations/connection-lifecycle.md)を参照してください。
