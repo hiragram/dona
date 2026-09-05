@@ -947,6 +947,8 @@ test("開始済みworkは失効・pause・再承認後も完了し通知だけ�
       null, mode === "pause" ? "https://hooks.slack.com/services/T/B/secret" : "結果");
     assert.equal(repo.getRun(run.run_id)?.status, "completed");
     assert.ok((repo.auditHistory(mode) as { operation: string }[]).some(x => x.operation.startsWith("work_result_suppressed_")));
+    if (mode === "expiry") assert.ok((repo.auditHistory(mode) as { operation: string }[])
+      .some(x => x.operation === "work_result_suppressed_authorization_expired"));
     if (mode === "pause") assert.equal((repo.auditHistory(mode) as { operation: string; created_at: string }[])
       .find(x => x.operation === "work_result_suppressed_cancelled")?.created_at, "2026-09-05T00:01:30Z");
     if (mode === "expiry") repo.update(mode, 1, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 2 }, later, actor, expiry);

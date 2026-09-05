@@ -356,9 +356,10 @@ export class SchedulerRepository {
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
       if (next === "started" && jobId === null) throw new Error("job_reference_required");
-      const notificationReason = current.state !== "active" ? "cancelled"
+      const notificationReason = runSnapshot.expires_at <= transitionAt ? "authorization_expired"
+        : current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
-        : runSnapshot.expires_at <= transitionAt ? "authorization_expired" : null;
+        : null;
       const workCompletion = next === "completed" && runSnapshot.action === "work.read_only";
       const hasTarget = (JSON.parse(runSnapshot.target_json) as Target).kind !== "none";
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
