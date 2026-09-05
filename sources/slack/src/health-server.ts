@@ -64,6 +64,7 @@ export interface AdapterHealthState {
 export class SlackHealthServer {
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
+  private readonly progressOperations = new Set<Promise<unknown>>();
 
   constructor(
     private readonly socketPath: string,
@@ -185,6 +186,8 @@ export class SlackHealthServer {
           return;
         }
         const operation = this.jobProgress.deliver(input);
+        this.progressOperations.add(operation);
+        void operation.finally(()=>this.progressOperations.delete(operation)).catch(()=>undefined);
         const result = await (this.adapter.trackExternal?.(operation) ?? operation);
         send(response, 200, { schema_version: 1, ...result });
       } catch (error) {
@@ -201,6 +204,12 @@ export class SlackHealthServer {
           error: { code: error instanceof SlackApiError ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }
       return;
+    }
+    if (method === "POST" && pathname === "/v1/internal/job-progress/drain") {
+      if (!this.jobProgress || !this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable"}}); return; }
+      if (!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden"}}); return; }
+      await Promise.allSettled([...this.progressOperations]);
+      send(response,200,{schema_version:1,drained:true}); return;
     }
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });

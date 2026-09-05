@@ -67,7 +67,7 @@ export class JobProgressStore {
     const existing = this.get(progress.job_id);
     if (existing && progress.sequence <= existing.sequence) return false;
     if (existing?.phase === progress.phase) {
-      if (existing.status !== "delivering" && existing.status !== "unknown") this.db.prepare("UPDATE job_progress SET sequence=?,safe_summary=?,updated_at=? WHERE job_id=?").run(progress.sequence,progress.safe_summary,progress.updated_at,progress.job_id);
+      if (existing.status !== "delivering" && existing.status !== "unknown") this.db.prepare("UPDATE job_progress SET sequence=?,safe_summary=?,updated_at=? WHERE job_id=?").run(progress.sequence,phaseLabels[progress.phase],progress.updated_at,progress.job_id);
       return false;
     }
     const timestamp = at.toISOString();
@@ -78,7 +78,7 @@ export class JobProgressStore {
       VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,phase=excluded.phase,
       safe_summary=excluded.safe_summary,updated_at=excluded.updated_at,status='pending',available_at=CASE WHEN job_progress.status='pending' AND job_progress.available_at>excluded.available_at THEN job_progress.available_at ELSE excluded.available_at END,
       delivered_at=NULL,last_error=NULL,terminal_checked=0 WHERE excluded.sequence > job_progress.sequence AND job_progress.status NOT IN ('unknown','delivering')`)
-      .run(progress.job_id, progress.sequence, progress.phase, progress.safe_summary, progress.updated_at, availableAt);
+      .run(progress.job_id, progress.sequence, progress.phase, phaseLabels[progress.phase], progress.updated_at, availableAt);
     return this.get(progress.job_id)?.sequence === progress.sequence;
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
@@ -96,7 +96,7 @@ export class JobProgressStore {
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
     this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
   }
-  markTerminalChecked(jobId: string): void { this.db.prepare("UPDATE job_progress SET terminal_checked=1 WHERE job_id=?").run(jobId); }
+  markTerminalChecked(jobId: string): void { const timestamp=new Date().toISOString(); this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at,terminal_checked) VALUES(?,0,'preparing','準備中',?,'delivered',?,1) ON CONFLICT(job_id) DO UPDATE SET terminal_checked=1`).run(jobId,timestamp,timestamp); }
   requeueLatestAndMarkTerminal(jobId: string, jobIds: string[], at = new Date()): void {
     this.db.transaction(() => {
       if (jobIds.length > 0) {
@@ -151,6 +151,7 @@ export class JobProgressCoordinator {
     }
   }
   async recover(): Promise<void> {
+    await this.drainAdapter();
     this.store.recoverDeliveries();
     for (const progress of this.store.recoverable()) {
       const job = this.jobs.getJob(progress.job_id);
@@ -210,8 +211,13 @@ export class JobProgressCoordinator {
     return operation;
   }
 
-  private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return !row||(row.terminal_checked===1&&!this.deliveryOperations.has(jobId)); }
+  private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return row!==undefined&&row.terminal_checked===1&&!this.deliveryOperations.has(jobId); }
   async drainDeliveries():Promise<void> { await Promise.allSettled([...this.deliveryOperations.values()]); }
+
+  private async drainAdapter():Promise<void> {
+    const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");
+    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});request.setTimeout(Math.max(this.config.jobCommandTimeoutMs,30_000),()=>request.destroy(new Error("progress drain timeout")));request.once("error",reject);request.end();});
+  }
 
   resolveDelivery(progressId: string, deliveryToken: string): { progress_id:string; workspace_id:string; channel_id:string; thread_ts:string; status:string } | undefined {
     const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId);

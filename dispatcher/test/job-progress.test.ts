@@ -140,7 +140,7 @@ test("store is monotonic, coalesces pending updates, and fences unknown delivery
     assert.equal(store.ingest(valid), true);
     assert.equal(store.ingest({ ...valid, safe_summary: "old" }), false);
     assert.equal(store.ingest({ ...valid, sequence: 2, phase: "reviewing", safe_summary: "PRをレビュー中" }), true);
-    assert.equal(store.get("job_abc")?.safe_summary, "PRをレビュー中");
+    assert.equal(store.get("job_abc")?.safe_summary, "レビュー中");
     assert.equal(store.pending()?.sequence, 2);
     store.begin("job_abc");
     store.unknown("job_abc", "acceptance unknown");

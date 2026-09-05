@@ -359,4 +359,15 @@ describe("SlackHealthServer", () => {
       assert.deepEqual(response.body.error, { code:"progress_not_sent" });
     } finally { await server.stop(); }
   });
+
+  test("progress drain waits for an accepted Adapter delivery", async () => {
+    const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-slack-progress-drain-")); roots.push(root); const socketPath=path.join(root,"run","slack.sock"); const tokenPath=path.join(root,"token"); const token="a".repeat(64); await fs.writeFile(tokenPath,token,{mode:0o600});
+    let release!:()=>void; const gate=new Promise<void>((resolve)=>{release=resolve;});
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,{async deliver(input:{progress_id:string}){await gate;return {progress_id:input.progress_id};}} as never);
+    await server.start(); try {
+      const delivery=request(socketPath,"/v1/internal/job-progress","POST",{schema_version:1,progress_id:"job_abc:1",delivery_token:"b".repeat(64)},{"x-dona-update-token":token});
+      await new Promise((resolve)=>setTimeout(resolve,10)); let drained=false; const drain=request(socketPath,"/v1/internal/job-progress/drain","POST",undefined,{"x-dona-update-token":token}).then((value)=>{drained=true;return value;});
+      await new Promise((resolve)=>setTimeout(resolve,10)); assert.equal(drained,false); release(); assert.equal((await delivery).status,200); assert.equal((await drain).status,200);
+    } finally {await server.stop();}
+  });
 });
