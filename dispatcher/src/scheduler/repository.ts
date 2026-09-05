@@ -208,7 +208,7 @@ export class SchedulerRepository {
   materialize(scheduleId: string, expectedRevision: number, scheduledFor: string, nextDue: string | null,
     now: string, actor: Actor, skip: "misfire" | "overlap" | null = null): { run: Run; duplicate: boolean } {
     utc(now); utc(scheduledFor); if (nextDue !== null) utc(nextDue);
-    return this.db.transaction(() => {
+    const result = this.db.transaction(() => {
       // An old caller may retry after the scheduler revision advanced. Identity/authorization still
       // apply, but an already persisted occurrence wins over its stale expected revision.
       const current = this.get(scheduleId);
@@ -220,7 +220,10 @@ export class SchedulerRepository {
       if (nextDue !== null && (nextDue <= scheduledFor || nextDue <= now)) throw new Error("invalid_next_due");
       if (before.state !== "active" || scheduledFor > now || scheduledFor !== before.next_due || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
       const revision = this.revision(before);
-      if (revision.expires_at <= now || revision.content === null) throw new Error("authorization_expired");
+      if (revision.expires_at <= now || revision.content === null) {
+        this.expireSchedule(before, actor, now);
+        return undefined;
+      }
       const unresolved = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
         (r.status IN ('materialized','started','needs_review') OR EXISTS
           (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
@@ -243,11 +246,13 @@ export class SchedulerRepository {
       this.completeIfDrained(scheduleId, now);
       return { run: this.getRun(runId)!, duplicate: false };
     }).immediate();
+    if (!result) throw new Error("authorization_expired");
+    return result;
   }
   setRunState(runId: string, expected: Run["status"], next: "started" | "completed" | "failed" | "cancelled",
     actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null): Run {
     utc(now); if (jobId !== null) id(jobId); if (resultContent !== null) safeContent(resultContent, 2000);
-    return this.db.transaction(() => {
+    const result = this.db.transaction(() => {
       const run = this.getRun(runId);
       if (!run || run.status !== expected) throw new Error("run_conflict");
       const current = this.get(run.schedule_id)!;
@@ -256,8 +261,20 @@ export class SchedulerRepository {
       if (!valid.includes(next)) throw new Error("invalid_transition");
       if (next === "started") {
         const revision = this.revision(current);
-        if (current.state !== "active" || current.revision !== run.revision || revision.expires_at <= now ||
-          Date.parse(now) - Date.parse(run.scheduled_for) > 900000) throw new Error("run_not_authorized");
+        const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
+          : revision.expires_at <= now ? "authorization_expired"
+          : Date.parse(now) - Date.parse(run.scheduled_for) > 900000 ? "misfire" : null;
+        if (reason !== null) {
+          if (reason === "authorization_expired") this.expireSchedule(current, actor, now);
+          const status = reason === "misfire" ? "skipped" : "cancelled";
+          this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ?").run(status, reason, now, runId);
+          this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
+            content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL
+            WHERE run_id = ? AND status IN ('pending','claimed')`).run(now, now, add(now, 604800), runId);
+          this.audit(current, this.get(current.schedule_id)!, `run_${status}`, actor, now, undefined, this.getRun(runId)!);
+          this.completeIfDrained(run.schedule_id, now);
+          return undefined;
+        }
       }
       if (jobId !== null) {
         const job = this.db.prepare("SELECT source_event_id FROM jobs WHERE job_id = ?").get(jobId) as { source_event_id: string } | undefined;
@@ -282,6 +299,8 @@ export class SchedulerRepository {
       this.completeIfDrained(run.schedule_id, now);
       return this.getRun(runId)!;
     }).immediate();
+    if (!result) throw new Error("run_not_authorized");
+    return result;
   }
   reconcile(outboxId: string, outcome: "sent" | "failed", receiptId: string, actor: Actor, now: string): Outbox {
     utc(now); id(receiptId);
@@ -301,6 +320,17 @@ export class SchedulerRepository {
       return { ...this.getOutbox(outboxId, now)!, content: null };
     }).immediate();
   }
+  private expireSchedule(before: Schedule, actor: Actor, now: string): void {
+    this.suppress(before.schedule_id, now, "cancelled");
+    this.db.prepare("UPDATE schedules SET state = 'expired', updated_at = ? WHERE schedule_id = ?").run(now, before.schedule_id);
+    const snapshot = this.revision(before);
+    this.db.prepare("UPDATE schedule_revisions SET content_delete_at = COALESCE(content_delete_at, ?) WHERE schedule_id = ? AND revision = ?")
+      .run(add(snapshot.expires_at, 604800), before.schedule_id, before.revision);
+    this.audit(before, this.get(before.schedule_id)!, "expire", actor, now);
+  }
+  private runCanSend(row: Outbox, run: Run): boolean {
+    return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : run.status === "completed";
+  }
   private completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
     if (before.state !== "active" || before.next_due !== null || before.high_watermark === null ||
@@ -318,7 +348,7 @@ export class SchedulerRepository {
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
     const snapshot = this.revision(run);
     const ageOrigin = row.kind === "slack.reminder.post" ? run.scheduled_for : run.terminal_at;
-    const reason = schedule.state !== "active" || schedule.revision !== run.revision ? "cancelled"
+    const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
       : snapshot.expires_at <= now ? "authorization_expired"
       : ageOrigin === null || Date.parse(now) - Date.parse(ageOrigin) > 900000 ? "misfire"
       : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= now) ? "cancelled"
@@ -363,8 +393,7 @@ export class SchedulerRepository {
       // Commit the terminal decision before reporting refusal to the sender.
       if (this.expireUnsent(row, now)) return undefined;
       const run = this.getRun(row.run_id)!;
-      if ((row.kind === "slack.reminder.post" && !["materialized", "started"].includes(run.status)) ||
-          (row.kind === "slack.work_result.post" && run.status !== "completed")) throw new Error("write_not_authorized");
+      if (!this.runCanSend(row, run)) throw new Error("write_not_authorized");
       if (row.attempt >= 3) throw new Error("attempt_limit");
       this.db.prepare("UPDATE connector_outbox SET status = 'request_started', request_started_at = ?, attempt = attempt + 1, updated_at = ? WHERE outbox_id = ?")
         .run(now, now, outboxId);
@@ -414,7 +443,7 @@ export class SchedulerRepository {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
         const run = this.getRun(row.run_id)!;
         const schedule = this.get(run.schedule_id)!;
-        const authorized = schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
+        const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
         const retry = outcome === "not_accepted" && row.attempt < 3 && authorized;
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
@@ -424,13 +453,13 @@ export class SchedulerRepository {
       }
       if (outcome !== "ambiguous") {
         this.expireUnsent(this.getOutbox(outboxId, now)!, now);
-        this.auditOutbox(row, `outbox_${outcome}`, now);
         const finished = this.getOutbox(outboxId, now)!;
         if (row.kind === "slack.reminder.post" && finished.terminal_at !== null) {
           this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ? AND status IN ('materialized','started')")
             .run(finished.status === "sent" ? "completed" : finished.status === "cancelled" ? "cancelled" : "failed",
               finished.status === "cancelled" ? "cancelled" : null, now, row.run_id);
         }
+        this.auditOutbox(row, `outbox_${outcome}`, now);
       }
       this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, now);
       return this.getOutbox(outboxId, now)!;

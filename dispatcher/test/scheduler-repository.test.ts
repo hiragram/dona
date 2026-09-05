@@ -359,3 +359,61 @@ test("one-shot workの結果通知と通知なし、graceでskipしたone-shot�
   repo.materialize("skipped", 1, due, null, "2026-09-05T00:16:01Z", actor);
   assert.equal(repo.get("skipped")?.state, "completed");
 });
+
+test("workの開始拒否を永続化し後続occurrenceを塞がない", () => {
+  const { repo } = setup(); repo.create("work_late", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("work_late", 1, due, later, due, actor).run;
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, "2026-09-05T00:16:01Z"), /run_not_authorized/);
+  assert.equal(repo.getRun(run.run_id)?.status, "skipped"); assert.equal(repo.getRun(run.run_id)?.reason, "misfire");
+  assert.equal(repo.materialize("work_late", 1, later, null, later, actor).run.status, "materialized");
+  repo.create("work_expired", { ...input, action: "work.read_only", expires_at: "2026-09-05T00:01:30Z" }, due, actor, now);
+  const expired = repo.materialize("work_expired", 1, due, later, due, actor).run;
+  assert.throws(() => repo.setRunState(expired.run_id, "materialized", "started", actor, "2026-09-05T00:01:30Z"), /run_not_authorized/);
+  assert.equal(repo.getRun(expired.run_id)?.status, "cancelled"); assert.equal(repo.getRun(expired.run_id)?.reason, "authorization_expired");
+  assert.equal(repo.get("work_expired")?.state, "expired");
+});
+
+test("物化前のauthorization失効はscheduleをexpiredへ移しdue scanから除く", () => {
+  const { repo, raw } = setup(); repo.create("expired", { ...input, expires_at: due }, due, actor, now);
+  raw.exec("CREATE TRIGGER fail_expire BEFORE INSERT ON schedule_audit WHEN NEW.operation = 'expire' BEGIN SELECT RAISE(ABORT, 'injected'); END");
+  assert.throws(() => repo.materialize("expired", 1, due, later, due, actor), /injected/);
+  assert.equal(repo.get("expired")?.state, "active");
+  raw.exec("DROP TRIGGER fail_expire");
+  assert.throws(() => repo.materialize("expired", 1, due, later, due, actor), /authorization_expired/);
+  assert.equal(repo.get("expired")?.state, "expired"); assert.equal(repo.due(later).length, 0);
+  assert.equal(count(raw, "schedule_runs"), 0);
+  const audit = (repo.auditHistory("expired") as { operation: string; after_json: string }[]).find(x => x.operation === "expire")!;
+  assert.equal(JSON.parse(audit.after_json).state, "expired");
+  repo.update("expired", 1, { ...input, authorization_id: "renewed", authorization_revision: 2 }, later, actor, due);
+  assert.equal(repo.get("expired")?.state, "active");
+});
+
+test("run取消・失敗後の未受理requestをpendingへ戻さない", () => {
+  const { repo } = setup();
+  for (const status of ["cancelled", "failed"] as const) {
+    repo.create(status, input, due, actor, now);
+    const run = repo.materialize(status, 1, due, later, due, actor).run;
+    const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    repo.setRunState(run.run_id, "materialized", status, actor, due);
+    assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", due).status, "cancelled");
+    assert.equal(repo.getRun(run.run_id)?.status, status);
+    assert.equal(repo.materialize(status, 1, later, null, later, actor).run.status, "materialized");
+  }
+});
+
+test("送信結果auditはrun更新後の終端statusを保持する", () => {
+  const { repo } = setup(); repo.create("sent", input, due, actor, now);
+  const run = repo.materialize("sent", 1, due, later, due, actor).run;
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, "receipt");
+  const audit = (repo.auditHistory("sent") as { operation: string; after_json: string }[]).find(x => x.operation === "outbox_sent")!;
+  assert.equal(JSON.parse(audit.after_json).run.status, "completed");
+  assert.equal(JSON.parse(audit.after_json).run.run_id, run.run_id);
+  repo.create("failure", input, due, actor, now); repo.materialize("failure", 1, due, later, due, actor);
+  for (const timestamp of [due, "2026-09-05T00:01:01Z", "2026-09-05T00:01:06Z"]) {
+    const attempt = repo.claim(timestamp)!; repo.requestStarted(attempt.outbox_id, attempt.claim_token!, timestamp);
+    repo.finishWrite(attempt.outbox_id, attempt.claim_token!, "not_accepted", timestamp);
+  }
+  const last = (repo.auditHistory("failure") as { operation: string; after_json: string }[]).filter(x => x.operation === "outbox_not_accepted").at(-1)!;
+  assert.equal(JSON.parse(last.after_json).run.status, "failed");
+});
