@@ -216,7 +216,7 @@ test("misfire 900秒境界、未決着overlap、expired auth、quotaを保存層
 test("FK、一意indexとdue/audit/claimのquery plan", () => {
   const { repo, raw } = setup(); repo.create("s1", input, due, actor, now); repo.materialize("s1", 1, due, later, due, actor);
   const run = raw.prepare("SELECT run_id FROM schedule_runs").get() as { run_id: string };
-  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, due, "missing"), /job_reference_conflict/);
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, due, "missing"), /invalid_transition/);
   assert.throws(() => raw.prepare("UPDATE schedule_runs SET revision = 999").run(), /FOREIGN KEY/);
   assert.deepEqual(raw.pragma("foreign_key_check"), []);
   for (const [sql, index] of [
@@ -368,6 +368,7 @@ test("公開run遷移はreminderのstartedとcompletedを拒否しoutboxを保�
   const { repo, raw } = setup(); repo.create("reminder", input, due, actor, now);
   const run = repo.materialize("reminder", 1, due, later, due, actor).run;
   assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, due), /invalid_transition/);
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, "2026-09-05T00:16:01Z"), /invalid_transition/);
   assert.throws(() => repo.setRunState(run.run_id, "materialized", "completed", actor, due), /invalid_transition/);
   assert.equal(repo.getRun(run.run_id)?.status, "materialized");
   assert.equal((raw.prepare("SELECT status FROM connector_outbox WHERE run_id = ?").get(run.run_id) as { status: string }).status, "pending");
@@ -734,14 +735,17 @@ test("通知先があるworkの結果欠落は完了transactionを拒否する",
   assert.equal(count(raw, "connector_outbox"), 1);
 });
 
-test("時計後退後の再承認next_dueはhigh-watermarkを越える必要がある", () => {
-  const { repo } = setup(); repo.create("s1", input, due, actor, now);
+test("時計後退後の再承認は時刻を戻さずnext_dueがhigh-watermarkを越える必要がある", () => {
+  const { repo, raw } = setup(); repo.create("s1", input, due, actor, now);
   repo.materialize("s1", 1, due, later, due, actor); repo.transition("s1", 1, "pause", actor, due);
   const renewed = { ...input, authorization_id: "renewed", authorization_revision: 3 };
   assert.throws(() => repo.update("s1", 2, renewed, due, actor, now), /invalid_next_due/);
   assert.equal(repo.get("s1")?.revision, 2);
   repo.update("s1", 2, renewed, later, actor, now);
   assert.equal(repo.get("s1")?.next_due, later);
+  assert.equal(repo.get("s1")?.updated_at, due);
+  assert.equal((raw.prepare("SELECT created_at FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 3").get() as { created_at: string }).created_at, due);
+  assert.equal(repo.transition("s1", 3, "cancel", actor, now).terminal_at, due);
 });
 
 test("cancel時刻を単調化しcaller skip不一致とxapp本文を保存前に拒否", () => {

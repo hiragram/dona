@@ -184,19 +184,21 @@ export class SchedulerRepository {
     utc(now); utc(nextDue);
     return this.db.transaction(() => {
       const before = this.checked(scheduleId, expectedRevision, actor, true);
+      const previousRevision = this.revision(before);
+      const updateAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
       if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= now) throw new Error("invalid_transition");
       if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, now);
-      if (input.authorization_revision !== expectedRevision + 1 || input.authorization_id === this.revision(before).authorization_id) throw new Error("authorization_revision_conflict");
-      this.suppress(scheduleId, now, "revision_replaced");
-      this.retireRevisions(scheduleId, now, expectedRevision);
-      this.insertRevision(scheduleId, expectedRevision + 1, input, now);
+      if (input.authorization_revision !== expectedRevision + 1 || input.authorization_id === previousRevision.authorization_id) throw new Error("authorization_revision_conflict");
+      this.suppress(scheduleId, updateAt, "revision_replaced");
+      this.retireRevisions(scheduleId, updateAt, expectedRevision);
+      this.insertRevision(scheduleId, expectedRevision + 1, input, updateAt);
       this.db.prepare("UPDATE schedules SET revision = revision + 1, state = 'active', next_due = ?, updated_at = ? WHERE schedule_id = ?")
-        .run(nextDue, now, scheduleId);
+        .run(nextDue, updateAt, scheduleId);
       this.db.prepare("UPDATE schedules SET terminal_at = NULL WHERE schedule_id = ?").run(scheduleId);
-      const after = this.get(scheduleId)!; this.audit(before, after, "update", actor, now); return after;
+      const after = this.get(scheduleId)!; this.audit(before, after, "update", actor, updateAt); return after;
     }).immediate();
   }
   transition(scheduleId: string, expectedRevision: number, operation: "pause" | "resume" | "cancel", actor: Actor, now: string): Schedule {
@@ -289,6 +291,7 @@ export class SchedulerRepository {
       if (!valid.includes(next)) throw new Error("invalid_transition");
       const runSnapshot = this.revision(run);
       const transitionAt = [now, run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at].sort().at(-1)!;
+      if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
       if (next === "started") {
         const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
           : runSnapshot.expires_at <= now ? "authorization_expired"
@@ -309,8 +312,7 @@ export class SchedulerRepository {
         const job = this.db.prepare("SELECT source_event_id FROM jobs WHERE job_id = ?").get(jobId) as { source_event_id: string } | undefined;
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
-      if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
-      if (next === "started" && runSnapshot.action === "work.read_only" && jobId === null) throw new Error("job_reference_required");
+      if (next === "started" && jobId === null) throw new Error("job_reference_required");
       const notificationReason = current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
         : runSnapshot.expires_at <= now ? "authorization_expired" : null;
