@@ -17,13 +17,22 @@ describe("DispatcherDatabase", () => {
   test("migrates an existing schema v1 database to the jobs schema", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
-    const seed = new DispatcherDatabase(config.databasePath);
-    seed.close();
+    const initial = new DispatcherDatabase(config.databasePath);
+    const existingEvent = initial.enqueue(eventEnvelope("legacy-v1")).row;
+    initial.close();
     const legacy = new Database(config.databasePath);
-    legacy.exec("DROP TABLE queue_deliveries; DROP TABLE queue_events; DROP TABLE queue_lanes; DROP TABLE queue_sources; DROP TABLE queue_metrics; DROP TABLE queue_selector; DROP TABLE jobs; PRAGMA user_version = 1;");
+    legacy.exec(`
+      DROP TABLE queue_deliveries; DROP TABLE queue_events; DROP TABLE queue_lanes;
+      DROP TABLE queue_sources; DROP TABLE queue_metrics; DROP TABLE queue_selector;
+      DROP TRIGGER completion_notification_projection;
+      DROP TABLE job_completions; DROP TABLE job_bindings; DROP TABLE jobs;
+      DROP TABLE event_bindings; DROP TABLE provider_execution_policies; DROP TABLE event_routing_migrations;
+      PRAGMA user_version = 1;
+    `);
     legacy.close();
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.listJobs(), []);
+    assert.deepEqual(database.get(existingEvent.event_id), existingEvent);
     database.close();
   });
 
@@ -193,6 +202,8 @@ describe("DispatcherDatabase", () => {
     }, created.row.result_path);
     const notification = database.enqueueJobNotification(created.row.job_id);
     const duplicate = database.enqueueJobNotification(created.row.job_id);
+    assert.ok(notification);
+    assert.ok(duplicate);
     assert.equal(notification.row.source, "dona_job");
     assert.equal(notification.row.event_type, "job_completed");
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");
