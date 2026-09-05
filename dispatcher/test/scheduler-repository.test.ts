@@ -156,6 +156,29 @@ test("未受理の確証だけ3 attemptsと1秒/5秒・Retry-Afterを使用、�
   assert.equal(repo.claim("2026-09-05T00:01:20Z"), undefined);
 });
 
+test("work結果retryは完了後900秒境界で長いRetry-Afterと停止復帰時に終端化", () => {
+  const { repo } = setup();
+  for (const [name, retryAt, retryAfter] of [
+    ["boundary", "2026-09-05T00:16:00Z", 0],
+    ["retry_after", due, 901],
+  ] as const) {
+    repo.create(name, { ...input, action: "work.read_only" }, due, actor, now);
+    const run = repo.materialize(name, 1, due, later, due, actor).run;
+    repo.setRunState(run.run_id, "materialized", "started", actor, due);
+    repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
+    const claim = repo.claim(retryAt)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, retryAt);
+    const finished = repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", retryAt, null, retryAfter);
+    assert.equal(finished.status, "failed");
+  }
+  repo.create("recovery", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("recovery", 1, due, later, due, actor).run;
+  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
+  const stopped = repo.claim(due, 1)!;
+  repo.recover("2026-09-05T00:16:01Z");
+  assert.equal(repo.getOutbox(stopped.outbox_id, "2026-09-05T00:16:01Z")?.status, "failed");
+});
+
 test("cancelとrequest開始のraceでもreceiptとrequest-started fenceを消さない", () => {
   const { repo } = setup(); repo.create("s1", input, due, actor, now); repo.materialize("s1", 1, due, later, due, actor);
   const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
@@ -326,6 +349,38 @@ test("needs_reviewの未解決fenceを再承認で迂回できずadmin reconcile
   assert.equal(repo.materialize("s1", 2, later, null, later, actor).run.status, "materialized");
 });
 
+test("公開run遷移はreminderのstartedとcompletedを拒否しoutboxを保持", () => {
+  const { repo, raw } = setup(); repo.create("reminder", input, due, actor, now);
+  const run = repo.materialize("reminder", 1, due, later, due, actor).run;
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, due), /invalid_transition/);
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "completed", actor, due), /invalid_transition/);
+  assert.equal(repo.getRun(run.run_id)?.status, "materialized");
+  assert.equal((raw.prepare("SELECT status FROM connector_outbox WHERE run_id = ?").get(run.run_id) as { status: string }).status, "pending");
+});
+
+test("admin reconcileはdrained one-shotだけを監査後completedへ進めquotaとpurgeを解放", () => {
+  const { dispatcher, raw } = setup();
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  for (const outcome of ["sent", "failed"] as const) {
+    const name = `once_${outcome}`; repo.create(name, once, due, actor, now); repo.materialize(name, 1, due, null, due, actor);
+    const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+    repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", due);
+    repo.reconcile(claim.outbox_id, outcome, `receipt_${outcome}`, { ...actor, role: "admin" }, due);
+    assert.equal(repo.get(name)?.state, "completed"); assert.equal(repo.get(name)?.terminal_at, due);
+    assert.deepEqual((repo.auditHistory(name) as { operation: string }[]).slice(-2).map(x => x.operation), [`reconcile_${outcome}`, "complete"]);
+  }
+  repo.create("recurring", input, due, actor, now); repo.materialize("recurring", 1, due, later, due, actor);
+  const recurring = repo.claim(due)!; repo.requestStarted(recurring.outbox_id, recurring.claim_token!, due);
+  repo.finishWrite(recurring.outbox_id, recurring.claim_token!, "ambiguous", due);
+  repo.reconcile(recurring.outbox_id, "sent", "receipt_recurring", { ...actor, role: "admin" }, due);
+  assert.equal(repo.get("recurring")?.state, "needs_review");
+  for (let i = 0; i < 19; i++) repo.create(`quota_reconcile_${i}`, once, due, actor, now);
+  repo.purge("2026-10-06T00:00:00Z");
+  assert.equal(repo.get("once_sent"), undefined); assert.equal(repo.get("once_failed"), undefined);
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM schedules WHERE schedule_id LIKE 'quota_reconcile_%'").get() as { n: number }).n, 19);
+});
+
 test("one-shotは最後のrun/outbox決着後に完了しquotaとretentionを解放", () => {
   const { dispatcher, raw } = setup();
   const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
@@ -355,9 +410,8 @@ test("one-shot workの結果通知と通知なし、graceでskipしたone-shot�
   repo.setRunState(notified.run_id, "materialized", "started", actor, due);
   repo.setRunState(notified.run_id, "started", "completed", actor, due, null, "結果");
   assert.equal(repo.get("result")?.state, "active");
-  const delayedResult = repo.claim("2026-09-05T00:16:01Z")!;
-  repo.requestStarted(delayedResult.outbox_id, delayedResult.claim_token!, "2026-09-05T00:16:01Z");
-  repo.finishWrite(delayedResult.outbox_id, delayedResult.claim_token!, "sent", "2026-09-05T00:16:01Z", "receipt");
+  const delayedResult = repo.claim("2026-09-05T00:16:01Z");
+  assert.equal(delayedResult, undefined);
   assert.equal(repo.getRun(notified.run_id)?.status, "completed"); assert.equal(repo.get("result")?.state, "completed");
   repo.create("skipped", once, due, actor, now);
   repo.materialize("skipped", 1, due, null, "2026-09-05T00:16:01Z", actor);

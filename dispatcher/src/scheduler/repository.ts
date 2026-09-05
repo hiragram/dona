@@ -270,10 +270,10 @@ export class SchedulerRepository {
       this.checked(current.schedule_id, current.revision, actor);
       const valid = expected === "materialized" ? ["started", "cancelled", "failed"] : expected === "started" ? ["completed", "failed", "cancelled"] : [];
       if (!valid.includes(next)) throw new Error("invalid_transition");
+      const runSnapshot = this.revision(run);
       if (next === "started") {
-        const revision = this.revision(current);
         const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
-          : revision.expires_at <= now ? "authorization_expired"
+          : runSnapshot.expires_at <= now ? "authorization_expired"
           : Date.parse(now) - Date.parse(run.scheduled_for) > 900000 ? "misfire" : null;
         if (reason !== null) {
           if (reason === "authorization_expired") this.expireSchedule(current, actor, now);
@@ -291,7 +291,7 @@ export class SchedulerRepository {
         const job = this.db.prepare("SELECT source_event_id FROM jobs WHERE job_id = ?").get(jobId) as { source_event_id: string } | undefined;
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
-      const runSnapshot = this.revision(run);
+      if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
       const notificationReason = current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
         : runSnapshot.expires_at <= now ? "authorization_expired" : null;
@@ -335,6 +335,7 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
         .run(outcome === "sent" ? "completed" : "failed", now, run.run_id);
       this.audit(schedule, schedule, `reconcile_${outcome}`, actor, now, this.getOutbox(outboxId, now)!);
+      this.completeIfDrained(run.schedule_id, now);
       // Admin reconciliation returns metadata, never the owner's body.
       return { ...this.getOutbox(outboxId, now)!, content: null };
     }).immediate();
@@ -361,7 +362,7 @@ export class SchedulerRepository {
   }
   private completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
-    if (!["active", "expired"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
+    if (!["active", "expired", "needs_review"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
     const unsettled = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o
@@ -376,17 +377,19 @@ export class SchedulerRepository {
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
     const snapshot = this.revision(run);
     const ageOrigin = run.scheduled_for;
+    const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(now) - Date.parse(row.created_at) > 900000;
     const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
       : snapshot.expires_at <= now ? "authorization_expired"
+      : workRetryExpired ? "retry_expired"
       : row.kind === "slack.reminder.post" && Date.parse(now) - Date.parse(ageOrigin) > 900000 ? "misfire"
       : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= now) ? "cancelled"
       : null;
     if (reason === null) return false;
     if (reason === "authorization_expired") this.expireSchedule(schedule,
       { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
-    this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
+    this.db.prepare(`UPDATE connector_outbox SET status = ?, terminal_at = ?, updated_at = ?,
       content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
-      .run(now, now, add(now, 604800), row.outbox_id);
+      .run(reason === "retry_expired" ? "failed" : "cancelled", now, now, add(now, 604800), row.outbox_id);
     if (row.kind === "slack.reminder.post" && ["materialized", "started"].includes(run.status)) this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ?
       WHERE run_id = ?`).run(reason === "misfire" ? "skipped" : "cancelled", reason, now, row.run_id);
     this.auditOutbox(row, `outbox_${reason}`, now);
@@ -475,11 +478,13 @@ export class SchedulerRepository {
         const run = this.getRun(row.run_id)!;
         const schedule = this.get(run.schedule_id)!;
         const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
-        const retry = outcome === "not_accepted" && row.attempt < 3 && authorized;
+        const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
+        const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
+        const retry = outcome === "not_accepted" && row.attempt < 3 && authorized && withinWorkRetryDeadline;
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
-          status, add(now, Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5)), retry ? null : row.request_started_at,
+          status, add(now, retryDelay), retry ? null : row.request_started_at,
           receiptId, retry ? null : now, row.content_delete_at === null ? add(now, 604800) : row.content_delete_at, now, outboxId);
       }
       if (outcome !== "ambiguous") {
