@@ -153,6 +153,8 @@ export class JobProgressCoordinator {
     const progress = this.store.pending(); if (!progress) return;
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
+    const group = this.jobs.getJobGroup(job.source_event_id);
+    if (group?.notification_mode === "grouped" && group.attention_event_id !== null) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);
     let finishDelivery!: () => void;
     const deliveryOperation = new Promise<void>((resolve) => { finishDelivery = resolve; });

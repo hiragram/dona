@@ -83,6 +83,23 @@ test("an attention-claimed group rejects later progress delivery", async () => {
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
+test("reporter suppresses pending progress after group attention is claimed", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-attention-pending-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try {
+    store.ingest(valid);
+    const job = { job_id:"job_abc", source_event_id:"evt_abc", status:"running", workspace_id:"T1", channel_id:"C1", thread_ts:"1.1" };
+    const jobs = {
+      getJob: () => job,
+      getJobGroup: () => ({ notification_mode:"grouped", sealed_at:"2026-09-05T00:00:00Z", attention_event_id:"evt_attention" }),
+    };
+    const coordinator = new JobProgressCoordinator(jobs as never, store, {} as never, {} as never);
+    await coordinator.report();
+    assert.equal(store.get("job_abc")?.status, "delivered");
+    assert.equal(store.pending(), undefined);
+  } finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
 test("store is monotonic, coalesces pending updates, and fences unknown delivery", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
