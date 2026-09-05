@@ -83,6 +83,7 @@ export class JobSupervisor {
   private nextSchedulerStatsAt = 0;
   private loopPromise: Promise<void> | undefined;
   private progressLoopPromise: Promise<void> | undefined;
+  private readonly cancelledWorkerCleanups = new Set<Promise<void>>();
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
@@ -157,6 +158,7 @@ export class JobSupervisor {
     await progressStop;
     await Promise.allSettled([...this.controls.values()]);
     await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
+    await Promise.allSettled([...this.cancelledWorkerCleanups]);
     this.running = false;
   }
 
@@ -216,9 +218,21 @@ export class JobSupervisor {
         throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
       this.database.markJobCancelled(jobId, reason);
+      if(!this.active.has(jobId))this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
     });
+  }
+
+  private trackCancelledWorkerCleanup(row:JobRow):void {
+    const operation=(async()=>{
+      while(!this.stopping){
+        try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted||waited.ok||(!waited.timedOut&&waited.errorCode!=="timeout"))break;}
+        catch {await abortableDelay(this.config.queuePollMs,this.abortController.signal);}
+      }
+      await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});
+    })();
+    this.cancelledWorkerCleanups.add(operation);void operation.finally(()=>this.cancelledWorkerCleanups.delete(operation)).catch(()=>undefined);
   }
 
   private async loop(): Promise<void> {

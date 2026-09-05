@@ -65,6 +65,7 @@ export class SlackHealthServer {
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
   private readonly progressOperations = new Set<Promise<unknown>>();
+  private progressDrains = 0;
 
   constructor(
     private readonly socketPath: string,
@@ -171,6 +172,7 @@ export class SlackHealthServer {
         send(response, 503, { schema_version: 1, error: { code: "reporter_unavailable" } });
         return;
       }
+      if(this.progressDrains>0){send(response,429,{schema_version:1,error:{code:"progress_draining"}});return;}
       let finishAdmission!:()=>void;
       const admission=new Promise<void>((resolve)=>{finishAdmission=resolve;});
       this.progressOperations.add(admission);
@@ -217,9 +219,12 @@ export class SlackHealthServer {
     }
     if (method === "POST" && pathname === "/v1/internal/job-progress/drain") {
       if (!this.jobProgress || !this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable"}}); return; }
-      if (!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden"}}); return; }
-      await Promise.allSettled([...this.progressOperations]);
-      send(response,200,{schema_version:1,drained:true}); return;
+      this.progressDrains+=1;
+      try {
+        if (!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden"}}); return; }
+        await Promise.allSettled([...this.progressOperations]);
+        send(response,200,{schema_version:1,drained:true}); return;
+      } finally {this.progressDrains-=1;}
     }
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });

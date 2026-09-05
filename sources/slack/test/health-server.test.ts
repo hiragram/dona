@@ -390,7 +390,9 @@ describe("SlackHealthServer", () => {
       const slow=http.request({socketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},(response)=>{response.resume();response.once("end",()=>resolveResponse({status:response.statusCode??0}));});
       slow.write(body.subarray(0,10)); await new Promise((resolve)=>setTimeout(resolve,10)); let drained=false;
       const drain=request(socketPath,"/v1/internal/job-progress/drain","POST",undefined,{"x-dona-update-token":token}).then((value)=>{drained=true;return value;});
-      await new Promise((resolve)=>setTimeout(resolve,10)); assert.equal(drained,false); slow.end(body.subarray(10)); assert.equal((await responsePromise).status,200); assert.equal((await drain).status,200);
+      await new Promise((resolve)=>setTimeout(resolve,10)); assert.equal(drained,false);
+      const late=await request(socketPath,"/v1/internal/job-progress","POST",{schema_version:1,progress_id:"job_late:1",delivery_token:"c".repeat(64)},{"x-dona-update-token":token}); assert.equal(late.status,429); assert.deepEqual(late.body.error,{code:"progress_draining"});
+      slow.end(body.subarray(10)); assert.equal((await responsePromise).status,200); assert.equal((await drain).status,200);
     } finally {await server.stop();}
   });
 });
