@@ -701,6 +701,21 @@ test("reconcileは後続schedule遷移時刻より前へ終端を戻さない", 
   assert.equal(repo.getOutbox(claim.outbox_id, cancelledAt)?.terminal_at, cancelledAt);
 });
 
+test("recoverの曖昧化は後続schedule遷移時刻より前へ戻らない", () => {
+  const { repo } = setup();
+  repo.create("recover_clock", input, due, actor, now);
+  repo.materialize("recover_clock", 1, due, later, due, actor);
+  const claim = repo.claim(due, 1)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  const pausedAt = "2026-09-05T00:02:00Z";
+  repo.transition("recover_clock", 1, "pause", actor, pausedAt);
+  repo.recover("2026-09-05T00:01:01Z");
+  const recovered = repo.getOutbox(claim.outbox_id, pausedAt)!;
+  assert.equal(recovered.updated_at, pausedAt);
+  assert.equal(recovered.content_delete_at, "2026-09-12T00:02:00Z");
+  assert.equal((repo.auditHistory("recover_clock") as { operation: string; created_at: string }[])
+    .find(row => row.operation === "outbox_needs_review")?.created_at, pausedAt);
+});
+
 test("materializeは保存済みschedule時刻以上でrunとauditを作成する", () => {
   const { repo } = setup();
   repo.create("materialize_clock", input, due, actor, now);
@@ -857,6 +872,9 @@ test("cancel時刻を単調化しcaller skip不一致とSlack credential本文�
   assert.throws(() => repo.materialize("bad_skip", 1, due, later, due, actor, "misfire"), /invalid_skip_reason/);
   assert.throws(() => repo.create("xapp_body", { ...input, content: "prefix xapp-secret" }, due, actor, now), /content_requires_redaction/);
   assert.throws(() => repo.create("webhook_body", { ...input, content: "https://hooks.slack.com/services/T/B/secret" }, due, actor, now), /content_requires_redaction/);
+  for (const [index, content] of ["<!channel> 全体通知", "<!here> 通知", "<@U123> 個別通知"].entries()) {
+    assert.throws(() => repo.create(`mention_${index}`, { ...input, content }, due, actor, now), /content_requires_redaction/);
+  }
   assert.throws(() => repo.create("target_token", { ...input,
     target: { kind: "thread", workspace_id: "T_TEST", channel_id: "xoxb-secret", thread_ts: "1.000001" } }, due, actor, now), /invalid_target/);
   assert.equal((raw.prepare("SELECT count(*) AS n FROM schedule_runs WHERE schedule_id = 'bad_skip'").get() as { n: number }).n, 0);

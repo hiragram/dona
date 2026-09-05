@@ -60,10 +60,10 @@ function validateReceipt(value: string): void {
 }
 function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
 function safeContent(value: string, limit: number): void {
-  if (!value || [...value].length > limit || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
 function truncateResultContent(value: string): string {
-  if (!value || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
   const points = [...value];
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
@@ -527,17 +527,20 @@ export class SchedulerRepository {
     this.audit(before ?? schedule, schedule, operation, { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now, this.getOutbox(row.outbox_id, now)!);
   }
   private markAmbiguous(row: Outbox, now: string): void {
-    this.db.prepare("UPDATE connector_outbox SET status = 'needs_review', content_delete_at = ?, updated_at = ? WHERE outbox_id = ?")
-      .run(add(now, 604800), now, row.outbox_id);
     const run = this.getRun(row.run_id)!;
     const before = this.get(run.schedule_id)!;
-    this.suppress(run.schedule_id, now, "cancelled");
+    const ambiguousAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
+      run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at,
+      before.terminal_at ?? before.created_at].sort().at(-1)!;
+    this.db.prepare("UPDATE connector_outbox SET status = 'needs_review', content_delete_at = ?, updated_at = ? WHERE outbox_id = ?")
+      .run(add(ambiguousAt, 604800), ambiguousAt, row.outbox_id);
+    this.suppress(run.schedule_id, ambiguousAt, "cancelled");
     if (row.kind === "slack.reminder.post") {
       this.db.prepare("UPDATE schedule_runs SET status = 'needs_review', reason = 'ambiguous_write' WHERE run_id = ?").run(run.run_id);
     }
-    this.db.prepare("UPDATE schedules SET state = 'needs_review', updated_at = ? WHERE schedule_id = ? AND state NOT IN ('cancelled','completed')").run(now, run.schedule_id);
-    this.retireRevisions(run.schedule_id, now);
-    this.auditOutbox(row, "outbox_needs_review", now, before);
+    this.db.prepare("UPDATE schedules SET state = 'needs_review', updated_at = ? WHERE schedule_id = ? AND state NOT IN ('cancelled','completed')").run(ambiguousAt, run.schedule_id);
+    this.retireRevisions(run.schedule_id, ambiguousAt);
+    this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
   finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
