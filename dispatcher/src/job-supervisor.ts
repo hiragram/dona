@@ -8,6 +8,7 @@ import { buildJobPrompt } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { JobProgressCoordinator } from "./job-progress.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -48,6 +49,15 @@ function maximumCount(counts: Iterable<number>): number {
   return maximum;
 }
 
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, milliseconds);
+    function finish(): void { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); }
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
 const schedulerStatsIntervalMs = 60_000;
 
 export interface JobControlResult {
@@ -71,8 +81,10 @@ export class JobSupervisor {
   private nextRunnableScanAt = 0;
   private nextSchedulerStatsAt = 0;
   private loopPromise: Promise<void> | undefined;
+  private progressLoopPromise: Promise<void> | undefined;
   private running = false;
   private stopping = false;
+  private staleJobsRecovered = false;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -80,6 +92,7 @@ export class JobSupervisor {
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
     private readonly wakeEventWorker: () => void,
+    private progress?: JobProgressCoordinator,
   ) {}
 
   isRunning(): boolean {
@@ -88,13 +101,7 @@ export class JobSupervisor {
 
   start(): void {
     if (this.loopPromise) return;
-    const recovered = this.database.recoverStaleJobs();
-    if (recovered.retryable || recovered.needsReview) {
-      this.logger.warn("Recovered stale jobs", {
-        retryable_count: recovered.retryable,
-        needs_review_count: recovered.needsReview,
-      });
-    }
+    this.recoverStaleJobs();
     this.running = true;
     this.loopPromise = this.loop().catch((error: unknown) => {
       this.logger.error("Job supervisor stopped unexpectedly", {
@@ -103,7 +110,22 @@ export class JobSupervisor {
       });
       throw error;
     });
+    if (this.progress) this.progressLoopPromise = this.progressLoop();
   }
+
+  recoverStaleJobs(): void {
+    if (this.staleJobsRecovered) return;
+    this.staleJobsRecovered = true;
+    const recovered = this.database.recoverStaleJobs();
+    if (recovered.retryable || recovered.needsReview) {
+      this.logger.warn("Recovered stale jobs", {
+        retryable_count: recovered.retryable,
+        needs_review_count: recovered.needsReview,
+      });
+    }
+  }
+
+  disableProgress(): void { this.progress = undefined; }
 
   wake(): void {
     this.nextRunnableScanAt = 0;
@@ -115,6 +137,7 @@ export class JobSupervisor {
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
+    await this.progressLoopPromise;
     await Promise.allSettled([...this.controls.values()]);
     await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
     this.running = false;
@@ -193,6 +216,19 @@ export class JobSupervisor {
         });
       }
       await this.wakeSignal.wait(this.config.queuePollMs);
+    }
+  }
+
+  private async progressLoop(): Promise<void> {
+    while (!this.stopping) {
+      try { await this.progress?.report(); }
+      catch (error) {
+        this.logger.warn("Job progress reporting cycle failed", {
+          error_code: "job_progress_cycle_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await abortableDelay(this.config.queuePollMs, this.abortController.signal);
     }
   }
 
@@ -384,8 +420,33 @@ export class JobSupervisor {
   }
 
   private async monitor(row: JobRow): Promise<void> {
+    await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
     if (await this.tryComplete(row, false)) return;
+    let keepPolling = true;
+    const pollAbort = new AbortController();
+    const stopPoll = (): void => pollAbort.abort();
+    this.abortController.signal.addEventListener("abort", stopPoll, { once: true });
+    const pollProgress = (async () => {
+      while (keepPolling && !this.stopping) {
+        await abortableDelay(this.config.queuePollMs, pollAbort.signal);
+        if (keepPolling && !this.stopping) {
+          try {
+            const current = this.database.getJob(row.job_id) ?? row;
+            if (["blocked", "completed", "failed", "cancelled", "needs_review"].includes(current.status)) {
+              await this.updateTerminalProgress(row.job_id);
+              break;
+            }
+            await this.progress?.ingest(current);
+          }
+          catch (error) { this.logger.warn("Job progress polling failed", { job_id: row.job_id, error_code: "job_progress_poll_failed", error_message: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+    })();
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
+    keepPolling = false;
+    pollAbort.abort();
+    await pollProgress;
+    this.abortController.signal.removeEventListener("abort", stopPoll);
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
@@ -400,10 +461,12 @@ export class JobSupervisor {
         waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
+      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (waited.agentStatus === "blocked") {
       this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
@@ -411,12 +474,17 @@ export class JobSupervisor {
     }
   }
 
+  private async updateTerminalProgress(jobId: string): Promise<void> {
+    try { await this.progress?.ingest(this.database.getJob(jobId)!); }
+    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id:jobId, error_code:"job_progress_terminal_failed", error_message:error instanceof Error ? error.message : String(error) }); }
+  }
+
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
+    let completed: JobRow;
     try {
       const result = await readJobResultEnvelope(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
-      this.logTransition(row, this.database.getJob(row.job_id)!);
-      return true;
+      completed = this.database.getJob(row.job_id)!;
     } catch (error) {
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
       this.database.markJobNeedsReview(
@@ -424,8 +492,12 @@ export class JobSupervisor {
         error instanceof JobResultNotFoundError ? "result_missing" : "invalid_result",
         error instanceof Error ? error.message : String(error),
       );
-      return true;
+      completed = this.database.getJob(row.job_id)!;
     }
+    try { await this.progress?.ingest(completed); }
+    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id: row.job_id, error_code: "job_progress_terminal_failed", error_message: error instanceof Error ? error.message : String(error) }); }
+    this.logTransition(row, completed);
+    return true;
   }
 
   private logTransition(from: JobRow, to: JobRow): void {

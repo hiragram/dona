@@ -102,6 +102,16 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約するため、owner 1件の`payload.result`だけを全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
 
+### background jobのAgent Status進捗
+
+worker promptにはDispatcherが生成したjob専用progress pathだけを公開先として渡します。GitHub jobではcheckout外のworktree固有gitdir、scratch jobではworkspace内を使います。workerはallowlist済みphase、単調増加sequence、短い監査用summaryを一時ファイルからrenameして公開します。Dispatcherはjob IDを固定値と照合し、Slack workspace/channel/threadはworkerファイルではなくsource eventから永続化済みのjob bindingだけで決めます。自由な宛先は受け付けず、worker由来summaryはSlackへ転送せず、表示文言はallowlist済みphaseの固定ラベルだけから生成します。
+
+進捗は本体schema v3と分離した`job-progress.sqlite3` schema v2へ保存します。v1からはterminal照合markerだけを追加し、古いreleaseの本体DB read/write互換性を壊さず、rollback時は新しい進捗表示だけが停止する設計です。pending更新は最新sequenceへcoalesceされ、順序逆転とduplicateは無視されます。Slack write開始後のtimeout・切断は`unknown`として永続化し、blind retryしません。進捗障害はjob Result・終端通知を失敗させません。terminal jobの遅延progressは破棄されます。
+
+具体的な工程表示には`assistant.threads.setStatus` compatibility APIを使い、`agents.sessions.setStatus`のlifecycle (`processing` / `suspended` / `active`) や作成時だけの`title`とは分離します。compatibility APIが利用できない環境ではchat messageへfallbackせず、durable stateを保持したまま表示をdegradeします。
+
+live smokeはrelease適用後に、専用test threadで`implementing`から`testing`の2 sequenceを順にatomic publishし、Slack画面の文言、API応答、短時間更新時のcoalesce/rate-limit、終端通知後の`active`復帰を確認します。このrepositoryのfake testはmethod/field境界だけを証明し、実Slack UI成功の証拠にはしません。検証後はprogress fileをjob Resultと同じretentionで削除でき、進捗DBは監査期間後にterminal rowを削除します。
+
 Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
 
 新規jobは作成時canonical payloadのSHA-256を`workspace_json`内のDispatcher予約metadataへ保存し、後続steerで`objective`が変わってもcreate/reuse判定を固定します。v2から移行した`legacy-default` rowには作成時payloadが存在しないためhashを推測せず、payload付き照合では`unverified_legacy`を返して従来の単一job reuseを維持します。予約metadataはworker promptと`dona_job` payloadのworkspace projectionから除外されます。

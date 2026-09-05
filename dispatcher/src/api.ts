@@ -100,6 +100,10 @@ export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
 
+export interface ApiJobProgressResolver {
+  resolveDelivery(progressId: string): Record<string, string> | undefined;
+}
+
 export class DispatcherApi {
   private server: http.Server | undefined;
   private shuttingDown = false;
@@ -117,6 +121,7 @@ export class DispatcherApi {
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
+    private readonly jobProgress?: ApiJobProgressResolver,
   ) {}
 
   async start(): Promise<void> {
@@ -208,6 +213,14 @@ export class DispatcherApi {
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/v1/internal/job-progress") {
+        if (!(await this.authorizedUpdateRequest(request))) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
+        const progressId = url.searchParams.get("progress_id") ?? "";
+        const delivery = this.jobProgress?.resolveDelivery(progressId);
+        if (!delivery) throw new ApiRequestError(404, "progress_not_deliverable", "Progress is not pending delivery");
+        sendJson(response, 200, { schema_version: 1, ...delivery });
         return;
       }
       if (request.method === "GET" && /^\/v1\/events\/[^/]+\/terminal$/.test(url.pathname)) {

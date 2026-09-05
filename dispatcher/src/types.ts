@@ -202,3 +202,17 @@ export interface EventJobProjection {
 }
 
 export type EventJobReconciliation = "not_found" | "matched" | "conflict" | "unverified_legacy";
+
+export const jobProgressPhases = [
+  "preparing", "implementing", "testing", "reviewing", "waiting_ci", "reconciling",
+] as const;
+export type JobProgressPhase = (typeof jobProgressPhases)[number];
+
+export interface JobProgressEnvelope {
+  schema_version: 1;
+  job_id: string;
+  sequence: number;
+  phase: JobProgressPhase;
+  safe_summary: string;
+  updated_at: string;
+}

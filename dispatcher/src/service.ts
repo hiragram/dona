@@ -12,6 +12,7 @@ import {
   UpdateNotificationDatabase,
   UpdateNotificationWorker,
 } from "./update-notification.js";
+import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -21,6 +22,15 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+  let jobProgressStore: JobProgressStore | undefined;
+  try {
+    jobProgressStore = new JobProgressStore(config.jobProgressDatabasePath);
+  } catch (error) {
+    apiLogger.warn("Job progress disabled after initialization failure", {
+      error_code: "job_progress_initialization_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
+  }
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
     session: config.herdrSession,
@@ -28,6 +38,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   let jobSupervisor!: JobSupervisor;
+  let jobProgress = jobProgressStore
+    ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
+    : undefined;
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
   jobSupervisor = new JobSupervisor(
     database,
@@ -35,7 +48,20 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
+    jobProgress,
   );
+  jobSupervisor.recoverStaleJobs();
+  try { await jobProgress?.recover(); }
+  catch (error) {
+    apiLogger.warn("Job progress disabled after recovery failure", {
+      error_code: "job_progress_recovery_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
+    jobProgressStore?.close();
+    jobProgressStore = undefined;
+    jobProgress = undefined;
+    jobSupervisor.disableProgress();
+  }
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -58,6 +84,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       },
     },
     updateNotificationWorker,
+    jobProgress,
   );
 
   try {
@@ -71,6 +98,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     if (worker.isRunning()) await worker.stop();
     database.close();
     updateNotificationDatabase.close();
+    jobProgressStore?.close();
     throw error;
   }
 
@@ -88,6 +116,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         await worker.stop();
         database.close();
         updateNotificationDatabase.close();
+        jobProgressStore?.close();
         resolve();
       } catch (error) {
         reject(error);

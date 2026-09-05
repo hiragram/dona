@@ -11,6 +11,8 @@ import {
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
+import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
+import { SlackApiError } from "./slack-api.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -56,6 +58,7 @@ export interface AdapterHealthState {
   connectionStates(): Record<string, string>;
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
+  trackExternal?<T>(operation: Promise<T>): Promise<T>;
 }
 
 export class SlackHealthServer {
@@ -70,6 +73,7 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
+    private readonly jobProgress?: SlackJobProgressReporter,
   ) {}
 
   async start(): Promise<void> {
@@ -158,6 +162,41 @@ export class SlackHealthServer {
             message: invalid || permanent ? message : "Slack update notification could not be completed",
           },
         });
+      }
+      return;
+    }
+    if (method === "POST" && pathname === "/v1/internal/job-progress") {
+      if (!this.jobProgress || !this.updateInternalTokenPath) {
+        send(response, 503, { schema_version: 1, error: { code: "reporter_unavailable" } });
+        return;
+      }
+      if (!(await this.authorized(request))) {
+        send(response, 403, { schema_version: 1, error: { code: "forbidden" } });
+        return;
+      }
+      if (this.adapter.isStopping()) {
+        send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
+        return;
+      }
+      try {
+        const input = parseJobProgressRequest(await this.readJson(request));
+        if (this.adapter.isStopping()) {
+          send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
+          return;
+        }
+        const operation = this.jobProgress.deliver(input);
+        const result = await (this.adapter.trackExternal?.(operation) ?? operation);
+        send(response, 200, { schema_version: 1, ...result });
+      } catch (error) {
+        this.logger.error("Slack job progress failed", {
+          error_code: "job_progress_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+        const slackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error"].includes(error.errorCode);
+        const definitelyUnsent = slackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
+        send(response, definitelyUnsent ? 429 : 503, { schema_version: 1,
+          ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
+          error: { code: slackRejection ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }
       return;
     }
