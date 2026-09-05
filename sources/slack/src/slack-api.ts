@@ -142,6 +142,7 @@ export interface SlackApiClient {
     initiatorUserId?: string;
     title?: string;
   }): Promise<SlackAgentSessionStatusResult>;
+  setAssistantThreadProgress?(input: { channelId: string; threadTs: string; status: string }): Promise<void>;
   addReaction(channelId: string, messageTs: string, emojiName: string): Promise<void>;
 }
 
@@ -649,6 +650,18 @@ export class SlackWebApiClient implements SlackApiClient {
         ? { warning: payload.warning }
         : {}),
     };
+  }
+
+  async setAssistantThreadProgress(input: {
+    channelId: string;
+    threadTs: string;
+    status: string;
+  }): Promise<void> {
+    await callSlack(() => this.client.apiCall("assistant.threads.setStatus", {
+      channel_id: input.channelId,
+      thread_ts: input.threadTs,
+      status: input.status,
+    }));
   }
 
   async addReaction(channelId: string, messageTs: string, emojiName: string): Promise<void> {

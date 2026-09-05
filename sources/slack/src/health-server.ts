@@ -11,6 +11,7 @@ import {
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
+import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -70,6 +71,7 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
+    private readonly jobProgress?: SlackJobProgressReporter,
   ) {}
 
   async start(): Promise<void> {
@@ -158,6 +160,27 @@ export class SlackHealthServer {
             message: invalid || permanent ? message : "Slack update notification could not be completed",
           },
         });
+      }
+      return;
+    }
+    if (method === "POST" && pathname === "/v1/internal/job-progress") {
+      if (!this.jobProgress || !this.updateInternalTokenPath) {
+        send(response, 503, { schema_version: 1, error: { code: "reporter_unavailable" } });
+        return;
+      }
+      if (!(await this.authorized(request))) {
+        send(response, 403, { schema_version: 1, error: { code: "forbidden" } });
+        return;
+      }
+      try {
+        const result = await this.jobProgress.deliver(parseJobProgressRequest(await this.readJson(request)));
+        send(response, 200, { schema_version: 1, ...result });
+      } catch (error) {
+        this.logger.error("Slack job progress failed", {
+          error_code: "job_progress_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+        send(response, 503, { schema_version: 1, error: { code: "job_progress_failed" } });
       }
       return;
     }

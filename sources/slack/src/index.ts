@@ -12,6 +12,7 @@ import { createSlackLogger, createSocketSdkLogger } from "./logger.js";
 import { promptSecret } from "./prompt.js";
 import { SlackSocketAdapter, type WorkspaceSocket } from "./socket-adapter.js";
 import { SlackUpdateNotificationReporter } from "./update-notification.js";
+import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 async function main(): Promise<void> {
@@ -49,6 +50,7 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
+    new SlackJobProgressReporter(registry),
   );
   await health.start();
   try {

@@ -1,0 +1,45 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { JobProgressStore, parseJobProgress, safeProgressText } from "../src/job-progress.js";
+
+const valid = { schema_version: 1 as const, job_id: "job_abc", sequence: 1, phase: "testing" as const,
+  safe_summary: "テスト中", updated_at: "2026-09-05T00:00:00.000Z" };
+
+test("progress schema binds the job and allowlisted phase", () => {
+  assert.deepEqual(parseJobProgress(valid, "job_abc"), valid);
+  assert.throws(() => parseJobProgress({ ...valid, job_id: "job_other" }, "job_abc"));
+  assert.throws(() => parseJobProgress({ ...valid, phase: "shell" }, "job_abc"));
+  assert.throws(() => parseJobProgress({ ...valid, destination: "C123" }, "job_abc"));
+});
+
+test("summary is normalized and secret-like content falls back to phase", () => {
+  assert.equal(safeProgressText({ ...valid, safe_summary: "  テスト\n実行中  " }), "テスト 実行中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "token=secret" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "https://example.com" }), "テスト中");
+});
+
+test("store is monotonic, coalesces pending updates, and fences unknown delivery", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try {
+    assert.equal(store.ingest(valid), true);
+    assert.equal(store.ingest({ ...valid, safe_summary: "old" }), false);
+    assert.equal(store.ingest({ ...valid, sequence: 2, phase: "reviewing", safe_summary: "レビュー中" }), true);
+    assert.equal(store.pending()?.sequence, 2);
+    store.begin("job_abc");
+    store.unknown("job_abc", "acceptance unknown");
+    assert.equal(store.ingest({ ...valid, sequence: 3 }), false);
+    assert.equal(store.get("job_abc")?.status, "unknown");
+  } finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
+test("terminal fence suppresses an undelivered progress update", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-terminal-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try { store.ingest(valid); store.terminal("job_abc"); assert.equal(store.pending(), undefined); }
+  finally { store.close(); await fs.rm(root, { recursive: true }); }
+});

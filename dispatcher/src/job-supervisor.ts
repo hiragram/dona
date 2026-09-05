@@ -8,6 +8,7 @@ import { buildJobPrompt } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { JobProgressCoordinator } from "./job-progress.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -80,6 +81,7 @@ export class JobSupervisor {
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
     private readonly wakeEventWorker: () => void,
+    private readonly progress?: JobProgressCoordinator,
   ) {}
 
   isRunning(): boolean {
@@ -184,6 +186,7 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       this.publishNotifications();
+      await this.progress?.report();
       try {
         this.scheduleRunnableJobs();
       } catch (error) {
@@ -384,6 +387,7 @@ export class JobSupervisor {
   }
 
   private async monitor(row: JobRow): Promise<void> {
+    await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
     if (await this.tryComplete(row, false)) return;
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
     if (waited.aborted || this.stopping) return;
@@ -415,6 +419,7 @@ export class JobSupervisor {
     try {
       const result = await readJobResultEnvelope(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
+      await this.progress?.ingest(this.database.getJob(row.job_id)!);
       this.logTransition(row, this.database.getJob(row.job_id)!);
       return true;
     } catch (error) {

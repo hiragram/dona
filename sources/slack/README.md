@@ -106,6 +106,8 @@ MCPが公開するツール:
 
 `set_agent_session_status`は、Donaが返信すると判断した後に`processing`、返信完了後に`active`、質問や承認待ちでは`suspended`を設定します。`closed`は会話を明示的に終了するときだけ使います。statusを設定しないイベントにはローディング表示は出ません。
 
+background jobの具体的な工程文言は内部認証済みの`/v1/internal/job-progress`からのみ受け、`assistant.threads.setStatus`へ渡します。Agent Session lifecycleと作成時titleは従来どおり`agents.sessions.setStatus`が所有します。進捗APIの失敗時にthread messageを投稿するfallbackは行いません。
+
 MCPはSlack APIへの自動再試行を無効にしています。書き込みの通信結果が曖昧な場合、二重投稿を避けるためエージェントへ自動再試行しないよう伝えます。token、投稿本文、スレッド本文は通常ログへ出しません。
 
 セルフアップデート通知では、`request_id`とterminal fenceから一意な`notification_id`を作り、表示本文を持つsection blockの`block_id`へ埋め込みます。再配送時は`conversations.replies`をcursorの終端まで読み、同じBotのexact blockが1件なら既存投稿を再利用します。0件だけ新規投稿し、複数件または別投稿者による衝突なら恒久エラーとして止めます。Slack Agent Sessionは成功・rollback・cancelで`active`、失敗・確認待ちで`suspended`へ遷移します。本文、宛先、statusはDispatcherのstrict schema以外から指定できません。この方式はcustom message metadata schema、`metadata.message:read` scope、App再認可、運用者attestationを必要としません。
