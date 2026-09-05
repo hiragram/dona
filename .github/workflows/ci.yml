@@ -30,6 +30,9 @@ jobs:
       - name: Validate project Skills
         run: npm run test:skills
 
+      - name: Validate scheduler decision fixtures
+        run: npm run test:scheduler-contract
+
   verify:
     name: Verify ${{ matrix.component }}
     runs-on: ${{ matrix.runner }}
