@@ -15,15 +15,15 @@ export class ConnectionLifecycle {
       })]);
     } finally { if (timer) clearTimeout(timer); }
   }
-  private async connection(id: string): Promise<Connection> {
+  private async connection(id: string, allowDisabled = false): Promise<Connection> {
     const c = this.registry.get(id);
-    if (c.state === "disabled") throw new ConnectionError("disabled");
+    if (c.state === "disabled" && !allowDisabled) throw new ConnectionError("disabled");
     if (c.provider !== this.driver.provider || stableStringify(c.capability) !== stableStringify(this.driver.capability)) throw new ConnectionError("capability_mismatch");
     let available = false;
     try { available = await this.bounded(() => this.driver.credentialAvailable(c)); } catch { /* 非公開 driver error は出力しない */ }
     if (!available) { this.registry.degrade(id, c.revision); throw new ConnectionError("credential_unavailable"); }
     const current = this.registry.get(id);
-    if (current.revision !== c.revision || current.state === "disabled") throw new ConnectionError("revision_conflict");
+    if (current.revision !== c.revision || (current.state === "disabled" && !allowDisabled)) throw new ConnectionError("revision_conflict");
     return c;
   }
   async createOrRenew(id: string, resource: string): Promise<Operation> {
@@ -52,7 +52,7 @@ export class ConnectionLifecycle {
   }
 
   async reconcile(id: string, operationId: string): Promise<void> {
-    const c = await this.connection(id);
+    const c = await this.connection(id, true);
     const operation = this.registry.operations(id).find((o) => o.id === operationId);
     if (!operation || operation.revision !== c.revision) throw new ConnectionError("revision_conflict");
     if (operation.state === "done") return;
@@ -67,7 +67,7 @@ export class ConnectionLifecycle {
       this.registry.reconcileStopped(operation); return;
     }
     if (result === null) throw new ConnectionError("operation_pending");
-    this.registry.observe(id, c.revision, operation.resource, operation.generation, result, operation);
+    this.registry.reconcileObservation(operation, result);
   }
   async stop(id: string, resource: string, generation: number): Promise<Operation> {
     const c = await this.connection(id);

@@ -107,9 +107,9 @@ export class ConnectionRegistry {
       this.audit(c, "verification_failed", now);
     }).immediate();
   }
-  private current(id: string, revision: number, resource: string): Connection {
+  private current(id: string, revision: number, resource: string, allowDisabled = false): Connection {
     const c = this.get(id);
-    if (c.state === "disabled") throw new ConnectionError("disabled");
+    if (c.state === "disabled" && !allowDisabled) throw new ConnectionError("disabled");
     if (c.revision !== revision) throw new ConnectionError("revision_conflict");
     if (!c.allowlist.some((entry) => entry.resource === resource)) throw new ConnectionError("not_authorized");
     return c;
@@ -154,7 +154,7 @@ export class ConnectionRegistry {
       let next: number;
       if (kind === "create") {
         if (previous) {
-          if (previous.revision !== revision || c.capability.renewal !== "replace" || previous.state !== "active" ||
+          if (previous.revision !== revision || c.capability.renewal !== "replace" || ! ["active","expiring"].includes(previous.state) ||
               previous.expiresAt === null || now < previous.expiresAt - previous.renewalWindowMs) throw new ConnectionError("invalid_transition");
         }
         next = (previous?.generation ?? 0) + 1;
@@ -174,7 +174,7 @@ export class ConnectionRegistry {
           .run(replacement.generation, id, resource, generation, revision);
         next = generation;
       }
-      const operation: Operation = { id: randomUUID(), connectionId: id, revision, resource, generation: next, kind, leaseUntil: now + leaseMs };
+      const operation: Operation = { id: randomUUID(), connectionId: id, revision, resource, generation: next, kind, leaseUntil: now + leaseMs, providerId: kind === "stop" ? this.sub(id, resource, next).providerId : null };
       this.db.prepare("INSERT INTO connection_operations VALUES(?,?,?,?,?,?,'inflight',?)")
         .run(operation.id, id, resource, next, revision, kind, operation.leaseUntil);
       this.audit(c, `${kind}_claimed`, now); return operation;
@@ -182,7 +182,9 @@ export class ConnectionRegistry {
   }
   operations(id: string): (Operation & { state: "inflight" | "unknown" | "done" })[] {
     return this.db.prepare(`SELECT id,connection_id AS connectionId,resource,generation,revision,kind,
-      lease_until AS leaseUntil,state FROM connection_operations WHERE connection_id=? ORDER BY rowid`).all(id) as
+      lease_until AS leaseUntil,state,(SELECT provider_id FROM connection_subscriptions s WHERE
+      s.connection_id=connection_operations.connection_id AND s.resource=connection_operations.resource AND s.generation=connection_operations.generation) AS providerId
+      FROM connection_operations WHERE connection_id=? ORDER BY rowid`).all(id) as
       (Operation & { state: "inflight" | "unknown" | "done" })[];
   }
   unknown(operation: Operation): void {
@@ -195,14 +197,22 @@ export class ConnectionRegistry {
       this.audit(c, "response_unknown", now);
     }).immediate();
   }
-  private validateObservation(observed: ProviderObservation, now: number): void {
+  private validateObservation(observed: ProviderObservation, now: number, allowExpired = false): void {
     if (!identifier.safeParse(observed.providerId).success || typeof observed.verified !== "boolean" || typeof observed.cutoverConfirmed !== "boolean" ||
-      (observed.expiresAt !== null && (!Number.isSafeInteger(observed.expiresAt) || observed.expiresAt <= now))) throw new ConnectionError("invalid_input");
+      (observed.expiresAt !== null && (!Number.isSafeInteger(observed.expiresAt) || observed.expiresAt < 0 || (!allowExpired && observed.expiresAt <= now)))) throw new ConnectionError("invalid_input");
   }
   observe(id: string, revision: number, resource: string, generation: number, observed: ProviderObservation, operation?: Operation, verificationEpoch?: number): void {
+    this.recordObservation(id, revision, resource, generation, observed, false, operation, verificationEpoch);
+  }
+  reconcileObservation(operation: Operation, observed: ProviderObservation): void {
+    this.recordObservation(operation.connectionId, operation.revision, operation.resource, operation.generation, observed, true, operation);
+  }
+  private recordObservation(id: string, revision: number, resource: string, generation: number, observed: ProviderObservation,
+    allowDisabled: boolean, operation?: Operation, verificationEpoch?: number): void {
     this.db.transaction(() => {
-      const c = this.current(id, revision, resource); const now = this.tick(id);
-      this.validateObservation(observed, now);
+      const c = this.current(id, revision, resource, allowDisabled); const now = this.tick(id);
+      this.validateObservation(observed, now, allowDisabled);
+      const expired = observed.expiresAt !== null && observed.expiresAt <= now;
       const s = this.sub(id, resource, generation);
       if (verificationEpoch !== undefined && s.verificationEpoch !== verificationEpoch) throw new ConnectionError("revision_conflict");
       if ((s.revision !== revision && operation !== undefined) || s.state === "stopped" || s.state === "stop_candidate" ||
@@ -215,15 +225,15 @@ export class ConnectionRegistry {
         if (saved.state === "done") return;
         this.db.prepare("UPDATE connection_operations SET state='done' WHERE id=?").run(operation.id);
       }
-      this.db.prepare(`UPDATE connection_subscriptions SET revision=?,provider_id=?,state=?,verified_at=?,expires_at=?,renewal_window_ms=?,last_reconcile_at=?,error=NULL
-        WHERE connection_id=? AND resource=? AND generation=?`).run(revision, observed.providerId, observed.verified ? "active" : "verification_pending",
-        observed.verified ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0, now, id, resource, generation);
-      if (observed.verified) {
-        this.db.prepare("UPDATE connections SET state='active' WHERE id=?").run(id);
+      this.db.prepare(`UPDATE connection_subscriptions SET revision=?,provider_id=?,state=?,verified_at=?,expires_at=?,renewal_window_ms=?,last_reconcile_at=?,error=?
+        WHERE connection_id=? AND resource=? AND generation=?`).run(revision, observed.providerId, expired ? "expiring" : observed.verified ? "active" : "verification_pending",
+        observed.verified && !expired ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0, now, expired ? "expired" : null, id, resource, generation);
+      if (observed.verified && !expired) {
+        this.db.prepare("UPDATE connections SET state='active' WHERE id=? AND state!='disabled'").run(id);
         if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1
           WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND state IN ('active','expiring')`).run(id, resource, generation, revision);
       }
-      if (!observed.verified && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
+      if ((!observed.verified || expired) && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state!='disabled'").run(id);
       this.audit(c, "observed", now);
     }).immediate();
   }
@@ -247,7 +257,7 @@ export class ConnectionRegistry {
   }
   private finishStop(operation: Operation, expected: "unknown" | "inflight"): void {
     this.db.transaction(() => {
-      const c = this.current(operation.connectionId, operation.revision, operation.resource);
+      const c = this.current(operation.connectionId, operation.revision, operation.resource, expected === "unknown");
       const now = this.tick(c.id);
       const saved = this.operations(c.id).find((o) => o.id === operation.id);
       if (!saved || saved.kind !== "stop" || saved.state !== expected) throw new ConnectionError("invalid_transition");
@@ -354,13 +364,13 @@ export class ConnectionRegistry {
     const connections = this.db.prepare("SELECT id,state FROM connections").all() as {id: string; state: string}[];
     const relevant = (id: string) => {
       const c = this.get(id);
-      return this.subscriptions(id).filter((s) => s.state !== "stopped" && c.allowlist.some((entry) => entry.resource === s.resource));
+      return this.subscriptions(id).filter((s) => s.state !== "stopped" && s.revision === c.revision && c.allowlist.some((entry) => entry.resource === s.resource));
     };
     let expiring = 0;
     for (const {id} of connections) {
       const c = this.get(id);
       if (c.state === "disabled") continue;
-      for (const s of relevant(id)) if (s.state === "active" && s.expiresAt !== null &&
+      for (const s of relevant(id)) if (["active","expiring"].includes(s.state) && s.expiresAt !== null &&
         now >= s.expiresAt - s.renewalWindowMs) expiring++;
     }
     const count = (state: string) => connections.filter((c) => c.state === state).length;

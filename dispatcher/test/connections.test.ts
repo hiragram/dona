@@ -512,3 +512,40 @@ test("allowlistのsubscription未作成/未再検証resourceをhealth pendingに
   db.connections.revise("pilot",2,configuration);await lifecycle.verify("pilot","folder1",1);
   assert.equal(db.connections.health().pending,1);assert.equal(db.connections.health().ready,false);
 });
+
+test("create応答不明はdisable/restart後もlookupでき、期限切れでも再enableしない",async(t)=>{
+  for(const expired of [false,true]){
+    const {db,driver,lifecycle,clock,file}=fixture(t);driver.loss=true;
+    const op=await lifecycle.createOrRenew("pilot","folder1");db.connections.disable("pilot",1);
+    if(expired)driver.observations.get(op.id)!.expiresAt=clock.now()-1;
+    const reopened=new DispatcherDatabase(file,clock);t.after(()=>reopened.close());
+    const recovery=new ConnectionLifecycle(reopened.connections,driver,{authorize:async()=>true},20);
+    await recovery.reconcile("pilot",op.id);
+    assert.equal(reopened.connections.operations("pilot")[0]!.state,"done");
+    assert.equal(reopened.connections.subscriptions("pilot")[0]!.providerId,"channel1");
+    assert.equal(reopened.connections.get("pilot").state,"disabled");assert.equal(reopened.connections.health().unknown,0);
+    assert.throws(()=>reopened.enqueueExternal(event(),binding()),/disabled/);
+    await assert.rejects(recovery.createOrRenew("pilot","folder1"),/disabled/);assert.equal(driver.creates,1);
+  }
+});
+
+test("stop応答不明をdisable後にprovider ID付きで照合する",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  clock.value+=9000;driver.cutover=true;await lifecycle.createOrRenew("pilot","folder1");
+  driver.stop=async()=>{driver.stops++;throw new Error("response lost");};
+  const op=await lifecycle.stop("pilot","folder1",1);db.connections.disable("pilot",1);
+  driver.lookup=async(_c,operation)=>{assert.equal(operation.providerId,"channel1");return null;};
+  await lifecycle.reconcile("pilot",op.id);
+  assert.equal(db.connections.get("pilot").state,"disabled");assert.equal(db.connections.subscriptions("pilot")[0]!.state,"stopped");
+  assert.equal(db.connections.health().unknown,0);assert.equal(driver.stops,1);
+});
+
+test("healthは新revisionの有効subscriptionがあれば旧revisionの残存状態を数えない",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);const capability:Capability={kind:"manual",cursor:false};
+  driver.capability=capability;db.connections.revise("pilot",1,{...config,capability});
+  db.connections.attachManual("pilot",2,"folder1","old-id",clock.now()+1000);
+  db.connections.revise("pilot",2,{...config,capability});
+  db.connections.attachManual("pilot",3,"folder1","new-id",null);await lifecycle.verify("pilot","folder1",2);
+  assert.equal(db.connections.health().pending,0);assert.equal(db.connections.health().degraded,0);assert.equal(db.connections.health().expiring,0);
+  assert.equal(db.connections.health().ready,true);
+});

@@ -56,7 +56,7 @@ export const deliverySchema = z.strictObject({
 });
 export interface Operation {
   id: string; connectionId: string; resource: string; generation: number; revision: number;
-  kind: "create" | "stop"; leaseUntil: number;
+  kind: "create" | "stop"; leaseUntil: number; providerId: string | null;
 }
 export interface ProviderObservation {
   providerId: string; expiresAt: number | null; verified: boolean; cutoverConfirmed: boolean;
