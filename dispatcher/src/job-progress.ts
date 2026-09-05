@@ -35,7 +35,7 @@ export function safeProgressText(progress: JobProgressEnvelope): string {
   return phaseLabels[progress.phase];
 }
 
-interface ProgressRow { job_id: string; sequence: number; phase: JobProgressEnvelope["phase"]; safe_summary: string; status: "pending"|"delivering"|"delivered"|"unknown"; available_at: string; terminal_checked:number; }
+interface ProgressRow { job_id: string; sequence: number; phase: JobProgressEnvelope["phase"]; safe_summary: string; status: "pending"|"delivering"|"delivered"|"unknown"; available_at: string; delivered_at?:string; terminal_checked:number; }
 
 export class JobProgressStore {
   private readonly db: Database.Database;
@@ -68,11 +68,14 @@ export class JobProgressStore {
       return false;
     }
     const timestamp = at.toISOString();
+    const availableAt = existing?.delivered_at
+      ? new Date(Math.max(at.getTime(), Date.parse(existing.delivered_at) + 30_000)).toISOString()
+      : timestamp;
     this.db.prepare(`INSERT INTO job_progress(job_id,sequence,phase,safe_summary,updated_at,status,available_at)
       VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,phase=excluded.phase,
       safe_summary=excluded.safe_summary,updated_at=excluded.updated_at,status='pending',available_at=CASE WHEN job_progress.status='pending' AND job_progress.available_at>excluded.available_at THEN job_progress.available_at ELSE excluded.available_at END,
       delivered_at=NULL,last_error=NULL,terminal_checked=0 WHERE excluded.sequence > job_progress.sequence AND job_progress.status NOT IN ('unknown','delivering')`)
-      .run(progress.job_id, progress.sequence, progress.phase, progress.safe_summary, progress.updated_at, timestamp);
+      .run(progress.job_id, progress.sequence, progress.phase, progress.safe_summary, progress.updated_at, availableAt);
     return this.get(progress.job_id)?.sequence === progress.sequence;
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
