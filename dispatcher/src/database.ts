@@ -1343,8 +1343,11 @@ export class DispatcherDatabase {
   manualComplete(eventId: string, at = new Date()): EventRow {
     return this.db.transaction(() => {
       const row = this.getRequired(eventId);
-      if (row.status === "completed") return row;
       const timestamp = at.toISOString();
+      if (row.status === "completed") {
+        this.sealJobGroupIfPresent(eventId, timestamp);
+        return row;
+      }
       const result: ResultEnvelope = {
         schema_version: 1,
         event_id: eventId,
@@ -1359,9 +1362,7 @@ export class DispatcherDatabase {
             last_error_code = NULL, last_error_message = NULL, updated_at = ?
           WHERE event_id = ?
         `).run(stableStringify(result), timestamp, timestamp, eventId);
-      if (["dispatching", "waiting_agent"].includes(row.status)) {
-        this.sealJobGroupIfPresent(eventId, timestamp);
-      }
+      this.sealJobGroupIfPresent(eventId, timestamp);
       return this.getRequired(eventId);
     }).immediate();
   }
@@ -1374,9 +1375,7 @@ export class DispatcherDatabase {
         UPDATE events SET status = 'dead_letter', last_error_code = 'operator_dead_letter',
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `).run(timestamp, eventId);
-      if (["dispatching", "waiting_agent"].includes(row.status)) {
-        this.sealJobGroupIfPresent(eventId, timestamp);
-      }
+      this.sealJobGroupIfPresent(eventId, timestamp);
       return this.getRequired(eventId);
     }).immediate();
   }
