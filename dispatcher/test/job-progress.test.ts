@@ -20,6 +20,20 @@ test("summary is normalized and secret-like content falls back to phase", () => 
   assert.equal(safeProgressText({ ...valid, safe_summary: "  テスト\n実行中  " }), "テスト 実行中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "token=secret" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "https://example.com" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "xapp-real-secret" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "github_pat_real_secret" }), "テスト中");
+});
+
+test("definite pre-delivery failure returns to pending with backoff", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-retry-"));
+  const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
+  try {
+    store.ingest(valid, new Date("2026-09-05T00:00:00Z")); store.begin("job_abc");
+    store.retry("job_abc", "adapter unavailable", new Date("2026-09-05T00:00:00Z"));
+    assert.equal(store.get("job_abc")?.status, "pending");
+    assert.equal(store.pending(new Date("2026-09-05T00:00:04Z")), undefined);
+    assert.equal(store.pending(new Date("2026-09-05T00:00:05Z"))?.job_id, "job_abc");
+  } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
 test("store is monotonic, coalesces pending updates, and fences unknown delivery", async () => {

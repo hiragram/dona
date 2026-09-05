@@ -11,7 +11,7 @@ import { jobProgressPhases, type JobProgressEnvelope, type JobRow } from "./type
 import { readPrivateToken } from "./private-token.js";
 
 const terminalStatuses = new Set(["blocked", "completed", "failed", "cancelled", "needs_review"]);
-const secretLike = /(?:xox[baprs]-|gh[pousr]_|bearer\s+|token\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
+const secretLike = /(?:xox[baprs]-|xapp-|gh[pousr]_|github_pat_|bearer\s+|token\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
 const phaseLabels: Record<JobProgressEnvelope["phase"], string> = {
   preparing: "準備中", implementing: "実装中", testing: "テスト中", reviewing: "レビュー中",
   waiting_ci: "CI待ち", reconciling: "状態を照合中",
@@ -72,6 +72,7 @@ export class JobProgressStore {
   begin(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivering' WHERE job_id=? AND status='pending'").run(jobId); }
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
+  retry(jobId: string, error: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+5_000).toISOString(),error.slice(0,500),jobId); }
   terminal(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status IN ('pending','delivering')").run(jobId); }
 }
 
@@ -96,11 +97,18 @@ export class JobProgressCoordinator {
     const index = siblings.findIndex((item) => item.job_id === job.job_id) + 1;
     const status = siblings.length > 1 ? `${siblings.length}件中${index}件目: ${progress.safe_summary}` : progress.safe_summary;
     this.store.begin(progress.job_id);
+    let requestStarted = false;
     try {
-      const token = await readPrivateToken(this.config.updateInternalTokenPath); if (!token) throw new Error("missing internal token");
+      const token = await readPrivateToken(this.config.updateInternalTokenPath);
+      if (!token) { this.store.retry(progress.job_id, "missing internal token"); return; }
       const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:`${job.job_id}:${progress.sequence}`, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts, status }));
-      await new Promise<void>((resolve,reject) => { const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ const chunks:Buffer[]=[]; response.on("data",(chunk:Buffer)=>chunks.push(chunk)); response.on("end",()=>response.statusCode===200?resolve():reject(new Error(`HTTP ${response.statusCode}`)));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(new Error("timeout"))); request.once("error",reject); request.end(body); });
+      await new Promise<void>((resolve,reject) => { const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; const chunks:Buffer[]=[]; response.on("data",(chunk:Buffer)=>chunks.push(chunk)); response.on("end",()=>response.statusCode===200?resolve():reject(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403].includes(response.statusCode??0)})));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",reject); request.end(body); });
       this.store.delivered(progress.job_id);
-    } catch (error) { this.store.unknown(progress.job_id, error instanceof Error ? error.message : String(error)); }
+    } catch (error) {
+      const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean };
+      const definitelyUnsent = detail.definitelyUnsent || (!requestStarted && ["ENOENT","ECONNREFUSED"].includes(detail.code ?? ""));
+      if (definitelyUnsent) this.store.retry(progress.job_id, detail.message);
+      else this.store.unknown(progress.job_id, detail.message);
+    }
   }
 }

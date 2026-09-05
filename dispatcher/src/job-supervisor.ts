@@ -186,7 +186,14 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       this.publishNotifications();
-      await this.progress?.report();
+      try {
+        await this.progress?.report();
+      } catch (error) {
+        this.logger.warn("Job progress reporting cycle failed", {
+          error_code: "job_progress_cycle_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
       try {
         this.scheduleRunnableJobs();
       } catch (error) {
@@ -389,7 +396,16 @@ export class JobSupervisor {
   private async monitor(row: JobRow): Promise<void> {
     await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
     if (await this.tryComplete(row, false)) return;
+    let keepPolling = true;
+    const pollProgress = (async () => {
+      while (keepPolling && !this.stopping) {
+        await new Promise((resolve) => setTimeout(resolve, this.config.queuePollMs));
+        if (keepPolling) await this.progress?.ingest(this.database.getJob(row.job_id) ?? row);
+      }
+    })();
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
+    keepPolling = false;
+    await pollProgress;
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
