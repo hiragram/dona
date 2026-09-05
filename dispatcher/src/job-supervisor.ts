@@ -81,6 +81,7 @@ export class JobSupervisor {
   private nextRunnableScanAt = 0;
   private nextSchedulerStatsAt = 0;
   private loopPromise: Promise<void> | undefined;
+  private progressLoopPromise: Promise<void> | undefined;
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
@@ -91,7 +92,7 @@ export class JobSupervisor {
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
     private readonly wakeEventWorker: () => void,
-    private readonly progress?: JobProgressCoordinator,
+    private progress?: JobProgressCoordinator,
   ) {}
 
   isRunning(): boolean {
@@ -109,6 +110,7 @@ export class JobSupervisor {
       });
       throw error;
     });
+    if (this.progress) this.progressLoopPromise = this.progressLoop();
   }
 
   recoverStaleJobs(): void {
@@ -123,6 +125,8 @@ export class JobSupervisor {
     }
   }
 
+  disableProgress(): void { this.progress = undefined; }
+
   wake(): void {
     this.nextRunnableScanAt = 0;
     this.wakeSignal.wake();
@@ -133,6 +137,7 @@ export class JobSupervisor {
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
+    await this.progressLoopPromise;
     await Promise.allSettled([...this.controls.values()]);
     await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
     this.running = false;
@@ -203,14 +208,6 @@ export class JobSupervisor {
     while (!this.stopping) {
       this.publishNotifications();
       try {
-        await this.progress?.report();
-      } catch (error) {
-        this.logger.warn("Job progress reporting cycle failed", {
-          error_code: "job_progress_cycle_failed",
-          error_message: error instanceof Error ? error.message : String(error),
-        });
-      }
-      try {
         this.scheduleRunnableJobs();
       } catch (error) {
         this.logger.warn("Job scheduling cycle failed", {
@@ -219,6 +216,19 @@ export class JobSupervisor {
         });
       }
       await this.wakeSignal.wait(this.config.queuePollMs);
+    }
+  }
+
+  private async progressLoop(): Promise<void> {
+    while (!this.stopping) {
+      try { await this.progress?.report(); }
+      catch (error) {
+        this.logger.warn("Job progress reporting cycle failed", {
+          error_code: "job_progress_cycle_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await abortableDelay(this.config.queuePollMs, this.abortController.signal);
     }
   }
 
@@ -448,17 +458,22 @@ export class JobSupervisor {
         waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
-      await this.progress?.ingest(this.database.getJob(row.job_id)!);
+      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (waited.agentStatus === "blocked") {
       this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
-      await this.progress?.ingest(this.database.getJob(row.job_id)!);
+      await this.updateTerminalProgress(row.job_id);
       return;
     }
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
       await this.tryComplete(row, true);
     }
+  }
+
+  private async updateTerminalProgress(jobId: string): Promise<void> {
+    try { await this.progress?.ingest(this.database.getJob(jobId)!); }
+    catch (error) { this.logger.warn("Terminal job progress update failed", { job_id:jobId, error_code:"job_progress_terminal_failed", error_message:error instanceof Error ? error.message : String(error) }); }
   }
 
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {

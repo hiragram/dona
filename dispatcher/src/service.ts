@@ -38,7 +38,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   let jobSupervisor!: JobSupervisor;
-  const jobProgress = jobProgressStore
+  let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
@@ -51,7 +51,17 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobProgress,
   );
   jobSupervisor.recoverStaleJobs();
-  await jobProgress?.recover();
+  try { await jobProgress?.recover(); }
+  catch (error) {
+    apiLogger.warn("Job progress disabled after recovery failure", {
+      error_code: "job_progress_recovery_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
+    jobProgressStore?.close();
+    jobProgressStore = undefined;
+    jobProgress = undefined;
+    jobSupervisor.disableProgress();
+  }
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,

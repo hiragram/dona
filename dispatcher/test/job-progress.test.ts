@@ -17,8 +17,8 @@ test("progress schema binds the job and allowlisted phase", () => {
   assert.throws(() => parseJobProgress({ ...valid, destination: "C123" }, "job_abc"));
 });
 
-test("summary is normalized and secret-like content falls back to phase", () => {
-  assert.equal(safeProgressText({ ...valid, safe_summary: "  テスト\n実行中  " }), "テスト 実行中");
+test("worker summary is never sent and phase is rendered as a fixed label", () => {
+  assert.equal(safeProgressText({ ...valid, safe_summary: "  テスト\n実行中  " }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "token=secret" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "https://example.com" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "xapp-real-secret" }), "テスト中");

@@ -12,7 +12,6 @@ import { readPrivateToken } from "./private-token.js";
 import { jobProgressPath } from "./job-prompt.js";
 
 const terminalStatuses = new Set(["blocked", "completed", "failed", "cancelled", "needs_review"]);
-const secretLike = /(?:xox[baprs]-|xapp-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|bearer\s+|(?:token|password|passwd|secret|api[_-]?key|access[_-]?key)\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
 const phaseLabels: Record<JobProgressEnvelope["phase"], string> = {
   preparing: "準備中", implementing: "実装中", testing: "テスト中", reviewing: "レビュー中",
   waiting_ci: "CI待ち", reconciling: "状態を照合中",
@@ -31,10 +30,7 @@ export function parseJobProgress(input: unknown, expectedJobId: string): JobProg
 }
 
 export function safeProgressText(progress: JobProgressEnvelope): string {
-  const normalized = progress.safe_summary.normalize("NFKC").replace(/[\r\n\t]+/gu, " ")
-    .replace(/[\u0000-\u001f\u007f]/gu, "").replace(/\s+/gu, " ").trim();
-  if (!normalized || normalized.length > 80 || secretLike.test(normalized)) return phaseLabels[progress.phase];
-  return normalized;
+  return phaseLabels[progress.phase];
 }
 
 interface ProgressRow { job_id: string; sequence: number; phase: JobProgressEnvelope["phase"]; safe_summary: string; status: "pending"|"delivering"|"delivered"|"unknown"; available_at: string; }
