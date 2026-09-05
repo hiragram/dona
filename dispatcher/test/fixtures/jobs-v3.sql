@@ -46,19 +46,19 @@
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
         last_error_code, last_error_message, created_at, updated_at
       FROM jobs;
-    
+
 
       DROP TABLE jobs;
       ALTER TABLE jobs_v3 RENAME TO jobs;
       CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
       CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
-      
+
   CREATE INDEX jobs_runnable_fair_idx
     ON jobs(source_event_id, created_at, job_id, available_at)
     WHERE status = 'queued'
 ;
-    
+
 
       CREATE TABLE job_groups (
         source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
@@ -94,5 +94,5 @@
       FROM jobs
       JOIN events ON events.event_id = jobs.source_event_id
       GROUP BY jobs.source_event_id;
-    
+
 PRAGMA user_version = 3;
