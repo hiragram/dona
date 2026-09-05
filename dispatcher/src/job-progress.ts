@@ -190,7 +190,7 @@ export class JobProgressCoordinator {
         if(detail.retryAfterSeconds!==undefined)this.store.deferWorkspace(job.workspace_id,new Date(at.getTime()+Math.max(5,detail.retryAfterSeconds)*1_000));
         this.store.retry(progress.job_id, detail.message, at, detail.retryAfterSeconds);
       }
-      else this.store.unknown(progress.job_id, detail.message);
+      else { await this.drainAdapter(); this.store.unknown(progress.job_id, detail.message); }
     } finally {
       finishDelivery();
       this.deliveryOperations.delete(progress.job_id);
@@ -216,7 +216,7 @@ export class JobProgressCoordinator {
 
   private async drainAdapter():Promise<void> {
     const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");
-    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});request.setTimeout(Math.max(this.config.jobCommandTimeoutMs,30_000),()=>request.destroy(new Error("progress drain timeout")));request.once("error",reject);request.end();});
+    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED","ECONNRESET"].includes(error.code??"")?resolve():reject(error));request.end();});
   }
 
   resolveDelivery(progressId: string, deliveryToken: string): { progress_id:string; workspace_id:string; channel_id:string; thread_ts:string; status:string } | undefined {

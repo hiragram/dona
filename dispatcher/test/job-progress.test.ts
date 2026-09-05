@@ -176,6 +176,14 @@ test("restart fences a delivery that may have reached Slack", async () => {
   finally { store.close(); await fs.rm(root,{recursive:true}); }
 });
 
+test("recovery tolerates an Adapter that has not started yet", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-adapter-absent-")); const tokenPath=path.join(root,"token"); await fs.writeFile(tokenPath,"a".repeat(64),{mode:0o600}); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    const coordinator=new JobProgressCoordinator({} as never,store,{updateInternalTokenPath:tokenPath,slackAdapterSocketPath:path.join(root,"missing.sock")} as never,{} as never);
+    await coordinator.recover();
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); PRAGMA user_version=1;"); legacy.close();
