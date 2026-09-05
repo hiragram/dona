@@ -90,3 +90,23 @@ test("Skill内のrelative Markdown linkはすべて解決できる", () => {
     }
   }
 });
+
+test("integration childは実際のmerge先とIssue完了点を明示する", () => {
+  const issueContract = fs.readFileSync(
+    path.join(skillDirectory, "references", "issue-contract.md"),
+    "utf8",
+  );
+  const integrationWorkflow = fs.readFileSync(
+    path.join(skillDirectory, "references", "integration-feature-workflow.md"),
+    "utf8",
+  );
+
+  assert.match(issueContract, /Issue全体の完了点.*実装PRを上記feature branchへmergeした時点.*integration PRをdefault branchへmergeした時点/);
+  assert.match(issueContract, /前者.*child単独のacceptanceとtest.*feature branch上で完結.*実装PRで`Closes #<child>`を使用できる/);
+  assert.match(issueContract, /後者.*child実装PR.*部分対応.*`Closes`を使用しない/);
+  assert.match(issueContract, /branch名.*integration PR link.*base指定だけを完了点の証拠にしない/);
+
+  assert.match(integrationWorkflow, /childごとにIssue全体の完了点.*feature branchへの実装PR merge.*default branchへのintegration PR merge/);
+  assert.match(integrationWorkflow, /`child_completion_point`.*Issue番号.*execution context/);
+  assert.match(integrationWorkflow, /全child Issue.*merge-target branch.*integration PR link.*`child_completion_point`.*`Closes`可否/);
+});

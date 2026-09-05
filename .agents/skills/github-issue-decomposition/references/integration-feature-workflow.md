@@ -42,6 +42,7 @@ PRを一意に検証できたら、`integration_pr_number`と`integration_pr_url
 - 実装PRのmerge先としてexact feature branch名をcode表記する。
 - integration PRをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 子Issueの実装PRはdefault branchではなくexact feature branchをbaseにする、と明記する。
+- childごとにIssue全体の完了点を`feature branchへの実装PR merge`または`default branchへのintegration PR merge`へ固定する。前者はchildのacceptanceと必須testがfeature branch上で独立して完了すると確認できる場合だけ選び、実装PRで`Closes #<child>`を使用できる。後者ではchild実装PRを部分対応として扱い、`Closes`を使用しない。この`child_completion_point`をIssue番号と結び付けてexecution contextへ追加する。
 
 各作成responseのURL、Issue番号、REST `id`、acceptanceを記録してから次へ進む。acceptance unknown時は親Issueと同じく再取得・照合し、blind retryしない。
 
@@ -65,6 +66,6 @@ PRを一意に検証できたら、`integration_pr_number`と`integration_pr_url
 - 親Issue番号・URL。
 - exact feature branch、起点となった最新default branch commit、空commit SHA、remote head。
 - integration PR番号・URL・base・head・state・non-draft状態・exact `Closes #<親Issue番号>`の存在。
-- 全child Issueと、各bodyに記載したmerge-target branch、integration PR link。
+- 全child Issueと、各bodyに記載したmerge-target branch、integration PR link、`child_completion_point`、実装PRでの`Closes`可否。
 - 両方向で検証したnative parent topology、最小blocker edge、parallel lane。
 - partialまたはambiguous failure、未完了resource、次の安全なaction。部分的にしか検証できないworkflowを完了扱いしない。

@@ -53,6 +53,7 @@ acceptance criteriaだけでIssueを独立してreviewできるようにする�
 - 実装PRのmerge先となるexact feature branch名。例: `feature/foo-bar`。
 - feature branchからdefault branchへのintegration PR番号とURLをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 実装PRのbaseはdefault branchではなく、上記feature branchであること。
+- Issue全体の完了点を、`実装PRを上記feature branchへmergeした時点`または`integration PRをdefault branchへmergeした時点`のどちらかへ明示的に固定する。前者はchild単独のacceptanceとtestがfeature branch上で完結するときだけ選び、実装PRで`Closes #<child>`を使用できる。後者を選ぶ場合、child実装PRは部分対応として`Closes`を使用しない。branch名、integration PR link、base指定だけを完了点の証拠にしない。
 
 ## Decision/ADR Issueの記述
 
