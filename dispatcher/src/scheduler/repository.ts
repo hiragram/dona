@@ -58,7 +58,7 @@ function validateReceipt(value: string): void {
   // Slack message timestamps contain a decimal point; URLs and bodies are not receipt IDs.
   if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || hasCredentialPattern(value)) throw new Error("invalid_receipt");
 }
-function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-/i.test(value); }
+function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
@@ -191,7 +191,9 @@ export class SchedulerRepository {
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, now);
-      if (input.authorization_revision !== expectedRevision + 1 || input.authorization_id === previousRevision.authorization_id) throw new Error("authorization_revision_conflict");
+      const reusedAuthorization = this.db.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = ? AND authorization_id = ? LIMIT 1")
+        .get(scheduleId, input.authorization_id);
+      if (input.authorization_revision !== expectedRevision + 1 || reusedAuthorization) throw new Error("authorization_revision_conflict");
       this.suppress(scheduleId, updateAt, "revision_replaced");
       this.retireRevisions(scheduleId, updateAt, expectedRevision);
       this.insertRevision(scheduleId, expectedRevision + 1, input, updateAt);
@@ -209,8 +211,8 @@ export class SchedulerRepository {
       if ((operation === "pause" && before.state !== "active") || (operation === "resume" && before.state !== "paused") ||
           (operation === "cancel" && ["cancelled", "completed"].includes(before.state))) throw new Error("invalid_transition");
       const old = this.revision(before);
-      if (operation === "resume" && (old.expires_at <= now || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= now))) throw new Error("authorization_expired");
       const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
+      if (operation === "resume" && (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
       // Every mutation advances the concurrency revision; copying a paused snapshot never extends its authorization.
       const revision = expectedRevision + 1;
       this.db.prepare(`INSERT INTO schedule_revisions SELECT schedule_id, ?, recurrence_json, recurrence_hash, policy_json,
@@ -281,7 +283,7 @@ export class SchedulerRepository {
   }
   setRunState(runId: string, expected: Run["status"], next: "started" | "completed" | "failed" | "cancelled",
     actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null): Run {
-    utc(now); if (jobId !== null) id(jobId); if (resultContent !== null) safeContent(resultContent, 2000);
+    utc(now); if (jobId !== null) id(jobId);
     const result = this.db.transaction(() => {
       const run = this.getRun(runId);
       if (!run || run.status !== expected) throw new Error("run_conflict");
@@ -321,6 +323,7 @@ export class SchedulerRepository {
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
       if (workCompletion && hasTarget && notificationReason === null) {
         if (resultContent === null) throw new Error("result_content_required");
+        safeContent(resultContent, 2000);
         this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, resultContent, transitionAt);
       }
       const suppressed = next === "cancelled" || next === "failed"
@@ -336,10 +339,10 @@ export class SchedulerRepository {
       for (const row of suppressed) this.auditOutbox(row, `outbox_run_${next}`, transitionAt);
       this.audit(current, current, `run_${next}`, actor, transitionAt, undefined, this.getRun(runId)!);
       if (workCompletion && hasTarget && notificationReason !== null) {
-        this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, now, undefined, this.getRun(runId)!);
+        this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, transitionAt, undefined, this.getRun(runId)!);
       }
-      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) this.expireSchedule(current, actor, now);
-      this.completeIfDrained(run.schedule_id, now);
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= transitionAt) this.expireSchedule(current, actor, transitionAt);
+      this.completeIfDrained(run.schedule_id, transitionAt);
       return this.getRun(runId)!;
     }).immediate();
     if (!result) throw new Error("run_not_authorized");
@@ -425,8 +428,11 @@ export class SchedulerRepository {
       : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= now) ? "cancelled"
       : null;
     if (reason === null) return false;
-    if (reason === "authorization_expired") this.expireSchedule(schedule,
-      { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, terminalAt);
+    if (reason === "authorization_expired") {
+      this.expireSchedule(schedule,
+        { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, terminalAt);
+      return true;
+    }
     this.db.prepare(`UPDATE connector_outbox SET status = ?, terminal_at = ?, updated_at = ?,
       content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
       .run(reason === "retry_expired" ? "failed" : "cancelled", terminalAt, terminalAt, add(terminalAt, 604800), row.outbox_id);
