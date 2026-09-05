@@ -56,7 +56,7 @@ function utc(value: string): void {
 function id(value: string): void { if (!/^[A-Za-z0-9_:-]{1,160}$/.test(value)) throw new Error("invalid_identity"); }
 function validateReceipt(value: string): void {
   // Slack message timestamps contain a decimal point; URLs and bodies are not receipt IDs.
-  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || /^xox[baprs]-|^xapp-/i.test(value)) throw new Error("invalid_receipt");
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || /xox[baprs]-|xapp-/i.test(value)) throw new Error("invalid_receipt");
 }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || /xox[baprs]-|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
@@ -141,9 +141,12 @@ export class SchedulerRepository {
     const auditRun = outbox ? this.getRun(outbox.run_id)! : run;
     const snapshot = this.revision(auditRun ?? after);
     const metadata = (row: Schedule) => ({ state: row.state, revision: row.revision, next_due: row.next_due, high_watermark: row.high_watermark });
+    const revisionMetadata = (revision: Revision) => ({ action: revision.action, policy_version: revision.policy_version,
+      tzdb_version: revision.tzdb_version, content_hash: revision.content_hash, recurrence_hash: revision.recurrence_hash });
     this.db.prepare(`INSERT INTO schedule_audit(schedule_id, revision, tenant_id, actor_id, source_event_id,
       operation, before_json, after_json, created_at) VALUES (?,?,?,?,?,?,?,?,?)`).run(after.schedule_id, snapshot.revision,
-      after.tenant_id, actor.actor_id, actor.source_event_id, operation, before ? JSON.stringify(metadata(before)) : null,
+      after.tenant_id, actor.actor_id, actor.source_event_id, operation,
+      before ? JSON.stringify({ ...metadata(before), ...revisionMetadata(this.revision(before)) }) : null,
       JSON.stringify({ ...metadata(after), operation_revision: snapshot.revision, action: snapshot.action, policy_version: snapshot.policy_version, tzdb_version: snapshot.tzdb_version, content_hash: outbox?.content_hash ?? snapshot.content_hash, recurrence_hash: snapshot.recurrence_hash,
         ...(compactSkip ? { compact_skip: { from: compactSkip.from, through: compactSkip.through, count: compactSkip.count, reason: "misfire" } } : {}),
         ...(auditRun ? { run: { run_id: auditRun.run_id, revision: auditRun.revision, status: auditRun.status, reason: auditRun.reason, event_id: auditRun.event_id, job_id: auditRun.job_id } } : {}),
@@ -356,7 +359,7 @@ export class SchedulerRepository {
       (revision === undefined ? "" : " AND revision = ?")).all(...(revision === undefined ? [scheduleId] : [scheduleId, revision])) as
       { revision: number; expires_at: string; terminal_at: string | null; content_delete_at: string | null }[];
     for (const row of rows) {
-      const endedAt = [row.expires_at, row.terminal_at ?? now, now].sort()[0]!;
+      const endedAt = row.terminal_at ?? [row.expires_at, now].sort()[0]!;
       const deadline = add(endedAt, 604800);
       this.db.prepare("UPDATE schedule_revisions SET terminal_at = ?, content_delete_at = ? WHERE schedule_id = ? AND revision = ?")
         .run(endedAt, row.content_delete_at !== null && row.content_delete_at < deadline ? row.content_delete_at : deadline, scheduleId, row.revision);

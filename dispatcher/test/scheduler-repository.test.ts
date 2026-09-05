@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -82,6 +83,11 @@ test("createとauditがatomic、revision conflict・不正遷移・tenant越境�
   const audit = JSON.stringify(repo.auditHistory("s1"));
   assert.ok(!audit.includes(input.content)); assert.ok(!audit.includes("変更後本文")); assert.ok(!audit.includes("C_TEST"));
   assert.deepEqual((repo.auditHistory("s1") as { operation: string }[]).map(x => x.operation), ["create", "pause", "update"]);
+  const updateAudit = (repo.auditHistory("s1") as { operation: string; before_json: string }[]).find(x => x.operation === "update")!;
+  assert.deepEqual(JSON.parse(updateAudit.before_json), { state: "paused", revision: 2, next_due: due, high_watermark: null,
+    action: input.action, policy_version: 1, tzdb_version: input.tzdb_version,
+    content_hash: createHash("sha256").update(input.content).digest("hex"),
+    recurrence_hash: createHash("sha256").update(input.recurrence_json).digest("hex") });
 });
 
 test("dueとoutboxを原子的に物化、duplicate wakeとrevision変更をまたぐ一意性", () => {
@@ -524,6 +530,26 @@ test("長期利用revisionのmetadataは作成日ではなく終了から30日�
   assert.ok(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 1").get());
   repo.purge("2026-11-03T00:00:00Z");
   assert.equal(raw.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 1").get(), undefined);
+});
+
+test("retire済みrevisionは時計後退でもterminalと削除期限を巻き戻さない", () => {
+  const { repo, raw } = setup();
+  repo.create("clock", input, due, actor, now);
+  repo.transition("clock", 1, "pause", actor, "2026-09-05T00:00:30Z");
+  const before = raw.prepare("SELECT terminal_at, content_delete_at FROM schedule_revisions WHERE schedule_id = 'clock' AND revision = 1").get();
+  repo.update("clock", 2, { ...input, authorization_id: "clock_new", authorization_revision: 3 }, later, actor, "2026-09-05T00:00:10Z");
+  const after = raw.prepare("SELECT terminal_at, content_delete_at FROM schedule_revisions WHERE schedule_id = 'clock' AND revision = 1").get();
+  assert.deepEqual(after, before);
+});
+
+test("receiptの任意位置に埋め込まれたSlack tokenを保存前に拒否", () => {
+  const { repo, raw } = setup(); repo.create("secret_receipt", input, due, actor, now); repo.materialize("secret_receipt", 1, due, later, due, actor);
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  for (const receipt of ["proof:xoxb-secret", "prefix_xapp-secret"]) {
+    assert.throws(() => repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, receipt), /invalid_receipt/);
+    assert.throws(() => repo.reconcile(claim.outbox_id, "failed", receipt, { ...actor, role: "admin" }, due), /invalid_receipt/);
+  }
+  assert.equal((raw.prepare("SELECT receipt_id FROM connector_outbox WHERE outbox_id = ?").get(claim.outbox_id) as { receipt_id: string | null }).receipt_id, null);
 });
 
 test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持", () => {
