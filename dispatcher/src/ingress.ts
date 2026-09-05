@@ -244,7 +244,7 @@ function isUtcRfc3339Timestamp(value: string): boolean {
     parsed.getUTCSeconds() === Number(match[6]);
 }
 
-function validateNormalized(input: NormalizedExternalEvent): NormalizedExternalEvent {
+export function validateNormalizedExternalEvent(input: NormalizedExternalEvent): NormalizedExternalEvent {
   if (
     !input.providerEventId.trim() || input.providerEventId.length > 512 ||
     !input.type.trim() || input.type.length > 128 ||
@@ -360,7 +360,7 @@ export class ExternalIngressProcessor {
         Promise.resolve().then(() => registration.normalize(request, verified)),
         remainingProcessingTime(processingDeadline),
       );
-      normalized = validateNormalized(registration.parseNormalized(candidate));
+      normalized = validateNormalizedExternalEvent(registration.parseNormalized(candidate));
       remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;

@@ -1,4 +1,5 @@
 import type { DispatcherDatabase } from "../database.js";
+import { validateNormalizedExternalEvent } from "../ingress.js";
 import { ConnectionError, type DeliveryBinding } from "./domain.js";
 import type { CursorBatch } from "./registry.js";
 
@@ -30,7 +31,13 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
     } catch {throw new ConnectionError("incomplete_batch");}
     finally {if(timer)clearTimeout(timer);}
     if(!Array.isArray(result.events)||events.length+result.events.length>limits.events) throw new ConnectionError("incomplete_batch");
-    events.push(...result.events);
+    try { events.push(...result.events.map(event=>{
+      if(event.envelope.schema_version!==1) throw new ConnectionError("incomplete_batch");
+      validateNormalizedExternalEvent({providerEventId:event.providerEventId,type:event.envelope.type,occurredAt:event.envelope.occurred_at,
+        subject:event.envelope.subject,payload:event.envelope.payload,replyTarget:event.envelope.reply_target,trace:event.envelope.trace});
+      return event;
+    })); }
+    catch { throw new ConnectionError("incomplete_batch"); }
     if(result.done===true) {
       database.commitConnectionBatch({binding,expected,checkpoint:result.checkpoint,complete:true,events}); return;
     }

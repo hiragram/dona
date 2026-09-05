@@ -22,10 +22,10 @@ event bindingはresource/generationも保持し、dispatch開始時にsubscripti
 
 NotionのUI型、GitHubのinstallation設定、FigmaのAPI管理、Driveの期限付きchannelのような差を、各pilotがこのcapabilityへ明示mappingする。すべてのproviderへrenewalを強制しない。windowはsubscriptionごとに保存する。
 
-- register → `verification_pending`。inspectで認証・provider IDを確認すると `active`。
+- register → `verification_pending`。inspectで認証・provider IDを確認すると `active`。同じsourceに登録前の未binding backlogがある場合は、先に明示処置できるようregisterを拒否する。
 - 未解決のcreate/stop、stop_candidate、またはdispatching/waiting_agent/blocked/needs_review/dead_letter eventがある間はrevision更新を拒否する。まずlookup、認可済みstop、event結果確定で既存処理を解消する。緊急停止にはrevision更新を待たずdisableを使う。
 - allowlist/credential revision更新 → `degraded`。未dispatchの旧revision eventは同じtransactionで決定的なcompleted resultへ退避してqueue容量を回収し、event/result/auditを保持する。旧revisionの通知/cursor commitは拒否する。更新前のgenerationを新credentialでread-only verifyし、新revisionへ再bindingできる。provider/accountは変更不可。初期cursorも登録時に保存し、未commitの場合も含めて `rebindCursor` に旧checkpoint/versionを指定し、tokenを保持したまま明示再bindingする。
-- resourceのinspect失敗は、そのsubscriptionのverifiedAtを消してquarantineする。他resourceの成功でconnectionがactiveへ戻っても、失敗resourceのdelivery/dispatchは再開しない。
+- resourceのinspect失敗は、そのsubscriptionのverifiedAtを消してquarantineする。parent connectionと他の正常resourceはactiveを維持し、失敗resourceのdelivery/dispatchだけを再開しない。
 - 最新generationがquarantineされ、未解決operationがない場合は、`createOrRenew`の明示認可を取り直して次generationを作成できる。自動置換は行わない。
 - verifyはallowlist・遷移可否を確認し、provider read前にpending状態とverification epochを保存する。期限切れやprovider ID不一致のobservationも失敗として隔離する。再起動時もpendingを保持し、並行verifyの遅延結果はepochで拒否する。healthはquarantine/pendingのresourceも集計する。
 - expiry-window内はinspection/healthで `expiring`。期限切れ通知は拒否する。

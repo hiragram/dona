@@ -392,6 +392,7 @@ test("resource Aの検証失敗はBの成功後もquarantineを維持する",asy
     return {providerId:s.providerId!,verified:true,cutoverConfirmed:false,expiresAt:clock.now()+10000};
   };
   await assert.rejects(lifecycle.verify("pilot","folder1",1),/not_authorized/);
+  assert.equal(db.connections.get("pilot").state,"active");
   await lifecycle.verify("pilot","folder2",1);
   assert.equal(db.connections.get("pilot").state,"active");
   assert.throws(()=>db.enqueueExternal(event("blocked"),b),/not_authorized/);
@@ -512,6 +513,21 @@ test("pollingは各pageのclock high-waterを保存する",async(t)=>{
     reads++;clock.value--;return {done:false as const,nextPage:"page2",events:[]};
   }),/clock_skew/);
   assert.equal(reads,1);assert.equal(db.connections.cursor("pilot","folder1").version,0);
+});
+
+test("未binding backlogがあるsourceのregisterを拒否する",(t)=>{
+  const {db,clock}=fixture(t);const source=externalEventSource("other");
+  db.enqueue({...event(),source,external_event_id:"legacy"},new Date(clock.now()),{connectionId:"legacy"});
+  assert.throws(()=>db.connections.register({...config,id:"other",provider:"other"}),/operation_pending/);
+});
+
+test("pollingは不正Envelopeをcursor commit前に拒否する",async(t)=>{
+  const {pollConnectionBatch}=await import("../src/connections/poll.js");
+  const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  await assert.rejects(pollConnectionBatch(db,binding(),async()=>({done:true,checkpoint:"next",events:[
+    {providerEventId:"bad",envelope:{...event("bad"),schema_version:2} as unknown as EventEnvelope},
+  ]})),/incomplete_batch/);
+  assert.equal(db.connections.cursor("pilot","folder1").version,0);assert.equal(db.list().length,0);
 });
 
 test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{

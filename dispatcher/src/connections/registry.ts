@@ -61,6 +61,7 @@ export class ConnectionRegistry {
     const config = parseConfig(input);
     return this.db.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM connections WHERE id=?").get(config.id)) throw new ConnectionError("revision_conflict");
+      if (this.db.prepare(`SELECT 1 FROM events WHERE source=? AND status IN ('queued','retryable_failed') LIMIT 1`).get(config.provider)) throw new ConnectionError("operation_pending");
       const now = this.clock.now();
       if (!Number.isSafeInteger(now) || now < 0) throw new ConnectionError("clock_skew");
       this.db.prepare("INSERT INTO connections VALUES(?,?,?,1,'verification_pending',?)")
@@ -122,7 +123,6 @@ export class ConnectionRegistry {
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET verified_at=NULL,error='verification_failed',last_reconcile_at=?
         WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
-      this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
       this.audit(c, "verification_failed", now);
     }).immediate();
   }
@@ -143,7 +143,6 @@ export class ConnectionRegistry {
       this.db.prepare(`UPDATE connection_subscriptions SET state='verification_pending',verified_at=NULL,
         verification_epoch=verification_epoch+1,last_reconcile_at=?,error=NULL
         WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
-      this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state='active'").run(id);
       return this.sub(id, resource, generation);
     }).immediate();
   }
@@ -261,7 +260,6 @@ export class ConnectionRegistry {
           WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND
             state IN ('active','expiring','verification_pending')`).run(id, resource, generation, revision);
       }
-      if ((!observed.verified || expired) && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state!='disabled'").run(id);
       this.audit(c, "observed", now);
     }).immediate();
   }
