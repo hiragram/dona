@@ -117,7 +117,7 @@ function request(
   source: string,
   body: Buffer,
   extraHeaders: Record<string, string> = {},
-): Promise<{ status: number; body: Record<string, unknown> }> {
+): Promise<{ status: number; body: Record<string, unknown>; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -138,6 +138,7 @@ function request(
           resolve({
             status: response.statusCode ?? 0,
             body: raw ? JSON.parse(raw) as Record<string, unknown> : {},
+            headers: response.headers,
           });
         });
       },
@@ -385,7 +386,9 @@ describe("external ingress contract", () => {
     await api.start();
 
     const oversized = fakeBody();
-    assert.equal((await request(config.socketPath, "fake", oversized, signedHeaders(oversized))).status, 413);
+    const oversizedResponse = await request(config.socketPath, "fake", oversized, signedHeaders(oversized));
+    assert.equal(oversizedResponse.status, 413);
+    assert.equal(oversizedResponse.headers.connection, "close");
     const small = Buffer.from("{}");
     assert.equal((await request(config.socketPath, "fake", small, signedHeaders(small))).status, 408);
     assert.equal(acknowledgements, 0);
@@ -407,7 +410,9 @@ describe("external ingress contract", () => {
       });
       socket.once("error", reject);
     });
-    assert.match(await partialResponse, /408 Request Timeout/);
+    const partial = await partialResponse;
+    assert.match(partial, /408 Request Timeout/);
+    assert.match(partial, /Connection: close/i);
     assert.equal(database.list().length, 0);
 
     await api.stop();
@@ -467,7 +472,7 @@ describe("external ingress contract", () => {
     database.close();
   });
 
-  test("rejects body-forbidden statuses and unserializable ACK bodies after persistence", async () => {
+  test("rejects invalid ACK statuses, headers, and bodies after persistence", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -485,6 +490,9 @@ describe("external ingress contract", () => {
           circular.self = circular;
           return { statusCode: 202, body: circular };
         }
+        if (attempt === 5) return { statusCode: 202, headers: { "x-provider-status": "bad\u0000value" }, body: {} };
+        if (attempt === 6) return { statusCode: 202, headers: { "x-provider-status": "bad\u0007value" }, body: {} };
+        if (attempt === 7) return { statusCode: 202, headers: { "x-provider-status": "snowman \u2603" }, body: {} };
         return definition.buildAcknowledgement(receipt);
       },
     }]);
@@ -502,7 +510,7 @@ describe("external ingress contract", () => {
     await api.start();
 
     const body = fakeBody();
-    for (let index = 0; index < 4; index += 1) {
+    for (let index = 0; index < 7; index += 1) {
       assert.equal((await request(config.socketPath, "fake", body, signedHeaders(body))).status, 503);
       assert.equal(database.list().length, 1, "the commit survives invalid acknowledgement output");
     }

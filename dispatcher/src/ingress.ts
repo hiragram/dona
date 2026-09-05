@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateHeaderName, validateHeaderValue } from "node:http";
 import { performance } from "node:perf_hooks";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
@@ -224,9 +225,14 @@ function validateAcknowledgement(input: ExternalIngressAcknowledgement): Prepare
     if (!isJsonObject(input.headers)) throw new ExternalIngressAcknowledgementError();
     for (const [name, value] of Object.entries(input.headers)) {
       if (
-        typeof value !== "string" || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
-        reservedAcknowledgementHeaders.has(name.toLowerCase()) || /[\r\n]/.test(value)
+        typeof value !== "string" || reservedAcknowledgementHeaders.has(name.toLowerCase())
       ) {
+        throw new ExternalIngressAcknowledgementError();
+      }
+      try {
+        validateHeaderName(name);
+        validateHeaderValue(name, value);
+      } catch {
         throw new ExternalIngressAcknowledgementError();
       }
       headers[name] = value;

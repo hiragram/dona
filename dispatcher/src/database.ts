@@ -32,6 +32,21 @@ function retryAt(attemptCount: number, now: Date): string {
   return new Date(now.getTime() + delay).toISOString();
 }
 
+function usesSlackReceivedAtFallback(trace: Record<string, unknown> | undefined): boolean {
+  return trace?.occurred_at_source === "received_at";
+}
+
+function storedSlackReceivedAtFallback(row: EventRow): boolean {
+  if (row.source !== "slack" || row.trace_json === null) return false;
+  try {
+    const trace = JSON.parse(row.trace_json) as unknown;
+    return trace !== null && typeof trace === "object" && !Array.isArray(trace) &&
+      (trace as Record<string, unknown>).occurred_at_source === "received_at";
+  } catch {
+    return false;
+  }
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
@@ -137,10 +152,12 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
       if (existing) {
+        const ignoreReceivedAtDifference = envelope.source === "slack" &&
+          usesSlackReceivedAtFallback(envelope.trace) && storedSlackReceivedAtFallback(existing);
         const mismatch =
           existing.schema_version !== envelope.schema_version ||
           existing.event_type !== envelope.type ||
-          existing.occurred_at !== envelope.occurred_at ||
+          (!ignoreReceivedAtDifference && existing.occurred_at !== envelope.occurred_at) ||
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;

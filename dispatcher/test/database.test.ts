@@ -50,6 +50,30 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("ignores changing receive time only for Slack events marked with timestamp fallback", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = eventEnvelope("Ev-fallback-time");
+    first.occurred_at = "2026-09-05T00:00:00.000Z";
+    first.trace = { socket_envelope_id: "env-first", occurred_at_source: "received_at" };
+    const created = database.enqueue(first);
+
+    const redelivery = eventEnvelope("Ev-fallback-time");
+    redelivery.occurred_at = "2026-09-05T00:01:00.000Z";
+    redelivery.trace = { socket_envelope_id: "env-retry", occurred_at_source: "received_at" };
+    const duplicate = database.enqueue(redelivery);
+    assert.equal(duplicate.outcome, "duplicate_same");
+    assert.equal(duplicate.payloadMismatch, false);
+    assert.equal(duplicate.row.event_id, created.row.event_id);
+    assert.equal(duplicate.row.occurred_at, first.occurred_at);
+
+    const unmarked = eventEnvelope("Ev-fallback-time");
+    unmarked.occurred_at = "2026-09-05T00:02:00.000Z";
+    assert.equal(database.enqueue(unmarked).outcome, "duplicate_conflict");
+    database.close();
+  });
+
   test("keeps schema v2 and reads existing source variants and nullable reply targets", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

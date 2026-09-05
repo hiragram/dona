@@ -19,10 +19,10 @@ raw request bytes + raw headers + receivedAt
 登録ごとに次を指定します。
 
 - `source`: `^[a-z][a-z0-9._-]{0,63}$`。`slack`、`dona_job`、`dona_update`は予約済みで、外部登録できません。
-- `maxBodyBytes`、`bodyTimeoutMs`、`processingTimeoutMs`: raw bodyと認証・正規化の有限な上限です。globalの`DONA_REQUEST_MAX_BYTES`も同時に適用されます。
+- `maxBodyBytes`、`bodyTimeoutMs`、`processingTimeoutMs`: raw bodyと認証・正規化の有限な上限です。認証と正規化は単一のprocessing deadlineを共有し、body timeoutまたはsize超過時はHTTP connectionを閉じます。globalの`DONA_REQUEST_MAX_BYTES`も同時に適用されます。
 - `authenticate`: JSON parseより先に、受信したものと同じ`Buffer`とraw header列で署名等を検証します。payload自己申告ではなく、永続設定から選んだstable `connectionId`と認証済みprincipalだけを返します。
 - `normalize` / `parseNormalized`: 認証後だけ実行します。provider固有schemaはtop-level、`subject`、`payload`、`replyTarget`をstrictにし、unknown fieldや別provider fieldを拒否します。
-- `buildAcknowledgement`: `PersistReceipt`を受けるpure formatterです。SQLite transactionが返る前には呼ばれず、2xx以外はcontract errorになります。
+- `buildAcknowledgement`: `PersistReceipt`を受けるpure formatterです。SQLite transactionが返る前には呼ばれません。JSON bodyを送れる2xxだけを許可し、204 / 205、Node HTTPが拒否するheader、serialize不能なbodyはcontract errorになります。検証時に生成したbody bytesをそのまま送信します。
 
 raw body、signature header、credential、raw principalはEvent Envelope、Result、通常logへ自動転記されません。normalizerもsecret、private callback URL、raw payloadを出力してはいけません。
 
@@ -39,6 +39,8 @@ providerのevent IDは、認証済み`connectionId`と`source`を含むSHA-256 i
 | `duplicate_conflict` | 409、provider ACK formatterは呼ばない | 同一identityの内容が異なるため既存rowを維持して停止 |
 
 認証、validation、body受信、SQLite commitが失敗した場合もprovider ACK formatterは呼びません。commit後にACK生成やresponse deliveryが失敗した場合、再送は`duplicate_same`として同じ`event_id`へ収束します。acceptance unknown時は同一event IDでread-only照合し、別IDによるblind retryをしません。
+
+Slack payloadのtimestampが不正でreceive timeへfallbackした場合は、その由来を`trace.occurred_at_source`へ記録します。同じSlack event IDの再送で両方がfallbackの場合だけ、変化するreceive timeをcanonical比較から除外し、最初に永続化した時刻を保持します。
 
 ## compatibility matrix
 

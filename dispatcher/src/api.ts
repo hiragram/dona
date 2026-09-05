@@ -40,11 +40,13 @@ class ApiRequestError extends Error {
   }
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
+function sendJson(response: ServerResponse, status: number, body: unknown, closeConnection = false): void {
   const encoded = Buffer.from(JSON.stringify(body));
+  if (closeConnection) response.shouldKeepAlive = false;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": encoded.length,
+    ...(closeConnection ? { connection: "close" } : {}),
   });
   response.end(encoded);
 }
@@ -403,11 +405,13 @@ export class DispatcherApi {
       });
     } catch (error) {
       if (error instanceof BodyTooLargeError) {
-        sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"));
-      } else if (error instanceof BodyReadTimeoutError || error instanceof ExternalIngressTimeoutError) {
+        sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"), true);
+      } else if (error instanceof BodyReadTimeoutError) {
+        sendJson(response, 408, errorBody("request_timeout", "Provider request body did not finish within its configured limit"), true);
+      } else if (error instanceof ExternalIngressTimeoutError) {
         sendJson(response, 408, errorBody("request_timeout", "Provider ingress did not finish within its configured limit"));
       } else if (error instanceof IncompleteBodyError) {
-        sendJson(response, 400, errorBody("request_incomplete", "Request body was not received completely"));
+        sendJson(response, 400, errorBody("request_incomplete", "Request body was not received completely"), true);
       } else if (error instanceof ExternalIngressAuthenticationError) {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
       } else if (error instanceof ExternalIngressValidationError) {
