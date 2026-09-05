@@ -43,10 +43,10 @@ test("definite pre-delivery failure returns to pending with backoff", async () =
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
   try {
     store.ingest(valid, new Date("2026-09-05T00:00:00Z")); store.begin("job_abc");
-    store.retry("job_abc", "adapter unavailable", new Date("2026-09-05T00:00:00Z"));
+    store.retry("job_abc", "adapter unavailable", new Date("2026-09-05T00:00:00Z"), 30);
     assert.equal(store.get("job_abc")?.status, "pending");
-    assert.equal(store.pending(new Date("2026-09-05T00:00:04Z")), undefined);
-    assert.equal(store.pending(new Date("2026-09-05T00:00:05Z"))?.job_id, "job_abc");
+    assert.equal(store.pending(new Date("2026-09-05T00:00:29Z")), undefined);
+    assert.equal(store.pending(new Date("2026-09-05T00:00:30Z"))?.job_id, "job_abc");
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
@@ -56,7 +56,8 @@ test("store is monotonic, coalesces pending updates, and fences unknown delivery
   try {
     assert.equal(store.ingest(valid), true);
     assert.equal(store.ingest({ ...valid, safe_summary: "old" }), false);
-    assert.equal(store.ingest({ ...valid, sequence: 2, phase: "reviewing", safe_summary: "レビュー中" }), true);
+    assert.equal(store.ingest({ ...valid, sequence: 2, phase: "reviewing", safe_summary: "PRをレビュー中" }), true);
+    assert.equal(store.get("job_abc")?.safe_summary, "PRをレビュー中");
     assert.equal(store.pending()?.sequence, 2);
     store.begin("job_abc");
     store.unknown("job_abc", "acceptance unknown");
@@ -68,7 +69,7 @@ test("store is monotonic, coalesces pending updates, and fences unknown delivery
 test("terminal fence suppresses an undelivered progress update", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-terminal-"));
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
-  try { store.ingest(valid); store.terminal("job_abc"); assert.equal(store.pending(), undefined); }
+  try { store.ingest(valid); store.terminal("job_abc"); assert.equal(store.pending(), undefined); assert.deepEqual(store.recoverable(), []); }
   finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 

@@ -24,7 +24,8 @@ export function parseJobProgress(input: unknown, expectedJobId: string): JobProg
   if (Object.keys(value).some((key) => !keys.includes(key)) || keys.some((key) => !(key in value)) ||
     value.schema_version !== 1 || value.job_id !== expectedJobId || !Number.isSafeInteger(value.sequence) ||
     (value.sequence as number) < 1 || !jobProgressPhases.includes(value.phase as never) ||
-    typeof value.safe_summary !== "string" || typeof value.updated_at !== "string" ||
+    typeof value.safe_summary !== "string" || value.safe_summary.length < 1 || value.safe_summary.length > 80 ||
+    /[\u0000-\u001f\u007f]/u.test(value.safe_summary) || typeof value.updated_at !== "string" ||
     !Number.isFinite(Date.parse(value.updated_at))) throw new Error("progress is invalid");
   return value as unknown as JobProgressEnvelope;
 }
@@ -65,16 +66,17 @@ export class JobProgressStore {
       VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,phase=excluded.phase,
       safe_summary=excluded.safe_summary,updated_at=excluded.updated_at,status='pending',available_at=excluded.available_at,
       delivered_at=NULL,last_error=NULL WHERE excluded.sequence > job_progress.sequence AND job_progress.status != 'unknown'`)
-      .run(progress.job_id, progress.sequence, progress.phase, safeProgressText(progress), progress.updated_at, timestamp);
+      .run(progress.job_id, progress.sequence, progress.phase, progress.safe_summary, progress.updated_at, timestamp);
     return this.get(progress.job_id)?.sequence === progress.sequence;
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
   all(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress ORDER BY job_id").all() as ProgressRow[]; }
+  recoverable(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress WHERE status!='delivered' ORDER BY job_id").all() as ProgressRow[]; }
   pending(at = new Date()): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE status='pending' AND available_at<=? ORDER BY available_at LIMIT 1").get(at.toISOString()) as ProgressRow|undefined; }
   begin(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivering' WHERE job_id=? AND status='pending'").run(jobId); }
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
-  retry(jobId: string, error: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+5_000).toISOString(),error.slice(0,500),jobId); }
+  retry(jobId: string, error: string, at = new Date(), retryAfterSeconds = 5): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+Math.max(5,retryAfterSeconds)*1_000).toISOString(),error.slice(0,500),jobId); }
   terminal(jobId: string): void {
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='job terminated during delivery' WHERE job_id=? AND status='delivering'").run(jobId);
     this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status='pending'").run(jobId);
@@ -88,6 +90,7 @@ export class JobProgressStore {
 }
 
 export class JobProgressCoordinator {
+  private readonly deliveryClaims = new Set<string>();
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
@@ -112,7 +115,7 @@ export class JobProgressCoordinator {
     }
   }
   async recover(): Promise<void> {
-    for (const progress of this.store.all()) {
+    for (const progress of this.store.recoverable()) {
       const job = this.jobs.getJob(progress.job_id);
       if (job && terminalStatuses.has(job.status)) await this.ingest(job);
     }
@@ -126,13 +129,15 @@ export class JobProgressCoordinator {
     try {
       const token = await readPrivateToken(this.config.updateInternalTokenPath);
       if (!token) { this.store.retry(progress.job_id, "missing internal token"); return; }
-      const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:`${job.job_id}:${progress.sequence}` }));
-      await new Promise<void>((resolve,reject) => { let settled=false; const finish=(error?:Error)=>{if(settled)return;settled=true;error?reject(error):resolve();}; const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; response.resume(); response.once("aborted",()=>finish(Object.assign(new Error("response aborted"),{acceptanceUnknown:true}))); response.once("error",error=>finish(Object.assign(error,{acceptanceUnknown:true}))); response.once("end",()=>response.statusCode===200?finish():finish(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403,429].includes(response.statusCode??0)})));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",error=>finish(error)); request.end(body); });
+      const progressId = `${job.job_id}:${progress.sequence}`;
+      const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:progressId }));
+      await new Promise<void>((resolve,reject) => { let settled=false; const chunks:Buffer[]=[]; let responseSize=0; const finish=(error?:Error)=>{if(settled)return;settled=true;error?reject(error):resolve();}; const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; response.on("data",(chunk:Buffer)=>{responseSize+=chunk.length;if(responseSize<=4096)chunks.push(chunk);}); response.once("aborted",()=>finish(Object.assign(new Error("response aborted"),{acceptanceUnknown:true}))); response.once("error",error=>finish(Object.assign(error,{acceptanceUnknown:true}))); response.once("end",()=>{let retryAfterSeconds:number|undefined;try{const parsed=JSON.parse(Buffer.concat(chunks).toString()) as {retry_after_seconds?:unknown};if(typeof parsed.retry_after_seconds==="number")retryAfterSeconds=parsed.retry_after_seconds;}catch{} response.statusCode===200?finish():finish(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403,429].includes(response.statusCode??0),retryAfterSeconds}));});}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",error=>finish(error)); request.end(body); });
       this.store.delivered(progress.job_id);
     } catch (error) {
-      const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean };
+      const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean; retryAfterSeconds?:number };
       const definitelyUnsent = detail.definitelyUnsent || (!requestStarted && ["ENOENT","ECONNREFUSED"].includes(detail.code ?? ""));
-      if (definitelyUnsent) this.store.retry(progress.job_id, detail.message);
+      this.deliveryClaims.delete(`${job.job_id}:${progress.sequence}`);
+      if (definitelyUnsent) this.store.retry(progress.job_id, detail.message, new Date(), detail.retryAfterSeconds);
       else this.store.unknown(progress.job_id, detail.message);
     }
   }
@@ -142,11 +147,12 @@ export class JobProgressCoordinator {
     if (!match) return undefined;
     const progress = this.store.get(match[1]!);
     const job = this.jobs.getJob(match[1]!);
-    if (!progress || progress.status !== "delivering" || progress.sequence !== Number(match[2]) || !job ||
+    if (this.deliveryClaims.has(progressId) || !progress || progress.status !== "delivering" || progress.sequence !== Number(match[2]) || !job ||
       terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) return undefined;
+    this.deliveryClaims.add(progressId);
     const siblings = this.jobs.listEventJobs(job.source_event_id);
     const index = siblings.findIndex((item) => item.job_id === job.job_id) + 1;
     return { progress_id:progressId, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts,
-      status:siblings.length > 1 ? `${siblings.length}件中${index}件目: ${progress.safe_summary}` : progress.safe_summary };
+      status:siblings.length > 1 ? `${siblings.length}件中${index}件目: ${phaseLabels[progress.phase]}` : phaseLabels[progress.phase] };
   }
 }

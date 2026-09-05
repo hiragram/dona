@@ -194,7 +194,9 @@ export class SlackHealthServer {
         });
         const slackRejection = error instanceof SlackApiError && !["slack_transport_error", "slack_http_error", "slack_api_error"].includes(error.errorCode);
         const definitelyUnsent = slackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
-        send(response, definitelyUnsent ? 429 : 503, { schema_version: 1, error: { code: slackRejection ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
+        send(response, definitelyUnsent ? 429 : 503, { schema_version: 1,
+          ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
+          error: { code: slackRejection ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
       }
       return;
     }
