@@ -211,6 +211,13 @@ describe("JobSupervisor", () => {
     const transitions = notifications.map((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition);
     assert.deepEqual(transitions.sort(), ["all_terminal", "progress"]);
     const owner = notifications.find((row) => (JSON.parse(row.payload_json).group as Record<string, unknown>).transition === "all_terminal")!;
+    const ownerGroup = JSON.parse(owner.payload_json).group as { total: number; jobs: Array<{ job_id: string }> };
+    assert.equal(ownerGroup.total, 2);
+    assert.deepEqual(ownerGroup.jobs.map(({ job_id }) => job_id).sort(), jobs.map(({ job_id }) => job_id).sort());
+    assert.deepEqual(
+      ownerGroup.jobs.map(({ job_id }) => JSON.parse(database.getJob(job_id)!.result_json!).summary).sort(),
+      ["one done", "two done"],
+    );
     assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, owner.event_id);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, null);
     database.close();
