@@ -277,7 +277,17 @@ describe("external ingress contract", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
-    const registry = new ExternalIngressRegistry([registration()]);
+    const definition = registration();
+    const registry = new ExternalIngressRegistry([{
+      ...definition,
+      async authenticate(request) {
+        const verified = await definition.authenticate(request);
+        if (header(request, "x-fake-invalid-connection") === "number") {
+          return { ...verified, connectionId: 123 as unknown as string };
+        }
+        return verified;
+      },
+    }]);
     const api = new DispatcherApi(
       database,
       { isRunning: () => true, wake() {} },
@@ -296,6 +306,10 @@ describe("external ingress contract", () => {
       ...signedHeaders(valid),
       "X-Fake-Signature": "wrong",
     })).status, 401);
+    assert.equal((await request(config.socketPath, "fake", valid, {
+      ...signedHeaders(valid),
+      "X-Fake-Invalid-Connection": "number",
+    })).status, 401);
 
     const topLevelExtra = fakeBody({ source: "dona_update" });
     assert.equal((await request(config.socketPath, "fake", topLevelExtra, signedHeaders(topLevelExtra))).status, 400);
@@ -312,7 +326,35 @@ describe("external ingress contract", () => {
     const invalidJson = Buffer.from("{");
     assert.equal((await request(config.socketPath, "fake", invalidJson, signedHeaders(invalidJson))).status, 400);
     assert.equal((await request(config.socketPath, "dona_update", valid, signedHeaders(valid))).status, 404);
-    assert.equal((await request(config.socketPath, "unknown", valid, signedHeaders(valid))).status, 404);
+    const unknown = await request(config.socketPath, "unknown", valid, signedHeaders(valid));
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.headers.connection, "close");
+
+    const partialUnknownResponse = await new Promise<string>((resolve, reject) => {
+      const socket = net.createConnection(config.socketPath);
+      let response = "";
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("unknown-source connection did not close"));
+      }, 500);
+      socket.setEncoding("utf8");
+      socket.once("connect", () => {
+        socket.write("POST /v1/ingress/unknown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n{");
+      });
+      socket.on("data", (chunk: string) => {
+        response += chunk;
+      });
+      socket.once("close", () => {
+        clearTimeout(timer);
+        resolve(response);
+      });
+      socket.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    assert.match(partialUnknownResponse, /404 Not Found/);
+    assert.match(partialUnknownResponse, /Connection: close/i);
     assert.equal(database.list().length, 0);
 
     await api.stop();

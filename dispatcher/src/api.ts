@@ -35,7 +35,12 @@ class BodyReadTimeoutError extends Error {}
 class IncompleteBodyError extends Error {}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly closeConnection = false,
+  ) {
     super(message);
   }
 }
@@ -427,7 +432,7 @@ export class DispatcherApi {
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
-        sendJson(response, error.status, errorBody(error.code, error.message));
+        sendJson(response, error.status, errorBody(error.code, error.message), error.closeConnection);
       } else {
         this.logger.error("Dispatcher API request failed", {
           error_code: "internal_error",
@@ -441,14 +446,31 @@ export class DispatcherApi {
 
   private async handleExternalIngress(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (request.method !== "POST" || url.pathname.split("/").length !== 4) {
-      throw new ApiRequestError(404, "not_found", "Route not found");
+      throw new ApiRequestError(404, "not_found", "Route not found", true);
     }
     if (this.shuttingDown) {
-      throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
+      throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down", true);
     }
-    const sourceInput = decodeURIComponent(url.pathname.split("/")[3]!);
+    let sourceInput: string;
+    try {
+      sourceInput = decodeURIComponent(url.pathname.split("/")[3]!);
+    } catch {
+      throw new ApiRequestError(
+        404,
+        "external_source_not_registered",
+        "External event source is not registered",
+        true,
+      );
+    }
     const resolved = this.externalIngress.registration(sourceInput);
-    if (!resolved) throw new ApiRequestError(404, "external_source_not_registered", "External event source is not registered");
+    if (!resolved) {
+      throw new ApiRequestError(
+        404,
+        "external_source_not_registered",
+        "External event source is not registered",
+        true,
+      );
+    }
 
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);

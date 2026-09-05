@@ -19,7 +19,7 @@ raw request bytes + raw headers + receivedAt
 登録ごとに次を指定します。
 
 - `source`: `^[a-z][a-z0-9._-]{0,63}$`。`slack`、`dona_job`、`dona_update`は予約済みで、外部登録できません。
-- `maxBodyBytes`、`bodyTimeoutMs`、`processingTimeoutMs`: raw bodyと認証・正規化の有限な上限です。認証と正規化は単一のprocessing deadlineを共有し、body timeoutまたはsize超過時はHTTP connectionを閉じます。globalの`DONA_REQUEST_MAX_BYTES`も同時に適用されます。
+- `maxBodyBytes`、`bodyTimeoutMs`、`processingTimeoutMs`: raw bodyと認証・正規化の有限な上限です。認証と正規化は単一のprocessing deadlineを共有し、body timeout、size超過、またはbody受信前のroute / source拒否時はHTTP connectionを閉じます。globalの`DONA_REQUEST_MAX_BYTES`も同時に適用されます。
 - `authenticate`: JSON parseより先に、受信したものと同じ`Buffer`とraw header列で署名等を検証します。payload自己申告ではなく、永続設定から選んだstable `connectionId`と認証済みprincipalだけを返します。
 - `normalize` / `parseNormalized`: 認証後だけ実行します。provider固有schemaはtop-level、`subject`、`payload`、`replyTarget`をstrictにし、unknown fieldや別provider fieldを拒否します。永続化前に値ツリー全体を検査し、BigInt、循環参照、undefined、非有限numberなどJSONへ正確に表現できない値を拒否します。
 - `buildAcknowledgement`: `PersistReceipt`を受けるpure formatterです。SQLite transactionが返る前には呼ばれません。JSON bodyを送れる2xxだけを許可し、204 / 205、Node HTTPが拒否するheader、serialize不能なbodyはcontract errorになります。検証時に生成したbody bytesをそのまま送信します。

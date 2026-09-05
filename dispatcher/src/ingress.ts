@@ -215,7 +215,8 @@ function isJsonCompatible(value: unknown, ancestors = new Set<object>()): boolea
 }
 
 function validatePrincipal(input: VerifiedIngressPrincipal): VerifiedIngressPrincipal {
-  if (!connectionIdPattern.test(input.connectionId) || !isJsonObject(input.principal)) {
+  if (typeof input.connectionId !== "string" ||
+    !connectionIdPattern.test(input.connectionId) || !isJsonObject(input.principal)) {
     throw new ExternalIngressAuthenticationError();
   }
   return input;
