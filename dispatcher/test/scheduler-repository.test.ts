@@ -688,6 +688,32 @@ test("時計後退中のfinishWriteとreconcileも保存済み時刻より前へ
   }
 });
 
+test("reconcileは後続schedule遷移時刻より前へ終端を戻さない", () => {
+  const { repo } = setup();
+  repo.create("reconcile_clock", input, due, actor, now);
+  const run = repo.materialize("reconcile_clock", 1, due, later, due, actor).run;
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "ambiguous", due);
+  const cancelledAt = "2026-09-05T00:02:00Z";
+  repo.transition("reconcile_clock", 1, "cancel", actor, cancelledAt);
+  repo.reconcile(claim.outbox_id, "sent", "receipt_after_cancel", { ...actor, role: "admin" }, "2026-09-05T00:01:30Z");
+  assert.equal(repo.getRun(run.run_id)?.terminal_at, cancelledAt);
+  assert.equal(repo.getOutbox(claim.outbox_id, cancelledAt)?.terminal_at, cancelledAt);
+});
+
+test("materializeは保存済みschedule時刻以上でrunとauditを作成する", () => {
+  const { repo } = setup();
+  repo.create("materialize_clock", input, due, actor, now);
+  const advancedAt = "2026-09-05T00:02:00Z";
+  repo.transition("materialize_clock", 1, "pause", actor, advancedAt);
+  repo.transition("materialize_clock", 2, "resume", actor, "2026-09-05T00:01:30Z");
+  const run = repo.materialize("materialize_clock", 3, due, later, "2026-09-05T00:01:30Z", actor).run;
+  assert.equal(run.created_at, advancedAt);
+  assert.equal(repo.get("materialize_clock")?.updated_at, advancedAt);
+  assert.equal((repo.auditHistory("materialize_clock") as { operation: string; created_at: string }[])
+    .find(row => row.operation === "materialize")?.created_at, advancedAt);
+});
+
 test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻さない", () => {
   const { repo, raw } = setup();
   repo.create("request_clock", input, due, actor, now);

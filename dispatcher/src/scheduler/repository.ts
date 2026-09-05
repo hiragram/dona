@@ -260,44 +260,45 @@ export class SchedulerRepository {
       const current = this.get(scheduleId);
       if (!current) throw new Error("schedule_not_found");
       const before = this.checked(scheduleId, current.revision, actor);
+      const materializedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
       const existing = this.db.prepare("SELECT * FROM schedule_runs WHERE schedule_id = ? AND scheduled_for = ?").get(scheduleId, scheduledFor) as Run | undefined;
       if (existing) return { run: existing, duplicate: true };
       if (before.revision !== expectedRevision) throw new Error("revision_conflict");
-      if (nextDue !== null && (nextDue <= scheduledFor || nextDue <= now)) throw new Error("invalid_next_due");
-      if (before.state !== "active" || scheduledFor > now || (before.next_due === null || scheduledFor < before.next_due) || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
+      if (nextDue !== null && (nextDue <= scheduledFor || nextDue <= materializedAt)) throw new Error("invalid_next_due");
+      if (before.state !== "active" || scheduledFor > materializedAt || (before.next_due === null || scheduledFor < before.next_due) || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
       const revision = this.revision(before);
       if (nextDue === null && (JSON.parse(revision.recurrence_json) as { kind: string }).kind !== "once") throw new Error("invalid_next_due");
       if (scheduledFor !== before.next_due) {
         if (!compactSkip || (JSON.parse(revision.recurrence_json) as { kind: string }).kind === "once") throw new Error("compact_skip_required");
         utc(compactSkip.from); utc(compactSkip.through);
         if (compactSkip.from !== before.next_due || compactSkip.through < compactSkip.from || compactSkip.through >= scheduledFor ||
-            Date.parse(now) - Date.parse(compactSkip.through) <= 900000 || !Number.isSafeInteger(compactSkip.count) || compactSkip.count < 1) throw new Error("invalid_compact_skip");
+            Date.parse(materializedAt) - Date.parse(compactSkip.through) <= 900000 || !Number.isSafeInteger(compactSkip.count) || compactSkip.count < 1) throw new Error("invalid_compact_skip");
       } else if (compactSkip) throw new Error("invalid_compact_skip");
-      if (revision.expires_at <= now || revision.content === null) {
-        this.expireSchedule(before, actor, now);
+      if (revision.expires_at <= materializedAt || revision.content === null) {
+        this.expireSchedule(before, actor, materializedAt);
         return undefined;
       }
       const unresolved = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
         (r.status IN ('materialized','started','needs_review') OR EXISTS
           (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
-      const reason = Date.parse(now) - Date.parse(scheduledFor) > 900000 ? "misfire" : unresolved ? "overlap" : null;
+      const reason = Date.parse(materializedAt) - Date.parse(scheduledFor) > 900000 ? "misfire" : unresolved ? "overlap" : null;
       if (skip !== null && skip !== reason) throw new Error("invalid_skip_reason");
       const runId = `run_${randomUUID()}`;
       this.db.prepare(`INSERT INTO schedule_runs(run_id, schedule_id, revision, occurrence_key, scheduled_for, status, reason, created_at, terminal_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, scheduledFor, scheduledFor, reason ? "skipped" : "materialized", reason, now, reason ? now : null);
-      if (!reason && revision.action === "slack.reminder.post") this.insertOutbox(runId, "slack.reminder.post", revision.target_json, revision.content!, now);
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, scheduledFor, scheduledFor, reason ? "skipped" : "materialized", reason, materializedAt, reason ? materializedAt : null);
+      if (!reason && revision.action === "slack.reminder.post") this.insertOutbox(runId, "slack.reminder.post", revision.target_json, revision.content!, materializedAt);
       if (!reason && revision.action === "work.read_only") {
         const result = this.enqueue({ schema_version: 1, source: "scheduler", external_event_id: `scheduler:${scheduleId}:${scheduledFor}`,
           type: "schedule_due", occurred_at: scheduledFor,
           subject: { tenant_id: before.tenant_id, owner_id: before.owner_id, schedule_id: scheduleId },
-          payload: { run_id: runId, revision: expectedRevision }, reply_target: null }, new Date(now));
+          payload: { run_id: runId, revision: expectedRevision }, reply_target: null }, new Date(materializedAt));
         if (result.duplicate) throw new Error("event_idempotency_conflict");
         this.db.prepare("UPDATE schedule_runs SET event_id = ? WHERE run_id = ?").run(result.row.event_id, runId);
       }
       this.db.prepare("UPDATE schedules SET high_watermark = ?, next_due = ?, updated_at = ? WHERE schedule_id = ?")
-        .run(scheduledFor, nextDue, now, scheduleId);
-      this.audit(before, this.get(scheduleId)!, "materialize", actor, now, undefined, this.getRun(runId)!, compactSkip);
-      this.completeIfDrained(scheduleId, now);
+        .run(scheduledFor, nextDue, materializedAt, scheduleId);
+      this.audit(before, this.get(scheduleId)!, "materialize", actor, materializedAt, undefined, this.getRun(runId)!, compactSkip);
+      this.completeIfDrained(scheduleId, materializedAt);
       return { run: this.getRun(runId)!, duplicate: false };
     }).immediate();
     if (!result) throw new Error("authorization_expired");
@@ -379,7 +380,8 @@ export class SchedulerRepository {
       if (!row || row.status !== "needs_review") throw new Error("invalid_transition");
       const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
       const reconciledAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
-        row.terminal_at ?? row.created_at, run.created_at, run.started_at ?? run.created_at].sort().at(-1)!;
+        row.terminal_at ?? row.created_at, run.created_at, run.started_at ?? run.created_at,
+        schedule.created_at, schedule.updated_at, schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
       this.checked(schedule.schedule_id, schedule.revision, actor);
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
         content_delete_at = ?, claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
