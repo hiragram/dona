@@ -1,5 +1,30 @@
 import http from "node:http";
 
+export class UpdaterClientError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "UpdaterClientError";
+  }
+}
+
+function structuredError(input: unknown): { code: string; message: string } | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const body = input as Record<string, unknown>;
+  if (body.schema_version !== 1 || !body.error || typeof body.error !== "object" || Array.isArray(body.error)) {
+    return undefined;
+  }
+  const error = body.error as Record<string, unknown>;
+  if (typeof error.code !== "string" || !/^[a-z0-9_]{1,128}$/.test(error.code) ||
+    typeof error.message !== "string" || error.message.length > 2_000) {
+    return undefined;
+  }
+  return { code: error.code, message: error.message };
+}
+
 export class UpdaterClient {
   constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
 
@@ -43,7 +68,11 @@ export class UpdaterClient {
             return void reject(new Error("Updater returned invalid JSON"));
           }
           if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
-            return void reject(new Error(`Updater rejected request: ${JSON.stringify(parsed)}`));
+            const error = structuredError(parsed);
+            if (error && (response.statusCode ?? 0) >= 400 && (response.statusCode ?? 0) < 600) {
+              return void reject(new UpdaterClientError(response.statusCode!, error.code, error.message));
+            }
+            return void reject(new Error("Updater returned an incompatible error response"));
           }
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
             (parsed as Record<string, unknown>).schema_version !== 1) {

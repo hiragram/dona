@@ -17,6 +17,7 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
+import { jobAgentName } from "./job-agent-name.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -282,7 +283,7 @@ export class DispatcherDatabase {
         };
       }
 
-      const jobId = `job_${ulid(at.getTime()).toLowerCase()}`;
+      const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, request.objective);
       const workspacePath = request.workspace.kind === "scratch"
         ? path.join(workspaceRoot, "scratch", jobId)
         : path.join(

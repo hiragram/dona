@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "small-single-bug",
+      "requested_issue_count": 1,
+      "facts": {
+        "one_cohesive_outcome": true,
+        "one_primary_responsibility": true,
+        "standalone_review_and_test": true,
+        "multiple_independent_review_test_responsibilities": false,
+        "multiple_ownership_boundaries": false,
+        "parallel_lanes": false,
+        "multiple_pr_deliverables": false,
+        "distinct_failure_recovery_contracts": false,
+        "independent_migration_or_rollout": false
+      },
+      "expected_route": "single_issue"
+    },
+    {
+      "id": "issue-46-multi-job-theme",
+      "requested_issue_count": null,
+      "facts": {
+        "one_cohesive_outcome": true,
+        "one_primary_responsibility": false,
+        "standalone_review_and_test": false,
+        "multiple_independent_review_test_responsibilities": true,
+        "multiple_ownership_boundaries": true,
+        "parallel_lanes": true,
+        "multiple_pr_deliverables": true,
+        "distinct_failure_recovery_contracts": true,
+        "independent_migration_or_rollout": true
+      },
+      "expected_route": "structured_issue_set"
+    },
+    {
+      "id": "one-issue-wording-does-not-collapse-scope",
+      "requested_issue_count": 1,
+      "facts": {
+        "one_cohesive_outcome": true,
+        "one_primary_responsibility": false,
+        "standalone_review_and_test": false,
+        "multiple_independent_review_test_responsibilities": true,
+        "multiple_ownership_boundaries": true,
+        "parallel_lanes": false,
+        "multiple_pr_deliverables": true,
+        "distinct_failure_recovery_contracts": true,
+        "independent_migration_or_rollout": true
+      },
+      "expected_route": "structured_issue_set"
+    }
+  ]
+}

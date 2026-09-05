@@ -20,6 +20,7 @@ import {
 } from "./ingress.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
+import { UpdaterClientError } from "./updater-client.js";
 import {
   parseCancelJobRequest,
   parseCreateJobRequest,
@@ -433,6 +434,13 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
         sendJson(response, error.status, errorBody(error.code, error.message), error.closeConnection);
+      } else if (error instanceof UpdaterClientError) {
+        this.logger.warn("Updater request rejected", {
+          error_code: error.code,
+          error_message: error.message,
+          status_code: error.statusCode,
+        });
+        sendJson(response, error.statusCode, errorBody(error.code, error.message));
       } else {
         this.logger.error("Dispatcher API request failed", {
           error_code: "internal_error",
