@@ -186,11 +186,11 @@ export class SchedulerRepository {
       const before = this.checked(scheduleId, expectedRevision, actor, true);
       const previousRevision = this.revision(before);
       const updateAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
-      if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= now) throw new Error("invalid_transition");
+      if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
       if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
-      this.validateRevision(input, before.owner_id, before.tenant_id, now);
+      this.validateRevision(input, before.owner_id, before.tenant_id, updateAt);
       const reusedAuthorization = this.db.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = ? AND authorization_id = ? LIMIT 1")
         .get(scheduleId, input.authorization_id);
       if (input.authorization_revision !== expectedRevision + 1 || reusedAuthorization) throw new Error("authorization_revision_conflict");
@@ -408,7 +408,8 @@ export class SchedulerRepository {
         WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
     if (unsettled) return;
     const runTerminal = (this.db.prepare("SELECT MAX(terminal_at) AS value FROM schedule_runs WHERE schedule_id = ?").get(scheduleId) as { value: string | null }).value;
-    const completedAt = [now, before.created_at, before.terminal_at ?? before.created_at, runTerminal ?? before.created_at].sort().at(-1)!;
+    const completedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at,
+      runTerminal ?? before.created_at].sort().at(-1)!;
     this.db.prepare("UPDATE schedules SET state = 'completed', terminal_at = ?, updated_at = ? WHERE schedule_id = ?").run(completedAt, completedAt, scheduleId);
     this.retireRevisions(scheduleId, completedAt);
     this.audit(before, this.get(scheduleId)!, "complete", { tenant_id: before.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, completedAt);

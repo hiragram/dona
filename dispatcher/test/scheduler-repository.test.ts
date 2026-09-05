@@ -776,13 +776,29 @@ test("時計後退後の再承認は時刻を戻さずnext_dueがhigh-watermark�
   const { repo, raw } = setup(); repo.create("s1", input, due, actor, now);
   repo.materialize("s1", 1, due, later, due, actor); repo.transition("s1", 1, "pause", actor, due);
   const renewed = { ...input, authorization_id: "renewed", authorization_revision: 3 };
-  assert.throws(() => repo.update("s1", 2, renewed, due, actor, now), /invalid_next_due/);
+  assert.throws(() => repo.update("s1", 2, { ...renewed, expires_at: "2026-09-05T00:00:45Z" }, later, actor, now), /invalid_authorization/);
+  assert.throws(() => repo.update("s1", 2, renewed, "2026-09-05T00:00:45Z", actor, now), /invalid_transition/);
+  assert.throws(() => repo.update("s1", 2, renewed, due, actor, now), /invalid_transition/);
   assert.equal(repo.get("s1")?.revision, 2);
   repo.update("s1", 2, renewed, later, actor, now);
   assert.equal(repo.get("s1")?.next_due, later);
   assert.equal(repo.get("s1")?.updated_at, due);
   assert.equal((raw.prepare("SELECT created_at FROM schedule_revisions WHERE schedule_id = 's1' AND revision = 3").get() as { created_at: string }).created_at, due);
   assert.equal(repo.transition("s1", 3, "cancel", actor, now).terminal_at, due);
+});
+
+test("時計後退中のone-shot決着はschedule更新時刻より前へ完了時刻を戻さない", () => {
+  const { dispatcher } = setup();
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  repo.create("once_clock", once, due, actor, now);
+  repo.materialize("once_clock", 1, due, null, due, actor);
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  const pausedAt = "2026-09-05T00:02:00Z";
+  repo.transition("once_clock", 1, "pause", actor, pausedAt);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", "2026-09-05T00:00:30Z", "receipt_once_clock");
+  assert.equal(repo.get("once_clock")?.state, "completed");
+  assert.equal(repo.get("once_clock")?.terminal_at, pausedAt);
 });
 
 test("cancel時刻を単調化しcaller skip不一致とSlack credential本文を保存前に拒否", () => {
