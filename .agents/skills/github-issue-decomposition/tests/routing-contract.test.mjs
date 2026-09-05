@@ -92,6 +92,7 @@ test("Skill内のrelative Markdown linkはすべて解決できる", () => {
 });
 
 test("integration childは実際のmerge先とIssue完了点を明示する", () => {
+  const skill = fs.readFileSync(path.join(skillDirectory, "SKILL.md"), "utf8");
   const issueContract = fs.readFileSync(
     path.join(skillDirectory, "references", "issue-contract.md"),
     "utf8",
@@ -103,13 +104,19 @@ test("integration childは実際のmerge先とIssue完了点を明示する", ()
 
   assert.match(issueContract, /Issue全体の完了点.*実装PRを上記feature branchへmergeした時点.*integration PRをdefault branchへmergeした時点/);
   assert.match(issueContract, /前者.*child単独のacceptanceとtest.*feature branch上で完結.*実装PRで`Closes #<child>`を使用できる/);
-  assert.match(issueContract, /non-default branch向けkeyword.*自動closeを保証しない.*実装PRをmergeする実行者.*base\/head\/merge commit.*手動close.*`state`.*`closedAt`.*close event/);
+  assert.match(issueContract, /non-default branch向けkeyword.*自動closeを保証しない.*実装PRをmergeするauthenticated identity.*base\/head\/merge commit.*手動close.*`state`.*`closedAt`.*close event/);
+  assert.match(issueContract, /authenticated identity.*`close_owner`.*`viewerCanClose: true`.*permission.*false・unknown・別identity.*`Closes`を使用しない/);
   assert.match(issueContract, /後者.*child実装PR.*部分対応.*`Closes`を使用せず.*integration PR本文.*`Closes #<child>`.*`closingIssuesReferences`/);
   assert.match(issueContract, /branch名.*integration PR link.*base指定.*non-default PR本文のkeywordだけを完了点やIssue closeの証拠にしない/);
 
   assert.match(integrationWorkflow, /childごとにIssue全体の完了点.*feature branchへの実装PR merge.*default branchへのintegration PR merge/);
   assert.match(integrationWorkflow, /`close_owner`.*`post_merge_close_action`.*`state`.*`closedAt`.*close event/);
+  assert.match(integrationWorkflow, /authenticated identity.*`close_owner`.*`viewerCanClose: true`.*permission.*false・unknown・別identity/);
   assert.match(integrationWorkflow, /`child_completion_point`.*close mechanism.*Issue番号.*execution context/);
+  assert.match(integrationWorkflow, /標準templateからnon-draft integration PRを作成する/);
+  assert.match(integrationWorkflow, /PR作成前.*current default branchのexact SHA.*標準`.github\/PULL_REQUEST_TEMPLATE.md`.*全見出し.*順序.*未解決placeholder/s);
+  assert.match(integrationWorkflow, /再取得.*raw title\/body.*標準templateの全見出し.*exactly 1件の`Closes #<親Issue番号>`/s);
+  assert.match(skill, /integration PR -> 子Issue -> integration PR closing relationship reconcile -> native graph/);
   assert.match(integrationWorkflow, /integration PRのchild closing relationshipをreconcileする/);
   assert.match(integrationWorkflow, /current default branchのexact SHA.*標準`.github\/PULL_REQUEST_TEMPLATE.md`.*`完了する Issue`.*`Closes #<child>`/s);
   assert.match(integrationWorkflow, /write直前.*snapshot.*blind retry.*`closingIssuesReferences`全page/s);

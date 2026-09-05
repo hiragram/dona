@@ -58,7 +58,7 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 
 1. 規模判定と根拠、提案・再利用するIssue、title、責務境界を含む完全なplanを提示するか、内部で確定する。構造化Issueではlabel、parent membership、blocker edge、parallel laneも含める。
 2. 最初のwrite直前に全Issueを再取得し、完全一致・正規化title、既存relation、write範囲を再確認する。
-3. 完全なintegration workflowでは、[integration feature workflow手順](references/integration-feature-workflow.md)を読み、`親Epic Issue -> feature branch -> 空commit -> integration PR -> 子Issue -> native graph`の順序を必ず守る。
+3. 完全なintegration workflowでは、[integration feature workflow手順](references/integration-feature-workflow.md)を読み、`親Epic Issue -> feature branch -> 空commit -> integration PR -> 子Issue -> integration PR closing relationship reconcile -> native graph`の順序を必ず守る。
 4. 単一Issue routeでは、許可された1件のIssueだけを作成または更新する。構造化Issue routeでIssueだけの作成が許可された場合は、許可されたIssueとnative relationだけを[native graph手順](references/native-issue-graph.md)に従って作成し、branchやPRは作成しない。
 5. GitHub native sub-issuesとissue dependenciesを使う。Markdown checkbox listは説明用に限り、native relationの代替にしない。APIまたは権限を利用できない場合は制約を報告し、代替topologyを捏造しない。
 6. 既存のlabel、Project、Milestone、assignee規約には明示された範囲内だけで従う。個別に依頼されていないものを作成しない。

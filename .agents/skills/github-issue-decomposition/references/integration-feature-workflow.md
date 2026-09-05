@@ -27,11 +27,13 @@ Issue、feature branchのpush、integration PR作成をすべて明示的に依�
 - remoteへ通常のpushを行う。force pushは禁止する。push前後にremote refを確認し、無関係な既存headを更新しない。
 - push結果が曖昧な場合はremote refとcommit ancestryを再取得し、受理済みか確認する。同じpushをblind retryしない。non-fast-forwardやcollisionを安全に解消できない場合は停止する。
 
-### 3. non-draft integration PRを作成する
+### 3. 標準templateからnon-draft integration PRを作成する
 
-exact feature branchをhead、default branchをbaseとするnon-draft PRを作成する。title・bodyは日本語で記述し、bodyにGitHub closing keywordをexactly `Closes #<親Issue番号>`として1件含める。このPRは、子Issueの実装PRをfeature branchへ集約し、最終的にfeature branchをdefault branchへ統合するためのものであり、直ちにmergeしない。
+PR作成前にcurrent default branchのexact SHAから標準`.github/PULL_REQUEST_TEMPLATE.md`を取得する。取得元のref/SHAとtemplate blob/hashを記録し、fileがない、空、取得不能、または構造を安全に解釈できない場合はPRを作成せず停止する。templateのコメント、全見出し、順序を維持し、`完了する Issue`へexactly 1件の`Closes #<親Issue番号>`、変更内容へchild PRをfeature branchへ集約する方針、test範囲、実行済みの確認手順と未検証境界を記入する。未解決placeholderを残さず、子Issue作成後にstep 5でintegration完了対象childを同じ欄へreconcileする予定も明記する。
 
-作成responseだけに依存せず、PR URL・番号、base、head、state、draft状態、`Closes #<親Issue番号>`を再取得して検証する。作成がtimeoutなどで曖昧な場合は、同じhead/baseのPRを検索して照合し、blind retryしない。
+この検証済みtitle/bodyを使い、exact feature branchをhead、default branchをbaseとするnon-draft PRを作成する。このPRは、子Issueの実装PRをfeature branchへ集約し、最終的にfeature branchをdefault branchへ統合するためのものであり、直ちにmergeしない。
+
+作成responseだけに依存せず、PR URL・番号、raw title/body、base、head、state、draft状態、標準templateの全見出し、exactly 1件の`Closes #<親Issue番号>`を再取得して検証する。作成がtimeoutなどで曖昧な場合は、同じhead/baseのPRを検索して照合し、blind retryしない。
 
 PRを一意に検証できたら、`integration_pr_number`と`integration_pr_url`をexecution contextへ固定する。子Issue作成前に、`parent_issue_number`、`feature_branch`、`empty_commit_sha`、`integration_pr_number`、`integration_pr_url`をimmutableなexecution contextとして確定し、以後のchild body間で不一致を作らない。
 
@@ -42,7 +44,7 @@ PRを一意に検証できたら、`integration_pr_number`と`integration_pr_url
 - 実装PRのmerge先としてexact feature branch名をcode表記する。
 - integration PRをMarkdown linkで記載する。例: `[#123](https://github.com/owner/repo/pull/123)`。
 - 子Issueの実装PRはdefault branchではなくexact feature branchをbaseにする、と明記する。
-- childごとにIssue全体の完了点を`feature branchへの実装PR merge`または`default branchへのintegration PR merge`へ固定する。前者はchildのacceptanceと必須testがfeature branch上で独立して完了すると確認できる場合だけ選び、実装PRで`Closes #<child>`を使用できる。ただしこのkeywordはnon-default branchへのmergeでGitHubによる自動closeを保証しない。実装PRをmergeする実行者を`close_owner`とし、`post_merge_close_action`として、merge済みPRのbase/head/merge commitとcurrent child Issue identityの照合、exact childへの明示的なclose write、Issueの`state`・`closedAt`・close eventの再取得をchild本文とexecution contextへ固定し、手動closeの再取得検証までを完了条件にする。後者ではchild実装PRを部分対応として扱い、`Closes`を使用しない。この`child_completion_point`とclose mechanismをIssue番号に結び付けてexecution contextへ追加する。
+- childごとにIssue全体の完了点を`feature branchへの実装PR merge`または`default branchへのintegration PR merge`へ固定する。前者はchildのacceptanceと必須testがfeature branch上で独立して完了すると確認できる場合だけ選び、実装PRで`Closes #<child>`を使用できる。ただしこのkeywordはnon-default branchへのmergeでGitHubによる自動closeを保証しない。実装PRをmergeするauthenticated identityを`close_owner`とし、target child IssueのGraphQL `viewerCanClose: true`または同等のcurrent permission evidenceを事前取得する。`post_merge_close_action`として、merge済みPRのbase/head/merge commitとcurrent child Issue identityの照合、exact childへの明示的なclose write、Issueの`state`・`closedAt`・close eventの再取得をchild本文とexecution contextへ固定し、手動closeの再取得検証までを完了条件にする。permissionがfalse・unknown・別identityの場合はfeature-merge完了点で`Closes`を許可せず、権限あるclose ownerを確認するかintegration完了点へ戻す。後者ではchild実装PRを部分対応として扱い、`Closes`を使用しない。この`child_completion_point`とclose mechanismをIssue番号に結び付けてexecution contextへ追加する。
 
 各作成responseのURL、Issue番号、REST `id`、acceptanceを記録してから次へ進む。acceptance unknown時は親Issueと同じく再取得・照合し、blind retryしない。
 

@@ -220,7 +220,7 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
   assertContract(repositoryTemplate, "repository PR template", [
     /実際のマージ先へのマージ.*Issue 全体を完了してよい場合だけ.*Closes #xx/s,
     /default branch 以外.*マージ先の契約.*current Issue.*完了を確認できる場合は使用できます/,
-    /non-default branch.*自動 close されない.*誰がどの Issue を手動 close.*何を再取得.*「動作確認方法」/,
+    /non-default branch.*自動 close されない.*close できる.*事前確認した実行者.*手動 close.*再取得.*「動作確認方法」/,
     /部分対応.*単なる関連付け.*後続の default-branch PR.*この行を削除/,
   ]);
   assert.doesNotMatch(repositoryTemplate, /default branch[^\n]*ため[^\n]*Closes[^\n]*使用しない/);
@@ -234,6 +234,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /`完了する Issue`.*selected baseへのmerge.*merge-target contract.*current Issue scope.*Issue全体を完了.*場合だけ.*`Closes #xx`/,
     /selected base.*default branchかどうかだけで許可・禁止せず.*branch名だけ.*contractの証拠にしない/,
     /non-default branch.*keywordだけではIssueが自動closeされない.*手動close.*`state`.*`closedAt`.*close event.*base\/head\/merge commit.*場合だけ`Closes`を許可/,
+    /authenticated identity.*`close_owner`.*target Issue.*`viewerCanClose: true`.*permission evidence.*write前/,
+    /cross-repository Issue.*target repository側.*permission evidence.*false・unknown・別identity.*`Closes OWNER\/REPOSITORY#xx`を許可しない/,
     /Issue全体の完了点.*後続のdefault-branch PR.*現在のnon-default PR.*部分対応.*`Closes`を使用しない/,
     /cross-repository Issue.*対象を変えない`Closes OWNER\/REPOSITORY#xx`/,
     /部分対応.*単なる関連.*Issue不明.*曖昧.*selected base.*Issueの実装先契約.*一致しない.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
@@ -250,7 +252,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /PR titleと本文.*automatic closing keyword.*検査.*squash merge.*commit subject.*titleも本文と同じIssue完了条件/,
     /`github_close_mechanism`.*canonical merge-target contract list.*SHA-256 hash/,
     /default branch.*keyword target.*`closingIssuesReferences`.*期待/,
-    /non-default base.*`github_close_mechanism: manual_close_after_verified_merge`.*実行者.*PR base\/head\/merge commit.*Issue identity.*Issue state.*`closedAt`.*close event/,
+    /non-default base.*`github_close_mechanism: manual_close_after_verified_merge`.*`close_owner`.*authenticated identity.*target repository.*`viewerCanClose: true`.*permission evidence.*PR base\/head\/merge commit.*Issue identity.*Issue state.*`closedAt`.*close event/,
+    /cross-repository target.*target repository.*同一identity.*false.*unknown.*取得不能.*closing targetに含めない/,
     /relationshipが空.*理由に`Closes`を禁止しない.*`Closes`自体は自動closeの保証ではなく.*手動closeが未実行.*完了扱いしない.*`動作確認方法`/,
     /Issueの完了点.*後続integration.*現在のPRのclosing targetに含めない/,
     /branch名だけ.*古いIssue内容.*relationshipの有無だけでIssue完了を判断しない/,
@@ -291,7 +294,8 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /未検証のreference.*残っていない/,
     /current merge-target contract.*current `closingIssuesReferences`全page.*closing targetのIssue content identity.*取得済み/,
     /各closing target.*current selected baseへのmerge.*Issue全体を完了.*closing relationshipと期待状態.*一致/,
-    /non-default base.*relationshipを作らない.*`manual_close_after_verified_merge`.*実行者.*事前照合.*事後再取得.*contractとPR本文に明記/,
+    /non-default base.*relationshipを作らない.*`manual_close_after_verified_merge`.*`close_owner` identity.*target Issue.*permission evidence.*実行者.*事前照合.*事後再取得.*contractとPR本文に明記/,
+    /cross-repository target.*target repository側の権限を確認済み/,
     /本文由来のpending removal.*残っていない/,
   ]);
 });
