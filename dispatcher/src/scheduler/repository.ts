@@ -60,7 +60,7 @@ function validateReceipt(value: string): void {
 }
 function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp-/i.test(value); }
 function safeContent(value: string, limit: number): void {
-  if (!value || [...value].length > limit || /xox[baprs]-|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || [...value].length > limit || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
 
 export class SchedulerRepository {
@@ -208,19 +208,20 @@ export class SchedulerRepository {
           (operation === "cancel" && ["cancelled", "completed"].includes(before.state))) throw new Error("invalid_transition");
       const old = this.revision(before);
       if (operation === "resume" && (old.expires_at <= now || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= now))) throw new Error("authorization_expired");
+      const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
       // Every mutation advances the concurrency revision; copying a paused snapshot never extends its authorization.
       const revision = expectedRevision + 1;
       this.db.prepare(`INSERT INTO schedule_revisions SELECT schedule_id, ?, recurrence_json, recurrence_hash, policy_json,
         policy_version, timezone, tzdb_version, authorization_id, authorization_revision, content_scope, approver_id, approved_at, expires_at, action, target_json,
-        content, content_hash, content_delete_at, ?, terminal_at FROM schedule_revisions WHERE schedule_id = ? AND revision = ?`).run(revision, now, scheduleId, expectedRevision);
-      this.retireRevisions(scheduleId, now, expectedRevision);
+        content, content_hash, content_delete_at, ?, terminal_at FROM schedule_revisions WHERE schedule_id = ? AND revision = ?`).run(revision, transitionAt, scheduleId, expectedRevision);
+      this.retireRevisions(scheduleId, transitionAt, expectedRevision);
       const state = operation === "pause" ? "paused" : operation === "resume" ? "active" : "cancelled";
       this.db.prepare("UPDATE schedules SET state = ?, revision = ?, updated_at = ?, terminal_at = ? WHERE schedule_id = ?")
-        .run(state, revision, now, state === "cancelled" ? now : null, scheduleId);
-      if (operation !== "resume") this.suppress(scheduleId, now, "cancelled");
-      if (operation === "cancel") this.retireRevisions(scheduleId, now);
-      const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, now);
-      this.completeIfDrained(scheduleId, now);
+        .run(state, revision, transitionAt, state === "cancelled" ? transitionAt : null, scheduleId);
+      if (operation !== "resume") this.suppress(scheduleId, transitionAt, "cancelled");
+      if (operation === "cancel") this.retireRevisions(scheduleId, transitionAt);
+      const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, transitionAt);
+      this.completeIfDrained(scheduleId, transitionAt);
       return this.get(scheduleId)!;
     }).immediate();
   }
@@ -253,7 +254,8 @@ export class SchedulerRepository {
       const unresolved = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
         (r.status IN ('materialized','started','needs_review') OR EXISTS
           (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
-      const reason = Date.parse(now) - Date.parse(scheduledFor) > 900000 ? "misfire" : skip ?? (unresolved ? "overlap" : null);
+      const reason = Date.parse(now) - Date.parse(scheduledFor) > 900000 ? "misfire" : unresolved ? "overlap" : null;
+      if (skip !== null && skip !== reason) throw new Error("invalid_skip_reason");
       const runId = `run_${randomUUID()}`;
       this.db.prepare(`INSERT INTO schedule_runs(run_id, schedule_id, revision, occurrence_key, scheduled_for, status, reason, created_at, terminal_at)
         VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, scheduledFor, scheduledFor, reason ? "skipped" : "materialized", reason, now, reason ? now : null);
@@ -307,6 +309,7 @@ export class SchedulerRepository {
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
       if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
+      if (next === "started" && runSnapshot.action === "work.read_only" && jobId === null) throw new Error("job_reference_required");
       const notificationReason = current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
         : runSnapshot.expires_at <= now ? "authorization_expired" : null;
@@ -318,7 +321,9 @@ export class SchedulerRepository {
         if (resultContent === null) throw new Error("result_content_required");
         this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, resultContent, transitionAt);
       }
-      if (next === "cancelled" || next === "failed") {
+      const suppressed = next === "cancelled" || next === "failed"
+        ? this.db.prepare("SELECT * FROM connector_outbox WHERE run_id = ? AND status IN ('pending','claimed')").all(runId) as Outbox[] : [];
+      if (suppressed.length > 0) {
         this.db.prepare(`UPDATE connector_outbox SET status = 'cancelled', terminal_at = ?, updated_at = ?,
           content_delete_at = COALESCE(content_delete_at, ?), claim_token = NULL, lease_until = NULL
           WHERE run_id = ? AND status IN ('pending','claimed')`).run(now, now, add(now, 604800), runId);
@@ -326,6 +331,7 @@ export class SchedulerRepository {
       this.db.prepare(`UPDATE schedule_runs SET status = ?, job_id = COALESCE(?, job_id), started_at =
         CASE WHEN ? = 'started' THEN ? ELSE started_at END, terminal_at = ? WHERE run_id = ?`)
         .run(next, jobId, next, transitionAt, next === "started" ? null : transitionAt, runId);
+      for (const row of suppressed) this.auditOutbox(row, `outbox_run_${next}`, transitionAt);
       this.audit(current, current, `run_${next}`, actor, transitionAt, undefined, this.getRun(runId)!);
       if (workCompletion && hasTarget && notificationReason !== null) {
         this.audit(current, current, `work_result_suppressed_${notificationReason}`, actor, now, undefined, this.getRun(runId)!);

@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import { envelopeFromRow } from "../src/prompt.js";
 import { DispatcherDatabase } from "../src/database.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
-import type { Actor, RevisionInput } from "../src/scheduler/repository.js";
+import type { Actor, RevisionInput, Run, SchedulerRepository } from "../src/scheduler/repository.js";
 import { eventEnvelope } from "./helpers.js";
 
 const now = "2026-09-05T00:00:00Z";
@@ -40,6 +40,12 @@ function setup() {
   }) };
 }
 const count = (raw: Database.Database, table: string): number => (raw.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+function startWork(repo: SchedulerRepository, dispatcher: DispatcherDatabase, raw: Database.Database, run: Run, at: string): void {
+  const event = dispatcher.enqueue(eventEnvelope(`job-${run.run_id}`)).row;
+  const job = dispatcher.createJob({ source_event_id: event.event_id, objective: "read only", workspace: { kind: "scratch" } }, "/tmp/test-scheduler-work", "/tmp/test-scheduler-results");
+  raw.prepare("UPDATE jobs SET source_event_id = ? WHERE job_id = ?").run(run.event_id, job.row.job_id);
+  repo.setRunState(run.run_id, "materialized", "started", actor, at, job.row.job_id);
+}
 
 test("新規DB、v2既存データ、再open、WAL/FK、unknown extension version", () => {
   const { raw, filename, dispatcher } = setup();
@@ -164,14 +170,14 @@ test("未受理の確証だけ3 attemptsと1秒/5秒・Retry-Afterを使用、�
 });
 
 test("work結果retryは完了後900秒境界で長いRetry-Afterと停止復帰時に終端化", () => {
-  const { repo } = setup();
+  const { repo, dispatcher, raw } = setup();
   for (const [name, retryAt, retryAfter] of [
     ["boundary", "2026-09-05T00:16:00Z", 0],
     ["retry_after", due, 901],
   ] as const) {
     repo.create(name, { ...input, action: "work.read_only" }, due, actor, now);
     const run = repo.materialize(name, 1, due, later, due, actor).run;
-    repo.setRunState(run.run_id, "materialized", "started", actor, due);
+    startWork(repo, dispatcher, raw, run, due);
     repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
     const claim = repo.claim(retryAt)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, retryAt);
     const finished = repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", retryAt, null, retryAfter);
@@ -179,7 +185,7 @@ test("work結果retryは完了後900秒境界で長いRetry-Afterと停止復帰
   }
   repo.create("recovery", { ...input, action: "work.read_only" }, due, actor, now);
   const run = repo.materialize("recovery", 1, due, later, due, actor).run;
-  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, run, due);
   repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
   const stopped = repo.claim(due, 1)!;
   repo.recover("2026-09-05T00:16:01Z");
@@ -238,6 +244,7 @@ test("本文retention、未決着fence保持、audit 90日、run purge後high-wa
 test("work run状態とjob参照、生成結果outboxのatomic primitive", () => {
   const { repo, dispatcher, raw } = setup(); repo.create("s1", { ...input, action: "work.read_only" }, due, actor, now);
   const { run } = repo.materialize("s1", 1, due, later, due, actor);
+  assert.throws(() => repo.setRunState(run.run_id, "materialized", "started", actor, due), /job_reference_required/);
   const job = dispatcher.createJob({ source_event_id: dispatcher.enqueue(eventEnvelope("job-fixture")).row.event_id, objective: "read only", workspace: { kind: "scratch" } }, "/tmp/test-scheduler-work", "/tmp/test-scheduler-results");
   // #11 owns scheduler-to-job routing. Supply only its persisted link for this repository test.
   raw.prepare("UPDATE jobs SET source_event_id = ? WHERE job_id = ?").run(run.event_id, job.row.job_id);
@@ -269,6 +276,7 @@ test("run単位の取消・失敗は未送信outboxを抑止する", () => {
     const claim = repo.claim(due)!;
     repo.setRunState(run.run_id, "materialized", next, actor, due);
     assert.equal(repo.getOutbox(claim.outbox_id, due)?.status, "cancelled");
+    assert.ok((repo.auditHistory(next) as { operation: string }[]).some(x => x.operation === `outbox_run_${next}`));
     assert.throws(() => repo.requestStarted(claim.outbox_id, claim.claim_token!, due), /claim_conflict/);
     assert.equal(repo.claim("2026-09-05T00:02:00Z"), undefined);
   }
@@ -318,7 +326,7 @@ test("grace超過の初回claimと送信開始直前の超過をterminal化し�
 });
 
 test("旧requestのreceiptは新revisionへ更新後も旧snapshot/hashに帰属", () => {
-  const { repo, raw } = setup(); repo.create("s1", input, due, actor, now);
+  const { repo, raw, dispatcher } = setup(); repo.create("s1", input, due, actor, now);
   repo.materialize("s1", 1, due, later, due, actor);
   const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
   repo.transition("s1", 1, "pause", actor, due);
@@ -332,7 +340,7 @@ test("旧requestのreceiptは新revisionへ更新後も旧snapshot/hashに帰属
   assert.notEqual(after.content_hash, (raw.prepare("SELECT content_hash FROM schedule_revisions WHERE revision = 3").get() as { content_hash: string }).content_hash);
   repo.create("work_audit", { ...input, action: "work.read_only" }, due, actor, now);
   const oldRun = repo.materialize("work_audit", 1, due, later, due, actor).run;
-  repo.setRunState(oldRun.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, oldRun, due);
   repo.transition("work_audit", 1, "pause", actor, due);
   repo.update("work_audit", 2, { ...input, action: "work.read_only", authorization_id: "work_auth", authorization_revision: 3, content: "新objective" }, later, actor, due);
   repo.setRunState(oldRun.run_id, "started", "failed", actor, due);
@@ -421,11 +429,11 @@ test("recurring materializeは将来next_dueを必須にしてNULLを拒否", ()
 });
 
 test("時計後退中のwork完了もrun・outbox・one-shot scheduleの終端時刻を開始前へ戻さない", () => {
-  const { dispatcher } = setup();
+  const { dispatcher, raw } = setup();
   const once = { ...input, action: "work.read_only" as const, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
   const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
   repo.create("clock_work", once, due, actor, now); const run = repo.materialize("clock_work", 1, due, null, due, actor).run;
-  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, run, due);
   repo.setRunState(run.run_id, "started", "completed", actor, "2026-09-05T00:00:30Z", null, "結果");
   const completed = repo.getRun(run.run_id)!; assert.equal(completed.terminal_at, due); assert.equal(completed.started_at, due);
   const outbox = repo.claim(due)!; assert.equal(outbox.created_at, due);
@@ -434,17 +442,17 @@ test("時計後退中のwork完了もrun・outbox・one-shot scheduleの終端�
 });
 
 test("one-shot workの結果通知と通知なし、graceでskipしたone-shotを完了可能", () => {
-  const { dispatcher } = setup();
+  const { dispatcher, raw } = setup();
   const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
   const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
   repo.create("silent", { ...once, action: "work.read_only", target: { kind: "none" } }, due, actor, now);
   const run = repo.materialize("silent", 1, due, null, due, actor).run;
-  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, run, due);
   repo.setRunState(run.run_id, "started", "completed", actor, due);
   assert.equal(repo.get("silent")?.state, "completed");
   repo.create("result", { ...once, action: "work.read_only" }, due, actor, now);
   const notified = repo.materialize("result", 1, due, null, due, actor).run;
-  repo.setRunState(notified.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, notified, due);
   repo.setRunState(notified.run_id, "started", "completed", actor, due, null, "結果");
   assert.equal(repo.get("result")?.state, "active");
   const delayedResult = repo.claim("2026-09-05T00:16:01Z");
@@ -583,13 +591,13 @@ test("authorization IDに埋め込まれたSlack tokenを保存前に拒否", ()
 });
 
 test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持", () => {
-  const { repo, raw } = setup();
+  const { repo, raw, dispatcher } = setup();
   for (const action of ["slack.reminder.post", "work.read_only"] as const) {
     const name = action === "work.read_only" ? "work" : "reminder";
     repo.create(name, { ...input, action }, due, actor, now);
     const run = repo.materialize(name, 1, due, later, due, actor).run;
     if (action === "work.read_only") {
-      repo.setRunState(run.run_id, "materialized", "started", actor, due);
+      startWork(repo, dispatcher, raw, run, due);
       repo.setRunState(run.run_id, "started", "completed", actor, due, null, "結果");
     }
     const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
@@ -663,10 +671,10 @@ test("送信応答時の失効をreceiptと共に保持し再承認可能にす�
 });
 
 test("通知先があるworkの結果欠落は完了transactionを拒否する", () => {
-  const { repo, raw } = setup();
+  const { repo, raw, dispatcher } = setup();
   repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
   const run = repo.materialize("work", 1, due, later, due, actor).run;
-  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  startWork(repo, dispatcher, raw, run, due);
   const auditCount = count(raw, "schedule_audit");
   assert.throws(() => repo.setRunState(run.run_id, "started", "completed", actor, due), /result_content_required/);
   assert.equal(repo.getRun(run.run_id)?.status, "started"); assert.equal(count(raw, "schedule_audit"), auditCount);
@@ -685,12 +693,22 @@ test("時計後退後の再承認next_dueはhigh-watermarkを越える必要が�
   assert.equal(repo.get("s1")?.next_due, later);
 });
 
+test("cancel時刻を単調化しcaller skip不一致とxapp本文を保存前に拒否", () => {
+  const { repo, raw } = setup(); repo.create("clock_cancel", input, due, actor, now);
+  const cancelled = repo.transition("clock_cancel", 1, "cancel", actor, "2025-09-05T00:00:00Z");
+  assert.equal(cancelled.terminal_at, now); assert.equal(cancelled.updated_at, now);
+  repo.create("bad_skip", input, due, actor, now);
+  assert.throws(() => repo.materialize("bad_skip", 1, due, later, due, actor, "misfire"), /invalid_skip_reason/);
+  assert.throws(() => repo.create("xapp_body", { ...input, content: "prefix xapp-secret" }, due, actor, now), /content_requires_redaction/);
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM schedule_runs WHERE schedule_id = 'bad_skip'").get() as { n: number }).n, 0);
+});
+
 test("開始済みworkは失効・pause・再承認後も完了し通知だけを抑止", () => {
-  const { repo, raw } = setup(); const expiry = "2026-09-05T00:02:00Z";
+  const { repo, raw, dispatcher } = setup(); const expiry = "2026-09-05T00:02:00Z";
   for (const mode of ["expiry", "pause", "replace", "cancel"] as const) {
     repo.create(mode, { ...input, action: "work.read_only", expires_at: expiry }, due, actor, now);
     const run = repo.materialize(mode, 1, due, later, due, actor).run;
-    repo.setRunState(run.run_id, "materialized", "started", actor, due);
+    startWork(repo, dispatcher, raw, run, due);
     if (mode === "pause" || mode === "replace") repo.transition(mode, 1, "pause", actor, due);
     if (mode === "cancel") repo.transition(mode, 1, "cancel", actor, due);
     if (mode === "replace") repo.update(mode, 2, { ...input, action: "work.read_only", authorization_id: "renewed", authorization_revision: 3 }, later, actor, due);
