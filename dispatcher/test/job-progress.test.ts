@@ -33,9 +33,10 @@ test("scratch progress path stays fixed when the worker creates git metadata", a
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-git-"));
   try {
     const row = { workspace_path: root, workspace_json: JSON.stringify({ kind:"scratch" }) } as never;
-    assert.equal(jobProgressPath(row), path.join(root, ".dona-job-progress.json"));
+    const expected=path.join(path.dirname(root),".dona-progress",path.basename(root),"progress.json");
+    assert.equal(jobProgressPath(row), expected);
     await fs.mkdir(path.join(root, ".git"));
-    assert.equal(jobProgressPath(row), path.join(root, ".dona-job-progress.json"));
+    assert.equal(jobProgressPath(row), expected);
   } finally { await fs.rm(root, { recursive: true }); }
 });
 
