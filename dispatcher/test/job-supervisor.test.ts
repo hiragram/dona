@@ -322,6 +322,34 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("stalled prompt後の同一agentのblocked進行を受理済みとして保持する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-blocked");
+    let prompted = false;
+    const identity = '["w1","p1","agent","session-1"]';
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        return {
+          ...ok(prompted ? "blocked" : "idle"),
+          agentIdentity: identity,
+          stateChangeSeq: prompted ? 2 : 1,
+        };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "blocked");
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.ok(updated.prompt_accepted_at);
+    assert.equal(updated.last_error_code, "agent_blocked");
+    database.close();
+  });
+
   test("stalled prompt後にResultが先行した場合はagentを待たず回収する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

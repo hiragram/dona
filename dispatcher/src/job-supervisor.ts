@@ -311,8 +311,12 @@ export class JobSupervisor {
         && initial.stateChangeSeq !== undefined
         && observed.stateChangeSeq !== undefined
         && observed.stateChangeSeq > initial.stateChangeSeq;
-      if (progressed && ["working", "idle", "done"].includes(observed.agentStatus ?? "")) {
+      if (progressed && ["working", "idle", "done", "blocked"].includes(observed.agentStatus ?? "")) {
         this.database.markJobRunning(row.job_id);
+        if (observed.agentStatus === "blocked") {
+          this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+          return;
+        }
         await this.monitor(this.database.getJob(row.job_id)!);
         return;
       }
