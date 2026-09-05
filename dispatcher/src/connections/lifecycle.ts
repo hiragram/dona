@@ -18,7 +18,7 @@ export class ConnectionLifecycle {
   private async connection(id: string): Promise<Connection> {
     const c = this.registry.get(id);
     if (c.state === "disabled") throw new ConnectionError("disabled");
-    if (stableStringify(c.capability) !== stableStringify(this.driver.capability)) throw new ConnectionError("capability_mismatch");
+    if (c.provider !== this.driver.provider || stableStringify(c.capability) !== stableStringify(this.driver.capability)) throw new ConnectionError("capability_mismatch");
     let available = false;
     try { available = await this.bounded(() => this.driver.credentialAvailable(c)); } catch { /* 非公開 driver error は出力しない */ }
     if (!available) { this.registry.degrade(id, c.revision); throw new ConnectionError("credential_unavailable"); }
@@ -45,7 +45,7 @@ export class ConnectionLifecycle {
     if (!subscription || subscription.providerId === null) throw new ConnectionError("not_found");
     let result;
     try { result = await this.bounded(() => this.driver.inspect(c, subscription)); }
-    catch { this.registry.degrade(id, c.revision); throw new ConnectionError("not_authorized"); }
+    catch { this.registry.quarantine(id, c.revision, resource, generation); throw new ConnectionError("not_authorized"); }
     this.registry.observe(id, c.revision, resource, generation, result);
   }
   async reconcile(id: string, operationId: string): Promise<void> {

@@ -10,6 +10,8 @@ Issue #51の共通registry。provider固有の署名検証・resource取得・�
 
 registryへ1件でも登録されたsourceはmanaged sourceになり、そのsourceのbindingなしの受信を拒否する。登録前の未binding queued eventも自動dispatchしない。未登録sourceの#48 contractは互換維持する。connectionごとのevent bindingを追加tableに保存し、disableまたはrevision不一致のeventはqueue選択とdispatch開始の両方で拒否する。dispatch開始が先にcommitしたeventを取り消す機能ではない。event/result/job/auditは削除しない。
 
+event bindingはresource/generationも保持し、dispatch開始時にsubscriptionの検証状態と期限を再検査する。新generationから同一eventが再送された場合は、同じrevisionのbindingだけを新generationへ進める。Driverはprovider/source discriminatorを持ち、capabilityとproviderの両方がconnectionと一致することを外部call前に検査する。
+
 ## capabilityと状態
 
 | capability | 登録・検証 | renewal |
@@ -21,7 +23,9 @@ registryへ1件でも登録されたsourceはmanaged sourceになり、そのsou
 NotionのUI型、GitHubのinstallation設定、FigmaのAPI管理、Driveの期限付きchannelのような差を、各pilotがこのcapabilityへ明示mappingする。すべてのproviderへrenewalを強制しない。windowはsubscriptionごとに保存する。
 
 - register → `verification_pending`。inspectで認証・provider IDを確認すると `active`。
-- allowlist/credential revision更新 → `degraded`。旧revisionの通知/queued event/cursor commitは拒否する。更新前のgenerationを新credentialでread-only verifyし、新revisionへ再bindingできる。provider/accountは変更不可。既存cursorは `rebindCursor` に旧checkpoint/versionを指定して照合し、tokenを保持したまま明示再bindingする。
+- 未解決のcreate/stopがある間はrevision更新を拒否する。まずlookupで既存operationを解消する。緊急停止にはrevision更新を待たずdisableを使う。
+- allowlist/credential revision更新 → `degraded`。旧revisionの通知/queued event/cursor commitは拒否する。更新前のgenerationを新credentialでread-only verifyし、新revisionへ再bindingできる。provider/accountは変更不可。初期cursorも登録時に保存し、未commitの場合も含めて `rebindCursor` に旧checkpoint/versionを指定し、tokenを保持したまま明示再bindingする。
+- resourceのinspect失敗は、そのsubscriptionのverifiedAtを消してquarantineする。他resourceの成功でconnectionがactiveへ戻っても、失敗resourceのdelivery/dispatchは再開しない。
 - expiry-window内はinspection/healthで `expiring`。期限切れ通知は拒否する。
 - claimは `BEGIN IMMEDIATE` 内でgenerationとoperation ID/leaseを永続化する。driverへoperation IDをidempotency/lookup keyとして渡す。1 resourceの未解決操作がある間は次操作を作らない。
 - timeout、create成功後response loss、claim後crashは `renewal_unknown` / operation `unknown`。lease expiryはlookup権限だけを与え、再create権限を与えない。driverの遅延responseを追って二度commitしない。

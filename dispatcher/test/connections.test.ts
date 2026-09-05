@@ -19,6 +19,7 @@ const managed: Capability = { kind: "managed", cursor: true, renewal: "replace",
 const config: ConnectionConfig = { id: "pilot", provider: "drive", account: "account1", credentialRef: "cred_fixture",
   credentialRevision: 1, allowlist: [{ resource: "folder1", events: ["changed"] }], capability: managed };
 class FakeDriver implements Driver {
+  provider = "drive";
   capability: Capability = managed; creates = 0; stops = 0; available = true; loss = false; timeout = false; cutover = false;
   observations = new Map<string, ProviderObservation>();
   constructor(readonly clock: FakeClock) {}
@@ -167,7 +168,7 @@ test("cursor compare/commitはbatchと同一transaction、競合・partial page�
   assert.deepEqual(db.connections.cursor("pilot","folder1"),expected);
   const raw = new Database(file); t.after(()=>raw.close());
   // SQLite failure exactly at checkpoint write, after event insert.
-  raw.exec("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON connection_cursors BEGIN SELECT RAISE(ABORT,'crash-before-checkpoint'); END");
+  raw.exec("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON connection_cursors BEGIN SELECT RAISE(ABORT,'crash-before-checkpoint'); END");
   assert.throws(()=>db.commitConnectionBatch(batch),/crash-before-checkpoint/);
   assert.equal(db.list().length,0); assert.deepEqual(db.connections.cursor("pilot","folder1"),expected);
   raw.exec("DROP TRIGGER fail_checkpoint");
@@ -239,7 +240,7 @@ test("additive migrationはlegacy user_version/event/jobを保ちrollbackとFK�
   assert.deepEqual(upgraded.get(oldEvent.event_id),oldEvent); assert.deepEqual(upgraded.getJob(oldJob.job_id),oldJob); upgraded.close();
   assert.deepEqual(raw.prepare("SELECT sql FROM sqlite_master WHERE name IN ('events','jobs') ORDER BY name").all(),legacySchema);
   assert.equal(raw.pragma("integrity_check",{simple:true}),"ok"); assert.deepEqual(raw.pragma("foreign_key_check"),[]);
-  assert.throws(()=>raw.prepare("INSERT INTO connection_event_bindings VALUES('missing','missing',1)").run(),/FOREIGN KEY/);
+  assert.throws(()=>raw.prepare("INSERT INTO connection_event_bindings VALUES('missing','missing',1,'missing',1)").run(),/FOREIGN KEY/);
   const broken=new Database(":memory:"); t.after(()=>broken.close());
   broken.exec("CREATE TABLE connections(id TEXT)"); assert.throws(()=>migrateConnections(broken));
   assert.equal(broken.prepare("SELECT name FROM sqlite_master WHERE name='connection_schema'").get(),undefined);
@@ -341,4 +342,66 @@ test("実page fetchの途中失敗/timeout/循環ではeventとcursorをcommit�
       {done:true,checkpoint:"final",events:[]};
   });
   assert.equal(pages,2);assert.equal(db.list().length,1);assert.equal(db.connections.cursor("pilot","folder1").checkpoint,"final");
+});
+
+test("未解決create/stopのrevision変更は拒否しreconcile可能性を維持する",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);driver.loss=true;
+  const op=await lifecycle.createOrRenew("pilot","folder1");
+  assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
+  assert.equal(db.connections.get("pilot").revision,1);
+  await lifecycle.reconcile("pilot",op.id);driver.loss=false;driver.cutover=true;clock.value+=9000;
+  await lifecycle.createOrRenew("pilot","folder1");
+  const stop=db.connections.claim("pilot",1,"folder1",20,"stop",1);
+  assert.throws(()=>db.connections.revise("pilot",1,config),/operation_pending/);
+  clock.value+=21;await lifecycle.reconcile("pilot",stop.id);
+  assert.equal(db.connections.revise("pilot",1,{...config,credentialRevision:2}).revision,2);
+});
+
+test("queue待機中の期限切れはdispatch不可、新generation再送でbindingを更新する",async(t)=>{
+  const {db,clock,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());clock.value+=9000;await lifecycle.createOrRenew("pilot","folder1");
+  clock.value+=1000;
+  assert.equal(db.nextAvailable(new Date(clock.now())),undefined);
+  assert.throws(()=>db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())),/no longer dispatchable/);
+  assert.equal(db.enqueueExternal(event(),binding(2)).outcome,"duplicate_same");
+  assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,accepted.row.event_id);
+  assert.equal(db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())).status,"dispatching");
+});
+
+test("resource Aの検証失敗はBの成功後もquarantineを維持する",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);
+  db.connections.revise("pilot",1,{...config,allowlist:[...config.allowlist,{resource:"folder2",events:["changed"]}]});
+  // 複数resourceに異なるprovider IDを返すdriver。
+  driver.create=async(_c,op)=>({providerId:op.resource,verified:true,cutoverConfirmed:false,expiresAt:clock.now()+10000});
+  await lifecycle.createOrRenew("pilot","folder1");await lifecycle.createOrRenew("pilot","folder2");
+  const b={...binding(),revision:2};const accepted=db.enqueueExternal(event(),b);
+  driver.inspect=async(_c,s)=>{
+    if(s.resource==='folder1')throw new Error("private-read-failure");
+    return {providerId:s.providerId!,verified:true,cutoverConfirmed:false,expiresAt:clock.now()+10000};
+  };
+  await assert.rejects(lifecycle.verify("pilot","folder1",1),/not_authorized/);
+  await lifecycle.verify("pilot","folder2",1);
+  assert.equal(db.connections.get("pilot").state,"active");
+  assert.throws(()=>db.enqueueExternal(event("blocked"),b),/not_authorized/);
+  assert.throws(()=>db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now())),/no longer dispatchable/);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+});
+
+test("未commitの初期cursorもrevision変更後は明示rebindが必要",async(t)=>{
+  const {db,lifecycle}=fixture(t);const original=db.connections.cursor("pilot","folder1");
+  await lifecycle.createOrRenew("pilot","folder1");db.connections.revise("pilot",1,{...config,credentialRevision:2});
+  await lifecycle.verify("pilot","folder1",1);
+  assert.deepEqual(db.connections.cursor("pilot","folder1"),original);
+  const batch={binding:{...binding(),revision:2,credentialRevision:2},expected:original,checkpoint:"page1",complete:true,events:[]};
+  assert.throws(()=>db.commitConnectionBatch(batch),/cursor_conflict/);
+  db.connections.rebindCursor("pilot","folder1",original,2);
+  db.commitConnectionBatch({...batch,expected:db.connections.cursor("pilot","folder1")});
+  assert.equal(db.connections.cursor("pilot","folder1").version,2);
+});
+
+test("同じcapabilityの別provider driverはcredential確認前に拒否する",async(t)=>{
+  const {db,driver,lifecycle}=fixture(t);driver.provider="wrong-provider";let reads=0;
+  driver.credentialAvailable=async()=>{reads++;return true;};
+  await assert.rejects(lifecycle.createOrRenew("pilot","folder1"),/capability_mismatch/);
+  assert.equal(reads,0);assert.equal(driver.creates,0);assert.equal(db.connections.operations("pilot").length,0);
 });

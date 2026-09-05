@@ -256,7 +256,7 @@ export class DispatcherApi {
         } catch {
           ready = false;
         }
-        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready", connections: this.database.connections.health() });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
@@ -421,7 +421,7 @@ export class DispatcherApi {
       } else if (error instanceof IncompleteBodyError) {
         sendJson(response, 400, errorBody("request_incomplete", "Request body was not received completely"), true);
       } else if (error instanceof ConnectionError) {
-        sendJson(response, 403, { error: "connection_not_authorized" });
+        sendJson(response, 403, errorBody("connection_not_authorized", "Connection binding is not authorized"));
       } else if (error instanceof ExternalIngressAuthenticationError) {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
       } else if (error instanceof ExternalIngressValidationError) {

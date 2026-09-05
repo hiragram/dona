@@ -629,7 +629,7 @@ export class DispatcherDatabase {
         WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update' AND ${connectionDispatchPredicate}
         ORDER BY sequence LIMIT 1
       `)
-      .get() as EventRow | undefined;
+      .get(at.getTime()) as EventRow | undefined;
     return head && head.available_at <= at.toISOString() ? head : undefined;
   }
 
@@ -688,7 +688,7 @@ export class DispatcherDatabase {
           result_path = ?, last_error_code = NULL, last_error_message = NULL, updated_at = ?
         WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
-      .run(timestamp, resultPath, timestamp, eventId).changes;
+      .run(timestamp, resultPath, timestamp, eventId, at.getTime()).changes;
     if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
     return this.get(eventId)!;
   }

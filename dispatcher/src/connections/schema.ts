@@ -41,7 +41,8 @@ export function migrateConnections(db: Database.Database): void {
       );
       CREATE TABLE connection_event_bindings (
         event_id TEXT PRIMARY KEY REFERENCES events(event_id), connection_id TEXT NOT NULL REFERENCES connections(id),
-        revision INTEGER NOT NULL
+        revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
+        FOREIGN KEY(connection_id,resource,generation) REFERENCES connection_subscriptions(connection_id,resource,generation)
       );
       CREATE INDEX connection_event_binding_idx ON connection_event_bindings(connection_id,revision);
       CREATE TABLE connection_audit (
@@ -57,5 +58,7 @@ export function migrateConnections(db: Database.Database): void {
 export const connectionDispatchPredicate = `(NOT EXISTS (SELECT 1 FROM connections managed WHERE managed.provider=events.source)
   OR EXISTS (SELECT 1 FROM connection_event_bindings bound WHERE bound.event_id=events.event_id)) AND NOT EXISTS (
   SELECT 1 FROM connection_event_bindings b JOIN connections c ON c.id=b.connection_id
-  WHERE b.event_id=events.event_id AND (c.state!='active' OR c.revision!=b.revision)
+  LEFT JOIN connection_subscriptions s ON s.connection_id=b.connection_id AND s.resource=b.resource AND s.generation=b.generation
+  WHERE b.event_id=events.event_id AND (c.state!='active' OR c.revision!=b.revision OR s.revision!=b.revision
+    OR s.verified_at IS NULL OR s.state NOT IN ('active','expiring','stop_candidate') OR s.expires_at<=?)
 )`;

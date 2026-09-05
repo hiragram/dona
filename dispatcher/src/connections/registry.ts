@@ -53,6 +53,9 @@ export class ConnectionRegistry {
       if (!Number.isSafeInteger(now) || now < 0) throw new ConnectionError("clock_skew");
       this.db.prepare("INSERT INTO connections VALUES(?,?,?,1,'verification_pending',?)")
         .run(config.id, config.provider, stableStringify(config), now);
+      if (config.capability.cursor) for (const entry of config.allowlist) {
+        this.db.prepare("INSERT INTO connection_cursors VALUES(?,?,1,0,NULL)").run(config.id, entry.resource);
+      }
       const result = this.get(config.id); this.audit(result, "registered", now); return result;
     }).immediate();
   }
@@ -61,11 +64,15 @@ export class ConnectionRegistry {
     return this.db.transaction(() => {
       const current = this.get(id);
       if (current.revision !== revision) throw new ConnectionError("revision_conflict");
+      if (this.operations(id).some((operation) => operation.state !== "done")) throw new ConnectionError("operation_pending");
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
       this.db.prepare("UPDATE connections SET config_json=?,revision=revision+1,state=CASE WHEN state='disabled' THEN 'disabled' ELSE 'degraded' END WHERE id=?")
         .run(stableStringify(config), id);
+      if (config.capability.cursor) for (const entry of config.allowlist) {
+        this.db.prepare("INSERT OR IGNORE INTO connection_cursors VALUES(?,?,?,0,NULL)").run(id, entry.resource, revision + 1);
+      }
       const result = this.get(id); this.audit(result, "revised", now); return result;
     }).immediate();
   }
@@ -86,6 +93,17 @@ export class ConnectionRegistry {
       const now = this.tick(id);
       this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
       this.audit(c, "credential_unavailable", now);
+    }).immediate();
+  }
+  quarantine(id: string, revision: number, resource: string, generation: number): void {
+    this.db.transaction(() => {
+      const c = this.get(id);
+      if (c.revision !== revision || c.state === "disabled") return;
+      const now = this.tick(id);
+      this.db.prepare(`UPDATE connection_subscriptions SET verified_at=NULL,error='verification_failed',last_reconcile_at=?
+        WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
+      this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
+      this.audit(c, "verification_failed", now);
     }).immediate();
   }
   private current(id: string, revision: number, resource: string): Connection {
@@ -223,9 +241,11 @@ export class ConnectionRegistry {
         (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
       const result = persist();
       if (result.outcome === "duplicate_conflict") return result;
-      const prior = this.db.prepare("SELECT connection_id,revision FROM connection_event_bindings WHERE event_id=?").get(result.row.event_id) as {connection_id: string; revision: number} | undefined;
-      if (prior && prior.connection_id !== c.id) throw new ConnectionError("not_authorized");
-      if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?)").run(result.row.event_id, c.id, c.revision);
+      const prior = this.db.prepare("SELECT connection_id,revision,resource,generation FROM connection_event_bindings WHERE event_id=?").get(result.row.event_id) as {connection_id: string; revision: number; resource: string; generation: number} | undefined;
+      if (prior && (prior.connection_id !== c.id || prior.resource !== binding.resource)) throw new ConnectionError("not_authorized");
+      if (!prior) this.db.prepare("INSERT INTO connection_event_bindings VALUES(?,?,?,?,?)").run(result.row.event_id, c.id, c.revision, binding.resource, binding.generation);
+      else if (prior.revision === c.revision && prior.generation < binding.generation) this.db.prepare("UPDATE connection_event_bindings SET generation=? WHERE event_id=?")
+        .run(binding.generation, result.row.event_id);
       this.db.prepare("UPDATE connection_subscriptions SET last_delivery_at=? WHERE connection_id=? AND resource=? AND generation=?")
         .run(now, c.id, binding.resource, binding.generation);
       return result;
@@ -254,7 +274,8 @@ export class ConnectionRegistry {
       const cursor = this.cursor(id, resource);
       if (stableStringify(cursor) !== stableStringify(expected)) throw new ConnectionError("cursor_conflict");
       const now = this.tick(id);
-      this.db.prepare("UPDATE connection_cursors SET revision=?,version=version+1 WHERE connection_id=? AND resource=?").run(revision, id, resource);
+      this.db.prepare(`INSERT INTO connection_cursors VALUES(?,?,?,?,?) ON CONFLICT(connection_id,resource)
+        DO UPDATE SET revision=excluded.revision,version=excluded.version,checkpoint=excluded.checkpoint`).run(id, resource, revision, cursor.version + 1, cursor.checkpoint);
       this.audit(c, "cursor_rebound", now);
     }).immediate();
   }

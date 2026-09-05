@@ -62,6 +62,7 @@ export interface ProviderObservation {
   providerId: string; expiresAt: number | null; verified: boolean; cutoverConfirmed: boolean;
 }
 export interface Driver {
+  readonly provider: string;
   readonly capability: Capability;
   // この参照の現在の capability revision を secret store から検証。secret は返さない。
   credentialAvailable(connection: Readonly<Connection>): Promise<boolean>;
