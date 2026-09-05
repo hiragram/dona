@@ -86,4 +86,22 @@ console.log('{"status":"ok","result":{"agent":{"agent_status":"working"}}}');
       else process.env.HERDR_TEST_ARGUMENTS_PATH = previousArgumentsPath;
     }
   });
+
+  test("returns at the command deadline even when Herdr ignores SIGTERM", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-herdr-timeout-"));
+    roots.push(root);
+    const executable = path.join(root, "fake-herdr");
+    await fs.writeFile(executable, "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n", { mode: 0o700 });
+    const client = new HerdrProcessClient({
+      executable,
+      session: "test",
+      agentName: "dona-main",
+      waitTimeoutMs: 100,
+      commandTimeoutMs: 20,
+    });
+    const started = Date.now();
+    const result = await client.get();
+    assert.equal(result.timedOut, true);
+    assert.ok(Date.now() - started < 500);
+  });
 });

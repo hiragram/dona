@@ -136,16 +136,22 @@ function runProcess(
       signal?.removeEventListener("abort", abort);
       resolve(resultFromProcess(base));
     };
-    const kill = (): void => {
-      if (!child.killed) child.kill("SIGTERM");
+    const terminate = (): void => {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      forceKill.unref();
     };
     const abort = (): void => {
       aborted = true;
-      kill();
+      terminate();
+      finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      kill();
+      terminate();
+      finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     }, timeoutMs);
     timer.unref();
     signal?.addEventListener("abort", abort, { once: true });
