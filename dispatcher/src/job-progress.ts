@@ -126,6 +126,7 @@ export class JobProgressCoordinator {
   private readonly deliveryClaims = new Map<string,string>();
   private readonly deliveryOperations = new Map<string,Promise<void>>();
   private readonly terminalReconciliations = new Map<string,Promise<void>>();
+  private readonly drainAbort = new AbortController();
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
@@ -190,7 +191,7 @@ export class JobProgressCoordinator {
         if(detail.retryAfterSeconds!==undefined)this.store.deferWorkspace(job.workspace_id,new Date(at.getTime()+Math.max(5,detail.retryAfterSeconds)*1_000));
         this.store.retry(progress.job_id, detail.message, at, detail.retryAfterSeconds);
       }
-      else { await this.drainAdapterUntilSettled(progress.job_id); this.store.unknown(progress.job_id, detail.message); }
+      else { if(await this.drainAdapterUntilSettled(progress.job_id))this.store.unknown(progress.job_id, detail.message); }
     } finally {
       finishDelivery();
       this.deliveryOperations.delete(progress.job_id);
@@ -213,16 +214,18 @@ export class JobProgressCoordinator {
 
   private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return row!==undefined&&row.terminal_checked===1&&!this.deliveryOperations.has(jobId); }
   async drainDeliveries():Promise<void> { await Promise.allSettled([...this.deliveryOperations.values()]); }
+  stop():void {this.drainAbort.abort();}
 
   private async drainAdapter():Promise<void> {
     const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");
-    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED","ECONNRESET"].includes(error.code??"")?resolve():reject(error));request.end();});
+    await new Promise<void>((resolve,reject)=>{const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress/drain",method:"POST",headers:{"content-length":"0","x-dona-update-token":token}},response=>{response.resume();response.once("end",()=>response.statusCode===200||[403,404,503].includes(response.statusCode??0)?resolve():reject(new Error(`progress drain HTTP ${response.statusCode}`)));});const abort=()=>request.destroy(Object.assign(new Error("progress drain aborted"),{name:"AbortError"}));this.drainAbort.signal.addEventListener("abort",abort,{once:true});request.once("close",()=>this.drainAbort.signal.removeEventListener("abort",abort));request.once("error",(error:NodeJS.ErrnoException)=>["ENOENT","ECONNREFUSED","ECONNRESET"].includes(error.code??"")?resolve():reject(error));request.end();});
   }
 
-  private async drainAdapterUntilSettled(jobId:string):Promise<void> {
+  private async drainAdapterUntilSettled(jobId:string):Promise<boolean> {
     for(;;){
-      try {await this.drainAdapter();return;}
-      catch {this.logger.warn("Ambiguous progress drain will be retried",{job_id:jobId,error_code:"job_progress_drain_retry"});await new Promise<void>((resolve)=>setTimeout(resolve,5_000));}
+      if(this.drainAbort.signal.aborted)return false;
+      try {await this.drainAdapter();return true;}
+      catch {if(this.drainAbort.signal.aborted)return false;this.logger.warn("Ambiguous progress drain will be retried",{job_id:jobId,error_code:"job_progress_drain_retry"});await new Promise<void>((resolve)=>{const timer=setTimeout(resolve,5_000);this.drainAbort.signal.addEventListener("abort",()=>{clearTimeout(timer);resolve();},{once:true});});}
     }
   }
 

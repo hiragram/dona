@@ -140,6 +140,7 @@ export class JobSupervisor {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.progress?.stop();
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
@@ -329,7 +330,8 @@ export class JobSupervisor {
       if (this.progress) {
         try {
           if (!this.progress.notificationReady(job)) {
-            void this.progress.reconcileTerminal(job).then(()=>this.wake(),(error)=>this.logger.warn("Terminal progress reconciliation failed",{job_id:job.job_id,error_code:"job_progress_terminal_reconcile_failed",error_message:error instanceof Error?error.message:String(error)}));
+            const failedProgress=this.progress;
+            void failedProgress.reconcileTerminal(job).then(()=>this.wake(),async(error)=>{this.logger.warn("Terminal progress reconciliation failed",{job_id:job.job_id,error_code:"job_progress_terminal_reconcile_failed",error_message:error instanceof Error?error.message:String(error)});await failedProgress.drainDeliveries();if(this.progress===failedProgress)await this.disableProgress();this.wake();});
             continue;
           }
         } catch (error) {
