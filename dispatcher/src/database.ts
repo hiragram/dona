@@ -708,6 +708,7 @@ export class DispatcherDatabase {
   }
   listNonterminalJobs(afterJobId="",limit=500):JobRow[] {return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status NOT IN ('blocked','completed','failed','cancelled','needs_review') ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];}
   listJobsAfter(afterJobId="",limit=500):JobRow[] {return this.db.prepare("SELECT * FROM jobs WHERE job_id>? ORDER BY job_id LIMIT ?").all(afterJobId,limit) as JobRow[];}
+  listStatusJobsAfter(status:JobStatus,afterJobId="",limit=500):JobRow[] {return this.db.prepare("SELECT * FROM jobs WHERE status=? AND job_id>? ORDER BY job_id LIMIT ?").all(status,afterJobId,limit) as JobRow[];}
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
     return this.db.prepare(`

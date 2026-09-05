@@ -84,6 +84,7 @@ export class JobSupervisor {
   private loopPromise: Promise<void> | undefined;
   private progressLoopPromise: Promise<void> | undefined;
   private readonly cancelledWorkerCleanups = new Set<Promise<void>>();
+  private readonly cancelledCleanupJobIds = new Set<string>();
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
@@ -104,6 +105,7 @@ export class JobSupervisor {
   start(): void {
     if (this.loopPromise) return;
     this.recoverStaleJobs();
+    this.trackRecoveredCancelledWorkerCleanups();
     this.running = true;
     this.loopPromise = this.loop().catch((error: unknown) => {
       this.logger.error("Job supervisor stopped unexpectedly", {
@@ -225,16 +227,22 @@ export class JobSupervisor {
   }
 
   private trackCancelledWorkerCleanup(row:JobRow):void {
+    if(this.cancelledCleanupJobIds.has(row.job_id))return;
+    this.cancelledCleanupJobIds.add(row.job_id);
     const operation=(async()=>{
-      try {
-        while(!this.stopping){
-          try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted)break;if(waited.ok&&waited.agentStatus!=="blocked")break;if(!waited.ok&&!waited.timedOut&&waited.errorCode!=="timeout")break;}
-          catch {}
-          try {await abortableDelay(this.config.queuePollMs,this.abortController.signal);}catch {break;}
-        }
-      } finally {await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});}
+      for(;;){
+        try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted||this.stopping)return;if(waited.ok&&waited.agentStatus!=="blocked")break;if(!waited.ok&&!waited.timedOut&&waited.errorCode!=="timeout")break;}
+        catch {if(this.stopping)return;}
+        await new Promise<void>((resolve)=>{const timer=setTimeout(resolve,this.config.queuePollMs);timer.unref();});
+      }
+      await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});
     })();
-    this.cancelledWorkerCleanups.add(operation);void operation.finally(()=>this.cancelledWorkerCleanups.delete(operation)).catch(()=>undefined);
+    this.cancelledWorkerCleanups.add(operation);void operation.finally(()=>{this.cancelledWorkerCleanups.delete(operation);this.cancelledCleanupJobIds.delete(row.job_id);}).catch(()=>undefined);
+  }
+
+  private trackRecoveredCancelledWorkerCleanups():void {
+    const recovery=(async()=>{let after="";for(;;){const batch=this.database.listStatusJobsAfter("cancelled",after,500);for(const row of batch){try{await fs.access(path.dirname(jobProgressPath(row)));this.trackCancelledWorkerCleanup(row);}catch{} }if(batch.length<500)break;after=batch.at(-1)!.job_id;}})();
+    this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>this.cancelledWorkerCleanups.delete(recovery)).catch(()=>undefined);
   }
 
   private async loop(): Promise<void> {
