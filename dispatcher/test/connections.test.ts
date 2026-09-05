@@ -160,7 +160,9 @@ test("allowlistとcredential revisionを同時bindingし変更時はfail closed"
   const fresh = db.enqueueExternal(event("fresh"),{...binding(),revision:2,credentialRevision:2});
   assert.equal(fresh.outcome,"created");
   assert.equal(db.nextAvailable(new Date(clock.now()))!.event_id,fresh.row.event_id);
-  assert.equal(db.get(accepted.row.event_id)!.status,"queued");
+  const superseded=db.get(accepted.row.event_id)!;
+  assert.equal(superseded.status,"completed");
+  assert.match(superseded.result_json!,/Connection revision superseded before dispatch/);
 });
 
 test("cursor compare/commitはbatchと同一transaction、競合・partial page・crashをrollback", async (t) => {

@@ -68,12 +68,25 @@ export class ConnectionRegistry {
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
+      const completedAt = new Date(now).toISOString();
+      const superseded = this.db.prepare(`SELECT events.event_id FROM events
+        JOIN connection_event_bindings binding USING(event_id)
+        WHERE binding.connection_id=? AND binding.revision=? AND events.status IN ('queued','retryable_failed')`)
+        .all(id, revision) as {event_id:string}[];
+      for (const {event_id} of superseded) {
+        const result = { schema_version: 1, event_id, status: "completed", summary: "Connection revision superseded before dispatch",
+          actions: [], memory_candidates: [], completed_at: completedAt };
+        this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,
+          last_error_message=NULL,updated_at=? WHERE event_id=?`).run(stableStringify(result), completedAt, completedAt, event_id);
+      }
       this.db.prepare("UPDATE connections SET config_json=?,revision=revision+1,state=CASE WHEN state='disabled' THEN 'disabled' ELSE 'degraded' END WHERE id=?")
         .run(stableStringify(config), id);
       if (config.capability.cursor) for (const entry of config.allowlist) {
         this.db.prepare("INSERT OR IGNORE INTO connection_cursors VALUES(?,?,?,0,NULL)").run(id, entry.resource, revision + 1);
       }
-      const result = this.get(id); this.audit(result, "revised", now); return result;
+      const result = this.get(id);
+      if (superseded.length) this.audit(result, "queued_events_superseded", now);
+      this.audit(result, "revised", now); return result;
     }).immediate();
   }
   disable(id: string, revision: number): void {

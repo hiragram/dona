@@ -336,12 +336,17 @@ export class ExternalIngressProcessor {
   ): Promise<ExternalIngressResult> {
     const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
+    let verifiedBinding: DeliveryBinding | undefined;
     try {
       const authenticated = await within(
         Promise.resolve().then(() => registration.authenticate(request)),
         remainingProcessingTime(processingDeadline),
       );
       verified = validatePrincipal(authenticated);
+      verifiedBinding = verified.connection === undefined ? undefined : deliverySchema.parse({
+        ...verified.connection,
+        connectionId: verified.connectionId,
+      });
       remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;
@@ -349,10 +354,6 @@ export class ExternalIngressProcessor {
     }
 
     const verifiedConnectionId = verified.connectionId;
-    const verifiedBinding = verified.connection === undefined ? undefined : deliverySchema.parse({
-      ...verified.connection,
-      connectionId: verifiedConnectionId,
-    });
     let normalized: NormalizedExternalEvent;
     try {
       const candidate = await within(
