@@ -121,6 +121,8 @@ export interface EventRow {
 }
 
 export interface EnqueueResult {
+  admission?: "coalesced";
+  committedAt?: string;
   row: EventRow;
   outcome: "created" | "duplicate_same" | "duplicate_conflict";
   duplicate: boolean;

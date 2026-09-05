@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, QueueClaimUnavailableError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -51,7 +53,11 @@ function storedSlackReceivedAtFallback(row: EventRow): boolean {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
-  constructor(databasePath: string) {
+  private claimsClosed = false;
+  readonly queuePolicy: QueuePolicy;
+
+  constructor(databasePath: string, queuePolicy: unknown = {}) {
+    this.queuePolicy = queuePolicySchema.parse(queuePolicy);
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -59,12 +65,17 @@ export class DispatcherDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    try {
+      this.db.transaction(() => {
+        this.migrate();
+        if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
+      }).immediate();
+    } catch (error) { this.db.close(); throw error; }
   }
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 2) throw new Error(`Database schema version ${version} is newer than supported version 2`);
+    if (version > 4 || version === 3) throw new Error(`Database schema version ${version} is not supported by the event queue schema 4`);
     if (version < 1) this.db.exec(`
       CREATE TABLE events (
         sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,6 +143,88 @@ export class DispatcherDatabase {
     `);
   }
 
+  private migrateQueue(): void {
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE queue_lanes (
+          lane TEXT PRIMARY KEY, source TEXT NOT NULL, connection TEXT NOT NULL,
+          class TEXT NOT NULL, tokens REAL NOT NULL, clock_ms INTEGER NOT NULL,
+          last_selected INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE queue_events (
+          event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+          lane TEXT NOT NULL REFERENCES queue_lanes(lane), bytes INTEGER NOT NULL,
+          coalesce_key TEXT, fingerprint TEXT NOT NULL, delivery_count INTEGER NOT NULL DEFAULT 1,
+          requires_fetch INTEGER NOT NULL DEFAULT 0 CHECK(requires_fetch IN (0,1))
+        );
+        CREATE INDEX queue_events_lane ON queue_events(lane, event_id);
+        CREATE INDEX queue_events_coalesce ON queue_events(lane, coalesce_key);
+        CREATE TABLE queue_deliveries (
+          source TEXT NOT NULL, external_event_id TEXT NOT NULL,
+          event_id TEXT NOT NULL REFERENCES events(event_id), fingerprint TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(source, external_event_id)
+        );
+        CREATE TABLE queue_sources (source TEXT PRIMARY KEY, tokens REAL NOT NULL, clock_ms INTEGER NOT NULL);
+        CREATE TABLE queue_metrics (code TEXT PRIMARY KEY, count INTEGER NOT NULL);
+        CREATE TABLE queue_selector (id INTEGER PRIMARY KEY CHECK(id=1), step INTEGER NOT NULL);
+        INSERT INTO queue_selector VALUES (1,0);
+      `);
+      for (const row of this.db.prepare("SELECT * FROM events ORDER BY sequence").all() as EventRow[]) {
+        // 旧provider rowのconnectionは復元不能なのでsource単位のlegacy laneへ隔離する。
+        const event: EventEnvelope = { schema_version: 1, source: row.source as EventEnvelope["source"], external_event_id: row.external_event_id, type: row.event_type, occurred_at: row.occurred_at, subject: JSON.parse(row.subject_json), payload: JSON.parse(row.payload_json), reply_target: row.reply_target_json === null ? null : JSON.parse(row.reply_target_json) };
+        if (row.trace_json !== null) event.trace = JSON.parse(row.trace_json);
+        const identity = queueIdentity(event, { connectionId: "legacy" });
+        if (identity.queueClass === "external") {
+          identity.lane = `legacy:${createHash("sha256").update(row.source).digest("hex")}`;
+          identity.connection = "unverified_legacy";
+        }
+        this.db.prepare("INSERT OR IGNORE INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
+          .run(identity.lane, row.source, identity.connection, identity.queueClass, this.queuePolicy.defaults.burst, Date.parse(row.created_at));
+        this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,fingerprint) VALUES (?,?,?,?)")
+          .run(row.event_id, identity.lane, Buffer.byteLength(stableStringify(event)), this.queueFingerprint(event));
+      }
+      this.db.pragma("user_version = 4");
+    }).immediate();
+  }
+
+  private queueFingerprint(event: EventEnvelope): string {
+    return createHash("sha256").update(stableStringify({ schema_version: event.schema_version, type: event.type, subject: event.subject, payload: event.payload, reply_target: event.reply_target })).digest("hex");
+  }
+
+  private queueMetric(code: string): void {
+    this.db.prepare("INSERT INTO queue_metrics VALUES (?,1) ON CONFLICT(code) DO UPDATE SET count=count+1").run(code);
+  }
+
+  queueDispatchMetadata(eventId: string) {
+    const metadata = this.db.prepare("SELECT requires_fetch, delivery_count FROM queue_events WHERE event_id=?").get(eventId) as {requires_fetch:number;delivery_count:number} | undefined;
+    return { schema_version: 1, requires_fetch: metadata?.requires_fetch === 1,
+      delivery_count: metadata?.delivery_count ?? 1, deliveries: this.coalescedDeliveries(eventId) };
+  }
+
+  coalescedDeliveries(eventId: string) {
+    return this.db.prepare("SELECT source,external_event_id,created_at FROM queue_deliveries WHERE event_id=? ORDER BY created_at,external_event_id").all(eventId);
+  }
+
+  closeClaims(): void { this.claimsClosed = true; }
+
+  queueHealth(at = new Date()) {
+    const counts = this.db.prepare(`SELECT l.class, e.status, count(*) AS depth,
+      sum(q.bytes) AS bytes, max(0, ? - min(strftime('%s', e.created_at)*1000)) AS lag_ms
+      FROM queue_events q JOIN events e USING(event_id) JOIN queue_lanes l USING(lane)
+      WHERE e.status != 'completed' GROUP BY l.class,e.status`).all(at.getTime());
+    return { schema_version: 1, claims_closed: this.claimsClosed, counts,
+      lanes: this.db.prepare(`SELECT l.lane,l.class,count(*) depth,sum(q.bytes) bytes,
+        sum(e.status='blocked' OR e.status='needs_review') blocked,
+        sum(e.status='dead_letter') dead_letter,
+        sum(e.status='retryable_failed' AND e.available_at>?) deferred
+        FROM queue_lanes l JOIN queue_events q USING(lane) JOIN events e USING(event_id)
+        WHERE e.status!='completed' GROUP BY l.lane ORDER BY l.lane`).all(at.toISOString()),
+      metrics: this.db.prepare("SELECT code,count FROM queue_metrics ORDER BY code").all(),
+      in_flight: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('dispatching','waiting_agent')").get() as {n:number}).n,
+      queued: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('queued','retryable_failed')").get() as {n:number}).n,
+      blocked: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('blocked','needs_review')").get() as {n:number}).n };
+  }
+
   close(): void {
     this.db.close();
   }
@@ -141,14 +234,28 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueue(envelope: EventEnvelope, at = new Date()): EnqueueResult {
+  enqueue(envelope: EventEnvelope, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
     const timestamp = at.toISOString();
     const subjectJson = stableStringify(envelope.subject);
     const payloadJson = stableStringify(envelope.payload);
     const replyTargetJson = envelope.reply_target === null ? null : stableStringify(envelope.reply_target);
     const traceJson = envelope.trace === undefined ? null : stableStringify(envelope.trace);
 
-    return this.db.transaction(() => {
+    const identity = queueIdentity(envelope, context);
+    const fingerprint = this.queueFingerprint(envelope);
+    const key = identity.queueClass === "external" ? coalesceKey(context) : null;
+    const bytes = Buffer.byteLength(stableStringify(envelope));
+    const sourcePolicy = Object.hasOwn(this.queuePolicy.sources, envelope.source) ? this.queuePolicy.sources[envelope.source]! : this.queuePolicy.defaults;
+    const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
+    try { return this.db.transaction(() => {
+      const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
+      const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
+      if (delivery) {
+        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex");
+        const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
+        this.queueMetric(outcome);
+        return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
+      }
       const existing = this.db
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
@@ -163,6 +270,7 @@ export class DispatcherDatabase {
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
         const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
+        this.queueMetric(outcome);
         return {
           row: existing,
           outcome,
@@ -171,6 +279,52 @@ export class DispatcherDatabase {
         };
       }
 
+      if (this.claimsClosed) reject("queue_quiescing");
+      let lane = this.db.prepare("SELECT * FROM queue_lanes WHERE lane=?").get(identity.lane) as {tokens:number; clock_ms:number} | undefined;
+      if (!lane) {
+        const count = (this.db.prepare("SELECT count(*) n FROM queue_lanes WHERE class=?").get(identity.queueClass) as {n:number}).n;
+        // classごとのslotにより外部connection乱立が予約laneの生成を妨げない。
+        if (count >= this.queuePolicy.maxLanes) reject("queue_lanes");
+        this.db.prepare("INSERT INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
+          .run(identity.lane, envelope.source, identity.connection, identity.queueClass, policy.burst, at.getTime());
+        lane = { tokens: policy.burst, clock_ms: at.getTime() };
+      }
+      const clock = Math.max(lane.clock_ms, at.getTime());
+      const tokens = Math.min(policy.burst, lane.tokens + Math.min(60000, clock-lane.clock_ms) * policy.rate / 1000);
+      if (tokens < 1) reject("queue_rate");
+      const sourceBucket = this.db.prepare("SELECT tokens,clock_ms FROM queue_sources WHERE source=?").get(envelope.source) as {tokens:number;clock_ms:number} | undefined;
+      const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
+      const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
+      if (sourceTokens < 1) reject("queue_rate");
+      const coalesced = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
+        WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
+        AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
+        ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
+      if (coalesced && coalesced.delivery_count >= this.queuePolicy.maxDeliveries) reject("queue_deliveries");
+      const usage = this.db.prepare(`SELECT l.class, count(*) depth, coalesce(sum(q.bytes),0) bytes FROM queue_events q
+        JOIN events e USING(event_id) JOIN queue_lanes l USING(lane) WHERE e.status!='completed' GROUP BY l.class`).all() as {class:string;depth:number;bytes:number}[];
+      const laneUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE q.lane=? AND e.status!='completed'`).get(identity.lane) as {depth:number;bytes:number};
+      const sourceUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE e.source=? AND e.status!='completed'`).get(envelope.source) as {depth:number;bytes:number};
+      const addedDepth = coalesced ? 0 : 1;
+      if (sourceUsage.depth+addedDepth > sourcePolicy.depth) reject("queue_depth");
+      if (sourceUsage.bytes+bytes > sourcePolicy.bytes) reject("queue_bytes");
+      let reservedDepth = 0, reservedBytes = 0;
+      for (const c of ["slack","internal","update"] as const) {
+        if (c === identity.queueClass) continue;
+        const used = usage.find(u => u.class === c);
+        reservedDepth += Math.max(0,this.queuePolicy.reservations[c]-(used?.depth??0));
+        reservedBytes += Math.max(0,this.queuePolicy.reservedBytes[c]-(used?.bytes??0));
+      }
+      if (laneUsage.depth+addedDepth > policy.depth || usage.reduce((n,u)=>n+u.depth,0)+addedDepth+reservedDepth > this.queuePolicy.depth) reject("queue_depth");
+      if (laneUsage.bytes+bytes > policy.bytes || usage.reduce((n,u)=>n+u.bytes,0)+bytes+reservedBytes > this.queuePolicy.bytes) reject("queue_bytes");
+      this.db.prepare("INSERT INTO queue_sources VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET tokens=excluded.tokens,clock_ms=excluded.clock_ms").run(envelope.source,sourceTokens-1,sourceClock);
+      this.db.prepare("UPDATE queue_lanes SET tokens=?,clock_ms=? WHERE lane=?").run(tokens-1,clock,identity.lane);
+      if (coalesced) {
+        this.db.prepare("INSERT INTO queue_deliveries VALUES (?,?,?,?,?)").run(envelope.source,envelope.external_event_id,coalesced.event_id,createHash("sha256").update(fingerprint+envelope.occurred_at).digest("hex"),timestamp);
+        this.db.prepare("UPDATE queue_events SET delivery_count=delivery_count+1,bytes=bytes+? WHERE event_id=?").run(bytes,coalesced.event_id);
+        this.queueMetric("coalesced");
+        return { row: coalesced, outcome: "created", duplicate: false, payloadMismatch: false, admission: "coalesced", committedAt: timestamp } as EnqueueResult;
+      }
       const eventId = `evt_${ulid(at.getTime())}`;
       const result = this.db
         .prepare(`
@@ -197,8 +351,14 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
+      this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
+      this.queueMetric("created");
       return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
-    })();
+    }).immediate();
+    } catch (error) {
+      if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
+      throw error;
+    }
   }
 
   get(eventId: string): EventRow | undefined {
@@ -206,8 +366,8 @@ export class DispatcherDatabase {
   }
 
   getByExternalId(source: string, externalEventId: string): EventRow | undefined {
-    return this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
-      .get(source, externalEventId) as EventRow | undefined;
+    return (this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
+      .get(source, externalEventId) ?? this.db.prepare("SELECT e.* FROM queue_deliveries d JOIN events e USING(event_id) WHERE d.source=? AND d.external_event_id=?").get(source,externalEventId)) as EventRow | undefined;
   }
 
   isEventCompleted(eventId: string): boolean {
@@ -598,19 +758,26 @@ export class DispatcherDatabase {
 
   nextWaiting(): EventRow | undefined {
     return this.db
-      .prepare("SELECT * FROM events WHERE status = 'waiting_agent' ORDER BY sequence LIMIT 1")
+      .prepare("SELECT * FROM events WHERE status = 'waiting_agent' AND source!='dona_update' ORDER BY sequence LIMIT 1")
       .get() as EventRow | undefined;
   }
 
   nextAvailable(at = new Date()): EventRow | undefined {
-    const head = this.db
-      .prepare(`
-        SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
-        ORDER BY sequence LIMIT 1
-      `)
-      .get() as EventRow | undefined;
-    return head && head.available_at <= at.toISOString() ? head : undefined;
+    if (this.claimsClosed || this.db.prepare("SELECT 1 FROM events WHERE status IN ('dispatching','waiting_agent') AND source!='dona_update' LIMIT 1").get()) return undefined;
+    const weights = this.queuePolicy.weights;
+    const slots = Object.entries(weights).flatMap(([c,w]) => Array<string>(w).fill(c));
+    const step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;
+    const candidates = this.db.prepare(`SELECT e.*,l.class,l.last_selected FROM events e
+      JOIN queue_events q USING(event_id) JOIN queue_lanes l USING(lane)
+      WHERE e.status IN ('queued','retryable_failed') AND e.source!='dona_update' AND e.available_at<=?
+      AND NOT EXISTS (SELECT 1 FROM queue_events older JOIN events prior ON prior.event_id=older.event_id
+        WHERE older.lane=q.lane AND prior.sequence<e.sequence AND prior.status!='completed')
+      ORDER BY l.last_selected,e.sequence`).all(at.toISOString()) as (EventRow & {class:string})[];
+    for (let offset=0;offset<slots.length;offset++) {
+      const candidate = candidates.find(row=>row.class===slots[(step+offset)%slots.length]);
+      if (candidate) return candidate;
+    }
+    return undefined;
   }
 
   updateEventsNeedingNotification(): EventRow[] {
@@ -659,6 +826,8 @@ export class DispatcherDatabase {
   }
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
+    return this.db.transaction(() => {
+    if (this.claimsClosed || this.nextAvailable(at)?.event_id !== eventId) throw new QueueClaimUnavailableError();
     const timestamp = at.toISOString();
     const changed = this.db
       .prepare(`
@@ -670,7 +839,15 @@ export class DispatcherDatabase {
       `)
       .run(timestamp, resultPath, timestamp, eventId).changes;
     if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
+    const slots = Object.entries(this.queuePolicy.weights).flatMap(([c,w])=>Array<string>(w).fill(c));
+    const lane = this.db.prepare("SELECT l.lane,l.class FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=?").get(eventId) as {lane:string;class:string};
+    let step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;
+    while (slots[step%slots.length] !== lane.class) step++;
+    step++;
+    this.db.prepare("UPDATE queue_selector SET step=? WHERE id=1").run(step);
+    this.db.prepare("UPDATE queue_lanes SET last_selected=? WHERE lane=?").run(step,lane.lane);
     return this.get(eventId)!;
+    }).immediate();
   }
 
   markWaiting(eventId: string, at = new Date()): void {

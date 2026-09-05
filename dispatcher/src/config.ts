@@ -1,8 +1,10 @@
+import { queuePolicySchema, type QueuePolicy } from "./queue.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 export interface DispatcherConfig {
+  queuePolicy?: QueuePolicy;
   socketPath: string;
   databasePath: string;
   resultsDir: string;
@@ -62,6 +64,7 @@ function buildSha(env: NodeJS.ProcessEnv): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConfig {
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
   return {
+    queuePolicy: queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}")),
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),
     resultsDir: expandHome(env.DONA_RESULTS_DIR ?? path.join(base, "results")),
