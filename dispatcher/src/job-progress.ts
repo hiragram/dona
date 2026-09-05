@@ -11,7 +11,7 @@ import { jobProgressPhases, type JobProgressEnvelope, type JobRow } from "./type
 import { readPrivateToken } from "./private-token.js";
 
 const terminalStatuses = new Set(["blocked", "completed", "failed", "cancelled", "needs_review"]);
-const secretLike = /(?:xox[baprs]-|xapp-|gh[pousr]_|github_pat_|bearer\s+|token\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
+const secretLike = /(?:xox[baprs]-|xapp-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|bearer\s+|(?:token|password|passwd|secret|api[_-]?key|access[_-]?key)\s*[=:]|-----BEGIN|https?:\/\/|\/[A-Za-z0-9._-]+\/)/iu;
 const phaseLabels: Record<JobProgressEnvelope["phase"], string> = {
   preparing: "準備中", implementing: "実装中", testing: "テスト中", reviewing: "レビュー中",
   waiting_ci: "CI待ち", reconciling: "状態を照合中",
@@ -54,6 +54,7 @@ export class JobProgressStore {
       );
       PRAGMA user_version = 1;
     `))();
+    this.db.prepare("UPDATE job_progress SET status='unknown',last_error='recovered ambiguous delivery' WHERE status='delivering'").run();
   }
   close(): void { this.db.close(); }
   ingest(progress: JobProgressEnvelope, at = new Date()): boolean {
@@ -74,13 +75,24 @@ export class JobProgressStore {
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
   retry(jobId: string, error: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+5_000).toISOString(),error.slice(0,500),jobId); }
   terminal(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivered' WHERE job_id=? AND status IN ('pending','delivering')").run(jobId); }
+  requeueLatest(jobIds: string[], at = new Date()): void {
+    if (jobIds.length === 0) return;
+    const placeholders = jobIds.map(() => "?").join(",");
+    const latest = this.db.prepare(`SELECT job_id FROM job_progress WHERE job_id IN (${placeholders}) AND status='delivered' ORDER BY updated_at DESC,job_id DESC LIMIT 1`).get(...jobIds) as {job_id:string}|undefined;
+    if (latest) this.db.prepare("UPDATE job_progress SET status='pending',available_at=? WHERE job_id=? AND status='delivered'").run(at.toISOString(),latest.job_id);
+  }
 }
 
 export class JobProgressCoordinator {
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
-    if (terminalStatuses.has(row.status)) { this.store.terminal(row.job_id); return; }
+    if (terminalStatuses.has(row.status)) {
+      this.store.terminal(row.job_id);
+      const runningSiblings = this.jobs.listEventJobs(row.source_event_id).filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
+      this.store.requeueLatest(runningSiblings);
+      return;
+    }
     try {
       const text = await fs.readFile(`${row.result_path}.progress.json`, "utf8");
       if (text.length > 4096) throw new Error("progress file too large");
@@ -102,7 +114,7 @@ export class JobProgressCoordinator {
       const token = await readPrivateToken(this.config.updateInternalTokenPath);
       if (!token) { this.store.retry(progress.job_id, "missing internal token"); return; }
       const body = Buffer.from(JSON.stringify({ schema_version:1, progress_id:`${job.job_id}:${progress.sequence}`, workspace_id:job.workspace_id, channel_id:job.channel_id, thread_ts:job.thread_ts, status }));
-      await new Promise<void>((resolve,reject) => { const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; const chunks:Buffer[]=[]; response.on("data",(chunk:Buffer)=>chunks.push(chunk)); response.on("end",()=>response.statusCode===200?resolve():reject(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403].includes(response.statusCode??0)})));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",reject); request.end(body); });
+      await new Promise<void>((resolve,reject) => { let settled=false; const finish=(error?:Error)=>{if(settled)return;settled=true;error?reject(error):resolve();}; const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},response=>{ requestStarted=true; response.resume(); response.once("aborted",()=>finish(Object.assign(new Error("response aborted"),{acceptanceUnknown:true}))); response.once("error",error=>finish(Object.assign(error,{acceptanceUnknown:true}))); response.once("end",()=>response.statusCode===200?finish():finish(Object.assign(new Error(`HTTP ${response.statusCode}`),{definitelyUnsent:[400,401,403,429].includes(response.statusCode??0)})));}); request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(Object.assign(new Error("timeout"),{acceptanceUnknown:true}))); request.once("socket",socket=>socket.once("connect",()=>{requestStarted=true;})); request.once("error",error=>finish(error)); request.end(body); });
       this.store.delivered(progress.job_id);
     } catch (error) {
       const detail = error as Error & { code?: string; definitelyUnsent?: boolean; acceptanceUnknown?: boolean };

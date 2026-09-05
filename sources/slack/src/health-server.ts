@@ -12,6 +12,7 @@ import {
   type UpdateNotificationPort,
 } from "./update-notification.js";
 import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
+import { SlackApiError } from "./slack-api.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -180,7 +181,8 @@ export class SlackHealthServer {
           error_code: "job_progress_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
-        send(response, 503, { schema_version: 1, error: { code: "job_progress_failed" } });
+        const rateLimited = error instanceof SlackApiError && error.errorCode === "rate_limited";
+        send(response, rateLimited ? 429 : 503, { schema_version: 1, error: { code: rateLimited ? "rate_limited" : "job_progress_failed" } });
       }
       return;
     }

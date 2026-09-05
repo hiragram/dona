@@ -22,6 +22,9 @@ test("summary is normalized and secret-like content falls back to phase", () => 
   assert.equal(safeProgressText({ ...valid, safe_summary: "https://example.com" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "xapp-real-secret" }), "テスト中");
   assert.equal(safeProgressText({ ...valid, safe_summary: "github_pat_real_secret" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "password=hunter2" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "api_key=secret" }), "テスト中");
+  assert.equal(safeProgressText({ ...valid, safe_summary: "AKIAIOSFODNN7EXAMPLE" }), "テスト中");
 });
 
 test("definite pre-delivery failure returns to pending with backoff", async () => {
@@ -56,4 +59,12 @@ test("terminal fence suppresses an undelivered progress update", async () => {
   const store = new JobProgressStore(path.join(root, "progress.sqlite3"));
   try { store.ingest(valid); store.terminal("job_abc"); assert.equal(store.pending(), undefined); }
   finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
+test("restart fences a delivery that may have reached Slack", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-recover-")); const file=path.join(root,"progress.sqlite3");
+  let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();
+  store = new JobProgressStore(file);
+  try { assert.equal(store.get("job_abc")?.status,"unknown"); assert.equal(store.pending(),undefined); }
+  finally { store.close(); await fs.rm(root,{recursive:true}); }
 });
