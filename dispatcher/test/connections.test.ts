@@ -475,6 +475,27 @@ test("in-flight eventがあるconnectionのrevision更新を拒否する",async(
   assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
 });
 
+test("手動retry可能なeventがあるconnectionのrevision更新を拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.manualDeadLetter(accepted.row.event_id,new Date(clock.now()));
+  assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
+});
+
+test("cutoverは検証中の旧generationをepochでfenceする",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");clock.value+=9000;
+  const replacement=db.connections.claim("pilot",1,"folder1",20);const old=db.connections.beginVerification("pilot",1,"folder1",1);
+  db.connections.observe("pilot",1,"folder1",replacement.generation,{providerId:"channel2",expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:true},replacement);
+  assert.equal(db.connections.subscriptions("pilot")[0]!.state,"stop_candidate");
+  assert.throws(()=>db.connections.observe("pilot",1,"folder1",1,{providerId:"channel1",expiresAt:clock.now()+10000,verified:true,cutoverConfirmed:false},undefined,old.verificationEpoch),/revision_conflict/);
+});
+
+test("negative observationは明示createで置換可能なquarantineにする",async(t)=>{
+  const {db,driver,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  driver.inspect=async(_c,s)=>({providerId:s.providerId!,expiresAt:clock.now()+10000,verified:false,cutoverConfirmed:false});
+  await lifecycle.verify("pilot","folder1",1);assert.equal(db.connections.subscriptions("pilot")[0]!.error,"verification_failed");
+  const replacement=await lifecycle.createOrRenew("pilot","folder1");assert.equal(replacement.generation,2);
+});
+
 test("cursor batchのqueue拒否metricをrollback後も保持する",async(t)=>{
   const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   (db.queuePolicy.defaults as {depth:number}).depth=1;db.enqueueExternal(event(),binding());

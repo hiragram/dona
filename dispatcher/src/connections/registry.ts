@@ -78,7 +78,7 @@ export class ConnectionRegistry {
       if (current.revision !== revision) throw new ConnectionError("revision_conflict");
       if (this.operations(id).some((operation) => operation.state !== "done") || this.subscriptions(id).some((s) => s.state === "stop_candidate")) throw new ConnectionError("operation_pending");
       if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
-        WHERE connection_id=? AND revision=? AND status IN ('dispatching','waiting_agent') LIMIT 1`).get(id, revision)) throw new ConnectionError("operation_pending");
+        WHERE connection_id=? AND revision=? AND status IN ('dispatching','waiting_agent','blocked','needs_review','dead_letter') LIMIT 1`).get(id, revision)) throw new ConnectionError("operation_pending");
       if (config.id !== id || config.provider !== current.provider || config.account !== current.account) throw new ConnectionError("invalid_input");
       if (config.credentialRevision < current.credentialRevision) throw new ConnectionError("revision_conflict");
       const now = this.tick(id);
@@ -252,13 +252,14 @@ export class ConnectionRegistry {
       }
       this.db.prepare(`UPDATE connection_subscriptions SET revision=?,provider_id=?,state=?,verified_at=?,expires_at=?,renewal_window_ms=?,last_reconcile_at=?,error=?
         WHERE connection_id=? AND resource=? AND generation=?`).run(revision, observed.providerId, expired ? "expiring" : observed.verified ? "active" : "verification_pending",
-        observed.verified && !expired ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0, now, expired ? "expired" : null, id, resource, generation);
+        observed.verified && !expired ? now : null, observed.expiresAt, c.capability.kind === "managed" && c.capability.renewal === "replace" ? c.capability.windowMs : 0,
+        now, expired ? "expired" : observed.verified ? null : "verification_failed", id, resource, generation);
       if (observed.verified && !expired) {
         this.db.prepare("UPDATE connections SET state='active' WHERE id=? AND state!='disabled'").run(id);
         if (observed.cutoverConfirmed) this.db.prepare(`UPDATE connection_subscriptions SET state='stop_candidate',verification_epoch=verification_epoch+1,
           error=CASE WHEN error='verification_failed' THEN NULL ELSE error END
           WHERE connection_id=? AND resource=? AND generation<? AND revision=? AND
-            (state IN ('active','expiring') OR (state='verification_pending' AND error='verification_failed'))`).run(id, resource, generation, revision);
+            state IN ('active','expiring','verification_pending')`).run(id, resource, generation, revision);
       }
       if ((!observed.verified || expired) && s.verifiedAt !== null) this.db.prepare("UPDATE connections SET state='degraded' WHERE id=? AND state!='disabled'").run(id);
       this.audit(c, "observed", now);
