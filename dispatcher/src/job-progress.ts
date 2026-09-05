@@ -57,6 +57,7 @@ export class JobProgressStore {
       );
       PRAGMA user_version = 1;
     `))();
+    this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_pending_idx ON job_progress(status,available_at)");
     this.db.prepare("UPDATE job_progress SET status='unknown',last_error='recovered ambiguous delivery' WHERE status='delivering'").run();
   }
   close(): void { this.db.close(); }
@@ -72,6 +73,7 @@ export class JobProgressStore {
     return this.get(progress.job_id)?.sequence === progress.sequence;
   }
   get(jobId: string): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE job_id=?").get(jobId) as ProgressRow|undefined; }
+  all(): ProgressRow[] { return this.db.prepare("SELECT * FROM job_progress ORDER BY job_id").all() as ProgressRow[]; }
   pending(at = new Date()): ProgressRow | undefined { return this.db.prepare("SELECT * FROM job_progress WHERE status='pending' AND available_at<=? ORDER BY available_at LIMIT 1").get(at.toISOString()) as ProgressRow|undefined; }
   begin(jobId: string): void { this.db.prepare("UPDATE job_progress SET status='delivering' WHERE job_id=? AND status='pending'").run(jobId); }
   delivered(jobId: string, at = new Date()): void { this.db.prepare("UPDATE job_progress SET status='delivered',delivered_at=? WHERE job_id=? AND status='delivering'").run(at.toISOString(),jobId); }
@@ -104,13 +106,19 @@ export class JobProgressCoordinator {
       const progressPath = jobProgressPath(row);
       const stats = await fs.lstat(progressPath);
       if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 4096) throw new Error("progress file must be a bounded regular file");
-      const handle = await fs.open(progressPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+      const handle = await fs.open(progressPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK);
       let text: string;
-      try { const buffer=Buffer.alloc(4097); const read=await handle.read(buffer,0,buffer.length,0); if(read.bytesRead>4096) throw new Error("progress file too large"); text=buffer.subarray(0,read.bytesRead).toString("utf8"); }
+      try { const opened=await handle.stat(); if(!opened.isFile() || opened.size>4096) throw new Error("opened progress must be a bounded regular file"); const buffer=Buffer.alloc(4097); const read=await handle.read(buffer,0,buffer.length,0); if(read.bytesRead>4096) throw new Error("progress file too large"); text=buffer.subarray(0,read.bytesRead).toString("utf8"); }
       finally { await handle.close(); }
       this.store.ingest(parseJobProgress(JSON.parse(text), row.job_id));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.logger.warn("Job progress ignored", { job_id: row.job_id, error_code: "invalid_job_progress" });
+    }
+  }
+  async recover(): Promise<void> {
+    for (const progress of this.store.all()) {
+      const job = this.jobs.getJob(progress.job_id);
+      if (job && terminalStatuses.has(job.status)) await this.ingest(job);
     }
   }
   async report(): Promise<void> {

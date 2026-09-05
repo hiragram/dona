@@ -38,6 +38,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   let jobSupervisor!: JobSupervisor;
+  const jobProgress = jobProgressStore
+    ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
+    : undefined;
+  await jobProgress?.recover();
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
   jobSupervisor = new JobSupervisor(
     database,
@@ -45,9 +49,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
-    jobProgressStore
-      ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
-      : undefined,
+    jobProgress,
   );
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,

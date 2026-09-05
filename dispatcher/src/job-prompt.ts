@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
 
@@ -7,6 +8,15 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
 }
 
 export function jobProgressPath(row: JobRow): string {
+  const dotGit = path.join(row.workspace_path, ".git");
+  try {
+    const stats = fs.lstatSync(dotGit);
+    if (stats.isDirectory() && !stats.isSymbolicLink()) return path.join(dotGit, "dona-job-progress.json");
+    if (stats.isFile() && !stats.isSymbolicLink()) {
+      const match = /^gitdir: (.+)\s*$/.exec(fs.readFileSync(dotGit, "utf8"));
+      if (match) return path.join(path.resolve(row.workspace_path, match[1]!), "dona-job-progress.json");
+    }
+  } catch { /* scratch workspace has no git metadata */ }
   return path.join(row.workspace_path, ".dona-job-progress.json");
 }
 
