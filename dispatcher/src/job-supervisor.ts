@@ -385,7 +385,8 @@ export class JobSupervisor {
         });
       })
       .finally(async () => {
-        if (!this.progress) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
+        const finalStatus=this.database.getJob(row.job_id)?.status;
+        if (!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled","needs_review"].includes(finalStatus))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
         });
         this.active.delete(row.job_id);
