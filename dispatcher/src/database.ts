@@ -222,6 +222,9 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
       CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
+      CREATE INDEX jobs_runnable_fair_idx
+        ON jobs(source_event_id, created_at, job_id, available_at)
+        WHERE status IN ('queued', 'retryable_failed');
     `);
     migrationHook("indexes_recreated");
 
@@ -264,6 +267,11 @@ export function migrateDispatcherDatabase(
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   })();
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS jobs_runnable_fair_idx
+      ON jobs(source_event_id, created_at, job_id, available_at)
+      WHERE status IN ('queued', 'retryable_failed');
+  `);
 }
 
 export class DispatcherDatabase {
@@ -720,7 +728,7 @@ export class DispatcherDatabase {
       : "";
     const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
     const statement = this.db.prepare(`
-      SELECT * FROM jobs
+      SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
       WHERE status IN ('queued', 'retryable_failed') AND available_at <= ?
         AND source_event_id > ?
         ${excludedSources}

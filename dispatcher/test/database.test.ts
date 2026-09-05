@@ -201,9 +201,19 @@ describe("DispatcherDatabase", () => {
     const migratedIndexes = new Set(
       (migrated.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
     );
-    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx"]) {
+    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx", "jobs_runnable_fair_idx"]) {
       assert.equal(migratedIndexes.has(name), true);
     }
+    const runnablePlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status IN ('queued', 'retryable_failed') AND available_at <= ?
+        AND source_event_id > ?
+      ORDER BY source_event_id, created_at, job_id
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z", "") as Array<{ detail: string }>;
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     assert.equal(
       (migrated.pragma("index_list('job_groups')") as Array<{ name: string }>).some(
         (index) => index.name === "job_groups_transition_idx",
@@ -237,7 +247,12 @@ describe("DispatcherDatabase", () => {
         'agent-duplicate-key', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z'
       );
     `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
+    migrated.exec("DROP INDEX jobs_runnable_fair_idx");
     migrated.close();
+
+    const existingV3 = new DispatcherDatabase(config.databasePath);
+    assert.doesNotThrow(() => existingV3.nextRunnableJob(new Date("2026-09-04T00:00:00.000Z")));
+    existingV3.close();
   });
 
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
