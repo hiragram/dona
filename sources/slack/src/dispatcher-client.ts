@@ -29,10 +29,16 @@ export class DispatcherClient {
   }
 
   async resolveJobProgress(progressId: string, deliveryToken: string): Promise<unknown> {
-    const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
-    const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}&delivery_token=${encodeURIComponent(deliveryToken)}`, undefined, token);
-    if (response.statusCode !== 200) throw Object.assign(new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`), { progressRetryable:response.statusCode===425 });
-    return JSON.parse(response.body);
+    try {
+      const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
+      const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}&delivery_token=${encodeURIComponent(deliveryToken)}`, undefined, token);
+      if (response.statusCode !== 200) throw Object.assign(new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`), response.statusCode===425 ? {progressRetryable:true} : {progressPermanent:true});
+      return JSON.parse(response.body);
+    } catch (error) {
+      const tagged=error as Error & {progressRetryable?:boolean;progressPermanent?:boolean};
+      if(tagged.progressRetryable||tagged.progressPermanent)throw tagged;
+      throw Object.assign(error instanceof Error?error:new Error(String(error)),{progressRetryable:true});
+    }
   }
 
   private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string): Promise<DispatcherResponse> {

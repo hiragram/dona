@@ -22,12 +22,12 @@ test("reporter uses assistant thread status rather than session title", async ()
   assert.deepEqual(observed, { channelId: "C123", threadTs: "1234567890.123", status: resolved.status });
 });
 
-test("reporter treats resolver and workspace failures as permanent and definitely unsent", async () => {
+test("reporter treats workspace failures as permanent and resolver transport failures as retryable", async () => {
   const registry = { getByTeamId() { throw new Error("unknown workspace"); } };
   await assert.rejects(new SlackJobProgressReporter(registry as never, async () => resolved).deliver(request),
     (error: Error & { definitelyUnsent?:boolean;progressPermanent?:boolean }) => error.definitelyUnsent === true && error.progressPermanent === true);
   await assert.rejects(new SlackJobProgressReporter(registry as never, async () => { throw new Error("resolver unavailable"); }).deliver(request),
-    (error: Error & { definitelyUnsent?:boolean;progressPermanent?:boolean }) => error.definitelyUnsent === true && error.progressPermanent === true);
+    (error: Error & { definitelyUnsent?:boolean;progressRetryable?:boolean }) => error.definitelyUnsent === true && error.progressRetryable === true);
 });
 
 test("reporter permanently rejects a workspace without assistant thread progress", async () => {
@@ -42,4 +42,12 @@ test("reporter preserves the temporary group-seal resolver state", async () => {
     throw Object.assign(new Error("group not sealed"), { progressRetryable:true });
   }).deliver(request), (error:Error & {progressRetryable?:boolean;progressPermanent?:boolean}) =>
     error.progressRetryable === true && error.progressPermanent === false);
+});
+
+test("reporter preserves an explicit permanent resolver rejection", async () => {
+  const registry = { getByTeamId() { throw new Error("must not resolve workspace"); } };
+  await assert.rejects(new SlackJobProgressReporter(registry as never, async () => {
+    throw Object.assign(new Error("not deliverable"), { progressPermanent:true });
+  }).deliver(request), (error:Error & {progressPermanent?:boolean;progressRetryable?:boolean}) =>
+    error.progressPermanent === true && error.progressRetryable === false);
 });
