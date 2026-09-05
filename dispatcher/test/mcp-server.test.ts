@@ -13,6 +13,7 @@ const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 describe("Dona Dispatcher MCP server", () => {
   test("advertises job tools and maps GitHub delegation to the UDS client", async () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
+    let planError: Error | undefined;
     const api: DispatcherJobClient = {
       async createJob(input) {
         calls.push({ method: "createJob", args: [input] });
@@ -40,6 +41,7 @@ describe("Dona Dispatcher MCP server", () => {
       },
       async planSelfUpdate(input) {
         calls.push({ method: "planSelfUpdate", args: [input] });
+        if (planError) throw planError;
         return { schema_version: 1, plan: {} };
       },
       async applySelfUpdate(input) {
@@ -110,6 +112,18 @@ describe("Dona Dispatcher MCP server", () => {
         method: "getJob",
         args: ["job_01m1es03xy5cf8d9pm5cwx4srv"],
       });
+
+      const body = {
+        schema_version: 1,
+        error: { code: "request_failed", message: "target_does_not_pass_fixed_ci_trust_gate" },
+      };
+      planError = new DispatcherClientError(409, JSON.stringify(body), body);
+      const rejected = await client.callTool({
+        name: "plan_self_update",
+        arguments: { source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
+      });
+      assert.equal(rejected.isError, true);
+      assert.deepEqual(rejected.structuredContent, body);
     } finally {
       await client.close();
       await server.close();
@@ -158,6 +172,7 @@ describe("Dona Dispatcher MCP server", () => {
         });
         assert.equal(failed.isError, true);
         assert.deepEqual(failed.structuredContent, {
+          schema_version: 1,
           error: { code, message: `${code} message` },
         });
       }

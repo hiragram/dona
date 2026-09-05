@@ -41,11 +41,6 @@ const createJobKey = jobKey.refine(
   (value) => value !== legacyJobKey,
   `${legacyJobKey} is reserved; omit job_key for legacy behavior`,
 );
-const preservedJobErrorCodes = new Set([
-  "job_idempotency_conflict",
-  "job_group_closed",
-  "job_group_limit_exceeded",
-]);
 
 function success(data: Record<string, unknown>) {
   return {
@@ -54,21 +49,26 @@ function success(data: Record<string, unknown>) {
   };
 }
 
+function dispatcherApiError(error: unknown): { code: string; message: string } | undefined {
+  if (!(error instanceof DispatcherClientError) || !error.body || typeof error.body !== "object" || Array.isArray(error.body)) {
+    return undefined;
+  }
+  const body = error.body as Record<string, unknown>;
+  if (body.schema_version !== 1 || !body.error || typeof body.error !== "object" || Array.isArray(body.error)) return undefined;
+  const structured = body.error as Record<string, unknown>;
+  if (typeof structured.code !== "string" || !/^[a-z0-9_]{1,128}$/.test(structured.code) ||
+    typeof structured.message !== "string" || structured.message.length > 2_000) {
+    return undefined;
+  }
+  return { code: structured.code, message: structured.message };
+}
+
 function failure(error: unknown, logger: Logger, tool: string) {
-  const message = error instanceof Error ? error.message : String(error);
-  const dispatcherBody = error instanceof DispatcherClientError &&
-      typeof error.body === "object" && error.body !== null
-    ? error.body as { error?: { code?: unknown; message?: unknown } }
-    : undefined;
-  const dispatcherCode = dispatcherBody?.error?.code;
-  const code = typeof dispatcherCode === "string" && preservedJobErrorCodes.has(dispatcherCode)
-    ? dispatcherCode
-    : "dispatcher_tool_error";
-  const safeMessage = code === "dispatcher_tool_error"
-    ? message
-    : typeof dispatcherBody?.error?.message === "string" ? dispatcherBody.error.message : message;
-  logger.error("Dispatcher MCP tool failed", { tool, error_code: code, error_message: safeMessage });
-  const data = { error: { code, message: safeMessage } };
+  const structured = dispatcherApiError(error);
+  const message = structured?.message ?? (error instanceof Error ? error.message : String(error));
+  const code = structured?.code ?? "dispatcher_tool_error";
+  logger.error("Dispatcher MCP tool failed", { tool, error_code: code, error_message: message });
+  const data = structured ? { schema_version: 1, error: structured } : { error: { code, message } };
   return {
     isError: true,
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],

@@ -8,6 +8,7 @@ import { afterEach, describe, test } from "node:test";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
+import { UpdaterClientError } from "../src/updater-client.js";
 import { canonicalJobPayloadSha256, parseCreateJobRequest, stableStringify } from "../src/validation.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
@@ -471,6 +472,40 @@ describe("DispatcherApi", () => {
       plan_hash: "a".repeat(64),
       approval_id: "approval-1",
     })).status, 503);
+    await api.stop();
+    database.close();
+  });
+
+  test("preserves structured Updater planning rejections", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const updates = {
+      async plan() {
+        throw new UpdaterClientError(409, "request_failed", "target_does_not_pass_fixed_ci_trust_gate");
+      },
+      async apply() { return { schema_version: 1 }; },
+      async status() { return { schema_version: 1, updates: [] }; },
+      async cancel() { return { schema_version: 1 }; },
+    };
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      logger,
+      updates,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-update-rejected"));
+    const rejected = await request(config.socketPath, "POST", "/v1/self-update/plan", {
+      source_event_id: accepted.body.event_id,
+    });
+    assert.equal(rejected.status, 409);
+    assert.deepEqual(rejected.body, {
+      schema_version: 1,
+      error: { code: "request_failed", message: "target_does_not_pass_fixed_ci_trust_gate" },
+    });
     await api.stop();
     database.close();
   });

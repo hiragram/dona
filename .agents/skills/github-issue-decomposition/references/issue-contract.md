@@ -1,6 +1,21 @@
 # Issue記述contract
 
-Epicや隣接Issueと内容を重複させず、各Issueを独立してreview可能にするため、以下のcontractを使う。既存のrepository templateに合わせて見出しは調整してよいが、情報は維持する。
+隣接Issueと内容を重複させず、各Issueを独立してreview可能にするため、以下のcontractを使う。既存のrepository templateに合わせて見出しは調整してよいが、情報は維持する。
+
+## 単一Issueの記述
+
+規模判定で単一Issueを選んだ場合は、次の情報を1件の中でimplementation-readyにする。
+
+- **成果と背景:** 修正・追加後に観測できる1つのcohesiveな成果と、その必要性。
+- **scopeと主責務:** Issueが所有する1つの主責務。変更候補componentやfileはownershipを説明する候補として挙げ、file数をscopeそのものにしない。
+- **現状と再現証拠:** bugなら最小再現、期待値と実際値、確認できた原因境界。機能なら現在不足するcontractとconsumerを示す。未確認の推測は事実と分ける。
+- **acceptance criteria:** 単独のPRまたは同等のreview単位で実証できるbehavior、永続state、該当する失敗時behavior。
+- **必須test:** riskに応じたunit、integration、migration、concurrency、fault、live-smokeのうち必要な証拠。「testが通る」だけをtest plan全体にしない。
+- **security・運用invariant:** 認証、認可、isolation、secret、idempotency、ambiguity、restart、observability、recoveryのうち、このIssueが違反し得る境界だけを書く。
+- **non-goalsと既存Issue境界:** 別ownership、独立migration/rollout、近接Issueへ残す責務を明示し、1件へ隠さない。
+- **dependency / 完了可能性:** directな技術的前提があれば供給artifactを示す。別Issueが完了しないと大半をreview・testできない場合は、単一Issue判定または責務境界を見直す。
+
+単一Issue routeを選んだことを理由に、不要なEpic、空の調整Issue、phase専用Issueを追加しない。一方、依頼文の「Issueを1件」を守るために独立責務を無理に詰め込まない。
 
 ## Epic Issueの記述
 

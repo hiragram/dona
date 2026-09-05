@@ -23,6 +23,7 @@ import type {
   ResultEnvelope,
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
+import { jobAgentName } from "./job-agent-name.js";
 import {
   canonicalJobPayloadSha256,
   jobCreationPayloadSha256FromWorkspace,
@@ -457,7 +458,10 @@ export class DispatcherDatabase {
         );
       }
 
-      const jobId = `job_${ulid(at.getTime()).toLowerCase()}`;
+      const jobId = jobAgentName(
+        `job_${ulid(at.getTime()).toLowerCase()}`,
+        parsedRequest.objective,
+      );
       const workspacePath = parsedRequest.workspace.kind === "scratch"
         ? path.join(workspaceRoot, "scratch", jobId)
         : path.join(
