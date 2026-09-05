@@ -230,6 +230,7 @@ export class JobSupervisor {
     if(this.cancelledCleanupJobIds.has(row.job_id))return;
     this.cancelledCleanupJobIds.add(row.job_id);
     const operation=(async()=>{
+      if(this.stopping)return;
       for(;;){
         try {const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);if(waited.aborted||this.stopping)return;if(waited.ok&&waited.agentStatus!=="blocked")break;if(!waited.ok&&!waited.timedOut&&waited.errorCode!=="timeout")break;}
         catch {if(this.stopping)return;}
