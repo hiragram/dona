@@ -62,6 +62,11 @@ function hasCredentialPattern(value: string): boolean { return /xox[baprs]-|xapp
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
+function truncateResultContent(value: string): string {
+  if (!value || hasCredentialPattern(value) || /(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  const points = [...value];
+  return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
+}
 
 export class SchedulerRepository {
   constructor(private readonly db: Database.Database, private readonly enqueue: (event: EventEnvelope, at: Date) => EnqueueResult,
@@ -216,7 +221,17 @@ export class SchedulerRepository {
       const old = this.revision(before);
       const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
       if (operation === "resume" && (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
-      if (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt)) {
+      const unusable = old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt);
+      if (operation === "cancel" && unusable) {
+        this.suppress(scheduleId, transitionAt, "cancelled");
+        this.db.prepare("UPDATE schedules SET state = 'cancelled', updated_at = ?, terminal_at = ? WHERE schedule_id = ?")
+          .run(transitionAt, transitionAt, scheduleId);
+        this.retireRevisions(scheduleId, transitionAt);
+        this.audit(before, this.get(scheduleId)!, "cancel", actor, transitionAt);
+        this.completeIfDrained(scheduleId, transitionAt);
+        return this.get(scheduleId)!;
+      }
+      if (unusable) {
         this.expireSchedule(before, actor, transitionAt);
         return this.get(scheduleId)!;
       }
@@ -304,8 +319,8 @@ export class SchedulerRepository {
       if (["started", "completed"].includes(next) && runSnapshot.action !== "work.read_only") throw new Error("invalid_transition");
       if (next === "started") {
         const reason = current.state !== "active" || current.revision !== run.revision ? "cancelled"
-          : runSnapshot.expires_at <= now ? "authorization_expired"
-          : Date.parse(now) - Date.parse(run.scheduled_for) > 900000 ? "misfire" : null;
+          : runSnapshot.expires_at <= transitionAt ? "authorization_expired"
+          : Date.parse(transitionAt) - Date.parse(run.scheduled_for) > 900000 ? "misfire" : null;
         if (reason !== null) {
           if (reason === "authorization_expired") this.expireSchedule(current, actor, now);
           const status = reason === "misfire" ? "skipped" : "cancelled";
@@ -325,14 +340,13 @@ export class SchedulerRepository {
       if (next === "started" && jobId === null) throw new Error("job_reference_required");
       const notificationReason = current.state !== "active" ? "cancelled"
         : current.revision !== run.revision ? "revision_replaced"
-        : runSnapshot.expires_at <= now ? "authorization_expired" : null;
+        : runSnapshot.expires_at <= transitionAt ? "authorization_expired" : null;
       const workCompletion = next === "completed" && runSnapshot.action === "work.read_only";
       const hasTarget = (JSON.parse(runSnapshot.target_json) as Target).kind !== "none";
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
       if (workCompletion && hasTarget && notificationReason === null) {
         if (resultContent === null) throw new Error("result_content_required");
-        safeContent(resultContent, 2000);
-        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, resultContent, transitionAt);
+        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, truncateResultContent(resultContent), transitionAt);
       }
       const suppressed = next === "cancelled" || next === "failed"
         ? this.db.prepare("SELECT * FROM connector_outbox WHERE run_id = ? AND status IN ('pending','claimed')").all(runId) as Outbox[] : [];
@@ -530,13 +544,14 @@ export class SchedulerRepository {
     return this.db.transaction(() => {
       const row = this.getOutbox(outboxId, now);
       if (!row || row.status !== "request_started" || row.claim_token !== token) throw new Error("claim_conflict");
+      const run = this.getRun(row.run_id)!;
+      const schedule = this.get(run.schedule_id)!;
       const finishedAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
-        row.terminal_at ?? row.created_at].sort().at(-1)!;
+        row.terminal_at ?? row.created_at, schedule.created_at, schedule.updated_at,
+        schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
       if (outcome === "ambiguous") this.markAmbiguous(row, finishedAt);
       else {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
-        const run = this.getRun(row.run_id)!;
-        const schedule = this.get(run.schedule_id)!;
         const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));

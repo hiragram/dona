@@ -705,6 +705,8 @@ test("authorization失効はschedule時刻を戻さず未開始workへ専用reas
   assert.equal(repo.transition("expire_clock", 1, "pause", actor, "2026-09-05T00:02:00Z").state, "expired");
   repo.purge(due);
   assert.equal(repo.get("expire_clock")?.terminal_at, "2026-09-05T00:02:00Z");
+  repo.create("cancel_expired", { ...input, expires_at: due }, due, actor, now);
+  assert.equal(repo.transition("cancel_expired", 1, "cancel", actor, "2026-09-05T00:02:00Z").state, "cancelled");
 
   const expiry = "2026-09-05T00:02:00Z";
   repo.create("expire_work", { ...input, action: "work.read_only", expires_at: expiry }, due, actor, now);
@@ -720,6 +722,15 @@ test("authorization失効はschedule時刻を戻さず未開始workへ専用reas
   assert.equal(repo.claim(expiry), undefined);
   assert.equal((repo.auditHistory("expire_reminder") as { operation: string }[])
     .filter(row => row.operation === "outbox_authorization_expired").length, 1);
+});
+
+test("schedule時刻が進んだ後の時計後退では古いwork runを開始しない", () => {
+  const { repo } = setup();
+  repo.create("start_clock", { ...input, action: "work.read_only" }, due, actor, now);
+  const first = repo.materialize("start_clock", 1, due, later, due, actor).run;
+  repo.materialize("start_clock", 1, later, afterLater, later, actor);
+  assert.throws(() => repo.setRunState(first.run_id, "materialized", "started", actor, due), /run_not_authorized/);
+  assert.equal(repo.getRun(first.run_id)?.reason, "misfire");
 });
 
 test("outbox本文の7日保持は作成時でなく終端またはneeds_review遷移から数える", () => {
@@ -769,6 +780,18 @@ test("通知先があるworkの結果欠落は完了transactionを拒否する",
   assert.equal(count(raw, "connector_outbox"), 0);
   repo.setRunState(run.run_id, "started", "completed", actor, due, null, "完了結果");
   assert.equal(count(raw, "connector_outbox"), 1);
+});
+
+test("長いwork結果は1999 code pointsとellipsisへ短縮してrun完了を保持する", () => {
+  const { repo, raw, dispatcher } = setup();
+  repo.create("long_result", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("long_result", 1, due, later, due, actor).run;
+  startWork(repo, dispatcher, raw, run, due);
+  repo.setRunState(run.run_id, "started", "completed", actor, due, null, "あ".repeat(2001));
+  const stored = raw.prepare("SELECT content FROM connector_outbox WHERE run_id = ?").get(run.run_id) as { content: string };
+  assert.equal([...stored.content].length, 2000);
+  assert.ok(stored.content.endsWith("…"));
+  assert.equal(repo.getRun(run.run_id)?.status, "completed");
 });
 
 test("時計後退後の再承認は時刻を戻さずnext_dueがhigh-watermarkを越える必要がある", () => {
