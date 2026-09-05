@@ -1,4 +1,5 @@
 import type { EventEnvelope } from "./types.js";
+import { persistedEventSource } from "./ingress.js";
 import { stableStringify } from "./validation.js";
 
 export function envelopeFromRow(row: {
@@ -12,12 +13,9 @@ export function envelopeFromRow(row: {
   reply_target_json: string | null;
   trace_json: string | null;
 }): EventEnvelope {
-  if (row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update") {
-    throw new Error(`Unsupported event source: ${row.source}`);
-  }
   const envelope: EventEnvelope = {
     schema_version: 1,
-    source: row.source,
+    source: persistedEventSource(row.source),
     external_event_id: row.external_event_id,
     type: row.event_type,
     occurred_at: row.occurred_at,

@@ -144,7 +144,13 @@ export class DispatcherDatabase {
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
-        return { row: existing, duplicate: true, payloadMismatch: mismatch };
+        const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
+        return {
+          row: existing,
+          outcome,
+          duplicate: true,
+          payloadMismatch: mismatch,
+        };
       }
 
       const eventId = `evt_${ulid(at.getTime())}`;
@@ -173,7 +179,7 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
-      return { row, duplicate: false, payloadMismatch: false };
+      return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
     })();
   }
 
@@ -515,7 +521,7 @@ export class DispatcherDatabase {
     if (job.completion_event_id) {
       const existing = this.get(job.completion_event_id);
       if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
-      return { row: existing, duplicate: true, payloadMismatch: false };
+      return { row: existing, outcome: "duplicate_same", duplicate: true, payloadMismatch: false };
     }
     const sourceEvent = this.getRequired(job.source_event_id);
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
