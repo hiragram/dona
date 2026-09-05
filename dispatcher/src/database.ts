@@ -269,7 +269,9 @@ export class DispatcherDatabase {
 
   commitConnectionBatch(batch: CursorBatch): EnqueueResult[] {
     try {
-      return this.connections.commitBatch(batch, (envelope) => this.enqueue(envelope, new Date(), { connectionId: batch.binding.connectionId }));
+      return this.connections.commitBatch(batch, (envelope) => this.enqueueProvider(envelope, {
+        kind: "provider_resource", source: envelope.source, connection_id: batch.binding.connectionId, resource_id: batch.binding.resource,
+      }, new Date(), { connectionId: batch.binding.connectionId }));
     } catch (error) {
       if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
       throw error;
@@ -997,12 +999,10 @@ export class DispatcherDatabase {
     });
   }
 
-  recordPreDispatchFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
+  recordPreDispatchFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow | undefined {
     return this.db.transaction(() => {
       const row = this.get(eventId);
-      if (!row || !["queued", "retryable_failed"].includes(row.status)) {
-        throw new Error(`Event ${eventId} is no longer dispatchable`);
-      }
+      if (!row || !["queued", "retryable_failed"].includes(row.status)) return undefined;
       const attemptCount = row.attempt_count + 1;
       const status: EventStatus = attemptCount >= maxAttempts ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(attemptCount, at);

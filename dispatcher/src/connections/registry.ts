@@ -61,7 +61,8 @@ export class ConnectionRegistry {
     const config = parseConfig(input);
     return this.db.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM connections WHERE id=?").get(config.id)) throw new ConnectionError("revision_conflict");
-      if (this.db.prepare(`SELECT 1 FROM events WHERE source=? AND status IN ('queued','retryable_failed') LIMIT 1`).get(config.provider)) throw new ConnectionError("operation_pending");
+      if (this.db.prepare(`SELECT 1 FROM events WHERE source=? AND status IN ('queued','retryable_failed','blocked','needs_review','dead_letter')
+        AND NOT EXISTS (SELECT 1 FROM connection_event_bindings binding WHERE binding.event_id=events.event_id) LIMIT 1`).get(config.provider)) throw new ConnectionError("operation_pending");
       const now = this.clock.now();
       if (!Number.isSafeInteger(now) || now < 0) throw new ConnectionError("clock_skew");
       this.db.prepare("INSERT INTO connections VALUES(?,?,?,1,'verification_pending',?)")

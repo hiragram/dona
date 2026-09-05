@@ -131,6 +131,7 @@ export class DispatcherWorker {
         commandMessage(preflight),
         this.config.maxAttempts,
       );
+      if (!updated) return;
       this.logTransition(row, updated, started);
       return;
     }
@@ -162,6 +163,7 @@ export class DispatcherWorker {
           error instanceof Error ? error.message : String(error),
           this.config.maxAttempts,
         );
+        if (!updated) return;
         this.logTransition(row, updated, started);
         return;
       }

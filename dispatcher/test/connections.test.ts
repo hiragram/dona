@@ -517,8 +517,15 @@ test("pollingは各pageのclock high-waterを保存する",async(t)=>{
 
 test("未binding backlogがあるsourceのregisterを拒否する",(t)=>{
   const {db,clock}=fixture(t);const source=externalEventSource("other");
-  db.enqueue({...event(),source,external_event_id:"legacy"},new Date(clock.now()),{connectionId:"legacy"});
+  const legacy=db.enqueue({...event(),source,external_event_id:"legacy"},new Date(clock.now()),{connectionId:"legacy"}).row;
+  db.manualDeadLetter(legacy.event_id,new Date(clock.now()));
   assert.throws(()=>db.connections.register({...config,id:"other",provider:"other"}),/operation_pending/);
+});
+
+test("binding済みbacklogは同じproviderの別connection登録を妨げない",async(t)=>{
+  const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  db.enqueueExternal(event(),binding());
+  assert.equal(db.connections.register({...config,id:"second"}).id,"second");
 });
 
 test("pollingは不正Envelopeをcursor commit前に拒否する",async(t)=>{
@@ -528,6 +535,16 @@ test("pollingは不正Envelopeをcursor commit前に拒否する",async(t)=>{
     {providerEventId:"bad",envelope:{...event("bad"),schema_version:2} as unknown as EventEnvelope},
   ]})),/incomplete_batch/);
   assert.equal(db.connections.cursor("pilot","folder1").version,0);assert.equal(db.list().length,0);
+});
+
+test("polling eventはprovider ownerとpolicy snapshotを永続化する",async(t)=>{
+  const {pollConnectionBatch}=await import("../src/connections/poll.js");
+  const {db,lifecycle}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const owner={kind:"provider_resource" as const,source:"drive",connection_id:"pilot",resource_id:"folder1"};
+  db.setProviderExecutionPolicy(owner,"changed",{background_job:true,workspace:"scratch"});
+  await pollConnectionBatch(db,binding(),async()=>({done:true,checkpoint:"next",events:[{providerEventId:"change1",envelope:event()}]}));
+  const saved=db.getEventBinding(db.list()[0]!.event_id);
+  assert.deepEqual(saved?.owner,owner);assert.equal(saved?.execution.background_job,true);
 });
 
 test("allowlist削除済みresourceと停止済みgenerationを外部inspectしない",async(t)=>{
