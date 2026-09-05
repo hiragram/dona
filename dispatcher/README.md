@@ -110,7 +110,7 @@ worker promptにはDispatcherが生成したjob専用progress pathだけを公�
 
 具体的な工程表示には`assistant.threads.setStatus` compatibility APIを使い、`agents.sessions.setStatus`のlifecycle (`processing` / `suspended` / `active`) や作成時だけの`title`とは分離します。compatibility APIが利用できない環境ではchat messageへfallbackせず、durable stateを保持したまま表示をdegradeします。
 
-live smokeはrelease適用後に、専用test threadで`implementing`から`testing`の2 sequenceを順にatomic publishし、Slack画面の文言、API応答、短時間更新時のcoalesce/rate-limit、終端通知後の`active`復帰を確認します。このrepositoryのfake testはmethod/field境界だけを証明し、実Slack UI成功の証拠にはしません。検証後はprogress fileをjob Resultと同じretentionで削除でき、進捗DBは監査期間後にterminal rowを削除します。
+live smokeはrelease適用後に、専用test threadで`implementing`から`testing`の2 sequenceを順にatomic publishし、Slack画面の文言、API応答、短時間更新時のcoalesce/rate-limit、終端通知後の`active`復帰を確認します。このrepositoryのfake testはmethod/field境界だけを証明し、実Slack UI成功の証拠にはしません。terminal時はprogress fileを削除し、進捗DBのrowは`terminal_checked=1`の監査記録として保持します。startup recoveryは未照合rowだけをqueryするため、保持件数に比例した全件走査は行いません。
 
 Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
 
