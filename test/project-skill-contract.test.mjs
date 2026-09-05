@@ -126,16 +126,17 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /^- `default_branch_ref`$/m,
     /^- `title_sha256`$/m,
     /^- `body_sha256`$/m,
+    /^- `merge_target_contract_sha256`$/m,
     /^- `closing_issues_sha256`$/m,
     /^- `closing_issue_scope_sha256`$/m,
     /^- `template_base_sha`$/m,
-    /raw title／本文.*`closingIssuesReferences`全page.*標準template.*closing relationship.*Issue完了条件.*検証/,
-    /canonical list.*SHA-256 hash.*title\/body\/closing relationship\/closing issue scope identity.*固定/,
+    /raw title／本文.*`closingIssuesReferences`全page.*標準template.*merge-target contract.*closing relationship.*期待状態.*検証/,
+    /canonical merge-target contract list.*SHA-256 hash.*title\/body\/merge-target contract\/closing relationship\/closing issue scope identity.*固定/,
     /closing target Issue.*`updatedAt`.*raw title\/body.*closing issue scope canonical list.*SHA-256 hash/,
-    /reconcile中にhead、base、title\/body hash.*closing issue scope hash.*変わった場合.*triggerを受理せず停止/,
+    /reconcile中にhead、base、title\/body hash.*merge-target contract hash.*closing issue scope hash.*変わった場合.*triggerを受理せず停止/,
     /投稿前.*既存trigger.*pagination.*reaction一覧.*pagination/,
     /latest trigger.*`eyes`.*terminal review\/completion.*reactionも空.*pending.*新規投稿せず.*poll/,
-    /保存済みround record.*`target_sha`.*`base_ref`.*`base_sha`.*`default_branch_ref`.*`title_sha256`.*`body_sha256`.*`closing_issues_sha256`.*`closing_issue_scope_sha256`.*`template_base_sha`.*すべて復元.*current head\/base\/default-branch\/title\/body\/closing relationship\/closing issue scope identity.*一致.*場合だけ/,
+    /保存済みround record.*`target_sha`.*`base_ref`.*`base_sha`.*`default_branch_ref`.*`title_sha256`.*`body_sha256`.*`merge_target_contract_sha256`.*`closing_issues_sha256`.*`closing_issue_scope_sha256`.*`template_base_sha`.*すべて復元.*current head\/base\/default-branch\/title\/body\/merge-target contract\/closing relationship\/closing issue scope identity.*一致.*場合だけ/,
     /current SHAだけ.*Codex-authored artifact.*body\/closing identityを復元できない.*旧roundを引き継がない/,
     /recordがなく.*pending.*duplicate triggerを投稿せず停止.*terminal artifact.*current identityのcleanに使わず.*fresh round/,
     /複数候補.*別identity.*対応不明.*30分.*停止/,
@@ -154,9 +155,10 @@ test("review referenceがexact triggerをSHAと全poll sourceへ結び付ける"
     /current head SHA.*status check.*check run/,
     /repository default branch ref/,
     /raw title\/body.*title\/body hash/,
+    /merge-target contract hash/,
     /`closingIssuesReferences`全page.*closing relationship hash/,
     /closing target Issue.*`updatedAt`.*closing issue scope hash/,
-    /PR titleのautomatic closing keyword.*Issue content identity.*各pollで再評価/,
+    /PR titleのautomatic closing keyword.*Issue content identity.*selected baseへのmerge完了条件.*GitHub closing relationshipの期待状態.*各pollで再評価/,
     /Pull Request association.*head\/base SHA.*tested merge commit.*GitHub API evidence/,
     /base driftより前のrun.*current CIに数えず/,
   ]);
@@ -181,10 +183,10 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
     /空reaction.*完了ではない/,
   ]);
   assertContract(decision, "empty state is not clean", [
-    /clean.*current head\/base\/default-branch\/title\/body\/closing relationship\/closing issue scope hash.*round recordのidentity/,
-    /superseded.*head SHA.*base ref.*base SHA.*repository default branch ref.*title hash.*body hash.*closing relationship hash.*closing issue scope hash.*旧roundをclean扱いしない/,
-    /base ref\/SHA.*default branch ref.*変わった.*新しいexact base SHA.*標準templateを再取得.*automatic closing reference条件.*再評価.*reconcile.*再取得.*検証/,
-    /title\/body hash.*closing relationship hash.*closing issue scope hash.*変わった.*current template.*current Issue内容の完了条件.*reconcile/,
+    /clean.*current head\/base\/default-branch\/title\/body\/merge-target contract\/closing relationship\/closing issue scope hash.*round recordのidentity/,
+    /superseded.*head SHA.*base ref.*base SHA.*repository default branch ref.*title hash.*body hash.*merge-target contract hash.*closing relationship hash.*closing issue scope hash.*旧roundをclean扱いしない/,
+    /base ref\/SHA.*default branch ref.*変わった.*新しいexact base SHA.*標準templateを再取得.*merge-target contract.*automatic closing reference条件.*再評価.*reconcile.*再取得.*検証/,
+    /title\/body hash.*merge-target contract hash.*closing relationship hash.*closing issue scope hash.*変わった.*current template.*current Issue内容の完了条件.*reconcile/,
     /findings.*`eyes`消失.*terminal review\/completion.*feedback処理やhead変更を始めない/,
     /terminal後.*reviews.*inline comments.*pagination.*全finding集合を固定/,
   ]);
@@ -207,10 +209,21 @@ test("feedback後は各inline threadへdirect replyしてからfresh roundへ進
 });
 
 test("PR本文はcurrent baseの標準template全欄を反映して再取得検証する", async () => {
-  const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
+  const [skill, repositoryTemplate] = await Promise.all([
+    read(".agents/skills/code-submission-review-cycle/SKILL.md"),
+    read(".github/PULL_REQUEST_TEMPLATE.md"),
+  ]);
   const template = section(skill, "標準Pull Request templateを反映する");
   const boundary = section(skill, "安全境界");
   const completion = section(skill, "完了条件");
+
+  assertContract(repositoryTemplate, "repository PR template", [
+    /実際のマージ先へのマージ.*Issue 全体を完了してよい場合だけ.*Closes #xx/s,
+    /default branch 以外.*マージ先の契約.*current Issue.*完了を確認できる場合は使用できます/,
+    /GitHub 上の closing relationship.*自動 close の可否.*別途確認/,
+    /部分対応.*単なる関連付け.*この行を削除/,
+  ]);
+  assert.doesNotMatch(repositoryTemplate, /default branch[^\n]*ため[^\n]*Closes[^\n]*使用しない/);
 
   assertContract(template, "standard PR template", [
     /作成・title／本文更新.*\.github\/PULL_REQUEST_TEMPLATE\.md.*必ず使う/,
@@ -218,9 +231,10 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /local checkout.*過去に保存したtemplate.*代用しない/,
     /存在しない.*取得できない.*空.*構造を安全に解釈できない.*PRを作成・更新せず.*review trigger.*停止/,
     /コメント.*全見出し.*各欄の目的.*見出しと順序を維持/,
-    /`完了する Issue`.*selected base.*default branch.*Issue全体が完了.*場合だけ.*`Closes #xx`/,
+    /`完了する Issue`.*selected baseへのmerge.*merge-target contract.*current Issue scope.*Issue全体を完了.*場合だけ.*`Closes #xx`/,
+    /selected base.*default branchかどうかだけで許可・禁止せず.*branch名だけ.*contractの証拠にしない/,
     /cross-repository Issue.*対象を変えない`Closes OWNER\/REPOSITORY#xx`/,
-    /non-default base.*部分対応.*単なる関連.*Issue不明.*曖昧.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
+    /部分対応.*単なる関連.*Issue不明.*曖昧.*selected base.*Issueの実装先契約.*一致しない.*automatic closing referenceを使用せず.*`Closes #xx`.*残さない/,
     /`close`.*`closes`.*`closed`.*`fix`.*`fixes`.*`fixed`.*`resolve`.*`resolves`.*`resolved`.*大文字小文字.*colon.*検査/,
     /Issue全体の完了を証明できないIssue reference.*残さない.*keywordだけ.*`Closes`.*same-repository.*cross-repository.*参照対象を保持/,
     /`https:\/\/github\.com\/OWNER\/REPOSITORY\/issues\/xx`.*完全URL.*検出/,
@@ -232,26 +246,31 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
     /current templateの全必須欄.*意味的に記入済み.*未解決placeholder.*含まず/,
     /全automatic closing keyword.*same-repository.*cross-repository.*完全URL.*Issue reference.*検査.*許可・正規化.*以外を残さない/,
     /PR titleと本文.*automatic closing keyword.*検査.*squash merge.*commit subject.*titleも本文と同じIssue完了条件/,
+    /canonical merge-target contract list.*SHA-256 hash/,
+    /default branch.*keyword target.*`closingIssuesReferences`.*期待/,
+    /non-default base.*keyword.*relationship化しない.*relationshipが空.*理由に`Closes`を禁止しない.*自動closeを主張せず.*後続integration.*手動close.*境界.*`動作確認方法`/,
+    /branch名だけ.*古いIssue内容.*relationshipの有無だけでIssue完了を判断しない/,
     /既存Pull Request.*`closingIssuesReferences`.*全page取得.*canonical list.*SHA-256 hash/,
-    /keyword由来.*Development欄.*manual link.*default branch.*Issue全体を完了.*検証/,
+    /keyword由来.*Development欄.*manual link.*許可済みclosing target.*current Issue identity.*merge-target contract.*一致.*検証/,
+    /default branch向けkeyword target.*relationship欠落.*許可していないrelationship.*non-default base.*relationship.*不一致.*停止/,
     /raw本文.*automatic closing reference.*許可できないrelationship.*CAS reconcile.*`body-derived pending removal`.*本文writeを許可/,
     /manual link由来.*title由来.*由来不明.*自動unlinkしない/,
     /本文更新後.*`closingIssuesReferences`全page.*pending removal.*消えなければ.*停止/,
     /許可するclosing target.*`updatedAt`.*raw title\/body.*canonical issue scope list.*SHA-256 hash/,
-    /新規Pull Request.*生成したtitle／本文.*closing targetのIssue scope canonical hash.*local `HEAD`.*upstream.*remote head ref\/SHA.*selected base ref\/SHA.*repository default branch ref.*template取得元のbase SHA.*template blob\/hash.*snapshot/,
+    /新規Pull Request.*生成したtitle／本文.*merge-target contract hash.*closing targetのIssue scope canonical hash.*local `HEAD`.*upstream.*remote head ref\/SHA.*selected base ref\/SHA.*repository default branch ref.*template取得元のbase SHA.*template blob\/hash.*snapshot/,
     /作成write直前.*current値.*同じhead\/base.*open\/closed\/merged Pull Request.*再取得/,
-    /Issue scope identityを含む全identity.*snapshot.*比較/,
+    /merge-target contractとIssue scope identityを含む全identity.*snapshot.*比較/,
     /古いdiff、template、Issue内容.*title／本文でPRを作成せず.*latest identity.*Issue完了条件.*本文生成.*検証をやり直す/,
     /matching open Pull Request.*重複作成せず.*current title／本文.*既存PR手順.*reconcile/,
     /closed\/merged Pull Request.*review targetを固定する.*再作成境界.*複数候補.*状態が曖昧.*停止/,
-    /既存Pull Request.*current title／本文を再取得.*raw title\/body hash.*closing relationship canonical hash.*closing issue scope canonical hash.*local `HEAD`.*upstream.*remote head ref\/SHA.*base ref\/SHA.*repository default branch ref.*template取得元のbase SHA.*template blob\/hash.*snapshot.*人間が追記.*保持.*最小限reconcile/,
+    /既存Pull Request.*current title／本文を再取得.*raw title\/body hash.*merge-target contract hash.*closing relationship canonical hash.*closing issue scope canonical hash.*local `HEAD`.*upstream.*remote head ref\/SHA.*base ref\/SHA.*repository default branch ref.*template取得元のbase SHA.*template blob\/hash.*snapshot.*人間が追記.*保持.*最小限reconcile/,
     /write直前.*もう一度取得.*snapshot.*変化.*古いsnapshot.*書き込まず.*最新のdiff.*exact base SHA.*template.*reconcileをやり直す/,
     /競合.*一意に判断できない.*上書きせず.*停止/,
-    /作成・更新後.*Pull Request.*Issue content identity.*`closingIssuesReferences`全page.*再取得.*実際のtitle／本文.*closing relationship.*closing issue scope.*head\/base\/state/,
+    /作成・更新後.*Pull Request.*Issue content identity.*`closingIssuesReferences`全page.*再取得.*実際のtitle／本文.*merge-target contract.*closing relationshipの期待状態.*closing issue scope.*head\/base\/state/,
     /既存PRがdraft.*検証成功後だけready.*再取得.*non-draft.*identity不変/,
     /write結果が曖昧.*blind retryせず.*本文.*更新時刻.*head\/base.*照合/,
     /追加push.*変更概要.*test範囲.*動作確認.*fresh roundの前.*更新・再取得・検証/,
-    /selected base ref\/SHA.*repository default branch ref.*closing relationship canonical hash.*変わった.*新しいexact base SHA.*template.*必ず再取得.*automatic closing reference.*再評価.*reconcile.*再取得.*検証/,
+    /selected base ref\/SHA.*repository default branch ref.*merge-target contract hash.*closing relationship canonical hash.*変わった.*新しいexact base SHA.*template.*必ず再取得.*automatic closing reference.*再評価.*reconcile.*再取得.*検証/,
   ]);
   assertContract(boundary, "template review gate", [
     /templateの取得.*意味的反映.*再取得検証.*review roundを開始しない/,
@@ -260,11 +279,13 @@ test("PR本文はcurrent baseの標準template全欄を反映して再取得検�
   assertContract(completion, "template completion gate", [
     /current baseの標準`.github\/PULL_REQUEST_TEMPLATE\.md`の全欄を反映/,
     /Issue情報を不必要に重複せず/,
-    /default branch向け.*Issue全体の完了を証明できないautomatic closing reference.*未解決placeholder.*含まない/,
+    /selected baseへのmerge.*Issue全体の完了を証明できないautomatic closing reference.*未解決placeholder.*含まない/,
+    /default branchかどうかだけでclose可否を決めず/,
     /許可したIssue close.*対象repositoryを保持.*`Closes #xx`.*`Closes OWNER\/REPOSITORY#xx`/,
     /全commit message.*automatic closing referenceがない/,
-    /current `closingIssuesReferences`全page.*各closing relationship.*default branch.*Issue全体の完了.*確認済み/,
-    /closing targetのIssue content identity.*current Issue内容.*Issue全体の完了.*確認済み/,
+    /current merge-target contract.*current `closingIssuesReferences`全page.*closing targetのIssue content identity.*取得済み/,
+    /各closing target.*current selected baseへのmerge.*Issue全体を完了.*closing relationshipと期待状態.*一致/,
+    /non-default base.*relationshipを作らない.*自動close境界.*明記/,
     /本文由来のpending removal.*残っていない/,
   ]);
 });
@@ -276,7 +297,7 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
   const target = section(skill, "review targetを固定する");
 
   assertContract(completion, "completion gates", [
-    /latest round.*current Pull Request head SHA.*current base ref\/SHA.*current repository default branch ref.*current PR title\/body hash.*current closing relationship canonical hash.*current closing issue scope canonical hash/,
+    /latest round.*current Pull Request head SHA.*current base ref\/SHA.*current repository default branch ref.*current PR title\/body hash.*current merge-target contract hash.*current closing relationship canonical hash.*current closing issue scope canonical hash/,
     /\+1.*no-major-issues\/no-findings/,
     /未解決finding.*過去round.*inline comment.*direct reply済み/,
     /local `HEAD`.*upstream.*Pull Request head SHA.*一致/,
