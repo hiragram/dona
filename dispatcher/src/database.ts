@@ -739,18 +739,34 @@ export class DispatcherDatabase {
     `).all() as JobRow[];
   }
 
+  beginRunnableCycle(at = new Date()): string | undefined {
+    const timestamp = at.toISOString();
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE jobs INDEXED BY jobs_run_idx
+        SET status = 'queued', updated_at = ?
+        WHERE status = 'retryable_failed' AND available_at <= ?
+      `).run(timestamp, timestamp);
+      const row = this.db.prepare(`
+        SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
+        WHERE status = 'queued' AND available_at <= ?
+        ORDER BY source_event_id DESC
+        LIMIT 1
+      `).get(timestamp) as Pick<JobRow, "source_event_id"> | undefined;
+      return row?.source_event_id;
+    })();
+  }
+
   nextRunnableJob(
     at = new Date(),
     afterSourceEventId = "",
     excludedSourceEventIds: string[] = [],
     excludedJobIds: string[] = [],
+    throughSourceEventId?: string,
   ): JobRow | undefined {
     const timestamp = at.toISOString();
-    this.db.prepare(`
-      UPDATE jobs INDEXED BY jobs_run_idx
-      SET status = 'queued', updated_at = ?
-      WHERE status = 'retryable_failed' AND available_at <= ?
-    `).run(timestamp, timestamp);
+    const cycleEndSourceEventId = throughSourceEventId ?? this.beginRunnableCycle(at);
+    if (cycleEndSourceEventId === undefined) return undefined;
     const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
     const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
     const excludedSources = excludedSourceEventIds.length > 0
@@ -761,17 +777,16 @@ export class DispatcherDatabase {
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
       WHERE status = 'queued' AND available_at <= ?
         AND source_event_id > ?
+        AND source_event_id <= ?
         ${excludedSources}
         ${excludedJobs}
       ORDER BY source_event_id, created_at, job_id
       LIMIT 1
     `);
-    const parameters = [timestamp, afterSourceEventId, ...excludedSourceEventIds, ...excludedJobIds];
-    const next = statement.get(...parameters) as JobRow | undefined;
-    if (next || afterSourceEventId === "") return next;
     return statement.get(
       timestamp,
-      "",
+      afterSourceEventId,
+      cycleEndSourceEventId,
       ...excludedSourceEventIds,
       ...excludedJobIds,
     ) as JobRow | undefined;

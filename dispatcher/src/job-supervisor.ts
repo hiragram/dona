@@ -66,6 +66,7 @@ export class JobSupervisor {
   private readonly active = new Map<string, ActiveJob>();
   private readonly controls = new Map<string, Promise<unknown>>();
   private fairCursorSourceEventId: string | undefined;
+  private fairCycleEndSourceEventId: string | undefined;
   private lastSchedulerState: string | undefined;
   private nextRunnableScanAt = 0;
   private nextSchedulerStatsAt = 0;
@@ -216,17 +217,34 @@ export class JobSupervisor {
       const excludedSourceEventIds = [...activeCounts]
         .filter(([, count]) => count >= effectivePerEventLimit)
         .map(([sourceEventId]) => sourceEventId);
-      const row = this.database.nextRunnableJob(
-        at,
-        this.fairCursorSourceEventId,
-        excludedSourceEventIds,
-        [...this.active.keys()],
-      );
+      const excludedJobIds = [...this.active.keys()];
+      let row = this.fairCycleEndSourceEventId === undefined
+        ? undefined
+        : this.database.nextRunnableJob(
+            at,
+            this.fairCursorSourceEventId,
+            excludedSourceEventIds,
+            excludedJobIds,
+            this.fairCycleEndSourceEventId,
+          );
+      if (!row) {
+        this.fairCursorSourceEventId = undefined;
+        this.fairCycleEndSourceEventId = this.database.beginRunnableCycle(at);
+        row = this.fairCycleEndSourceEventId === undefined
+          ? undefined
+          : this.database.nextRunnableJob(
+              at,
+              this.fairCursorSourceEventId,
+              excludedSourceEventIds,
+              excludedJobIds,
+              this.fairCycleEndSourceEventId,
+            );
+      }
       if (!row) {
         this.nextRunnableScanAt = this.database.nextWaitingJobAt(
           at,
           excludedSourceEventIds,
-          [...this.active.keys()],
+          excludedJobIds,
         )?.getTime() ?? Number.POSITIVE_INFINITY;
         break;
       }

@@ -209,9 +209,10 @@ describe("DispatcherDatabase", () => {
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
       WHERE status = 'queued' AND available_at <= ?
         AND source_event_id > ?
+        AND source_event_id <= ?
       ORDER BY source_event_id, created_at, job_id
       LIMIT 1
-    `).all("2026-09-04T00:00:00.000Z", "") as Array<{ detail: string }>;
+    `).all("2026-09-04T00:00:00.000Z", "", "evt_zzzz") as Array<{ detail: string }>;
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     const runnableIndexSql = migrated.prepare(`
@@ -219,6 +220,15 @@ describe("DispatcherDatabase", () => {
     `).pluck().get() as string;
     assert.match(runnableIndexSql, /WHERE status = 'queued'/);
     assert.doesNotMatch(runnableIndexSql, /retryable_failed/);
+    const cycleEndPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+      ORDER BY source_event_id DESC
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     const retryPromotionPlan = migrated.prepare(`
       EXPLAIN QUERY PLAN
       UPDATE jobs INDEXED BY jobs_run_idx

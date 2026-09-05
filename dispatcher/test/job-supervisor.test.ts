@@ -180,6 +180,56 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("does not starve an old fan-out while new source events keep arriving", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 1;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const old = createKeyedScratchJobs(database, config, "Ev-continuous-old", 3, 0);
+    const sourceByJob = new Map(old.jobs.map((row) => [row.job_id, row.source_event_id]));
+    const prompted: string[] = [];
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    const addSource = (externalEventId: string, offsetMs: number): void => {
+      const created = createKeyedScratchJobs(database, config, externalEventId, 1, offsetMs);
+      sourceByJob.set(created.jobs[0]!.job_id, created.sourceEventId);
+      supervisor.wake();
+    };
+
+    supervisor.start();
+    await waitFor(() => prompted.length === 1 && waiters.has(prompted[0]!));
+    assert.equal(sourceByJob.get(prompted[0]!), old.sourceEventId);
+    addSource("Ev-continuous-new-1", 100);
+    waiters.get(prompted[0]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 2 && waiters.has(prompted[1]!));
+    assert.equal(sourceByJob.get(prompted[1]!), old.sourceEventId);
+    addSource("Ev-continuous-new-2", 200);
+    waiters.get(prompted[1]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 3 && waiters.has(prompted[2]!));
+    assert.notEqual(sourceByJob.get(prompted[2]!), old.sourceEventId);
+    addSource("Ev-continuous-new-3", 300);
+    waiters.get(prompted[2]!)!(ok("done"));
+
+    await waitFor(() => prompted.length === 4);
+    assert.equal(sourceByJob.get(prompted[3]!), old.sourceEventId);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("keeps cursor order when the cursor event is temporarily at its active limit", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -267,10 +317,16 @@ describe("JobSupervisor", () => {
       database.beginJobPreparation(job.job_id, failureAt);
       database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failureAt);
     }
+    const originalBeginRunnableCycle = database.beginRunnableCycle.bind(database);
     const originalNextRunnableJob = database.nextRunnableJob.bind(database);
     const originalNextWaitingJobAt = database.nextWaitingJobAt.bind(database);
+    let cycleQueries = 0;
     let runnableQueries = 0;
     let retryTimeQueries = 0;
+    database.beginRunnableCycle = (...args): string | undefined => {
+      cycleQueries += 1;
+      return originalBeginRunnableCycle(...args);
+    };
     database.nextRunnableJob = (...args): JobRow | undefined => {
       runnableQueries += 1;
       return originalNextRunnableJob(...args);
@@ -284,7 +340,8 @@ describe("JobSupervisor", () => {
     supervisor.start();
     await waitFor(() => retryTimeQueries === 1);
     await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
-    assert.equal(runnableQueries, 1);
+    assert.equal(cycleQueries, 1);
+    assert.equal(runnableQueries, 0);
     assert.equal(retryTimeQueries, 1);
     await supervisor.stop();
     database.close();
@@ -359,6 +416,7 @@ describe("JobSupervisor", () => {
       afterSourceEventId?: string,
       excludedSourceEventIds?: string[],
       excludedJobIds?: string[],
+      throughSourceEventId?: string,
     ): JobRow | undefined => {
       queryCount += 1;
       if (queryCount === 1) {
@@ -366,7 +424,13 @@ describe("JobSupervisor", () => {
         error.code = "SQLITE_BUSY";
         throw error;
       }
-      return originalNextRunnableJob(at, afterSourceEventId, excludedSourceEventIds, excludedJobIds);
+      return originalNextRunnableJob(
+        at,
+        afterSourceEventId,
+        excludedSourceEventIds,
+        excludedJobIds,
+        throughSourceEventId,
+      );
     };
     const warnings: Array<Record<string, unknown>> = [];
     const busyLogger: Logger = {
