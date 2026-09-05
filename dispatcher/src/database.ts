@@ -256,9 +256,15 @@ export class DispatcherDatabase {
     const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
     try { return this.db.transaction(() => {
       const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
+      const bindingMatches = (eventId: string): boolean => {
+        if (!binding) return true;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved) === stableStringify(binding);
+      };
       const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
       if (delivery) {
-        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex");
+        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex") ||
+          !bindingMatches(delivery.event_id);
         const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
         this.queueMetric(outcome);
         return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
@@ -277,11 +283,8 @@ export class DispatcherDatabase {
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
         const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
-        if (binding) {
-          const saved = readBinding(this.db, existing.event_id);
-          if (!saved || stableStringify(saved.owner) !== stableStringify(binding.owner)) {
-            return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
-          }
+        if (!bindingMatches(existing.event_id)) {
+          return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
         }
         this.queueMetric(outcome);
         return {
@@ -309,10 +312,11 @@ export class DispatcherDatabase {
       const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
       const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
       if (sourceTokens < 1) reject("queue_rate");
-      const coalesced = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
+      const coalescedCandidate = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
         WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
         AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
         ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
+      const coalesced = coalescedCandidate && bindingMatches(coalescedCandidate.event_id) ? coalescedCandidate : undefined;
       if (coalesced && coalesced.delivery_count >= this.queuePolicy.maxDeliveries) reject("queue_deliveries");
       const usage = this.db.prepare(`SELECT l.class, count(*) depth, coalesce(sum(q.bytes),0) bytes FROM queue_events q
         JOIN events e USING(event_id) JOIN queue_lanes l USING(lane) WHERE e.status!='completed' GROUP BY l.class`).all() as {class:string;depth:number;bytes:number}[];
@@ -736,8 +740,7 @@ export class DispatcherDatabase {
       const subject = JSON.parse(existing.subject_json) as Record<string, unknown>;
       if (existing.source !== "dona_job" || subject.job_id !== jobId || subject.source_event_id !== job.source_event_id ||
         existing.reply_target_json !== stableStringify(binding.destination)) throw new Error("Completion owner mismatch");
-      this.db.prepare("UPDATE job_completions SET notification_event_id = ? WHERE job_id = ? AND job_status = ?")
-        .run(existing.event_id, jobId, job.status);
+      this.linkJobCompletionNotification(jobId, job.status, existing);
       return { row: existing, outcome: "duplicate_same", duplicate: true, payloadMismatch: false };
     }
 
@@ -770,8 +773,17 @@ export class DispatcherDatabase {
     const enqueued = this.enqueue(envelope, at);
     this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
       .run(enqueued.row.event_id, at.toISOString(), jobId);
-    this.db.prepare("UPDATE job_completions SET notification_event_id = ? WHERE job_id = ? AND job_status = ?").run(enqueued.row.event_id, jobId, job.status);
+    this.linkJobCompletionNotification(jobId, job.status, enqueued.row);
     return enqueued;
+  }
+
+  private linkJobCompletionNotification(jobId: string, jobStatus: string, event: EventRow): void {
+    const notificationState = event.status === "completed" ? "accepted" :
+      ["needs_review", "dead_letter", "blocked"].includes(event.status) ? "needs_review" : "pending";
+    this.db.prepare(`UPDATE job_completions
+      SET notification_event_id = ?, notification_state = ?, notification_result_json = ?
+      WHERE job_id = ? AND job_status = ?`)
+      .run(event.event_id, notificationState, event.result_json, jobId, jobStatus);
   }
 
   getEventBinding(eventId: string): EventBinding | undefined { return readBinding(this.db, eventId); }

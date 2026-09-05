@@ -239,6 +239,36 @@ test("completion commit/restart and notification acceptance unknown preserve job
   recovered.close();
 });
 
+test("relinking an existing completed notification atomically restores its projection", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const source = database.enqueue(eventEnvelope("relink-completed")).row;
+  const job = database.createJob({ source_event_id: source.event_id, objective: "調査", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  database.beginJobPreparation(job.job_id); database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+  database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+  const notification = database.enqueueJobNotification(job.job_id)!.row;
+  database.manualComplete(source.event_id);
+  database.beginDispatch(notification.event_id, "notification-result"); database.markWaiting(notification.event_id);
+  database.saveCompleted(notification.event_id, { schema_version: 1, event_id: notification.event_id, status: "completed", summary: "通知済み", actions: [], completed_at: new Date().toISOString() }, "notification-result");
+  const expectedResult = database.get(notification.event_id)!.result_json;
+  database.close();
+
+  const interrupted = new Database(config.databasePath);
+  interrupted.prepare("UPDATE jobs SET completion_event_id = NULL WHERE job_id = ?").run(job.job_id);
+  interrupted.prepare("UPDATE job_completions SET notification_event_id = NULL, notification_state = 'pending', notification_result_json = NULL WHERE job_id = ?").run(job.job_id);
+  interrupted.close();
+
+  const recovered = new DispatcherDatabase(config.databasePath);
+  const relinked = recovered.enqueueJobNotification(job.job_id)!;
+  assert.equal(relinked.row.event_id, notification.event_id); assert.equal(relinked.duplicate, true);
+  const projection = recovered.getJobCompletion(job.job_id)!;
+  assert.equal(projection.notification_event_id, notification.event_id);
+  assert.equal(projection.notification_state, "accepted");
+  assert.equal(projection.notification_result_json, expectedResult);
+  assert.deepEqual(recovered.listJobsNeedingNotification(), []);
+  recovered.close();
+});
+
 test("simultaneous processes admit one provider event/job and materialize one completion", async () => {
   const { database, config, source, create } = await setup();
   const run = promisify(execFile);
