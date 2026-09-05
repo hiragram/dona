@@ -156,6 +156,17 @@ test("terminal fence suppresses an undelivered progress update", async () => {
   finally { store.close(); await fs.rm(root, { recursive: true }); }
 });
 
+test("terminal ingest removes the job-bound progress directory", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-terminal-cleanup-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    const row={job_id:"job_abc",source_event_id:"evt_abc",status:"completed",workspace_path:path.join(root,"job_abc"),workspace_json:JSON.stringify({kind:"scratch"})};
+    const progressFile=jobProgressPath(row as never); await fs.mkdir(path.dirname(progressFile),{recursive:true}); await fs.writeFile(progressFile,"{}");
+    const jobs={listEventJobs:()=>[row]}; const logger={warn(){}};
+    await new JobProgressCoordinator(jobs as never,store,{} as never,logger as never).ingest(row as never);
+    await assert.rejects(fs.access(path.dirname(progressFile)),{code:"ENOENT"});
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("restart fences a delivery that may have reached Slack", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-recover-")); const file=path.join(root,"progress.sqlite3");
   let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();

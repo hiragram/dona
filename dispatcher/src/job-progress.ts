@@ -132,7 +132,7 @@ export class JobProgressCoordinator {
     if (terminalStatuses.has(row.status)) {
       await this.deliveryOperations.get(row.job_id);
       this.store.terminal(row.job_id);
-      await fs.unlink(jobProgressPath(row)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
+      await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(() => { this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
       const runningSiblings = this.jobs.listEventJobs(row.source_event_id).filter((item) => !terminalStatuses.has(item.status)).map((item) => item.job_id);
       this.store.requeueLatestAndMarkTerminal(row.job_id,runningSiblings);
       return;
