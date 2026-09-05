@@ -90,7 +90,7 @@ export class JobProgressStore {
   unknown(jobId: string, error: string): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error=? WHERE job_id=? AND status='delivering'").run(error.slice(0,500),jobId); }
   retry(jobId: string, error: string, at = new Date(), retryAfterSeconds = 5): void { this.db.prepare("UPDATE job_progress SET status='pending',available_at=?,last_error=? WHERE job_id=? AND status='delivering'").run(new Date(at.getTime()+Math.max(5,retryAfterSeconds)*1_000).toISOString(),error.slice(0,500),jobId); }
   defer(jobId:string,availableAt:Date):void { this.db.prepare("UPDATE job_progress SET available_at=? WHERE job_id=? AND status='pending' AND available_at<?").run(availableAt.toISOString(),jobId,availableAt.toISOString()); }
-  deferJobs(jobIds:string[],availableAt:Date):void {if(jobIds.length===0)return;const placeholders=jobIds.map(()=>"?").join(",");this.db.prepare(`UPDATE job_progress SET available_at=? WHERE job_id IN (${placeholders}) AND status='pending' AND available_at<?`).run(availableAt.toISOString(),...jobIds,availableAt.toISOString());}
+  deferJobs(jobIds:string[],availableAt:Date):void {const timestamp=availableAt.toISOString();for(let offset=0;offset<jobIds.length;offset+=500){const batch=jobIds.slice(offset,offset+500);const placeholders=batch.map(()=>"?").join(",");this.db.prepare(`UPDATE job_progress SET available_at=? WHERE job_id IN (${placeholders}) AND status='pending' AND available_at<?`).run(timestamp,...batch,timestamp);}}
   deferWorkspace(workspaceId:string,availableAt:Date):void { this.db.prepare(`INSERT INTO job_progress_throttles(workspace_id,available_at) VALUES(?,?) ON CONFLICT(workspace_id) DO UPDATE SET available_at=CASE WHEN available_at<excluded.available_at THEN excluded.available_at ELSE available_at END`).run(workspaceId,availableAt.toISOString()); }
   workspaceAvailableAt(workspaceId:string):Date|undefined { const row=this.db.prepare("SELECT available_at FROM job_progress_throttles WHERE workspace_id=?").get(workspaceId) as {available_at:string}|undefined; return row?new Date(row.available_at):undefined; }
   terminal(jobId: string): void {
@@ -165,7 +165,7 @@ export class JobProgressCoordinator {
     const job = this.jobs.getJob(progress.job_id);
     if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
     const workspaceAvailableAt=this.store.workspaceAvailableAt(job.workspace_id);
-    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.deferJobs(this.jobs.listJobs(undefined,1_000_000).filter((item)=>item.workspace_id===job.workspace_id).map((item)=>item.job_id),workspaceAvailableAt);return;}
+    if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){this.store.deferJobs(this.jobs.listJobs(undefined,1_000_000).filter((item)=>item.workspace_id===job.workspace_id&&!terminalStatuses.has(item.status)).map((item)=>item.job_id),workspaceAvailableAt);return;}
     const group = this.jobs.getJobGroup(job.source_event_id);
     if (group?.notification_mode === "grouped" && group.attention_event_id !== null) { this.store.terminal(progress.job_id); return; }
     this.store.begin(progress.job_id);

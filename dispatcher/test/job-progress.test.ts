@@ -57,7 +57,7 @@ test("workspace Retry-After deadline is durable and defers other pending jobs", 
   let store=new JobProgressStore(file);
   try {
     const start=new Date("2026-09-05T00:00:00Z"); store.ingest(valid,start); store.ingest({...valid,job_id:"job_other"},start);
-    const deadline=new Date("2026-09-05T00:00:30Z"); store.deferWorkspace("T1",deadline); store.defer("job_other",deadline); store.close();
+    const deadline=new Date("2026-09-05T00:00:30Z"); store.deferWorkspace("T1",deadline); store.deferJobs(["job_other",...Array.from({length:40_000},(_,index)=>`job_history_${index}`)],deadline); store.close();
     store=new JobProgressStore(file); assert.equal(store.workspaceAvailableAt("T1")?.toISOString(),deadline.toISOString());
     assert.equal(store.pending(new Date("2026-09-05T00:00:29Z"))?.job_id,"job_abc");
     assert.equal(store.get("job_other")?.available_at,deadline.toISOString());
