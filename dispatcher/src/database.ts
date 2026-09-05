@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, QueueClaimUnavailableError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -18,7 +20,9 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
-import { stableStringify } from "./validation.js";
+import { parseJobResultEnvelope, parseResultEnvelope, stableStringify } from "./validation.js";
+import { eventOwnerSchema, executionPolicySchema, insertBinding, legacySlackBinding, migrateEventRouting, readBinding } from "./event-routing.js";
+import type { EventBinding, ExecutionPolicy, ProviderOwner } from "./event-routing.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -33,10 +37,29 @@ function retryAt(attemptCount: number, now: Date): string {
   return new Date(now.getTime() + delay).toISOString();
 }
 
+function usesSlackReceivedAtFallback(trace: Record<string, unknown> | undefined): boolean {
+  return trace?.occurred_at_source === "received_at";
+}
+
+function storedSlackReceivedAtFallback(row: EventRow): boolean {
+  if (row.source !== "slack" || row.trace_json === null) return false;
+  try {
+    const trace = JSON.parse(row.trace_json) as unknown;
+    return trace !== null && typeof trace === "object" && !Array.isArray(trace) &&
+      (trace as Record<string, unknown>).occurred_at_source === "received_at";
+  } catch {
+    return false;
+  }
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
 
-  constructor(databasePath: string) {
+  private claimsClosed = false;
+  readonly queuePolicy: QueuePolicy;
+
+  constructor(databasePath: string, queuePolicy: unknown = {}) {
+    this.queuePolicy = queuePolicySchema.parse(queuePolicy);
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -44,12 +67,18 @@ export class DispatcherDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    try {
+      this.db.transaction(() => {
+        this.migrate();
+        if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
+        migrateEventRouting(this.db);
+      }).immediate();
+    } catch (error) { this.db.close(); throw error; }
   }
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 2) throw new Error(`Database schema version ${version} is newer than supported version 2`);
+    if (version > 4 || version === 3) throw new Error(`Database schema version ${version} is not supported by the event queue schema 4`);
     if (version < 1) this.db.exec(`
       CREATE TABLE events (
         sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +146,88 @@ export class DispatcherDatabase {
     `);
   }
 
+  private migrateQueue(): void {
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE queue_lanes (
+          lane TEXT PRIMARY KEY, source TEXT NOT NULL, connection TEXT NOT NULL,
+          class TEXT NOT NULL, tokens REAL NOT NULL, clock_ms INTEGER NOT NULL,
+          last_selected INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE queue_events (
+          event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+          lane TEXT NOT NULL REFERENCES queue_lanes(lane), bytes INTEGER NOT NULL,
+          coalesce_key TEXT, fingerprint TEXT NOT NULL, delivery_count INTEGER NOT NULL DEFAULT 1,
+          requires_fetch INTEGER NOT NULL DEFAULT 0 CHECK(requires_fetch IN (0,1))
+        );
+        CREATE INDEX queue_events_lane ON queue_events(lane, event_id);
+        CREATE INDEX queue_events_coalesce ON queue_events(lane, coalesce_key);
+        CREATE TABLE queue_deliveries (
+          source TEXT NOT NULL, external_event_id TEXT NOT NULL,
+          event_id TEXT NOT NULL REFERENCES events(event_id), fingerprint TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(source, external_event_id)
+        );
+        CREATE TABLE queue_sources (source TEXT PRIMARY KEY, tokens REAL NOT NULL, clock_ms INTEGER NOT NULL);
+        CREATE TABLE queue_metrics (code TEXT PRIMARY KEY, count INTEGER NOT NULL);
+        CREATE TABLE queue_selector (id INTEGER PRIMARY KEY CHECK(id=1), step INTEGER NOT NULL);
+        INSERT INTO queue_selector VALUES (1,0);
+      `);
+      for (const row of this.db.prepare("SELECT * FROM events ORDER BY sequence").all() as EventRow[]) {
+        // 旧provider rowのconnectionは復元不能なのでsource単位のlegacy laneへ隔離する。
+        const event: EventEnvelope = { schema_version: 1, source: row.source as EventEnvelope["source"], external_event_id: row.external_event_id, type: row.event_type, occurred_at: row.occurred_at, subject: JSON.parse(row.subject_json), payload: JSON.parse(row.payload_json), reply_target: row.reply_target_json === null ? null : JSON.parse(row.reply_target_json) };
+        if (row.trace_json !== null) event.trace = JSON.parse(row.trace_json);
+        const identity = queueIdentity(event, { connectionId: "legacy" });
+        if (identity.queueClass === "external") {
+          identity.lane = `legacy:${createHash("sha256").update(row.source).digest("hex")}`;
+          identity.connection = "unverified_legacy";
+        }
+        this.db.prepare("INSERT OR IGNORE INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
+          .run(identity.lane, row.source, identity.connection, identity.queueClass, this.queuePolicy.defaults.burst, Date.parse(row.created_at));
+        this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,fingerprint) VALUES (?,?,?,?)")
+          .run(row.event_id, identity.lane, Buffer.byteLength(stableStringify(event)), this.queueFingerprint(event));
+      }
+      this.db.pragma("user_version = 4");
+    }).immediate();
+  }
+
+  private queueFingerprint(event: EventEnvelope): string {
+    return createHash("sha256").update(stableStringify({ schema_version: event.schema_version, type: event.type, subject: event.subject, payload: event.payload, reply_target: event.reply_target })).digest("hex");
+  }
+
+  private queueMetric(code: string): void {
+    this.db.prepare("INSERT INTO queue_metrics VALUES (?,1) ON CONFLICT(code) DO UPDATE SET count=count+1").run(code);
+  }
+
+  queueDispatchMetadata(eventId: string) {
+    const metadata = this.db.prepare("SELECT requires_fetch, delivery_count FROM queue_events WHERE event_id=?").get(eventId) as {requires_fetch:number;delivery_count:number} | undefined;
+    return { schema_version: 1, requires_fetch: metadata?.requires_fetch === 1,
+      delivery_count: metadata?.delivery_count ?? 1, deliveries: this.coalescedDeliveries(eventId) };
+  }
+
+  coalescedDeliveries(eventId: string) {
+    return this.db.prepare("SELECT source,external_event_id,created_at FROM queue_deliveries WHERE event_id=? ORDER BY created_at,external_event_id").all(eventId);
+  }
+
+  closeClaims(): void { this.claimsClosed = true; }
+
+  queueHealth(at = new Date()) {
+    const counts = this.db.prepare(`SELECT l.class, e.status, count(*) AS depth,
+      sum(q.bytes) AS bytes, max(0, ? - min(strftime('%s', e.created_at)*1000)) AS lag_ms
+      FROM queue_events q JOIN events e USING(event_id) JOIN queue_lanes l USING(lane)
+      WHERE e.status != 'completed' GROUP BY l.class,e.status`).all(at.getTime());
+    return { schema_version: 1, claims_closed: this.claimsClosed, counts,
+      lanes: this.db.prepare(`SELECT l.lane,l.class,count(*) depth,sum(q.bytes) bytes,
+        sum(e.status='blocked' OR e.status='needs_review') blocked,
+        sum(e.status='dead_letter') dead_letter,
+        sum(e.status='retryable_failed' AND e.available_at>?) deferred
+        FROM queue_lanes l JOIN queue_events q USING(lane) JOIN events e USING(event_id)
+        WHERE e.status!='completed' GROUP BY l.lane ORDER BY l.lane`).all(at.toISOString()),
+      metrics: this.db.prepare("SELECT code,count FROM queue_metrics ORDER BY code").all(),
+      in_flight: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('dispatching','waiting_agent')").get() as {n:number}).n,
+      queued: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('queued','retryable_failed')").get() as {n:number}).n,
+      blocked: (this.db.prepare("SELECT count(*) n FROM events WHERE status IN ('blocked','needs_review')").get() as {n:number}).n };
+  }
+
   close(): void {
     this.db.close();
   }
@@ -126,28 +237,116 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueue(envelope: EventEnvelope, at = new Date()): EnqueueResult {
+  enqueue(envelope: EventEnvelope, at = new Date(), input?: QueueAdmissionContext | EventBinding | (QueueAdmissionContext & { binding: EventBinding })): EnqueueResult {
+    const binding = input && "connectionId" in input && "binding" in input ? input.binding :
+      input && "owner" in input ? input as EventBinding : undefined;
+    const context = input && "connectionId" in input ? input as QueueAdmissionContext :
+      binding?.owner.kind === "provider_resource" ? { connectionId: binding.owner.connection_id } : undefined;
     const timestamp = at.toISOString();
     const subjectJson = stableStringify(envelope.subject);
     const payloadJson = stableStringify(envelope.payload);
     const replyTargetJson = envelope.reply_target === null ? null : stableStringify(envelope.reply_target);
     const traceJson = envelope.trace === undefined ? null : stableStringify(envelope.trace);
 
-    return this.db.transaction(() => {
+    const identity = queueIdentity(envelope, context);
+    const fingerprint = this.queueFingerprint(envelope);
+    const key = identity.queueClass === "external" ? coalesceKey(context) : null;
+    const bytes = Buffer.byteLength(stableStringify(envelope));
+    const sourcePolicy = Object.hasOwn(this.queuePolicy.sources, envelope.source) ? this.queuePolicy.sources[envelope.source]! : this.queuePolicy.defaults;
+    const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
+    try { return this.db.transaction(() => {
+      const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
+      const ownerMatches = (eventId: string): boolean => {
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved.owner) === stableStringify(binding.owner);
+      };
+      const bindingMatches = (eventId: string): boolean => {
+        if (!binding) return identity.queueClass !== "external" || readBinding(this.db, eventId) === undefined;
+        const saved = readBinding(this.db, eventId);
+        return saved !== undefined && stableStringify(saved) === stableStringify(binding);
+      };
+      const delivery = this.db.prepare("SELECT * FROM queue_deliveries WHERE source=? AND external_event_id=?").get(envelope.source, envelope.external_event_id) as {event_id:string; fingerprint:string; created_at:string} | undefined;
+      if (delivery) {
+        const mismatch = delivery.fingerprint !== createHash("sha256").update(fingerprint + envelope.occurred_at).digest("hex") ||
+          !ownerMatches(delivery.event_id);
+        const outcome = mismatch ? "duplicate_conflict" : "duplicate_same";
+        this.queueMetric(outcome);
+        return { row: this.get(delivery.event_id)!, committedAt: delivery.created_at, outcome, duplicate: true, payloadMismatch: mismatch } as EnqueueResult;
+      }
       const existing = this.db
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
       if (existing) {
+        const ignoreReceivedAtDifference = envelope.source === "slack" &&
+          usesSlackReceivedAtFallback(envelope.trace) && storedSlackReceivedAtFallback(existing);
         const mismatch =
           existing.schema_version !== envelope.schema_version ||
           existing.event_type !== envelope.type ||
-          existing.occurred_at !== envelope.occurred_at ||
+          (!ignoreReceivedAtDifference && existing.occurred_at !== envelope.occurred_at) ||
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
-        return { row: existing, duplicate: true, payloadMismatch: mismatch };
+        const outcome: EnqueueResult["outcome"] = mismatch ? "duplicate_conflict" : "duplicate_same";
+        if (!ownerMatches(existing.event_id)) {
+          return { row: existing, outcome: "duplicate_conflict" as const, duplicate: true, payloadMismatch: true };
+        }
+        this.queueMetric(outcome);
+        return {
+          row: existing,
+          outcome,
+          duplicate: true,
+          payloadMismatch: mismatch,
+        };
       }
 
+      if (this.claimsClosed) reject("queue_quiescing");
+      let lane = this.db.prepare("SELECT * FROM queue_lanes WHERE lane=?").get(identity.lane) as {tokens:number; clock_ms:number} | undefined;
+      if (!lane) {
+        const count = (this.db.prepare("SELECT count(*) n FROM queue_lanes WHERE class=?").get(identity.queueClass) as {n:number}).n;
+        // classごとのslotにより外部connection乱立が予約laneの生成を妨げない。
+        if (count >= this.queuePolicy.maxLanes) reject("queue_lanes");
+        this.db.prepare("INSERT INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
+          .run(identity.lane, envelope.source, identity.connection, identity.queueClass, policy.burst, at.getTime());
+        lane = { tokens: policy.burst, clock_ms: at.getTime() };
+      }
+      const clock = Math.max(lane.clock_ms, at.getTime());
+      const tokens = Math.min(policy.burst, lane.tokens + Math.min(60000, clock-lane.clock_ms) * policy.rate / 1000);
+      if (tokens < 1) reject("queue_rate");
+      const sourceBucket = this.db.prepare("SELECT tokens,clock_ms FROM queue_sources WHERE source=?").get(envelope.source) as {tokens:number;clock_ms:number} | undefined;
+      const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
+      const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
+      if (sourceTokens < 1) reject("queue_rate");
+      const coalescedCandidate = policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
+        WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
+        AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
+        ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
+      const coalesced = coalescedCandidate && bindingMatches(coalescedCandidate.event_id) ? coalescedCandidate : undefined;
+      if (coalesced && coalesced.delivery_count >= this.queuePolicy.maxDeliveries) reject("queue_deliveries");
+      const usage = this.db.prepare(`SELECT l.class, count(*) depth, coalesce(sum(q.bytes),0) bytes FROM queue_events q
+        JOIN events e USING(event_id) JOIN queue_lanes l USING(lane) WHERE e.status!='completed' GROUP BY l.class`).all() as {class:string;depth:number;bytes:number}[];
+      const laneUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE q.lane=? AND e.status!='completed'`).get(identity.lane) as {depth:number;bytes:number};
+      const sourceUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE e.source=? AND e.status!='completed'`).get(envelope.source) as {depth:number;bytes:number};
+      const addedDepth = coalesced ? 0 : 1;
+      if (sourceUsage.depth+addedDepth > sourcePolicy.depth) reject("queue_depth");
+      if (sourceUsage.bytes+bytes > sourcePolicy.bytes) reject("queue_bytes");
+      let reservedDepth = 0, reservedBytes = 0;
+      for (const c of ["slack","internal","update"] as const) {
+        if (c === identity.queueClass) continue;
+        const used = usage.find(u => u.class === c);
+        reservedDepth += Math.max(0,this.queuePolicy.reservations[c]-(used?.depth??0));
+        reservedBytes += Math.max(0,this.queuePolicy.reservedBytes[c]-(used?.bytes??0));
+      }
+      if (laneUsage.depth+addedDepth > policy.depth || usage.reduce((n,u)=>n+u.depth,0)+addedDepth+reservedDepth > this.queuePolicy.depth) reject("queue_depth");
+      if (laneUsage.bytes+bytes > policy.bytes || usage.reduce((n,u)=>n+u.bytes,0)+bytes+reservedBytes > this.queuePolicy.bytes) reject("queue_bytes");
+      this.db.prepare("INSERT INTO queue_sources VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET tokens=excluded.tokens,clock_ms=excluded.clock_ms").run(envelope.source,sourceTokens-1,sourceClock);
+      this.db.prepare("UPDATE queue_lanes SET tokens=?,clock_ms=? WHERE lane=?").run(tokens-1,clock,identity.lane);
+      if (coalesced) {
+        this.db.prepare("INSERT INTO queue_deliveries VALUES (?,?,?,?,?)").run(envelope.source,envelope.external_event_id,coalesced.event_id,createHash("sha256").update(fingerprint+envelope.occurred_at).digest("hex"),timestamp);
+        this.db.prepare("UPDATE queue_events SET delivery_count=delivery_count+1,bytes=bytes+? WHERE event_id=?").run(bytes,coalesced.event_id);
+        this.queueMetric("coalesced");
+        return { row: coalesced, outcome: "created", duplicate: false, payloadMismatch: false, admission: "coalesced", committedAt: timestamp } as EnqueueResult;
+      }
       const eventId = `evt_${ulid(at.getTime())}`;
       const result = this.db
         .prepare(`
@@ -174,8 +373,16 @@ export class DispatcherDatabase {
         );
       const row = this.getBySequence(Number(result.lastInsertRowid));
       if (!row) throw new Error("Inserted event could not be read back");
-      return { row, duplicate: false, payloadMismatch: false };
-    })();
+      const resolvedBinding = binding ?? legacySlackBinding(row);
+      if (resolvedBinding) insertBinding(this.db, eventId, resolvedBinding);
+      this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
+      this.queueMetric("created");
+      return { row, outcome: "created" as const, duplicate: false, payloadMismatch: false };
+    }).immediate();
+    } catch (error) {
+      if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
+      throw error;
+    }
   }
 
   get(eventId: string): EventRow | undefined {
@@ -183,8 +390,8 @@ export class DispatcherDatabase {
   }
 
   getByExternalId(source: string, externalEventId: string): EventRow | undefined {
-    return this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
-      .get(source, externalEventId) as EventRow | undefined;
+    return (this.db.prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
+      .get(source, externalEventId) ?? this.db.prepare("SELECT e.* FROM queue_deliveries d JOIN events e USING(event_id) WHERE d.source=? AND d.external_event_id=?").get(source,externalEventId)) as EventRow | undefined;
   }
 
   isEventCompleted(eventId: string): boolean {
@@ -238,14 +445,11 @@ export class DispatcherDatabase {
     const workspaceId = stringValue(replyTarget.workspace_id);
     const channelId = stringValue(replyTarget.channel_id);
     const threadTs = stringValue(replyTarget.thread_ts);
-    if (
-      sourceEvent.source !== "slack" ||
-      stringValue(replyTarget.kind) !== "slack_thread" ||
-      !workspaceId ||
-      !channelId ||
-      !threadTs
-    ) {
-      throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target`);
+    const binding = this.getEventBinding(sourceEvent.event_id);
+    if (!binding) throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target or authenticated provider owner`);
+    if (!binding.execution.background_job) throw new Error("Background job capability denied");
+    if (binding.owner.kind === "provider_resource" && request.workspace.kind !== "scratch") {
+      throw new Error("Provider job policy permits only scratch workspace");
     }
 
     return this.db.transaction(() => {
@@ -296,8 +500,10 @@ export class DispatcherDatabase {
         timestamp,
         timestamp,
       );
+      this.db.prepare("INSERT INTO job_bindings SELECT ?, event_id, owner_json, execution_json, destination_json FROM event_bindings WHERE event_id = ?")
+        .run(jobId, sourceEvent.event_id);
       return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
-    })();
+    }).immediate();
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -333,6 +539,7 @@ export class DispatcherDatabase {
       SELECT * FROM jobs
       WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
         AND completion_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM job_completions c WHERE c.job_id = jobs.job_id AND c.job_status = jobs.status AND c.notification_state = 'none')
       ORDER BY updated_at LIMIT ?
     `).all(limit) as JobRow[];
   }
@@ -444,6 +651,9 @@ export class DispatcherDatabase {
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string): void {
+    result = parseJobResultEnvelope(result, jobId);
+    const job = this.getJobRequired(jobId);
+    if (job.result_path !== resultPath) throw new Error("Job result path mismatch");
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     this.updateJob(jobId, ["running"], status, {
       result_json: stableStringify(result),
@@ -511,14 +721,34 @@ export class DispatcherDatabase {
     });
   }
 
-  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult {
+  enqueueJobNotification(jobId: string, at = new Date()): EnqueueResult | undefined {
+    return this.db.transaction(() => this.materializeJobCompletion(jobId, at)).immediate();
+  }
+
+  private materializeJobCompletion(jobId: string, at: Date): EnqueueResult | undefined {
     const job = this.getJobRequired(jobId);
+    const binding = this.getEventBinding(job.source_event_id);
+    if (!binding) throw new Error("Unknown completion owner");
+    this.assertJobSourceMatchesThread(jobId, job.source_event_id);
+    if (!["blocked", "completed", "failed", "cancelled", "needs_review"].includes(job.status)) throw new Error("Job is not terminal");
+    const savedCompletion = this.getJobCompletion(jobId);
+    if (savedCompletion && binding.destination.kind === "none") return undefined;
+    this.db.prepare(`INSERT OR IGNORE INTO job_completions
+      (job_id, event_id, owner_json, destination_json, result_json, job_status, materialized_at, notification_state)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(jobId, job.source_event_id, stableStringify(binding.owner), stableStringify(binding.destination), job.result_json,
+        job.status, at.toISOString(), binding.destination.kind === "none" ? "none" : "pending");
+    if (binding.destination.kind === "none") return undefined;
     if (job.completion_event_id) {
       const existing = this.get(job.completion_event_id);
       if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
-      return { row: existing, duplicate: true, payloadMismatch: false };
+      const subject = JSON.parse(existing.subject_json) as Record<string, unknown>;
+      if (existing.source !== "dona_job" || subject.job_id !== jobId || subject.source_event_id !== job.source_event_id ||
+        existing.reply_target_json !== stableStringify(binding.destination)) throw new Error("Completion owner mismatch");
+      this.linkJobCompletionNotification(jobId, job.status, existing);
+      return { row: existing, outcome: "duplicate_same", duplicate: true, payloadMismatch: false };
     }
-    const sourceEvent = this.getRequired(job.source_event_id);
+
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const envelope: EventEnvelope = {
       schema_version: 1,
@@ -542,31 +772,69 @@ export class DispatcherDatabase {
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
         ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
       },
-      reply_target: sourceEvent.reply_target_json
-        ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
-        : null,
+      reply_target: binding.destination,
       trace: { job_id: job.job_id, source_event_id: job.source_event_id },
     };
     const enqueued = this.enqueue(envelope, at);
     this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
       .run(enqueued.row.event_id, at.toISOString(), jobId);
+    this.linkJobCompletionNotification(jobId, job.status, enqueued.row);
     return enqueued;
   }
 
-  private assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
+  private linkJobCompletionNotification(jobId: string, jobStatus: string, event: EventRow): void {
+    const notificationState = event.status === "completed" ? "accepted" :
+      ["needs_review", "dead_letter", "blocked"].includes(event.status) ? "needs_review" : "pending";
+    this.db.prepare(`UPDATE job_completions
+      SET notification_event_id = ?, notification_state = ?, notification_result_json = ?
+      WHERE job_id = ? AND job_status = ?`)
+      .run(event.event_id, notificationState, event.result_json, jobId, jobStatus);
+  }
+
+  getEventBinding(eventId: string): EventBinding | undefined { return readBinding(this.db, eventId); }
+
+  // trusted local configuration API。HTTP/MCP/payload からこの policy を変更しない。
+  setProviderExecutionPolicy(ownerInput: ProviderOwner, eventType: string, policy: ExecutionPolicy): void {
+    const owner = eventOwnerSchema.parse(ownerInput);
+    if (owner.kind !== "provider_resource" || !eventType.trim() || eventType.length > 128) throw new Error("Invalid provider policy");
+    this.db.prepare(`INSERT INTO provider_execution_policies VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(source, connection_id, resource_id, event_type) DO UPDATE SET policy_json = excluded.policy_json`)
+      .run(owner.source, owner.connection_id, owner.resource_id, eventType, stableStringify(executionPolicySchema.parse(policy)));
+  }
+
+  enqueueProvider(envelope: EventEnvelope, ownerInput: ProviderOwner | undefined, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+    if (!ownerInput) return this.enqueue(envelope, at, context);
+    const owner = eventOwnerSchema.parse(ownerInput);
+    if (owner.kind !== "provider_resource" || owner.source !== envelope.source || envelope.reply_target !== null) throw new Error("Invalid provider binding");
+    return this.db.transaction(() => {
+      const policy = this.db.prepare(`SELECT policy_json FROM provider_execution_policies
+        WHERE source = ? AND connection_id = ? AND resource_id = ? AND event_type = ?`)
+        .get(owner.source, owner.connection_id, owner.resource_id, envelope.type) as { policy_json: string } | undefined;
+      const binding = { owner, destination: { kind: "none" as const },
+        execution: policy ? executionPolicySchema.parse(JSON.parse(policy.policy_json)) : { background_job: false, workspace: "scratch" as const } };
+      return this.enqueue(envelope, at, { ...(context ?? { connectionId: owner.connection_id }), binding });
+    }).immediate();
+  }
+
+  listOwnerJobs(sourceEventId: string): JobRow[] {
+    const binding = this.getEventBinding(sourceEventId);
+    if (!binding) throw new Error("Unknown event owner");
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_bindings b ON b.job_id = j.job_id
+      WHERE b.owner_json = ? ORDER BY j.created_at DESC LIMIT 100`).all(stableStringify(binding.owner)) as JobRow[];
+  }
+
+  assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
     const job = this.getJobRequired(jobId);
-    const sourceEvent = this.getRequired(sourceEventId);
-    const replyTarget = sourceEvent.reply_target_json
-      ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
-      : {};
-    if (
-      sourceEvent.source !== "slack" ||
-      stringValue(replyTarget.workspace_id) !== job.workspace_id ||
-      stringValue(replyTarget.channel_id) !== job.channel_id ||
-      stringValue(replyTarget.thread_ts) !== job.thread_ts
-    ) {
-      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s Slack thread`);
+    const source = this.getEventBinding(sourceEventId);
+    const binding = this.db.prepare("SELECT owner_json FROM job_bindings WHERE job_id = ? AND event_id = ?")
+      .get(jobId, job.source_event_id) as { owner_json: string } | undefined;
+    if (!source || !binding || stableStringify(source.owner) !== binding.owner_json) {
+      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s Slack thread or provider owner`);
     }
+  }
+
+  getJobCompletion(jobId: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM job_completions WHERE job_id = ? AND job_status = (SELECT status FROM jobs WHERE job_id = ?)").get(jobId, jobId) as Record<string, unknown> | undefined;
   }
 
   hasBlockedEvent(): boolean {
@@ -575,19 +843,26 @@ export class DispatcherDatabase {
 
   nextWaiting(): EventRow | undefined {
     return this.db
-      .prepare("SELECT * FROM events WHERE status = 'waiting_agent' ORDER BY sequence LIMIT 1")
+      .prepare("SELECT * FROM events WHERE status = 'waiting_agent' AND source!='dona_update' ORDER BY sequence LIMIT 1")
       .get() as EventRow | undefined;
   }
 
   nextAvailable(at = new Date()): EventRow | undefined {
-    const head = this.db
-      .prepare(`
-        SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
-        ORDER BY sequence LIMIT 1
-      `)
-      .get() as EventRow | undefined;
-    return head && head.available_at <= at.toISOString() ? head : undefined;
+    if (this.claimsClosed || this.db.prepare("SELECT 1 FROM events WHERE status IN ('dispatching','waiting_agent') AND source!='dona_update' LIMIT 1").get()) return undefined;
+    const weights = this.queuePolicy.weights;
+    const slots = Object.entries(weights).flatMap(([c,w]) => Array<string>(w).fill(c));
+    const step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;
+    const candidates = this.db.prepare(`SELECT e.*,l.class,l.last_selected FROM events e
+      JOIN queue_events q USING(event_id) JOIN queue_lanes l USING(lane)
+      WHERE e.status IN ('queued','retryable_failed') AND e.source!='dona_update' AND e.available_at<=?
+      AND NOT EXISTS (SELECT 1 FROM queue_events older JOIN events prior ON prior.event_id=older.event_id
+        WHERE older.lane=q.lane AND prior.sequence<e.sequence AND prior.status!='completed')
+      ORDER BY l.last_selected,e.sequence`).all(at.toISOString()) as (EventRow & {class:string})[];
+    for (let offset=0;offset<slots.length;offset++) {
+      const candidate = candidates.find(row=>row.class===slots[(step+offset)%slots.length]);
+      if (candidate) return candidate;
+    }
+    return undefined;
   }
 
   updateEventsNeedingNotification(): EventRow[] {
@@ -636,6 +911,8 @@ export class DispatcherDatabase {
   }
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
+    return this.db.transaction(() => {
+    if (this.claimsClosed || this.nextAvailable(at)?.event_id !== eventId) throw new QueueClaimUnavailableError();
     const timestamp = at.toISOString();
     const changed = this.db
       .prepare(`
@@ -647,7 +924,15 @@ export class DispatcherDatabase {
       `)
       .run(timestamp, resultPath, timestamp, eventId).changes;
     if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
+    const slots = Object.entries(this.queuePolicy.weights).flatMap(([c,w])=>Array<string>(w).fill(c));
+    const lane = this.db.prepare("SELECT l.lane,l.class FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=?").get(eventId) as {lane:string;class:string};
+    let step = (this.db.prepare("SELECT step FROM queue_selector WHERE id=1").get() as {step:number}).step;
+    while (slots[step%slots.length] !== lane.class) step++;
+    step++;
+    this.db.prepare("UPDATE queue_selector SET step=? WHERE id=1").run(step);
+    this.db.prepare("UPDATE queue_lanes SET last_selected=? WHERE lane=?").run(step,lane.lane);
     return this.get(eventId)!;
+    }).immediate();
   }
 
   markWaiting(eventId: string, at = new Date()): void {
@@ -689,7 +974,7 @@ export class DispatcherDatabase {
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordSafePromptFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
@@ -705,7 +990,7 @@ export class DispatcherDatabase {
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       return this.get(eventId)!;
-    })();
+    }).immediate();
   }
 
   recordWaitingError(eventId: string, code: string, message: string, at = new Date()): void {
@@ -718,6 +1003,7 @@ export class DispatcherDatabase {
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    result = parseResultEnvelope(result, eventId);
     this.transition(eventId, ["waiting_agent"], "completed", {
       result_json: stableStringify(result),
       result_path: resultPath,
@@ -728,6 +1014,7 @@ export class DispatcherDatabase {
   }
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    result = parseResultEnvelope(result, eventId);
     this.transition(eventId, ["waiting_agent"], "dead_letter", {
       result_json: stableStringify(result),
       result_path: resultPath,

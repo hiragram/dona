@@ -1,3 +1,4 @@
+import { QueueAdmissionError } from "./queue.js";
 import fs from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
@@ -8,6 +9,16 @@ import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
+import {
+  ExternalIngressAcknowledgementError,
+  ExternalIngressAuthenticationError,
+  ExternalIngressProcessor,
+  ExternalIngressRegistry,
+  ExternalIngressTimeoutError,
+  ExternalIngressValidationError,
+  type PreparedExternalIngressAcknowledgement,
+  type RawIngressRequest,
+} from "./ingress.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
@@ -22,18 +33,27 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+class BodyReadTimeoutError extends Error {}
+class IncompleteBodyError extends Error {}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly closeConnection = false,
+  ) {
     super(message);
   }
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
+function sendJson(response: ServerResponse, status: number, body: unknown, closeConnection = false): void {
   const encoded = Buffer.from(JSON.stringify(body));
+  if (closeConnection) response.shouldKeepAlive = false;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": encoded.length,
+    ...(closeConnection ? { connection: "close" } : {}),
   });
   response.end(encoded);
 }
@@ -42,21 +62,71 @@ function errorBody(code: string, message: string): unknown {
   return { schema_version: 1, error: { code, message } };
 }
 
-async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  let exceeded = false;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buffer.length;
-    if (size > limit) {
-      exceeded = true;
-      continue;
-    }
-    chunks.push(buffer);
+function sendExternalAcknowledgement(
+  response: ServerResponse,
+  acknowledgement: PreparedExternalIngressAcknowledgement,
+): void {
+  response.writeHead(acknowledgement.statusCode, {
+    ...acknowledgement.headers,
+    "content-type": "application/json; charset=utf-8",
+    "content-length": acknowledgement.encodedBody.length,
+  });
+  response.end(acknowledgement.encodedBody);
+}
+
+async function readBody(request: IncomingMessage, limit: number, timeoutMs?: number): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = (): void => {
+      if (timer) clearTimeout(timer);
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("aborted", onAborted);
+      request.off("error", onError);
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      request.resume();
+      reject(error);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > limit) {
+        fail(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onAborted = (): void => fail(new IncompleteBodyError());
+    const onError = (): void => fail(new IncompleteBodyError());
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("aborted", onAborted);
+    request.once("error", onError);
+    if (timeoutMs !== undefined) timer = setTimeout(() => fail(new BodyReadTimeoutError()), timeoutMs);
+  });
+}
+
+function rawHeaders(request: IncomingMessage): ReadonlyArray<readonly [string, string]> {
+  const headers: Array<readonly [string, string]> = [];
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index];
+    const value = request.rawHeaders[index + 1];
+    if (name !== undefined && value !== undefined) headers.push(Object.freeze([name, value] as const));
   }
-  if (exceeded) throw new BodyTooLargeError();
-  return Buffer.concat(chunks);
+  return Object.freeze(headers);
 }
 
 async function socketIsAlive(socketPath: string, timeoutMs = 500): Promise<boolean> {
@@ -106,6 +176,8 @@ export class DispatcherApi {
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
+  private readonly externalIngress: ExternalIngressProcessor;
+  private readonly ingressLimits = new Map<string, {tokens:number; time:number}>();
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -116,7 +188,10 @@ export class DispatcherApi {
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
-  ) {}
+    externalIngressRegistry = new ExternalIngressRegistry(),
+  ) {
+    this.externalIngress = new ExternalIngressProcessor(externalIngressRegistry);
+  }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
@@ -149,6 +224,7 @@ export class DispatcherApi {
 
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.database.closeClaims();
   }
 
   async stop(): Promise<void> {
@@ -170,6 +246,10 @@ export class DispatcherApi {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (request.method === "GET" && url.pathname === "/v1/queue") {
+        sendJson(response, 200, this.database.queueHealth());
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -199,7 +279,7 @@ export class DispatcherApi {
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: 2,
+          app_schema: 4,
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
@@ -225,6 +305,7 @@ export class DispatcherApi {
           quiescing: this.shuttingDown,
           drained: this.shuttingDown && this.quiesceComplete && unsafeStates.length === 0 &&
             !this.worker.isRunning() && !this.jobs.isRunning(),
+          queue: this.database.queueHealth(),
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
         });
@@ -265,9 +346,14 @@ export class DispatcherApi {
           service: "dispatcher",
           quiescing: true,
           drained,
+          queue: this.database.queueHealth(),
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
         });
+        return;
+      }
+      if (url.pathname.startsWith("/v1/ingress/")) {
+        await this.handleExternalIngress(request, response, url);
         return;
       }
       if (url.pathname.startsWith("/v1/internal/update-events")) {
@@ -292,22 +378,31 @@ export class DispatcherApi {
       }
       const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
+      if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
       let result;
       try {
         result = this.database.enqueue(envelope);
       } catch (error) {
+        if (error instanceof QueueAdmissionError) throw error;
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
         );
       }
       const row = result.row;
-      if (result.payloadMismatch) {
+      if (result.outcome === "duplicate_conflict") {
         this.logger.warn("Duplicate event payload differs from the persisted event", {
           event_id: row.event_id,
           source: row.source,
           external_event_id: row.external_event_id,
           sequence: row.sequence,
         });
+        sendJson(response, 409, {
+          schema_version: 1,
+          outcome: result.outcome,
+          error: { code: "duplicate_conflict", message: "Stable external event ID has different content" },
+          event_id: row.event_id,
+        });
+        return;
       }
       this.logger.info(result.duplicate ? "Duplicate event accepted" : "Event persisted", {
         event_id: row.event_id,
@@ -319,6 +414,7 @@ export class DispatcherApi {
       this.worker.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         event_id: row.event_id,
         sequence: row.sequence,
         status: row.status,
@@ -326,9 +422,24 @@ export class DispatcherApi {
       });
     } catch (error) {
       if (error instanceof BodyTooLargeError) {
-        sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"));
+        sendJson(response, 413, errorBody("request_too_large", "Request body exceeds the configured limit"), true);
+      } else if (error instanceof BodyReadTimeoutError) {
+        sendJson(response, 408, errorBody("request_timeout", "Provider request body did not finish within its configured limit"), true);
+      } else if (error instanceof ExternalIngressTimeoutError) {
+        sendJson(response, 408, errorBody("request_timeout", "Provider ingress did not finish within its configured limit"));
+      } else if (error instanceof IncompleteBodyError) {
+        sendJson(response, 400, errorBody("request_incomplete", "Request body was not received completely"), true);
+      } else if (error instanceof ExternalIngressAuthenticationError) {
+        sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
+      } else if (error instanceof ExternalIngressValidationError) {
+        sendJson(response, 400, errorBody("invalid_provider_event", "Provider event is invalid"));
+      } else if (error instanceof ExternalIngressAcknowledgementError) {
+        sendJson(response, 503, errorBody("acknowledgement_unavailable", "Event was persisted but acknowledgement could not be built"));
       } else if (error instanceof RequestValidationError) {
         sendJson(response, 400, errorBody("invalid_request", error.message));
+      } else if (error instanceof QueueAdmissionError) {
+        const internalCompletion = request.method === "POST" && request.url?.split("?")[0] === "/v1/internal/update-events";
+        sendJson(response, error.code === "queue_identity" ? 400 : internalCompletion ? 503 : 429, { schema_version: 1, ack_allowed: false, error: { code: error.code, message: "Event was not admitted; reconcile delivery identity before retry" } });
       } else if (error instanceof PersistenceUnavailableError) {
         this.logger.error("Event could not be persisted", {
           error_code: "persistence_unavailable",
@@ -336,7 +447,7 @@ export class DispatcherApi {
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
-        sendJson(response, error.status, errorBody(error.code, error.message));
+        sendJson(response, error.status, errorBody(error.code, error.message), error.closeConnection);
       } else if (error instanceof UpdaterClientError) {
         this.logger.warn("Updater request rejected", {
           error_code: error.code,
@@ -353,6 +464,108 @@ export class DispatcherApi {
         else response.end();
       }
     }
+  }
+
+  private async handleExternalIngress(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    if (request.method !== "POST" || url.pathname.split("/").length !== 4) {
+      throw new ApiRequestError(404, "not_found", "Route not found", true);
+    }
+    if (this.shuttingDown) {
+      throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down", true);
+    }
+    let sourceInput: string;
+    try {
+      sourceInput = decodeURIComponent(url.pathname.split("/")[3]!);
+    } catch {
+      throw new ApiRequestError(
+        404,
+        "external_source_not_registered",
+        "External event source is not registered",
+        true,
+      );
+    }
+    const resolved = this.externalIngress.registration(sourceInput);
+    if (!resolved) {
+      throw new ApiRequestError(
+        404,
+        "external_source_not_registered",
+        "External event source is not registered",
+        true,
+      );
+    }
+
+    const monotonicNow = performance.now();
+    const bucket = this.ingressLimits.get(resolved.source) ?? { tokens: 100, time: monotonicNow };
+    bucket.tokens = Math.min(100, bucket.tokens + Math.max(0,monotonicNow-bucket.time)/100);
+    bucket.time = monotonicNow;
+    this.ingressLimits.set(resolved.source,bucket);
+    if (bucket.tokens < 1) { request.resume(); throw new QueueAdmissionError("queue_rate"); }
+    bucket.tokens--;
+    const declaredLength = Number(request.headers["content-length"] ?? 0);
+    const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
+    if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
+      request.resume();
+      throw new BodyTooLargeError();
+    }
+    const receivedAt = new Date().toISOString();
+    const rawRequest: RawIngressRequest = Object.freeze({
+      body: await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs),
+      headers: rawHeaders(request),
+      method: "POST",
+      requestTarget: request.url!,
+      receivedAt,
+    });
+
+    let result;
+    try {
+      result = await this.externalIngress.process(
+        resolved.source,
+        resolved.registration,
+        rawRequest,
+        (envelope, context) => {
+          if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
+          const persisted = this.database.enqueueProvider(envelope, context.owner, new Date(), context);
+          if (persisted.outcome !== "duplicate_conflict") this.worker.wake();
+          return persisted;
+        },
+      );
+    } catch (error) {
+      if (
+        error instanceof QueueAdmissionError ||
+        error instanceof ExternalIngressAuthenticationError ||
+        error instanceof ExternalIngressValidationError ||
+        error instanceof ExternalIngressTimeoutError ||
+        error instanceof ExternalIngressAcknowledgementError
+      ) {
+        throw error;
+      }
+      throw new PersistenceUnavailableError("External event could not be persisted");
+    }
+
+    const { receipt } = result;
+    if (receipt.outcome === "duplicate_conflict") {
+      this.logger.warn("External event duplicate conflicts with persisted content", {
+        event_id: receipt.eventId,
+        source: receipt.source,
+        sequence: receipt.sequence,
+        outcome: receipt.outcome,
+      });
+      sendJson(response, 409, {
+        schema_version: 1,
+        outcome: receipt.outcome,
+        event_id: receipt.eventId,
+        error: { code: "duplicate_conflict", message: "Stable external event ID has different content" },
+      });
+      return;
+    }
+
+    this.logger.info(receipt.outcome === "created" ? "External event persisted" : "External event redelivery matched", {
+      event_id: receipt.eventId,
+      source: receipt.source,
+      sequence: receipt.sequence,
+      outcome: receipt.outcome,
+    });
+    sendExternalAcknowledgement(response, result.acknowledgement!);
   }
 
   private async handleSelfUpdate(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
@@ -431,6 +644,7 @@ export class DispatcherApi {
       this.updateNotifications?.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         event_id: result.row.event_id,
         duplicate: result.duplicate,
         payload_mismatch: result.payloadMismatch,
@@ -495,6 +709,12 @@ export class DispatcherApi {
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId) {
+        try { sendJson(response, 200, { schema_version: 1, jobs: this.database.listOwnerJobs(sourceEventId) }); }
+        catch { throw new ApiRequestError(403, "owner_mismatch", "Unknown event owner"); }
+        return;
+      }
       const workspaceId = url.searchParams.get("workspace_id");
       const channelId = url.searchParams.get("channel_id");
       const threadTs = url.searchParams.get("thread_ts");
@@ -514,6 +734,13 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId || job.source !== "slack") {
+        try {
+          if (!sourceEventId) throw new Error("Owner required");
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
+        } catch { throw new ApiRequestError(403, "owner_mismatch", "Job owner does not match"); }
+      }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }

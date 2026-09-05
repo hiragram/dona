@@ -139,6 +139,9 @@ export function normalizeSlackEvent(
       thread_ts: threadTs,
     },
   };
-  if (socketEnvelopeId) envelope.trace = { socket_envelope_id: socketEnvelopeId };
+  const trace: Record<string, unknown> = {};
+  if (socketEnvelopeId) trace.socket_envelope_id = socketEnvelopeId;
+  if (occurredAt === undefined) trace.occurred_at_source = "received_at";
+  if (Object.keys(trace).length > 0) envelope.trace = trace;
   return { envelope, usedReceivedAt: occurredAt === undefined };
 }
