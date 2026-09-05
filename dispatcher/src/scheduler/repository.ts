@@ -172,6 +172,7 @@ export class SchedulerRepository {
     return this.db.transaction(() => {
       const before = this.checked(scheduleId, expectedRevision, actor, true);
       if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= now) throw new Error("invalid_transition");
+      if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, now);
@@ -282,6 +283,9 @@ export class SchedulerRepository {
         const job = this.db.prepare("SELECT source_event_id FROM jobs WHERE job_id = ?").get(jobId) as { source_event_id: string } | undefined;
         if (!job || job.source_event_id !== run.event_id || (run.job_id !== null && run.job_id !== jobId)) throw new Error("job_reference_conflict");
       }
+      const runSnapshot = this.revision(run);
+      if (next === "completed" && runSnapshot.action === "work.read_only" &&
+          (JSON.parse(runSnapshot.target_json) as Target).kind !== "none" && resultContent === null) throw new Error("result_content_required");
       if (resultContent !== null) {
         if (next !== "completed" || current.state !== "active" || current.revision !== run.revision) throw new Error("result_not_authorized");
         const revision = this.revision(current);
@@ -475,7 +479,11 @@ export class SchedulerRepository {
         }
         this.auditOutbox(row, `outbox_${outcome}`, now);
       }
-      this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, now);
+      const current = this.get(this.getRun(row.run_id)!.schedule_id)!;
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) {
+        this.expireSchedule(current, { tenant_id: current.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
+      }
+      this.completeIfDrained(current.schedule_id, now);
       return this.getOutbox(outboxId, now)!;
     }).immediate();
   }
@@ -498,6 +506,11 @@ export class SchedulerRepository {
   purge(now: string): void {
     utc(now);
     this.db.transaction(() => {
+      const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
+        ON r.schedule_id = s.schedule_id AND r.revision = s.revision
+        WHERE s.state IN ('active','paused') AND r.expires_at <= ?`).all(now) as Schedule[];
+      for (const row of currentExpired) this.expireSchedule(row,
+        { tenant_id: row.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
       const expired = this.db.prepare("SELECT schedule_id, revision FROM schedule_revisions WHERE expires_at <= ? AND terminal_at IS NULL")
         .all(now) as { schedule_id: string; revision: number }[];
       for (const row of expired) this.retireRevisions(row.schedule_id, now, row.revision);

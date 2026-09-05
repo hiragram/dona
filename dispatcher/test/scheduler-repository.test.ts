@@ -489,3 +489,53 @@ test("専用routing未実装のscheduler eventが通常workerのqueueを妨げ�
   dispatcher.markBlocked(run.event_id!, "専用routing待ち"); dispatcher.manualRetry(run.event_id!, true, new Date(due));
   assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
 });
+
+test("purgeはcurrent authorization失効とauditを原子的に反映する", () => {
+  const { repo, raw } = setup();
+  for (const id of ["active", "paused"]) {
+    repo.create(id, { ...input, expires_at: due }, due, actor, now);
+    if (id === "paused") repo.transition(id, 1, "pause", actor, now);
+  }
+  raw.exec("CREATE TRIGGER fail_purge BEFORE INSERT ON schedule_audit WHEN NEW.operation = 'expire' BEGIN SELECT RAISE(ABORT, 'injected'); END");
+  assert.throws(() => repo.purge(due), /injected/);
+  assert.equal(repo.get("active")?.state, "active"); assert.equal(repo.get("paused")?.state, "paused");
+  raw.exec("DROP TRIGGER fail_purge"); repo.purge(due); repo.purge(due);
+  for (const id of ["active", "paused"]) {
+    assert.equal(repo.get(id)?.state, "expired");
+    assert.equal((repo.auditHistory(id) as { operation: string }[]).filter(x => x.operation === "expire").length, 1);
+  }
+});
+
+test("送信応答時の失効をreceiptと共に保持し再承認可能にする", () => {
+  const { repo } = setup(); const expiry = "2026-09-05T00:02:00Z";
+  repo.create("s1", { ...input, expires_at: expiry }, due, actor, now);
+  const run = repo.materialize("s1", 1, due, later, due, actor).run;
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", expiry, "receipt").status, "sent");
+  assert.equal(repo.getRun(run.run_id)?.status, "completed"); assert.equal(repo.get("s1")?.state, "expired");
+  repo.update("s1", 1, { ...input, authorization_id: "renewed", authorization_revision: 2 }, later, actor, expiry);
+  assert.equal(repo.get("s1")?.state, "active");
+});
+
+test("通知先があるworkの結果欠落は完了transactionを拒否する", () => {
+  const { repo, raw } = setup();
+  repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
+  const run = repo.materialize("work", 1, due, later, due, actor).run;
+  repo.setRunState(run.run_id, "materialized", "started", actor, due);
+  const auditCount = count(raw, "schedule_audit");
+  assert.throws(() => repo.setRunState(run.run_id, "started", "completed", actor, due), /result_content_required/);
+  assert.equal(repo.getRun(run.run_id)?.status, "started"); assert.equal(count(raw, "schedule_audit"), auditCount);
+  assert.equal(count(raw, "connector_outbox"), 0);
+  repo.setRunState(run.run_id, "started", "completed", actor, due, null, "完了結果");
+  assert.equal(count(raw, "connector_outbox"), 1);
+});
+
+test("時計後退後の再承認next_dueはhigh-watermarkを越える必要がある", () => {
+  const { repo } = setup(); repo.create("s1", input, due, actor, now);
+  repo.materialize("s1", 1, due, later, due, actor); repo.transition("s1", 1, "pause", actor, due);
+  const renewed = { ...input, authorization_id: "renewed", authorization_revision: 3 };
+  assert.throws(() => repo.update("s1", 2, renewed, due, actor, now), /invalid_next_due/);
+  assert.equal(repo.get("s1")?.revision, 2);
+  repo.update("s1", 2, renewed, later, actor, now);
+  assert.equal(repo.get("s1")?.next_due, later);
+});

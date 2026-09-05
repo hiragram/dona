@@ -57,9 +57,11 @@ cancel/pauseは未開始run/outboxを抑止する。開始済みrequestは結果
 
 ## 実行した検証
 
-- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加31件を含めて検証。
+- `npm --prefix dispatcher test`、`typecheck`、`build`: repository追加35件を含めて検証。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-codec-integration.ts <#6 checkout>/dispatcher/src/scheduler`: 上記#82 headの実codecでcanonical bytes、未知version、重複key、policy改変、owner_dm、物化一意性を確認。
 - `node --import ./dispatcher/node_modules/tsx/dist/loader.mjs dispatcher/test/scheduler-core-migration-integration.ts <fan-out checkout>/dispatcher/src/database.ts`: `feature/multi-job-fanout@e241fb41087a9b4a6aa5329cf1aaf60148e4c0d0`の実migrationでv2+scheduler→v3、3つの中間phaseでのrollback、v3新規→scheduler、旧v2 readerの拒否を確認。
 - repository testsは新規/v2/reopen/WAL/FK、DDL失敗、重複wake、revision競合、invalid transition、tenant境界、transaction失敗、2 connection claim、lease expiry、needs_review永続化、cancel race、retention、audit redaction/order、必要indexのquery planを検証する。
 
 Slack HTTP、実権限照会、Herdr実行、scheduler loop、production DB、self-update、deploymentの成功は主張しない。
+
+- purgeと送信応答でもcurrent authorizationの失効をtransaction内で反映する。通知先があるworkの完了には結果本文を必須とし、再承認の`next_due`は時計後退時もhigh-watermarkを越える必要がある。
