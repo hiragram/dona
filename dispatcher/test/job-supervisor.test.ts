@@ -458,33 +458,196 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
-  test("does not start a queued sibling during a running-job cancel and drain race", async () => {
+  for (const completionOrder of ["cancel-first", "wait-first"] as const) {
+    test(`drains overlapping cancel/wait before restart (${completionOrder})`, { timeout: 10_000 }, async (t) => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      config.jobConcurrency = 1;
+      config.jobConcurrencyPerEvent = 1;
+      const database = new DispatcherDatabase(config.databasePath);
+      const running = createKeyedScratchJobs(database, config, "Ev-cancel-drain-running", 1, 0);
+      const queued = createKeyedScratchJobs(database, config, "Ev-cancel-drain-queued", 2, 100);
+      const cancellation = database.enqueue(eventEnvelope("Ev-cancel-drain-request")).row;
+      const prompted: string[] = [];
+      let releaseWait: ((result: HerdrCommandResult) => void) | undefined;
+      let releaseCancel: ((result: HerdrCommandResult) => void) | undefined;
+      let waitSignal: AbortSignal | undefined;
+      const runtime = fakeRuntime({
+        async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+        async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+        async wait(_jobId, signal) {
+          waitSignal = signal;
+          return new Promise((resolve) => { releaseWait = resolve; });
+        },
+        async cancel() { return new Promise((resolve) => { releaseCancel = resolve; }); },
+      });
+      const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+      let restarted: JobSupervisor | undefined;
+      t.after(async () => {
+        releaseCancel?.(ok("idle"));
+        releaseWait?.({ ...ok("working"), aborted: true });
+        await supervisor.stop();
+        await restarted?.stop();
+        database.close();
+      });
+      supervisor.start();
+      await waitFor(() => releaseWait !== undefined);
+      const cancelling = supervisor.cancel(running.jobs[0]!.job_id, cancellation.event_id, "競合テスト");
+      await waitFor(() => releaseCancel !== undefined);
+      let drained = false;
+      const stopping = supervisor.stop().then(() => { drained = true; });
+      assert.equal(waitSignal?.aborted, true);
+      if (completionOrder === "cancel-first") {
+        releaseCancel!(ok("idle"));
+        await cancelling;
+      } else {
+        releaseWait!({ ...ok("working"), aborted: true });
+      }
+      // Flush promise continuations without advancing either controlled operation.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(drained, false, "drain must await both worker monitoring and accepted controls");
+      assert.deepEqual(prompted, [running.jobs[0]!.job_id]);
+      releaseCancel!(ok("idle"));
+      releaseWait!({ ...ok("working"), aborted: true });
+      await Promise.all([cancelling, stopping]);
+      assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
+      assert.ok(queued.jobs.every((row) => database.getJob(row.job_id)?.status === "queued"));
+
+      restarted = new JobSupervisor(database, fakeRuntime({
+        async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+        async prompt(jobId) { prompted.push(jobId); return ok("working"); },
+        async wait(_jobId, signal) { return waitUntilAbort(signal); },
+      }), config, logger, () => undefined);
+      restarted.start();
+      await waitFor(() => database.getJob(queued.jobs[0]!.job_id)?.status === "running");
+      assert.deepEqual(prompted, [running.jobs[0]!.job_id, queued.jobs[0]!.job_id]);
+      assert.equal(database.listRunningJobs().length, 1);
+      assert.equal(database.getJob(queued.jobs[1]!.job_id)?.status, "queued");
+      assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
+      await restarted.stop();
+    });
+  }
+
+  test("preserves an established fair cursor across repeated mid-cycle SQLITE_BUSY", { timeout: 10_000 }, async (t) => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    config.jobConcurrencyPerEvent = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const first = createKeyedScratchJobs(database, config, "Ev-mid-busy-a", 2, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-mid-busy-b", 1, 100);
+    const third = createKeyedScratchJobs(database, config, "Ev-mid-busy-c", 1, 200);
+    const selected: string[] = [];
+    const original = database.nextRunnableJob.bind(database);
+    let busy = true;
+    let busyCount = 0;
+    database.nextRunnableJob = (...args) => {
+      if (args[1] === first.sourceEventId && busy) {
+        busyCount += 1;
+        throw Object.assign(new Error("injected mid-cycle busy"), { code: "SQLITE_BUSY" });
+      }
+      const row = original(...args);
+      if (row) selected.push(row.job_id);
+      return row;
+    };
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
+      async prompt() { return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    t.after(async () => { await supervisor.stop(); database.close(); });
+    supervisor.start();
+    await waitFor(() => busyCount >= 2 && waiters.has(first.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    busy = false;
+    await waitFor(() => waiters.has(second.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 2);
+    waiters.get(first.jobs[0]!.job_id)!(failed("worker_failed"));
+    await waitFor(() => waiters.has(third.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id, third.jobs[0]!.job_id]);
+    assert.equal(database.getJob(first.jobs[0]!.job_id)?.status, "needs_review");
+    assert.equal(database.getJob(first.jobs[1]!.job_id)?.status, "queued");
+    assert.equal(database.listRunningJobs().length, 2);
+    await supervisor.stop();
+  });
+
+  test("resumes a retry deadline scan after SQLITE_BUSY without an early retry", { timeout: 10_000 }, async (t) => {
     const { root, config } = await tempConfig();
     roots.push(root);
     config.jobConcurrency = 1;
     config.jobConcurrencyPerEvent = 1;
+    const start = new Date("2026-09-05T00:01:00.000Z");
+    t.mock.timers.enable({ apis: ["Date"], now: start });
     const database = new DispatcherDatabase(config.databasePath);
-    const running = createKeyedScratchJobs(database, config, "Ev-cancel-drain-running", 1, 0);
-    const queued = createKeyedScratchJobs(database, config, "Ev-cancel-drain-queued", 1, 100);
-    const cancellation = database.enqueue(eventEnvelope("Ev-cancel-drain-request")).row;
-    const prompted: string[] = [];
-    const runtime = fakeRuntime({
+    const first = createKeyedScratchJobs(database, config, "Ev-retry-busy-a", 1, 0);
+    const second = createKeyedScratchJobs(database, config, "Ev-retry-busy-b", 1, 100);
+    for (const row of [...first.jobs, ...second.jobs]) {
+      database.beginJobPreparation(row.job_id);
+      database.recordJobPreparationFailure(row.job_id, "start_failed", "retry later", 5, start);
+    }
+    const deadline = new Date(database.getJob(first.jobs[0]!.job_id)!.available_at).getTime();
+    let waitingScans = 0;
+    const originalWaiting = database.nextWaitingJobAt.bind(database);
+    database.nextWaitingJobAt = (...args) => { waitingScans += 1; return originalWaiting(...args); };
+    let busy = true;
+    let busyCount = 0;
+    let candidateScans = 0;
+    const selected: string[] = [];
+    const original = database.nextRunnableJob.bind(database);
+    database.nextRunnableJob = (...args) => {
+      candidateScans += 1;
+      if (Date.now() >= deadline && busy) {
+        busyCount += 1;
+        throw Object.assign(new Error("injected retry deadline busy"), { code: "SQLITE_BUSY" });
+      }
+      const row = original(...args);
+      if (row) selected.push(row.job_id);
+      return row;
+    };
+    const waiters = new Map<string, (result: HerdrCommandResult) => void>();
+    const supervisor = new JobSupervisor(database, fakeRuntime({
       async prepare() { return { herdrWorkspaceId: "1", herdrPaneId: "w1:p1" }; },
-      async prompt(jobId) { prompted.push(jobId); return ok("working"); },
-      async wait(_jobId, signal) { return waitUntilAbort(signal); },
-      async cancel() { return ok("idle"); },
-    });
-    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
-
+      async prompt() { return ok("working"); },
+      async wait(jobId, signal) {
+        return new Promise((resolve) => {
+          waiters.set(jobId, resolve);
+          signal?.addEventListener("abort", () => resolve({ ...ok("working"), aborted: true }), { once: true });
+          if (signal?.aborted) resolve({ ...ok("working"), aborted: true });
+        });
+      },
+    }), config, logger, () => undefined);
+    t.after(async () => { await supervisor.stop(); database.close(); });
     supervisor.start();
-    await waitFor(() => database.getJob(running.jobs[0]!.job_id)?.status === "running");
-    await supervisor.cancel(running.jobs[0]!.job_id, cancellation.event_id, "cancel before drain");
+    await waitFor(() => waitingScans === 1);
+    const before = candidateScans;
+    t.mock.timers.setTime(deadline - 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 3));
+    assert.equal(candidateScans, before);
+    assert.deepEqual(selected, []);
+    t.mock.timers.setTime(deadline);
+    await waitFor(() => busyCount >= 2);
+    assert.deepEqual(selected, []);
+    assert.equal(database.listRunningJobs().length, 0);
+    busy = false;
+    await waitFor(() => waiters.has(first.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    waiters.get(first.jobs[0]!.job_id)!(failed("worker_failed"));
+    await waitFor(() => waiters.has(second.jobs[0]!.job_id));
+    assert.deepEqual(selected, [first.jobs[0]!.job_id, second.jobs[0]!.job_id]);
+    assert.equal(database.listRunningJobs().length, 1);
+    assert.equal(database.getJob(second.jobs[0]!.job_id)?.attempt_count, 2);
     await supervisor.stop();
-
-    assert.deepEqual(prompted, [running.jobs[0]!.job_id]);
-    assert.equal(database.getJob(running.jobs[0]!.job_id)?.status, "cancelled");
-    assert.equal(database.getJob(queued.jobs[0]!.job_id)?.status, "queued");
-    database.close();
   });
 
   test("runs a background job and queues a dona_job completion event", async () => {
