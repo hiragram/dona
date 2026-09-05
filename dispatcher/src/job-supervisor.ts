@@ -320,8 +320,11 @@ export class JobSupervisor {
 
   private publishNotifications(): void {
     for (const job of this.database.listJobsNeedingNotification()) {
-      if (this.progress && !this.progress.notificationReady(job.job_id)) continue;
       try {
+        if (this.progress && !this.progress.notificationReady(job)) {
+          void this.progress.reconcileTerminal(job).then(()=>this.wake(),(error)=>this.logger.warn("Terminal progress reconciliation failed",{job_id:job.job_id,error_code:"job_progress_terminal_reconcile_failed",error_message:error instanceof Error?error.message:String(error)}));
+          continue;
+        }
         const event = this.database.enqueueJobNotification(job.job_id);
         this.logger.info("Job notification event enqueued", {
           job_id: job.job_id,

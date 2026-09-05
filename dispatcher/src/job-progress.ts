@@ -109,6 +109,7 @@ export class JobProgressStore {
 export class JobProgressCoordinator {
   private readonly deliveryClaims = new Map<string,string>();
   private readonly deliveryOperations = new Map<string,Promise<void>>();
+  private readonly terminalReconciliations = new Map<string,Promise<void>>();
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
@@ -171,7 +172,21 @@ export class JobProgressCoordinator {
     }
   }
 
-  notificationReady(jobId:string): boolean { const row=this.store.get(jobId); return !row || (row.terminal_checked===1 && !this.deliveryOperations.has(jobId)); }
+  notificationReady(job:JobRow): boolean {
+    const siblings=this.jobs.listEventJobs(job.source_event_id).map((item)=>this.jobs.getJob(item.job_id)!).filter(Boolean);
+    const candidates=siblings.every((item)=>terminalStatuses.has(item.status)) ? siblings : [job];
+    return candidates.every((item)=>this.jobNotificationReady(item.job_id));
+  }
+
+  reconcileTerminal(job:JobRow): Promise<void> {
+    const existing=this.terminalReconciliations.get(job.source_event_id); if(existing)return existing;
+    const operation=(async()=>{for(const item of this.jobs.listEventJobs(job.source_event_id)){const row=this.jobs.getJob(item.job_id);if(row&&terminalStatuses.has(row.status)&&!this.jobNotificationReady(row.job_id))await this.ingest(row);}})();
+    this.terminalReconciliations.set(job.source_event_id,operation);
+    void operation.finally(()=>this.terminalReconciliations.delete(job.source_event_id)).catch(()=>undefined);
+    return operation;
+  }
+
+  private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return !row||(row.terminal_checked===1&&!this.deliveryOperations.has(jobId)); }
 
   resolveDelivery(progressId: string, deliveryToken: string): { progress_id:string; workspace_id:string; channel_id:string; thread_ts:string; status:string } | undefined {
     const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId);
