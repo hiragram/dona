@@ -291,7 +291,7 @@ test("request開始後の取消で未受理が確定したrunはterminalにな�
   repo.transition("s1", 1, "cancel", actor, due);
   assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", due).status, "cancelled");
   assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
-  assert.equal(repo.getRun(run.run_id)?.terminal_at, due);
+  assert.equal(repo.getRun(run.run_id)?.terminal_at, "2026-09-05T00:02:00Z");
   repo.purge("2026-10-06T00:00:00Z");
   assert.equal(count(raw, "schedule_runs"), 0); assert.equal(count(raw, "schedules"), 0);
 });
@@ -831,6 +831,19 @@ test("claimed outboxのrun取消はclaim時刻より前へ終端を戻さない"
   assert.equal(stored.content_delete_at, "2026-09-12T00:02:00Z");
 });
 
+test("schedule遷移はclaimed outboxのlease時刻より前へ戻らない", () => {
+  const { repo, raw } = setup();
+  repo.create("transition_claimed", input, due, actor, now);
+  repo.materialize("transition_claimed", 1, due, later, due, actor);
+  repo.claim(due);
+  const paused = repo.transition("transition_claimed", 1, "pause", actor, "2026-09-05T00:00:30Z");
+  assert.equal(paused.updated_at, "2026-09-05T00:02:00Z");
+  const outbox = raw.prepare("SELECT o.terminal_at, o.content_delete_at FROM connector_outbox o JOIN schedule_runs r USING(run_id) WHERE r.schedule_id = 'transition_claimed'")
+    .get() as { terminal_at: string; content_delete_at: string };
+  assert.equal(outbox.terminal_at, "2026-09-05T00:02:00Z");
+  assert.equal(outbox.content_delete_at, "2026-09-12T00:02:00Z");
+});
+
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {
   const { repo, dispatcher, raw } = setup();
   repo.create("work_ambiguous", { ...input, action: "work.read_only" }, due, actor, now);
@@ -908,6 +921,9 @@ test("cancel時刻を単調化しcaller skip不一致とSlack credential本文�
   assert.throws(() => repo.create("webhook_body", { ...input, content: "https://hooks.slack.com/services/T/B/secret" }, due, actor, now), /content_requires_redaction/);
   for (const [index, token] of ["xoxe-secret", "xoxc-secret", "xoxd-secret"].entries()) {
     assert.throws(() => repo.create(`token_prefix_${index}`, { ...input, content: token }, due, actor, now), /content_requires_redaction/);
+  }
+  for (const [index, token] of ["ghp_1234567890abcdef", "github_pat_1234567890abcdef", "sk-proj-1234567890abcdef"].entries()) {
+    assert.throws(() => repo.create(`external_token_${index}`, { ...input, content: token }, due, actor, now), /content_requires_redaction/);
   }
   for (const [index, content] of ["<!channel> 全体通知", "<!here> 通知", "<@U123> 個別通知", "<!subteam^S12345> グループ通知"].entries()) {
     assert.throws(() => repo.create(`mention_${index}`, { ...input, content }, due, actor, now), /content_requires_redaction/);

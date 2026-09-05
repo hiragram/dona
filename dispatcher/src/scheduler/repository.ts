@@ -58,7 +58,9 @@ function validateReceipt(value: string): void {
   // Slack message timestamps contain a decimal point; URLs and bodies are not receipt IDs.
   if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(value) || hasCredentialPattern(value)) throw new Error("invalid_receipt");
 }
-function hasCredentialPattern(value: string): boolean { return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\//i.test(value); }
+function hasCredentialPattern(value: string): boolean {
+  return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\/|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i.test(value);
+}
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
 }
@@ -226,7 +228,15 @@ export class SchedulerRepository {
       if ((operation === "pause" && before.state !== "active") || (operation === "resume" && before.state !== "paused") ||
           (operation === "cancel" && ["cancelled", "completed"].includes(before.state))) throw new Error("invalid_transition");
       const old = this.revision(before);
-      const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
+      const runs = this.db.prepare("SELECT created_at, started_at, terminal_at FROM schedule_runs WHERE schedule_id = ?").all(scheduleId) as
+        { created_at: string; started_at: string | null; terminal_at: string | null }[];
+      const outboxes = this.db.prepare(`SELECT o.created_at, o.updated_at, o.request_started_at, o.terminal_at, o.lease_until
+        FROM connector_outbox o JOIN schedule_runs r USING(run_id) WHERE r.schedule_id = ?`).all(scheduleId) as
+        { created_at: string; updated_at: string; request_started_at: string | null; terminal_at: string | null; lease_until: string | null }[];
+      const transitionAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at,
+        ...runs.flatMap(row => [row.created_at, row.started_at ?? row.created_at, row.terminal_at ?? row.created_at]),
+        ...outboxes.flatMap(row => [row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
+          row.terminal_at ?? row.created_at, row.lease_until ?? row.created_at])].sort().at(-1)!;
       if (operation === "resume" && (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
       const unusable = old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt);
       if (operation === "cancel" && unusable) {
