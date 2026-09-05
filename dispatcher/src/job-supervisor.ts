@@ -42,16 +42,29 @@ function errorCode(error: unknown): string {
   return code ?? "job_preparation_failed";
 }
 
+function maximumCount(counts: Iterable<number>): number {
+  let maximum = 0;
+  for (const count of counts) maximum = Math.max(maximum, count);
+  return maximum;
+}
+
 export interface JobControlResult {
   row: JobRow;
   duplicate: boolean;
 }
 
+interface ActiveJob {
+  sourceEventId: string;
+  operation: Promise<void>;
+}
+
 export class JobSupervisor {
   private readonly wakeSignal = new WakeSignal();
   private readonly abortController = new AbortController();
-  private readonly active = new Map<string, Promise<void>>();
+  private readonly active = new Map<string, ActiveJob>();
   private readonly controls = new Map<string, Promise<unknown>>();
+  private fairCursorSourceEventId: string | undefined;
+  private lastSchedulerState: string | undefined;
   private loopPromise: Promise<void> | undefined;
   private running = false;
   private stopping = false;
@@ -96,7 +109,7 @@ export class JobSupervisor {
     this.abortController.abort();
     this.wake();
     await this.loopPromise;
-    await Promise.allSettled(this.active.values());
+    await Promise.allSettled([...this.active.values()].map(({ operation }) => operation));
     this.running = false;
   }
 
@@ -163,11 +176,99 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       this.publishNotifications();
-      const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
-      const rows = this.database.listRunnableJobs().filter((row) => !this.active.has(row.job_id));
-      for (const row of rows.slice(0, availableSlots)) this.launch(row);
+      try {
+        this.scheduleRunnableJobs();
+      } catch (error) {
+        this.logger.warn("Job scheduling cycle failed", {
+          error_code: (error as Error & { code?: string }).code ?? "job_scheduler_query_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
       await this.wakeSignal.wait(this.config.queuePollMs);
     }
+  }
+
+  private scheduleRunnableJobs(): void {
+    const rows = this.database.listRunnableJobs();
+    for (const row of rows) {
+      if (row.status === "running" && !this.active.has(row.job_id)) this.launch(row);
+    }
+
+    const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
+    const waiting = rows.filter((row) => row.status !== "running" && !this.active.has(row.job_id));
+    const selected = this.selectFairJobs(waiting, availableSlots);
+    for (const row of selected) this.launch(row);
+    this.logSchedulerState(waiting.filter((row) => !this.active.has(row.job_id)));
+  }
+
+  private selectFairJobs(rows: JobRow[], availableSlots: number): JobRow[] {
+    if (availableSlots <= 0 || rows.length === 0) return [];
+    const effectivePerEventLimit = Math.min(
+      this.config.jobConcurrency,
+      this.config.jobConcurrencyPerEvent,
+    );
+    const activeCounts = new Map<string, number>();
+    for (const active of this.active.values()) {
+      activeCounts.set(active.sourceEventId, (activeCounts.get(active.sourceEventId) ?? 0) + 1);
+    }
+    const queues = new Map<string, JobRow[]>();
+    for (const row of rows) {
+      const queue = queues.get(row.source_event_id) ?? [];
+      queue.push(row);
+      queues.set(row.source_event_id, queue);
+    }
+
+    const sourceEventIds = [...queues.keys()];
+    const selected: JobRow[] = [];
+    while (selected.length < availableSlots) {
+      const eligible = sourceEventIds.filter((sourceEventId) =>
+        (queues.get(sourceEventId)?.length ?? 0) > 0 &&
+        (activeCounts.get(sourceEventId) ?? 0) < effectivePerEventLimit
+      );
+      if (eligible.length === 0) break;
+      const cursorIndex = this.fairCursorSourceEventId === undefined
+        ? -1
+        : eligible.indexOf(this.fairCursorSourceEventId);
+      const startIndex = cursorIndex < 0 ? 0 : (cursorIndex + 1) % eligible.length;
+      let selectedInRound = false;
+      for (let offset = 0; offset < eligible.length && selected.length < availableSlots; offset += 1) {
+        const sourceEventId = eligible[(startIndex + offset) % eligible.length]!;
+        if ((activeCounts.get(sourceEventId) ?? 0) >= effectivePerEventLimit) continue;
+        const row = queues.get(sourceEventId)?.shift();
+        if (!row) continue;
+        selected.push(row);
+        activeCounts.set(sourceEventId, (activeCounts.get(sourceEventId) ?? 0) + 1);
+        this.fairCursorSourceEventId = sourceEventId;
+        selectedInRound = true;
+      }
+      if (!selectedInRound) break;
+    }
+    return selected;
+  }
+
+  private logSchedulerState(waiting: JobRow[]): void {
+    const queuedCounts = new Map<string, number>();
+    for (const row of waiting) {
+      queuedCounts.set(row.source_event_id, (queuedCounts.get(row.source_event_id) ?? 0) + 1);
+    }
+    const activeCounts = new Map<string, number>();
+    for (const active of this.active.values()) {
+      activeCounts.set(active.sourceEventId, (activeCounts.get(active.sourceEventId) ?? 0) + 1);
+    }
+    const fields = {
+      queued_jobs: waiting.length,
+      queued_source_events: queuedCounts.size,
+      queued_max_per_event: maximumCount(queuedCounts.values()),
+      active_jobs: this.active.size,
+      active_source_events: activeCounts.size,
+      active_max_per_event: maximumCount(activeCounts.values()),
+      global_limit: this.config.jobConcurrency,
+      per_event_limit: Math.min(this.config.jobConcurrency, this.config.jobConcurrencyPerEvent),
+    };
+    const state = JSON.stringify(fields);
+    if (state === this.lastSchedulerState) return;
+    this.lastSchedulerState = state;
+    this.logger.debug("Job scheduler state changed", fields);
   }
 
   private publishNotifications(): void {
@@ -207,7 +308,7 @@ export class JobSupervisor {
         this.active.delete(row.job_id);
         this.wake();
       });
-    this.active.set(row.job_id, operation);
+    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation });
   }
 
   private async startJob(row: JobRow): Promise<void> {
@@ -218,6 +319,7 @@ export class JobSupervisor {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
+    if (this.stopping) return;
 
     const preparing = this.database.beginJobPreparation(row.job_id);
     let prepared;

@@ -456,6 +456,132 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("enforces count admission transactionally while preserving idempotent reuse", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const limits = { jobsPerEventMax: 3, jobObjectiveTotalMaxBytes: 400_000 };
+    const database = new DispatcherDatabase(config.databasePath, limits);
+    const competingConnection = new DispatcherDatabase(config.databasePath, limits);
+    const source = database.enqueue(eventEnvelope("Ev-job-count-limit")).row;
+    const request = (jobKey: string) => ({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `objective ${jobKey}`,
+      workspace: { kind: "scratch" as const },
+    });
+
+    const first = database.createJob(request("job.one"), config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = competingConnection.createJob(
+      request("job.two"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    const cancellation = database.enqueue(eventEnvelope("Ev-job-count-cancel")).row;
+    database.beginJobCancellation(first.row.job_id, cancellation.event_id);
+    database.markJobCancelled(first.row.job_id, "test cancellation");
+    database.beginJobPreparation(second.row.job_id);
+    database.recordJobPreparationFailure(second.row.job_id, "worker_start_failed", "failed", 1);
+    const third = competingConnection.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    assert.equal(database.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row.job_id, third.row.job_id);
+    assert.throws(
+      () => competingConnection.createJob(
+        request("job.four"),
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "jobs_per_event" &&
+        error.limitDetails.attempted === 4,
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    competingConnection.close();
+    database.close();
+  });
+
+  test("allows the default eight jobs and rejects the ninth", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-default-job-limit")).row;
+    for (let index = 1; index <= 8; index += 1) {
+      database.createJob({
+        source_event_id: source.event_id,
+        job_key: `default.${index}`,
+        objective: `objective ${index}`,
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    }
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "default.9",
+        objective: "ninth objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_limit_exceeded",
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 8);
+    database.close();
+  });
+
+  test("enforces canonical objective UTF-8 bytes without counting queued steer text", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: 8,
+      jobObjectiveTotalMaxBytes: 6,
+    });
+    const source = database.enqueue(eventEnvelope("Ev-job-byte-limit")).row;
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "unicode.one",
+      objective: "あ",
+      workspace: { kind: "scratch" as const },
+    };
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const followUp = database.enqueue(eventEnvelope("Ev-job-byte-steer")).row;
+    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "追加条件".repeat(100));
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.two",
+      objective: "ab",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.three",
+      objective: "c",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.throws(
+      () => database.createJob({
+        ...firstRequest,
+        job_key: "unicode.four",
+        objective: "d",
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "objective_utf8_bytes_per_event" &&
+        error.limitDetails.current === 6 &&
+        error.limitDetails.attempted === 7,
+    );
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id,
+      first.row.job_id,
+    );
+    database.close();
+  });
+
   test("deduplicates the same source event without overwriting its payload", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

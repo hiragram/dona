@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import {
   canonicalJobPayload,
   canonicalJobPayloadSha256,
+  jobObjectiveCharacterMax,
   parseCreateJobRequest,
   parseEventEnvelope,
   parseInternalUpdateEventEnvelope,
@@ -106,5 +107,21 @@ describe("job creation validation", () => {
       stableStringify(canonicalJobPayload(second)),
     );
     assert.equal(canonicalJobPayloadSha256(first), canonicalJobPayloadSha256(second));
+  });
+
+  test("counts objective characters independently from UTF-8 bytes", () => {
+    const base = {
+      source_event_id: "evt_source",
+      job_key: "unicode.boundary",
+      workspace: { kind: "scratch" },
+    };
+    const objective = "😀".repeat(jobObjectiveCharacterMax);
+    const parsed = parseCreateJobRequest({ ...base, objective });
+    assert.equal(Array.from(parsed.objective).length, jobObjectiveCharacterMax);
+    assert.equal(Buffer.byteLength(parsed.objective, "utf8"), 400_000);
+    assert.throws(
+      () => parseCreateJobRequest({ ...base, objective: `${objective}😀` }),
+      /at most 100000 characters/,
+    );
   });
 });

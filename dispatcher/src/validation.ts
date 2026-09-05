@@ -21,6 +21,8 @@ const utcRfc3339 = z
 
 export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 export const legacyJobKey = "legacy-default";
+export const jobObjectiveCharacterMax = 100_000;
+export const jobObjectiveUtf8ByteMax = jobObjectiveCharacterMax * 4;
 const jobCreationMetadataKey = "__dona_job_creation";
 
 const eventEnvelopeSchema = z
@@ -98,6 +100,7 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
 ]);
 const jobCreationMetadataSchema = z.object({
   canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  objective_utf8_bytes: z.number().int().positive().max(jobObjectiveUtf8ByteMax).optional(),
 }).strict();
 
 const createJobSchema = z.object({
@@ -108,7 +111,10 @@ const createJobSchema = z.object({
     .regex(jobKeyPattern, "must be 1-64 lowercase key characters")
     .refine((value) => value !== legacyJobKey, `${legacyJobKey} is reserved and must be omitted`)
     .optional(),
-  objective: z.string().trim().min(1).max(100_000),
+  objective: z.string().trim().min(1).refine(
+    (value) => Array.from(value).length <= jobObjectiveCharacterMax,
+    `must be at most ${jobObjectiveCharacterMax} characters`,
+  ),
   workspace: jobWorkspaceSchema,
 }).strip();
 
@@ -197,10 +203,17 @@ export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
     .digest("hex");
 }
 
-export function serializeJobWorkspace(workspace: JobWorkspace, canonicalPayloadSha256: string): string {
+export function serializeJobWorkspace(
+  workspace: JobWorkspace,
+  canonicalPayloadSha256: string,
+  objectiveUtf8Bytes?: number,
+): string {
   return stableStringify({
     ...workspace,
-    [jobCreationMetadataKey]: { canonical_payload_sha256: canonicalPayloadSha256 },
+    [jobCreationMetadataKey]: {
+      canonical_payload_sha256: canonicalPayloadSha256,
+      ...(objectiveUtf8Bytes === undefined ? {} : { objective_utf8_bytes: objectiveUtf8Bytes }),
+    },
   });
 }
 
@@ -214,6 +227,14 @@ export function jobCreationPayloadSha256FromWorkspace(input: unknown): string | 
     (input as Record<string, unknown>)[jobCreationMetadataKey],
   );
   return parsed.success ? parsed.data.canonical_payload_sha256 : undefined;
+}
+
+export function jobCreationObjectiveBytesFromWorkspace(input: unknown): number | undefined {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const parsed = jobCreationMetadataSchema.safeParse(
+    (input as Record<string, unknown>)[jobCreationMetadataKey],
+  );
+  return parsed.success ? parsed.data.objective_utf8_bytes : undefined;
 }
 
 export function parseSteerJobRequest(input: unknown): SteerJobRequest {

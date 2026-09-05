@@ -503,6 +503,15 @@ export class DispatcherApi {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
         if (error instanceof JobCreationError) {
+          if (error.limitDetails) {
+            this.logger.warn("Job creation rejected by resource limit", {
+              error_code: error.code,
+              resource: error.limitDetails.resource,
+              current_value: error.limitDetails.current,
+              attempted_value: error.limitDetails.attempted,
+              limit_value: error.limitDetails.maximum,
+            });
+          }
           throw new ApiRequestError(409, error.code, error.message);
         }
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));

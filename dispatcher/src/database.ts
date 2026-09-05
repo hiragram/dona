@@ -4,6 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 
+import { jobResourceDefaults, jobResourceHardLimits } from "./config.js";
 import type {
   CreateJobRequest,
   CreateJobResult,
@@ -24,6 +25,7 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import {
   canonicalJobPayloadSha256,
+  jobCreationObjectiveBytesFromWorkspace,
   jobCreationPayloadSha256FromWorkspace,
   legacyJobKey,
   parseCreateJobRequest,
@@ -40,8 +42,24 @@ export type JobCreationErrorCode =
   | "job_group_closed"
   | "job_group_limit_exceeded";
 
+export interface JobAdmissionLimits {
+  jobsPerEventMax: number;
+  jobObjectiveTotalMaxBytes: number;
+}
+
+export interface JobCreationLimitDetails {
+  resource: "jobs_per_event" | "objective_utf8_bytes_per_event";
+  current: number;
+  attempted: number;
+  maximum: number;
+}
+
 export class JobCreationError extends Error {
-  constructor(readonly code: JobCreationErrorCode, message: string) {
+  constructor(
+    readonly code: JobCreationErrorCode,
+    message: string,
+    readonly limitDetails?: JobCreationLimitDetails,
+  ) {
     super(message);
     this.name = "JobCreationError";
   }
@@ -244,8 +262,26 @@ export function migrateDispatcherDatabase(
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  private readonly jobAdmissionLimits: JobAdmissionLimits;
 
-  constructor(databasePath: string) {
+  constructor(
+    databasePath: string,
+    jobAdmissionLimits: JobAdmissionLimits = jobResourceDefaults,
+  ) {
+    if (
+      !Number.isSafeInteger(jobAdmissionLimits.jobsPerEventMax) ||
+      jobAdmissionLimits.jobsPerEventMax <= 0 ||
+      jobAdmissionLimits.jobsPerEventMax > jobResourceHardLimits.jobsPerEventMax
+    ) {
+      throw new Error(`jobsPerEventMax must be a positive integer at most ${jobResourceHardLimits.jobsPerEventMax}`);
+    }
+    if (
+      !Number.isSafeInteger(jobAdmissionLimits.jobObjectiveTotalMaxBytes) ||
+      jobAdmissionLimits.jobObjectiveTotalMaxBytes <= 0
+    ) {
+      throw new Error("jobObjectiveTotalMaxBytes must be a positive integer");
+    }
+    this.jobAdmissionLimits = { ...jobAdmissionLimits };
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -384,7 +420,12 @@ export class DispatcherDatabase {
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
     const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
-    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace, canonicalPayloadSha256);
+    const objectiveUtf8Bytes = Buffer.byteLength(parsedRequest.objective, "utf8");
+    const workspaceJson = serializeJobWorkspace(
+      parsedRequest.workspace,
+      canonicalPayloadSha256,
+      objectiveUtf8Bytes,
+    );
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -447,6 +488,43 @@ export class DispatcherDatabase {
         throw new JobCreationError(
           "job_group_closed",
           `Legacy job group ${parsedRequest.source_event_id} does not accept additional job keys`,
+        );
+      }
+
+      const admittedJobs = this.db.prepare(`
+        SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
+      `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
+      if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {
+        throw new JobCreationError(
+          "job_group_limit_exceeded",
+          "Job group jobs-per-event limit exceeded",
+          {
+            resource: "jobs_per_event",
+            current: admittedJobs.length,
+            attempted: admittedJobs.length + 1,
+            maximum: this.jobAdmissionLimits.jobsPerEventMax,
+          },
+        );
+      }
+      const currentObjectiveBytes = admittedJobs.reduce((total, row) => {
+        const workspace = JSON.parse(row.workspace_json) as unknown;
+        // Older v3 and migrated v2 rows do not have the immutable byte count. Queued steers only append,
+        // so the persisted objective is a fail-closed upper bound rather than an unsafe undercount.
+        return total + (
+          jobCreationObjectiveBytesFromWorkspace(workspace) ?? Buffer.byteLength(row.objective, "utf8")
+        );
+      }, 0);
+      const attemptedObjectiveBytes = currentObjectiveBytes + objectiveUtf8Bytes;
+      if (attemptedObjectiveBytes > this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) {
+        throw new JobCreationError(
+          "job_group_limit_exceeded",
+          "Job group objective UTF-8 byte limit exceeded",
+          {
+            resource: "objective_utf8_bytes_per_event",
+            current: currentObjectiveBytes,
+            attempted: attemptedObjectiveBytes,
+            maximum: this.jobAdmissionLimits.jobObjectiveTotalMaxBytes,
+          },
         );
       }
 
@@ -617,13 +695,13 @@ export class DispatcherDatabase {
     return storedSha256 === canonicalPayloadSha256 ? "matched" : "conflict";
   }
 
-  listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
+  listRunnableJobs(at = new Date()): JobRow[] {
     return this.db.prepare(`
       SELECT * FROM jobs
       WHERE (status IN ('queued', 'retryable_failed') AND available_at <= ?)
          OR status = 'running'
-      ORDER BY created_at LIMIT ?
-    `).all(at.toISOString(), limit) as JobRow[];
+      ORDER BY created_at, job_id
+    `).all(at.toISOString()) as JobRow[];
   }
 
   listJobsNeedingNotification(limit = 100): JobRow[] {
