@@ -1113,4 +1113,11 @@ describe("JobSupervisor", () => {
     await supervisor.disableProgress();
     assert.equal(disabled,true); await assert.rejects(fs.access(progressDir),{code:"ENOENT"}); database.close();
   });
+
+  test("a persistent progress store failure disables progress after one cycle", async () => {
+    const {root,config}=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath); let disabled=false; let reports=0;
+    const runtime=fakeRuntime({disableProgress(){disabled=true;}}); const progress={async report(){reports+=1;throw new Error("readonly progress store");},async drainDeliveries(){}};
+    const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined,progress as never); supervisor.start();
+    await waitFor(()=>disabled); await supervisor.stop(); assert.equal(reports,1); database.close();
+  });
 });

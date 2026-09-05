@@ -189,6 +189,16 @@ test("unchanged invalid progress is warned once and a changed file is warned aga
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("terminal cleanup releases the invalid progress warning fingerprint", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-warning-terminal-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    const row={job_id:"job_abc",source_event_id:"evt_abc",status:"running",workspace_path:path.join(root,"job_abc"),workspace_json:JSON.stringify({kind:"scratch"})}; const file=jobProgressPath(row as never);
+    await fs.mkdir(path.dirname(file),{recursive:true}); await fs.writeFile(file,"{"); const coordinator=new JobProgressCoordinator({listEventJobs:()=>[row]} as never,store,{} as never,{warn(){}} as never);
+    await coordinator.ingest(row as never); assert.equal((coordinator as unknown as {invalidProgressWarnings:Map<string,string>}).invalidProgressWarnings.size,1);
+    await coordinator.ingest({...row,status:"completed"} as never); assert.equal((coordinator as unknown as {invalidProgressWarnings:Map<string,string>}).invalidProgressWarnings.size,0);
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("restart fences a delivery that may have reached Slack", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-recover-")); const file=path.join(root,"progress.sqlite3");
   let store = new JobProgressStore(file); store.ingest(valid); store.begin("job_abc"); store.close();
@@ -204,6 +214,12 @@ test("recovery tolerates an Adapter that has not started yet", async () => {
     const coordinator=new JobProgressCoordinator({} as never,store,{updateInternalTokenPath:tokenPath,slackAdapterSocketPath:path.join(root,"missing.sock")} as never,{} as never);
     await coordinator.recover();
   } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
+test("recovery without delivering rows does not require an Adapter token", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-no-drain-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try { await new JobProgressCoordinator({} as never,store,{updateInternalTokenPath:path.join(root,"missing-token"),slackAdapterSocketPath:path.join(root,"missing.sock")} as never,{} as never).recover(); }
+  finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {

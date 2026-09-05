@@ -171,6 +171,10 @@ export class SlackHealthServer {
         send(response, 503, { schema_version: 1, error: { code: "reporter_unavailable" } });
         return;
       }
+      let finishAdmission!:()=>void;
+      const admission=new Promise<void>((resolve)=>{finishAdmission=resolve;});
+      this.progressOperations.add(admission);
+      try {
       if (!(await this.authorized(request))) {
         send(response, 403, { schema_version: 1, error: { code: "forbidden" } });
         return;
@@ -204,6 +208,10 @@ export class SlackHealthServer {
         send(response, permanentSlackRejection || permanentProgressRejection ? 409 : definitelyUnsent ? 429 : 503, { schema_version: 1,
           ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
           error: { code: error instanceof SlackApiError ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
+      }
+      } finally {
+        finishAdmission();
+        this.progressOperations.delete(admission);
       }
       return;
     }

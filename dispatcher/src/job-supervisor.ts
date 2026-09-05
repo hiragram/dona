@@ -128,13 +128,17 @@ export class JobSupervisor {
 
   async disableProgress(): Promise<void> {
     this.progress = undefined; this.runtime.disableProgress?.();
-    let after="";
-    for (;;) {
-      const batch=this.database.listNonterminalJobs(after,500);
-      const cleanup = await Promise.allSettled(batch.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
-      cleanup.forEach((result,index)=>{if(result.status==="rejected")this.logger.warn("Disabled job progress cleanup failed",{job_id:batch[index]!.job_id,error_code:"job_progress_disable_cleanup_failed"});});
-      if(batch.length<500)break;
-      after=batch.at(-1)!.job_id;
+    try {
+      let after="";
+      for (;;) {
+        const batch=this.database.listNonterminalJobs(after,500);
+        const cleanup = await Promise.allSettled(batch.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
+        cleanup.forEach((result,index)=>{if(result.status==="rejected")this.logger.warn("Disabled job progress cleanup failed",{job_id:batch[index]!.job_id,error_code:"job_progress_disable_cleanup_failed"});});
+        if(batch.length<500)break;
+        after=batch.at(-1)!.job_id;
+      }
+    } catch (error) {
+      this.logger.warn("Disabled job progress cleanup stopped", { error_code:"job_progress_disable_cleanup_stopped", error_message:error instanceof Error?error.message:String(error) });
     }
   }
 
@@ -234,12 +238,14 @@ export class JobSupervisor {
 
   private async progressLoop(): Promise<void> {
     while (!this.stopping) {
-      try { await this.progress?.report(); }
+      const failedProgress=this.progress;
+      try { await failedProgress?.report(); }
       catch (error) {
         this.logger.warn("Job progress reporting cycle failed", {
           error_code: "job_progress_cycle_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
+        if(failedProgress){await failedProgress.drainDeliveries();if(this.progress===failedProgress)await this.disableProgress();}
       }
       await abortableDelay(this.config.queuePollMs, this.abortController.signal);
     }

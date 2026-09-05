@@ -380,4 +380,17 @@ describe("SlackHealthServer", () => {
       await new Promise((resolve)=>setTimeout(resolve,10)); assert.equal(drained,false); release(); assert.equal((await delivery).status,200); assert.equal((await drain).status,200);
     } finally {await server.stop();}
   });
+
+  test("progress drain waits for a request still reading its body", async () => {
+    const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-slack-progress-admission-")); roots.push(root); const socketPath=path.join(root,"run","slack.sock"); const tokenPath=path.join(root,"token"); const token="a".repeat(64); await fs.writeFile(tokenPath,token,{mode:0o600});
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,{async deliver(input:{progress_id:string}){return {progress_id:input.progress_id};}} as never); await server.start();
+    try {
+      const body=Buffer.from(JSON.stringify({schema_version:1,progress_id:"job_abc:1",delivery_token:"b".repeat(64)}));
+      let resolveResponse!:(value:{status:number})=>void; const responsePromise=new Promise<{status:number}>((resolve)=>{resolveResponse=resolve;});
+      const slow=http.request({socketPath,path:"/v1/internal/job-progress",method:"POST",headers:{"content-type":"application/json","content-length":String(body.length),"x-dona-update-token":token}},(response)=>{response.resume();response.once("end",()=>resolveResponse({status:response.statusCode??0}));});
+      slow.write(body.subarray(0,10)); await new Promise((resolve)=>setTimeout(resolve,10)); let drained=false;
+      const drain=request(socketPath,"/v1/internal/job-progress/drain","POST",undefined,{"x-dona-update-token":token}).then((value)=>{drained=true;return value;});
+      await new Promise((resolve)=>setTimeout(resolve,10)); assert.equal(drained,false); slow.end(body.subarray(10)); assert.equal((await responsePromise).status,200); assert.equal((await drain).status,200);
+    } finally {await server.stop();}
+  });
 });

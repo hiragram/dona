@@ -62,6 +62,7 @@ export class JobProgressStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS job_progress_terminal_idx ON job_progress(terminal_checked,job_id)");
   }
   recoverDeliveries(): void { this.db.prepare("UPDATE job_progress SET status='unknown',last_error='recovered ambiguous delivery' WHERE status='delivering'").run(); }
+  hasDelivering(): boolean { return this.db.prepare("SELECT 1 FROM job_progress WHERE status='delivering' LIMIT 1").get() !== undefined; }
   close(): void { this.db.close(); }
   ingest(progress: JobProgressEnvelope, at = new Date()): boolean {
     const existing = this.get(progress.job_id);
@@ -133,6 +134,7 @@ export class JobProgressCoordinator {
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
     if (terminalStatuses.has(row.status)) {
+      this.invalidProgressWarnings.delete(row.job_id);
       await this.deliveryOperations.get(row.job_id);
       this.store.terminal(row.job_id);
       await fs.rm(path.dirname(jobProgressPath(row)),{recursive:true,force:true}).catch(() => { this.logger.warn("Job progress cleanup failed", { job_id: row.job_id, error_code: "job_progress_cleanup_failed" }); });
@@ -164,7 +166,7 @@ export class JobProgressCoordinator {
     }
   }
   async recover(): Promise<void> {
-    if(!await this.drainAdapterUntilSettled("startup"))return;
+    if(this.store.hasDelivering()&&!await this.drainAdapterUntilSettled("startup"))return;
     this.store.recoverDeliveries();
     for (const progress of this.store.recoverable()) {
       const job = this.jobs.getJob(progress.job_id);
