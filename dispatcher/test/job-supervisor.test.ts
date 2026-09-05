@@ -253,6 +253,43 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("does not rescan a retry backlog before its earliest backoff expires", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobConcurrency = 2;
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-first", 1, 0).jobs,
+      ...createKeyedScratchJobs(database, config, "Ev-backoff-second", 1, 100).jobs,
+    ];
+    const failureAt = new Date();
+    for (const job of jobs) {
+      database.beginJobPreparation(job.job_id, failureAt);
+      database.recordJobPreparationFailure(job.job_id, "worker_start_failed", "offline", 2, failureAt);
+    }
+    const originalNextRunnableJob = database.nextRunnableJob.bind(database);
+    const originalNextWaitingJobAt = database.nextWaitingJobAt.bind(database);
+    let runnableQueries = 0;
+    let retryTimeQueries = 0;
+    database.nextRunnableJob = (...args): JobRow | undefined => {
+      runnableQueries += 1;
+      return originalNextRunnableJob(...args);
+    };
+    database.nextWaitingJobAt = (...args): Date | undefined => {
+      retryTimeQueries += 1;
+      return originalNextWaitingJobAt(...args);
+    };
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+
+    supervisor.start();
+    await waitFor(() => retryTimeQueries === 1);
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 5));
+    assert.equal(runnableQueries, 1);
+    assert.equal(retryTimeQueries, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("counts recovered running jobs before starting queued work", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

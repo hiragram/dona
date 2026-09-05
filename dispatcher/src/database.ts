@@ -747,6 +747,37 @@ export class DispatcherDatabase {
     ) as JobRow | undefined;
   }
 
+  nextWaitingJobAt(
+    after: Date,
+    excludedSourceEventIds: string[] = [],
+    excludedJobIds: string[] = [],
+  ): Date | undefined {
+    const sourcePlaceholders = excludedSourceEventIds.map(() => "?").join(", ");
+    const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
+    const excludedSources = excludedSourceEventIds.length > 0
+      ? `AND source_event_id NOT IN (${sourcePlaceholders})`
+      : "";
+    const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";
+    const statement = this.db.prepare(`
+      SELECT available_at FROM jobs INDEXED BY jobs_run_idx
+      WHERE status = ? AND available_at > ?
+        ${excludedSources}
+        ${excludedJobs}
+      ORDER BY available_at, created_at
+      LIMIT 1
+    `);
+    const nextForStatus = (status: "queued" | "retryable_failed") => statement.get(
+      status,
+      after.toISOString(),
+      ...excludedSourceEventIds,
+      ...excludedJobIds,
+    ) as Pick<JobRow, "available_at"> | undefined;
+    const candidates = [nextForStatus("queued"), nextForStatus("retryable_failed")]
+      .filter((row): row is Pick<JobRow, "available_at"> => row !== undefined)
+      .sort((left, right) => left.available_at.localeCompare(right.available_at));
+    return candidates[0] ? new Date(candidates[0].available_at) : undefined;
+  }
+
   jobQueueStats(excludedJobIds: string[] = []): JobQueueStats {
     const jobPlaceholders = excludedJobIds.map(() => "?").join(", ");
     const excludedJobs = excludedJobIds.length > 0 ? `AND job_id NOT IN (${jobPlaceholders})` : "";

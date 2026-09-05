@@ -214,6 +214,15 @@ describe("DispatcherDatabase", () => {
     `).all("2026-09-04T00:00:00.000Z", "") as Array<{ detail: string }>;
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
     assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const retryPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT available_at FROM jobs INDEXED BY jobs_run_idx
+      WHERE status = ? AND available_at > ?
+      ORDER BY available_at, created_at
+      LIMIT 1
+    `).all("retryable_failed", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     assert.equal(
       (migrated.pragma("index_list('job_groups')") as Array<{ name: string }>).some(
         (index) => index.name === "job_groups_transition_idx",

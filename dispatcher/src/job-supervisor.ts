@@ -67,6 +67,7 @@ export class JobSupervisor {
   private readonly controls = new Map<string, Promise<unknown>>();
   private fairCursorSourceEventId: string | undefined;
   private lastSchedulerState: string | undefined;
+  private nextRunnableScanAt = 0;
   private nextSchedulerStatsAt = 0;
   private loopPromise: Promise<void> | undefined;
   private running = false;
@@ -104,6 +105,7 @@ export class JobSupervisor {
   }
 
   wake(): void {
+    this.nextRunnableScanAt = 0;
     this.wakeSignal.wake();
   }
 
@@ -205,17 +207,29 @@ export class JobSupervisor {
     for (const active of this.active.values()) {
       activeCounts.set(active.sourceEventId, (activeCounts.get(active.sourceEventId) ?? 0) + 1);
     }
-    for (let selected = 0; selected < availableSlots; selected += 1) {
+    const at = new Date();
+    for (
+      let selected = 0;
+      selected < availableSlots && at.getTime() >= this.nextRunnableScanAt;
+      selected += 1
+    ) {
       const excludedSourceEventIds = [...activeCounts]
         .filter(([, count]) => count >= effectivePerEventLimit)
         .map(([sourceEventId]) => sourceEventId);
       const row = this.database.nextRunnableJob(
-        new Date(),
+        at,
         this.fairCursorSourceEventId,
         excludedSourceEventIds,
         [...this.active.keys()],
       );
-      if (!row) break;
+      if (!row) {
+        this.nextRunnableScanAt = this.database.nextWaitingJobAt(
+          at,
+          excludedSourceEventIds,
+          [...this.active.keys()],
+        )?.getTime() ?? Number.POSITIVE_INFINITY;
+        break;
+      }
       this.launch(row);
       activeCounts.set(row.source_event_id, (activeCounts.get(row.source_event_id) ?? 0) + 1);
       this.fairCursorSourceEventId = row.source_event_id;
