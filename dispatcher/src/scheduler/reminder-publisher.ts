@@ -146,6 +146,9 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
     try { return await request(this.config.slackAdapterSocketPath, token, path, input, Math.max(this.config.jobCommandTimeoutMs, 180_000)); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
+      if (path.endsWith("/preflight")) {
+        return { outcome: "authorization_unavailable", code: "authorization_check_failed", retry_after_seconds: 5 };
+      }
       return code === "ENOENT" || code === "ECONNREFUSED"
         ? { outcome: "unavailable", code: "connector_unavailable", retry_after_seconds: 5 }
         : { outcome: "acceptance_unknown", code: "connector_transport_error" };

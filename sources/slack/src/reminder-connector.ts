@@ -97,7 +97,12 @@ export class SlackReminderConnector {
         ? { outcome: "revoked", code }
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
-    this.prepared.set(input.outbox_id, { serialized, channel, expiresAt: Date.now() + 60_000 });
+    const expiresAt = Date.now() + 60_000;
+    this.prepared.set(input.outbox_id, { serialized, channel, expiresAt });
+    const cleanup = setTimeout(() => {
+      if (this.prepared.get(input.outbox_id)?.expiresAt === expiresAt) this.prepared.delete(input.outbox_id);
+    }, 60_000);
+    cleanup.unref();
     return { outcome: "prepared" };
   }
 
