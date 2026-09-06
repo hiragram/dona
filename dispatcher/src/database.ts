@@ -385,7 +385,7 @@ export class DispatcherDatabase {
   listOverdueScheduledJobs(at = new Date()): JobRow[] {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status IN ('running','blocked') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
+      WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
@@ -396,7 +396,7 @@ export class DispatcherDatabase {
       JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(b.owner_json,'$.revision')
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
-        AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked')
+        AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -577,7 +577,7 @@ export class DispatcherDatabase {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     const row = this.getJobRequired(jobId);
     if (row.status === "cancelled") return row;
-    if (!["queued", "retryable_failed", "preparing", "dispatching", "running", "blocked"].includes(row.status)) {
+    if (!["queued", "retryable_failed", "preparing", "dispatching", "running", "blocked", "needs_review"].includes(row.status)) {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
     this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
@@ -629,14 +629,14 @@ export class DispatcherDatabase {
       } else try {
         this.scheduler.setRunState(binding.owner.run_id,"started",next,
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
-          next==="completed"?renderJobResult(result):null,scheduleAt);
+          next==="completed"?renderJobResult(result):null,scheduleAt,true);
       } catch(error) {
         if(!(error instanceof Error)||error.message!=="content_requires_redaction") throw error;
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review',notification_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
         this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
       }
     }
-    if(binding.destination.kind==="none"||binding.owner.kind==="schedule") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
+    if(binding.destination.kind==="none") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
     const envelope: EventEnvelope = {
       schema_version: 1,
       source: "dona_job",
@@ -667,6 +667,8 @@ export class DispatcherDatabase {
       .run(enqueued.row.event_id, at.toISOString(), jobId);
     this.db.prepare(`UPDATE job_completion_results SET notification_event_id=? WHERE job_id=? AND job_status=?`)
       .run(enqueued.row.event_id,jobId,job.status);
+    this.db.prepare(`UPDATE job_completion_results SET notification_state='pending' WHERE job_id=? AND job_status=?`)
+      .run(jobId,job.status);
     return enqueued;
   }
 
@@ -853,6 +855,7 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
+      this.db.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(eventId);
     }).immediate();
   }
 
@@ -861,6 +864,7 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], "dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: "agent_reported_failure",last_error_message: result.summary ?? "Agent reported failure"});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
+      this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
     }).immediate();
   }
 

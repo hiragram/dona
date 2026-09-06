@@ -51,6 +51,7 @@ export interface Outbox {
   attempt: number; available_at: string; claim_token: string | null; lease_until: string | null;
   request_started_at: string | null; receipt_id: string | null; created_at: string; updated_at: string;
   terminal_at: string | null; content_delete_at: string | null;
+  completion_job_status?: string | null;
 }
 export type ReconciledOutbox = Pick<Outbox, "outbox_id" | "run_id" | "kind" | "idempotency_key" | "content_hash" |
   "status" | "attempt" | "available_at" | "lease_until" | "request_started_at" | "receipt_id" | "created_at" |
@@ -461,7 +462,8 @@ export class SchedulerRepository {
     return result;
   }
   setRunState(runId: string, expected: Run["status"], next: "started" | "completed" | "failed" | "cancelled",
-    actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null, notificationAt: string | null = null): Run {
+    actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null, notificationAt: string | null = null,
+    routeResultViaDona = false): Run {
     utc(now); if (jobId !== null) id(jobId);
     const result = this.db.transaction(() => {
       const run = this.getRun(runId);
@@ -502,7 +504,7 @@ export class SchedulerRepository {
       const workCompletion = next === "completed" && runSnapshot.action === "work.read_only";
       const hasTarget = (JSON.parse(runSnapshot.target_json) as Target).kind !== "none";
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
-      if (workCompletion && hasTarget && notificationReason === null) {
+      if (workCompletion && hasTarget && notificationReason === null && !routeResultViaDona) {
         if (resultContent === null) throw new Error("result_content_required");
         this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, truncateResultContent(resultContent), notificationAt??transitionAt);
       }
@@ -515,7 +517,7 @@ export class SchedulerRepository {
           content_delete_at = ?, claim_token = NULL, lease_until = NULL
           WHERE run_id = ? AND status IN ('pending','claimed')`).run(operationAt, operationAt, add(operationAt, 604800), runId);
       }
-      if (next === "failed" && runSnapshot.action === "work.read_only" && hasTarget && notificationReason === null) {
+      if (next === "failed" && runSnapshot.action === "work.read_only" && hasTarget && notificationReason === null && !routeResultViaDona) {
         this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, "scheduled workが失敗しました", notificationAt??operationAt);
       }
       this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = CASE WHEN ? = 'cancelled' THEN 'cancelled' ELSE reason END,
@@ -544,9 +546,9 @@ export class SchedulerRepository {
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
       this.suppress(run.schedule_id, at, "cancelled");
-      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND state!='completed'").run(at, run.schedule_id);
+      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id);
       const snapshot = this.revision(run); const target = JSON.parse(snapshot.target_json) as Target;
-      if (target.kind !== "none" && !this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(runId)) {
+      if (!["cancelled","expired"].includes(before.state) && target.kind !== "none" && !this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(runId)) {
         this.insertOutbox(runId, "slack.work_result.post", snapshot.target_json, "scheduled workの結果は確認が必要です", at);
       }
       this.retireRevisions(run.schedule_id, at);
@@ -610,8 +612,10 @@ export class SchedulerRepository {
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
         content_delete_at = MIN(COALESCE(content_delete_at, ?), ?), claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
         .run(outcome, receiptId, reconciledAt, reconciledAt, add(reconciledAt, 604800), add(reconciledAt, 604800), outboxId);
-      this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
-        .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
+      if (!(row.kind === "slack.work_result.post" && ["blocked", "needs_review"].includes(row.completion_job_status ?? ""))) {
+        this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
+          .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
+      }
       this.audit(schedule, schedule, `reconcile_${outcome}`, actor, reconciledAt, this.getOutbox(outboxId, reconciledAt)!);
       this.completeIfDrained(run.schedule_id, reconciledAt);
       // Admin reconciliation returns allowlisted metadata, never owner content or a private target.
@@ -836,10 +840,11 @@ export class SchedulerRepository {
     utc(now);
     const resultFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`).all(now) as Array<{job_id:string;result_path:string}>;
-    const eventResults=this.db.prepare(`SELECT e.event_id,e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
-      WHERE e.source='dona_schedule' AND e.result_path IS NOT NULL AND (r.terminal_at<=? OR EXISTS
+    const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
+      LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id
+      WHERE e.source='dona_schedule' AND e.result_path IS NOT NULL AND (r.terminal_at<=? OR c.content_delete_at<=? OR EXISTS
         (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?))`)
-      .all(add(now,-604800),add(now,-604800)) as Array<{event_id:string;result_path:string}>;
+      .all(add(now,-604800),now,add(now,-604800)) as Array<{event_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
@@ -864,8 +869,9 @@ export class SchedulerRepository {
           AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=events.event_id
             AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
       this.db.prepare(`UPDATE events SET result_json=NULL WHERE event_id IN (SELECT r.event_id FROM schedule_runs r
-        WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a
-          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
+        WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
+          WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
+          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

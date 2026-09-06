@@ -167,7 +167,6 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      this.publishNotifications();
       for (const job of this.database.listScheduledJobsRequiringCancellation()) {
         try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
         catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
@@ -178,6 +177,7 @@ export class JobSupervisor {
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
       }
+      this.publishNotifications();
       const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
       const rows = this.database.listRunnableJobs().filter((row) => !this.active.has(row.job_id));
       for (const row of rows.slice(0, availableSlots)) this.launch(row);
