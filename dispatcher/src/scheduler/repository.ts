@@ -186,10 +186,12 @@ export class SchedulerRepository {
       claim_token = NULL, lease_until = NULL WHERE run_id IN (SELECT run_id FROM schedule_runs WHERE schedule_id = ?)
       AND status IN ('pending','claimed')`).run(now, add(now, 604800), now, scheduleId);
     if (reason === "authorization_expired") {
-      for (const row of suppressed) {
+      const expiring = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+        WHERE r.schedule_id = ? AND o.status IN ('cancelled','request_started')`).all(scheduleId) as Outbox[];
+      for (const row of expiring) {
         const deadline = add(this.revision(this.getRun(row.run_id)!).expires_at, 604800);
-        this.db.prepare("UPDATE connector_outbox SET content_delete_at = MIN(content_delete_at, ?) WHERE outbox_id = ?")
-          .run(deadline, row.outbox_id);
+        this.db.prepare(`UPDATE connector_outbox SET content_delete_at = MIN(COALESCE(content_delete_at, ?), ?)
+          WHERE outbox_id = ?`).run(deadline, deadline, row.outbox_id);
       }
     }
     this.db.prepare(`UPDATE schedule_runs SET status = 'cancelled', reason = ?, terminal_at = ?

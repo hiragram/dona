@@ -781,6 +781,18 @@ test("authorization失効はschedule時刻を戻さず未開始workへ専用reas
   repo.purge("2026-09-20T00:00:00Z");
   assert.equal(repo.getOutbox(lateOutbox.outbox_id, "2026-09-20T00:00:00Z")?.content, null);
   assert.equal(repo.getOutbox(lateOutbox.outbox_id, "2026-09-20T00:00:00Z")?.content_delete_at, "2026-09-12T00:02:00Z");
+
+  repo.create("started_expiry", { ...input, expires_at: expiry }, due, actor, now);
+  repo.materialize("started_expiry", 1, due, later, due, actor);
+  const started = repo.claim(due)!;
+  repo.requestStarted(started.outbox_id, started.claim_token!, due);
+  repo.purge("2026-09-20T00:00:00Z");
+  const fenced = raw.prepare("SELECT status, claim_token, content, content_delete_at FROM connector_outbox WHERE outbox_id = ?")
+    .get(started.outbox_id) as { status: string; claim_token: string | null; content: string | null; content_delete_at: string };
+  assert.equal(fenced.status, "request_started");
+  assert.equal(fenced.claim_token, started.claim_token);
+  assert.equal(fenced.content, null);
+  assert.equal(fenced.content_delete_at, "2026-09-12T00:02:00Z");
 });
 
 test("schedule時刻が進んだ後の時計後退では古いwork runを開始しない", () => {
