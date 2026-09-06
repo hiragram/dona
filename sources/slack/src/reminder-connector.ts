@@ -34,7 +34,7 @@ export type SlackReminderResult =
 const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)|https?:\/\/hooks\.slack\.com\/services\/|xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i;
 const revokedSlackErrors = new Set([
   "channel_not_found", "user_not_found", "missing_scope", "not_in_channel", "thread_not_found", "is_archived",
-  "token_revoked", "account_inactive",
+  "token_revoked", "account_inactive", "invalid_auth", "not_authed", "not_allowed_token_type",
 ]);
 
 export function parseSlackReminderCommand(value: unknown): SlackReminderCommand {

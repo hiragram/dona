@@ -56,7 +56,8 @@ export type ReconciledOutbox = Pick<Outbox, "outbox_id" | "run_id" | "kind" | "i
   "updated_at" | "terminal_at" | "content_delete_at">;
 interface Revision extends Omit<RevisionInput, "target" | "content"> {
   schedule_id: string; revision: number; target_json: string; content: string | null;
-  content_scope: "fixed_body" | "fixed_objective_redacted_result"; content_hash: string; recurrence_hash: string; content_delete_at: string | null;
+  content_scope: "fixed_body" | "fixed_objective_redacted_result"; content_hash: string; recurrence_hash: string;
+  content_delete_at: string | null; terminal_at: string | null;
 }
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const add = (now: string, seconds: number): string => new Date(Date.parse(now) + seconds * 1000).toISOString().replace(".000Z", "Z");
@@ -359,7 +360,7 @@ export class SchedulerRepository {
         ...runs.flatMap(row => [row.created_at, row.started_at ?? row.created_at, row.terminal_at ?? row.created_at]),
         ...outboxes.flatMap(row => [row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
           row.terminal_at ?? row.created_at, row.lease_until ?? row.created_at])].sort().at(-1)!;
-      if (operation === "resume" && (old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
+      if (operation === "resume" && (old.terminal_at !== null || old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
       const unusable = old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt);
       if (operation === "cancel" && unusable) {
         this.suppress(scheduleId, transitionAt, "cancelled");
@@ -712,10 +713,10 @@ export class SchedulerRepository {
       const finishedAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
         row.terminal_at ?? row.created_at, schedule.created_at, schedule.updated_at,
         schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
+      const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
       if (outcome === "ambiguous") this.markAmbiguous(row, finishedAt);
       else {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
-        const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
         const retry = (outcome === "not_accepted" || outcome === "unavailable") && (outcome === "unavailable" || row.attempt < 3) && authorized && withinWorkRetryDeadline;
@@ -727,9 +728,12 @@ export class SchedulerRepository {
         if (outcome === "unavailable" && retry) this.db.prepare("UPDATE connector_outbox SET attempt = attempt - 1 WHERE outbox_id = ?").run(outboxId);
         if (outcome === "revoked") {
           const paused = this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND revision = ? AND state = 'active'").run(finishedAt, run.schedule_id, run.revision);
-          if (paused.changes === 1) this.suppress(run.schedule_id, finishedAt, "cancelled");
+          if (paused.changes === 1) {
+            this.suppress(run.schedule_id, finishedAt, "cancelled");
+            this.retireRevisions(run.schedule_id, finishedAt, run.revision);
+          }
         }
-        if (outcome === "misfire") {
+        if (outcome === "misfire" && authorized) {
           this.db.prepare("UPDATE connector_outbox SET status = 'cancelled' WHERE outbox_id = ?").run(outboxId);
           this.db.prepare("UPDATE schedule_runs SET status = 'skipped', reason = 'misfire', terminal_at = ? WHERE run_id = ?").run(finishedAt, run.run_id);
         }
@@ -742,7 +746,7 @@ export class SchedulerRepository {
             .run(finished.status === "sent" ? "completed" : finished.status === "cancelled" ? "cancelled" : "failed",
               finished.status === "cancelled" ? "cancelled" : null, finishedAt, row.run_id);
         }
-        this.auditOutbox(row, `outbox_${outcome}`, finishedAt);
+        this.auditOutbox(row, outcome === "misfire" && !authorized ? "outbox_cancelled" : `outbox_${outcome}`, finishedAt);
       }
       this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, finishedAt);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;

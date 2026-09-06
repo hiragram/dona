@@ -27,4 +27,7 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   assert.deepEqual(await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => {
     throw new SlackApiError("token_revoked", "revoked");
   })).deliver(input), { outcome: "revoked", code: "token_revoked" });
+  assert.deepEqual(await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => {
+    throw new SlackApiError("invalid_auth", "invalid");
+  })).deliver(input), { outcome: "revoked", code: "invalid_auth" });
 });

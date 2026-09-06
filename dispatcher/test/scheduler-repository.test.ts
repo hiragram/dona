@@ -780,6 +780,31 @@ test("outbox送信直前の期限判定は保存済みschedule時刻を使用す
   assert.equal(repo.getRun(first.run_id)?.reason, "misfire");
 });
 
+test("connector revocationは旧authorizationの通常resumeを拒否する", () => {
+  const { repo } = setup();
+  repo.create("revoked_resume", input, due, actor, now);
+  repo.materialize("revoked_resume", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due);
+  assert.equal(repo.get("revoked_resume")?.state, "paused");
+  assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
+});
+
+test("connector待機中のpauseは遅着misfireより優先される", () => {
+  const { repo } = setup();
+  repo.create("paused_misfire", input, due, actor, now);
+  const run = repo.materialize("paused_misfire", 1, due, later, due, actor).run;
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("paused_misfire", 1, "pause", actor, later);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "misfire", later);
+  assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+  assert.equal(repo.getRun(run.run_id)?.reason, "cancelled");
+  assert.equal(repo.getOutbox(claim.outbox_id, later)?.status, "cancelled");
+  assert.ok((repo.auditHistory("paused_misfire") as { operation: string }[]).some(row => row.operation === "outbox_cancelled"));
+});
+
 test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻さない", () => {
   const { repo, raw } = setup();
   repo.create("request_clock", input, due, actor, now);
