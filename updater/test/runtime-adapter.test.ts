@@ -216,6 +216,11 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
   assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true }), /database_identity_invalid/);
+  await fs.chmod(configuredDatabase, 0o600);
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "DONA_DATABASE_PATH=relative/dispatcher.sqlite3\n", { mode: 0o600 });
+  assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true }), /path_must_be_absolute/);
   await removeTree(root);
 });
 

@@ -19,7 +19,7 @@ import type {
 import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
-const schemaV3BridgeSha = "5e9bbf235f2f48c6f5675dbba3ab723a956cf64d";
+const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 interface TerminalObservation {
   status: "succeeded" | "rolled_back";
   activeSha: string;
