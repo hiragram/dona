@@ -1139,6 +1139,35 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("queues live cancelled worker cleanup behind one pump", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [0, 1, 2].map((index) => {
+      const job = createScratchJob(database, config, `Ev-live-cancel-cleanup-${index}`);
+      markRunning(database, job.job_id);
+      return job;
+    });
+    let concurrent = 0;
+    let maximum = 0;
+    const runtime = fakeRuntime({
+      async cancel() { return ok("idle"); },
+      async wait(_agentName, signal) {
+        concurrent += 1;
+        maximum = Math.max(maximum, concurrent);
+        const result = await waitUntilAbort(signal);
+        concurrent -= 1;
+        return result;
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    await Promise.all(jobs.map((job) => supervisor.cancel(job.job_id, job.source_event_id)));
+    await waitFor(() => maximum > 0);
+    assert.equal(maximum, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("interrupts cancelled worker cleanup backoff during shutdown", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
