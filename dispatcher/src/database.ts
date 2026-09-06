@@ -60,11 +60,11 @@ export class DispatcherDatabase {
       this.migrate();
       migrateScheduler(this.db);
       migrateJobRouting(this.db);
-      for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs WHERE status IN ('queued','retryable_failed','preparing')").all() as Array<{job_id:string;result_path:string;status:string}>) {
+      for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
-        if(row.status==="preparing") this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
-          last_error_message='Legacy preparing agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
-        else this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
+        if(["preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
+          last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
+        else if(["queued","retryable_failed"].includes(row.status)) this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
     } catch (error) {
       this.db.close();
@@ -748,7 +748,7 @@ export class DispatcherDatabase {
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent') AND json_extract(c.owner_json,'$.kind')='schedule'
-          AND (julianday(c.materialized_at,'+900 seconds')<=julianday(?) OR s.state NOT IN ('active','needs_review')
+          AND (julianday(c.materialized_at,'+900 seconds')<julianday(?) OR s.state NOT IN ('active','needs_review')
             OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
         .all(timestamp,timestamp) as Array<{event_id:string}>;
       for(const row of rows) {

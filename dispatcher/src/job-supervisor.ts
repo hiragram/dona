@@ -78,13 +78,20 @@ export class JobSupervisor {
       });
     }
     this.running = true;
-    this.loopPromise = this.loop().catch((error: unknown) => {
+    this.loopPromise = this.stopLegacySharedGrantAgents().then(()=>this.loop()).catch((error: unknown) => {
       this.logger.error("Job supervisor stopped unexpectedly", {
         error_code: "job_supervisor_crashed",
         error_message: error instanceof Error ? error.message : String(error),
       });
       throw error;
     });
+  }
+
+  private async stopLegacySharedGrantAgents():Promise<void> {
+    for(const job of this.database.listJobs().filter(row=>row.last_error_code==="legacy_agent_sandbox_unknown")) {
+      const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
+      if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
+    }
   }
 
   wake(): void {
