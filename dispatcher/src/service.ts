@@ -5,6 +5,8 @@ import { HerdrProcessClient } from "./herdr.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
+import { SystemClock } from "./scheduler/clock.js";
+import { SchedulerService } from "./scheduler/service.js";
 import { DispatcherWorker } from "./worker.js";
 import { UpdaterClient } from "./updater-client.js";
 import {
@@ -25,6 +27,13 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   const worker = new DispatcherWorker(database, herdr, config, workerLogger);
+  const scheduler = new SchedulerService(
+    database.scheduler,
+    new SystemClock(),
+    () => worker.wake(),
+    createLogger("dispatcher_scheduler"),
+    { pollMilliseconds: Math.min(config.queuePollMs, 60_000) },
+  );
   const jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),
@@ -48,22 +57,27 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await scheduler.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
       },
     },
     updateNotificationWorker,
+    undefined,
+    () => scheduler.wake(),
   );
 
   try {
     await api.start();
     worker.start();
+    scheduler.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
+    if (scheduler.isRunning()) await scheduler.stop();
     if (worker.isRunning()) await worker.stop();
     database.close();
     updateNotificationDatabase.close();
@@ -79,6 +93,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       try {
         api.beginShutdown();
         await api.stop();
+        await scheduler.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();

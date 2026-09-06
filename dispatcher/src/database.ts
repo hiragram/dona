@@ -18,6 +18,8 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import { migrateScheduler } from "./scheduler/schema.js";
+import { SchedulerRepository } from "./scheduler/repository.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -35,6 +37,7 @@ function retryAt(attemptCount: number, now: Date): string {
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  readonly scheduler: SchedulerRepository;
 
   constructor(databasePath: string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -44,7 +47,14 @@ export class DispatcherDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    try {
+      this.migrate();
+      migrateScheduler(this.db);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+    this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at));
   }
 
   private migrate(): void {
@@ -583,7 +593,7 @@ export class DispatcherDatabase {
     const head = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE status IN ('queued', 'retryable_failed') AND source != 'dona_update'
+        WHERE status IN ('queued', 'retryable_failed') AND source NOT IN ('dona_update', 'scheduler', 'dona_schedule')
         ORDER BY sequence LIMIT 1
       `)
       .get() as EventRow | undefined;

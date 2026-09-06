@@ -34,6 +34,13 @@ export class DispatcherApiClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`, input);
   }
+  previewSchedule(input: unknown) { return this.request("POST", "/v1/schedules/preview", input); }
+  createSchedule(input: unknown) { return this.request("POST", "/v1/schedules", input); }
+  getSchedule(scheduleId: string, sourceEventId: string) { return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}?source_event_id=${encodeURIComponent(sourceEventId)}`); }
+  listSchedules(sourceEventId: string, limit: number, cursor?: string) { const q = new URLSearchParams({ source_event_id: sourceEventId, limit: String(limit), ...(cursor ? { cursor } : {}) }); return this.request("GET", `/v1/schedules?${q}`); }
+  updateSchedule(scheduleId: string, input: unknown) { return this.request("PATCH", `/v1/schedules/${encodeURIComponent(scheduleId)}`, input); }
+  transitionSchedule(scheduleId: string, action: "pause"|"resume"|"cancel", input: unknown) { return this.request("POST", `/v1/schedules/${encodeURIComponent(scheduleId)}/${action}`, input); }
+  getScheduleHistory(scheduleId: string, sourceEventId: string, limit: number, cursor?: string) { const q = new URLSearchParams({ source_event_id: sourceEventId, limit: String(limit), ...(cursor ? { cursor } : {}) }); return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}/runs?${q}`); }
 
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/self-update/plan", input);

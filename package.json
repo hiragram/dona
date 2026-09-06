@@ -9,7 +9,8 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "test": "npm run test:skills && npm --prefix dispatcher test && npm --prefix sources/slack test && npm --prefix updater test",
+    "test": "npm run test:skills && npm run test:scheduler-contract && npm --prefix dispatcher test && npm --prefix sources/slack test && npm --prefix updater test",
+    "test:scheduler-contract": "node --test test/scheduler-policy-fixtures.test.mjs",
     "test:skills": "node --test test/project-skill-contract.test.mjs .agents/skills/github-issue-decomposition/tests/*.test.mjs",
     "typecheck": "npm --prefix dispatcher run typecheck && npm --prefix sources/slack run typecheck && npm --prefix updater run typecheck",
     "build": "npm --prefix dispatcher run build && npm --prefix sources/slack run build && npm --prefix updater run build",
