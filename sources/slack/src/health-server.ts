@@ -57,6 +57,7 @@ export interface AdapterHealthState {
   connectionStates(): Record<string, string>;
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
+  trackOperation?<T>(operation: Promise<T>): Promise<T>;
 }
 
 export class SlackHealthServer {
@@ -127,11 +128,12 @@ export class SlackHealthServer {
         return;
       }
       if (this.adapter.isStopping()) {
-        send(response, 503, { schema_version: 1, outcome: "not_accepted", code: "shutting_down", retry_after_seconds: 1 });
+        send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
         return;
       }
       try {
-        const result = await this.reminders.deliver(await this.readJson(request));
+        const delivery = this.reminders.deliver(await this.readJson(request));
+        const result = this.adapter.trackOperation ? await this.adapter.trackOperation(delivery) : await delivery;
         send(response, 200, { schema_version: 1, ...result });
       } catch {
         send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
