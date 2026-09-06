@@ -72,8 +72,10 @@ export class ReminderPublisher {
       while (this.running) {
         // The policy permits 100 schedules per tenant and one authorization check may take 150s.
         // Twenty-five workers keep a full due cohort within the 900s misfire grace (four waves).
-        const settled = await Promise.all(Array.from({ length: 25 }, () => this.publishOne()));
-        if (!settled.some(Boolean)) break;
+        const settled = await Promise.allSettled(Array.from({ length: 25 }, () => this.publishOne()));
+        const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failed) throw failed.reason;
+        if (!settled.some((result) => result.status === "fulfilled" && result.value)) break;
       }
     }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }

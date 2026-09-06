@@ -719,8 +719,11 @@ export class SchedulerRepository {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
+        const withinReminderGrace = row.kind !== "slack.reminder.post" ||
+          Date.parse(add(finishedAt, retryDelay)) <= Date.parse(add(run.scheduled_for, 900));
         const retry = (outcome === "not_accepted" || outcome === "authorization_unavailable" || outcome === "unavailable") &&
-          (outcome === "unavailable" || row.attempt < 3) && authorized && withinWorkRetryDeadline;
+          (outcome === "unavailable" || row.attempt < 3) && authorized && withinWorkRetryDeadline &&
+          (outcome !== "authorization_unavailable" || withinReminderGrace);
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(

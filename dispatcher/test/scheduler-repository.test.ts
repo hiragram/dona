@@ -819,6 +819,18 @@ test("認可照会不能はretry上限後にscheduleをpauseする", () => {
   assert.throws(() => repo.transition("auth_unavailable", 1, "resume", actor, later), /authorization_expired/);
 });
 
+test("認可照会retryがmisfire graceを越える場合は即時pauseする", () => {
+  const { repo } = setup();
+  repo.create("auth_retry_after_grace", input, due, actor, now);
+  repo.materialize("auth_retry_after_grace", 1, due, later, due, actor);
+  const nearGrace = "2026-09-05T00:15:59Z";
+  const claim = repo.claim(nearGrace)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, nearGrace);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "authorization_unavailable", nearGrace, null, 10);
+  assert.equal(repo.get("auth_retry_after_grace")?.state, "paused");
+  assert.equal(repo.getOutbox(claim.outbox_id, nearGrace)?.status, "failed");
+});
+
 test("connector待機中のpauseは遅着misfireより優先される", () => {
   const { repo } = setup();
   repo.create("paused_misfire", input, due, actor, now);
