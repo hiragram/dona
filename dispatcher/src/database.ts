@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -30,7 +31,9 @@ const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 function configuredSchemaWrite(): 2 | 3 {
   const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
   if (!manifestPath) return 2;
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { compatibility?: { app_schema_write?: unknown } };
+  const resolvedPath = manifestPath === "~" ? os.homedir()
+    : manifestPath.startsWith("~/") ? path.join(os.homedir(), manifestPath.slice(2)) : path.resolve(manifestPath);
+  const manifest = JSON.parse(fs.readFileSync(resolvedPath, "utf8")) as { compatibility?: { app_schema_write?: unknown } };
   const write = manifest.compatibility?.app_schema_write;
   if (write !== 2 && write !== 3) throw new Error("Release manifest app_schema_write is invalid");
   return write;
@@ -216,7 +219,7 @@ export function migrateDispatcherDatabase(
     migrationHook("indexes_recreated");
 
     db.exec(`
-      CREATE TABLE job_groups (
+      CREATE TABLE IF NOT EXISTS job_groups (
         source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
         sealed_at             TEXT,
         notification_mode     TEXT NOT NULL CHECK (notification_mode IN ('grouped', 'legacy')),
@@ -225,9 +228,9 @@ export function migrateDispatcherDatabase(
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL
       );
-      CREATE INDEX job_groups_transition_idx
+      CREATE INDEX IF NOT EXISTS job_groups_transition_idx
         ON job_groups(notification_mode, sealed_at, updated_at);
-      INSERT INTO job_groups (
+      INSERT OR REPLACE INTO job_groups (
         source_event_id, sealed_at, notification_mode, attention_event_id,
         all_terminal_event_id, created_at, updated_at
       )

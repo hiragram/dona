@@ -141,6 +141,36 @@ afterEach(async () => {
 });
 
 describe("DispatcherDatabase", () => {
+  test("migrates a bridge-initialized v2 database and expands a tilde manifest path", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const bridge = new DispatcherDatabase(config.databasePath);
+    assert.equal(bridge.schemaCompatibility().actual, 2);
+    bridge.close();
+
+    const previousHome = process.env.HOME;
+    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
+    process.env.HOME = root;
+    process.env.DONA_RELEASE_MANIFEST_PATH = "~/activation-manifest.json";
+    await fs.writeFile(path.join(root, "activation-manifest.json"), JSON.stringify({
+      compatibility: { app_schema_write: 3 },
+    }));
+    try {
+      const activated = new DispatcherDatabase(config.databasePath);
+      assert.equal(activated.schemaCompatibility().actual, 3);
+      activated.close();
+      const verified = new Database(config.databasePath);
+      assert.deepEqual(verified.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      verified.close();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+      else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
+    }
+  });
+
   test("transactionally migrates a real schema v2 fixture to v3 without losing job state", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
