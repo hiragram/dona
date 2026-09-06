@@ -139,16 +139,28 @@ function request(socketPath: string, token: string, path: string, body: SlackRem
 }
 
 export class SlackAdapterReminderClient implements SlackReminderPort {
+  private readonly preparedTokens = new Map<string, string>();
   constructor(private readonly config: DispatcherConfig) {}
   async preflight(input: SlackReminderCommand): Promise<ReminderDelivery> {
-    return await this.call(input, "/v1/internal/slack-reminders/preflight");
-  }
-  async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
-    return await this.call(input, "/v1/internal/slack-reminders");
-  }
-  private async call(input: SlackReminderCommand, path: string): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
     if (!token) return { outcome: "unavailable", code: "missing_internal_token", retry_after_seconds: 5 };
+    const result = await this.call(input, "/v1/internal/slack-reminders/preflight", token);
+    if (result.outcome === "prepared") {
+      this.preparedTokens.set(input.outbox_id, token);
+      const cleanup = setTimeout(() => {
+        if (this.preparedTokens.get(input.outbox_id) === token) this.preparedTokens.delete(input.outbox_id);
+      }, 2_000);
+      cleanup.unref();
+    }
+    return result;
+  }
+  async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
+    const token = this.preparedTokens.get(input.outbox_id);
+    this.preparedTokens.delete(input.outbox_id);
+    if (!token) return { outcome: "unavailable", code: "preflight_token_expired", retry_after_seconds: 0 };
+    return await this.call(input, "/v1/internal/slack-reminders", token);
+  }
+  private async call(input: SlackReminderCommand, path: string, token: string): Promise<ReminderDelivery> {
     const timeoutMs = path.endsWith("/preflight") ? 180_000 : Math.max(this.config.jobCommandTimeoutMs, 180_000);
     try { return await request(this.config.slackAdapterSocketPath, token, path, input, timeoutMs); }
     catch (error) {

@@ -56,7 +56,7 @@ test("preflight ticket欠落をknown non-acceptance、thread receipt逸脱をunk
   assert.deepEqual(await mismatch.deliverPrepared(threadInput), { outcome: "acceptance_unknown", code: "receipt_mismatch" });
 });
 
-test("同一channelの同時認可照会を直列化しない", async () => {
+test("同一channelの同時preflightをremote認可前にthrottleする", async () => {
   let release!: () => void;
   let calls = 0;
   const gate = new Promise<void>((resolve) => void (release = resolve));
@@ -68,11 +68,11 @@ test("同一channelの同時認可照会を直列化しない", async () => {
   const first = instance.deliver(input);
   const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   release();
   await first;
   await second;
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
 });
 
 test("同一workspaceでも異なるchannelの認可照会を並行する", async () => {
@@ -100,7 +100,7 @@ test("認可rate limitをauthorization unavailableとして返す", async () => 
   assert.deepEqual(await instance.deliver(input), {
     outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: 901,
   });
-  assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
+  assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "unavailable");
 });
 
 test("認可rate limitを各preflightのRetry-Afterへ分離する", async () => {

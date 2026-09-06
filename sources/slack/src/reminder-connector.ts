@@ -57,7 +57,10 @@ export class SlackReminderConnector {
     const now = Date.now();
     const slot = this.nextPostAt.get(key) ?? now;
     if (slot > now) return Math.ceil((slot - now) / 1_000);
-    this.nextPostAt.set(key, now + 1_000);
+    const next = now + 1_000;
+    this.nextPostAt.set(key, next);
+    const cleanup = setTimeout(() => { if (this.nextPostAt.get(key) === next) this.nextPostAt.delete(key); }, 1_000);
+    cleanup.unref();
     return 0;
   }
 
@@ -81,6 +84,8 @@ export class SlackReminderConnector {
       // The read-only checks below were completed by the immediately preceding preflight.
       return await this.postPrepared(connection, input);
     }
+    const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
+    if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
@@ -104,8 +109,6 @@ export class SlackReminderConnector {
     const current = Date.now();
     if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
     if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
-    const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
-    if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
     // The ticket is valid only for the one-second channel slot reserved above. If the
     // dispatcher stalls, it must preflight again instead of bursting stale reservations.
     const ticketExpiresAt = Date.now() + 1_000;
@@ -123,7 +126,10 @@ export class SlackReminderConnector {
   private async postPrepared(connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>, input: SlackReminderCommand): Promise<SlackReminderResult> {
     try {
       const channelKey = `${input.target.workspace_id}:${input.target.channel_id}`;
-      this.nextPostAt.set(channelKey, Math.max(this.nextPostAt.get(channelKey) ?? 0, Date.now() + 1_000));
+      const next = Math.max(this.nextPostAt.get(channelKey) ?? 0, Date.now() + 1_000);
+      this.nextPostAt.set(channelKey, next);
+      const cleanup = setTimeout(() => { if (this.nextPostAt.get(channelKey) === next) this.nextPostAt.delete(channelKey); }, Math.max(0, next - Date.now()));
+      cleanup.unref();
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,
