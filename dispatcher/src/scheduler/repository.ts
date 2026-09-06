@@ -102,13 +102,15 @@ export class SchedulerRepository {
       AND schedule_id > ? ORDER BY schedule_id LIMIT ?`).all(actor.tenant_id, actor.actor_id, cursor ?? "", limit) as Schedule[];
     return rows.map(row => this.getAuthorized(row.schedule_id, actor)!);
   }
-  runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: string): Run[] {
+  runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: { scheduled_for: string; run_id: string }): Run[] {
     const schedule = this.get(scheduleId);
     if (!schedule) throw new Error("schedule_not_found");
     this.checked(scheduleId, schedule.revision, actor);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
-    return this.db.prepare(`SELECT * FROM schedule_runs WHERE schedule_id = ? AND run_id > ?
-      ORDER BY run_id LIMIT ?`).all(scheduleId, cursor ?? "", limit) as Run[];
+    const scheduledFor = cursor?.scheduled_for ?? ""; const runId = cursor?.run_id ?? "";
+    return this.db.prepare(`SELECT * FROM schedule_runs WHERE schedule_id = ? AND
+      (scheduled_for > ? OR (scheduled_for = ? AND run_id > ?))
+      ORDER BY scheduled_for, run_id LIMIT ?`).all(scheduleId, scheduledFor, scheduledFor, runId, limit) as Run[];
   }
   pendingMaterializedCount(scheduleId: string): number {
     return (this.db.prepare("SELECT count(*) AS count FROM schedule_runs WHERE schedule_id = ? AND status = 'materialized'")

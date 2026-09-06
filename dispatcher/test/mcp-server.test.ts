@@ -90,6 +90,8 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "apply_self_update")?.annotations?.destructiveHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "update_schedule")?.annotations?.destructiveHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "pause_schedule")?.annotations?.destructiveHint, true);
 
       const result = await client.callTool({
         name: "delegate_job",
@@ -118,6 +120,13 @@ describe("Dona Dispatcher MCP server", () => {
       } });
       assert.equal(preview.isError, undefined);
       assert.equal(calls.at(-1)?.method, "previewSchedule");
+      const beforeInvalid = calls.length;
+      const invalidKey = await client.callTool({ name: "create_schedule", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", idempotency_key: "request.1",
+        definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },
+      } });
+      assert.equal(invalidKey.isError, true);
+      assert.equal(calls.length, beforeInvalid);
 
       const body = {
         schema_version: 1,

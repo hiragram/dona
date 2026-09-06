@@ -36,6 +36,7 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   assert.equal((api.get(schedule.schedule_id, first.event_id).schedule as { revision: number }).revision, 1);
   assert.equal(api.list(first.event_id, 1).schedules.length, 1);
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
+  assert.equal(new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("別本文") }), (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
   database.close();
 });
@@ -62,6 +63,7 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
   const updated = api.update(id, { source_event_id: first.event_id, expected_revision: 1, definition: definition("更新本文") });
   assert.equal((updated.schedule as { revision: number }).revision, 2);
   assert.throws(() => api.list(first.event_id, 101), /invalid_limit/);
+  assert.throws(() => api.history(id, first.event_id, 10, "run_random"), /invalid_cursor/);
   database.close();
   const reopened = new DispatcherDatabase(config.databasePath);
   const reopenedApi = new ScheduleApiService(reopened, () => new Date("2026-09-02T00:00:00Z"));
