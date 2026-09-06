@@ -122,6 +122,8 @@ export class SlackReminderConnector {
 
   private async postPrepared(connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>, input: SlackReminderCommand): Promise<SlackReminderResult> {
     try {
+      const channelKey = `${input.target.workspace_id}:${input.target.channel_id}`;
+      this.nextPostAt.set(channelKey, Math.max(this.nextPostAt.get(channelKey) ?? 0, Date.now() + 1_000));
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,
