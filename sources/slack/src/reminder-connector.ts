@@ -49,7 +49,7 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 
 export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
-  private readonly prepared = new Map<string, { serialized: string; expiresAt: number }>();
+  private readonly prepared = new Map<string, { serialized: string; ticketExpiresAt: number; authorizationExpiresAt: number; misfireAt: number }>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
 
   private reservePost(workspaceId: string, channelId: string): number {
@@ -67,7 +67,8 @@ export class SlackReminderConnector {
     const serialized = JSON.stringify(input);
     const prepared = this.prepared.get(input.outbox_id);
     if (!preflightOnly) {
-      if (prepared?.serialized !== serialized || prepared.expiresAt <= Date.now()) {
+      const now = Date.now();
+      if (prepared?.serialized !== serialized || prepared.ticketExpiresAt <= now || prepared.authorizationExpiresAt <= now || prepared.misfireAt < now) {
         this.prepared.delete(input.outbox_id);
         return { outcome: "not_accepted", code: "preflight_required", retry_after_seconds: 0 };
       }
@@ -105,11 +106,14 @@ export class SlackReminderConnector {
     if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
     const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
     if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
-    const expiresAt = Math.min(Date.now() + 60_000, Date.parse(input.expires_at), Date.parse(input.misfire_at));
-    this.prepared.set(input.outbox_id, { serialized, expiresAt });
+    const ticketExpiresAt = Date.now() + 60_000;
+    const authorizationExpiresAt = Date.parse(input.expires_at);
+    const misfireAt = Date.parse(input.misfire_at);
+    this.prepared.set(input.outbox_id, { serialized, ticketExpiresAt, authorizationExpiresAt, misfireAt });
+    const cleanupAt = Math.min(ticketExpiresAt, authorizationExpiresAt, misfireAt + 1);
     const cleanup = setTimeout(() => {
-      if (this.prepared.get(input.outbox_id)?.expiresAt === expiresAt) this.prepared.delete(input.outbox_id);
-    }, Math.max(0, expiresAt - Date.now()));
+      if (this.prepared.get(input.outbox_id)?.ticketExpiresAt === ticketExpiresAt) this.prepared.delete(input.outbox_id);
+    }, Math.max(0, cleanupAt - Date.now()));
     cleanup.unref();
     return { outcome: "prepared" };
   }
