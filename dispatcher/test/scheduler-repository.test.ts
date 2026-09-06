@@ -251,6 +251,9 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
   assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } });
   assert.equal(dispatcher.listOwnerJobs(run.event_id!).length, 0);
+  raw.prepare("UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]') WHERE event_id=?").run(run.event_id);
+  migrateJobRouting(raw);
+  assert.equal((JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string}}).work.objective,"[deleted]");
 });
 
 test("blockedとredaction拒否をneeds_reviewへ隔離し取消しを確定できる", () => {
@@ -284,6 +287,8 @@ test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", (
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:00:59Z")).length, 0);
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id, job.job_id);
+  dispatcher.markJobBlocked(job.job_id,"入力待ち");
+  assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
 });
 
 test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象へ出す", () => {
@@ -304,6 +309,8 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
     expires_at:"2026-09-05T00:02:00Z" }, due, actor, now);
   const expiryRun=repo.materialize("expiry_job",1,due,"2026-09-06T00:01:00Z",due,actor).run;
   const expiryJob=dispatcher.createJob({source_event_id:expiryRun.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  repo.update("expiry_job",1,{...input,action:"work.read_only",target:{kind:"none"},content:objective,
+    authorization_id:"auth_renewed",authorization_revision:2,expires_at:"2026-09-30T00:00:00Z"},"2026-09-06T00:01:00Z",actor,due);
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation(new Date("2026-09-05T00:02:00Z")).some(row=>row.job_id===expiryJob.job_id),true);
 });
 

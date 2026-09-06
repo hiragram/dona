@@ -385,17 +385,17 @@ export class DispatcherDatabase {
   listOverdueScheduledJobs(at = new Date()): JobRow[] {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='running' AND j.prompt_accepted_at<=? AND json_extract(b.owner_json,'$.kind')='schedule'
+      WHERE j.status IN ('running','blocked') AND j.prompt_accepted_at<=? AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY j.prompt_accepted_at,j.job_id`).all(deadline) as JobRow[];
   }
 
   listScheduledJobsRequiringCancellation(at = new Date()): JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       JOIN schedules s ON s.schedule_id=json_extract(b.owner_json,'$.schedule_id')
-      JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=s.revision
+      JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(b.owner_json,'$.revision')
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
-        AND j.status IN ('queued','retryable_failed','running','blocked')
+        AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked')
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -575,7 +575,7 @@ export class DispatcherDatabase {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     const row = this.getJobRequired(jobId);
     if (row.status === "cancelled") return row;
-    if (!["queued", "retryable_failed", "running", "blocked"].includes(row.status)) {
+    if (!["queued", "retryable_failed", "preparing", "dispatching", "running", "blocked"].includes(row.status)) {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
     this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });

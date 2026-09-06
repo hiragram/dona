@@ -57,7 +57,9 @@ export function migrateJobRouting(db: Database.Database): void {
         ? {kind:"none"}
         : {kind:"slack",action:"slack.work_result.post",target:target.parse(rawTarget)};
       insertEventJobBinding(db,row.event_id,{owner:{kind:"schedule",...subject,run_id:row.run_id,revision:row.revision},destination});
-      if(row.content!==null) db.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(stableStringify({run_id:row.run_id,revision:row.revision,
+      const existingPayload=JSON.parse((db.prepare("SELECT payload_json FROM events WHERE event_id=?").get(row.event_id) as {payload_json:string}).payload_json) as Record<string,unknown>;
+      if(row.content!==null&&!(existingPayload.work&&typeof existingPayload.work==="object"&&!Array.isArray(existingPayload.work)&&
+        typeof (existingPayload.work as Record<string,unknown>).objective==="string")) db.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(stableStringify({run_id:row.run_id,revision:row.revision,
         occurrence_key:row.occurrence_key,work:{objective:row.content,scope:"read_only",allowed_external_writes:[],result_destination:rawTarget}}),row.event_id);
     }
     db.exec(`INSERT OR IGNORE INTO job_owner_bindings SELECT j.job_id,b.event_id,b.owner_json,b.destination_json FROM jobs j JOIN event_job_bindings b ON b.event_id=j.source_event_id`);

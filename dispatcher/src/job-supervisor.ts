@@ -144,6 +144,7 @@ export class JobSupervisor {
         this.wake();
         return { row: this.database.getJob(jobId)!, duplicate: false };
       }
+      if (["preparing", "dispatching"].includes(before.status)) await this.active.get(jobId);
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
@@ -239,6 +240,7 @@ export class JobSupervisor {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
       if (this.stopping) return;
+      if (this.database.getJob(row.job_id)?.status !== "preparing") return;
       const updated = this.database.recordJobPreparationFailure(
         row.job_id,
         errorCode(error),
@@ -249,9 +251,11 @@ export class JobSupervisor {
       return;
     }
     if (this.stopping) return;
+    if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     const dispatching = this.database.beginJobDispatch(row.job_id);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
+    if (this.database.getJob(row.job_id)?.status !== "dispatching") return;
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
       return;
