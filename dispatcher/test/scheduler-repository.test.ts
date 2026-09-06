@@ -58,10 +58,10 @@ test("新規DB、v2既存データ、再open、WAL/FK", () => {
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 3);
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
   reopened.close();
-  raw.exec("UPDATE scheduler_schema SET version = 3");
+  raw.exec("UPDATE scheduler_schema SET version = 4");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
@@ -82,14 +82,18 @@ test("scheduler schema v1へ保持されるlist sequenceを追加する", () => 
     raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
       INSERT INTO scheduler_schema VALUES(1, 1);
       CREATE TABLE schedules(schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL);
+      CREATE TABLE schedule_revisions(schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, recurrence_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL, action TEXT NOT NULL, target_json TEXT NOT NULL, content_hash TEXT NOT NULL);
       CREATE TABLE schedule_audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL, operation TEXT NOT NULL);
       INSERT INTO schedules VALUES('legacy', 'T', 'U');
+      INSERT INTO schedule_revisions VALUES('legacy', 1, '{}', '{}', 'work.read_only', '{"kind":"none"}', 'content');
       INSERT INTO schedule_audit(schedule_id, operation) VALUES('legacy', 'create');`);
     migrateScheduler(raw);
-    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 3);
     assert.equal((raw.prepare("SELECT list_sequence FROM schedules WHERE schedule_id = 'legacy'").get() as { list_sequence: number }).list_sequence, 1);
     assert.equal((raw.prepare("SELECT next_value FROM schedule_list_sequence").get() as { next_value: number }).next_value, 2);
     assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
+    assert.match((raw.prepare("SELECT create_payload_hash FROM schedules WHERE schedule_id = 'legacy'").get() as { create_payload_hash: string }).create_payload_hash, /^[a-f0-9]{64}$/);
   } finally { raw.close(); }
 });
 

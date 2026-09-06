@@ -9,6 +9,7 @@ import { encodePolicy, defaultPolicy } from "./policy.js";
 import { encodeRecurrence, parseRecurrence } from "./recurrence.js";
 import type { Actor, RevisionInput, Schedule, ScheduleView, Target } from "./repository.js";
 import { nextPersistedOccurrence } from "./service.js";
+import { definitionFingerprint } from "./fingerprint.js";
 
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i);
@@ -83,10 +84,9 @@ export class ScheduleApiService {
     const existing = this.database.scheduler.getAuthorized(scheduleId, context.actor);
     if (existing) {
       this.assertBinding(existing, context);
-      const initial = this.database.scheduler.getAuthorizedRevision(scheduleId, 1, context.actor);
-      if (!initial || initial.recurrence_json !== built.input.recurrence_json || initial.policy_json !== built.input.policy_json ||
-        initial.action !== built.input.action || JSON.stringify(initial.target) !== JSON.stringify(built.input.target) ||
-        initial.content_hash !== hash(built.input.content)) throw new ScheduleApiError(409, "idempotency_conflict");
+      const payloadHash = definitionFingerprint({ recurrence_json: built.input.recurrence_json, policy_json: built.input.policy_json,
+        action: built.input.action, target_json: JSON.stringify(built.input.target), content_hash: hash(built.input.content) });
+      if (existing.create_payload_hash !== payloadHash) throw new ScheduleApiError(409, "idempotency_conflict");
       return { schema_version: 1, duplicate: true, schedule: this.project(existing) };
     }
     validateCreation(built.parsed, new FakeClock(at));

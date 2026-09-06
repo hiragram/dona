@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { EnqueueResult, EventEnvelope } from "../types.js";
 import type { ScheduleDefinition } from "./domain.js";
+import { definitionFingerprint } from "./fingerprint.js";
 
 export type ScheduleState = "active" | "paused" | "expired" | "needs_review" | "cancelled" | "completed";
 export type Action = "slack.reminder.post" | "work.read_only";
@@ -27,7 +28,7 @@ export interface Schedule {
   schedule_id: string; tenant_id: string; owner_id: string; state: ScheduleState;
   revision: number; next_due: string | null; high_watermark: string | null;
   created_at: string; updated_at: string; terminal_at: string | null;
-  list_sequence: number; idempotency_key_hash: string | null;
+  list_sequence: number; idempotency_key_hash: string | null; create_payload_hash: string;
 }
 export interface ScheduleClaim extends Schedule { claim_owner: string; claim_until: string; claim_fence: number }
 export type MaterializationDefinition = ScheduleDefinition;
@@ -96,14 +97,6 @@ export class SchedulerRepository {
     this.checked(scheduleId, row.revision, actor);
     const revision = this.revision(row);
     return this.view(row, revision);
-  }
-  getAuthorizedRevision(scheduleId: string, revisionNumber: number, actor: Actor): ScheduleView | undefined {
-    const row = this.get(scheduleId);
-    if (!row) return undefined;
-    this.checked(scheduleId, row.revision, actor);
-    const revision = this.db.prepare("SELECT * FROM schedule_revisions WHERE schedule_id = ? AND revision = ?")
-      .get(scheduleId, revisionNumber) as Revision | undefined;
-    return revision ? this.view(row, revision) : undefined;
   }
   private view(row: Schedule, revision: Revision): ScheduleView {
     return { ...row, action: revision.action, target: JSON.parse(revision.target_json) as Target,
@@ -283,9 +276,12 @@ export class SchedulerRepository {
       this.quota(actor.tenant_id, actor.actor_id);
       const sequence = (this.db.prepare("SELECT next_value FROM schedule_list_sequence WHERE singleton = 1").get() as { next_value: number }).next_value;
       this.db.prepare("UPDATE schedule_list_sequence SET next_value = next_value + 1 WHERE singleton = 1").run();
+      const targetJson = JSON.stringify(input.target.kind === "none" ? { kind: "none" } : input.target);
+      const createPayloadHash = definitionFingerprint({ recurrence_json: input.recurrence_json, policy_json: input.policy_json,
+        action: input.action, target_json: targetJson, content_hash: digest(input.content) });
       this.db.prepare(`INSERT INTO schedules(schedule_id, tenant_id, owner_id, state, revision, next_due, created_at, updated_at,
-        list_sequence, idempotency_key_hash) VALUES (?,?,?,'active',1,?,?,?,?,?)`)
-        .run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now, sequence, idempotencyKeyHash);
+        list_sequence, idempotency_key_hash, create_payload_hash) VALUES (?,?,?,'active',1,?,?,?,?,?,?)`)
+        .run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now, sequence, idempotencyKeyHash, createPayloadHash);
       this.insertRevision(scheduleId, 1, input, now);
       const row = this.get(scheduleId)!; this.audit(undefined, row, "create", actor, now); return row;
     }).immediate();
@@ -321,8 +317,10 @@ export class SchedulerRepository {
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, updateAt);
-      const reusedAuthorization = this.db.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = ? AND authorization_id = ? LIMIT 1")
-        .get(scheduleId, input.authorization_id);
+      const sourceEventId = input.authorization_id.replace(/:\d+$/, "");
+      const reusedAuthorization = this.db.prepare(`SELECT 1 FROM schedule_revisions
+        WHERE schedule_id = ? AND (authorization_id = ? OR authorization_id GLOB ?) LIMIT 1`)
+        .get(scheduleId, sourceEventId, `${sourceEventId}:*`);
       if (input.authorization_revision !== expectedRevision + 1 || reusedAuthorization) throw new Error("authorization_revision_conflict");
       this.suppress(scheduleId, updateAt, "revision_replaced");
       this.retireRevisions(scheduleId, updateAt, expectedRevision);

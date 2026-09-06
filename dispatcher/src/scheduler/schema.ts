@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { definitionFingerprint, type DefinitionFingerprintInput } from "./fingerprint.js";
 
 // Core user_version is owned by the Dispatcher (including the independent v3 job migration).
 export function migrateScheduler(db: Database.Database): void {
@@ -7,8 +8,8 @@ export function migrateScheduler(db: Database.Database): void {
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL
     )`);
     const row = db.prepare("SELECT version FROM scheduler_schema WHERE singleton = 1").get() as { version: number } | undefined;
-    if (row && row.version !== 1 && row.version !== 2) throw new Error("unsupported_scheduler_schema");
-    if (row?.version === 2) return;
+    if (row && row.version !== 1 && row.version !== 2 && row.version !== 3) throw new Error("unsupported_scheduler_schema");
+    if (row?.version === 3) return;
     if (row?.version === 1) {
       db.exec(`CREATE TABLE IF NOT EXISTS schedule_claims (
           schedule_id TEXT PRIMARY KEY REFERENCES schedules(schedule_id) ON DELETE CASCADE,
@@ -25,6 +26,14 @@ export function migrateScheduler(db: Database.Database): void {
         CREATE TABLE schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
         INSERT INTO schedule_list_sequence VALUES (1, COALESCE((SELECT MAX(list_sequence) + 1 FROM schedules), 1));
         UPDATE scheduler_schema SET version = 2 WHERE singleton = 1;`);
+    }
+    if (row?.version === 1 || row?.version === 2) {
+      db.exec("ALTER TABLE schedules ADD COLUMN create_payload_hash TEXT");
+      const revisions = db.prepare(`SELECT schedule_id, recurrence_json, policy_json, action, target_json, content_hash
+        FROM schedule_revisions WHERE revision = 1`).all() as Array<DefinitionFingerprintInput & { schedule_id: string }>;
+      const update = db.prepare("UPDATE schedules SET create_payload_hash = ? WHERE schedule_id = ?");
+      for (const revision of revisions) update.run(definitionFingerprint(revision), revision.schedule_id);
+      db.exec("UPDATE scheduler_schema SET version = 3 WHERE singleton = 1");
       return;
     }
     db.exec(`
@@ -33,7 +42,7 @@ export function migrateScheduler(db: Database.Database): void {
         state TEXT NOT NULL CHECK(state IN ('active','paused','expired','needs_review','cancelled','completed')),
         revision INTEGER NOT NULL CHECK(revision > 0), next_due TEXT, high_watermark TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT,
-        list_sequence INTEGER NOT NULL UNIQUE, idempotency_key_hash TEXT,
+        list_sequence INTEGER NOT NULL UNIQUE, idempotency_key_hash TEXT, create_payload_hash TEXT NOT NULL,
         FOREIGN KEY(schedule_id, revision) REFERENCES schedule_revisions(schedule_id, revision) DEFERRABLE INITIALLY DEFERRED
       );
       CREATE INDEX schedules_due_idx ON schedules(next_due, schedule_id) WHERE state = 'active';
@@ -91,7 +100,7 @@ export function migrateScheduler(db: Database.Database): void {
       );
       CREATE INDEX schedule_audit_order_idx ON schedule_audit(schedule_id, sequence);
       CREATE INDEX schedule_audit_retention_idx ON schedule_audit(created_at);
-      INSERT INTO scheduler_schema VALUES (1, 2);
+      INSERT INTO scheduler_schema VALUES (1, 3);
     `);
   }).immediate();
 }
