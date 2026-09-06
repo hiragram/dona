@@ -54,7 +54,13 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   f.runtime.schemaMigrationReady = false;
   await assert.rejects(
     f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
-    /stable_updater_schema_migration_capability_required/,
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = "3".repeat(40);
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
   );
   assert.equal(f.database.list().length, 0);
   f.database.close();
@@ -120,9 +126,10 @@ class FakeDispatcher implements DispatcherPort {
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
   schemaMigrationReady = true;
+  schemaMigrationBuildSha = targetSha;
   async schemaMigrationCapability() {
     this.calls.push("schemaMigrationCapability");
-    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? "3".repeat(40) : null };
+    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null };
   }
   async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;

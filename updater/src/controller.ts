@@ -90,7 +90,9 @@ export class UpdateController {
     if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
       if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
       controlPlane = await this.runtime.schemaMigrationCapability();
-      if (!controlPlane.ready) throw new Error("stable_updater_schema_migration_capability_required");
+      if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
+        throw new Error("stable_updater_exact_target_schema_migration_capability_required");
+      }
     }
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
@@ -532,7 +534,7 @@ export class UpdateController {
         }
         const controlPlane = await this.runtime.schemaMigrationCapability();
         this.assertLease(row);
-        if (!controlPlane.ready) {
+        if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
           this.needsReview(row, "stable_updater_schema_migration_capability_unverified");
           return;
         }
