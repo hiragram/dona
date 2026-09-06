@@ -20,7 +20,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler } from "./scheduler/schema.js";
-import { SchedulerRepository, validateWorkResultContent } from "./scheduler/repository.js";
+import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent } from "./scheduler/repository.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -658,7 +658,10 @@ export class DispatcherDatabase {
         job_id: job.job_id,
         job_status: job.status,
         workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
-        ...(result ? { result } : {}),
+        ...(result ? { result: binding.owner.kind==="schedule"
+          ? {schema_version:result.schema_version,job_id:result.job_id,status:result.status,
+              summary:projectWorkResultContent(renderJobResult(result)),completed_at:result.completed_at}
+          : result } : {}),
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
         ...(job.last_error_message ? { error_message: this.safeNotificationError(job.last_error_message,binding.owner.kind==="schedule") } : {}),
       },
@@ -726,12 +729,13 @@ export class DispatcherDatabase {
       const rows=this.db.prepare(`SELECT e.event_id FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
-        WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed') AND json_extract(c.owner_json,'$.kind')='schedule'
-          AND (julianday(c.materialized_at,'+900 seconds')<=julianday(?) OR s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))`)
+        WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching') AND json_extract(c.owner_json,'$.kind')='schedule'
+          AND (julianday(c.materialized_at,'+900 seconds')<=julianday(?) OR s.state NOT IN ('active','needs_review')
+            OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
         .all(timestamp,timestamp) as Array<{event_id:string}>;
       for(const row of rows) {
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
-          last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')`).run(timestamp,timestamp,row.event_id);
+          last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching')`).run(timestamp,timestamp,row.event_id);
         this.setNotificationState(row.event_id,"none",at);
       }
     }).immediate();
@@ -908,7 +912,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       this.transition(eventId, ["waiting_agent"], "dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: "agent_reported_failure",last_error_message: result.summary ?? "Agent reported failure"});
-      this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
+      this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,"failed",new Date(result.completed_at));
     }).immediate();
   }

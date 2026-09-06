@@ -105,7 +105,7 @@ const gitRef = z
 
 const createJobSchema = z.object({
   source_event_id: z.string().trim().min(1),
-  objective: z.string().trim().min(1).max(100_000),
+  objective: z.string().min(1).max(100_000),
   workspace: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("scratch") }).strip(),
     z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),

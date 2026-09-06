@@ -85,6 +85,7 @@ function truncateResultContent(value: string): string {
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
 export function validateWorkResultContent(value: string): void { truncateResultContent(value); }
+export function projectWorkResultContent(value: string): string { return truncateResultContent(value); }
 
 export class SchedulerRepository {
   constructor(private readonly db: Database.Database, private readonly enqueue: (event: EventEnvelope, at: Date) => EnqueueResult,
@@ -429,7 +430,9 @@ export class SchedulerRepository {
       }
       const unresolved = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
         (r.status IN ('materialized','started','needs_review') OR EXISTS
-          (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
+          (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review')) OR EXISTS
+          (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+            AND c.notification_state IN ('pending','needs_review'))) LIMIT 1`).get(scheduleId);
       const reason = Date.parse(materializedAt) - Date.parse(scheduledFor) > 900000 ? "misfire" : unresolved ? "overlap" : null;
       if (skip !== null && skip !== reason) throw new Error("invalid_skip_reason");
       const runId = `run_${randomUUID()}`;
@@ -864,7 +867,7 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE connector_outbox SET content = NULL WHERE content_delete_at <= ?").run(now);
       this.db.prepare(`UPDATE jobs SET result_json = NULL,
         objective = '[deleted]',
-        last_error_message = CASE WHEN last_error_code='agent_reported_failure' THEN NULL ELSE last_error_message END
+        last_error_message = NULL
         WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?
           AND json_extract(owner_json,'$.kind')='schedule')`).run(now);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]')
@@ -878,7 +881,7 @@ export class SchedulerRepository {
         WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
           WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
           WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
-      this.db.prepare(`UPDATE events SET payload_json=json_remove(payload_json,'$.result'),result_json=NULL
+      this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
           WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
