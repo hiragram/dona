@@ -58,10 +58,10 @@ test("新規DB、v2既存データ、再open、WAL/FK", () => {
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 3);
+  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
   reopened.close();
-  raw.exec("UPDATE scheduler_schema SET version = 4");
+  raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
@@ -89,7 +89,7 @@ test("scheduler schema v1へ保持されるlist sequenceを追加する", () => 
       INSERT INTO schedule_revisions VALUES('legacy', 1, '{}', '{}', 'work.read_only', '{"kind":"none"}', 'content');
       INSERT INTO schedule_audit(schedule_id, operation) VALUES('legacy', 'create');`);
     migrateScheduler(raw);
-    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 3);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
     assert.equal((raw.prepare("SELECT list_sequence FROM schedules WHERE schedule_id = 'legacy'").get() as { list_sequence: number }).list_sequence, 1);
     assert.equal((raw.prepare("SELECT next_value FROM schedule_list_sequence").get() as { next_value: number }).next_value, 2);
     assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
@@ -97,7 +97,7 @@ test("scheduler schema v1へ保持されるlist sequenceを追加する", () => 
   } finally { raw.close(); }
 });
 
-test("revision 1が欠落したv2 DBを不完全なv3として受理しない", () => {
+test("revision 1が欠落したv2 DBへexpand列を不完全に追加しない", () => {
   const raw = new Database(":memory:");
   try {
     raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);

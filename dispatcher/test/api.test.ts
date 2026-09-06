@@ -332,6 +332,8 @@ describe("DispatcherApi", () => {
       undefined, undefined, undefined, () => new Date("2026-09-06T00:00:00Z"));
     await api.start();
     const event = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-schedule-uds"));
+    database.beginDispatch(event.body.event_id as string, path.join(root, "schedule-result.json"));
+    database.markWaiting(event.body.event_id as string);
     const definition = { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "UDS確認" } };
     const preview = await request(config.socketPath, "POST", "/v1/schedules/preview", { source_event_id: event.body.event_id, definition, after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10 });
     assert.equal(preview.status, 200);

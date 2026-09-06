@@ -11,6 +11,11 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))));
 const recurrence = { version: 1, kind: "daily", start_date: "2026-09-02", local_time: "09:00:00", timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 1 };
 const definition = (body = "確認してください") => ({ recurrence, action: { kind: "reminder", body } });
+function activateEvent(databasePath: string, eventId: string): void {
+  const raw = new Database(databasePath);
+  raw.prepare("UPDATE events SET status = 'waiting_agent' WHERE event_id = ?").run(eventId);
+  raw.close();
+}
 
 async function fixture() {
   const { root, config } = await tempConfig(); roots.push(root);
@@ -22,6 +27,7 @@ async function fixture() {
   otherThreadEnvelope.subject.thread_ts = "1756722031.123456";
   otherThreadEnvelope.reply_target = { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722031.123456" };
   const otherThread = database.enqueue(otherThreadEnvelope).row;
+  for (const row of [first, other, otherThread]) activateEvent(config.databasePath, row.event_id);
   return { root, config, database, first, other, otherThread, api: new ScheduleApiService(database, () => new Date("2026-09-02T00:00:00Z")) };
 }
 
@@ -43,6 +49,7 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   assert.equal(new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("別本文") }), (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
   const updateEvent = database.enqueue(eventEnvelope("schedule-api-update")).row;
+  activateEvent(config.databasePath, updateEvent.event_id);
   api.update(schedule.schedule_id, { source_event_id: updateEvent.event_id, expected_revision: 1, definition: definition("更新後") });
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("更新後") }),
@@ -74,7 +81,7 @@ test("schedule一覧cursorは同一秒に後から作成したscheduleを見落�
 });
 
 test("別actorを拒否しrevision conflictと冪等transitionを区別する", async () => {
-  const { database, first, other, otherThread, api } = await fixture();
+  const { config, database, first, other, otherThread, api } = await fixture();
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-2", definition: definition() });
   const id = (created.schedule as { schedule_id: string }).schedule_id;
   assert.throws(() => api.get(id, other.event_id), /unauthorized/);
@@ -84,8 +91,29 @@ test("別actorを拒否しrevision conflictと冪等transitionを区別する", 
   assert.equal(api.transition(id, "pause", { source_event_id: first.event_id, expected_revision: 1 }).duplicate, true);
   assert.throws(() => api.transition(id, "resume", { source_event_id: first.event_id, expected_revision: 1 }), (error: unknown) => error instanceof ScheduleApiError && error.code === "revision_conflict");
   const updateEvent = database.enqueue(eventEnvelope("schedule-api-revision-update")).row;
+  activateEvent(config.databasePath, updateEvent.event_id);
   api.update(id, { source_event_id: updateEvent.event_id, expected_revision: 2, definition: definition("更新後") });
   assert.throws(() => api.transition(id, "resume", { source_event_id: first.event_id, expected_revision: 2 }), (error: unknown) => error instanceof ScheduleApiError && error.code === "revision_conflict");
+  database.close();
+});
+
+test("完了済みeventの遷移とstale updateを処理前に拒否する", async () => {
+  const { config, database, first, api } = await fixture();
+  const created = api.create({ source_event_id: first.event_id, idempotency_key: "active-event", definition: definition() });
+  const scheduleId = (created.schedule as { schedule_id: string }).schedule_id;
+  const raw = new Database(config.databasePath);
+  raw.prepare("UPDATE events SET status = 'completed' WHERE event_id = ?").run(first.event_id);
+  raw.close();
+  assert.throws(() => api.transition(scheduleId, "pause", { source_event_id: first.event_id, expected_revision: 1 }),
+    (error: unknown) => error instanceof ScheduleApiError && error.code === "unauthorized");
+  const updateEvent = database.enqueue(eventEnvelope("schedule-api-current-update")).row;
+  activateEvent(config.databasePath, updateEvent.event_id);
+  api.update(scheduleId, { source_event_id: updateEvent.event_id, expected_revision: 1, definition: definition("current") });
+  const staleEvent = database.enqueue(eventEnvelope("schedule-api-stale-update")).row;
+  activateEvent(config.databasePath, staleEvent.event_id);
+  const elapsed = { recurrence: { version: 1, kind: "once", at: "2026-09-01T00:00:00Z" }, action: { kind: "reminder", body: "stale" } };
+  assert.throws(() => api.update(scheduleId, { source_event_id: staleEvent.event_id, expected_revision: 1, definition: elapsed }),
+    (error: unknown) => error instanceof ScheduleApiError && error.code === "revision_conflict");
   database.close();
 });
 
@@ -129,6 +157,7 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
   assert.throws(() => api.update(id, { source_event_id: first.event_id, expected_revision: 1, definition: definition("不正な再承認") }),
     (error: unknown) => error instanceof ScheduleApiError && error.code === "authorization_revision_conflict");
   const updateEvent = database.enqueue(eventEnvelope("schedule-api-persistence-update")).row;
+  activateEvent(config.databasePath, updateEvent.event_id);
   const updated = api.update(id, { source_event_id: updateEvent.event_id, expected_revision: 1, definition: definition("更新本文") });
   assert.equal((updated.schedule as { revision: number }).revision, 2);
   const fingerprint = (updated.schedule as { fingerprint: Record<string, string> }).fingerprint;
@@ -146,12 +175,13 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
 });
 
 test("更新時も366日を越える次回occurrenceを永続化する", async () => {
-  const { database, first, api } = await fixture();
+  const { config, database, first, api } = await fixture();
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "long-interval", definition: definition() });
   const scheduleId = (created.schedule as { schedule_id: string }).schedule_id;
   const longInterval = { recurrence: { version: 1, kind: "monthly", start_date: "2026-09-02", local_time: "09:00:00",
     timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 13, day: 2 }, action: { kind: "reminder", body: "長周期" } };
   const updateEvent = database.enqueue(eventEnvelope("schedule-api-long-update")).row;
+  activateEvent(config.databasePath, updateEvent.event_id);
   const updated = new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).update(scheduleId,
     { source_event_id: updateEvent.event_id, expected_revision: 1, definition: longInterval });
   assert.equal((updated.schedule as { next_due: string }).next_due, "2027-10-02T00:00:00Z");
