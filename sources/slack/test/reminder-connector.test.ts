@@ -10,7 +10,7 @@ import { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 const keychain: KeychainStore = { async get() { return "xoxb-test"; }, async set() {} };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 async function connector(post: () => Promise<{ channelId: string; messageTs: string }>, getChannel = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
-  const client = { authenticate: async () => ({ teamId: "T1" }), getChannel,
+  const client = { authenticate: async () => ({ teamId: "T1", botUserId: "U_BOT" }), getChannel,
     getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
   return new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
 }
@@ -32,5 +32,8 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   })).deliver(input), { outcome: "revoked", code: "invalid_auth" });
   assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => ({
     id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: true,
+  }))).deliver(input)).outcome, "accepted");
+  assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => ({
+    id: "C1", isPrivate: true, isArchived: false, isMember: false, isShared: false, isMpim: true,
   }))).deliver(input)).outcome, "accepted");
 });

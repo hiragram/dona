@@ -59,6 +59,8 @@ export class SlackReminderConnector {
       const owner = await connection.client.getUser(input.owner_id);
       if (owner.isDeleted || owner.isBot || owner.isAppUser || (!channel.isIm && (!connection.client.hasChannelMember ||
         !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))))) return { outcome: "revoked", code: "owner_not_authorized" };
+      if (channel.isMpim && (!connection.botUserId || !connection.client.hasChannelMember ||
+        !(await connection.client.hasChannelMember(input.target.channel_id, connection.botUserId)))) return { outcome: "revoked", code: "target_not_allowed" };
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       return revokedSlackErrors.has(code)
@@ -66,7 +68,7 @@ export class SlackReminderConnector {
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
     try {
-      if (channel.isArchived || (!channel.isIm && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
+      if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
       if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };
       if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
       const current = Date.now();

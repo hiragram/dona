@@ -59,6 +59,7 @@ export interface SlackChannel {
   purpose?: string;
   memberCount?: number;
   isIm?: boolean;
+  isMpim?: boolean;
   userId?: string;
 }
 
@@ -178,6 +179,7 @@ function channelFromResponse(channel: {
   purpose?: { value?: string };
   num_members?: number;
   is_im?: boolean;
+  is_mpim?: boolean;
   user?: string;
 }): SlackChannel {
   return {
@@ -191,6 +193,7 @@ function channelFromResponse(channel: {
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
     ...(channel.is_im !== undefined ? { isIm: channel.is_im } : {}),
+    ...(channel.is_mpim !== undefined ? { isMpim: channel.is_mpim } : {}),
     ...(channel.user ? { userId: channel.user } : {}),
   };
 }
