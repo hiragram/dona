@@ -10,6 +10,7 @@ export interface UpdateNotificationRequest {
   notification_id: string;
   request_id: string;
   terminal_fence: number;
+  terminal_status?: "succeeded" | "failed" | "rolled_back" | "needs_review" | "cancelled";
   workspace_id: string;
   channel_id: string;
   thread_ts: string;
@@ -52,15 +53,19 @@ export function parseUpdateNotificationRequest(input: unknown): UpdateNotificati
   const value = exactObject(input);
   const keys = [
     "schema_version", "notification_id", "request_id", "terminal_fence", "workspace_id",
-    "channel_id", "thread_ts", "text", "desired_session_status",
+    "channel_id", "thread_ts", "text", "desired_session_status", "terminal_status",
   ];
-  if (Object.keys(value).some((key) => !keys.includes(key)) || keys.some((key) => !(key in value))) {
+  const requiredKeys = keys.filter((key) => key !== "terminal_status");
+  if (Object.keys(value).some((key) => !keys.includes(key)) || requiredKeys.some((key) => !(key in value))) {
     throw new Error("notification fields do not match schema");
   }
   if (value.schema_version !== 1 || typeof value.notification_id !== "string" ||
     !notificationIdPattern.test(value.notification_id) || typeof value.request_id !== "string" ||
     !/^upd_[0-9a-hjkmnp-tv-z]{26}$/.test(value.request_id) ||
-    !Number.isSafeInteger(value.terminal_fence) || (value.terminal_fence as number) < 1 ||
+    !Number.isSafeInteger(value.terminal_fence) || (value.terminal_fence as number) < 0 ||
+    (value.terminal_status !== undefined && ![
+      "succeeded", "failed", "rolled_back", "needs_review", "cancelled",
+    ].includes(value.terminal_status as string)) ||
     typeof value.workspace_id !== "string" || !idPattern.test(value.workspace_id) ||
     typeof value.channel_id !== "string" || !idPattern.test(value.channel_id) ||
     typeof value.thread_ts !== "string" || !timestampPattern.test(value.thread_ts) ||
@@ -70,6 +75,11 @@ export function parseUpdateNotificationRequest(input: unknown): UpdateNotificati
   }
   if (value.notification_id !== `update:${value.request_id}:terminal:${value.terminal_fence}`) {
     throw new Error("notification identity does not match request and fence");
+  }
+  if (value.terminal_fence === 0 && (
+    value.terminal_status !== "cancelled" || value.desired_session_status !== "active"
+  )) {
+    throw new Error("notification terminal fence 0 is reserved for an unclaimed cancellation");
   }
   return value as unknown as UpdateNotificationRequest;
 }
