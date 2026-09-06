@@ -212,6 +212,19 @@ test("失効境界のresumeを4xx化しpauseのexpire結果を同一eventで照�
   const retry = expiredApi.transition(activeId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
   assert.equal((retry.schedule as { state: string }).state, "expired");
   assert.equal(retry.duplicate, true);
+
+  const onceDefinition = { recurrence: { version: 1, kind: "once", at: "2026-09-03T00:00:00Z" },
+    action: { kind: "reminder", body: "一度だけ" } };
+  const once = api.create({ source_event_id: first.event_id, idempotency_key: "pause-expired-once", definition: onceDefinition });
+  const onceId = (once.schedule as { schedule_id: string }).schedule_id;
+  database.scheduler.materialize(onceId, 1, "2026-09-03T00:00:00Z", null, "2026-09-03T00:00:00Z",
+    { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: first.event_id });
+  const completed = expiredApi.transition(onceId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  assert.equal((completed.schedule as { state: string }).state, "completed");
+  assert.equal(completed.materialized_runs_affected, 1);
+  const completedRetry = expiredApi.transition(onceId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  assert.equal((completedRetry.schedule as { state: string }).state, "completed");
+  assert.equal(completedRetry.duplicate, true);
   database.close();
 });
 
