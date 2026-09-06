@@ -177,6 +177,20 @@ export class JobSupervisor {
         this.wake();
         throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
+      const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+      let stopped=false;
+      while(Date.now()<deadline) {
+        const observed=await this.runtime.get(cancelling.agent_name,this.abortController.signal);
+        if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+          (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {stopped=true;break;}
+        if(!observed.ok) break;
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      if(!stopped) {
+        this.database.markJobNeedsReview(jobId,"cancel_exit_unknown","Agent exit was not observed after cancellation acceptance");
+        this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
+      }
+      if(await this.tryComplete(cancelling,false)) return {row:this.database.getJob(jobId)!,duplicate:false};
       this.database.markJobCancelled(jobId, reason);
       this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -372,8 +386,8 @@ export class JobSupervisor {
       this.logTransition(row, this.database.getJob(row.job_id)!);
       return true;
     } catch (error) {
-      if (["cancelling","cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return true;
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
+      if (this.database.getJob(row.job_id)?.status === "cancelled") return true;
       this.database.markJobNeedsReview(
         row.job_id,
         error instanceof JobResultNotFoundError ? "result_missing" : "invalid_result",

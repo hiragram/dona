@@ -197,6 +197,7 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
     assert.equal(reopened.getJob(job.job_id)?.result_path,`${config.jobResultsDir}/${job.job_id}/result.json`);
+    assert.equal(reopened.listLegacySharedGrantJobs().some(row=>row.job_id===job.job_id),false);
     reopened.close();
   });
 

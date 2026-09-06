@@ -63,7 +63,7 @@ export class DispatcherDatabase {
       this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,stopped_at TEXT)");
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
-        this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
+        if(row.status!=="queued") this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
@@ -581,7 +581,7 @@ export class DispatcherDatabase {
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
       if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(completedAt.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-      this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running"], status, {
+      this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
         last_error_message: result.status === "failed" ? result.summary : null,

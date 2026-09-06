@@ -31,8 +31,9 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig): stri
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
-  const args = ["--add-dir", resultDirectory];
-  if(row.source==="dona_schedule") args.push("--sandbox","read-only","--ask-for-approval","never");
+  const args = row.source==="dona_schedule"
+    ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never"]
+    : ["--add-dir", resultDirectory];
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {

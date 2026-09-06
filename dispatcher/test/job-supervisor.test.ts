@@ -143,7 +143,7 @@ describe("JobSupervisor", () => {
     const steerTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
+      async get() { return ok("idle"); },
       async prompt(agentName, text) { steerTargets.push(agentName); steers.push(text); return ok("working"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
@@ -174,7 +174,7 @@ describe("JobSupervisor", () => {
     const waitTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
+      async get() { return ok("idle"); },
       async prompt() { return ok("working"); },
       async wait(agentName) {
         waitTargets.push(agentName);
@@ -210,7 +210,7 @@ describe("JobSupervisor", () => {
     const cancelTargets: string[] = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
-      async get() { return ok("working"); },
+      async get() { return ok("idle"); },
       async prompt() { return ok("working"); },
       async wait() { return ok("working"); },
       async cancel(agentName) { cancelTargets.push(agentName); return ok("idle"); },
@@ -228,14 +228,34 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const job=createScratchJob(database,config,"Ev-cancel-monitor-race"); markRunning(database,job.job_id);
     let resolveWait!: (value:HerdrCommandResult)=>void; let waiting=false;
-    const runtime=fakeRuntime({
+    let cancelled=false; const runtime=fakeRuntime({
       async wait(){waiting=true; return await new Promise<HerdrCommandResult>(resolve=>{resolveWait=resolve;});},
-      async cancel(){return ok("idle");},
+      async cancel(){cancelled=true;return ok("idle");}, async get(){return ok(cancelled?"idle":"working");},
     });
     const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined); supervisor.start();
     await waitFor(()=>waiting); await supervisor.cancel(job.job_id,job.source_event_id); resolveWait(ok("done"));
     await waitFor(()=>database.getJob(job.job_id)?.status==="cancelled"); await supervisor.stop();
     assert.equal(database.getJob(job.job_id)?.status,"cancelled"); database.close();
+  });
+
+  test("collects a result published while cancellation is stopping the agent", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-cancel-late-result"); markRunning(database,job.job_id);
+    let published=false;
+    const runtime=fakeRuntime({
+      async cancel(){return ok("idle");},
+      async get(){
+        if(!published) {
+          published=true; await fs.mkdir(path.dirname(job.result_path),{recursive:true});
+          await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+        }
+        return ok("idle");
+      },
+    });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.cancel(job.job_id,job.source_event_id);
+    assert.equal(result.row.status,"completed"); database.close();
   });
 
   test("treats pre-prompt agent absence as a completed cancellation", async () => {
