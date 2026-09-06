@@ -22,6 +22,7 @@ oauth_config:
       - groups:history
       - groups:read
       - im:history
+      - im:read
       - mpim:history
       - chat:write
       - files:read

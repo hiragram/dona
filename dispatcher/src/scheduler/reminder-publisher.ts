@@ -8,12 +8,13 @@ import type { Outbox, SchedulerRepository, Target } from "./repository.js";
 
 export interface SlackReminderCommand {
   schema_version: 1; action: "slack.reminder.post"; outbox_id: string; run_id: string;
-  idempotency_key: string; owner_id: string; target: Exclude<Target, { kind: "none" }>; text: string;
+  idempotency_key: string; owner_id: string; expires_at: string; send_before: string; target: Exclude<Target, { kind: "none" }>; text: string;
 }
 export type ReminderDelivery =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
+  | { outcome: "revoked"; code: string }
   | { outcome: "acceptance_unknown"; code: string };
 export interface SlackReminderPort { deliver(command: SlackReminderCommand): Promise<ReminderDelivery> }
 
@@ -21,9 +22,9 @@ function command(repository: SchedulerRepository, row: Outbox): SlackReminderCom
   if (row.kind !== "slack.reminder.post" || row.content === null) throw new Error("invalid_reminder_outbox");
   const target = JSON.parse(row.target_json) as Target;
   if (target.kind === "none" || target.workspace_id.length === 0 || target.channel_id.length === 0) throw new Error("invalid_reminder_target");
-  const run = repository.getRun(row.run_id); const schedule = run && repository.get(run.schedule_id);
-  if (!schedule) throw new Error("invalid_reminder_owner");
-  return { schema_version: 1, action: "slack.reminder.post", outbox_id: row.outbox_id, run_id: row.run_id, owner_id: schedule.owner_id,
+  const constraints = repository.reminderConstraints(row.outbox_id);
+  if (!constraints) throw new Error("invalid_reminder_owner");
+  return { schema_version: 1, action: "slack.reminder.post", outbox_id: row.outbox_id, run_id: row.run_id, ...constraints,
     idempotency_key: row.idempotency_key, target, text: row.content };
 }
 
@@ -53,6 +54,7 @@ export class ReminderPublisher {
     if (result.outcome === "accepted") this.repository.finishWrite(claimed.outbox_id, token, "sent", finishedAt, result.receipt_id);
     else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds);
     else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt);
+    else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt);
     else this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", finishedAt);
     this.logger.info("Slack reminder delivery settled", { outbox_id: claimed.outbox_id, run_id: claimed.run_id, outcome: result.outcome,
       code: "code" in result ? result.code : undefined });
@@ -93,8 +95,13 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   constructor(private readonly config: DispatcherConfig) {}
   async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
-    if (!token) return { outcome: "rejected", code: "missing_internal_token" };
+    if (!token) return { outcome: "not_accepted", code: "missing_internal_token", retry_after_seconds: 1 };
     try { return await request(this.config.slackAdapterSocketPath, token, input, this.config.jobCommandTimeoutMs); }
-    catch { return { outcome: "acceptance_unknown", code: "connector_transport_error" }; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ECONNREFUSED"
+        ? { outcome: "not_accepted", code: "connector_unavailable", retry_after_seconds: 1 }
+        : { outcome: "acceptance_unknown", code: "connector_transport_error" };
+    }
   }
 }

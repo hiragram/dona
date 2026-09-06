@@ -17,6 +17,8 @@ const command = z.strictObject({
   run_id: id,
   idempotency_key: id,
   owner_id: id,
+  expires_at: z.string().datetime({ offset: false }),
+  send_before: z.string().datetime({ offset: false }),
   target,
   text: z.string().min(1).refine((value) => [...value].length <= 2_000),
 });
@@ -25,6 +27,7 @@ export type SlackReminderResult =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
+  | { outcome: "revoked"; code: string }
   | { outcome: "acceptance_unknown"; code: string };
 
 const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)|https?:\/\/hooks\.slack\.com\/services\/|xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i;
@@ -49,19 +52,21 @@ export class SlackReminderConnector {
       channel = await connection.client.getChannel(input.target.channel_id);
       const owner = await connection.client.getUser(input.owner_id);
       if (owner.isDeleted || owner.isBot || owner.isAppUser || !connection.client.hasChannelMember ||
-        !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))) return { outcome: "rejected", code: "owner_not_authorized" };
+        !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))) return { outcome: "revoked", code: "owner_not_authorized" };
     } catch (error) {
       return { outcome: "not_accepted", code: error instanceof SlackApiError ? error.errorCode : "authorization_check_failed", retry_after_seconds: 1 };
     }
     try {
-      if (channel.isArchived || !channel.isMember || channel.isShared) return { outcome: "rejected", code: "target_not_allowed" };
-      if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "rejected", code: "target_not_allowed" };
+      if (channel.isArchived || !channel.isMember || channel.isShared) return { outcome: "revoked", code: "target_not_allowed" };
+      if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
+      if (new Date().toISOString() >= input.send_before || input.send_before > input.expires_at) return { outcome: "revoked", code: "authorization_expired" };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,
         ...(input.target.kind === "thread" ? { threadTs: input.target.thread_ts } : {}),
         replyBroadcast: false,
         identityBlockId: `dona_reminder_${input.run_id}`.slice(0, 255),
+        mrkdwn: false,
       });
       if (posted.channelId !== input.target.channel_id) return { outcome: "acceptance_unknown", code: "receipt_mismatch" };
       return { outcome: "accepted", receipt_id: posted.messageTs };
