@@ -28,21 +28,26 @@ const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 
-function configuredSchemaWrite(): 2 | 3 {
+function configuredSchemaCompatibility(): { read_max: 2 | 3; write: 2 | 3 } {
   const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
-  if (!manifestPath) return 2;
+  if (!manifestPath) return { read_max: 2, write: 2 };
   const resolvedPath = manifestPath === "~" ? os.homedir()
     : manifestPath.startsWith("~/") ? path.join(os.homedir(), manifestPath.slice(2)) : path.resolve(manifestPath);
-  const manifest = JSON.parse(fs.readFileSync(resolvedPath, "utf8")) as { compatibility?: { app_schema_write?: unknown } };
+  const manifest = JSON.parse(fs.readFileSync(resolvedPath, "utf8")) as {
+    compatibility?: { app_schema_read_max?: unknown; app_schema_write?: unknown };
+  };
+  const readMax = manifest.compatibility?.app_schema_read_max;
   const write = manifest.compatibility?.app_schema_write;
-  if (write !== 2 && write !== 3) throw new Error("Release manifest app_schema_write is invalid");
-  return write;
+  if ((readMax !== 2 && readMax !== 3) || (write !== 2 && write !== 3) || write > readMax) {
+    throw new Error("Release manifest schema compatibility is invalid");
+  }
+  return { read_max: readMax, write };
 }
 
 export const dispatcherSchemaCompatibility = {
   read_min: 2,
-  read_max: 3,
-  get write(): 2 | 3 { return configuredSchemaWrite(); },
+  get read_max(): 2 | 3 { return configuredSchemaCompatibility().read_max; },
+  get write(): 2 | 3 { return configuredSchemaCompatibility().write; },
 } as const;
 
 export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled";

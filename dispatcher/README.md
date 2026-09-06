@@ -93,7 +93,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
-bridge releaseはDB schema v2を正本として維持し、legacy jobを`job_key = legacy-default`として扱います。schema v3をreadできる互換primitiveは含みますが、release manifestのwrite schemaは2であり、自動migrationやmulti-job activationは行いません。production backup/restoreとactivationは別releaseで扱い、WAL稼働中DBの単体file copyをbackup扱いしません。
+bootstrap releaseはDB schema v2を正本として維持し、legacy jobを`job_key = legacy-default`として扱います。release manifestのread/write schemaはともに2で、自動migrationやmulti-job activationは行いません。次のbridge releaseでread maxだけを3へ広げられるplannerを含みます。production backup/restoreとactivationは別releaseで扱い、WAL稼働中DBの単体file copyをbackup扱いしません。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -140,7 +140,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" 
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/version
 ```
 
-`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。version healthはactual build SHA、protocol 1、実DB schema、read range 2〜3、write schema 2、config 1、`update_notification_protocol: 1`だけを出し、pathやsecretは返しません。
+`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。version healthはactual build SHA、protocol 1、実DB schema、release manifestのread/write schema、config 1、`update_notification_protocol: 1`だけを出し、pathやsecretは返しません。
 
 ## 運用CLI
 

@@ -86,7 +86,7 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 ## Backupとschema
 
-bridge releaseはapp DB `user_version=2`とlegacy single-job write/result/completionを維持し、`multi_job_enabled=false`を固定する。healthとrelease manifestのactual build SHA、read range 2〜3、write schema 2、protocol/configが一致しない場合はplanまたはpointer切替前に拒否する。current→bridgeはfast-forwardでなければならず、timeoutやconnection lossはpointer、receipt、version healthをread-onlyで照合してblind retryしない。
+bootstrap releaseはapp DB `user_version=2`とlegacy single-job write/result/completionを維持し、`multi_job_enabled=false`、read/write schema 2を固定する。bootstrapのplannerだけが、protocol/config・write schema・read min・rollback compatibilityを維持した次段のread max拡張を許可し、feature activationは拒否する。healthとrelease manifestのactual build SHA、read/write capabilityが一致しない場合はpointer切替前に拒否する。current→targetはfast-forwardでなければならず、timeoutやconnection lossはpointer、receipt、version healthをread-onlyで照合してblind retryしない。
 
 schema v3 migration、multi-job activation、SQLite Online Backup/restore、live Slack fan-out smokeは後続activation releaseの責務である。activation targetは実稼働bridge SHAの子孫でなければならず、rollback先もv3をread可能なbridgeに限定する。WAL稼働中の`.sqlite3`単体copyは禁止する。CIやrehearsalはlive rollout成功の代替にしない。
 

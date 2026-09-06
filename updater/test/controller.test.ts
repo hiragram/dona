@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { releaseCompatibilityMatches, UpdateController } from "../src/controller.js";
+import { releaseCompatibilityMatches, targetCompatibilityAllowedByPolicy, UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
@@ -40,10 +40,35 @@ test("requires a v2/v3 compatibility bridge before a schema-v3 writing release",
   assert.equal(releaseCompatibilityMatches(schemaV3, bridge), true);
 });
 
+test("allows only rollback-compatible read-max widening from the approved current policy", () => {
+  const approved = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const bridge = { ...approved, app_schema_read_max: 3 };
+  assert.equal(targetCompatibilityAllowedByPolicy(approved, approved, approved), true);
+  assert.equal(targetCompatibilityAllowedByPolicy(approved, bridge, approved), true);
+  for (const unsafe of [
+    { ...bridge, protocol: 2 },
+    { ...bridge, config: 2 },
+    { ...bridge, app_schema_read_min: 3 },
+    { ...bridge, app_schema_write: 3 },
+    { ...bridge, rollback_safe: false },
+    { ...bridge, app_schema_read_min: 1, app_schema_read_max: 1 },
+  ]) {
+    assert.equal(targetCompatibilityAllowedByPolicy(approved, unsafe, approved), false);
+  }
+  assert.equal(targetCompatibilityAllowedByPolicy(bridge, { ...bridge, app_schema_read_max: 4 }, approved), false);
+});
+
 class FakeGit implements GitPort {
   targetCompatibility: Compatibility = {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
     app_schema_write: 2, rollback_safe: true,
+  };
+  targetRollout = {
+    schema_version: 1 as const, phase: "compatibility_bootstrap", database_schema: 2,
+    multi_job_enabled: false, capabilities: ["safe_read_max_widening_planner"],
   };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
@@ -53,6 +78,7 @@ class FakeGit implements GitPort {
       target_reachable: this.reachable,
       ci_trusted: true,
       target_compatibility: this.targetCompatibility,
+      target_rollout: this.targetRollout,
     };
   }
   async stage(target: string, destination: string) {
@@ -267,6 +293,24 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
+  test("rehearses stable-to-bootstrap exact policy and bootstrap-to-bridge widening plans", async () => {
+    const exact = await fixture();
+    const bootstrapPlan = await exact.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    assert.deepEqual((bootstrapPlan.plan as { compatibility: Compatibility }).compatibility, exact.policy.compatibility);
+    exact.database.close();
+
+    const widening = await fixture();
+    widening.git.targetCompatibility = { ...widening.policy.compatibility, app_schema_read_max: 3 };
+    widening.git.targetRollout = {
+      schema_version: 1, phase: "compatibility_bridge", database_schema: 2,
+      multi_job_enabled: false, capabilities: ["app_schema_read_v2_v3"],
+    };
+    const bridgePlan = await widening.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    assert.equal((bridgePlan.plan as { compatibility: Compatibility }).compatibility.app_schema_read_max, 3);
+    assert.equal((bridgePlan.plan as { rollback_compatible: boolean }).rollback_compatible, true);
+    widening.database.close();
+  });
+
   test("waits for the source Result terminal barrier, then stages, activates, verifies, and routes completion", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -738,7 +782,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
-  test("fails planning closed when CI trust or candidate compatibility is not exact", async () => {
+  test("fails planning closed for untrusted, unsafe, or feature-activating candidates", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     await installPointers(policy);
@@ -753,6 +797,7 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: false,
       target_compatibility: policy.compatibility,
+      target_rollout: untrustedGit.targetRollout,
     });
     const untrusted = new UpdateController(database, policy, untrustedGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(untrusted.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /ci_trust_gate/);
@@ -763,9 +808,24 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: true,
       target_compatibility: { ...policy.compatibility, protocol: 2 },
+      target_rollout: incompatibleGit.targetRollout,
     });
     const incompatible = new UpdateController(database, policy, incompatibleGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(incompatible.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /approved_policy/);
+    const activatingGit = new FakeGit();
+    activatingGit.targetCompatibility = { ...policy.compatibility, app_schema_read_max: 3 };
+    activatingGit.targetRollout = { ...activatingGit.targetRollout, multi_job_enabled: true };
+    const activating = new UpdateController(database, policy, activatingGit, new FakeBuild(), store, runtime, dispatcher, logger);
+    await assert.rejects(activating.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /feature_activation/);
+    const disguisedActivationGit = new FakeGit();
+    disguisedActivationGit.targetCompatibility = { ...policy.compatibility, app_schema_read_max: 3 };
+    disguisedActivationGit.targetRollout = {
+      ...disguisedActivationGit.targetRollout, phase: "schema_v3_activation", capabilities: ["app_schema_read_v2_v3"],
+    };
+    const disguisedActivation = new UpdateController(
+      database, policy, disguisedActivationGit, new FakeBuild(), store, runtime, dispatcher, logger,
+    );
+    await assert.rejects(disguisedActivation.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /feature_activation/);
     database.close();
   });
 

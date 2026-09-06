@@ -16,7 +16,7 @@ describe("fixed self-update surface", () => {
       protocol: 1,
       config: 1,
       app_schema_read_min: 2,
-      app_schema_read_max: 3,
+      app_schema_read_max: 2,
       app_schema_write: 2,
       rollback_safe: true,
     });
