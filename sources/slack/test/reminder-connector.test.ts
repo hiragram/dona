@@ -9,8 +9,8 @@ import { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 
 const keychain: KeychainStore = { async get() { return "xoxb-test"; }, async set() {} };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
-async function connector(post: () => Promise<{ channelId: string; messageTs: string }>) {
-  const client = { authenticate: async () => ({ teamId: "T1" }), getChannel: async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false }),
+async function connector(post: () => Promise<{ channelId: string; messageTs: string }>, getChannel = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
+  const client = { authenticate: async () => ({ teamId: "T1" }), getChannel,
     getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
   return new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
 }
@@ -24,4 +24,7 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   assert.equal((await (await connector(async () => { throw new SlackApiError("slack_transport_error", "reset"); })).deliver(input)).outcome, "acceptance_unknown");
   assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }))).deliver({ ...input, text: "<!channel>" })).outcome, "rejected");
   assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }))).deliver({ ...input, target: { ...input.target, workspace_id: "T2" } })).outcome, "revoked");
+  assert.deepEqual(await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => {
+    throw new SlackApiError("token_revoked", "revoked");
+  })).deliver(input), { outcome: "revoked", code: "token_revoked" });
 });
