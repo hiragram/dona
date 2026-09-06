@@ -739,9 +739,28 @@ export class SchedulerRepository {
     now: string, retryAfterSeconds: number, decisionCode: string): Outbox {
     return this.db.transaction(() => {
       const current = this.getOutbox(outboxId, now);
-      if (current?.status === "cancelled" && current.claim_token === null) return current;
+      if (current?.status === "cancelled" && current.claim_token === null) {
+        if (outcome === "revoked") {
+          const run = this.getRun(current.run_id)!;
+          const schedule = this.get(run.schedule_id)!;
+          const runAuthorization = this.revision(run);
+          const currentAuthorization = this.revision(schedule);
+          if (runAuthorization.authorization_id === currentAuthorization.authorization_id &&
+            runAuthorization.authorization_revision === currentAuthorization.authorization_revision) {
+            this.retireRevisions(run.schedule_id, now, schedule.revision);
+            this.auditOutbox(current, "outbox_revoked", now, schedule, decisionCode);
+          }
+        }
+        return this.getOutbox(outboxId, now)!;
+      }
+      const run = current ? this.getRun(current.run_id)! : undefined;
       this.requestStarted(outboxId, token, now);
-      return this.finishWrite(outboxId, token, outcome, now, null, retryAfterSeconds, decisionCode);
+      const settled = this.finishWrite(outboxId, token, outcome, now, null, retryAfterSeconds, decisionCode);
+      this.db.prepare("UPDATE connector_outbox SET request_started_at = NULL WHERE outbox_id = ?").run(outboxId);
+      if (run) this.db.prepare(`DELETE FROM schedule_audit WHERE sequence = (
+        SELECT sequence FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_request_started' ORDER BY sequence DESC LIMIT 1
+      )`).run(run.schedule_id);
+      return this.getOutbox(outboxId, now) ?? settled;
     }).immediate();
   }
   finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0, rawDecisionCode?: string): Outbox {

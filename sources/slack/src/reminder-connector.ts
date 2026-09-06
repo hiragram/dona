@@ -49,8 +49,6 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 
 export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
-  private readonly authorizationInFlight = new Set<string>();
-  private readonly authorizationBlockedUntil = new Map<string, number>();
   private readonly prepared = new Map<string, { serialized: string; channel: SlackChannel; expiresAt: number }>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
 
@@ -71,26 +69,17 @@ export class SlackReminderConnector {
     if (!preflightOnly) {
       if (prepared?.serialized !== serialized || prepared.expiresAt < Date.now()) {
         this.prepared.delete(input.outbox_id);
-        return { outcome: "rejected", code: "preflight_required" };
+        return { outcome: "not_accepted", code: "preflight_required", retry_after_seconds: 0 };
       }
       this.prepared.delete(input.outbox_id);
     }
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
     catch { return { outcome: "revoked", code: "workspace_not_allowed" }; }
-    const authorizationKey = `${input.target.workspace_id}:${input.target.channel_id}`;
     if (!preflightOnly) {
       // The read-only checks below were completed by the immediately preceding preflight.
       return await this.postPrepared(connection, input, prepared!.channel);
     }
-    const authorizationDelay = Math.max(0, (this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0) - Date.now());
-    if (authorizationDelay > 0) {
-      return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
-    }
-    if (this.authorizationInFlight.has(authorizationKey)) {
-      return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
-    }
-    this.authorizationInFlight.add(authorizationKey);
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
@@ -102,17 +91,11 @@ export class SlackReminderConnector {
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
-        this.authorizationBlockedUntil.set(input.target.workspace_id, Math.max(
-          this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0,
-          Date.now() + (error.retryAfterSeconds ?? 1) * 1_000,
-        ));
         return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
       }
       return revokedSlackErrors.has(code)
         ? { outcome: "revoked", code }
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
-    } finally {
-      this.authorizationInFlight.delete(authorizationKey);
     }
     this.prepared.set(input.outbox_id, { serialized, channel, expiresAt: Date.now() + 60_000 });
     return { outcome: "prepared" };
@@ -136,7 +119,10 @@ export class SlackReminderConnector {
         mrkdwn: false,
         parse: "none",
       });
-      if (posted.channelId !== input.target.channel_id) return { outcome: "acceptance_unknown", code: "receipt_mismatch" };
+      if (posted.channelId !== input.target.channel_id ||
+        (input.target.kind === "thread" && posted.threadTs !== input.target.thread_ts)) {
+        return { outcome: "acceptance_unknown", code: "receipt_mismatch" };
+      }
       return { outcome: "accepted", receipt_id: posted.messageTs };
     } catch (error) {
       if (!(error instanceof SlackApiError)) return { outcome: "acceptance_unknown", code: "unexpected_error" };

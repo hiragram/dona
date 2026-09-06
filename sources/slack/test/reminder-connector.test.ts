@@ -9,11 +9,13 @@ import { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 
 const keychain: KeychainStore = { async get() { return "xoxb-test"; }, async set() {} };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
-async function connector(post: (input: { channelId: string }) => Promise<{ channelId: string; messageTs: string }>, getChannel: (channelId: string) => Promise<{ id: string; isPrivate: boolean; isArchived: boolean; isMember: boolean; isShared: boolean; isMpim?: boolean }> = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
+async function connector(post: (input: { channelId: string }) => Promise<{ channelId: string; messageTs: string; threadTs?: string }>, getChannel: (channelId: string) => Promise<{ id: string; isPrivate: boolean; isArchived: boolean; isMember: boolean; isShared: boolean; isMpim?: boolean }> = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
   const client = { authenticate: async () => ({ teamId: "T1", botUserId: "U_BOT" }), getChannel,
-    getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
+    getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true,
+    postMessage: async (request: { channelId: string; threadTs?: string }) => ({ ...(request.threadTs ? { threadTs: request.threadTs } : {}), ...await post(request) }),
+  } as unknown as SlackApiClient;
   const instance = new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
-  return { async deliver(value: unknown) {
+  return { preflight: (value: unknown) => instance.deliver(value, true), deliverPrepared: (value: unknown) => instance.deliver(value), async deliver(value: unknown) {
     const preflight = await instance.deliver(value, true);
     return preflight.outcome === "prepared" ? await instance.deliver(value) : preflight;
   } };
@@ -45,22 +47,32 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   })).deliver(input), { outcome: "revoked", code: "restricted_action_thread_locked" });
 });
 
-test("同一workspaceの同時認可照会を待機せずthrottleする", async () => {
+test("preflight ticket欠落をknown non-acceptance、thread receipt逸脱をunknownにする", async () => {
+  const missing = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }));
+  assert.deepEqual(await missing.deliverPrepared(input), { outcome: "not_accepted", code: "preflight_required", retry_after_seconds: 0 });
+  const mismatch = await connector(async () => ({ channelId: "C1", messageTs: "1.000001", threadTs: "2.000002" }));
+  const threadInput = { ...input, target: { kind: "thread", workspace_id: "T1", channel_id: "C1", thread_ts: "1.000001" } } as const;
+  assert.equal((await mismatch.preflight(threadInput)).outcome, "prepared");
+  assert.deepEqual(await mismatch.deliverPrepared(threadInput), { outcome: "acceptance_unknown", code: "receipt_mismatch" });
+});
+
+test("同一channelの同時認可照会を直列化しない", async () => {
   let release!: () => void;
   let calls = 0;
-  const instance = await connector(async () => {
+  const gate = new Promise<void>((resolve) => void (release = resolve));
+  const instance = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }), async () => {
     calls++;
-    if (calls === 1) await new Promise<void>((resolve) => void (release = resolve));
-    return { channelId: "C1", messageTs: `1.00000${calls}` };
+    await gate;
+    return { id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false };
   });
   const first = instance.deliver(input);
-  const second = await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
+  const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls, 1);
-  assert.deepEqual(second, { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 });
+  assert.equal(calls, 2);
   release();
   await first;
-  assert.equal(calls, 1);
+  await second;
+  assert.equal(calls, 2);
 });
 
 test("同一workspaceでも異なるchannelの認可照会を並行する", async () => {
@@ -91,7 +103,7 @@ test("認可rate limitをauthorization unavailableとして返す", async () => 
   assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
 });
 
-test("workspaceの認可rate-limit期限を短い後続429で短縮しない", async () => {
+test("認可rate limitを各preflightのRetry-Afterへ分離する", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => void (release = resolve));
   const instance = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }), async (channelId) => {
@@ -103,7 +115,5 @@ test("workspaceの認可rate-limit期限を短い後続429で短縮しない", a
   assert.equal(long.outcome, "authorization_unavailable");
   release();
   assert.equal((await short).outcome, "authorization_unavailable");
-  const blocked = await instance.deliver({ ...input, outbox_id: "o3", run_id: "r3", idempotency_key: "k3" });
-  assert.equal(blocked.outcome, "authorization_unavailable");
-  if (blocked.outcome === "authorization_unavailable") assert.ok(blocked.retry_after_seconds >= 59);
+  assert.equal(long.outcome === "authorization_unavailable" ? long.retry_after_seconds : 0, 60);
 });

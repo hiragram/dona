@@ -128,3 +128,20 @@ test("認可preflight中の通常pauseでauthorizationをretireしない", async
   assert.doesNotThrow(() => state.repo.transition("s1", state.repo.get("s1")!.revision, "resume", actor, at));
   state.database.close();
 });
+
+test("認可preflight中のpause後も確定revocationを継承する", async () => {
+  const state = setup([], {
+    recurrence_json: '{"interval":1,"kind":"daily","local_time":"09:00:00","start_date":"2026-09-06","timezone":"Asia/Tokyo","tzdb_version":"2025b","version":1}\n',
+    timezone: "Asia/Tokyo", tzdb_version: "2025b",
+  }, "2026-09-07T00:00:00Z");
+  const publisher = new ReminderPublisher(state.repo, {
+    async preflight() {
+      state.repo.transition("s1", 1, "pause", actor, at);
+      return { outcome: "revoked", code: "owner_not_authorized" };
+    },
+    async deliver() { throw new Error("write must not run"); },
+  }, new FakeClock(at), logger);
+  await publisher.publishOne();
+  assert.throws(() => state.repo.transition("s1", state.repo.get("s1")!.revision, "resume", actor, at), /authorization_expired/);
+  state.database.close();
+});

@@ -46,7 +46,7 @@ export class ReminderPublisher {
   isRunning(): boolean { return this.running; }
   async publishOne(): Promise<boolean> {
     const now = this.clock.now();
-    const claimed = this.repository.claim(now, 60, "slack.reminder.post");
+    const claimed = this.repository.claim(now, 180, "slack.reminder.post");
     if (!claimed) return false;
     await this.publishClaimed(claimed, now);
     return true;
@@ -90,7 +90,7 @@ export class ReminderPublisher {
         // Quota is 100 schedules per tenant; a 100-wide global bound also gives multiple tenants
         // independent capacity while channel-level throttling protects Slack writes.
         const now = this.clock.now();
-        const claimed = this.repository.claimBatch(now, 60, "slack.reminder.post", 100);
+        const claimed = this.repository.claimBatch(now, 180, "slack.reminder.post", 100);
         if (claimed.length === 0) break;
         const settled = await Promise.allSettled(claimed.map((row) => this.publishClaimed(row, now)));
         const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
