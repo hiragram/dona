@@ -6,7 +6,7 @@ import { afterEach, test } from "node:test";
 
 import Database from "better-sqlite3";
 
-import { assertSchemaActivationSafe, migrateV2ToV3WithBackup } from "../src/schema-rollout.js";
+import { assertReceiptMatchesDatabases, assertSchemaActivationSafe, migrateV2ToV3WithBackup } from "../src/schema-rollout.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))));
@@ -65,6 +65,19 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   assert.equal(migrated.pragma("user_version", { simple: true }), 3);
   assert.equal(migrated.prepare("SELECT result_json FROM jobs").pluck().get(), '{"status":"completed"}');
   migrated.close();
+
+  const changed = new Database(databasePath);
+  changed.prepare(`INSERT INTO events (
+    event_id, schema_version, source, external_event_id, event_type, occurred_at,
+    subject_json, payload_json, status, available_at, created_at, updated_at
+  ) VALUES (?, 1, 'slack', 'Ev-after-receipt', 'message', ?, '{}', '{}', 'queued', ?, ?, ?)`)
+    .run("evt_01M1ES03XY5CF8D9PM5CWX4SRX", at, at, at, at);
+  changed.close();
+  const changedRead = new Database(databasePath, { readonly: true });
+  const backupRead = new Database(backupPath, { readonly: true });
+  assert.throws(() => assertReceiptMatchesDatabases(receipt, changedRead, backupRead), /receipt_state_mismatch/);
+  changedRead.close();
+  backupRead.close();
 });
 
 test("migration refuses to run before drain and never overwrites a backup", async () => {

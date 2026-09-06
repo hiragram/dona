@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -462,6 +463,27 @@ export class RealRuntime implements RuntimePort {
     return snapshot;
   }
 
+  async schemaMigrationCapability(): Promise<{ ready: boolean; build_sha: string | null }> {
+    const buildSha = process.env.DONA_UPDATER_BUILD_SHA?.trim() ?? null;
+    if (!buildSha || !/^[0-9a-f]{40}$/.test(buildSha)) return { ready: false, build_sha: null };
+    try {
+      const receiptPath = path.join(this.policy.control_root, "control-plane-receipt.json");
+      const stats = await fs.lstat(receiptPath);
+      const uid = process.getuid?.();
+      if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+      return {
+        ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
+          receipt.schema_migration_capability === "dispatcher_v2_to_v3_online_backup_v1",
+        build_sha: buildSha,
+      };
+    } catch {
+      return { ready: false, build_sha: buildSha };
+    }
+  }
+
   stopSlack(): Promise<CommandResult> {
     return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.slack_label)]);
   }
@@ -471,11 +493,11 @@ export class RealRuntime implements RuntimePort {
   }
 
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
-    const root = path.resolve(this.policy.config_root, "..");
+    const databasePath = this.dispatcherDatabasePath();
     const backupRoot = path.join(this.policy.control_root, "schema-backups", requestId);
     return this.runner.run(this.policy.executables.node, [
       path.join(this.policy.release_root, targetSha, "dispatcher", "dist", "schema-rollout-cli.js"),
-      path.join(root, "dona.sqlite3"),
+      databasePath,
       path.join(backupRoot, "dispatcher-v2.sqlite3"),
       path.join(backupRoot, "migration-receipt.json"),
       JSON.stringify(previous),
@@ -485,6 +507,40 @@ export class RealRuntime implements RuntimePort {
       outputLimitBytes: this.policy.output_limit_bytes,
       env: minimalEnvironment(),
     });
+  }
+
+  private dispatcherDatabasePath(): string {
+    const environmentPath = path.join(this.policy.config_root, "dispatcher.env");
+    const stats = fsSync.lstatSync(environmentPath);
+    const uid = process.getuid?.();
+    if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      throw new Error("dispatcher_environment_identity_invalid");
+    }
+    const body = fsSync.readFileSync(environmentPath, "utf8");
+    let configured: string | undefined;
+    for (const rawLine of body.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const match = /^(?:export\s+)?DONA_DATABASE_PATH\s*=\s*(.*)$/.exec(line);
+      if (!match) continue;
+      if (configured !== undefined) throw new Error("dispatcher_database_path_duplicated");
+      let value = match[1]!.trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+      if (!value || /[\0\r\n]/.test(value) || value.includes("${") || value.includes("$(") || value.includes("`")) {
+        throw new Error("dispatcher_database_path_invalid");
+      }
+      configured = value;
+    }
+    const base = path.resolve(this.policy.config_root, "..");
+    const resolved = configured === undefined ? path.join(base, "dona.sqlite3")
+      : configured === "~" ? os.homedir()
+        : configured.startsWith("~/") ? path.join(os.homedir(), configured.slice(2)) : path.resolve(configured);
+    if (!path.isAbsolute(resolved) || path.normalize(resolved) !== resolved) throw new Error("dispatcher_database_path_invalid");
+    const database = fsSync.lstatSync(resolved);
+    if (!database.isFile() || database.isSymbolicLink() || database.uid !== uid || (database.mode & 0o077) !== 0) {
+      throw new Error("dispatcher_database_identity_invalid");
+    }
+    return resolved;
   }
 
   startDispatcher(): Promise<CommandResult> {

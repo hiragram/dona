@@ -85,6 +85,11 @@ export class UpdateController {
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
     if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
+    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
+      controlPlane = await this.runtime.schemaMigrationCapability();
+      if (!controlPlane.ready) throw new Error("stable_updater_schema_migration_capability_required");
+    }
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,
@@ -98,7 +103,10 @@ export class UpdateController {
       request_id: result.row.request_id,
       duplicate: result.duplicate,
       plan: result.plan,
-      preflight: { storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable },
+      preflight: {
+        storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
+        ...(controlPlane ? { schema_migration_control_plane_sha: controlPlane.build_sha } : {}),
+      },
     };
   }
 
@@ -500,6 +508,12 @@ export class UpdateController {
       ))) return;
       const previousCompatibility = (await this.releases.readCurrentManifest()).compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
+        const controlPlane = await this.runtime.schemaMigrationCapability();
+        this.assertLease(row);
+        if (!controlPlane.ready) {
+          this.needsReview(row, "stable_updater_schema_migration_capability_unverified");
+          return;
+        }
         const migration = await this.runtime.migrateAppSchema(
           row.request_id, row.target_sha, previousCompatibility, targetCompatibility,
         );

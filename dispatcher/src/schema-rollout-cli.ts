@@ -4,7 +4,12 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
-import { migrateV2ToV3WithBackup, type SchemaCompatibility } from "./schema-rollout.js";
+import {
+  assertReceiptMatchesDatabases,
+  migrateV2ToV3WithBackup,
+  type MigrationReceipt,
+  type SchemaCompatibility,
+} from "./schema-rollout.js";
 
 async function main(): Promise<void> {
   const [databasePath, backupPath, receiptPath, previousJson, targetJson] = process.argv.slice(2);
@@ -12,17 +17,14 @@ async function main(): Promise<void> {
   await fs.mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(backupPath), 0o700);
   try {
-    const existing = JSON.parse(await fs.readFile(receiptPath, "utf8")) as { schema_version?: unknown; to_schema?: unknown };
+    const existing = JSON.parse(await fs.readFile(receiptPath, "utf8")) as MigrationReceipt;
     if (existing.schema_version !== 1 || existing.to_schema !== 3) throw new Error("schema_rollout_receipt_invalid");
     const migrated = new Database(databasePath, { readonly: true, fileMustExist: true });
     const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
     try {
-      if (migrated.pragma("user_version", { simple: true }) !== 3 ||
-        backup.pragma("user_version", { simple: true }) !== 2 ||
-        migrated.pragma("integrity_check", { simple: true }) !== "ok" ||
-        backup.pragma("integrity_check", { simple: true }) !== "ok") {
-        throw new Error("schema_rollout_receipt_state_mismatch");
-      }
+      migrated.pragma("foreign_keys = ON");
+      backup.pragma("foreign_keys = ON");
+      assertReceiptMatchesDatabases(existing, migrated, backup);
     } finally {
       migrated.close();
       backup.close();

@@ -8,7 +8,7 @@ import { parseApplyRequest, parseCompatibilityMetadata, parsePlanRequest } from 
 import { tempPolicy } from "./helpers.js";
 
 describe("fixed self-update surface", () => {
-  test("publishes the dispatcher v2/v3 read range and schema-v3 write target", async () => {
+  test("publishes the dispatcher v2/v3 read range while the bridge keeps schema-v2 writes", async () => {
     const metadata = parseCompatibilityMetadata(JSON.parse(
       await fs.readFile(new URL("../../config/release-compatibility.json", import.meta.url), "utf8"),
     ));
@@ -17,7 +17,7 @@ describe("fixed self-update surface", () => {
       config: 1,
       app_schema_read_min: 2,
       app_schema_read_max: 3,
-      app_schema_write: 3,
+      app_schema_write: 2,
       rollback_safe: true,
     });
     const examplePolicy = JSON.parse(

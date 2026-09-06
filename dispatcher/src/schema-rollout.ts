@@ -31,20 +31,38 @@ const preservedCounts = {
   job_completions: "SELECT COUNT(*) AS count FROM jobs WHERE completed_at IS NOT NULL",
 } as const;
 
-function countSnapshot(db: Database.Database): Record<string, number> {
+export function countSnapshot(db: Database.Database): Record<string, number> {
   return Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
     name,
     (db.prepare(sql).get() as { count: number }).count,
   ]));
 }
 
-function verify(db: Database.Database, expectedVersion: number): void {
+export function verifyDatabase(db: Database.Database, expectedVersion: number): void {
   const integrity = db.pragma("integrity_check", { simple: true });
   if (integrity !== "ok") throw new Error("database_integrity_check_failed");
   const foreignKeys = db.pragma("foreign_key_check") as unknown[];
   if (foreignKeys.length !== 0) throw new Error("database_foreign_key_check_failed");
   const version = db.pragma("user_version", { simple: true });
   if (version !== expectedVersion) throw new Error(`database_schema_${String(version)}_does_not_match_${expectedVersion}`);
+}
+
+export function assertReceiptMatchesDatabases(
+  receipt: MigrationReceipt,
+  migrated: Database.Database,
+  backup: Database.Database,
+): void {
+  verifyDatabase(migrated, 3);
+  verifyDatabase(backup, 2);
+  const migratedCounts = countSnapshot(migrated);
+  const backupCounts = countSnapshot(backup);
+  const names = Object.keys(receipt.preservation);
+  if (names.length !== Object.keys(migratedCounts).length || names.some((name) =>
+    !(name in migratedCounts) ||
+    receipt.preservation[name]?.before !== backupCounts[name] ||
+    receipt.preservation[name]?.after !== migratedCounts[name] ||
+    backupCounts[name] !== migratedCounts[name]
+  )) throw new Error("schema_rollout_receipt_state_mismatch");
 }
 
 export function assertSchemaActivationSafe(
@@ -85,7 +103,7 @@ export async function migrateV2ToV3WithBackup(input: {
   try {
     const actual = source.pragma("user_version", { simple: true }) as number;
     assertSchemaActivationSafe(input.previous, input.target, actual);
-    verify(source, 2);
+    verifyDatabase(source, 2);
     const before = countSnapshot(source);
 
     // better-sqlite3 uses SQLite's Online Backup API and includes committed WAL pages.
@@ -94,7 +112,7 @@ export async function migrateV2ToV3WithBackup(input: {
     const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
     try {
       backup.pragma("foreign_keys = ON");
-      verify(backup, 2);
+      verifyDatabase(backup, 2);
       if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before)) throw new Error("schema_backup_count_mismatch");
     } finally {
       backup.close();
@@ -104,7 +122,7 @@ export async function migrateV2ToV3WithBackup(input: {
     source.transaction(() => {
       migrateDispatcherDatabase(source, () => {}, true);
       input.postMigrationHook?.();
-      verify(source, dispatcherSchemaCompatibility.write);
+      verifyDatabase(source, dispatcherSchemaCompatibility.write);
       const after = countSnapshot(source);
       preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
         before: before[name]!, after: after[name]!,

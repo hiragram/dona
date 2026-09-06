@@ -60,6 +60,7 @@ export interface RuntimePort {
   stopSlack(): Promise<CommandResult>;
   stopDispatcher(): Promise<CommandResult>;
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;
+  schemaMigrationCapability(): Promise<{ ready: boolean; build_sha: string | null }>;
   startDispatcher(): Promise<CommandResult>;
   startSlack(): Promise<CommandResult>;
   waitForMainAgentIdle(): Promise<MainAgentObservation>;

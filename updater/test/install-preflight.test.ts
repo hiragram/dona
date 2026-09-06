@@ -143,6 +143,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /--upgrade-control/);
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
+  assert.match(source, /control-plane-receipt\.json/);
+  assert.match(source, /dispatcher_v2_to_v3_online_backup_v1/);
   assert.match(source, /updater\.previous\.sqlite3/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);
