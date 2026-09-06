@@ -131,6 +131,7 @@ export class JobProgressCoordinator {
   private readonly terminalReconciliations = new Map<string,Promise<void>>();
   private readonly invalidProgressWarnings = new Map<string,string>();
   private readonly drainAbort = new AbortController();
+  private backgroundRecovery:Promise<void>|undefined;
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
@@ -172,7 +173,20 @@ export class JobProgressCoordinator {
     this.invalidProgressWarnings.delete(row.job_id);
   }
   async recover(): Promise<void> {
-    if(this.store.hasDelivering())await this.drainAdapter();
+    if(this.store.hasDelivering()){
+      try {await this.drainAdapter();}
+      catch(error){throw Object.assign(error instanceof Error?error:new Error(String(error)),{progressRecoveryDeferred:true});}
+    }
+    await this.finishRecovery();
+  }
+  recoverInBackground():Promise<void> {
+    if(this.backgroundRecovery)return this.backgroundRecovery;
+    const operation=(async()=>{if(this.store.hasDelivering()&&!await this.drainAdapterUntilSettled("startup"))return;await this.finishRecovery();})();
+    this.backgroundRecovery=operation;
+    void operation.finally(()=>{if(this.backgroundRecovery===operation)this.backgroundRecovery=undefined;}).catch(()=>undefined);
+    return operation;
+  }
+  private async finishRecovery():Promise<void> {
     this.store.recoverDeliveries();
     let after="";for(;;){const batch=this.store.recoverable(after,500);for(const progress of batch){const job=this.jobs.getJob(progress.job_id);if(job&&terminalStatuses.has(job.status))await this.ingest(job);}if(batch.length<500)break;after=batch.at(-1)!.job_id;}
   }
@@ -233,7 +247,7 @@ export class JobProgressCoordinator {
 
   private jobNotificationReady(jobId:string):boolean { const row=this.store.get(jobId);return row!==undefined&&row.terminal_checked===1&&!this.deliveryOperations.has(jobId); }
   async drainDeliveries(jobIds?:string[]):Promise<void> { const operations=jobIds?jobIds.flatMap((jobId)=>{const operation=this.deliveryOperations.get(jobId);return operation?[operation]:[]}):[...this.deliveryOperations.values()];await Promise.allSettled(operations); }
-  async stop():Promise<void> {this.drainAbort.abort();await Promise.allSettled([...this.terminalReconciliations.values()]);await this.drainDeliveries();}
+  async stop():Promise<void> {this.drainAbort.abort();await this.backgroundRecovery;await Promise.allSettled([...this.terminalReconciliations.values()]);await this.drainDeliveries();}
 
   private async drainAdapter():Promise<void> {
     const token=await readPrivateToken(this.config.updateInternalTokenPath); if(!token)throw new Error("missing internal token for progress drain");

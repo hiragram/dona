@@ -81,6 +81,13 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     jobSupervisor.recoverStaleJobs();
     try { await jobProgress?.recover(); }
     catch (error) {
+      if((error as Error&{progressRecoveryDeferred?:boolean}).progressRecoveryDeferred&&jobProgress){
+        apiLogger.warn("Job progress recovery deferred without releasing delivery fences",{
+          error_code:"job_progress_recovery_deferred",
+          error_message:error instanceof Error?error.message:String(error),
+        });
+        void jobProgress.recoverInBackground();
+      } else {
       apiLogger.warn("Job progress disabled after recovery failure", {
         error_code: "job_progress_recovery_failed",
         error_message: error instanceof Error ? error.message : String(error),
@@ -90,6 +97,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       jobProgress = undefined;
       await jobSupervisor.disableProgress();
       api.disableJobProgress();
+      }
     }
     worker.start();
     jobSupervisor.start();

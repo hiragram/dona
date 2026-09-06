@@ -303,6 +303,26 @@ test("startup drain times out without clearing the delivery fence", async () => 
   }
 });
 
+test("background recovery keeps the fence until a later drain succeeds", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-background-recover-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  const socketPath=path.join(root,"adapter.sock"); const tokenPath=path.join(root,"token");
+  const server=http.createServer((_request,response)=>{response.writeHead(200).end();});
+  try {
+    store.ingest(valid); store.begin("job_abc");
+    const coordinator=new JobProgressCoordinator({getJob:()=>undefined} as never,store,{updateInternalTokenPath:tokenPath,slackAdapterSocketPath:socketPath,jobCommandTimeoutMs:100} as never,{warn(){}} as never);
+    await assert.rejects(coordinator.recover(),/missing internal token/);
+    assert.equal(store.get("job_abc")?.status,"delivering");
+    await fs.writeFile(tokenPath,"c".repeat(64),{mode:0o600});
+    await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);});
+    await coordinator.recoverInBackground();
+    assert.equal(store.get("job_abc")?.status,"unknown");
+    await coordinator.stop();
+  } finally {
+    server.closeAllConnections(); await new Promise<void>((resolve)=>server.close(()=>resolve()));
+    store.close(); await fs.rm(root,{recursive:true});
+  }
+});
+
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); INSERT INTO job_progress VALUES ('job_legacy',1,'testing','token=untrusted','2026-09-05T00:00:00Z','delivered','2026-09-05T00:00:00Z',NULL,NULL); PRAGMA user_version=1;"); legacy.close();
