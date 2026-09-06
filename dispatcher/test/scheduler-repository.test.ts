@@ -791,6 +791,18 @@ test("connector revocationは旧authorizationの通常resumeを拒否する", ()
   assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
 });
 
+test("認可照会中のpause複製も遅着revocationでresume不能にする", () => {
+  const { repo } = setup();
+  repo.create("revoked_after_pause", input, due, actor, now);
+  repo.materialize("revoked_after_pause", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("revoked_after_pause", 1, "pause", actor, later);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", later);
+  assert.equal(repo.get("revoked_after_pause")?.state, "paused");
+  assert.throws(() => repo.transition("revoked_after_pause", 2, "resume", actor, afterLater), /authorization_expired/);
+});
+
 test("認可照会不能はretry上限後にscheduleをpauseする", () => {
   const { repo } = setup();
   repo.create("auth_unavailable", input, due, actor, now);

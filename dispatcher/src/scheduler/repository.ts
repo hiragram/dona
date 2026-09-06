@@ -728,10 +728,14 @@ export class SchedulerRepository {
           receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
         if (outcome === "unavailable" && retry) this.db.prepare("UPDATE connector_outbox SET attempt = attempt - 1 WHERE outbox_id = ?").run(outboxId);
         if (outcome === "revoked" || (outcome === "authorization_unavailable" && !retry)) {
-          const paused = this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND revision = ? AND state = 'active'").run(finishedAt, run.schedule_id, run.revision);
-          if (paused.changes === 1) {
+          const runAuthorization = this.revision(run);
+          const currentAuthorization = this.revision(schedule);
+          const sameAuthorization = runAuthorization.authorization_id === currentAuthorization.authorization_id &&
+            runAuthorization.authorization_revision === currentAuthorization.authorization_revision;
+          if (sameAuthorization && ["active", "paused"].includes(schedule.state)) {
+            this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND state = 'active'").run(finishedAt, run.schedule_id);
             this.suppress(run.schedule_id, finishedAt, "cancelled");
-            this.retireRevisions(run.schedule_id, finishedAt, run.revision);
+            this.retireRevisions(run.schedule_id, finishedAt, schedule.revision);
           }
         }
         if (outcome === "misfire" && authorized) {

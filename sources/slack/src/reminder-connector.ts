@@ -77,7 +77,6 @@ export class SlackReminderConnector {
         text: input.text,
         ...(input.target.kind === "thread" ? { threadTs: input.target.thread_ts } : {}),
         replyBroadcast: false,
-        identityBlockId: `dona_reminder_${input.run_id}`.slice(0, 255),
         mrkdwn: false,
       });
       if (posted.channelId !== input.target.channel_id) return { outcome: "acceptance_unknown", code: "receipt_mismatch" };

@@ -15,7 +15,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const at = "2026-09-06T00:00:00Z";
 const actor: Actor = { tenant_id: "T1", actor_id: "U1", role: "owner", source_event_id: null };
-function setup(outcomes: ReminderDelivery[]) {
+function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[]) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-reminder-")); roots.push(root);
   const database = new DispatcherDatabase(path.join(root, "db.sqlite"));
   const repo = database.scheduler.withCodecs({ recurrence: value => value, policy: value => value });
@@ -28,8 +28,8 @@ function setup(outcomes: ReminderDelivery[]) {
   repo.create("s1", input, at, actor, "2026-09-05T00:00:00Z");
   const run = repo.materialize("s1", 1, at, null, at, actor).run;
   const commands: SlackReminderCommand[] = [];
-  const publisher = new ReminderPublisher(repo, { async deliver(command) { commands.push(command); return outcomes.shift()!; } }, new FakeClock(at), logger);
-  return { database, repo, run, commands, publisher };
+  const publisher = new ReminderPublisher(repo, { async deliver(command) { commands.push(command); return await outcomes.shift()!; } }, new FakeClock(at), logger);
+  return { database, repo, run, commands, publisher, input };
 }
 
 test("typed commandを1回送信してrun/outbox/auditを完了する", async () => {
@@ -61,4 +61,21 @@ test("claim後のpauseでconnectorを呼ばずoutboxを抑止する", async () =
   const state = setup([{ outcome: "accepted", receipt_id: "1.000002" }]);
   state.repo.transition("s1", 1, "pause", actor, at);
   assert.equal(await state.publisher.publishOne(), false); assert.equal(state.commands.length, 0); state.database.close();
+});
+
+test("独立reminderをbounded concurrencyで配送開始する", async () => {
+  let finishFirst!: (value: ReminderDelivery) => void;
+  let finishSecond!: (value: ReminderDelivery) => void;
+  const first = new Promise<ReminderDelivery>((resolve) => void (finishFirst = resolve));
+  const second = new Promise<ReminderDelivery>((resolve) => void (finishSecond = resolve));
+  const state = setup([first, second]);
+  state.repo.create("s2", { ...state.input, authorization_id: "auth2" }, at, actor, "2026-09-05T00:00:00Z");
+  state.repo.materialize("s2", 1, at, null, at, actor);
+  state.publisher.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.commands.length, 2);
+  finishFirst({ outcome: "accepted", receipt_id: "1.000002" });
+  finishSecond({ outcome: "accepted", receipt_id: "1.000003" });
+  await state.publisher.stop();
+  state.database.close();
 });

@@ -68,7 +68,12 @@ export class ReminderPublisher {
   }
   private async tick(): Promise<void> {
     if (!this.running) return;
-    try { while (this.running && await this.publishOne()) {} }
+    try {
+      while (this.running) {
+        const settled = await Promise.all(Array.from({ length: 4 }, () => this.publishOne()));
+        if (!settled.some(Boolean)) break;
+      }
+    }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }
     if (this.running) { this.timer = setTimeout(() => { this.loopPromise = this.tick(); }, this.pollMs); this.timer.unref(); }
   }
