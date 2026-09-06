@@ -48,6 +48,8 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 
 export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
+  private readonly authorizationInFlight = new Set<string>();
+  private readonly authorizationBlockedUntil = new Map<string, number>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
 
   private reservePost(workspaceId: string, channelId: string): number {
@@ -65,6 +67,11 @@ export class SlackReminderConnector {
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
     catch { return { outcome: "revoked", code: "workspace_not_allowed" }; }
+    const authorizationDelay = Math.max(0, (this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0) - Date.now());
+    if (authorizationDelay > 0 || this.authorizationInFlight.has(input.target.workspace_id)) {
+      return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
+    }
+    this.authorizationInFlight.add(input.target.workspace_id);
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
@@ -75,9 +82,15 @@ export class SlackReminderConnector {
         !(await connection.client.hasChannelMember(input.target.channel_id, connection.botUserId)))) return { outcome: "revoked", code: "target_not_allowed" };
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
+      if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
+        this.authorizationBlockedUntil.set(input.target.workspace_id, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000);
+        return { outcome: "unavailable", code: "authorization_rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
+      }
       return revokedSlackErrors.has(code)
         ? { outcome: "revoked", code }
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
+    } finally {
+      this.authorizationInFlight.delete(input.target.workspace_id);
     }
     try {
       if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };

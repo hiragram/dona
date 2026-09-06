@@ -44,10 +44,14 @@ export class ReminderPublisher {
     const now = this.clock.now();
     const claimed = this.repository.claim(now, 60, "slack.reminder.post");
     if (!claimed) return false;
+    await this.publishClaimed(claimed, now);
+    return true;
+  }
+  private async publishClaimed(claimed: Outbox, now: string): Promise<void> {
     const token = claimed.claim_token!;
     let input: SlackReminderCommand;
     try { input = command(this.repository, claimed); }
-    catch { this.repository.requestStarted(claimed.outbox_id, token, now); this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", now); return true; }
+    catch { this.repository.requestStarted(claimed.outbox_id, token, now); this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", now); return; }
     // This durable transition is the last operation before the connector call. A crash afterwards is acceptance unknown.
     this.repository.requestStarted(claimed.outbox_id, token, now);
     let result: ReminderDelivery;
@@ -64,7 +68,6 @@ export class ReminderPublisher {
     else this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", finishedAt, null, 0, result.code);
     this.logger.info("Slack reminder delivery settled", { outbox_id: claimed.outbox_id, run_id: claimed.run_id, outcome: result.outcome,
       code: "code" in result ? result.code : undefined });
-    return true;
   }
   private async tick(): Promise<void> {
     if (!this.running) return;
@@ -72,10 +75,12 @@ export class ReminderPublisher {
       while (this.running) {
         // Quota is 100 schedules per tenant; a 100-wide global bound also gives multiple tenants
         // independent capacity while channel-level throttling protects Slack writes.
-        const settled = await Promise.allSettled(Array.from({ length: 100 }, () => this.publishOne()));
+        const now = this.clock.now();
+        const claimed = this.repository.claimBatch(now, 60, "slack.reminder.post", 100);
+        if (claimed.length === 0) break;
+        const settled = await Promise.allSettled(claimed.map((row) => this.publishClaimed(row, now)));
         const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
         if (failed) throw failed.reason;
-        if (!settled.some((result) => result.status === "fulfilled" && result.value)) break;
       }
     }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }

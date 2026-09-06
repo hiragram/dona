@@ -632,10 +632,14 @@ export class SchedulerRepository {
       `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now);
   }
   claim(now: string, leaseSeconds = 60, kind?: Outbox["kind"]): Outbox | undefined {
+    return this.claimBatch(now, leaseSeconds, kind, 1)[0];
+  }
+  claimBatch(now: string, leaseSeconds = 60, kind?: Outbox["kind"], limit = 100): Outbox[] {
     utc(now); if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 300) throw new Error("invalid_lease");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
     return this.db.transaction(() => {
       this.recover(now);
-      const row = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+      const select = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
         JOIN schedules s ON s.schedule_id = r.schedule_id JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
         WHERE o.status = 'pending' AND o.available_at <= ? AND o.content IS NOT NULL AND s.state = 'active'
         AND (? IS NULL OR o.kind = ?)
@@ -645,11 +649,16 @@ export class SchedulerRepository {
         ORDER BY (SELECT COUNT(*) FROM connector_outbox oo JOIN schedule_runs rr USING(run_id)
           JOIN schedules ss ON ss.schedule_id = rr.schedule_id
           WHERE ss.tenant_id = s.tenant_id AND oo.status IN ('claimed','request_started')),
-          o.available_at, o.outbox_id LIMIT 1`).get(now, kind ?? null, kind ?? null, now, now) as Outbox | undefined;
-      if (!row) return undefined;
-      this.db.prepare("UPDATE connector_outbox SET status = 'claimed', claim_token = ?, lease_until = ?, updated_at = ? WHERE outbox_id = ?")
-        .run(randomUUID(), add(now, leaseSeconds), now, row.outbox_id);
-      return this.getOutbox(row.outbox_id, now);
+          o.available_at, o.outbox_id LIMIT 1`);
+      const claimed: Outbox[] = [];
+      for (let index = 0; index < limit; index++) {
+        const row = select.get(now, kind ?? null, kind ?? null, now, now) as Outbox | undefined;
+        if (!row) break;
+        this.db.prepare("UPDATE connector_outbox SET status = 'claimed', claim_token = ?, lease_until = ?, updated_at = ? WHERE outbox_id = ?")
+          .run(randomUUID(), add(now, leaseSeconds), now, row.outbox_id);
+        claimed.push(this.getOutbox(row.outbox_id, now)!);
+      }
+      return claimed;
     }).immediate();
   }
   requestStarted(outboxId: string, token: string, now: string): Outbox {
