@@ -443,11 +443,15 @@ export class SchedulerRepository {
         VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, occurrenceKey, scheduledFor, reason ? "skipped" : "materialized", reason, materializedAt, reason ? materializedAt : null);
       if (!reason && revision.action === "slack.reminder.post") this.insertOutbox(runId, "slack.reminder.post", revision.target_json, revision.content!, materializedAt);
       if (!reason && revision.action === "work.read_only") {
+        const authorizationEventId=revision.authorization_id.replace(/:\d+$/,""), authorizationEvent=this.db.prepare("SELECT reply_target_json FROM events WHERE event_id=?").get(authorizationEventId) as {reply_target_json:string|null}|undefined;
+        const authorizationReply=authorizationEvent?.reply_target_json?JSON.parse(authorizationEvent.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown}:undefined;
+        const authorizationTarget=typeof authorizationReply?.workspace_id==="string"&&typeof authorizationReply.channel_id==="string"
+          ? {workspace_id:authorizationReply.workspace_id,channel_id:authorizationReply.channel_id}:undefined;
         const result = this.enqueue({ schema_version: 1, source: "dona_schedule", external_event_id: `schedule:v1:${scheduleId}:${scheduledFor}`,
           type: "schedule_due", occurred_at: scheduledFor,
           subject: { tenant_id: before.tenant_id, owner_id: before.owner_id, schedule_id: scheduleId },
           payload: { run_id: runId, revision: expectedRevision, occurrence_key: occurrenceKey,
-            work: { objective: revision.content, scope: "read_only", allowed_external_writes: [], result_destination: JSON.parse(revision.target_json) } }, reply_target: null,
+            work: { objective: revision.content, scope: "read_only", allowed_external_writes: [], result_destination: JSON.parse(revision.target_json), ...(authorizationTarget?{authorization_target:authorizationTarget}:{}) } }, reply_target: null,
           trace: { schedule_id: scheduleId, run_id: runId } }, new Date(materializedAt));
         if (result.duplicate || result.payloadMismatch) throw new Error("event_idempotency_conflict");
         this.db.prepare("UPDATE schedule_runs SET event_id = ? WHERE run_id = ?").run(result.row.event_id, runId);

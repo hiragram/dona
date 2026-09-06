@@ -60,9 +60,11 @@ export class DispatcherDatabase {
       this.migrate();
       migrateScheduler(this.db);
       migrateJobRouting(this.db);
-      for(const row of this.db.prepare("SELECT job_id,result_path FROM jobs WHERE status IN ('queued','retryable_failed','preparing')").all() as Array<{job_id:string;result_path:string}>) {
-        if(path.basename(row.result_path)===`${row.job_id}.json`) this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?")
-          .run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
+      for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs WHERE status IN ('queued','retryable_failed','preparing')").all() as Array<{job_id:string;result_path:string;status:string}>) {
+        if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
+        if(row.status==="preparing") this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
+          last_error_message='Legacy preparing agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
+        else this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
     } catch (error) {
       this.db.close();
@@ -72,7 +74,11 @@ export class DispatcherDatabase {
       const legacy=path.basename(resultPath)===`${jobId}.json`;
       const isolated=path.basename(resultPath)==="result.json"&&path.basename(path.dirname(resultPath))===jobId;
       if(!legacy&&!isolated) return false;
-      try { fs.unlinkSync(resultPath); return true; } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
+      try {
+        if(isolated) fs.rmSync(path.dirname(resultPath),{recursive:true,force:true});
+        else fs.unlinkSync(resultPath);
+        return true;
+      } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
   }
 

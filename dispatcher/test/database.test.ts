@@ -199,4 +199,17 @@ describe("DispatcherDatabase", () => {
     assert.equal(reopened.getJob(job.job_id)?.result_path,`${config.jobResultsDir}/${job.job_id}/result.json`);
     reopened.close();
   });
+
+  test("isolates a legacy preparing job whose existing agent grant cannot be verified", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-legacy-preparing")).row;
+    const job = database.createJob({source_event_id:source.event_id,objective:"調査する",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id); database.close();
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(`${config.jobResultsDir}/${job.job_id}.json`,job.job_id); raw.close();
+    const reopened = new DispatcherDatabase(config.databasePath), isolated=reopened.getJob(job.job_id)!;
+    assert.equal(isolated.status,"needs_review"); assert.equal(isolated.last_error_code,"legacy_agent_sandbox_unknown");
+    reopened.close();
+  });
 });
