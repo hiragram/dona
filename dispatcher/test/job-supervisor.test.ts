@@ -1165,6 +1165,29 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("removes late progress from a needs-review worker only after it exits", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-needs-review-progress-cleanup");
+    markRunning(database, job.job_id);
+    database.markJobNeedsReview(job.job_id, "steer_acceptance_unknown", "transport disconnected");
+    const progressDir = path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let release!: () => void;
+    const exited = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = fakeRuntime({ async wait() { await exited; return ok("done"); } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(progressDir), true);
+    release();
+    await waitFor(() => !existsSync(progressDir));
+    await supervisor.stop();
+    database.close();
+  });
+
   test("queues live cancelled worker cleanup behind one pump", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

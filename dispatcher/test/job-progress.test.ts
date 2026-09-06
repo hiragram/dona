@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -52,6 +53,26 @@ test("definite pre-delivery failure returns to pending with backoff", async () =
     assert.equal(store.pending(new Date("2026-09-05T00:00:29Z")), undefined);
     assert.equal(store.pending(new Date("2026-09-05T00:00:30Z"))?.job_id, "job_abc");
   } finally { store.close(); await fs.rm(root, { recursive: true }); }
+});
+
+test("an old Adapter 404 is definitely unsent and remains retryable", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-adapter-404-"));
+  const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  const socketPath=path.join(root,"adapter.sock"); const tokenPath=path.join(root,"token");
+  const server=http.createServer((_request,response)=>{response.writeHead(404).end();});
+  try {
+    await fs.writeFile(tokenPath,"c".repeat(64),{mode:0o600});
+    await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);});
+    store.ingest(valid,new Date());
+    const job={job_id:"job_abc",source_event_id:"evt_abc",status:"running",workspace_id:"T1",channel_id:"C1",thread_ts:"1.1"};
+    const jobs={getJob:()=>job,getJobGroup:()=>({notification_mode:"legacy"}),listEventJobs:()=>[job]};
+    const coordinator=new JobProgressCoordinator(jobs as never,store,{updateInternalTokenPath:tokenPath,slackAdapterSocketPath:socketPath,jobCommandTimeoutMs:100} as never,{warn(){}} as never);
+    await coordinator.report();
+    assert.equal(store.get("job_abc")?.status,"pending");
+  } finally {
+    await new Promise<void>((resolve)=>server.close(()=>resolve()));
+    store.close(); await fs.rm(root,{recursive:true});
+  }
 });
 
 test("workspace Retry-After deadline is durable and defers other pending jobs", async () => {

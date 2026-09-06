@@ -252,7 +252,7 @@ export class JobSupervisor {
           if(this.stopping)return;
           const jobId=path.basename(progressDir);
           const row=this.database.getJob(jobId);
-          if(!row||row.status!=="cancelled"||path.dirname(jobProgressPath(row))!==progressDir)continue;
+          if(!row||!["cancelled","needs_review"].includes(row.status)||path.dirname(jobProgressPath(row))!==progressDir)continue;
           try {
             const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);
             if(waited.aborted||this.stopping)return;
@@ -447,7 +447,8 @@ export class JobSupervisor {
       })
       .finally(async () => {
         const finalStatus=this.database.getJob(row.job_id)?.status;
-        if (!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled","needs_review"].includes(finalStatus))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
+        if(this.progress&&finalStatus==="needs_review")this.trackCancelledWorkerCleanup(row);
+        else if (!this.progress || (finalStatus!==undefined&&["blocked","completed","failed","cancelled"].includes(finalStatus))) await fs.rm(path.dirname(jobProgressPath(row)), { recursive:true, force:true }).catch(() => {
           this.logger.warn("Disabled job progress terminal cleanup failed", { job_id:row.job_id, error_code:"job_progress_disabled_terminal_cleanup_failed" });
         });
         this.active.delete(row.job_id);
