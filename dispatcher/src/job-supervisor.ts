@@ -190,7 +190,7 @@ export class JobSupervisor {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
         if(["completed","failed"].includes(current?.status??"")) continue;
-        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);if(!stopped.ok)this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));continue;}
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {await this.stopInvalidResultAgent(job);continue;}
         try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
         catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
@@ -199,7 +199,7 @@ export class JobSupervisor {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
         if(["completed","failed"].includes(current?.status??"")) continue;
-        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);if(!stopped.ok)this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));continue;}
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {await this.stopInvalidResultAgent(job);continue;}
         try { await this.cancel(job.job_id, job.source_event_id, "Scheduled work exceeded its 3600 second execution deadline"); }
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
@@ -210,6 +210,20 @@ export class JobSupervisor {
       for (const row of rows.slice(0, availableSlots)) this.launch(row);
       await this.wakeSignal.wait(this.config.queuePollMs);
     }
+  }
+
+  private async stopInvalidResultAgent(job:JobRow):Promise<void> {
+    const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
+    if(!stopped.ok&&! ["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));return;}
+    if(!stopped.ok) {this.database.recordInvalidResultAgentStopped(job.job_id);return;}
+    const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+    while(Date.now()<deadline) {
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);return;}
+      if(!observed.ok) break;
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    this.database.recordInvalidResultAgentStopFailure(job.job_id,"Agent exit was not observed after invalid Result");
   }
 
   private publishNotifications(): void {

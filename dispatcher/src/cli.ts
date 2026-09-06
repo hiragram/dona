@@ -15,7 +15,8 @@ function usage(): never {
   dona-dispatcher event complete <event_id>
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
-  dona-dispatcher job show <job_id>`);
+  dona-dispatcher job show <job_id>
+  dona-dispatcher job reconcile-run <run_id> <failed|cancelled>`);
   process.exit(2);
 }
 
@@ -50,6 +51,10 @@ async function main(): Promise<void> {
         if (!row) throw new Error(`Job ${jobId} was not found`);
         console.log(JSON.stringify(row, null, 2));
         return;
+      }
+      if(command==="reconcile-run") {
+        const runId=eventIdAt(args,2),outcome=args[3];if(outcome!=="failed"&&outcome!=="cancelled")usage();
+        console.log(JSON.stringify(database.reconcileScheduledRun(runId,outcome),null,2));return;
       }
       usage();
     }

@@ -551,6 +551,15 @@ export class DispatcherDatabase {
   recordInvalidResultAgentStopFailure(jobId:string,message:string):void {
     this.db.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stop_unknown',last_error_message=?,updated_at=? WHERE job_id=? AND status='needs_review'").run(message,nowUtc(),jobId);
   }
+  recordInvalidResultAgentStopped(jobId:string):void {
+    this.db.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped',last_error_message='Invalid Result was fenced and the agent exit was observed',updated_at=? WHERE job_id=? AND status='needs_review'").run(nowUtc(),jobId);
+  }
+
+  reconcileScheduledRun(runId:string,outcome:"failed"|"cancelled",at=new Date()):unknown {
+    const row=this.db.prepare("SELECT s.tenant_id FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?").get(runId) as {tenant_id:string}|undefined;
+    if(!row) throw new Error(`Run ${runId} was not found`);
+    return this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+  }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
     const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
@@ -955,6 +964,17 @@ export class DispatcherDatabase {
       .run(code, message, at.toISOString(), eventId);
   }
 
+  private notificationDelivered(eventId:string,result:ResultEnvelope):{delivered:boolean;runId?:string} {
+    const completion=this.db.prepare("SELECT owner_json,destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string}|undefined;
+    if(!completion)return {delivered:false};
+    const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
+    const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
+    const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
+    const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
+    const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
+    return {delivered:actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+  }
+
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
@@ -973,19 +993,10 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
-      const completion=this.db.prepare("SELECT destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {destination_json:string}|undefined;
-      if(completion) {
-        const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>};
-        const target=destination.kind==="slack"?destination.target:undefined;
-        const owner=JSON.parse((this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string}).owner_json) as {owner_id?:unknown};
-        const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
-        const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
-        const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&
-          value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
-        const delivered=actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&
-          typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&
-          (target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
-        this.setNotificationState(eventId,delivered?"accepted":"needs_review",new Date(result.completed_at));
+      const delivery=this.notificationDelivered(eventId,result);
+      if(delivery.runId) {
+        this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
+        if(!delivery.delivered)this.scheduler.markWorkNotificationNeedsReview(delivery.runId,new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       }
     }).immediate();
   }
@@ -994,6 +1005,11 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
+      const delivery=this.notificationDelivered(eventId,result);
+      if(delivery.delivered) {
+        this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
+        this.setNotificationState(eventId,"accepted",new Date(result.completed_at));return;
+      }
       const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
         typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
         (action as Record<string,unknown>).ambiguous===true);
