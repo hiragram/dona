@@ -90,12 +90,21 @@ export class ReminderPublisher {
       // finishes so a slow authorization lookup cannot hold completed capacity behind a barrier.
       const initialAt = this.clock.now();
       const initial = this.repository.claimBatch(initialAt, 240, "slack.reminder.post", 100);
+      let activeClaims = initial.length;
       const worker = async (first: Outbox | undefined): Promise<void> => {
         let row: Outbox | undefined = first;
         while (this.running) {
-          row ??= this.repository.claim(this.clock.now(), 240, "slack.reminder.post");
-          if (!row) return;
+          if (!row) {
+            row = this.repository.claim(this.clock.now(), 240, "slack.reminder.post");
+            if (row) activeClaims++;
+            else {
+              if (activeClaims === 0) return;
+              await new Promise<void>((resolve) => setTimeout(resolve, this.pollMs));
+              continue;
+            }
+          }
           await this.publishClaimed(row, this.clock.now());
+          activeClaims--;
           row = undefined;
         }
       };

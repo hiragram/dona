@@ -148,7 +148,10 @@ export class SlackReminderConnector {
       if (revokedSlackErrors.has(error.errorCode)) return { outcome: "revoked", code: error.errorCode };
       if (error.errorCode === "rate_limited") {
         const key = `${input.target.workspace_id}:${input.target.channel_id}`;
-        this.nextPostAt.set(key, Math.max(this.nextPostAt.get(key) ?? 0, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000));
+        const next = Math.max(this.nextPostAt.get(key) ?? 0, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000);
+        this.nextPostAt.set(key, next);
+        const cleanup = setTimeout(() => { if (this.nextPostAt.get(key) === next) this.nextPostAt.delete(key); }, Math.max(0, next - Date.now()));
+        cleanup.unref();
         return { outcome: "not_accepted", code: "rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
       }
       if (error.errorCode === "slack_server_error_before_send") return { outcome: "not_accepted", code: error.errorCode, retry_after_seconds: 1 };
