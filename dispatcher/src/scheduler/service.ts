@@ -122,7 +122,7 @@ export class SchedulerService {
           after: new Date(Date.parse(firstDue) - 86_400_000).toISOString().replace(".000Z", "Z"),
           before_or_equal: now,
           limit: 100,
-        }).occurrences;
+        }).occurrences.filter(({ occurrence_at }) => occurrence_at >= firstDue);
         const occurrence = occurrences.at(-1);
         if (!occurrence || occurrences[0]?.occurrence_at !== firstDue) throw new Error("next_due_definition_mismatch");
         const scheduledFor = occurrence.occurrence_at;

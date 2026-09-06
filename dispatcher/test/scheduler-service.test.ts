@@ -174,6 +174,25 @@ test("366日horizonを越える次回occurrenceも有限windowで永続化する
   assert.equal(repo.get("long_interval")?.next_due, "2027-10-05T00:01:00Z");
 });
 
+test("DST春切替の23時間間隔でもnext_dueより古いoccurrenceを再採用しない", () => {
+  const { repo, raw, clock } = setup("2026-03-08T12:00:00Z");
+  const due = "2026-03-08T13:00:00Z";
+  const recurrence = { version: 1, kind: "daily", start_date: "2026-03-01", local_time: "09:00:00",
+    timezone: "America/New_York", tzdb_version: "2025b", interval: 1 };
+  repo.create("dst_spring", {
+    ...daily(due),
+    recurrence_json: `${JSON.stringify(recurrence)}\n`,
+    timezone: "America/New_York",
+    approved_at: "2026-03-01T00:00:00Z",
+    expires_at: "2026-03-31T00:00:00Z",
+  }, due, actor, clock.now());
+  clock.set(due);
+  const service = new SchedulerService(repo, clock, () => {}, logger, { owner: "scheduler_a" });
+  assert.equal(service.runBatch(), 1);
+  assert.equal((raw.prepare("SELECT scheduled_for FROM schedule_runs").get() as { scheduled_for: string }).scheduled_for, due);
+  assert.equal(repo.get("dst_spring")?.next_due, "2026-03-09T13:00:00Z");
+});
+
 test("長期間overdueでauthorization失効済みならpreview前にexpiredへ進める", () => {
   const { repo, clock } = setup();
   const due = "2026-09-05T00:01:00Z";
