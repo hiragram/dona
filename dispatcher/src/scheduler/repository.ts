@@ -734,6 +734,16 @@ export class SchedulerRepository {
       return this.getOutbox(outboxId, finishedAt)!;
     }).immediate();
   }
+  finishWriteAfterPreflight(outboxId: string, token: string,
+    outcome: "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire",
+    now: string, retryAfterSeconds: number, decisionCode: string): Outbox {
+    return this.db.transaction(() => {
+      const current = this.getOutbox(outboxId, now);
+      if (current?.status === "cancelled" && current.claim_token === null) return current;
+      this.requestStarted(outboxId, token, now);
+      return this.finishWrite(outboxId, token, outcome, now, null, retryAfterSeconds, decisionCode);
+    }).immediate();
+  }
   finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0, rawDecisionCode?: string): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
     if (!["sent", "not_accepted", "authorization_unavailable", "unavailable", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
@@ -763,7 +773,8 @@ export class SchedulerRepository {
           status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
           receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
         if (outcome === "unavailable" && retry) this.db.prepare("UPDATE connector_outbox SET attempt = attempt - 1 WHERE outbox_id = ?").run(outboxId);
-        if (outcome === "revoked" || (outcome === "authorization_unavailable" && !retry)) {
+        const authorizationFailedWhileActive = outcome === "authorization_unavailable" && schedule.state === "active" && !retry;
+        if (outcome === "revoked" || authorizationFailedWhileActive) {
           const runAuthorization = this.revision(run);
           const currentAuthorization = this.revision(schedule);
           const sameAuthorization = runAuthorization.authorization_id === currentAuthorization.authorization_id &&

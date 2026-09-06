@@ -15,7 +15,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const at = "2026-09-06T00:00:00Z";
 const actor: Actor = { tenant_id: "T1", actor_id: "U1", role: "owner", source_event_id: null };
-function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[]) {
+function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[], overrides: Partial<RevisionInput> = {}, nextDue: string | null = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-reminder-")); roots.push(root);
   const database = new DispatcherDatabase(path.join(root, "db.sqlite"));
   const repo = database.scheduler.withCodecs({ recurrence: value => value, policy: value => value });
@@ -23,12 +23,15 @@ function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[]) {
     recurrence_json: `{"at":"${at}","kind":"once","version":1}\n`, policy_json: "{}", policy_version: 1,
     timezone: null, tzdb_version: null, authorization_id: "auth1", authorization_revision: 1,
     approver_id: "U1", approved_at: "2026-09-05T00:00:00Z", expires_at: "2026-09-07T00:00:00Z",
-    action: "slack.reminder.post", target: { kind: "thread", workspace_id: "T1", channel_id: "C1", thread_ts: "1.000001" }, content: "確認してください",
+    action: "slack.reminder.post", target: { kind: "thread", workspace_id: "T1", channel_id: "C1", thread_ts: "1.000001" }, content: "確認してください", ...overrides,
   };
   repo.create("s1", input, at, actor, "2026-09-05T00:00:00Z");
-  const run = repo.materialize("s1", 1, at, null, at, actor).run;
+  const run = repo.materialize("s1", 1, at, nextDue, at, actor).run;
   const commands: SlackReminderCommand[] = [];
-  const publisher = new ReminderPublisher(repo, { async deliver(command) { commands.push(command); return await outcomes.shift()!; } }, new FakeClock(at), logger);
+  const publisher = new ReminderPublisher(repo, {
+    async preflight() { return { outcome: "prepared" }; },
+    async deliver(command) { commands.push(command); return await outcomes.shift()!; },
+  }, new FakeClock(at), logger);
   return { database, repo, run, commands, publisher, input };
 }
 
@@ -87,5 +90,41 @@ test("独立reminderをbounded concurrencyで配送開始する", async () => {
   finishFirst({ outcome: "accepted", receipt_id: "1.000002" });
   finishSecond({ outcome: "accepted", receipt_id: "1.000003" });
   await state.publisher.stop();
+  state.database.close();
+});
+
+test("read-only preflight完了後までrequest-started fenceを立てない", async () => {
+  const state = setup([]);
+  let finishPreflight!: (value: ReminderDelivery) => void;
+  let finishWrite!: (value: ReminderDelivery) => void;
+  const preflight = new Promise<ReminderDelivery>((resolve) => void (finishPreflight = resolve));
+  const write = new Promise<ReminderDelivery>((resolve) => void (finishWrite = resolve));
+  const publisher = new ReminderPublisher(state.repo, { async preflight() { return await preflight; }, async deliver() { return await write; } }, new FakeClock(at), logger);
+  const publishing = publisher.publishOne();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((state.repo.auditHistory("s1") as { operation: string }[]).some(row => row.operation === "outbox_request_started"), false);
+  finishPreflight({ outcome: "prepared" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((state.repo.auditHistory("s1") as { operation: string }[]).some(row => row.operation === "outbox_request_started"), true);
+  finishWrite({ outcome: "accepted", receipt_id: "1.000002" });
+  await publishing;
+  state.database.close();
+});
+
+test("認可preflight中の通常pauseでauthorizationをretireしない", async () => {
+  const state = setup([], {
+    recurrence_json: '{"interval":1,"kind":"daily","local_time":"09:00:00","start_date":"2026-09-06","timezone":"Asia/Tokyo","tzdb_version":"2025b","version":1}\n',
+    timezone: "Asia/Tokyo", tzdb_version: "2025b",
+  }, "2026-09-07T00:00:00Z");
+  const publisher = new ReminderPublisher(state.repo, {
+    async preflight() {
+      state.repo.transition("s1", 1, "pause", actor, at);
+      return { outcome: "authorization_unavailable", code: "authorization_check_failed", retry_after_seconds: 1 };
+    },
+    async deliver() { throw new Error("write must not run"); },
+  }, new FakeClock(at), logger);
+  await publisher.publishOne();
+  assert.equal(state.repo.get("s1")?.state, "paused");
+  assert.doesNotThrow(() => state.repo.transition("s1", state.repo.get("s1")!.revision, "resume", actor, at));
   state.database.close();
 });

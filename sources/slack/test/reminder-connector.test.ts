@@ -12,7 +12,11 @@ const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 async function connector(post: (input: { channelId: string }) => Promise<{ channelId: string; messageTs: string }>, getChannel: (channelId: string) => Promise<{ id: string; isPrivate: boolean; isArchived: boolean; isMember: boolean; isShared: boolean; isMpim?: boolean }> = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
   const client = { authenticate: async () => ({ teamId: "T1", botUserId: "U_BOT" }), getChannel,
     getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
-  return new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
+  const instance = new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
+  return { async deliver(value: unknown) {
+    const preflight = await instance.deliver(value, true);
+    return preflight.outcome === "prepared" ? await instance.deliver(value) : preflight;
+  } };
 }
 const input = { schema_version: 1, action: "slack.reminder.post", outbox_id: "o1", run_id: "r1", idempotency_key: "k1", owner_id: "U1",
   expires_at: "2099-09-07T00:00:00Z", misfire_at: "2099-09-06T23:00:00Z",
@@ -85,4 +89,21 @@ test("認可rate limitをauthorization unavailableとして返す", async () => 
     outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: 901,
   });
   assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
+});
+
+test("workspaceの認可rate-limit期限を短い後続429で短縮しない", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => void (release = resolve));
+  const instance = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }), async (channelId) => {
+    if (channelId === "C1") await gate;
+    throw new SlackApiError("rate_limited", "rate", channelId === "C1" ? 1 : 60);
+  });
+  const short = instance.deliver(input);
+  const long = await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2", target: { ...input.target, channel_id: "C2" } });
+  assert.equal(long.outcome, "authorization_unavailable");
+  release();
+  assert.equal((await short).outcome, "authorization_unavailable");
+  const blocked = await instance.deliver({ ...input, outbox_id: "o3", run_id: "r3", idempotency_key: "k3" });
+  assert.equal(blocked.outcome, "authorization_unavailable");
+  if (blocked.outcome === "authorization_unavailable") assert.ok(blocked.retry_after_seconds >= 59);
 });

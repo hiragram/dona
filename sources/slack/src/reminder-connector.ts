@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { SlackApiError } from "./slack-api.js";
+import { SlackApiError, type SlackChannel } from "./slack-api.js";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 const id = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
@@ -24,6 +24,7 @@ const command = z.strictObject({
 });
 export type SlackReminderCommand = Readonly<z.infer<typeof command>>;
 export type SlackReminderResult =
+  | { outcome: "prepared" }
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
   | { outcome: "unavailable"; code: string; retry_after_seconds: number }
@@ -50,6 +51,7 @@ export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
   private readonly authorizationInFlight = new Set<string>();
   private readonly authorizationBlockedUntil = new Map<string, number>();
+  private readonly prepared = new Map<string, { serialized: string; channel: SlackChannel; expiresAt: number }>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
 
   private reservePost(workspaceId: string, channelId: string): number {
@@ -61,13 +63,26 @@ export class SlackReminderConnector {
     return 0;
   }
 
-  async deliver(value: unknown): Promise<SlackReminderResult> {
+  async deliver(value: unknown, preflightOnly = false): Promise<SlackReminderResult> {
     let input: SlackReminderCommand;
     try { input = parseSlackReminderCommand(value); } catch { return { outcome: "rejected", code: "invalid_command" }; }
+    const serialized = JSON.stringify(input);
+    const prepared = this.prepared.get(input.outbox_id);
+    if (!preflightOnly) {
+      if (prepared?.serialized !== serialized || prepared.expiresAt < Date.now()) {
+        this.prepared.delete(input.outbox_id);
+        return { outcome: "rejected", code: "preflight_required" };
+      }
+      this.prepared.delete(input.outbox_id);
+    }
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
     catch { return { outcome: "revoked", code: "workspace_not_allowed" }; }
     const authorizationKey = `${input.target.workspace_id}:${input.target.channel_id}`;
+    if (!preflightOnly) {
+      // The read-only checks below were completed by the immediately preceding preflight.
+      return await this.postPrepared(connection, input, prepared!.channel);
+    }
     const authorizationDelay = Math.max(0, (this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0) - Date.now());
     if (authorizationDelay > 0) {
       return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
@@ -87,7 +102,10 @@ export class SlackReminderConnector {
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
-        this.authorizationBlockedUntil.set(input.target.workspace_id, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000);
+        this.authorizationBlockedUntil.set(input.target.workspace_id, Math.max(
+          this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0,
+          Date.now() + (error.retryAfterSeconds ?? 1) * 1_000,
+        ));
         return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
       }
       return revokedSlackErrors.has(code)
@@ -96,6 +114,11 @@ export class SlackReminderConnector {
     } finally {
       this.authorizationInFlight.delete(authorizationKey);
     }
+    this.prepared.set(input.outbox_id, { serialized, channel, expiresAt: Date.now() + 60_000 });
+    return { outcome: "prepared" };
+  }
+
+  private async postPrepared(connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>, input: SlackReminderCommand, channel: SlackChannel): Promise<SlackReminderResult> {
     try {
       if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
       if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };
