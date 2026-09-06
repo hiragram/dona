@@ -721,8 +721,8 @@ export class SchedulerRepository {
           status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
           receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
         if (outcome === "revoked") {
-          this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND state = 'active'").run(finishedAt, run.schedule_id);
-          this.suppress(run.schedule_id, finishedAt, "cancelled");
+          const paused = this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND revision = ? AND state = 'active'").run(finishedAt, run.schedule_id, run.revision);
+          if (paused.changes === 1) this.suppress(run.schedule_id, finishedAt, "cancelled");
         }
         if (outcome === "misfire") {
           this.db.prepare("UPDATE connector_outbox SET status = 'cancelled' WHERE outbox_id = ?").run(outboxId);

@@ -98,7 +98,7 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
     if (!token) return { outcome: "not_accepted", code: "missing_internal_token", retry_after_seconds: 1 };
-    try { return await request(this.config.slackAdapterSocketPath, token, input, Math.max(this.config.jobCommandTimeoutMs, 60_000)); }
+    try { return await request(this.config.slackAdapterSocketPath, token, input, Math.max(this.config.jobCommandTimeoutMs, 135_000)); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       return code === "ENOENT" || code === "ECONNREFUSED"

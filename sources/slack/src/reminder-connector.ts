@@ -58,14 +58,14 @@ export class SlackReminderConnector {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       return ["channel_not_found", "user_not_found", "missing_scope", "not_in_channel"].includes(code)
         ? { outcome: "revoked", code }
-        : { outcome: "not_accepted", code, retry_after_seconds: 1 };
+        : { outcome: "not_accepted", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
     try {
       if (channel.isArchived || channel.isShared || (input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
       if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
       const current = Date.now();
       if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
-      if (current >= Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
+      if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,
@@ -78,6 +78,7 @@ export class SlackReminderConnector {
       return { outcome: "accepted", receipt_id: posted.messageTs };
     } catch (error) {
       if (!(error instanceof SlackApiError)) return { outcome: "acceptance_unknown", code: "unexpected_error" };
+      if (["channel_not_found", "user_not_found", "missing_scope", "not_in_channel"].includes(error.errorCode)) return { outcome: "revoked", code: error.errorCode };
       if (error.errorCode === "rate_limited") return { outcome: "not_accepted", code: "rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
       if (error.errorCode === "slack_server_error_before_send") return { outcome: "not_accepted", code: error.errorCode, retry_after_seconds: 1 };
       if (["slack_transport_error", "slack_http_error", "slack_api_error", "invalid_slack_response"].includes(error.errorCode)) {
