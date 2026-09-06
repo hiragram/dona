@@ -866,8 +866,9 @@ export class SchedulerRepository {
   }
   purge(now: string): void {
     utc(now);
-    const resultFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
-      WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`).all(now) as Array<{job_id:string;result_path:string}>;
+    const resultFiles=this.db.prepare(`SELECT DISTINCT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
+      WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`).all(now,now) as Array<{job_id:string;result_path:string}>;
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
