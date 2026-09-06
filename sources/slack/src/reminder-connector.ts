@@ -103,19 +103,19 @@ export class SlackReminderConnector {
     const current = Date.now();
     if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
     if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
-    const expiresAt = Date.now() + 60_000;
+    const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
+    if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
+    const expiresAt = Math.min(Date.now() + 60_000, Date.parse(input.expires_at), Date.parse(input.misfire_at));
     this.prepared.set(input.outbox_id, { serialized, expiresAt });
     const cleanup = setTimeout(() => {
       if (this.prepared.get(input.outbox_id)?.expiresAt === expiresAt) this.prepared.delete(input.outbox_id);
-    }, 60_000);
+    }, Math.max(0, expiresAt - Date.now()));
     cleanup.unref();
     return { outcome: "prepared" };
   }
 
   private async postPrepared(connection: ReturnType<SlackWorkspaceRegistry["getByTeamId"]>, input: SlackReminderCommand): Promise<SlackReminderResult> {
     try {
-      const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
-      if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,

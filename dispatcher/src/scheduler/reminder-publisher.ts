@@ -46,7 +46,7 @@ export class ReminderPublisher {
   isRunning(): boolean { return this.running; }
   async publishOne(): Promise<boolean> {
     const now = this.clock.now();
-    const claimed = this.repository.claim(now, 180, "slack.reminder.post");
+    const claimed = this.repository.claim(now, 240, "slack.reminder.post");
     if (!claimed) return false;
     await this.publishClaimed(claimed, now);
     return true;
@@ -90,7 +90,7 @@ export class ReminderPublisher {
         // Quota is 100 schedules per tenant; a 100-wide global bound also gives multiple tenants
         // independent capacity while channel-level throttling protects Slack writes.
         const now = this.clock.now();
-        const claimed = this.repository.claimBatch(now, 180, "slack.reminder.post", 100);
+        const claimed = this.repository.claimBatch(now, 240, "slack.reminder.post", 100);
         if (claimed.length === 0) break;
         const settled = await Promise.allSettled(claimed.map((row) => this.publishClaimed(row, now)));
         const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -143,7 +143,7 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   private async call(input: SlackReminderCommand, path: string): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
     if (!token) return { outcome: "unavailable", code: "missing_internal_token", retry_after_seconds: 5 };
-    const timeoutMs = path.endsWith("/preflight") ? 120_000 : Math.max(this.config.jobCommandTimeoutMs, 180_000);
+    const timeoutMs = path.endsWith("/preflight") ? 180_000 : Math.max(this.config.jobCommandTimeoutMs, 180_000);
     try { return await request(this.config.slackAdapterSocketPath, token, path, input, timeoutMs); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
