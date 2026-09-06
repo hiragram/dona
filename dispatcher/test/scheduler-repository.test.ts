@@ -457,6 +457,21 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   assert.equal(payload.error_message,"実行エラーの詳細は安全上省略されました"); assert.doesNotMatch(payload.error_message,/xoxb/);
 });
 
+test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにする", () => {
+  const {repo,dispatcher,raw,filename}=setup(); const objective="時刻とwrite境界";
+  repo.create("result_fence",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("result_fence",1,due,later,due,actor).run;
+  const job=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"future",completed_at:later},job.result_path,new Date(due)),/completed_at_is_in_the_future/);
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
+  dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"投稿結果不明",actions:[{tool:"dona_slack.post_message",ambiguous:true}],completed_at:due},resultPath);
+  assert.equal(dispatcher.get(eventId)?.status,"needs_review");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+});
+
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {
   const { repo, filename } = setup();
   const other = new DispatcherDatabase(filename); cleanups.push(() => other.close());

@@ -533,6 +533,7 @@ export class DispatcherDatabase {
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     const completedAt = new Date(result.completed_at);
+    if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       this.updateJob(jobId, ["running"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
@@ -943,10 +944,14 @@ export class DispatcherDatabase {
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
     this.db.transaction(()=>{
-      this.transition(eventId, ["waiting_agent"], "dead_letter", {result_json: stableStringify(result),result_path: resultPath,
-        completed_at: result.completed_at,last_error_code: "agent_reported_failure",last_error_message: result.summary ?? "Agent reported failure"});
-      this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
-      this.setNotificationState(eventId,"failed",new Date(result.completed_at));
+      const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+        typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+        (action as Record<string,unknown>).ambiguous===true);
+      this.transition(eventId, ["waiting_agent"], ambiguous?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
+        completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":"agent_reported_failure",
+        last_error_message: result.summary ?? "Agent reported failure"});
+      this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
   }
 
