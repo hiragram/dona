@@ -8,7 +8,16 @@ export function migrateScheduler(db: Database.Database): void {
     )`);
     const row = db.prepare("SELECT version FROM scheduler_schema WHERE singleton = 1").get() as { version: number } | undefined;
     if (row && row.version !== 1) throw new Error("unsupported_scheduler_schema");
-    if (row) return;
+    if (row?.version === 1) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS schedule_claims (
+          schedule_id TEXT PRIMARY KEY REFERENCES schedules(schedule_id) ON DELETE CASCADE,
+          claim_owner TEXT, claim_until TEXT, claim_fence INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS schedule_claims_lease_idx ON schedule_claims(claim_until, schedule_id);
+      `);
+      return;
+    }
     db.exec(`
       CREATE TABLE schedules (
         schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL,
@@ -19,6 +28,11 @@ export function migrateScheduler(db: Database.Database): void {
       );
       CREATE INDEX schedules_due_idx ON schedules(next_due, schedule_id) WHERE state = 'active';
       CREATE INDEX schedules_owner_idx ON schedules(tenant_id, owner_id, state);
+      CREATE TABLE schedule_claims (
+        schedule_id TEXT PRIMARY KEY REFERENCES schedules(schedule_id) ON DELETE CASCADE,
+        claim_owner TEXT, claim_until TEXT, claim_fence INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX schedule_claims_lease_idx ON schedule_claims(claim_until, schedule_id);
       CREATE TABLE schedule_revisions (
         schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id) ON DELETE CASCADE,
         revision INTEGER NOT NULL CHECK(revision > 0),

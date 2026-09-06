@@ -61,6 +61,24 @@ const updateEventEnvelopeSchema = z
   .refine((value) => value.external_event_id.startsWith(`update:${value.payload.request_id}:terminal:`), "external_event_id mismatch")
   .refine((value) => value.type === `update_${value.payload.update_status}`, "type/status mismatch");
 
+const scheduleEventEnvelopeSchema = z.object({
+  schema_version: z.literal(1),
+  source: z.literal("dona_schedule"),
+  external_event_id: z.string().regex(/^schedule:v1:[A-Za-z0-9_-]+:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/),
+  type: z.literal("schedule_due"),
+  occurred_at: utcRfc3339,
+  subject: z.object({
+    tenant_id: z.string().min(1).max(160), owner_id: z.string().min(1).max(160), schedule_id: z.string().min(1).max(160),
+  }).strict(),
+  payload: z.object({
+    run_id: z.string().min(1).max(160), revision: z.number().int().positive(), occurrence_key: z.string().min(1).max(512),
+  }).strict(),
+  reply_target: z.null(),
+  trace: z.object({ schedule_id: z.string().min(1).max(160), run_id: z.string().min(1).max(160) }).strict(),
+}).strict()
+  .refine((value) => value.external_event_id === `schedule:v1:${value.subject.schedule_id}:${value.occurred_at}`, "external_event_id mismatch")
+  .refine((value) => value.subject.schedule_id === value.trace.schedule_id && value.payload.run_id === value.trace.run_id, "trace mismatch");
+
 const resultEnvelopeSchema = z
   .object({
     schema_version: z.literal(1),
@@ -132,6 +150,16 @@ export function parseEventEnvelope(input: unknown): EventEnvelope {
 
 export function parseInternalUpdateEventEnvelope(input: unknown): EventEnvelope {
   const parsed = updateEventEnvelopeSchema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const location = issue?.path.length ? `${issue.path.join(".")} ` : "";
+    throw new RequestValidationError(`${location}${issue?.message ?? "is invalid"}`);
+  }
+  return parsed.data as EventEnvelope;
+}
+
+export function parseInternalScheduleEventEnvelope(input: unknown): EventEnvelope {
+  const parsed = scheduleEventEnvelopeSchema.safeParse(input);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
     const location = issue?.path.length ? `${issue.path.join(".")} ` : "";

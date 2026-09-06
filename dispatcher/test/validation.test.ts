@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { parseEventEnvelope, parseInternalUpdateEventEnvelope, parseResultEnvelope } from "../src/validation.js";
+import { parseEventEnvelope, parseInternalScheduleEventEnvelope, parseInternalUpdateEventEnvelope, parseResultEnvelope } from "../src/validation.js";
 import { eventEnvelope } from "./helpers.js";
 
 describe("event validation", () => {
@@ -54,5 +54,22 @@ describe("event validation", () => {
     assert.throws(() => parseEventEnvelope(envelope), /source/);
     assert.equal(parseInternalUpdateEventEnvelope(envelope).source, "dona_update");
     assert.throws(() => parseInternalUpdateEventEnvelope({ ...envelope, type: "update_succeeded" }), /type\/status mismatch/);
+  });
+
+  test("dona_scheduleをinternal typed validatorだけで受理しstable identityを照合する", () => {
+    const envelope = {
+      schema_version: 1,
+      source: "dona_schedule",
+      external_event_id: "schedule:v1:s1:2026-09-05T00:01:00Z",
+      type: "schedule_due",
+      occurred_at: "2026-09-05T00:01:00Z",
+      subject: { tenant_id: "T1", owner_id: "U1", schedule_id: "s1" },
+      payload: { run_id: "run_1", revision: 1, occurrence_key: '["s1","2026-09-05T00:01:00Z"]' },
+      reply_target: null,
+      trace: { schedule_id: "s1", run_id: "run_1" },
+    };
+    assert.throws(() => parseEventEnvelope(envelope), /source/);
+    assert.equal(parseInternalScheduleEventEnvelope(envelope).source, "dona_schedule");
+    assert.throws(() => parseInternalScheduleEventEnvelope({ ...envelope, external_event_id: "schedule:v1:s2:2026-09-05T00:01:00Z" }), /mismatch/);
   });
 });
