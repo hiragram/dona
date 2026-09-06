@@ -286,6 +286,23 @@ test("recovery with a delivery fence fails open promptly when the token is unava
   } finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("startup drain times out without clearing the delivery fence", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-drain-timeout-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  const socketPath=path.join(root,"adapter.sock"); const tokenPath=path.join(root,"token");
+  const server=http.createServer(()=>undefined);
+  try {
+    await fs.writeFile(tokenPath,"c".repeat(64),{mode:0o600});
+    await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);});
+    store.ingest(valid); store.begin("job_abc");
+    const coordinator=new JobProgressCoordinator({} as never,store,{updateInternalTokenPath:tokenPath,slackAdapterSocketPath:socketPath,jobCommandTimeoutMs:100} as never,{} as never);
+    await assert.rejects(coordinator.recover(),/progress drain timed out/);
+    assert.equal(store.get("job_abc")?.status,"delivering");
+  } finally {
+    server.closeAllConnections(); await new Promise<void>((resolve)=>server.close(()=>resolve()));
+    store.close(); await fs.rm(root,{recursive:true});
+  }
+});
+
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); INSERT INTO job_progress VALUES ('job_legacy',1,'testing','token=untrusted','2026-09-05T00:00:00Z','delivered','2026-09-05T00:00:00Z',NULL,NULL); PRAGMA user_version=1;"); legacy.close();
