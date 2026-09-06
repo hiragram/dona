@@ -158,13 +158,13 @@ export class DispatcherApi {
 
   async stop(): Promise<void> {
     this.beginShutdown();
-    const ownsSocket = this.server !== undefined;
-    if (this.server) {
+    const ownsSocket = this.server?.listening === true;
+    if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
       });
-      this.server = undefined;
     }
+    this.server = undefined;
     if (!ownsSocket) return;
     try {
       await fs.unlink(this.config.socketPath);

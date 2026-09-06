@@ -148,7 +148,9 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (path.endsWith("/preflight")) {
-        return { outcome: "authorization_unavailable", code: "authorization_check_failed", retry_after_seconds: 5 };
+        return code === "ENOENT" || code === "ECONNREFUSED"
+          ? { outcome: "unavailable", code: "connector_unavailable", retry_after_seconds: 5 }
+          : { outcome: "authorization_unavailable", code: "authorization_check_failed", retry_after_seconds: 5 };
       }
       return code === "ENOENT" || code === "ECONNREFUSED"
         ? { outcome: "unavailable", code: "connector_unavailable", retry_after_seconds: 5 }

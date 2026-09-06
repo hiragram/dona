@@ -239,7 +239,7 @@ export class SlackHealthServer {
       this.quiesceOperationId = input.operation_id;
       await this.adapter.quiesce();
       const status = this.adapter.drainStatus();
-      send(response, status.drained ? 200 : 409, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
+      send(response, status.drained ? 200 : 202, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
