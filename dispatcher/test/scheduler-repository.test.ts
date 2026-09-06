@@ -982,6 +982,17 @@ test("claim leaseの未来時刻では有効なauthorizationを早期失効さ�
   assert.equal(paused.updated_at, "2026-09-05T00:02:00Z");
 });
 
+test("配送完了時もlease由来のschedule時刻ではauthorizationを早期失効させない", () => {
+  const { repo } = setup();
+  repo.create("finish_before_expiry", { ...input, expires_at: "2026-09-05T00:02:00Z" }, due, actor, now);
+  repo.materialize("finish_before_expiry", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("finish_before_expiry", 1, "pause", actor, "2026-09-05T00:01:30Z");
+  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", "2026-09-05T00:01:40Z", "receipt").status, "sent");
+  assert.equal(repo.get("finish_before_expiry")?.state, "paused");
+});
+
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {
   const { repo, dispatcher, raw } = setup();
   repo.create("work_ambiguous", { ...input, action: "work.read_only" }, due, actor, now);

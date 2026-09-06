@@ -599,7 +599,7 @@ export class SchedulerRepository {
     this.retireRevisions(scheduleId, completedAt);
     this.audit(before, this.get(scheduleId)!, "complete", { tenant_id: before.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, completedAt);
   }
-  private expireUnsent(row: Outbox, now: string): boolean {
+  private expireUnsent(row: Outbox, now: string, eligibilityAt = now): boolean {
     if (row.status !== "pending" && row.status !== "claimed") return false;
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
     const terminalAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
@@ -608,7 +608,7 @@ export class SchedulerRepository {
     const ageOrigin = run.scheduled_for;
     const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(terminalAt) - Date.parse(row.created_at) > 900000;
     const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
-      : snapshot.expires_at <= terminalAt ? "authorization_expired"
+      : snapshot.expires_at <= eligibilityAt ? "authorization_expired"
       : workRetryExpired ? "retry_expired"
       : row.kind === "slack.reminder.post" && Date.parse(terminalAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
       : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= terminalAt) ? "cancelled"
@@ -826,7 +826,7 @@ export class SchedulerRepository {
         }
       }
       if (outcome !== "ambiguous") {
-        this.expireUnsent(this.getOutbox(outboxId, finishedAt)!, finishedAt);
+        this.expireUnsent(this.getOutbox(outboxId, finishedAt)!, finishedAt, now);
         const finished = this.getOutbox(outboxId, finishedAt)!;
         if (row.kind === "slack.reminder.post" && finished.terminal_at !== null) {
           this.db.prepare("UPDATE schedule_runs SET status = ?, reason = ?, terminal_at = ? WHERE run_id = ? AND status IN ('materialized','started')")
@@ -838,7 +838,7 @@ export class SchedulerRepository {
       }
       this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, finishedAt);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;
-      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= finishedAt) {
+      if (["active", "paused"].includes(current.state) && this.revision(current).expires_at <= now) {
         this.expireSchedule(current, { tenant_id: current.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, finishedAt);
       }
       this.completeIfDrained(current.schedule_id, finishedAt);
