@@ -19,6 +19,18 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 Dona Projectの対象Issueがある場合、実装前に[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Dispatcher job IDと担当を再確認し、`Dona Job ID`の記録と`Todo` → `In Progress`の更新・read-backを行う。別jobの担当を無断で上書きしない。対象IssueのないSkill修正等では適用せず、架空Issueを作らない。
 
+## Issue完了と残タスクを確定する
+
+PR本文を作成・更新する前に、対象Issueのcurrent title／本文、acceptance、実際のdiffと検証結果、selected baseへのmerge-target contractを照合し、このPRのmergeだけでIssue全体が完了するかを判定する。file数、実装量、PRが存在すること、または一部のacceptanceを満たしたことをwhole-Issue completionの代用にしない。
+
+- Issue全体が完了する場合は、後述のclosing target、identity、relationship検証を満たした標準形式の`Closes #<Issue番号>`（cross-repositoryでは`Closes OWNER/REPOSITORY#<Issue番号>`）をPR本文へ必ず記載する。default branch向けでは、merge時のautomatic closeまで`closingIssuesReferences`で確認する。
+- 残タスクがありIssue全体を完了しない場合は、元Issueをclosing targetに含めず、PR title／本文とtask/review commitから元Issueを対象とするautomatic closing referenceを除く。元Issueのclose、acceptance縮小、完了扱い、Projectの`Merge Ready`化を行わない。
+- 残タスクを新しいIssueへ切り出すのは、依頼がIssue作成を明示的に許可する場合だけとする。許可がなければ候補を報告して確認を求め、Issueを作成しない。許可がある場合は[$github-issue-decomposition](../github-issue-decomposition/SKILL.md)の単一Issue／構造化Issue判定、重複確認、native sub-issue／dependency、write前後の検証を使う。
+- 新しい残タスクIssueの人向け本文には、元Issueと当該PRから残ったtaskであること、残作業とacceptanceの境界を日本語で明記し、元Issueと当該PRの両方をGitHub上で解決できるlinkとして含める。単なるURL記載をnative parent/dependencyの代替にせず、元IssueがEpicまたは既存parentを持つ場合は、権限と依頼範囲内で既存topologyを維持する。
+- Issue作成writeの直前に元Issue、PR head/base/body、同成果のIssue、current native graphを再取得し、作成後に新Issueのtitle/body/stateと両link、意図したnative relationをread-backする。write結果が曖昧ならblind retryせず、重複の有無を再取得して一意に照合する。
+
+残タスクIssueを作成しても、元Issueを完了したことにはならず、このPRへ元Issueの`Closes`を追加する根拠にもならない。新Issue作成後にPR本文を更新する場合は、標準templateのCAS手順とreview identityの固定をやり直す。
+
 ## review targetを固定する
 
 1. latest remote default branch、current branch、upstream、local diff、同じhead/baseのopen/closed Pull Requestを再取得する。ユーザーまたは既存workflowが指定したbaseを優先し、指定がない場合だけdefault branchをbaseに選ぶ。

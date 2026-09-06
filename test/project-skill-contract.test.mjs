@@ -351,3 +351,20 @@ test("SKILL.mdが全completion gateと禁止事項を保持する", async () => 
     /rebase.*force push.*ours.*theirs.*stash.*破棄.*禁止/,
   ]);
 });
+
+test("Issue全体の完了と残タスクIssueのhandoffを安全に分岐する", async () => {
+  const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
+  const handoff = section(skill, "Issue完了と残タスクを確定する");
+
+  assertContract(handoff, "whole-Issue completion and residual handoff", [
+    /current title／本文.*acceptance.*実際のdiff.*検証結果.*merge-target contract.*Issue全体が完了/,
+    /Issue全体が完了する場合.*`Closes #<Issue番号>`.*必ず記載/,
+    /残タスク.*元Issueをclosing targetに含めず.*automatic closing referenceを除く/,
+    /元Issueのclose.*acceptance縮小.*完了扱い.*`Merge Ready`化を行わない/,
+    /Issue作成を明示的に許可.*だけ.*github-issue-decomposition/,
+    /新しい残タスクIssue.*元Issueと当該PRから残ったtask.*日本語.*元Issueと当該PRの両方.*link/,
+    /native parent\/dependencyの代替にせず.*既存topologyを維持/,
+    /writeの直前.*再取得.*作成後.*read-back.*blind retryせず/,
+    /残タスクIssueを作成しても.*元Issueを完了したことにはならず.*元Issueの`Closes`を追加する根拠にもならない/,
+  ]);
+});
