@@ -1,0 +1,123 @@
+import fs from "node:fs/promises";
+
+import Database from "better-sqlite3";
+
+import { dispatcherSchemaCompatibility, migrateDispatcherDatabase } from "./database.js";
+
+export interface SchemaCompatibility {
+  app_schema_read_min: number;
+  app_schema_read_max: number;
+  app_schema_write: number;
+  rollback_safe: boolean;
+}
+
+export interface MigrationReceipt {
+  schema_version: 1;
+  from_schema: 2;
+  to_schema: 3;
+  backup: { opened: true; integrity_check: "ok"; foreign_key_violations: 0 };
+  migrated: { integrity_check: "ok"; foreign_key_violations: 0; user_version: 3 };
+  preservation: Record<string, { before: number; after: number }>;
+  rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: true };
+  completed_at: string;
+}
+
+const preservedCounts = {
+  events: "SELECT COUNT(*) AS count FROM events",
+  event_results: "SELECT COUNT(*) AS count FROM events WHERE result_json IS NOT NULL",
+  event_completions: "SELECT COUNT(*) AS count FROM events WHERE completed_at IS NOT NULL",
+  jobs: "SELECT COUNT(*) AS count FROM jobs",
+  job_results: "SELECT COUNT(*) AS count FROM jobs WHERE result_json IS NOT NULL",
+  job_completions: "SELECT COUNT(*) AS count FROM jobs WHERE completed_at IS NOT NULL",
+} as const;
+
+function countSnapshot(db: Database.Database): Record<string, number> {
+  return Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
+    name,
+    (db.prepare(sql).get() as { count: number }).count,
+  ]));
+}
+
+function verify(db: Database.Database, expectedVersion: number): void {
+  const integrity = db.pragma("integrity_check", { simple: true });
+  if (integrity !== "ok") throw new Error("database_integrity_check_failed");
+  const foreignKeys = db.pragma("foreign_key_check") as unknown[];
+  if (foreignKeys.length !== 0) throw new Error("database_foreign_key_check_failed");
+  const version = db.pragma("user_version", { simple: true });
+  if (version !== expectedVersion) throw new Error(`database_schema_${String(version)}_does_not_match_${expectedVersion}`);
+}
+
+export function assertSchemaActivationSafe(
+  previous: SchemaCompatibility,
+  target: SchemaCompatibility,
+  actualSchema: number,
+): void {
+  if (actualSchema !== 2) throw new Error("schema_activation_requires_v2_database");
+  if (previous.app_schema_read_min > 2 || previous.app_schema_read_max < 3 || previous.app_schema_write !== 2) {
+    throw new Error("previous_release_is_not_v2_v3_compatibility_bridge");
+  }
+  if (target.app_schema_read_min > 2 || target.app_schema_read_max < 3 || target.app_schema_write !== 3) {
+    throw new Error("target_release_is_not_v3_activation_release");
+  }
+  if (!previous.rollback_safe || !target.rollback_safe) throw new Error("schema_activation_has_no_safe_rollback_target");
+}
+
+export async function migrateV2ToV3WithBackup(input: {
+  databasePath: string;
+  backupPath: string;
+  previous: SchemaCompatibility;
+  target: SchemaCompatibility;
+  quiesced: boolean;
+  drained: boolean;
+  completedAt?: string;
+}): Promise<MigrationReceipt> {
+  if (!input.quiesced || !input.drained) throw new Error("schema_activation_requires_quiesced_drained_runtime");
+  try {
+    await fs.access(input.backupPath);
+    throw new Error("schema_backup_target_already_exists");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const source = new Database(input.databasePath);
+  source.pragma("foreign_keys = ON");
+  try {
+    const actual = source.pragma("user_version", { simple: true }) as number;
+    assertSchemaActivationSafe(input.previous, input.target, actual);
+    verify(source, 2);
+    const before = countSnapshot(source);
+
+    // better-sqlite3 uses SQLite's Online Backup API and includes committed WAL pages.
+    await source.backup(input.backupPath);
+    const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
+    try {
+      backup.pragma("foreign_keys = ON");
+      verify(backup, 2);
+      if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before)) throw new Error("schema_backup_count_mismatch");
+    } finally {
+      backup.close();
+    }
+
+    migrateDispatcherDatabase(source);
+    verify(source, dispatcherSchemaCompatibility.write);
+    const after = countSnapshot(source);
+    const preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
+      before: before[name]!, after: after[name]!,
+    }]));
+    if (Object.values(preservation).some(({ before: left, after: right }) => left !== right)) {
+      throw new Error("schema_migration_preservation_failed");
+    }
+    return {
+      schema_version: 1,
+      from_schema: 2,
+      to_schema: 3,
+      backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
+      migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
+      preservation,
+      rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
+      completed_at: input.completedAt ?? new Date().toISOString(),
+    };
+  } finally {
+    source.close();
+  }
+}

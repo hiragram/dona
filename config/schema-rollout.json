@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "phase": "activation",
+  "database_schema": 3,
+  "multi_job_enabled": true,
+  "previous_release_contract": "release-compatibility.v2-v3-bridge.json",
+  "migration": {
+    "from_schema": 2,
+    "to_schema": 3,
+    "requires_quiesce": true,
+    "requires_drain": true,
+    "backup": "sqlite_online_backup",
+    "restore_open_test": true
+  }
+}
