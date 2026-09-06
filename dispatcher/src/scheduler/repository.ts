@@ -361,8 +361,10 @@ export class SchedulerRepository {
         ...runs.flatMap(row => [row.created_at, row.started_at ?? row.created_at, row.terminal_at ?? row.created_at]),
         ...outboxes.flatMap(row => [row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
           row.terminal_at ?? row.created_at, row.lease_until ?? row.created_at])].sort().at(-1)!;
-      if (operation === "resume" && (old.terminal_at !== null || old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt))) throw new Error("authorization_expired");
-      const unusable = old.expires_at <= transitionAt || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= transitionAt);
+      // A claim lease is a future fencing deadline, not the wall clock at which this operation occurs.
+      // Keep transitionAt monotonic for persisted timestamps, but evaluate authorization lifetime at now.
+      if (operation === "resume" && (old.terminal_at !== null || old.expires_at <= now || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= now))) throw new Error("authorization_expired");
+      const unusable = old.expires_at <= now || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= now);
       if (operation === "cancel" && unusable) {
         this.suppress(scheduleId, transitionAt, "cancelled");
         this.db.prepare("UPDATE schedules SET state = 'cancelled', updated_at = ?, terminal_at = ? WHERE schedule_id = ?")

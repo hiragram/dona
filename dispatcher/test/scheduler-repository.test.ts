@@ -972,6 +972,16 @@ test("schedule遷移はclaimed outboxのlease時刻より前へ戻らない", ()
   assert.equal(outbox.content_delete_at, "2026-09-12T00:02:00Z");
 });
 
+test("claim leaseの未来時刻では有効なauthorizationを早期失効させない", () => {
+  const { repo } = setup();
+  repo.create("transition_before_expiry", { ...input, expires_at: "2026-09-05T00:02:00Z" }, due, actor, now);
+  repo.materialize("transition_before_expiry", 1, due, later, due, actor);
+  repo.claim(due);
+  const paused = repo.transition("transition_before_expiry", 1, "pause", actor, "2026-09-05T00:01:30Z");
+  assert.equal(paused.state, "paused");
+  assert.equal(paused.updated_at, "2026-09-05T00:02:00Z");
+});
+
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {
   const { repo, dispatcher, raw } = setup();
   repo.create("work_ambiguous", { ...input, action: "work.read_only" }, due, actor, now);
