@@ -41,7 +41,7 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   })).deliver(input), { outcome: "revoked", code: "restricted_action_thread_locked" });
 });
 
-test("同一channelのpostを直列化する", async () => {
+test("同一channelの同時postを待機せずthrottleする", async () => {
   let release!: () => void;
   let calls = 0;
   const instance = await connector(async () => {
@@ -50,10 +50,11 @@ test("同一channelのpostを直列化する", async () => {
     return { channelId: "C1", messageTs: `1.00000${calls}` };
   });
   const first = instance.deliver(input);
-  const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
+  const second = await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls, 1);
+  assert.deepEqual(second, { outcome: "not_accepted", code: "channel_throttled", retry_after_seconds: 1 });
   release();
-  await Promise.all([first, second]);
-  assert.equal(calls, 2);
+  await first;
+  assert.equal(calls, 1);
 });

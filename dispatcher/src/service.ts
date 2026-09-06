@@ -87,6 +87,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     if (scheduler.isRunning()) await scheduler.stop();
     if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
+    await api.stop();
     database.close();
     updateNotificationDatabase.close();
     throw error;
