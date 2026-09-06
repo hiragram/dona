@@ -34,7 +34,7 @@ export function envelopeFromRow(row: {
 
 export function buildEventPrompt(eventId: string, resultPath: string, envelope: EventEnvelope): string {
   const scheduleInstruction = envelope.source === "dona_schedule"
-    ? "\nこれは永続化済みschedule runのone-shot workです。payload.work.objectiveを変更せず、workspace_kind: \"scratch\"でdelegate_jobを必ず1回だけ呼び、run identityを変更しないでください。scopeはread-onlyで、許可された外部writeはありません。Result destinationは永続bindingだけから決まり、payloadから通知先を追加してはいけません。"
+    ? "\nこれは永続化済みschedule runのone-shot workです。委任直前にsubject.tenant_idのworkspaceを確定し、check_user_channel_accessでsubject.owner_idのresult_destination channelへのcurrent accessを確認してください。authorized: trueの場合だけ、payload.work.objectiveを変更せずworkspace_kind: \"scratch\"でdelegate_jobを必ず1回だけ呼びます。照会不能・不一致・非許可では委任せずfail-closedにしてください。run identityを変更せず、scopeはread-onlyで、許可された外部writeはありません。Result destinationは永続bindingだけから決まり、payloadから通知先を追加してはいけません。"
     : "";
   const updateInstruction = envelope.source === "dona_update"
     ? "\nこれはstable updaterが生成したinternal完了通知です。payloadの確認済み結果だけを元reply_targetへ簡潔に通知し、再実行や追加のupdate操作は行わないでください。"

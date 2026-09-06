@@ -914,6 +914,7 @@ export class DispatcherDatabase {
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
+      if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
       if(event.source==="dona_schedule") {
         const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
         if(!run?.job_id||run.status==="materialized") {
@@ -939,7 +940,7 @@ export class DispatcherDatabase {
           value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
         const delivered=actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&
           typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&
-          (target?.kind!=="thread"||(value.thread_ts===target.thread_ts&&value.reply_broadcast===false)));
+          (target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
         this.setNotificationState(eventId,delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
@@ -947,6 +948,8 @@ export class DispatcherDatabase {
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
     this.db.transaction(()=>{
+      const event=this.getRequired(eventId);
+      if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
       const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
         typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
         (action as Record<string,unknown>).ambiguous===true);

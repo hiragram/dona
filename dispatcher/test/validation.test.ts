@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { parseEventEnvelope, parseInternalScheduleEventEnvelope, parseInternalUpdateEventEnvelope, parseResultEnvelope } from "../src/validation.js";
+import { parseCreateJobRequest, parseEventEnvelope, parseInternalScheduleEventEnvelope, parseInternalUpdateEventEnvelope, parseResultEnvelope } from "../src/validation.js";
 import { eventEnvelope } from "./helpers.js";
 
 describe("event validation", () => {
+  test("job objectiveは値を保持したまま空白だけを拒否する",()=>{
+    assert.equal(parseCreateJobRequest({source_event_id:"evt_1",objective:"  調査  ",workspace:{kind:"scratch"}}).objective,"  調査  ");
+    assert.throws(()=>parseCreateJobRequest({source_event_id:"evt_1",objective:"   ",workspace:{kind:"scratch"}}),/non-whitespace/);
+  });
   test("ignores unknown top-level fields", () => {
     const input = { ...eventEnvelope("Ev-1"), future_field: true };
     assert.equal("future_field" in parseEventEnvelope(input), false);
