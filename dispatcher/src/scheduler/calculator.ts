@@ -38,12 +38,23 @@ function matches(date: string, recurrence: Exclude<Recurrence, { kind: 'once' }>
 }
 
 export function previewOccurrences(input: ScheduleDefinition, request: PreviewRequest): OccurrencePreview {
+  const { definition, after, before } = checkedPreview(input, request);
+  return calculateOccurrences(definition, after, before, request.limit);
+}
+
+function checkedPreview(input: ScheduleDefinition, request: PreviewRequest) {
   const definition = parseDefinition(input);
   const after = Date.parse(utcInstant(request.after));
   const before = Date.parse(utcInstant(request.before_or_equal));
   const horizon = before - after;
   if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > definition.policy.limits.preview_count || horizon < DAY_MS || horizon > definition.policy.limits.preview_days * DAY_MS) throw new ScheduleError('invalid_preview_limit');
-  return calculateOccurrences(definition, after, before, request.limit);
+  return { definition, after, before };
+}
+
+export function previewOccurrencesBefore(input: ScheduleDefinition, request: PreviewRequest, exclusiveBefore: string): OccurrencePreview {
+  const { definition, after, before } = checkedPreview(input, request);
+  const authorizedBefore = Date.parse(utcInstant(exclusiveBefore)) - 1;
+  return calculateOccurrences(definition, after, Math.min(before, authorizedBefore), request.limit);
 }
 
 function calculateOccurrences(definition: ScheduleDefinition, after: number, before: number, limit: number): OccurrencePreview {

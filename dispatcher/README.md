@@ -72,6 +72,8 @@ Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" }
 
 Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
 
+schedule操作は、呼出し元が指定したworkspace・actor・返信先を信用しません。`source_event_id`で保存済みSlack eventを引き、actor、workspace、固定thread、30日以内のauthorization snapshotをserver-sideで組み立てます。`preview_schedule`で有限horizonのoccurrence・policy・固定target・失効時刻を確認してから、`create_schedule`を呼びます。writeのtimeoutや切断時はblind retryせず、同じidempotency keyの状態を`get_schedule`または`list_schedules`で照合してください。updateとpause/resume/cancelは必ず取得済みの`expected_revision`を渡します。
+
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
 - `get_job_status`: 状態と結果を取得
@@ -81,6 +83,12 @@ Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも�
 - `apply_self_update`: exact plan hashと明示承認receiptを投入（destructive）
 - `get_self_update_status`: state、fence、SHA、health、outboxを取得（read-only）
 - `cancel_self_update`: activation前にcancel。外部mutation後はneeds_review（destructive）
+- `preview_schedule` / `create_schedule`: scheduleの安全なpreviewと冪等作成
+- `get_schedule` / `list_schedules` / `update_schedule`: owner-scoped CRUDとoptimistic revision更新
+- `pause_schedule` / `resume_schedule` / `cancel_schedule`: 冪等な状態遷移
+- `get_schedule_history`: bounded paginationのrun履歴（本文・secretは非投影）
+
+対応UDS routeは`POST /v1/schedules/preview`、`POST|GET /v1/schedules`、`GET|PATCH /v1/schedules/:id`、`POST /v1/schedules/:id/{pause,resume,cancel}`、`GET /v1/schedules/:id/runs`です。due scan、Slack投稿、background job実行、自然言語日時解析はこのsurfaceの責務外です。
 
 `apply_self_update`のacceptedはupdater DB commit後だけ返ります。元のSlack受付eventが`completed`になる前にupdaterはactivationをclaimしません。timeoutや接続切断でapply/cancelのacceptanceが不明な場合は、同じwriteを再送せずstatusを確認します。
 
