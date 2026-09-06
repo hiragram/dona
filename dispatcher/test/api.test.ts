@@ -328,7 +328,8 @@ describe("DispatcherApi", () => {
   test("exposes preview, CRUD and transition contracts over UDS", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
-    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
+      undefined, undefined, undefined, () => new Date("2026-09-06T00:00:00Z"));
     await api.start();
     const event = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-schedule-uds"));
     const definition = { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "UDS確認" } };

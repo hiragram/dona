@@ -119,7 +119,8 @@ export class DispatcherApi {
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
-  ) { this.schedules = new ScheduleApiService(database); }
+    scheduleNow: () => Date = () => new Date(),
+  ) { this.schedules = new ScheduleApiService(database, scheduleNow); }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
