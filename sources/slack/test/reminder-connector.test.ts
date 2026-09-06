@@ -36,4 +36,7 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }), async () => ({
     id: "C1", isPrivate: true, isArchived: false, isMember: false, isShared: false, isMpim: true,
   }))).deliver(input)).outcome, "accepted");
+  assert.deepEqual(await (await connector(async () => {
+    throw new SlackApiError("restricted_action_thread_locked", "locked");
+  })).deliver(input), { outcome: "revoked", code: "restricted_action_thread_locked" });
 });

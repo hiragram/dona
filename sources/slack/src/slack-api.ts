@@ -139,6 +139,7 @@ export interface SlackApiClient {
     replyBroadcast: boolean;
     identityBlockId?: string;
     mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult>;
   setAgentSessionStatus(input: {
     channelId: string;
@@ -604,11 +605,13 @@ export class SlackWebApiClient implements SlackApiClient {
     replyBroadcast: boolean;
     identityBlockId?: string;
     mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult> {
     const base = {
       channel: input.channelId,
       text: input.text,
       mrkdwn: input.mrkdwn ?? true,
+      ...(input.parse ? { parse: input.parse } : {}),
       unfurl_links: false,
       unfurl_media: false,
       ...(input.identityBlockId ? {

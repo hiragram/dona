@@ -36,6 +36,7 @@ const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?
 const revokedSlackErrors = new Set([
   "channel_not_found", "user_not_found", "missing_scope", "not_in_channel", "thread_not_found", "is_archived",
   "token_revoked", "account_inactive", "invalid_auth", "not_authed", "not_allowed_token_type",
+  "restricted_action_read_only_channel", "restricted_action_thread_locked",
 ]);
 
 export function parseSlackReminderCommand(value: unknown): SlackReminderCommand {
@@ -80,6 +81,7 @@ export class SlackReminderConnector {
         ...(input.target.kind === "thread" ? { threadTs: input.target.thread_ts } : {}),
         replyBroadcast: false,
         mrkdwn: false,
+        parse: "none",
       });
       if (posted.channelId !== input.target.channel_id) return { outcome: "acceptance_unknown", code: "receipt_mismatch" };
       return { outcome: "accepted", receipt_id: posted.messageTs };
