@@ -212,6 +212,12 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true });
   assert.equal(recording.calls[0]?.args[1], configuredDatabase);
+  assert.equal(recording.calls[0]?.args[2], path.join(
+    policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "dispatcher-v2.sqlite3",
+  ));
+  assert.equal(recording.calls[0]?.args[3], path.join(
+    policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "migration-receipt.json",
+  ));
   await fs.chmod(configuredDatabase, 0o644);
   assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },

@@ -6,7 +6,12 @@ import { afterEach, test } from "node:test";
 
 import Database from "better-sqlite3";
 
-import { assertReceiptMatchesDatabases, assertSchemaActivationSafe, migrateV2ToV3WithBackup } from "../src/schema-rollout.js";
+import {
+  assertReceiptMatchesDatabases,
+  assertSchemaActivationSafe,
+  migrateV2ToV3WithBackup,
+  publishMigrationReceipt,
+} from "../src/schema-rollout.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))));
@@ -85,6 +90,26 @@ test("migration refuses to run before drain and never overwrites a backup", asyn
     databasePath: "/not/opened", backupPath: "/not/written", previous: bridge, target: activation,
     quiesced: false, drained: true,
   }), /quiesced_drained/);
+});
+
+test("receipt publication is not blocked by a stale legacy temporary file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-receipt-"));
+  roots.push(root);
+  const receiptPath = path.join(root, "migration-receipt.json");
+  await fs.writeFile(`${receiptPath}.tmp`, "stale", { mode: 0o600 });
+  const receipt = {
+    schema_version: 1 as const,
+    from_schema: 2 as const,
+    to_schema: 3 as const,
+    backup: { opened: true as const, integrity_check: "ok" as const, foreign_key_violations: 0 as const },
+    migrated: { integrity_check: "ok" as const, foreign_key_violations: 0 as const, user_version: 3 as const },
+    preservation: {},
+    rollback: { target_schema: 3 as const, previous_release_can_read: true as const, backup_restore_opened: true as const },
+    completed_at: "2026-09-06T00:00:00.000Z",
+  };
+  await publishMigrationReceipt(receiptPath, receipt);
+  assert.deepEqual(JSON.parse(await fs.readFile(receiptPath, "utf8")), receipt);
+  assert.equal(await fs.readFile(`${receiptPath}.tmp`, "utf8"), "stale");
 });
 
 test("a wrong source path creates no database file", async () => {

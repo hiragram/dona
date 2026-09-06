@@ -494,9 +494,12 @@ export class RealRuntime implements RuntimePort {
     return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
   }
 
-  migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
+  migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
     const databasePath = this.dispatcherDatabasePath();
-    const backupRoot = path.join(this.policy.control_root, "schema-backups", requestId);
+    // The schema transition outlives an individual update request. A later
+    // activation attempt must be able to validate and reuse the durable v2
+    // backup/receipt left by an earlier attempt that rolled the release back.
+    const backupRoot = path.join(this.policy.control_root, "schema-backups", "dispatcher-v2-to-v3");
     return this.runner.run(this.policy.executables.node, [
       path.join(this.policy.release_root, targetSha, "dispatcher", "dist", "schema-rollout-cli.js"),
       databasePath,

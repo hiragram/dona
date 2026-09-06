@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 
 import Database from "better-sqlite3";
 
@@ -20,6 +21,16 @@ export interface MigrationReceipt {
   preservation: Record<string, { before: number; after: number }>;
   rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: true };
   completed_at: string;
+}
+
+export async function publishMigrationReceipt(receiptPath: string, receipt: MigrationReceipt): Promise<void> {
+  const temporary = path.join(path.dirname(receiptPath), `.${path.basename(receiptPath)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(receipt)}\n`, { mode: 0o600, flag: "wx" });
+    await fs.rename(temporary, receiptPath);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
 }
 
 const preservedCounts = {

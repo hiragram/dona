@@ -8,6 +8,7 @@ import {
   assertReceiptMatchesDatabases,
   countSnapshot,
   migrateV2ToV3WithBackup,
+  publishMigrationReceipt,
   verifyDatabase,
   type MigrationReceipt,
   type SchemaCompatibility,
@@ -57,9 +58,7 @@ async function main(): Promise<void> {
         rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
         completed_at: new Date().toISOString(),
       };
-      const temporary = `${receiptPath}.tmp`;
-      await fs.writeFile(temporary, `${JSON.stringify(recovered)}\n`, { mode: 0o600, flag: "wx" });
-      await fs.rename(temporary, receiptPath);
+      await publishMigrationReceipt(receiptPath, recovered);
       process.stdout.write(`${JSON.stringify(recovered)}\n`);
       return;
     } finally {
@@ -77,9 +76,7 @@ async function main(): Promise<void> {
     quiesced: true,
     drained: true,
   });
-  const temporary = `${receiptPath}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(receipt)}\n`, { mode: 0o600, flag: "wx" });
-  await fs.rename(temporary, receiptPath);
+  await publishMigrationReceipt(receiptPath, receipt);
   process.stdout.write(`${JSON.stringify(receipt)}\n`);
 }
 
