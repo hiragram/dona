@@ -95,14 +95,17 @@ export class ReminderPublisher {
         active.add(task);
       };
       for (const row of this.repository.claimBatch(this.clock.now(), 240, "slack.reminder.post", 100)) launch(row);
-      while (this.running && active.size > 0) {
-        if (active.size < 100) {
+      while (active.size > 0) {
+        if (this.running && active.size < 100) {
           const claimed = this.repository.claimBatch(this.clock.now(), 240, "slack.reminder.post", 100 - active.size);
           for (const row of claimed) launch(row);
         }
         if (active.size === 0) break;
-        try { await Promise.race([...active, new Promise<void>((resolve) => setTimeout(resolve, this.pollMs))]); }
+        let pollTimer: NodeJS.Timeout | undefined;
+        const poll = new Promise<void>((resolve) => { pollTimer = setTimeout(resolve, this.pollMs); pollTimer.unref(); });
+        try { await Promise.race([...active, poll]); }
         catch (error) { await Promise.allSettled(active); throw error; }
+        finally { if (pollTimer) clearTimeout(pollTimer); }
       }
     }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }
