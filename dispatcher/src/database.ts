@@ -272,7 +272,7 @@ export class DispatcherDatabase {
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
-      if (typeof payload.work?.objective!=="string" || payload.work.objective.trim() !== request.objective || payload.work.scope !== "read_only" ||
+      if (typeof payload.work?.objective!=="string" || payload.work.objective !== request.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
         throw new Error("Scheduled work request does not match its persisted read-only scope");
       }
@@ -614,7 +614,7 @@ export class DispatcherDatabase {
     if(prior) return {row:sourceEvent,duplicate:true,payloadMismatch:false};
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const workState=job.status==="completed"?"completed":job.status==="needs_review"?"needs_review":"failed";
-    const notificationState="none";
+    const notificationState=binding.destination.kind==="none"?"none":"pending";
     const completedAt=job.completed_at??job.updated_at;
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
       (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
@@ -660,7 +660,7 @@ export class DispatcherDatabase {
         workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
         ...(result ? { result } : {}),
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
-        ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
+        ...(job.last_error_message ? { error_message: this.safeNotificationError(job.last_error_message,binding.owner.kind==="schedule") } : {}),
       },
           reply_target: binding.destination.kind==="slack"?binding.destination.target:binding.destination,
       trace: { job_id: job.job_id, source_event_id: job.source_event_id },
@@ -670,9 +670,21 @@ export class DispatcherDatabase {
       .run(enqueued.row.event_id, at.toISOString(), jobId);
     this.db.prepare(`UPDATE job_completion_results SET notification_event_id=? WHERE job_id=? AND job_status=?`)
       .run(enqueued.row.event_id,jobId,job.status);
-    this.db.prepare(`UPDATE job_completion_results SET notification_state='pending' WHERE job_id=? AND job_status=?`)
-      .run(jobId,job.status);
     return enqueued;
+  }
+
+  private safeNotificationError(message:string,scheduled:boolean):string {
+    if(!scheduled) return message;
+    try { validateWorkResultContent(message); return message; }
+    catch { return "実行エラーの詳細は安全上省略されました"; }
+  }
+
+  private setNotificationState(eventId:string,state:"none"|"accepted"|"failed"|"needs_review",at:Date):void {
+    const rows=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id FROM job_completion_results
+      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).all(eventId) as Array<{run_id:string}>;
+    this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId);
+    const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+    for(const row of rows) this.scheduler.settleWorkNotification(row.run_id,timestamp);
   }
 
   assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
@@ -715,12 +727,12 @@ export class DispatcherDatabase {
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed') AND json_extract(c.owner_json,'$.kind')='schedule'
-          AND (julianday(e.available_at,'+900 seconds')<=julianday(?) OR s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))`)
+          AND (julianday(c.materialized_at,'+900 seconds')<=julianday(?) OR s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))`)
         .all(timestamp,timestamp) as Array<{event_id:string}>;
       for(const row of rows) {
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
           last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')`).run(timestamp,timestamp,row.event_id);
-        this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=?").run(row.event_id);
+        this.setNotificationState(row.event_id,"none",at);
       }
     }).immediate();
   }
@@ -760,6 +772,8 @@ export class DispatcherDatabase {
   recoverStaleDispatching(at = new Date()): number {
     return this.db.transaction(() => {
       const scheduled=(this.db.prepare("SELECT event_id FROM events WHERE status='dispatching' AND source='dona_schedule'").all() as Array<{event_id:string}>);
+      const notifications=(this.db.prepare(`SELECT event_id FROM events WHERE status='dispatching' AND source='dona_job'
+        AND event_id IN (SELECT notification_event_id FROM job_completion_results WHERE notification_event_id IS NOT NULL)`).all() as Array<{event_id:string}>);
       const changed=this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
@@ -770,7 +784,7 @@ export class DispatcherDatabase {
       `).run(at.toISOString()).changes;
       const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
       for(const row of scheduled) this.scheduler.settleUndelegatedWorkEvent(row.event_id,"needs_review",timestamp);
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id IN (SELECT event_id FROM events WHERE status='needs_review')").run();
+      for(const row of notifications) this.setNotificationState(row.event_id,"needs_review",at);
       return changed;
     }).immediate();
   }
@@ -804,7 +818,7 @@ export class DispatcherDatabase {
       const scheduled=this.getRequired(eventId).source==="dona_schedule";
       this.transition(eventId, from, scheduled ? "needs_review" : "blocked", {last_error_code: "agent_blocked",last_error_message: message});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?").run(eventId);
+      this.setNotificationState(eventId,"needs_review",at);
     }).immediate();
   }
 
@@ -812,7 +826,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {last_error_code: code,last_error_message: message});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?").run(eventId);
+      this.setNotificationState(eventId,"needs_review",new Date());
     }).immediate();
   }
 
@@ -834,7 +848,7 @@ export class DispatcherDatabase {
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-        this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+        this.setNotificationState(eventId,"failed",at);
       }
       return this.get(eventId)!;
     })();
@@ -854,7 +868,7 @@ export class DispatcherDatabase {
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-        this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+        this.setNotificationState(eventId,"failed",at);
       }
       return this.get(eventId)!;
     })();
@@ -886,7 +900,7 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
-      this.db.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(eventId);
+      this.setNotificationState(eventId,"accepted",new Date(result.completed_at));
     }).immediate();
   }
 
@@ -895,7 +909,7 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], "dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: "agent_reported_failure",last_error_message: result.summary ?? "Agent reported failure"});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
-      this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+      this.setNotificationState(eventId,"failed",new Date(result.completed_at));
     }).immediate();
   }
 
@@ -937,7 +951,7 @@ export class DispatcherDatabase {
         WHERE event_id = ?
       `)
       .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
-    this.db.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(eventId);
+    this.setNotificationState(eventId,"accepted",at);
     return this.getRequired(eventId);
   }
 
@@ -949,7 +963,7 @@ export class DispatcherDatabase {
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
-    this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+    this.setNotificationState(eventId,"failed",at);
     return this.getRequired(eventId);
   }
 

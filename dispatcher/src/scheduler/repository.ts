@@ -224,6 +224,7 @@ export class SchedulerRepository {
     if (input.policy_version !== 1 || input.approver_id !== owner || input.approved_at > now || input.expires_at <= now ||
         Date.parse(input.expires_at) - Date.parse(input.approved_at) > 2592000000) throw new Error("invalid_authorization");
     if (input.action !== "slack.reminder.post" && input.action !== "work.read_only") throw new Error("invalid_action");
+    if (input.action === "work.read_only" && input.content.trim().length === 0) throw new Error("invalid_content");
     safeContent(input.content, input.action === "work.read_only" ? 4000 : 2000);
     if (input.target.kind === "none") { if (input.action !== "work.read_only") throw new Error("invalid_target"); }
     else {
@@ -547,10 +548,6 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
       this.suppress(run.schedule_id, at, "cancelled");
       this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id);
-      const snapshot = this.revision(run); const target = JSON.parse(snapshot.target_json) as Target;
-      if (!["cancelled","expired"].includes(before.state) && target.kind !== "none" && !this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(runId)) {
-        this.insertOutbox(runId, "slack.work_result.post", snapshot.target_json, "scheduled workの結果は確認が必要です", at);
-      }
       this.retireRevisions(run.schedule_id, at);
       this.audit(before, this.get(run.schedule_id)!, "work_result_needs_review",
         {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:sourceEventId}, at, undefined, this.getRun(runId)!);
@@ -657,7 +654,9 @@ export class SchedulerRepository {
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
     const unsettled = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o
-        WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
+        WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review')) OR EXISTS
+        (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+          AND c.notification_state IN ('pending','needs_review'))) LIMIT 1`).get(scheduleId);
     if (unsettled) return;
     const runTerminal = (this.db.prepare("SELECT MAX(terminal_at) AS value FROM schedule_runs WHERE schedule_id = ?").get(scheduleId) as { value: string | null }).value;
     const completedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at,
@@ -665,6 +664,11 @@ export class SchedulerRepository {
     this.db.prepare("UPDATE schedules SET state = 'completed', terminal_at = ?, updated_at = ? WHERE schedule_id = ?").run(completedAt, completedAt, scheduleId);
     this.retireRevisions(scheduleId, completedAt);
     this.audit(before, this.get(scheduleId)!, "complete", { tenant_id: before.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, completedAt);
+  }
+  settleWorkNotification(runId: string, now: string): void {
+    utc(now); id(runId);
+    const run = this.getRun(runId);
+    if (run) this.completeIfDrained(run.schedule_id, now);
   }
   private expireUnsent(row: Outbox, now: string): boolean {
     if (row.status !== "pending" && row.status !== "claimed") return false;
@@ -840,11 +844,13 @@ export class SchedulerRepository {
     utc(now);
     const resultFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`).all(now) as Array<{job_id:string;result_path:string}>;
-    const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
-      LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id
-      WHERE e.source='dona_schedule' AND e.result_path IS NOT NULL AND (r.terminal_at<=? OR c.content_delete_at<=? OR EXISTS
-        (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?))`)
-      .all(add(now,-604800),now,add(now,-604800)) as Array<{event_id:string;result_path:string}>;
+    const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
+      LEFT JOIN schedule_runs r ON r.event_id=e.event_id
+      LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
+      WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (r.terminal_at<=? OR c.content_delete_at<=? OR EXISTS
+        (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))
+        OR (e.source='dona_job' AND c.notification_event_id=e.event_id AND c.content_delete_at<=?))`)
+      .all(add(now,-604800),now,add(now,-604800),now) as Array<{event_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
