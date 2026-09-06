@@ -67,7 +67,7 @@ export class SlackReminderConnector {
     const serialized = JSON.stringify(input);
     const prepared = this.prepared.get(input.outbox_id);
     if (!preflightOnly) {
-      if (prepared?.serialized !== serialized || prepared.expiresAt < Date.now()) {
+      if (prepared?.serialized !== serialized || prepared.expiresAt <= Date.now()) {
         this.prepared.delete(input.outbox_id);
         return { outcome: "not_accepted", code: "preflight_required", retry_after_seconds: 0 };
       }

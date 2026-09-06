@@ -747,6 +747,11 @@ export class SchedulerRepository {
           const currentAuthorization = this.revision(schedule);
           if (runAuthorization.authorization_id === currentAuthorization.authorization_id &&
             runAuthorization.authorization_revision === currentAuthorization.authorization_revision) {
+            if (schedule.state === "active") {
+              this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND state = 'active'")
+                .run(now, run.schedule_id);
+              this.suppress(run.schedule_id, now, "cancelled");
+            }
             this.retireRevisions(run.schedule_id, now, schedule.revision);
             this.auditOutbox(current, "outbox_revoked", now, schedule, decisionCode);
           }

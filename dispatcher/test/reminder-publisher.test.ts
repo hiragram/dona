@@ -151,6 +151,7 @@ test("認可preflight中のpause後も確定revocationを継承する", async ()
   const publisher = new ReminderPublisher(state.repo, {
     async preflight() {
       state.repo.transition("s1", 1, "pause", actor, at);
+      state.repo.transition("s1", state.repo.get("s1")!.revision, "resume", actor, at);
       return { outcome: "revoked", code: "owner_not_authorized" };
     },
     async deliver() { throw new Error("write must not run"); },
