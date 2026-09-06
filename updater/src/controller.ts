@@ -34,6 +34,21 @@ export function releaseCompatibilityMatches(
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
 }
 
+export function targetCompatibilityAllowedByPolicy(
+  current: ReleaseManifest["compatibility"],
+  target: ReleaseManifest["compatibility"],
+  approved: ReleaseManifest["compatibility"],
+): boolean {
+  if (canonicalJson(target) === canonicalJson(approved)) return true;
+  return canonicalJson(current) === canonicalJson(approved) &&
+    current.rollback_safe && target.rollback_safe &&
+    target.protocol === approved.protocol && target.config === approved.config &&
+    target.app_schema_read_min === approved.app_schema_read_min &&
+    approved.app_schema_read_max === 2 && target.app_schema_read_max === 3 &&
+    target.app_schema_write === approved.app_schema_write &&
+    releaseCompatibilityMatches(current, target);
+}
+
 function resultSucceeded(result: { exit_code: number | null; timed_out: boolean }): boolean {
   return result.exit_code === 0 && !result.timed_out;
 }
@@ -68,8 +83,16 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
+    if (!targetCompatibilityAllowedByPolicy(current.compatibility, git.target_compatibility, this.policy.compatibility)) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
+    }
+    const widening = git.target_compatibility.app_schema_read_max > this.policy.compatibility.app_schema_read_max;
+    const expectedPhase = widening ? "compatibility_bridge" : "compatibility_bootstrap";
+    const expectedCapabilities = widening ? ["app_schema_read_v2_v3"] : ["safe_read_max_widening_planner"];
+    if (git.target_rollout.database_schema !== current.compatibility.app_schema_write ||
+      git.target_rollout.multi_job_enabled || git.target_rollout.phase !== expectedPhase ||
+      canonicalJson(git.target_rollout.capabilities) !== canonicalJson(expectedCapabilities)) {
+      throw new Error("target_feature_activation_is_not_allowed_during_compatibility_widening");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
     const targetManifest: ReleaseManifest = {
@@ -232,6 +255,7 @@ export class UpdateController {
       this.runtime.dispatcherHealth(), this.runtime.slackHealth(), this.runtime.mainAgentStatus(expectedRelease),
       observation.current_sha ? this.releases.releaseManifest(observation.current_sha) : Promise.resolve(null),
     ]);
+    const targetCompatibility = JSON.parse(claimed.compatibility_json) as ReleaseManifest["compatibility"];
     if (
       observation.current_sha === claimed.target_sha &&
       observation.previous_sha === claimed.current_sha &&
@@ -240,8 +264,8 @@ export class UpdateController {
       observation.receipt.to_sha === claimed.target_sha &&
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
-      this.healthMatches(dispatcherHealth, claimed.target_sha, false) &&
-      this.healthMatches(slackHealth, claimed.target_sha, true) &&
+      this.healthMatches(dispatcherHealth, claimed.target_sha, false, targetCompatibility) &&
+      this.healthMatches(slackHealth, claimed.target_sha, true, targetCompatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) &&
       this.mainAgentMatchesReceipt(claimed, mainAgent)
     ) {
@@ -344,6 +368,7 @@ export class UpdateController {
 
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
+    const targetCompatibility = JSON.parse(row.compatibility_json) as ReleaseManifest["compatibility"];
     let mainAgentPaneId = this.database.runtimeOperation(row.request_id, "stop_main_agent")?.target_ref;
     this.assertLease(row);
     if (row.state === "rolling_back") {
@@ -523,6 +548,7 @@ export class UpdateController {
       }
       const dispatcherStart = await this.ensureServiceStarted(
         row, "start_target_dispatcher", "dispatcher", row.target_sha, () => this.runtime.startDispatcher(),
+        targetCompatibility,
       );
       if (dispatcherStart === "deferred") return;
       if (dispatcherStart === "wrong_sha") {
@@ -531,6 +557,7 @@ export class UpdateController {
       }
       const slackStart = await this.ensureServiceStarted(
         row, "start_target_slack", "slack_adapter", row.target_sha, () => this.runtime.startSlack(),
+        targetCompatibility,
       );
       if (slackStart === "deferred") return;
       if (slackStart === "wrong_sha") {
@@ -562,8 +589,8 @@ export class UpdateController {
         await this.rollback(row, "slack_wrong_target_sha", {});
         return;
       }
-      if (!this.healthMatches(dispatcherHealth, row.target_sha, false) ||
-        !this.healthMatches(slackHealth, row.target_sha, true) ||
+      if (!this.healthMatches(dispatcherHealth, row.target_sha, false, targetCompatibility) ||
+        !this.healthMatches(slackHealth, row.target_sha, true, targetCompatibility) ||
         !this.notificationReporterReady(dispatcherHealth, slackHealth) ||
         !this.mainAgentMatchesReceipt(row, mainAgent)) {
         this.deferOrReview(row, "ambiguous_runtime_observation", "Target runtime has not reached the exact verified state");

@@ -71,6 +71,7 @@ export class SlackHealthServer {
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
     private readonly appSchemaWrite: 2 | 3 = 2,
+    private readonly appSchemaReadMax: 2 | 3 = 2,
   ) {}
 
   async start(): Promise<void> {
@@ -191,7 +192,7 @@ export class SlackHealthServer {
         protocol: 1,
         app_schema: this.appSchemaWrite,
         app_schema_read_min: 2,
-        app_schema_read_max: 3,
+        app_schema_read_max: this.appSchemaReadMax,
         app_schema_write: this.appSchemaWrite,
         config: 1,
         ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),

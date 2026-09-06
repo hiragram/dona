@@ -36,6 +36,14 @@ export interface Compatibility {
   rollback_safe: boolean;
 }
 
+export interface SchemaRollout {
+  schema_version: 1;
+  phase: string;
+  database_schema: number;
+  multi_job_enabled: boolean;
+  capabilities: string[];
+}
+
 export interface ReplyTarget {
   kind: "slack_thread";
   workspace_id: string;

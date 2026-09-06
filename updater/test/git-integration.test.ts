@@ -29,8 +29,12 @@ test("RealGit uses an isolated fixed branch, exact SHA, FF-only ancestry, and de
       schema_version: 1, protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
       app_schema_write: 2, rollback_safe: true,
     }));
+    await fs.writeFile(path.join(work, "config", "schema-rollout.json"), JSON.stringify({
+      schema_version: 1, phase: "compatibility_bootstrap", database_schema: 2,
+      multi_job_enabled: false, capabilities: ["safe_read_max_widening_planner"],
+    }));
     await fs.writeFile(path.join(work, "version.txt"), "one\n");
-    await git(["-C", work, "add", "version.txt", "config/release-compatibility.json"]);
+    await git(["-C", work, "add", "version.txt", "config/release-compatibility.json", "config/schema-rollout.json"]);
     await git(["-C", work, "commit", "-m", "first"]);
     const first = await git(["-C", work, "rev-parse", "HEAD"]);
     await git(["clone", "--bare", work, remote]);
@@ -48,6 +52,10 @@ test("RealGit uses an isolated fixed branch, exact SHA, FF-only ancestry, and de
       target_reachable: true,
       ci_trusted: true,
       target_compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+      target_rollout: {
+        schema_version: 1, phase: "compatibility_bootstrap", database_schema: 2,
+        multi_job_enabled: false, capabilities: ["safe_read_max_widening_planner"],
+      },
     });
     const stage = path.join(root, "stage");
     await fs.mkdir(stage);

@@ -79,7 +79,7 @@ describe("SlackHealthServer", () => {
     assert.equal(version.body.build_sha, "development");
     assert.equal(version.body.app_schema, 2);
     assert.equal(version.body.app_schema_read_min, 2);
-    assert.equal(version.body.app_schema_read_max, 3);
+    assert.equal(version.body.app_schema_read_max, 2);
     assert.equal(version.body.app_schema_write, 2);
     assert.equal(version.body.update_notification_protocol, undefined);
     await server.stop();

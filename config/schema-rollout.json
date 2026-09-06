@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "phase": "compatibility_bridge",
+  "phase": "compatibility_bootstrap",
   "database_schema": 2,
   "multi_job_enabled": false,
-  "capabilities": ["app_schema_read_v2_v3"]
+  "capabilities": ["safe_read_max_widening_planner"]
 }

@@ -154,7 +154,7 @@ describe("DispatcherDatabase", () => {
     process.env.HOME = root;
     process.env.DONA_RELEASE_MANIFEST_PATH = "~/activation-manifest.json";
     await fs.writeFile(path.join(root, "activation-manifest.json"), JSON.stringify({
-      compatibility: { app_schema_write: 3 },
+      compatibility: { app_schema_read_max: 3, app_schema_write: 3 },
     }));
     try {
       const activated = new DispatcherDatabase(config.databasePath);
@@ -176,7 +176,7 @@ describe("DispatcherDatabase", () => {
     roots.push(root);
     const before = await createSchemaV2Fixture(config.databasePath);
     const manifestPath = path.join(root, "activation-manifest.json");
-    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 3 } }));
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_read_max: 3, app_schema_write: 3 } }));
     const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
     process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
 
@@ -275,7 +275,7 @@ describe("DispatcherDatabase", () => {
     const manifestRoot = await fs.mkdtemp("/tmp/dona-v3-migration-");
     roots.push(manifestRoot);
     const manifestPath = path.join(manifestRoot, "release-manifest.json");
-    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 3 } }));
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_read_max: 3, app_schema_write: 3 } }));
     const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
     process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {

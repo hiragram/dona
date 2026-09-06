@@ -50,6 +50,7 @@ async function main(): Promise<void> {
     updateNotifications,
     config.updateInternalTokenPath,
     config.appSchemaWrite,
+    config.appSchemaReadMax,
   );
   await health.start();
   try {

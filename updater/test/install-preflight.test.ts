@@ -184,7 +184,7 @@ test("an existing immutable release is reusable only with the exact control-plan
       protocol: 1,
       config: 1,
       app_schema_read_min: 2,
-      app_schema_read_max: 3,
+      app_schema_read_max: 2,
       app_schema_write: 2,
       rollback_safe: true,
     },

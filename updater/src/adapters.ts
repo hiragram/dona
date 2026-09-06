@@ -17,6 +17,7 @@ import type {
   MainAgentStopResult,
   MainAgentStatus,
   OutboxRow,
+  SchemaRollout,
 } from "./types.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
@@ -46,6 +47,7 @@ export class RealGit implements GitPort {
     target_reachable: boolean;
     ci_trusted: boolean;
     target_compatibility: Compatibility;
+    target_rollout: SchemaRollout;
   }> {
     fullSha(currentSha, "current_sha");
     await fs.mkdir(this.policy.control_root, { recursive: true, mode: 0o700 });
@@ -75,6 +77,7 @@ export class RealGit implements GitPort {
       target_reachable: ancestry.exit_code === 0,
       ci_trusted: await this.verifyTrust(targetSha),
       target_compatibility: await this.readCompatibility(targetSha),
+      target_rollout: await this.readSchemaRollout(targetSha),
     };
   }
 
@@ -158,6 +161,19 @@ export class RealGit implements GitPort {
       "--git-dir", this.cachePath, "show", `${targetSha}:config/release-compatibility.json`,
     ]));
     return parseCompatibilityMetadata(JSON.parse(body));
+  }
+
+  private async readSchemaRollout(targetSha: string): Promise<SchemaRollout> {
+    const raw = requireSuccess("git show schema rollout", await this.git([
+      "--git-dir", this.cachePath, "show", `${targetSha}:config/schema-rollout.json`,
+    ]));
+    const value = JSON.parse(raw) as Partial<SchemaRollout>;
+    if (value.schema_version !== 1 || typeof value.phase !== "string" ||
+      !Number.isInteger(value.database_schema) || typeof value.multi_job_enabled !== "boolean" ||
+      !Array.isArray(value.capabilities) || !value.capabilities.every((entry) => typeof entry === "string")) {
+      throw new Error("target_schema_rollout_is_invalid");
+    }
+    return value as SchemaRollout;
   }
 }
 
