@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { EnqueueResult, EventEnvelope } from "../types.js";
+import type { ScheduleDefinition } from "./domain.js";
 
 export type ScheduleState = "active" | "paused" | "expired" | "needs_review" | "cancelled" | "completed";
 export type Action = "slack.reminder.post" | "work.read_only";
@@ -28,6 +29,8 @@ export interface Schedule {
   created_at: string; updated_at: string; terminal_at: string | null;
   list_sequence: number; idempotency_key_hash: string | null;
 }
+export interface ScheduleClaim extends Schedule { claim_owner: string; claim_until: string; claim_fence: number }
+export type MaterializationDefinition = ScheduleDefinition;
 export interface Run {
   run_id: string; schedule_id: string; revision: number; occurrence_key: string; scheduled_for: string;
   status: "materialized" | "started" | "completed" | "failed" | "cancelled" | "skipped" | "needs_review";
@@ -134,6 +137,56 @@ export class SchedulerRepository {
   due(now: string, limit = 100): Schedule[] {
     utc(now); if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
     return this.db.prepare("SELECT * FROM schedules WHERE state = 'active' AND next_due <= ? ORDER BY next_due, schedule_id LIMIT ?").all(now, limit) as Schedule[];
+  }
+  claimDue(owner: string, now: string, leaseSeconds = 60, excludedScheduleIds: readonly string[] = []): ScheduleClaim | undefined {
+    id(owner); utc(now);
+    if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 300) throw new Error("invalid_lease");
+    if (excludedScheduleIds.length > 100) throw new Error("invalid_limit");
+    for (const scheduleId of excludedScheduleIds) id(scheduleId);
+    return this.db.transaction(() => {
+      const exclusion = excludedScheduleIds.length > 0 ? `AND s.schedule_id NOT IN (${excludedScheduleIds.map(() => "?").join(",")})` : "";
+      const row = this.db.prepare(`SELECT s.schedule_id FROM schedules s LEFT JOIN schedule_claims c USING(schedule_id)
+        WHERE s.state = 'active' AND s.next_due <= ? AND (c.claim_until IS NULL OR c.claim_until <= ?)
+        ${exclusion} ORDER BY s.next_due, s.schedule_id LIMIT 1`).get(now, now, ...excludedScheduleIds) as { schedule_id: string } | undefined;
+      if (!row) return undefined;
+      this.db.prepare(`INSERT INTO schedule_claims(schedule_id, claim_owner, claim_until, claim_fence) VALUES(?,?,?,1)
+        ON CONFLICT(schedule_id) DO UPDATE SET claim_owner = excluded.claim_owner, claim_until = excluded.claim_until,
+          claim_fence = schedule_claims.claim_fence + 1 WHERE schedule_claims.claim_until IS NULL OR schedule_claims.claim_until <= ?`)
+        .run(row.schedule_id, owner, add(now, leaseSeconds), now);
+      const claim = this.db.prepare("SELECT * FROM schedule_claims WHERE schedule_id = ? AND claim_owner = ?").get(row.schedule_id, owner) as
+        { claim_owner: string; claim_until: string; claim_fence: number } | undefined;
+      return claim ? { ...this.get(row.schedule_id)!, ...claim } : undefined;
+    }).immediate();
+  }
+  releaseClaims(owner: string, now: string): number {
+    id(owner); utc(now);
+    return this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE claim_owner = ?").run(owner).changes;
+  }
+  expireDue(now: string, limit = 100): number {
+    utc(now); if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions v
+        ON v.schedule_id = s.schedule_id AND v.revision = s.revision
+        WHERE s.state = 'active' AND s.next_due <= ? AND v.expires_at <= ? ORDER BY s.next_due, s.schedule_id LIMIT ?`)
+        .all(now, now, limit) as Schedule[];
+      for (const row of rows) this.expireSchedule(row,
+        { tenant_id: row.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
+      return rows.length;
+    }).immediate();
+  }
+  materializationDefinition(scheduleId: string, revision: number): MaterializationDefinition {
+    const schedule = this.checked(scheduleId, revision);
+    const snapshot = this.revision(schedule);
+    if (snapshot.content === null) throw new Error("schedule_content_unavailable");
+    const target = JSON.parse(snapshot.target_json) as Target;
+    const action = snapshot.action === "slack.reminder.post"
+      ? { kind: "reminder" as const, action: "slack.reminder.post" as const, target: target as Exclude<Target, { kind: "none" }>, body: snapshot.content }
+      : { kind: "work" as const, action: "work.read_only" as const, objective: snapshot.content,
+          notification: target.kind === "none" ? { kind: "none" as const } : { kind: "slack" as const, action: "slack.work_result.post" as const, target } };
+    return {
+      schedule_id: schedule.schedule_id, revision: schedule.revision, tenant_id: schedule.tenant_id, owner_id: schedule.owner_id,
+      action, recurrence: JSON.parse(snapshot.recurrence_json), policy: JSON.parse(snapshot.policy_json),
+    };
   }
   private revision(schedule: Pick<Schedule, "schedule_id" | "revision">): Revision {
     return this.db.prepare("SELECT * FROM schedule_revisions WHERE schedule_id = ? AND revision = ?").get(schedule.schedule_id, schedule.revision) as Revision;
@@ -310,6 +363,7 @@ export class SchedulerRepository {
       const state = operation === "pause" ? "paused" : operation === "resume" ? "active" : "cancelled";
       this.db.prepare("UPDATE schedules SET state = ?, revision = ?, updated_at = ?, terminal_at = ? WHERE schedule_id = ?")
         .run(state, revision, transitionAt, state === "cancelled" ? transitionAt : null, scheduleId);
+      this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
       if (operation !== "resume") this.suppress(scheduleId, transitionAt, "cancelled");
       if (operation === "cancel") this.retireRevisions(scheduleId, transitionAt);
       const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, transitionAt);
@@ -318,7 +372,8 @@ export class SchedulerRepository {
     }).immediate();
   }
   materialize(scheduleId: string, expectedRevision: number, scheduledFor: string, nextDue: string | null,
-    now: string, actor: Actor, skip: "misfire" | "overlap" | null = null, compactSkip?: CompactSkip): { run: Run; duplicate: boolean } {
+    now: string, actor: Actor, skip: "misfire" | "overlap" | null = null, compactSkip?: CompactSkip,
+    claim?: { owner: string; fence: number; occurrenceKey: string }): { run: Run; duplicate: boolean } {
     utc(now); utc(scheduledFor); if (nextDue !== null) utc(nextDue);
     const result = this.db.transaction(() => {
       // An old caller may retry after the scheduler revision advanced. Identity/authorization still
@@ -327,8 +382,17 @@ export class SchedulerRepository {
       if (!current) throw new Error("schedule_not_found");
       const before = this.checked(scheduleId, current.revision, actor);
       const materializedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
+      if (claim) {
+        const storedClaim = this.db.prepare("SELECT * FROM schedule_claims WHERE schedule_id = ?").get(scheduleId) as
+          { claim_owner: string | null; claim_until: string | null; claim_fence: number } | undefined;
+        if (!storedClaim || storedClaim.claim_owner !== claim.owner || storedClaim.claim_fence !== claim.fence ||
+            storedClaim.claim_until === null || storedClaim.claim_until <= now) throw new Error("claim_conflict");
+      }
       const existing = this.db.prepare("SELECT * FROM schedule_runs WHERE schedule_id = ? AND scheduled_for = ?").get(scheduleId, scheduledFor) as Run | undefined;
-      if (existing) return { run: existing, duplicate: true };
+      if (existing) {
+        if (claim) this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
+        return { run: existing, duplicate: true };
+      }
       if (before.revision !== expectedRevision) throw new Error("revision_conflict");
       if (nextDue !== null && (nextDue <= scheduledFor || nextDue <= materializedAt)) throw new Error("invalid_next_due");
       if (before.state !== "active" || scheduledFor > materializedAt || (before.next_due === null || scheduledFor < before.next_due) || (before.high_watermark !== null && scheduledFor <= before.high_watermark)) throw new Error("invalid_occurrence");
@@ -350,19 +414,22 @@ export class SchedulerRepository {
       const reason = Date.parse(materializedAt) - Date.parse(scheduledFor) > 900000 ? "misfire" : unresolved ? "overlap" : null;
       if (skip !== null && skip !== reason) throw new Error("invalid_skip_reason");
       const runId = `run_${randomUUID()}`;
+      const occurrenceKey = claim?.occurrenceKey ?? scheduledFor;
       this.db.prepare(`INSERT INTO schedule_runs(run_id, schedule_id, revision, occurrence_key, scheduled_for, status, reason, created_at, terminal_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, scheduledFor, scheduledFor, reason ? "skipped" : "materialized", reason, materializedAt, reason ? materializedAt : null);
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, scheduleId, expectedRevision, occurrenceKey, scheduledFor, reason ? "skipped" : "materialized", reason, materializedAt, reason ? materializedAt : null);
       if (!reason && revision.action === "slack.reminder.post") this.insertOutbox(runId, "slack.reminder.post", revision.target_json, revision.content!, materializedAt);
       if (!reason && revision.action === "work.read_only") {
-        const result = this.enqueue({ schema_version: 1, source: "scheduler", external_event_id: `scheduler:${scheduleId}:${scheduledFor}`,
+        const result = this.enqueue({ schema_version: 1, source: "dona_schedule", external_event_id: `schedule:v1:${scheduleId}:${scheduledFor}`,
           type: "schedule_due", occurred_at: scheduledFor,
           subject: { tenant_id: before.tenant_id, owner_id: before.owner_id, schedule_id: scheduleId },
-          payload: { run_id: runId, revision: expectedRevision }, reply_target: null }, new Date(materializedAt));
-        if (result.duplicate) throw new Error("event_idempotency_conflict");
+          payload: { run_id: runId, revision: expectedRevision, occurrence_key: occurrenceKey }, reply_target: null,
+          trace: { schedule_id: scheduleId, run_id: runId } }, new Date(materializedAt));
+        if (result.duplicate || result.payloadMismatch) throw new Error("event_idempotency_conflict");
         this.db.prepare("UPDATE schedule_runs SET event_id = ? WHERE run_id = ?").run(result.row.event_id, runId);
       }
       this.db.prepare("UPDATE schedules SET high_watermark = ?, next_due = ?, updated_at = ? WHERE schedule_id = ?")
         .run(scheduledFor, nextDue, materializedAt, scheduleId);
+      if (claim) this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
       this.audit(before, this.get(scheduleId)!, "materialize", actor, materializedAt, undefined, this.getRun(runId)!, compactSkip);
       this.completeIfDrained(scheduleId, materializedAt);
       return { run: this.getRun(runId)!, duplicate: false };

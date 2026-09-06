@@ -29,7 +29,7 @@ export type JobStatus = (typeof jobStatuses)[number];
 
 export interface EventEnvelope {
   schema_version: 1;
-  source: "slack" | "dona_job" | "dona_update" | "scheduler";
+  source: "slack" | "dona_job" | "dona_update" | "dona_schedule";
   external_event_id: string;
   type: string;
   occurred_at: string;

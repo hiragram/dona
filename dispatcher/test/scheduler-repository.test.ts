@@ -47,17 +47,19 @@ function startWork(repo: SchedulerRepository, dispatcher: DispatcherDatabase, ra
   repo.setRunState(run.run_id, "materialized", "started", actor, at, job.row.job_id);
 }
 
-test("新規DB、v2既存データ、再open、WAL/FK、unknown extension version", () => {
+test("新規DB、v2既存データ、再open、WAL/FK", () => {
   const { raw, filename, dispatcher } = setup();
   const event = dispatcher.enqueue(eventEnvelope("legacy")).row;
   raw.exec(`DROP TABLE schedule_audit; DROP TABLE connector_outbox; DROP TABLE schedule_runs;
-    DROP TABLE schedules; DROP TABLE schedule_revisions; DROP TABLE schedule_list_sequence; DROP TABLE scheduler_schema`);
+    DROP TABLE schedule_claims; DROP TABLE schedules; DROP TABLE schedule_revisions;
+    DROP TABLE schedule_list_sequence; DROP TABLE scheduler_schema`);
   assert.equal(raw.pragma("user_version", { simple: true }), 2);
   const reopened = new DispatcherDatabase(filename);
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
   assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
   reopened.close();
   raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
@@ -87,6 +89,7 @@ test("scheduler schema v1へ保持されるlist sequenceを追加する", () => 
     assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
     assert.equal((raw.prepare("SELECT list_sequence FROM schedules WHERE schedule_id = 'legacy'").get() as { list_sequence: number }).list_sequence, 1);
     assert.equal((raw.prepare("SELECT next_value FROM schedule_list_sequence").get() as { next_value: number }).next_value, 2);
+    assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
   } finally { raw.close(); }
 });
 
@@ -628,15 +631,17 @@ test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持",
   assert.equal(count(raw, "schedule_runs"), 2);
 });
 
-test("専用routing未実装のscheduler eventが通常workerのqueueを妨げない", () => {
-  const { repo, dispatcher } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
+test("dona_scheduleとlegacy scheduler eventは#11 routingまで通常workerを妨げない", () => {
+  const { repo, dispatcher, raw } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
   const run = repo.materialize("work", 1, due, later, due, actor).run;
   assert.equal(dispatcher.get(run.event_id!)?.status, "queued");
   assert.equal(dispatcher.nextAvailable(new Date(due)), undefined);
   const slack = dispatcher.enqueue(eventEnvelope("slack-after-scheduler"), new Date(due)).row;
   assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
   assert.equal(envelopeFromRow(dispatcher.nextAvailable(new Date(due))!).source, "slack");
-  dispatcher.markBlocked(run.event_id!, "専用routing待ち"); dispatcher.manualRetry(run.event_id!, true, new Date(due));
+  raw.prepare("INSERT INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,status,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("evt_legacy_scheduler", 1, "scheduler", "legacy", "schedule_due", due, "{}", "{}", "queued", due, due, due);
+  raw.prepare("UPDATE events SET sequence = 0 WHERE event_id = 'evt_legacy_scheduler'").run();
   assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
 });
 
@@ -1017,6 +1022,7 @@ test("redacted backupはclaimed/request_startedの書込みcapabilityを含ま�
     if (started) repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
     const backup = JSON.stringify(repo.redactedBackup());
     assert.ok(!backup.includes("claim_token")); assert.ok(!backup.includes(claim.claim_token!));
+    assert.ok(!backup.includes("claim_owner"));
     assert.ok(backup.includes(claim.outbox_id)); assert.ok(backup.includes("lease_until")); assert.ok(backup.includes("request_started_at"));
   }
 });
