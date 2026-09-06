@@ -23,3 +23,4 @@ coverage/
 .vscode/
 *.swp
 *~
+.dona-job-progress.json

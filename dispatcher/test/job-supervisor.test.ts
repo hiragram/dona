@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
@@ -7,6 +9,7 @@ import type { DispatcherConfig } from "../src/config.js";
 import type { HerdrCommandResult } from "../src/herdr.js";
 import type { JobAgentRuntime } from "../src/job-runtime.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
+import { jobProgressPath } from "../src/job-prompt.js";
 import type { Logger } from "../src/logger.js";
 import type { JobRow } from "../src/types.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
@@ -1100,5 +1103,176 @@ describe("JobSupervisor", () => {
     assert.equal(updated.last_error_code, "timeout");
     assert.equal(cancelCount, 1);
     database.close();
+  });
+
+  test("recovers cancelled worker cleanup sequentially", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [0, 1, 2].map((index) => {
+      const job = createScratchJob(database, config, `Ev-cancelled-recovery-${index}`);
+      markRunning(database, job.job_id);
+      database.beginJobCancellation(job.job_id, job.source_event_id);
+      database.markJobCancelled(job.job_id, "cancelled before restart");
+      return job;
+    });
+    await Promise.all(jobs.map(async (job) => {
+      const progressDir = path.dirname(jobProgressPath(job));
+      await fs.mkdir(progressDir, { recursive: true });
+      await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    }));
+    let concurrent = 0;
+    let maximum = 0;
+    const runtime = fakeRuntime({
+      async wait(_agentName, signal) {
+        concurrent += 1;
+        maximum = Math.max(maximum, concurrent);
+        const result = await waitUntilAbort(signal);
+        concurrent -= 1;
+        return result;
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => maximum > 0);
+    assert.equal(maximum, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = Array.from({ length: 60 }, (_, index) => {
+      const job = createScratchJob(database, config, `Ev-cancelled-history-${index}`);
+      markRunning(database, job.job_id);
+      database.beginJobCancellation(job.job_id, job.source_event_id);
+      database.markJobCancelled(job.job_id, "cancelled before restart");
+      return job;
+    });
+    const candidate = jobs.at(-1)!;
+    const progressDir = path.dirname(jobProgressPath(candidate));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let waits = 0;
+    const runtime = fakeRuntime({ async wait() { waits += 1; return ok("done"); } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => !existsSync(progressDir));
+    assert.equal(waits, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("removes late progress from a needs-review worker only after it exits", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-needs-review-progress-cleanup");
+    markRunning(database, job.job_id);
+    database.markJobNeedsReview(job.job_id, "steer_acceptance_unknown", "transport disconnected");
+    const progressDir = path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let release!: () => void;
+    const exited = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = fakeRuntime({ async wait() { await exited; return ok("done"); } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(progressDir), true);
+    release();
+    await waitFor(() => !existsSync(progressDir));
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("queues live cancelled worker cleanup behind one pump", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = [0, 1, 2].map((index) => {
+      const job = createScratchJob(database, config, `Ev-live-cancel-cleanup-${index}`);
+      markRunning(database, job.job_id);
+      return job;
+    });
+    await Promise.all(jobs.map(async (job) => {
+      const progressDir = path.dirname(jobProgressPath(job));
+      await fs.mkdir(progressDir, { recursive: true });
+      await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    }));
+    let concurrent = 0;
+    let maximum = 0;
+    const runtime = fakeRuntime({
+      async cancel() { return ok("idle"); },
+      async wait(_agentName, signal) {
+        concurrent += 1;
+        maximum = Math.max(maximum, concurrent);
+        const result = await waitUntilAbort(signal);
+        concurrent -= 1;
+        return result;
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    await Promise.all(jobs.map((job) => supervisor.cancel(job.job_id, job.source_event_id)));
+    await waitFor(() => maximum > 0);
+    assert.equal(maximum, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("retries an unclassified cleanup failure and interrupts backoff during shutdown", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-cancelled-backoff-shutdown");
+    markRunning(database, job.job_id);
+    database.beginJobCancellation(job.job_id, job.source_event_id);
+    database.markJobCancelled(job.job_id, "cancelled before restart");
+    const progressDir = path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let waited = false;
+    const runtime = fakeRuntime({ async wait() { waited = true; return failed("transport_failed"); } });
+    const supervisor = new JobSupervisor(database, runtime, { ...config, queuePollMs: 60_000 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => waited);
+    await Promise.race([
+      supervisor.stop(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("shutdown timed out")), 500)),
+    ]);
+    await fs.access(progressDir);
+    database.close();
+  });
+
+  test("does not lose shutdown while an empty cleanup directory scan is in flight", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), { ...config, queuePollMs: 60_000 }, logger, () => undefined);
+    supervisor.start();
+    await Promise.race([
+      supervisor.stop(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("shutdown timed out")), 500)),
+    ]);
+    database.close();
+  });
+
+  test("runtime progress disable removes directories for nonterminal workers", async () => {
+    const { root,config }=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-disable-progress"); const progressDir=path.dirname(jobProgressPath(job));
+    await fs.mkdir(progressDir,{recursive:true}); await fs.writeFile(path.join(progressDir,"progress.json"),"{}");
+    let disabled=false; const runtime=fakeRuntime({ disableProgress(){disabled=true;} });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    await supervisor.disableProgress();
+    assert.equal(disabled,true); await assert.rejects(fs.access(progressDir),{code:"ENOENT"}); database.close();
+  });
+
+  test("a persistent progress store failure disables progress after one cycle", async () => {
+    const {root,config}=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath); let disabled=false; let reports=0;
+    const runtime=fakeRuntime({disableProgress(){disabled=true;}}); const progress={async report(){reports+=1;throw new Error("readonly progress store");},async drainDeliveries(){}};
+    const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined,progress as never); supervisor.start();
+    await waitFor(()=>disabled); await supervisor.stop(); assert.equal(reports,1); database.close();
   });
 });
