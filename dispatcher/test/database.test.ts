@@ -1192,6 +1192,26 @@ describe("DispatcherDatabase", () => {
     process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
     try {
       const database = new DispatcherDatabase(config.databasePath);
+      const source = database.enqueue(eventEnvelope("Ev-bridge-explicit-key")).row;
+      const first = database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.primary",
+        objective: "調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir);
+      assert.equal(first.row.job_key, "research.primary");
+      assert.equal(database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.primary",
+        objective: "調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).outcome, "reused");
+      assert.throws(() => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.secondary",
+        objective: "追加調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir), /multi_job_feature_disabled_for_schema_v2_bridge/);
       database.close();
       const raw = new Database(config.databasePath, { readonly: true });
       assert.equal(raw.pragma("user_version", { simple: true }), 2);

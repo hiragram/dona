@@ -513,9 +513,6 @@ export class DispatcherDatabase {
     const parsedRequest = parseCreateJobRequest(request);
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
-    if (dispatcherSchemaCompatibility.write === 2 && jobKey !== legacyJobKey) {
-      throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
-    }
     const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
     const objectiveUtf8Bytes = Buffer.byteLength(parsedRequest.objective, "utf8");
     const workspaceJson = serializeJobWorkspace(
@@ -591,6 +588,9 @@ export class DispatcherDatabase {
       const admittedJobs = this.db.prepare(`
         SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
       `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
+      if (dispatcherSchemaCompatibility.write === 2 && admittedJobs.length > 0) {
+        throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
+      }
       if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {
         throw new JobCreationError(
           "job_group_limit_exceeded",
