@@ -172,7 +172,7 @@ export class JobProgressCoordinator {
     this.invalidProgressWarnings.delete(row.job_id);
   }
   async recover(): Promise<void> {
-    if(this.store.hasDelivering()&&!await this.drainAdapterUntilSettled("startup"))return;
+    if(this.store.hasDelivering())await this.drainAdapter();
     this.store.recoverDeliveries();
     let after="";for(;;){const batch=this.store.recoverable(after,500);for(const progress of batch){const job=this.jobs.getJob(progress.job_id);if(job&&terminalStatuses.has(job.status))await this.ingest(job);}if(batch.length<500)break;after=batch.at(-1)!.job_id;}
   }

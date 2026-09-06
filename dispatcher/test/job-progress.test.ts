@@ -273,6 +273,19 @@ test("recovery without delivering rows does not require an Adapter token", async
   finally {store.close();await fs.rm(root,{recursive:true});}
 });
 
+test("recovery with a delivery fence fails open promptly when the token is unavailable", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-missing-token-")); const store=new JobProgressStore(path.join(root,"progress.sqlite3"));
+  try {
+    store.ingest(valid); store.begin("job_abc");
+    const coordinator=new JobProgressCoordinator({} as never,store,{updateInternalTokenPath:path.join(root,"missing-token"),slackAdapterSocketPath:path.join(root,"missing.sock")} as never,{} as never);
+    await assert.rejects(Promise.race([
+      coordinator.recover(),
+      new Promise<never>((_resolve,reject)=>setTimeout(()=>reject(new Error("recovery timed out")),500)),
+    ]),/missing internal token/);
+    assert.equal(store.get("job_abc")?.status,"delivering");
+  } finally {store.close();await fs.rm(root,{recursive:true});}
+});
+
 test("migrates progress schema 1 with a terminal reconciliation marker", async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-progress-v1-")); const file=path.join(root,"progress.sqlite3");
   const legacy=new Database(file); legacy.exec("CREATE TABLE job_progress (job_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, phase TEXT NOT NULL, safe_summary TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT); INSERT INTO job_progress VALUES ('job_legacy',1,'testing','token=untrusted','2026-09-05T00:00:00Z','delivered','2026-09-05T00:00:00Z',NULL,NULL); PRAGMA user_version=1;"); legacy.close();
