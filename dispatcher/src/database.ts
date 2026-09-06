@@ -244,6 +244,7 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   const migrateV3 = () => {
+    const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -285,7 +286,7 @@ export function migrateDispatcherDatabase(
         last_error_code, last_error_message, created_at, updated_at
       )
       SELECT
-        job_id, source_event_id, 'legacy-default', source, workspace_id, channel_id, thread_ts, actor_id,
+        job_id, source_event_id, ${jobsHasKey ? "job_key" : "'legacy-default'"}, source, workspace_id, channel_id, thread_ts, actor_id,
         objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,

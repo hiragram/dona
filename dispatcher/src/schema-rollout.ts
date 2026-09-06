@@ -52,9 +52,16 @@ export function countSnapshot(db: Database.Database): Record<string, number> {
 
 export function contentSnapshot(db: Database.Database): Record<string, string> {
   const digestRows = (table: "events" | "jobs", orderBy: string): string => {
-    const columns = (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name)
-      .filter((name) => name !== "job_key");
-    const projection = columns.map((name) => `"${name.replaceAll('"', '""')}"`).join(", ");
+    const columns = (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name);
+    const canonicalColumns = [...columns];
+    if (table === "jobs" && !columns.includes("job_key")) {
+      canonicalColumns.push("job_key");
+    }
+    canonicalColumns.sort();
+    const projections = canonicalColumns.map((name) => name === "job_key" && !columns.includes("job_key")
+      ? `'legacy-default' AS "job_key"`
+      : `"${name.replaceAll('"', '""')}"`);
+    const projection = projections.join(", ");
     const rows = db.prepare(`SELECT ${projection} FROM ${table} ORDER BY ${orderBy}`).all();
     return crypto.createHash("sha256").update(JSON.stringify(rows)).digest("hex");
   };

@@ -49,6 +49,9 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
     '/fixture/result.json', 'dona-job-fixture', ?, ?, ?, ?)`)
     .run("job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV", at,
       "2026-09-06T00:00:01.000Z", '{"status":"completed"}', at, at);
+  db.exec("ALTER TABLE jobs ADD COLUMN job_key TEXT NOT NULL DEFAULT 'legacy-default'");
+  db.prepare("UPDATE jobs SET job_key = ? WHERE job_id = ?")
+    .run("research.primary", "job_01m1es03xy5cf8d9pm5cwx4srv");
   const wal = await fs.stat(`${databasePath}-wal`);
   assert.ok(wal.size > 0, "fixture must have committed pages in a live WAL");
 
@@ -73,6 +76,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   const migrated = new Database(databasePath, { readonly: true });
   assert.equal(migrated.pragma("user_version", { simple: true }), 3);
   assert.equal(migrated.prepare("SELECT result_json FROM jobs").pluck().get(), '{"status":"completed"}');
+  assert.equal(migrated.prepare("SELECT job_key FROM jobs").pluck().get(), "research.primary");
   migrated.close();
 
   const changed = new Database(databasePath);
