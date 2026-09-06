@@ -144,13 +144,10 @@ export class JobSupervisor {
   async disableProgress(): Promise<void> {
     this.progress = undefined; this.runtime.disableProgress?.();
     try {
-      let after="";
-      for (;;) {
-        const batch=this.database.listJobsAfter(after,500);
-        const cleanup = await Promise.allSettled(batch.map((job)=>fs.rm(path.dirname(jobProgressPath(job)), { recursive:true, force:true })));
-        cleanup.forEach((result,index)=>{if(result.status==="rejected")this.logger.warn("Disabled job progress cleanup failed",{job_id:batch[index]!.job_id,error_code:"job_progress_disable_cleanup_failed"});});
-        if(batch.length<500)break;
-        after=batch.at(-1)!.job_id;
+      for await(const progressDir of this.progressDirectories()){
+        await fs.rm(progressDir,{recursive:true,force:true}).catch(()=>{
+          this.logger.warn("Disabled job progress cleanup failed",{error_code:"job_progress_disable_cleanup_failed"});
+        });
       }
     } catch (error) {
       this.logger.warn("Disabled job progress cleanup stopped", { error_code:"job_progress_disable_cleanup_stopped", error_message:error instanceof Error?error.message:String(error) });
@@ -248,7 +245,7 @@ export class JobSupervisor {
     if(this.cancelledCleanupRecovery)return;
     const recovery=(async()=>{
       while(!this.stopping){
-        for await(const progressDir of this.cancelledProgressDirectories()){
+        for await(const progressDir of this.progressDirectories()){
           if(this.stopping)return;
           const jobId=path.basename(progressDir);
           const row=this.database.getJob(jobId);
@@ -263,6 +260,7 @@ export class JobSupervisor {
             this.logger.warn("Cancelled worker progress cleanup attempt failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed",error_message:error instanceof Error?error.message:String(error)});
           }
         }
+        if(this.stopping)return;
         await this.cancelledCleanupWake.wait(this.config.queuePollMs,true);
       }
     })();
@@ -270,7 +268,7 @@ export class JobSupervisor {
     this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>{this.cancelledWorkerCleanups.delete(recovery);if(this.cancelledCleanupRecovery===recovery)this.cancelledCleanupRecovery=undefined;}).catch(()=>undefined);
   }
 
-  private async *cancelledProgressDirectories():AsyncGenerator<string> {
+  private async *progressDirectories():AsyncGenerator<string> {
     const scratchRoot=path.join(this.config.jobsWorkspaceRoot,"scratch",".dona-progress");
     for(const jobId of await directoryNames(scratchRoot))yield path.join(scratchRoot,jobId);
     const githubRoot=path.join(this.config.jobsWorkspaceRoot,"github");

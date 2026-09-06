@@ -1246,6 +1246,19 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("does not lose shutdown while an empty cleanup directory scan is in flight", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), { ...config, queuePollMs: 60_000 }, logger, () => undefined);
+    supervisor.start();
+    await Promise.race([
+      supervisor.stop(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("shutdown timed out")), 500)),
+    ]);
+    database.close();
+  });
+
   test("runtime progress disable removes directories for nonterminal workers", async () => {
     const { root,config }=await tempConfig(); roots.push(root); const database=new DispatcherDatabase(config.databasePath);
     const job=createScratchJob(database,config,"Ev-disable-progress"); const progressDir=path.dirname(jobProgressPath(job));
