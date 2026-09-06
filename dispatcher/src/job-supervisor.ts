@@ -281,7 +281,9 @@ export class JobSupervisor {
       }
       this.database.markJobNeedsReview(
         row.job_id,
-        prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_acceptance_unknown"),
+        row.source === "dona_schedule"
+          ? "prompt_acceptance_unknown"
+          : prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_acceptance_unknown"),
         commandMessage(prompted),
       );
       return;

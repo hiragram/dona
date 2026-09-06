@@ -386,7 +386,7 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
-        AND (j.status!='needs_review' OR j.last_error_code='ambiguous_prompt_acceptance')
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted'))
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
@@ -398,7 +398,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
-        AND (j.status!='needs_review' OR j.last_error_code='ambiguous_prompt_acceptance')
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted'))
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -526,13 +526,14 @@ export class DispatcherDatabase {
       validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
+    const completedAt = new Date(result.completed_at);
     this.db.transaction(()=>{
       this.updateJob(jobId, ["running"], status, {
-        result_json: stableStringify(result), result_path: resultPath, completed_at: at.toISOString(),
+        result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
         last_error_message: result.status === "failed" ? result.summary : null,
       });
-      if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,at);
+      if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,completedAt);
     }).immediate();
   }
 

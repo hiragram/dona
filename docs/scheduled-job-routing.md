@@ -21,6 +21,6 @@ schedule由来jobは固定objectiveのためsteerを許可せず、cancelだけ�
 
 `job_completion_results`はwork stateとnotification stateを別fieldで保存し、Result本文は既存`jobs.result_json`を唯一の保存先にする。destination `none`でもResultを保存し、`dona_job`通知eventを生成しない。Result本文は完了記録から7日後に消去し、owner・destination・work/notification stateの監査metadataは残す。
 
-Slack destinationを持つscheduled workは既存`connector_outbox`の`slack.work_result.post`へ渡し、outboxの`pending`、`accepted`、`failed`、`needs_review`をcompletion metadataへ同期する。jobが`blocked`/`needs_review`になった場合や通知本文のredactionを安全に確定できない場合は、runとscheduleも`needs_review`へ隔離し、固定の確認要求だけを通知できる。adminの明示的な`reconcileWorkRun`だけが失敗または取消しへ確定でき、scheduleは新revisionの再承認なしにresumeできない。これによりjob失敗、notification failure、request acceptance unknownを別状態で監査する。Slack thread起点jobは従来どおり`dona_job` eventを生成する。
+Slack destinationを持つscheduled workは固定destination付き`dona_job` eventとしてDonaへ戻し、Donaだけが対外応答を判断する。eventの`pending`、`accepted`、`failed`、`needs_review`をcompletion metadataへ同期し、固定900秒期限、schedule state・revision・authorizationをdispatch前に再検証する。jobが`blocked`/`needs_review`になった場合や通知本文のredactionを安全に確定できない場合は、runとscheduleも`needs_review`へ隔離し、同じDona event経路だけで確認要求を通知できる。adminの明示的な`reconcileWorkRun`だけが失敗または取消しへ確定でき、scheduleは新revisionの再承認なしにresumeできない。これによりjob失敗、notification failure、request acceptance unknownを別状態で監査する。Slack thread起点jobも従来どおり`dona_job` eventを生成する。
 
 provider ingress一般、recurrence計算、Slack reminder送信実装はこのcontractの対象外である。
