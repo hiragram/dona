@@ -199,7 +199,10 @@ export class DispatcherWorker {
       return;
     }
 
-    this.database.markWaiting(row.event_id);
+    const afterPrompt=this.database.get(row.event_id);
+    if(afterPrompt?.status==="completed"&&afterPrompt.last_error_code==="schedule_notification_suppressed") return;
+    if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
+    else if(afterPrompt?.status!=="waiting_agent") return;
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);

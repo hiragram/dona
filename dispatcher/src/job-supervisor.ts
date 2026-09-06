@@ -91,6 +91,15 @@ export class JobSupervisor {
     for(const job of this.database.listLegacySharedGrantJobs()) {
       const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
+      const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+      let exited=false;
+      while(Date.now()<deadline) {
+        const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+        if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {exited=true;break;}
+        if(!observed.ok) throw new Error(`Legacy agent ${job.agent_name} exit could not be observed`);
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      if(!exited) throw new Error(`Legacy agent ${job.agent_name} exit was not observed`);
     }
   }
 
@@ -175,6 +184,7 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       for (const job of this.database.listScheduledJobsRequiringCancellation()) {
+        if(await this.tryComplete(job,false)) continue;
         try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
         catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }

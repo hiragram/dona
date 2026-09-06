@@ -65,6 +65,7 @@ export class DispatcherDatabase {
         if(["preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
         else if(["queued","retryable_failed"].includes(row.status)) this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
+        else this.db.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown',last_error_message='Legacy agent may retain the shared result-directory grant' WHERE job_id=?").run(row.job_id);
       }
     } catch (error) {
       this.db.close();
@@ -772,7 +773,8 @@ export class DispatcherDatabase {
       JOIN job_completion_results c ON c.notification_event_id=e.event_id
       WHERE e.event_id=? AND e.source='dona_job' AND json_extract(c.owner_json,'$.kind')='schedule'`).get(eventId) as
       {status:string;owner_json:string;destination_json:string}|undefined;
-    if(!row||row.status!=="waiting_agent") throw new Error("schedule_notification_not_authorized");
+    if(!row||!["dispatching","waiting_agent"].includes(row.status)) throw new Error("schedule_notification_not_authorized");
+    if(row.status==="dispatching") this.markWaiting(eventId,at);
     const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
     return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
       destination:JSON.parse(row.destination_json) as Record<string,unknown>};

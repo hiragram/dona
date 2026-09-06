@@ -890,6 +890,19 @@ export class SchedulerRepository {
       this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,last_error_message=NULL
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
           WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
+      const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
+      this.db.prepare(`DELETE FROM job_owner_bindings WHERE job_id IN
+        (SELECT c.job_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline);
+      this.db.prepare(`DELETE FROM event_job_bindings WHERE event_id IN
+        (SELECT c.source_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline);
+      this.db.prepare(`UPDATE events SET subject_json='{}',payload_json='{}',reply_target_json=NULL WHERE event_id IN
+        (SELECT c.source_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline);
+      this.db.prepare(`UPDATE job_completion_results SET owner_json=?,destination_json='{"kind":"none"}' WHERE rowid IN
+        (SELECT c.rowid FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(deletedOwner,metadataDeadline);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.
