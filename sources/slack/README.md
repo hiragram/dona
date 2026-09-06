@@ -154,7 +154,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
   http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 3、read range 2〜3、write schema 3、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のactual build SHA、protocol 1、read range 2〜3、bridge write schema 2、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
 
 ## 検証
 

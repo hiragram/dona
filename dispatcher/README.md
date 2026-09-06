@@ -93,7 +93,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
-Dispatcher DB schema v3は、v2の`jobs.source_event_id UNIQUE`を`UNIQUE(source_event_id, job_key)`へtransactionalにrebuildします。既存jobは`job_key = legacy-default`へbackfillされ、全job列、Result、runtime identity、completion eventを保持します。source eventごとの`job_groups`も同じtransactionで作成し、通知済みjobは`notification_mode = legacy`、未通知jobは`grouped`として区別します。migration失敗時は旧tableと`PRAGMA user_version = 2`がそのままrollbackされます。production backup/restoreとactivationはこの自動migrationとは別のrelease手順で、WAL稼働中DBの単体file copyをbackup扱いしません。
+bridge releaseはDB schema v2を正本として維持し、legacy jobを`job_key = legacy-default`として扱います。schema v3をreadできる互換primitiveは含みますが、release manifestのwrite schemaは2であり、自動migrationやmulti-job activationは行いません。production backup/restoreとactivationは別releaseで扱い、WAL稼働中DBの単体file copyをbackup扱いしません。
 
 Codexで`/clear`するとagent sessionが置き換わり、Herdr上の`dona-main`という名前が解除される場合があります。`waiting_agent`の処理中は`/clear`を避けてください。解除された場合は`herdr --session dona agent list`で対象の`pane_id`を確認し、次のように名前を戻します。
 
@@ -140,7 +140,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" 
 curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" http://localhost/health/version
 ```
 
-`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。version healthはbuild SHA、protocol 1、実DB schema 3、read range 2〜3、write schema 3、config 1、`update_notification_protocol: 1`だけを出し、pathやsecretは返しません。
+`POST /v1/admin/quiesce`は新規event/job control受付を止め、workerとJob supervisorをdrainします。`GET /v1/admin/update-safety`はeventの`dispatching/waiting_agent`、jobの`dispatching/cancelling`、steer acceptance unknownを報告します。version healthはactual build SHA、protocol 1、実DB schema、read range 2〜3、write schema 2、config 1、`update_notification_protocol: 1`だけを出し、pathやsecretは返しません。
 
 ## 運用CLI
 

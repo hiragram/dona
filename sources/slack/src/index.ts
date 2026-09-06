@@ -49,6 +49,7 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
+    config.appSchemaWrite,
   );
   await health.start();
   try {

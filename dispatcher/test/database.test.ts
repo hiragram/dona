@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
@@ -144,6 +145,10 @@ describe("DispatcherDatabase", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const before = await createSchemaV2Fixture(config.databasePath);
+    const manifestPath = path.join(root, "activation-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 3 } }));
+    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
+    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
 
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 3, write: 3 });
@@ -232,9 +237,17 @@ describe("DispatcherDatabase", () => {
       );
     `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
     migrated.close();
+    if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+    else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
   });
 
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
+    const manifestRoot = await fs.mkdtemp("/tmp/dona-v3-migration-");
+    roots.push(manifestRoot);
+    const manifestPath = path.join(manifestRoot, "release-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 3 } }));
+    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
+    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
       const { root, config } = await tempConfig();
       roots.push(root);
@@ -262,6 +275,8 @@ describe("DispatcherDatabase", () => {
       assert.deepEqual(fixture.pragma("foreign_key_check"), []);
       fixture.close();
     }
+    if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+    else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
   });
 
   test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {

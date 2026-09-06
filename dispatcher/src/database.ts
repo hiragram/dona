@@ -27,10 +27,19 @@ const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 
+function configuredSchemaWrite(): 2 | 3 {
+  const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return 2;
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { compatibility?: { app_schema_write?: unknown } };
+  const write = manifest.compatibility?.app_schema_write;
+  if (write !== 2 && write !== 3) throw new Error("Release manifest app_schema_write is invalid");
+  return write;
+}
+
 export const dispatcherSchemaCompatibility = {
   read_min: 2,
   read_max: 3,
-  write: 3,
+  get write(): 2 | 3 { return configuredSchemaWrite(); },
 } as const;
 
 export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled";
@@ -44,6 +53,31 @@ function nowUtc(): string {
 function retryAt(attemptCount: number, now: Date): string {
   const delay = retryDelaysMs[Math.min(Math.max(attemptCount - 1, 0), retryDelaysMs.length - 1)]!;
   return new Date(now.getTime() + delay).toISOString();
+}
+
+function ensureV2BridgeSchema(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+  if (!columns.some(({ name }) => name === "job_key")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN job_key TEXT NOT NULL DEFAULT 'legacy-default'");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_groups (
+      source_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+      sealed_at TEXT,
+      notification_mode TEXT NOT NULL CHECK (notification_mode IN ('grouped', 'legacy')),
+      attention_event_id TEXT REFERENCES events(event_id),
+      all_terminal_event_id TEXT REFERENCES events(event_id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS job_groups_transition_idx ON job_groups(notification_mode, sealed_at, updated_at);
+    CREATE INDEX IF NOT EXISTS jobs_event_idx ON jobs(source_event_id, created_at);
+    INSERT OR IGNORE INTO job_groups (
+      source_event_id, sealed_at, notification_mode, attention_event_id,
+      all_terminal_event_id, created_at, updated_at
+    ) SELECT source_event_id, NULL, 'legacy', NULL, NULL, MIN(created_at), MAX(updated_at)
+      FROM jobs GROUP BY source_event_id;
+  `);
 }
 
 export function migrateDispatcherDatabase(
@@ -121,7 +155,7 @@ export function migrateDispatcherDatabase(
     CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
     PRAGMA user_version = 2;
   `);
-  if (version < 3) db.transaction(() => {
+  if (dispatcherSchemaCompatibility.write === 3 && version < 3) db.transaction(() => {
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -220,6 +254,9 @@ export function migrateDispatcherDatabase(
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   })();
+  if (dispatcherSchemaCompatibility.write === 2 && (db.pragma("user_version", { simple: true }) as number) === 2) {
+    ensureV2BridgeSchema(db);
+  }
 }
 
 export class DispatcherDatabase {

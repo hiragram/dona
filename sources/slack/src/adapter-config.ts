@@ -15,6 +15,18 @@ export interface SlackAdapterConfig {
   socketModeEnabled: true;
   logLevel: SlackLogLevel;
   buildSha: string;
+  appSchemaWrite: 2 | 3;
+}
+
+function appSchemaWrite(env: NodeJS.ProcessEnv): 2 | 3 {
+  const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return 2;
+  const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as {
+    compatibility?: { app_schema_write?: unknown };
+  };
+  const write = parsed.compatibility?.app_schema_write;
+  if (write !== 2 && write !== 3) throw new Error("DONA release manifest app_schema_write is invalid");
+  return write;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -69,5 +81,6 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     socketModeEnabled: socketModeEnabled(env.SLACK_SOCKET_MODE_ENABLED),
     logLevel: existing.logLevel,
     buildSha: buildSha(env),
+    appSchemaWrite: appSchemaWrite(env),
   };
 }
