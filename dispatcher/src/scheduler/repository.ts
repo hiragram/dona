@@ -133,11 +133,15 @@ export class SchedulerRepository {
   }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
   reminderConstraints(outboxId: string): { owner_id: string; expires_at: string; misfire_at: string } | undefined {
-    return this.db.prepare(`SELECT s.owner_id, v.expires_at,
+    const row = this.db.prepare(`SELECT s.owner_id, v.expires_at,
       strftime('%Y-%m-%dT%H:%M:%SZ', r.scheduled_for, '+900 seconds') AS misfire_at
+      , o.target_json, v.target_json AS revision_target, o.content, o.content_hash, v.content_hash AS revision_content_hash
       FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
       JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
-      WHERE o.outbox_id = ? AND o.kind = 'slack.reminder.post'`).get(outboxId) as { owner_id: string; expires_at: string; misfire_at: string } | undefined;
+      WHERE o.outbox_id = ? AND o.kind = 'slack.reminder.post'`).get(outboxId) as { owner_id: string; expires_at: string; misfire_at: string;
+        target_json: string; revision_target: string; content: string | null; content_hash: string; revision_content_hash: string } | undefined;
+    if (!row || row.content === null || row.target_json !== row.revision_target || row.content_hash !== row.revision_content_hash || digest(row.content) !== row.content_hash) return undefined;
+    return { owner_id: row.owner_id, expires_at: row.expires_at, misfire_at: row.misfire_at };
   }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
     utc(now);
@@ -696,9 +700,9 @@ export class SchedulerRepository {
     this.retireRevisions(run.schedule_id, ambiguousAt);
     this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
-  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
+  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
-    if (!["sent", "not_accepted", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
+    if (!["sent", "not_accepted", "unavailable", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
     if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds < 0 || retryAfterSeconds > 2592000) throw new Error("invalid_retry_after");
     return this.db.transaction(() => {
       const row = this.getOutbox(outboxId, now);
@@ -714,12 +718,13 @@ export class SchedulerRepository {
         const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
-        const retry = outcome === "not_accepted" && row.attempt < 3 && authorized && withinWorkRetryDeadline;
+        const retry = (outcome === "not_accepted" || outcome === "unavailable") && (outcome === "unavailable" || row.attempt < 3) && authorized && withinWorkRetryDeadline;
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
           status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
           receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
+        if (outcome === "unavailable" && retry) this.db.prepare("UPDATE connector_outbox SET attempt = attempt - 1 WHERE outbox_id = ?").run(outboxId);
         if (outcome === "revoked") {
           const paused = this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND revision = ? AND state = 'active'").run(finishedAt, run.schedule_id, run.revision);
           if (paused.changes === 1) this.suppress(run.schedule_id, finishedAt, "cancelled");

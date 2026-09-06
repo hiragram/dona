@@ -379,9 +379,9 @@ export class SlackWebApiClient implements SlackApiClient {
 
   async hasChannelMember(channelId: string, userId: string): Promise<boolean> {
     let cursor: string | undefined;
-    let pages = 0;
+    const deadline = Date.now() + 90_000;
     do {
-      if (++pages > 5) throw new SlackApiError("membership_scan_limit", "Slack channel membership scan exceeded its bounded page limit");
+      if (Date.now() >= deadline) throw new SlackApiError("membership_scan_timeout", "Slack channel membership scan exceeded its execution deadline", 5);
       const response = await callSlack(() => this.client.conversations.members({ channel: channelId, limit: 999, ...(cursor ? { cursor } : {}) }));
       if ((response.members ?? []).includes(userId)) return true;
       cursor = optionalCursor(response.response_metadata?.next_cursor);

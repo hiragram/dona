@@ -13,6 +13,7 @@ export interface SlackReminderCommand {
 export type ReminderDelivery =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
+  | { outcome: "unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
   | { outcome: "misfire"; code: string }
@@ -45,7 +46,7 @@ export class ReminderPublisher {
     const token = claimed.claim_token!;
     let input: SlackReminderCommand;
     try { input = command(this.repository, claimed); }
-    catch { this.repository.requestStarted(claimed.outbox_id, token, now); this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", now); return true; }
+    catch { this.repository.requestStarted(claimed.outbox_id, token, now); this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", now); return true; }
     // This durable transition is the last operation before the connector call. A crash afterwards is acceptance unknown.
     this.repository.requestStarted(claimed.outbox_id, token, now);
     let result: ReminderDelivery;
@@ -54,6 +55,7 @@ export class ReminderPublisher {
     const finishedAt = this.clock.now();
     if (result.outcome === "accepted") this.repository.finishWrite(claimed.outbox_id, token, "sent", finishedAt, result.receipt_id);
     else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds);
+    else if (result.outcome === "unavailable") this.repository.finishWrite(claimed.outbox_id, token, "unavailable", finishedAt, null, result.retry_after_seconds);
     else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt);
     else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt);
     else if (result.outcome === "misfire") this.repository.finishWrite(claimed.outbox_id, token, "misfire", finishedAt);
@@ -97,12 +99,12 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   constructor(private readonly config: DispatcherConfig) {}
   async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
-    if (!token) return { outcome: "not_accepted", code: "missing_internal_token", retry_after_seconds: 1 };
+    if (!token) return { outcome: "unavailable", code: "missing_internal_token", retry_after_seconds: 5 };
     try { return await request(this.config.slackAdapterSocketPath, token, input, Math.max(this.config.jobCommandTimeoutMs, 135_000)); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       return code === "ENOENT" || code === "ECONNREFUSED"
-        ? { outcome: "not_accepted", code: "connector_unavailable", retry_after_seconds: 1 }
+        ? { outcome: "unavailable", code: "connector_unavailable", retry_after_seconds: 5 }
         : { outcome: "acceptance_unknown", code: "connector_transport_error" };
     }
   }
