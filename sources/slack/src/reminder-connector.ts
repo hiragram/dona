@@ -26,6 +26,7 @@ export type SlackReminderCommand = Readonly<z.infer<typeof command>>;
 export type SlackReminderResult =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
+  | { outcome: "unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "authorization_unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
@@ -86,7 +87,7 @@ export class SlackReminderConnector {
       if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
       if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
       const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
-      if (throttleDelay > 0) return { outcome: "not_accepted", code: "channel_throttled", retry_after_seconds: throttleDelay };
+      if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,

@@ -53,7 +53,7 @@ test("同一channelの同時postを待機せずthrottleする", async () => {
   const second = await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls, 1);
-  assert.deepEqual(second, { outcome: "not_accepted", code: "channel_throttled", retry_after_seconds: 1 });
+  assert.deepEqual(second, { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: 1 });
   release();
   await first;
   assert.equal(calls, 1);
