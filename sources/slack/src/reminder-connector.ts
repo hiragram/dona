@@ -52,7 +52,7 @@ export class SlackReminderConnector {
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
       const owner = await connection.client.getUser(input.owner_id);
-      if (owner.isDeleted || owner.isBot || owner.isAppUser || (channel.isPrivate && !channel.isIm && (!connection.client.hasChannelMember ||
+      if (owner.isDeleted || owner.isBot || owner.isAppUser || (!channel.isIm && (!connection.client.hasChannelMember ||
         !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))))) return { outcome: "revoked", code: "owner_not_authorized" };
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
