@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { DispatcherDatabase } from "../database.js";
 import type { EventRow } from "../types.js";
-import { previewOccurrences } from "./calculator.js";
+import { previewOccurrencesBefore } from "./calculator.js";
 import { parseDefinition, validateCreation } from "./domain.js";
 import { FakeClock } from "./clock.js";
 import { encodePolicy, defaultPolicy } from "./policy.js";
@@ -74,10 +74,7 @@ export class ScheduleApiService {
   preview(input: unknown) {
     const value = previewInput.parse(input); const context = this.context(value.source_event_id);
     const built = this.built(value.definition, context, "preview", 1);
-    const rawPreview = previewOccurrences(built.parsed, value);
-    const occurrences = rawPreview.occurrences.filter(occurrence => occurrence.occurrence_at < built.expires);
-    const truncated = rawPreview.truncated && occurrences.length === rawPreview.occurrences.length;
-    const preview = { occurrences, truncated, cursor: truncated ? occurrences.at(-1)?.occurrence_at ?? null : null };
+    const preview = previewOccurrencesBefore(built.parsed, value, built.expires);
     return { schema_version: 1, preview, policy: built.parsed.policy,
       target: built.input.target, authorization_expires_at: built.expires };
   }

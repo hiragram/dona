@@ -42,6 +42,10 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   assert.ok(expiryPreview.preview.occurrences.every(occurrence => occurrence.occurrence_at < expiryPreview.authorization_expires_at));
   assert.equal(expiryPreview.preview.occurrences.at(-1)?.occurrence_at, "2026-10-01T00:00:00Z");
   assert.equal(expiryPreview.preview.truncated, false);
+  const exactExpiryPage = api.preview({ source_event_id: first.event_id, definition: definition(), after: "2026-09-28T00:00:00Z", before_or_equal: "2026-10-10T00:00:00Z", limit: 3 });
+  assert.equal(exactExpiryPage.preview.occurrences.length, 3);
+  assert.equal(exactExpiryPage.preview.truncated, false);
+  assert.equal(exactExpiryPage.preview.cursor, null);
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() });
   assert.equal(created.duplicate, false);
   assert.equal(wakes.count, 1);
