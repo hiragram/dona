@@ -20,7 +20,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler } from "./scheduler/schema.js";
-import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent } from "./scheduler/repository.js";
+import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -534,7 +534,7 @@ export class DispatcherDatabase {
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
     const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
     if (binding?.owner.kind === "schedule") {
-      validateWorkResultContent(stableStringify(result));
+      validateWorkResultEnvelope(stableStringify(result));
       validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";

@@ -310,14 +310,15 @@ test("job開始時の認可拒否はjobだけを戻してrun終端を確定す�
 
 test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {
   const { repo, dispatcher, raw } = setup(); const objective = "旧eventの調査";
-  repo.create("legacy_work", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const authorization=dispatcher.enqueue(eventEnvelope("legacy-work-authorization")).row;
+  repo.create("legacy_work", { ...input, authorization_id:`${authorization.event_id}:1`,action: "work.read_only", target: { kind: "none" }, content: objective }, due, {...actor,source_event_id:authorization.event_id}, now);
   const run = repo.materialize("legacy_work", 1, due, later, due, actor).run;
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
   raw.prepare("DELETE FROM job_routing_schema").run();
   migrateJobRouting(raw);
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
-  assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } });
+  assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" },authorization_target:{workspace_id:"T_TEST",channel_id:"C_TEST"} });
   assert.equal(dispatcher.listOwnerJobs(run.event_id!).length, 0);
   raw.prepare("UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]') WHERE event_id=?").run(run.event_id);
   migrateJobRouting(raw);
@@ -398,13 +399,13 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
   const run = repo.materialize("dispatch_fail",1,due,later,due,actor).run;
   dispatcher.recordPreDispatchFailure(run.event_id!,"preflight_failed","失敗",1,new Date(due));
   assert.equal(dispatcher.get(run.event_id!)?.status,"dead_letter"); assert.equal(repo.getRun(run.run_id)?.status,"failed");
-  assert.equal(repo.claim(due)?.kind,"slack.work_result.post");
+  assert.equal(repo.claim(due),undefined);
   repo.create("dispatch_blocked", { ...input, action:"work.read_only",content:"確認境界" },due,actor,now);
   const blocked=repo.materialize("dispatch_blocked",1,due,later,due,actor).run;
   dispatcher.markBlocked(blocked.event_id!,"承認待ち",undefined,new Date(due));
   assert.equal(dispatcher.get(blocked.event_id!)?.status,"needs_review");
   assert.equal(repo.getRun(blocked.run_id)?.status,"needs_review");
-  assert.equal(repo.claim(due)?.kind,"slack.work_result.post");
+  assert.equal(repo.claim(due),undefined);
   repo.purge("2026-09-12T00:01:00Z");
   for(const eventId of [run.event_id!,blocked.event_id!]) {
     const payload=JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string}).payload_json);
@@ -420,9 +421,7 @@ test("未委任の成功Resultをneeds_reviewへ隔離し取消済みeventをdis
   dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
   dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:due},resultPath);
   assert.equal(dispatcher.get(run.event_id!)?.status,"needs_review"); assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
-  const outbox=raw.prepare("SELECT outbox_id FROM connector_outbox WHERE run_id=?").get(run.run_id) as {outbox_id:string};
-  raw.prepare("UPDATE connector_outbox SET status='needs_review' WHERE outbox_id=?").run(outbox.outbox_id);
-  repo.reconcile(outbox.outbox_id,"sent","receipt",{...actor,role:"admin"},due);
+  assert.equal(raw.prepare("SELECT outbox_id FROM connector_outbox WHERE run_id=?").get(run.run_id),undefined);
   assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
   repo.purge("2026-09-12T00:01:00Z");
   assert.equal(dispatcher.get(run.event_id!)?.result_json,null); assert.equal(dispatcher.get(run.event_id!)?.result_path,null);

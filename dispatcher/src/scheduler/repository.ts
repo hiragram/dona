@@ -85,6 +85,9 @@ function truncateResultContent(value: string): string {
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
 export function validateWorkResultContent(value: string): void { truncateResultContent(value); }
+export function validateWorkResultEnvelope(value:string):void {
+  if(hasCredentialPattern(value)||hasSensitiveContentPattern(value)) throw new Error("content_requires_redaction");
+}
 export function projectWorkResultContent(value: string): string { return truncateResultContent(value); }
 
 export class SchedulerRepository {
@@ -573,15 +576,12 @@ export class SchedulerRepository {
       const settledAt=[now,run.created_at,before.created_at,before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,terminal_at=? WHERE run_id=?")
         .run(outcome, outcome === "needs_review" ? "ambiguous_write" : null, outcome === "failed" ? settledAt : null, run.run_id);
-      const snapshot=this.revision(run); const target=JSON.parse(snapshot.target_json) as Target;
       if (outcome === "needs_review") {
         this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=?").run(settledAt, run.schedule_id);
         this.retireRevisions(run.schedule_id, settledAt);
       }
-      if(target.kind!=="none"&&!this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(run.run_id)) {
-        this.insertOutbox(run.run_id,"slack.work_result.post",snapshot.target_json,
-          outcome==="needs_review"?"scheduled workの開始前処理は確認が必要です":"scheduled workを開始できませんでした",settledAt);
-      }
+      // No write is materialized after a delegation preflight fails: the same failure may be
+      // the current-access denial, and the outbox path cannot prove that access independently.
       this.audit(before, this.get(run.schedule_id)!, `event_${outcome}`,
         {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:eventId},settledAt,undefined,this.getRun(run.run_id)!);
       this.completeIfDrained(run.schedule_id, settledAt);
