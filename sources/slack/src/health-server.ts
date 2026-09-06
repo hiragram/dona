@@ -130,8 +130,12 @@ export class SlackHealthServer {
         send(response, 503, { schema_version: 1, outcome: "not_accepted", code: "shutting_down", retry_after_seconds: 1 });
         return;
       }
-      const result = await this.reminders.deliver(await this.readJson(request));
-      send(response, 200, { schema_version: 1, ...result });
+      try {
+        const result = await this.reminders.deliver(await this.readJson(request));
+        send(response, 200, { schema_version: 1, ...result });
+      } catch {
+        send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
+      }
       return;
     }
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
