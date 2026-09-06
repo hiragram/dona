@@ -632,9 +632,9 @@ export class SchedulerRepository {
     this.retireRevisions(run.schedule_id, ambiguousAt);
     this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
-  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
+  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "rejected" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
-    if (!["sent", "not_accepted", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
+    if (!["sent", "not_accepted", "rejected", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
     if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds < 0 || retryAfterSeconds > 2592000) throw new Error("invalid_retry_after");
     return this.db.transaction(() => {
       const row = this.getOutbox(outboxId, now);

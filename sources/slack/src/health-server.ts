@@ -11,6 +11,7 @@ import {
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
+import type { SlackReminderConnector } from "./reminder-connector.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -70,6 +71,7 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
+    private readonly reminders?: Pick<SlackReminderConnector, "deliver">,
   ) {}
 
   async start(): Promise<void> {
@@ -115,6 +117,23 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (method === "POST" && pathname === "/v1/internal/slack-reminders") {
+      if (!this.reminders || !this.updateInternalTokenPath) {
+        send(response, 503, { schema_version: 1, error: { code: "connector_unavailable", message: "Reminder connector is not configured" } });
+        return;
+      }
+      if (!(await this.authorized(request))) {
+        send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
+        return;
+      }
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, outcome: "not_accepted", code: "shutting_down", retry_after_seconds: 1 });
+        return;
+      }
+      const result = await this.reminders.deliver(await this.readJson(request));
+      send(response, 200, { schema_version: 1, ...result });
+      return;
+    }
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
       if (!this.updateNotifications || !this.updateInternalTokenPath) {
         send(response, 503, {

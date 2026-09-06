@@ -7,3 +7,4 @@ export * from './recurrence.js';
 export * from './policy.js';
 export * from './domain.js';
 export * from './calculator.js';
+export * from './reminder-publisher.js';

@@ -13,6 +13,7 @@ import { promptSecret } from "./prompt.js";
 import { SlackSocketAdapter, type WorkspaceSocket } from "./socket-adapter.js";
 import { SlackUpdateNotificationReporter } from "./update-notification.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
+import { SlackReminderConnector } from "./reminder-connector.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -49,6 +50,7 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
+    new SlackReminderConnector(registry),
   );
   await health.start();
   try {
