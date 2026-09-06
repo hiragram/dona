@@ -86,16 +86,20 @@ export class ReminderPublisher {
   private async tick(): Promise<void> {
     if (!this.running) return;
     try {
-      while (this.running) {
-        // Quota is 100 schedules per tenant; a 100-wide global bound also gives multiple tenants
-        // independent capacity while channel-level throttling protects Slack writes.
-        const now = this.clock.now();
-        const claimed = this.repository.claimBatch(now, 240, "slack.reminder.post", 100);
-        if (claimed.length === 0) break;
-        const settled = await Promise.allSettled(claimed.map((row) => this.publishClaimed(row, now)));
-        const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
-        if (failed) throw failed.reason;
-      }
+      // Start from one tenant-fair batch, then refill each of the at most 100 slots as soon as it
+      // finishes so a slow authorization lookup cannot hold completed capacity behind a barrier.
+      const initialAt = this.clock.now();
+      const initial = this.repository.claimBatch(initialAt, 240, "slack.reminder.post", 100);
+      const worker = async (first: Outbox): Promise<void> => {
+        let row: Outbox | undefined = first;
+        while (this.running && row) {
+          await this.publishClaimed(row, this.clock.now());
+          row = this.repository.claim(this.clock.now(), 240, "slack.reminder.post");
+        }
+      };
+      const settled = await Promise.allSettled(initial.map(worker));
+      const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failed) throw failed.reason;
     }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }
     if (this.running) { this.timer = setTimeout(() => { this.loopPromise = this.tick(); }, this.pollMs); this.timer.unref(); }
