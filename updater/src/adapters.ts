@@ -475,6 +475,7 @@ export class RealRuntime implements RuntimePort {
         return { ready: false, build_sha: buildSha };
       }
       const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+      this.dispatcherDatabasePath();
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
           receipt.schema_migration_capability === "dispatcher_v2_to_v3_online_backup_v1",
@@ -522,6 +523,9 @@ export class RealRuntime implements RuntimePort {
       throw new Error("dispatcher_database_path_invalid");
     }
     const base = path.resolve(this.policy.config_root, "..");
+    if (configured !== undefined && configured !== "~" && !configured.startsWith("~/") && !path.isAbsolute(configured)) {
+      throw new Error("dispatcher_database_path_must_be_absolute");
+    }
     const resolved = configured === undefined ? path.join(base, "dona.sqlite3")
       : configured === "~" ? os.homedir()
         : configured.startsWith("~/") ? path.join(os.homedir(), configured.slice(2)) : path.resolve(configured);

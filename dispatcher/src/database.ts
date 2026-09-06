@@ -126,6 +126,36 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
     db.exec(jobsRunnableFairIndexSql);
   })();
 }
+
+function ensureV2BridgeSchema(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+  if (!columns.some(({ name }) => name === "job_key")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN job_key TEXT NOT NULL DEFAULT 'legacy-default'");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_groups (
+      source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
+      sealed_at             TEXT,
+      notification_mode     TEXT NOT NULL CHECK (notification_mode IN ('grouped', 'legacy')),
+      attention_event_id    TEXT REFERENCES events(event_id),
+      all_terminal_event_id TEXT REFERENCES events(event_id),
+      created_at            TEXT NOT NULL,
+      updated_at            TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS job_groups_transition_idx
+      ON job_groups(notification_mode, sealed_at, updated_at);
+    CREATE INDEX IF NOT EXISTS jobs_event_idx ON jobs(source_event_id, created_at);
+    INSERT OR IGNORE INTO job_groups (
+      source_event_id, sealed_at, notification_mode, attention_event_id,
+      all_terminal_event_id, created_at, updated_at
+    )
+    SELECT jobs.source_event_id, NULL, 'legacy', NULL, NULL, MIN(jobs.created_at), MAX(jobs.updated_at)
+    FROM jobs GROUP BY jobs.source_event_id;
+  `);
+  ensureJobsRunnableFairIndex(db);
+  ensureJobsWorkspaceJobIndex(db);
+  ensureJobsStatusJobIndex(db);
+}
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id);
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_workspace_job_idx ON jobs(workspace_id,job_id)
@@ -275,6 +305,7 @@ export function migrateDispatcherDatabase(
     migrationHook("indexes_recreated");
 
     db.exec(`
+      DROP TABLE IF EXISTS job_groups;
       CREATE TABLE job_groups (
         source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
         sealed_at             TEXT,
@@ -314,6 +345,7 @@ export function migrateDispatcherDatabase(
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   };
   if (dispatcherSchemaCompatibility.write >= 3 && version < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
+  if (dispatcherSchemaCompatibility.write === 2 && version === 2) ensureV2BridgeSchema(db);
   if ((db.pragma("user_version", { simple: true }) as number) >= 3) {
     ensureJobsRunnableFairIndex(db);
     ensureJobsWorkspaceJobIndex(db);
@@ -480,6 +512,9 @@ export class DispatcherDatabase {
     const parsedRequest = parseCreateJobRequest(request);
     const sourceEvent = this.getRequired(parsedRequest.source_event_id);
     const jobKey = parsedRequest.job_key ?? legacyJobKey;
+    if (dispatcherSchemaCompatibility.write === 2 && jobKey !== legacyJobKey) {
+      throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
+    }
     const canonicalPayloadSha256 = canonicalJobPayloadSha256(parsedRequest);
     const objectiveUtf8Bytes = Buffer.byteLength(parsedRequest.objective, "utf8");
     const workspaceJson = serializeJobWorkspace(

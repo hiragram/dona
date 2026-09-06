@@ -417,8 +417,6 @@ export class UpdateController {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
       const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
       const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
-      const shutdownStarted = persistedStop?.phase === "observed" &&
-        (persistedSlackStop?.phase === "observed" || persistedDispatcherStop?.phase === "observed");
       const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
@@ -438,20 +436,30 @@ export class UpdateController {
         );
         return;
       }
-      // An observed service stop is durable proof that this request already passed
-      // the drain barrier. A restarted stable updater must continue to the migration
-      // receipt instead of calling a UDS endpoint on the stopped services.
-      if (!shutdownStarted) {
+      // Reboot can restart a previously stopped launchd service. Re-observe each
+      // service independently: live services must drain again, while an unavailable
+      // UDS is accepted as stopped only when this request has durable stop evidence.
+      const slackHealth = await this.runtime.slackHealth();
+      this.assertLease(row);
+      if (slackHealth.live) {
         const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
           throw new Error("slack_adapter_drain_incomplete");
         }
+      } else if (!persistedSlackStop) {
+        throw new Error("slack_adapter_current_state_unverified");
+      }
+      const dispatcherHealth = await this.runtime.dispatcherHealth();
+      this.assertLease(row);
+      if (dispatcherHealth.live) {
         const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
           throw new Error("dispatcher_drain_incomplete");
         }
+      } else if (!persistedDispatcherStop) {
+        throw new Error("dispatcher_current_state_unverified");
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();
