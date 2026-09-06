@@ -524,6 +524,39 @@ export class SchedulerRepository {
     if (!result) throw new Error("run_not_authorized");
     return result;
   }
+  markWorkRunNeedsReview(runId: string, jobId: string, now: string, sourceEventId: string): Run {
+    utc(now); id(jobId); id(sourceEventId);
+    return this.db.transaction(() => {
+      const run = this.getRun(runId);
+      if (!run || run.status !== "started" || run.job_id !== jobId || run.event_id !== sourceEventId) throw new Error("job_reference_conflict");
+      const before = this.get(run.schedule_id)!;
+      const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
+      this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
+      this.suppress(run.schedule_id, at, "cancelled");
+      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=? WHERE schedule_id=? AND state NOT IN ('cancelled','completed')").run(at, run.schedule_id);
+      this.retireRevisions(run.schedule_id, at);
+      this.audit(before, this.get(run.schedule_id)!, "work_result_needs_review",
+        {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:sourceEventId}, at, undefined, this.getRun(runId)!);
+      return this.getRun(runId)!;
+    }).immediate();
+  }
+
+  reconcileWorkRun(runId: string, outcome: "failed" | "cancelled", actor: Actor, now: string): Run {
+    utc(now); if (actor.role !== "admin") throw new Error("admin_required");
+    return this.db.transaction(() => {
+      const run = this.getRun(runId);
+      if (!run || run.status !== "needs_review") throw new Error("invalid_transition");
+      const before = this.get(run.schedule_id)!;
+      this.checked(before.schedule_id, before.revision, actor);
+      const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
+      this.db.prepare("UPDATE schedule_runs SET status=?, reason=?, terminal_at=? WHERE run_id=?")
+        .run(outcome, outcome === "cancelled" ? "cancelled" : null, at, runId);
+      this.db.prepare("UPDATE schedules SET state='paused', updated_at=? WHERE schedule_id=? AND state='needs_review'").run(at, run.schedule_id);
+      this.audit(before, this.get(run.schedule_id)!, `reconcile_work_${outcome}`, actor, at, undefined, this.getRun(runId)!);
+      this.completeIfDrained(run.schedule_id, at);
+      return this.getRun(runId)!;
+    }).immediate();
+  }
   reconcile(outboxId: string, outcome: "sent" | "failed", receiptId: string, actor: Actor, now: string): ReconciledOutbox {
     utc(now); validateReceipt(receiptId);
     if (actor.role !== "admin") throw new Error("admin_required");
@@ -768,6 +801,8 @@ export class SchedulerRepository {
       for (const row of expired) this.retireRevisions(row.schedule_id, now, row.revision);
       this.db.prepare("UPDATE schedule_revisions SET content = NULL WHERE content_delete_at <= ? OR expires_at <= ?").run(now, add(now, -604800));
       this.db.prepare("UPDATE connector_outbox SET content = NULL WHERE content_delete_at <= ?").run(now);
+      this.db.prepare(`UPDATE jobs SET result_json = NULL WHERE job_id IN
+        (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?)`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

@@ -36,6 +36,14 @@ function retryAt(attemptCount: number, now: Date): string {
   return new Date(now.getTime() + delay).toISOString();
 }
 
+function renderJobResult(result: Record<string, unknown> | null): string {
+  if (!result) return "完了";
+  const summary = typeof result.summary === "string" ? result.summary : "完了";
+  const output = result.output && typeof result.output === "object" && !Array.isArray(result.output)
+    ? result.output as Record<string, unknown> : undefined;
+  return typeof output?.text === "string" && output.text.trim() ? `${summary}\n\n${output.text}` : summary;
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
@@ -259,6 +267,13 @@ export class DispatcherDatabase {
     if (binding.owner.kind === "schedule" && request.workspace.kind !== "scratch") {
       throw new Error("Scheduled work permits only a scratch workspace");
     }
+    if (binding.owner.kind === "schedule") {
+      const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
+      if (payload.work?.objective !== request.objective || payload.work.scope !== "read_only" ||
+        !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
+        throw new Error("Scheduled work request does not match its persisted read-only scope");
+      }
+    }
 
     return this.db.transaction(() => {
       const existing = this.db
@@ -311,10 +326,10 @@ export class DispatcherDatabase {
       this.db.prepare(`INSERT INTO job_owner_bindings(job_id,source_event_id,owner_json,destination_json)
         SELECT ?,event_id,owner_json,destination_json FROM event_job_bindings WHERE event_id=?`).run(jobId,sourceEvent.event_id);
       if (binding.owner.kind === "schedule") {
-        const changed=this.db.prepare(`UPDATE schedule_runs SET job_id=?,status='started',started_at=?
-          WHERE run_id=? AND event_id=? AND status='materialized' AND job_id IS NULL`)
-          .run(jobId,timestamp,binding.owner.run_id,sourceEvent.event_id).changes;
-        if(changed!==1) throw new Error("Schedule run is no longer available for job creation");
+        const scheduleAt = new Date(Math.floor(at.getTime() / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
+        this.scheduler.setRunState(binding.owner.run_id, "materialized", "started",
+          { tenant_id: binding.owner.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: sourceEvent.event_id },
+          scheduleAt, jobId);
       }
       return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
     }).immediate();
@@ -558,18 +573,18 @@ export class DispatcherDatabase {
     if(prior) return {row:sourceEvent,duplicate:true,payloadMismatch:false};
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const workState=job.status==="completed"?"completed":job.status==="needs_review"?"needs_review":"failed";
-    const notificationState=binding.destination.kind==="none"?"none":"pending";
+    const notificationState="none";
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
-      (job_id,job_status,source_event_id,owner_json,destination_json,result_json,work_state,notification_state,materialized_at)
+      (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(job.job_id,job.status,job.source_event_id,stableStringify(binding.owner),
-      stableStringify(binding.destination),job.result_json,workState,notificationState,at.toISOString());
+      stableStringify(binding.destination),workState,notificationState,at.toISOString(),new Date(at.getTime()+604_800_000).toISOString());
     if(binding.owner.kind==="schedule") {
-      const scheduleAt=at.toISOString().replace(".000Z","Z");
+      const scheduleAt=new Date(Math.floor(at.getTime()/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
-      if(next==="needs_review") this.db.prepare(`UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at=? WHERE run_id=? AND job_id=? AND status='started'`).run(scheduleAt,binding.owner.run_id,job.job_id);
+      if(next==="needs_review") this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
       else this.scheduler.setRunState(binding.owner.run_id,"started",next,
         {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
-        next==="completed"?stableStringify(result??{summary:job.last_error_message??"completed"}):null);
+        next==="completed"?renderJobResult(result):null);
     }
     if(binding.destination.kind==="none"||binding.owner.kind==="schedule") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
     const envelope: EventEnvelope = {

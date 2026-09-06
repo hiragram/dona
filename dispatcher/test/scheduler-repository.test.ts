@@ -176,8 +176,9 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   const run=repo.materialize("scheduled",1,due,later,due,actor).run;
   const event=dispatcher.get(run.event_id!)!;
   assert.equal(dispatcher.nextAvailable()?.event_id,event.event_id);
-  const created=dispatcher.createJob({source_event_id:event.event_id,objective:"read-only調査",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
-  const duplicate=dispatcher.createJob({source_event_id:event.event_id,objective:"read-only調査",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
+  assert.throws(()=>dispatcher.createJob({source_event_id:event.event_id,objective:"差し替えた依頼",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/persisted read-only scope/);
+  const created=dispatcher.createJob({source_event_id:event.event_id,objective:work.content,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
+  const duplicate=dispatcher.createJob({source_event_id:event.event_id,objective:work.content,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
   assert.equal(duplicate.duplicate,true); assert.equal(duplicate.row.job_id,created.row.job_id);
   assert.equal(dispatcher.listOwnerJobs(event.event_id)[0]?.job_id,created.row.job_id);
   assert.equal(repo.getRun(run.run_id)?.status,"started");
@@ -189,6 +190,40 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   assert.equal(repo.getRun(run.run_id)?.status,"completed");
   const completion=raw.prepare("SELECT work_state,notification_state,notification_event_id FROM job_completion_results").get() as Record<string,unknown>;
   assert.deepEqual(completion,{work_state:"completed",notification_state:"none",notification_event_id:null});
+});
+
+test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを監査する", () => {
+  const { repo, dispatcher, raw } = setup();
+  const objective = "曖昧なread-only作業";
+  repo.create("review_work", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const run = repo.materialize("review_work", 1, due, later, due, actor).run;
+  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
+  dispatcher.markJobNeedsReview(job.job_id, "ambiguous_job_result", "結果の受理が不明");
+  dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get("review_work")?.state, "needs_review");
+  assert.throws(() => repo.reconcileWorkRun(run.run_id, "failed", actor, due), /admin_required/);
+  repo.reconcileWorkRun(run.run_id, "failed", { ...actor, role: "admin" }, due);
+  assert.equal(repo.getRun(run.run_id)?.status, "failed");
+  assert.ok((repo.auditHistory("review_work") as Array<{ operation: string }>).some(row => row.operation === "reconcile_work_failed"));
+  assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "needs_review");
+});
+
+test("work result通知のdelivery stateと本文retentionをjob resultへ同期する", () => {
+  const { repo, dispatcher, raw } = setup();
+  const objective = "通知付きread-only作業";
+  repo.create("notify_work", { ...input, action: "work.read_only", content: objective }, due, actor, now);
+  const run = repo.materialize("notify_work", 1, due, later, due, actor).run;
+  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
+  dispatcher.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "完了", output: { format: "markdown", text: "結果" }, completed_at: due }, job.result_path);
+  dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
+  const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, "1.000002");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
+  repo.purge("2026-09-12T00:01:01Z");
+  assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json, null);
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {

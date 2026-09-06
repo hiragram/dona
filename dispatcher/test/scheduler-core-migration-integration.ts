@@ -19,8 +19,11 @@ try {
   const event = db.enqueue(eventEnvelope("v3-probe")).row;
   const job = db.createJob({ source_event_id: event.event_id, objective: "probe", workspace: { kind: "scratch" } }, root, root).row;
   raw.transaction(() => {
-    raw.exec(`INSERT INTO schedules VALUES ('s','T','U','active',1,NULL,NULL,'n','n',NULL);
-      INSERT INTO schedule_revisions VALUES ('s',1,'{}','hash','{}',1,NULL,NULL,'a',1,'fixed_objective_redacted_result','U','a','b','work.read_only','{}',NULL,'hash',NULL,'n',NULL)`);
+    raw.exec(`INSERT INTO schedules(schedule_id,tenant_id,owner_id,state,revision,next_due,high_watermark,created_at,updated_at,terminal_at,list_sequence,idempotency_key_hash,create_payload_hash)
+        VALUES ('s','T','U','active',1,NULL,NULL,'n','n',NULL,1,NULL,'hash');
+      INSERT INTO schedule_revisions(schedule_id,revision,recurrence_json,recurrence_hash,policy_json,policy_version,timezone,tzdb_version,
+        authorization_id,authorization_revision,content_scope,approver_id,approved_at,expires_at,action,target_json,content,content_hash,content_delete_at,created_at,terminal_at)
+        VALUES ('s',1,'{}','hash','{}',1,NULL,NULL,'a',1,'fixed_objective_redacted_result','U','a','b','work.read_only','{}',NULL,'hash',NULL,'n',NULL)`);
     raw.prepare(`INSERT INTO schedule_runs(run_id,schedule_id,revision,occurrence_key,scheduled_for,status,event_id,job_id,created_at)
       VALUES ('r','s',1,'t','t','started',?,?,'n')`).run(event.event_id, job.job_id);
   })();
