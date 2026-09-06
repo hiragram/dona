@@ -409,7 +409,7 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result_agent_stop_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown'))
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
@@ -427,7 +427,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result_agent_stop_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown'))
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -571,6 +571,7 @@ export class DispatcherDatabase {
         this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
+      if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(completedAt.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,

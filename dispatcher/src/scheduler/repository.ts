@@ -568,6 +568,14 @@ export class SchedulerRepository {
       return this.getRun(runId)!;
     }).immediate();
   }
+  recoverWorkRunForResult(runId:string,jobId:string,sourceEventId:string,now:string):void {
+    utc(now);id(jobId);id(sourceEventId);
+    const run=this.getRun(runId);
+    if(!run||run.status!=="needs_review"||run.job_id!==jobId||run.event_id!==sourceEventId) return;
+    this.db.prepare("UPDATE schedule_runs SET status='started',reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
+    this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND state='needs_review'").run(now,run.schedule_id);
+    this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);
+  }
 
   settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string): void {
     utc(now); id(eventId);
