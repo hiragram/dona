@@ -6,7 +6,7 @@ import type { UpdatePolicy } from "../src/policy.js";
 import type { ReleaseManifest } from "../src/types.js";
 import { canonicalJson } from "../src/validation.js";
 
-export const currentSha = "1".repeat(40);
+export const currentSha = "5e9bbf235f2f48c6f5675dbba3ab723a956cf64d";
 export const targetSha = "2".repeat(40);
 export const olderSha = "0".repeat(40);
 

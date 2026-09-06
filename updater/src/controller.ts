@@ -19,6 +19,7 @@ import type {
 import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
+const schemaV3BridgeSha = "5e9bbf235f2f48c6f5675dbba3ab723a956cf64d";
 interface TerminalObservation {
   status: "succeeded" | "rolled_back";
   activeSha: string;
@@ -87,6 +88,7 @@ export class UpdateController {
     if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
     if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
+      if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
       controlPlane = await this.runtime.schemaMigrationCapability();
       if (!controlPlane.ready) throw new Error("stable_updater_schema_migration_capability_required");
     }
@@ -513,8 +515,13 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
       ))) return;
-      const previousCompatibility = (await this.releases.readCurrentManifest()).compatibility;
+      const previousManifest = await this.releases.readCurrentManifest();
+      const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
+        if (previousManifest.sha !== schemaV3BridgeSha || previousManifest.sha !== row.current_sha) {
+          this.needsReview(row, "schema_activation_bridge_identity_unverified");
+          return;
+        }
         const controlPlane = await this.runtime.schemaMigrationCapability();
         this.assertLease(row);
         if (!controlPlane.ready) {
