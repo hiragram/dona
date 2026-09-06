@@ -205,7 +205,7 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
   await fs.mkdir(path.dirname(configuredDatabase), { recursive: true });
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
   await fs.writeFile(configuredDatabase, "fixture", { mode: 0o600 });
-  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), `DONA_DATABASE_PATH=${configuredDatabase}\n`, { mode: 0o600 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), `DONA_DATABASE_PATH=${configuredDatabase} # custom path\n`, { mode: 0o600 });
   const recording = new RecordingRunner();
   const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
   await runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,

@@ -413,6 +413,10 @@ export class UpdateController {
     }
     if (row.state === "quiescing") {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
+      const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
+      const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
+      const shutdownStarted = persistedStop?.phase === "observed" &&
+        (persistedSlackStop?.phase === "observed" || persistedDispatcherStop?.phase === "observed");
       const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
@@ -432,17 +436,20 @@ export class UpdateController {
         );
         return;
       }
-      // Quiesce is keyed by the stable request ID and is idempotent. Re-observe it
-      // after every controller restart in case either ingress service also restarted.
-      const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
-      this.assertLease(row);
-      if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-        throw new Error("slack_adapter_drain_incomplete");
-      }
-      const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
-      this.assertLease(row);
-      if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-        throw new Error("dispatcher_drain_incomplete");
+      // An observed service stop is durable proof that this request already passed
+      // the drain barrier. A restarted stable updater must continue to the migration
+      // receipt instead of calling a UDS endpoint on the stopped services.
+      if (!shutdownStarted) {
+        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+          throw new Error("slack_adapter_drain_incomplete");
+        }
+        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+          throw new Error("dispatcher_drain_incomplete");
+        }
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();

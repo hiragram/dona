@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseDotenv } from "dotenv";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
@@ -516,20 +517,9 @@ export class RealRuntime implements RuntimePort {
     if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
       throw new Error("dispatcher_environment_identity_invalid");
     }
-    const body = fsSync.readFileSync(environmentPath, "utf8");
-    let configured: string | undefined;
-    for (const rawLine of body.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) continue;
-      const match = /^(?:export\s+)?DONA_DATABASE_PATH\s*=\s*(.*)$/.exec(line);
-      if (!match) continue;
-      if (configured !== undefined) throw new Error("dispatcher_database_path_duplicated");
-      let value = match[1]!.trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
-      if (!value || /[\0\r\n]/.test(value) || value.includes("${") || value.includes("$(") || value.includes("`")) {
-        throw new Error("dispatcher_database_path_invalid");
-      }
-      configured = value;
+    const configured = parseDotenv(fsSync.readFileSync(environmentPath)).DONA_DATABASE_PATH;
+    if (configured !== undefined && (!configured || /[\0\r\n]/.test(configured))) {
+      throw new Error("dispatcher_database_path_invalid");
     }
     const base = path.resolve(this.policy.config_root, "..");
     const resolved = configured === undefined ? path.join(base, "dona.sqlite3")
