@@ -119,25 +119,9 @@ export class SlackHealthServer {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
     if (method === "POST" && pathname === "/v1/internal/slack-reminders") {
-      if (!this.reminders || !this.updateInternalTokenPath) {
-        send(response, 503, { schema_version: 1, error: { code: "connector_unavailable", message: "Reminder connector is not configured" } });
-        return;
-      }
-      if (!(await this.authorized(request))) {
-        send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
-        return;
-      }
-      if (this.adapter.isStopping()) {
-        send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
-        return;
-      }
-      try {
-        const delivery = this.reminders.deliver(await this.readJson(request));
-        const result = this.adapter.trackOperation ? await this.adapter.trackOperation(delivery) : await delivery;
-        send(response, 200, { schema_version: 1, ...result });
-      } catch {
-        send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
-      }
+      const operation = this.handleReminder(request, response);
+      if (this.adapter.trackOperation) await this.adapter.trackOperation(operation);
+      else await operation;
       return;
     }
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
@@ -259,6 +243,32 @@ export class SlackHealthServer {
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
+  }
+
+  private async handleReminder(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.reminders || !this.updateInternalTokenPath) {
+      send(response, 503, { schema_version: 1, error: { code: "connector_unavailable", message: "Reminder connector is not configured" } });
+      return;
+    }
+    if (!(await this.authorized(request))) {
+      send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
+      return;
+    }
+    if (this.adapter.isStopping()) {
+      send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+      return;
+    }
+    try {
+      const input = await this.readJson(request);
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+        return;
+      }
+      const result = await this.reminders.deliver(input);
+      send(response, 200, { schema_version: 1, ...result });
+    } catch {
+      send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
+    }
   }
 
   private async authorized(request: IncomingMessage): Promise<boolean> {

@@ -791,6 +791,19 @@ test("connector revocationは旧authorizationの通常resumeを拒否する", ()
   assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
 });
 
+test("認可照会不能はretry上限後にscheduleをpauseする", () => {
+  const { repo } = setup();
+  repo.create("auth_unavailable", input, due, actor, now);
+  repo.materialize("auth_unavailable", 1, due, later, due, actor);
+  for (const attemptAt of [due, "2026-09-05T00:01:01Z", "2026-09-05T00:01:06Z"]) {
+    const claim = repo.claim(attemptAt)!;
+    repo.requestStarted(claim.outbox_id, claim.claim_token!, attemptAt);
+    repo.finishWrite(claim.outbox_id, claim.claim_token!, "authorization_unavailable", attemptAt, null, 1);
+  }
+  assert.equal(repo.get("auth_unavailable")?.state, "paused");
+  assert.throws(() => repo.transition("auth_unavailable", 1, "resume", actor, later), /authorization_expired/);
+});
+
 test("connector待機中のpauseは遅着misfireより優先される", () => {
   const { repo } = setup();
   repo.create("paused_misfire", input, due, actor, now);

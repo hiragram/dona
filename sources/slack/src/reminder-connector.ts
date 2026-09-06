@@ -26,6 +26,7 @@ export type SlackReminderCommand = Readonly<z.infer<typeof command>>;
 export type SlackReminderResult =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
+  | { outcome: "authorization_unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
   | { outcome: "misfire"; code: string }
@@ -62,7 +63,7 @@ export class SlackReminderConnector {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       return revokedSlackErrors.has(code)
         ? { outcome: "revoked", code }
-        : { outcome: "not_accepted", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
+        : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
     try {
       if (channel.isArchived || (!channel.isIm && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };

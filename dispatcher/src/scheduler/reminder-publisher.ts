@@ -13,6 +13,7 @@ export interface SlackReminderCommand {
 export type ReminderDelivery =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
+  | { outcome: "authorization_unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "unavailable"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
@@ -55,6 +56,7 @@ export class ReminderPublisher {
     const finishedAt = this.clock.now();
     if (result.outcome === "accepted") this.repository.finishWrite(claimed.outbox_id, token, "sent", finishedAt, result.receipt_id);
     else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds);
+    else if (result.outcome === "authorization_unavailable") this.repository.finishWrite(claimed.outbox_id, token, "authorization_unavailable", finishedAt, null, result.retry_after_seconds);
     else if (result.outcome === "unavailable") this.repository.finishWrite(claimed.outbox_id, token, "unavailable", finishedAt, null, result.retry_after_seconds);
     else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt);
     else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt);
@@ -82,9 +84,16 @@ function request(socketPath: string, token: string, body: SlackReminderCommand, 
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
       response.on("end", () => {
         try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ReminderDelivery;
-          if (!parsed || typeof parsed !== "object" || !("outcome" in parsed)) throw new Error("invalid_connector_response");
-          resolve(parsed);
+          const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object" && "outcome" in parsed) {
+            resolve(parsed as ReminderDelivery);
+            return;
+          }
+          const error = parsed?.error && typeof parsed.error === "object" ? parsed.error as Record<string, unknown> : undefined;
+          const code = typeof error?.code === "string" ? error.code : "connector_unavailable";
+          if (response.statusCode === 403) resolve({ outcome: "rejected", code: "internal_auth_failed" });
+          else if (response.statusCode !== undefined && response.statusCode >= 500) resolve({ outcome: "unavailable", code, retry_after_seconds: 5 });
+          else throw new Error("invalid_connector_response");
         } catch (error) { reject(error); }
       });
       response.once("aborted", () => reject(new Error("reminder_connector_response_aborted")));
