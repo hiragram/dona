@@ -260,6 +260,7 @@ test("blockedとredaction拒否をneeds_reviewへ隔離し取消しを確定で�
     dispatcher.enqueueJobNotification(job.job_id, new Date(due));
     assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
     assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
+    const notice = repo.claim(due); assert.ok(notice); assert.equal(notice.kind, "slack.work_result.post");
     if (mode === "blocked") {
       dispatcher.beginJobCancellation(job.job_id, job.source_event_id); dispatcher.markJobCancelled(job.job_id, "取消し", new Date(due));
       dispatcher.enqueueJobNotification(job.job_id, new Date(due)); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");

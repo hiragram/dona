@@ -635,7 +635,8 @@ export class SchedulerRepository {
     const snapshot = this.revision(run);
     const ageOrigin = run.scheduled_for;
     const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(terminalAt) - Date.parse(row.created_at) > 900000;
-    const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
+    const reviewNotification = row.kind === "slack.work_result.post" && run.status === "needs_review" && schedule.state === "needs_review";
+    const reason = (!reviewNotification && schedule.state !== "active") || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
       : snapshot.expires_at <= terminalAt ? "authorization_expired"
       : workRetryExpired ? "retry_expired"
       : row.kind === "slack.reminder.post" && Date.parse(terminalAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
@@ -667,7 +668,8 @@ export class SchedulerRepository {
       this.recover(now);
       const row = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
         JOIN schedules s ON s.schedule_id = r.schedule_id JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
-        WHERE o.status = 'pending' AND o.available_at <= ? AND o.content IS NOT NULL AND s.state = 'active'
+        WHERE o.status = 'pending' AND o.available_at <= ? AND o.content IS NOT NULL
+        AND (s.state = 'active' OR (o.kind = 'slack.work_result.post' AND s.state = 'needs_review' AND r.status = 'needs_review'))
         AND ((o.kind = 'slack.reminder.post' AND r.status IN ('materialized','started'))
           OR (o.kind = 'slack.work_result.post' AND r.status IN ('completed','needs_review')))
         AND s.revision = r.revision AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
@@ -746,7 +748,9 @@ export class SchedulerRepository {
       if (outcome === "ambiguous") this.markAmbiguous(row, finishedAt);
       else {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
-        const authorized = this.runCanSend(row, run) && schedule.state === "active" && schedule.revision === run.revision && this.revision(schedule).expires_at > now;
+        const reviewNotification = row.kind === "slack.work_result.post" && run.status === "needs_review" && schedule.state === "needs_review";
+        const authorized = this.runCanSend(row, run) && (schedule.state === "active" || reviewNotification) &&
+          schedule.revision === run.revision && this.revision(schedule).expires_at > now;
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
         const retry = outcome === "not_accepted" && row.attempt < 3 && authorized && withinWorkRetryDeadline;
