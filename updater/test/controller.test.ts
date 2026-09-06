@@ -48,6 +48,7 @@ test("allows only rollback-compatible read-max widening from the approved curren
   const bridge = { ...approved, app_schema_read_max: 3 };
   assert.equal(targetCompatibilityAllowedByPolicy(approved, approved, approved), true);
   assert.equal(targetCompatibilityAllowedByPolicy(approved, bridge, approved), true);
+  assert.equal(targetCompatibilityAllowedByPolicy(approved, { ...bridge, app_schema_read_max: 4 }, approved), false);
   for (const unsafe of [
     { ...bridge, protocol: 2 },
     { ...bridge, config: 2 },

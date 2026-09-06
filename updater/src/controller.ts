@@ -44,7 +44,7 @@ export function targetCompatibilityAllowedByPolicy(
     current.rollback_safe && target.rollback_safe &&
     target.protocol === approved.protocol && target.config === approved.config &&
     target.app_schema_read_min === approved.app_schema_read_min &&
-    target.app_schema_read_max > approved.app_schema_read_max &&
+    approved.app_schema_read_max === 2 && target.app_schema_read_max === 3 &&
     target.app_schema_write === approved.app_schema_write &&
     releaseCompatibilityMatches(current, target);
 }
