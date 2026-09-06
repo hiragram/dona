@@ -857,6 +857,20 @@ export class DispatcherDatabase {
     `).all() as EventRow[];
   }
 
+  quarantineUpdateNotification(eventId: string, code: string, message: string, at = new Date()): EventRow {
+    const row = this.getRequired(eventId);
+    if (row.source !== "dona_update" || !["queued", "retryable_failed"].includes(row.status)) {
+      throw new Error(`Event ${eventId} is not a pending update notification`);
+    }
+    const changed = this.db.prepare(`
+      UPDATE events SET status = 'dead_letter', last_error_code = ?, last_error_message = ?,
+        updated_at = ?
+      WHERE event_id = ? AND source = 'dona_update' AND status IN ('queued', 'retryable_failed')
+    `).run(code, message.slice(0, 2_000), at.toISOString(), eventId).changes;
+    if (changed !== 1) throw new Error(`Event ${eventId} is no longer a pending update notification`);
+    return this.getRequired(eventId);
+  }
+
   saveDeterministicCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
     const row = this.getRequired(eventId);
     if (row.status === "completed") return;
