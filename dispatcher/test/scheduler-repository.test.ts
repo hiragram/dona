@@ -203,6 +203,8 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
   dispatcher.markJobNeedsReview(job.job_id, "ambiguous_job_result", "結果の受理が不明");
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  assert.ok(raw.prepare("SELECT 1 FROM job_completion_results WHERE job_id=? AND job_status='needs_review'").get(job.job_id));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get("review_work")?.state, "needs_review");
   assert.throws(() => repo.reconcileWorkRun(run.run_id, "failed", actor, due), /admin_required/);
   repo.reconcileWorkRun(run.run_id, "failed", { ...actor, role: "admin" }, due);
@@ -343,12 +345,15 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
 });
 
 test("未委任の成功Resultをneeds_reviewへ隔離し取消済みeventをdispatchしない", () => {
-  const {repo,dispatcher}=setup();
+  const {repo,dispatcher,filename}=setup();
   repo.create("undelegated_success",{...input,action:"work.read_only",content:"未委任"},due,actor,now);
   const run=repo.materialize("undelegated_success",1,due,later,due,actor).run;
-  dispatcher.beginDispatch(run.event_id!,"/tmp/result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
-  dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:due},"/tmp/result.json");
+  const resultPath=path.join(path.dirname(filename),`${run.event_id}.json`); fs.writeFileSync(resultPath,"result");
+  dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:due},resultPath);
   assert.equal(dispatcher.get(run.event_id!)?.status,"needs_review"); assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  repo.purge("2026-09-12T00:01:00Z");
+  assert.equal(dispatcher.get(run.event_id!)?.result_json,null); assert.equal(dispatcher.get(run.event_id!)?.result_path,null);
 
   repo.create("cancelled_event",{...input,action:"work.read_only",target:{kind:"none"},content:"取消"},due,actor,now);
   const cancelled=repo.materialize("cancelled_event",1,due,later,due,actor).run;
@@ -365,6 +370,7 @@ test("scheduled failed Resultを保存前にredactionし通常Slack Resultのret
   dispatcher.beginJobPreparation(scheduled.job_id,new Date(due)); dispatcher.beginJobDispatch(scheduled.job_id,new Date(due)); dispatcher.markJobRunning(scheduled.job_id,new Date(due));
   assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"token: secret",output:{format:"markdown",text:"失敗"},completed_at:due},scheduled.result_path),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:'{"password":"hunter2"}',completed_at:due},scheduled.result_path),/content_requires_redaction/);
+  assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"api_key: AKIAEXAMPLE",completed_at:due},scheduled.result_path),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"失敗",actions:[{detail:"https://files.slack.com/private?token=hidden"}],completed_at:due},scheduled.result_path),/content_requires_redaction/);
   assert.equal(dispatcher.getJob(scheduled.job_id)?.result_json,null);
   dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"安全な失敗",completed_at:due},scheduled.result_path,new Date(due));

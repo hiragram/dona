@@ -29,6 +29,7 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
 
 export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
   const args = ["--add-dir", config.jobResultsDir];
+  if(row.source==="dona_schedule") args.push("--sandbox","read-only","--ask-for-approval","never");
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {

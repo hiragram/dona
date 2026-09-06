@@ -54,6 +54,9 @@ describe("Codex background agent arguments", () => {
     assert.equal(args[3]!.match(/trust_level/g)?.length, 1);
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config),[
+      "--add-dir",config.jobResultsDir,"--sandbox","read-only","--ask-for-approval","never","-c",expectedOverride,
+    ]);
     database.close();
   });
 

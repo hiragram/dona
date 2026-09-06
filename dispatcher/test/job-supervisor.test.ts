@@ -236,6 +236,16 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.status,"cancelled"); database.close();
   });
 
+  test("treats pre-prompt agent absence as a completed cancellation", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath); const job=createScratchJob(database,config,"Ev-pre-prompt-cancel");
+    database.beginJobPreparation(job.job_id);
+    const runtime=fakeRuntime({async cancel(){return failed("agent_not_found");}});
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.cancel(job.job_id,job.source_event_id);
+    assert.equal(result.row.status,"cancelled"); database.close();
+  });
+
   test("requires review when initial prompt acceptance times out instead of retrying", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

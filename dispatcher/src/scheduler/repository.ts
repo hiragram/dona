@@ -73,7 +73,7 @@ function hasCredentialPattern(value: string): boolean {
   return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\/|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i.test(value);
 }
 function hasSensitiveContentPattern(value: string): boolean {
-  return /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)["']?\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)/i.test(value);
+  return /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)["']?\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)/i.test(value);
 }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || hasSensitiveContentPattern(value)) throw new Error("content_requires_redaction");
@@ -538,7 +538,8 @@ export class SchedulerRepository {
     utc(now); id(jobId); id(sourceEventId);
     return this.db.transaction(() => {
       const run = this.getRun(runId);
-      if (!run || run.status !== "started" || run.job_id !== jobId || run.event_id !== sourceEventId) throw new Error("job_reference_conflict");
+      if (!run || !["started","needs_review"].includes(run.status) || run.job_id !== jobId || run.event_id !== sourceEventId) throw new Error("job_reference_conflict");
+      if(run.status==="needs_review") return run;
       const before = this.get(run.schedule_id)!;
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
@@ -835,6 +836,10 @@ export class SchedulerRepository {
     utc(now);
     const resultFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`).all(now) as Array<{job_id:string;result_path:string}>;
+    const eventResults=this.db.prepare(`SELECT e.event_id,e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
+      WHERE e.source='dona_schedule' AND e.result_path IS NOT NULL AND (r.terminal_at<=? OR EXISTS
+        (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?))`)
+      .all(add(now,-604800),add(now,-604800)) as Array<{event_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
@@ -858,6 +863,9 @@ export class SchedulerRepository {
         WHERE source='dona_schedule' AND EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=events.event_id
           AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=events.event_id
             AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
+      this.db.prepare(`UPDATE events SET result_json=NULL WHERE event_id IN (SELECT r.event_id FROM schedule_runs r
+        WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a
+          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.
@@ -873,6 +881,9 @@ export class SchedulerRepository {
     }).immediate();
     if(this.deleteJobResult) for(const row of resultFiles) if(this.deleteJobResult(row.job_id,row.result_path)) {
       this.db.prepare("UPDATE job_completion_results SET result_file_deleted_at=? WHERE job_id=? AND result_file_deleted_at IS NULL").run(now,row.job_id);
+    }
+    if(this.deleteJobResult) for(const row of eventResults) if(this.deleteJobResult(row.event_id,row.result_path)) {
+      this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(row.event_id,row.result_path);
     }
   }
 }
