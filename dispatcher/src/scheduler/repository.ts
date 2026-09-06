@@ -72,11 +72,14 @@ function validateReceipt(value: string): void {
 function hasCredentialPattern(value: string): boolean {
   return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\/|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i.test(value);
 }
+function hasSensitiveContentPattern(value: string): boolean {
+  return /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)["']?\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)/i.test(value);
+}
 function safeContent(value: string, limit: number): void {
-  if (!value || [...value].length > limit || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || [...value].length > limit || hasCredentialPattern(value) || hasSensitiveContentPattern(value)) throw new Error("content_requires_redaction");
 }
 function truncateResultContent(value: string): string {
-  if (!value || hasCredentialPattern(value) || /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files.slack.com)/i.test(value)) throw new Error("content_requires_redaction");
+  if (!value || hasCredentialPattern(value) || hasSensitiveContentPattern(value)) throw new Error("content_requires_redaction");
   const points = [...value];
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
@@ -847,6 +850,10 @@ export class SchedulerRepository {
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]')
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'`).run(now);
+      this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]')
+        WHERE source='dona_schedule' AND EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=events.event_id
+          AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=events.event_id
+            AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

@@ -308,7 +308,7 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
 });
 
 test("schedule eventのdelegation前terminal failureをrunへ原子的に反映する", () => {
-  const { repo, dispatcher } = setup();
+  const { repo, dispatcher, raw } = setup();
   repo.create("dispatch_fail", { ...input, action: "work.read_only", content: "失敗境界" }, due, actor, now);
   const run = repo.materialize("dispatch_fail",1,due,later,due,actor).run;
   dispatcher.recordPreDispatchFailure(run.event_id!,"preflight_failed","失敗",1,new Date(due));
@@ -320,6 +320,11 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
   assert.equal(dispatcher.get(blocked.event_id!)?.status,"needs_review");
   assert.equal(repo.getRun(blocked.run_id)?.status,"needs_review");
   assert.equal(repo.claim(due)?.kind,"slack.work_result.post");
+  repo.purge("2026-09-12T00:01:00Z");
+  for(const eventId of [run.event_id!,blocked.event_id!]) {
+    const payload=JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string}).payload_json);
+    assert.equal(payload.work.objective,"[deleted]");
+  }
 });
 
 test("scheduled failed Resultを保存前にredactionし通常Slack Resultのretentionを変えない", () => {
@@ -329,6 +334,7 @@ test("scheduled failed Resultを保存前にredactionし通常Slack Resultのret
   const scheduled=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
   dispatcher.beginJobPreparation(scheduled.job_id,new Date(due)); dispatcher.beginJobDispatch(scheduled.job_id,new Date(due)); dispatcher.markJobRunning(scheduled.job_id,new Date(due));
   assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"token: secret",output:{format:"markdown",text:"失敗"},completed_at:due},scheduled.result_path),/content_requires_redaction/);
+  assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:'{"password":"hunter2"}',completed_at:due},scheduled.result_path),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"失敗",actions:[{detail:"https://files.slack.com/private?token=hidden"}],completed_at:due},scheduled.result_path),/content_requires_redaction/);
   assert.equal(dispatcher.getJob(scheduled.job_id)?.result_json,null);
   dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"安全な失敗",completed_at:due},scheduled.result_path,new Date(due));
