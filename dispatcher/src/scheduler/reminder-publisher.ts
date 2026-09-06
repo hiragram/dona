@@ -70,9 +70,9 @@ export class ReminderPublisher {
     if (!this.running) return;
     try {
       while (this.running) {
-        // The policy permits 100 schedules per tenant and one authorization check may take 150s.
-        // Twenty-five workers keep a full due cohort within the 900s misfire grace (four waves).
-        const settled = await Promise.allSettled(Array.from({ length: 25 }, () => this.publishOne()));
+        // Quota is 100 schedules per tenant; a 100-wide global bound also gives multiple tenants
+        // independent capacity while channel-level throttling protects Slack writes.
+        const settled = await Promise.allSettled(Array.from({ length: 100 }, () => this.publishOne()));
         const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
         if (failed) throw failed.reason;
         if (!settled.some((result) => result.status === "fulfilled" && result.value)) break;

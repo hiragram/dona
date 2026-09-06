@@ -52,9 +52,10 @@ export class SlackReminderConnector {
   private reservePost(workspaceId: string, channelId: string): number {
     const key = `${workspaceId}:${channelId}`;
     const now = Date.now();
-    const slot = Math.max(now, this.nextPostAt.get(key) ?? now);
-    this.nextPostAt.set(key, slot + 1_000);
-    return Math.max(0, Math.ceil((slot - now) / 1_000));
+    const slot = this.nextPostAt.get(key) ?? now;
+    if (slot > now) return Math.ceil((slot - now) / 1_000);
+    this.nextPostAt.set(key, now + 1_000);
+    return 0;
   }
 
   async deliver(value: unknown): Promise<SlackReminderResult> {

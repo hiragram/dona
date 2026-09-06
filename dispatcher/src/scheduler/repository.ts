@@ -642,7 +642,10 @@ export class SchedulerRepository {
         AND ((o.kind = 'slack.reminder.post' AND r.status IN ('materialized','started'))
           OR (o.kind = 'slack.work_result.post' AND r.status = 'completed'))
         AND s.revision = r.revision AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
-        ORDER BY o.available_at, o.outbox_id LIMIT 1`).get(now, kind ?? null, kind ?? null, now, now) as Outbox | undefined;
+        ORDER BY (SELECT COUNT(*) FROM connector_outbox oo JOIN schedule_runs rr USING(run_id)
+          JOIN schedules ss ON ss.schedule_id = rr.schedule_id
+          WHERE ss.tenant_id = s.tenant_id AND oo.status IN ('claimed','request_started')),
+          o.available_at, o.outbox_id LIMIT 1`).get(now, kind ?? null, kind ?? null, now, now) as Outbox | undefined;
       if (!row) return undefined;
       this.db.prepare("UPDATE connector_outbox SET status = 'claimed', claim_token = ?, lease_until = ?, updated_at = ? WHERE outbox_id = ?")
         .run(randomUUID(), add(now, leaseSeconds), now, row.outbox_id);
