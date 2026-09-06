@@ -108,7 +108,7 @@ test("claim後のpauseとauthorization expiryをclaim時にも再確認する", 
   const claim = repo.claimDue("scheduler_a", due)!;
   repo.transition("paused", 1, "pause", actor, due);
   assert.throws(() => repo.materialize("paused", 1, due, null, due, { ...actor, role: "admin", actor_id: "scheduler" }, null, undefined,
-    { owner: "scheduler_a", fence: claim.claim_fence, occurrenceKey: JSON.stringify(["paused", due]) }), /revision_conflict/);
+    { owner: "scheduler_a", fence: claim.claim_fence, occurrenceKey: JSON.stringify(["paused", due]) }), /claim_conflict/);
 
   const expiryDue = "2026-09-05T00:02:00Z";
   repo.create("expired", { ...once(expiryDue), expires_at: expiryDue }, expiryDue, actor, "2026-09-05T00:01:00Z");
@@ -160,4 +160,38 @@ test("system clock rewindとlarge jump後も同じoccurrenceを再物化しな�
   const rows = raw.prepare("SELECT occurrence_key FROM schedule_runs ORDER BY scheduled_for").all() as Array<{ occurrence_key: string }>;
   assert.equal(rows.length, new Set(rows.map((row) => row.occurrence_key)).size);
   assert.equal(rows.length, 1);
+});
+
+test("366日horizonを越える次回occurrenceも有限windowで永続化する", () => {
+  const { repo, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  const recurrence = { version: 1, kind: "monthly", start_date: "2026-09-05", local_time: "09:01:00",
+    timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 13, day: 5 };
+  repo.create("long_interval", { ...daily(due), recurrence_json: `${JSON.stringify(recurrence)}\n` }, due, actor, clock.now());
+  clock.set(due);
+  const service = new SchedulerService(repo, clock, () => {}, logger, { owner: "scheduler_a" });
+  assert.equal(service.runBatch(), 1);
+  assert.equal(repo.get("long_interval")?.next_due, "2027-10-05T00:01:00Z");
+});
+
+test("長期間overdueでauthorization失効済みならpreview前にexpiredへ進める", () => {
+  const { repo, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  repo.create("long_overdue", daily(due), due, actor, clock.now());
+  clock.set("2027-09-05T00:01:00Z");
+  const service = new SchedulerService(repo, clock, () => {}, logger, { owner: "scheduler_a" });
+  assert.equal(service.runBatch(), 0);
+  assert.equal(repo.get("long_overdue")?.state, "expired");
+});
+
+test("startup scanはpoll前にbatch上限を二重実行しない", async () => {
+  const { repo, raw, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  for (const id of ["startup_a", "startup_b", "startup_c"]) repo.create(id, once(due), due, actor, clock.now());
+  clock.set(due);
+  const service = new SchedulerService(repo, clock, () => {}, logger, { owner: "scheduler_a", batchSize: 2, pollMilliseconds: 60_000 });
+  service.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await service.stop();
+  assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs").get() as { n: number }).n, 2);
 });

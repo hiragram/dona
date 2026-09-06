@@ -27,7 +27,6 @@ export interface Schedule {
   schedule_id: string; tenant_id: string; owner_id: string; state: ScheduleState;
   revision: number; next_due: string | null; high_watermark: string | null;
   created_at: string; updated_at: string; terminal_at: string | null;
-  claim_owner: string | null; claim_until: string | null; claim_fence: number;
 }
 export interface ScheduleClaim extends Schedule { claim_owner: string; claim_until: string; claim_fence: number }
 export type MaterializationDefinition = ScheduleDefinition;
@@ -102,22 +101,35 @@ export class SchedulerRepository {
     if (excludedScheduleIds.length > 100) throw new Error("invalid_limit");
     for (const scheduleId of excludedScheduleIds) id(scheduleId);
     return this.db.transaction(() => {
-      const exclusion = excludedScheduleIds.length > 0 ? `AND schedule_id NOT IN (${excludedScheduleIds.map(() => "?").join(",")})` : "";
-      const row = this.db.prepare(`SELECT schedule_id FROM schedules
-        WHERE state = 'active' AND next_due <= ? AND (claim_until IS NULL OR claim_until <= ?)
-        ${exclusion} ORDER BY next_due, schedule_id LIMIT 1`).get(now, now, ...excludedScheduleIds) as { schedule_id: string } | undefined;
+      const exclusion = excludedScheduleIds.length > 0 ? `AND s.schedule_id NOT IN (${excludedScheduleIds.map(() => "?").join(",")})` : "";
+      const row = this.db.prepare(`SELECT s.schedule_id FROM schedules s LEFT JOIN schedule_claims c USING(schedule_id)
+        WHERE s.state = 'active' AND s.next_due <= ? AND (c.claim_until IS NULL OR c.claim_until <= ?)
+        ${exclusion} ORDER BY s.next_due, s.schedule_id LIMIT 1`).get(now, now, ...excludedScheduleIds) as { schedule_id: string } | undefined;
       if (!row) return undefined;
-      const changed = this.db.prepare(`UPDATE schedules SET claim_owner = ?, claim_until = ?, claim_fence = claim_fence + 1
-        WHERE schedule_id = ? AND state = 'active' AND next_due <= ? AND (claim_until IS NULL OR claim_until <= ?)`)
-        .run(owner, add(now, leaseSeconds), row.schedule_id, now, now).changes;
-      if (changed !== 1) return undefined;
-      return this.get(row.schedule_id) as ScheduleClaim;
+      this.db.prepare(`INSERT INTO schedule_claims(schedule_id, claim_owner, claim_until, claim_fence) VALUES(?,?,?,1)
+        ON CONFLICT(schedule_id) DO UPDATE SET claim_owner = excluded.claim_owner, claim_until = excluded.claim_until,
+          claim_fence = schedule_claims.claim_fence + 1 WHERE schedule_claims.claim_until IS NULL OR schedule_claims.claim_until <= ?`)
+        .run(row.schedule_id, owner, add(now, leaseSeconds), now);
+      const claim = this.db.prepare("SELECT * FROM schedule_claims WHERE schedule_id = ? AND claim_owner = ?").get(row.schedule_id, owner) as
+        { claim_owner: string; claim_until: string; claim_fence: number } | undefined;
+      return claim ? { ...this.get(row.schedule_id)!, ...claim } : undefined;
     }).immediate();
   }
   releaseClaims(owner: string, now: string): number {
     id(owner); utc(now);
-    return this.db.prepare(`UPDATE schedules SET claim_owner = NULL, claim_until = NULL, updated_at =
-      CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE claim_owner = ?`).run(now, now, owner).changes;
+    return this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE claim_owner = ?").run(owner).changes;
+  }
+  expireDue(now: string, limit = 100): number {
+    utc(now); if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions v
+        ON v.schedule_id = s.schedule_id AND v.revision = s.revision
+        WHERE s.state = 'active' AND s.next_due <= ? AND v.expires_at <= ? ORDER BY s.next_due, s.schedule_id LIMIT ?`)
+        .all(now, now, limit) as Schedule[];
+      for (const row of rows) this.expireSchedule(row,
+        { tenant_id: row.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now);
+      return rows.length;
+    }).immediate();
   }
   materializationDefinition(scheduleId: string, revision: number): MaterializationDefinition {
     const schedule = this.checked(scheduleId, revision);
@@ -304,6 +316,7 @@ export class SchedulerRepository {
       const state = operation === "pause" ? "paused" : operation === "resume" ? "active" : "cancelled";
       this.db.prepare("UPDATE schedules SET state = ?, revision = ?, updated_at = ?, terminal_at = ? WHERE schedule_id = ?")
         .run(state, revision, transitionAt, state === "cancelled" ? transitionAt : null, scheduleId);
+      this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
       if (operation !== "resume") this.suppress(scheduleId, transitionAt, "cancelled");
       if (operation === "cancel") this.retireRevisions(scheduleId, transitionAt);
       const after = this.get(scheduleId)!; this.audit(before, after, operation, actor, transitionAt);
@@ -322,12 +335,15 @@ export class SchedulerRepository {
       if (!current) throw new Error("schedule_not_found");
       const before = this.checked(scheduleId, current.revision, actor);
       const materializedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
-      if (claim && (before.claim_owner !== claim.owner || before.claim_fence !== claim.fence || before.claim_until === null || before.claim_until <= now)) {
-        throw new Error("claim_conflict");
+      if (claim) {
+        const storedClaim = this.db.prepare("SELECT * FROM schedule_claims WHERE schedule_id = ?").get(scheduleId) as
+          { claim_owner: string | null; claim_until: string | null; claim_fence: number } | undefined;
+        if (!storedClaim || storedClaim.claim_owner !== claim.owner || storedClaim.claim_fence !== claim.fence ||
+            storedClaim.claim_until === null || storedClaim.claim_until <= now) throw new Error("claim_conflict");
       }
       const existing = this.db.prepare("SELECT * FROM schedule_runs WHERE schedule_id = ? AND scheduled_for = ?").get(scheduleId, scheduledFor) as Run | undefined;
       if (existing) {
-        if (claim) this.db.prepare("UPDATE schedules SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
+        if (claim) this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
         return { run: existing, duplicate: true };
       }
       if (before.revision !== expectedRevision) throw new Error("revision_conflict");
@@ -366,7 +382,7 @@ export class SchedulerRepository {
       }
       this.db.prepare("UPDATE schedules SET high_watermark = ?, next_due = ?, updated_at = ? WHERE schedule_id = ?")
         .run(scheduledFor, nextDue, materializedAt, scheduleId);
-      if (claim) this.db.prepare("UPDATE schedules SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
+      if (claim) this.db.prepare("UPDATE schedule_claims SET claim_owner = NULL, claim_until = NULL WHERE schedule_id = ?").run(scheduleId);
       this.audit(before, this.get(scheduleId)!, "materialize", actor, materializedAt, undefined, this.getRun(runId)!, compactSkip);
       this.completeIfDrained(scheduleId, materializedAt);
       return { run: this.getRun(runId)!, duplicate: false };

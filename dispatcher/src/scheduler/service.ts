@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../logger.js";
 import { nextOccurrence, previewOccurrences } from "./calculator.js";
+import { DAY_MS, MAX_YEAR } from "./calendar.js";
 import type { Clock } from "./clock.js";
+import type { ScheduleDefinition } from "./domain.js";
 import type { Actor, SchedulerRepository } from "./repository.js";
 
 class WakeSignal {
@@ -39,6 +41,19 @@ export interface SchedulerServiceOptions {
   leaseSeconds?: number;
   pollMilliseconds?: number;
   owner?: string;
+}
+
+function nextPersistedOccurrence(definition: ScheduleDefinition, after: string): ReturnType<typeof nextOccurrence> {
+  let cursor = after;
+  const last = Date.parse(`${MAX_YEAR}-12-31T23:59:59Z`);
+  while (Date.parse(cursor) < last) {
+    const occurrence = nextOccurrence(definition, cursor);
+    if (occurrence) return occurrence;
+    const advanced = Math.min(Date.parse(cursor) + 366 * DAY_MS, last);
+    if (advanced <= Date.parse(cursor)) break;
+    cursor = new Date(advanced).toISOString().replace(".000Z", "Z");
+  }
+  return null;
 }
 
 export class SchedulerService {
@@ -79,7 +94,6 @@ export class SchedulerService {
       });
       throw error;
     }).finally(() => { this.running = false; });
-    this.wake();
   }
 
   wake(): void { this.wakeSignal.wake(); }
@@ -95,6 +109,7 @@ export class SchedulerService {
   runBatch(): number {
     let materialized = 0;
     const visited: string[] = [];
+    this.repository.expireDue(this.clock.now(), this.batchSize);
     for (let index = 0; index < this.batchSize && !this.stopping; index++) {
       const now = this.clock.now();
       const claim = this.repository.claimDue(this.owner, now, this.leaseSeconds, visited);
@@ -111,7 +126,7 @@ export class SchedulerService {
         const occurrence = occurrences.at(-1);
         if (!occurrence || occurrences[0]?.occurrence_at !== firstDue) throw new Error("next_due_definition_mismatch");
         const scheduledFor = occurrence.occurrence_at;
-        const next = nextOccurrence(definition, scheduledFor);
+        const next = definition.recurrence.kind === "once" ? null : nextPersistedOccurrence(definition, scheduledFor);
         const compactSkip = occurrences.length > 1
           ? { from: firstDue, through: occurrences.at(-2)!.occurrence_at, count: occurrences.length - 1 }
           : undefined;

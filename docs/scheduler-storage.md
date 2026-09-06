@@ -6,13 +6,13 @@
 
 integration `feature/durable-scheduler@87c8e18c9a20ad6c2a88f2355e309cccc0d27e59` とmainのcore DBは`PRAGMA user_version = 2`。独立integration `feature/multi-job-fanout` がv3を使用しているため、schedulerでv3を再定義したりv3を飛ばしてv4と表示したりしない。
 
-新schemaの識別子は **core v2 + scheduler v2**。`scheduler_schema(singleton=1, version=2)`を同じDBへ追加し、既存core migrationの直後にextension migrationを実行する。v2はv1の保存契約を維持し、due materializer用の`claim_owner`、`claim_until`、単調増加する`claim_fence`を`schedules`へ追加する。新規DBはcore v1→v2を既存コードで実行してからscheduler v2へ、既存scheduler v1 DBは同じtransactionでclaim列を追加してv2へ進む。extensionの全DDLとversion記録は1つの`BEGIN IMMEDIATE` transactionで、失敗時はextension全体をrollbackする。再openは同じschemaを再利用し、未知extension versionは拒否する。WAL、foreign_keys、busy_timeoutは既存Dispatcher connectionを共有する。
+新schemaの識別子は **core v2 + scheduler v1**。`scheduler_schema(singleton=1, version=1)`を同じDBへ追加し、既存core migrationの直後にextension migrationを実行する。due materializerの`claim_owner`、`claim_until`、単調増加する`claim_fence`は旧v1 readerが安全に無視できる追加table`schedule_claims`へ保存し、extension versionを上げずrollback互換性を維持する。新規DBはcore v1→v2を既存コードで実行してからscheduler v1へ、既存scheduler v1 DBは同じtransactionで不足するclaim tableだけを追加する。extensionの全DDLとversion記録は1つの`BEGIN IMMEDIATE` transactionで、失敗時はextension全体をrollbackする。再openは同じschemaを再利用し、未知extension versionは拒否する。WAL、foreign_keys、busy_timeoutは既存Dispatcher connectionを共有する。
 
 ## Due materializer
 
 `SchedulerService`のtimerはwake hintだけで、正本は`schedules.next_due`と`schedule_runs`である。各instanceはbounded batchごとに期限切れまたは未取得のscheduleを`BEGIN IMMEDIATE`でclaimし、owner token、lease、fenceを同じtransaction内で再確認してから、#6のcalculatorが返すoccurrence identityを#7の一意制約へ物化する。run、`source: dona_schedule` event、`next_due`、high-watermark、auditは同一transactionで確定し、途中失敗は全体をrollbackする。stable IDは`schedule:v1:<schedule_id>:<occurrence UTC instant>`で、payloadにはcalculator由来のoccurrence keyを保持する。
 
-1回のwakeで最大10件だけを物化し、既存event queueへsequence順で追加する。Slack ingressや既存retryを飛び越さず、workerはbatch完了後に1回だけwakeされる。shutdownは新規claimを止め、現在instanceが保持する未処理claimだけを解放する。他instanceの有効leaseはowner/fenceなしに変更しない。reminder connector、scheduled job作成/result routing、recurring catch-up最終policyは#10〜#12の境界であり、このserviceでは実行しない。
+1回のwakeで最大10件だけを物化し、既存event queueへsequence順で追加する。#11のroutingが入るまでは`dona_schedule`とlegacy `scheduler` eventを通常workerから除外するため、Slack ingressや既存retryを妨げない。shutdownは新規claimを止め、現在instanceが保持する未処理claimだけを解放する。他instanceの有効leaseはowner/fenceなしに変更しない。redacted backupにはlive claim owner/leaseを含めず、fenceはDB内でのみ保持する。reminder connector、scheduled job作成/result routing、recurring catch-up最終policyは#10〜#12の境界であり、このserviceでは実行しない。
 
 core v3 migrationをコピー／省略／置換しない。fan-out統合後はそのcore migrationを先に実行し、同じextension migrationを続ける。scheduler側の`job_id`は履歴参照で、`setRunState`が同じtransaction内でjobの存在とsource eventの一致を検証する。**jobsへのSQL FKやtriggerは設けない**。既存v2→v3はjobsをDROP/再構築するため、参照元FKやtriggerがあるとmigrationが失敗することを実DBで確認した。schedule/revision/run/event/outbox間にはFKを持ち、job本体の将来のretentionから履歴参照を独立させる。
 
@@ -45,7 +45,7 @@ PR #82のexact head `56eeec85d271813e33984fd2c5eae9753a607190`を一時checkout�
 
 ## Transactionと外部write
 
-create/状態更新/新revisionとaudit、run物化とevent/outbox・high-watermark・auditはそれぞれ同じconnectionのtransaction。workは本文を持たない`source: dona_schedule`の内部eventへrun/revision/occurrence参照を保存し、reminderはtyped outboxを作る。scheduler eventは既存queueへsequence順で接続するが、#11が所有するscheduled jobの自動作成やresult routingは行わない。source型の追加だけでは外部HTTP ingressを許可せず、内部typed validatorでstable identityを照合する。既存Slack専用createJobをscheduler対応に変更せず、`setRunState`が後続#11から渡されるjob参照とrun transitionを検証する。work結果本文のoutbox追加とrun完了もatomicなprimitiveを供給する。開始済みworkの完了は失効・pause・取消・revision変更後も保存し、その場合は通知outboxだけを抑止してdecision codeをauditへ残す。有効な通知先がある完了では結果本文を必須とする。work結果通知に開始graceを再適用しない。
+create/状態更新/新revisionとaudit、run物化とevent/outbox・high-watermark・auditはそれぞれ同じconnectionのtransaction。workは本文を持たない`source: dona_schedule`の内部eventへrun/revision/occurrence参照を保存し、reminderはtyped outboxを作る。scheduler eventは既存queueへ永続化するが、#11が所有するscheduled jobの自動作成やresult routingが入るまでは通常workerへ配送しない。source型の追加だけでは外部HTTP ingressを許可せず、内部typed validatorでstable identityを照合する。既存Slack専用createJobをscheduler対応に変更せず、`setRunState`が後続#11から渡されるjob参照とrun transitionを検証する。work結果本文のoutbox追加とrun完了もatomicなprimitiveを供給する。開始済みworkの完了は失効・pause・取消・revision変更後も保存し、その場合は通知outboxだけを抑止してdecision codeをauditへ残す。有効な通知先がある完了では結果本文を必須とする。work結果通知に開始graceを再適用しない。
 
 duplicate wakeは既存runを返し、event/outboxを増やさない。run削除後はhigh-watermarkにより過去occurrenceの再作成を拒否する。900秒境界・未決着run/outboxのoverlapは保存直前にも確認するが、直近候補の選択・calendar計算・長期停止で選ぶ直近候補とcompact skipの範囲・件数の計算は#9の責任。`materialize`のoptional `compactSkip: { from, through, count }`へ計算済み範囲を渡すと、保存済みnext_dueから選択候補までの古い範囲をauditへcompactに記録し、選択候補のrun/event/outboxとhigh-watermarkを同一transactionで物化する。範囲開始は保存済みnext_due、終端は選択候補より前かつgrace外、件数は正の整数を要求し、個々の古いrunを生成しない。workの開始前にgraceを過ぎた場合もrunを終端化してから拒否し、authorization失効を検出したscheduleはexpiredへ移してdue scanから外す。未送信outboxがgraceを過ぎた場合はclaim/recover/送信開始直前にrunとともに終端化し、永久的なoverlapを防ぐ。one-shotは次回なしで最後のrun/outboxが決着してからcompletedへ進め、quotaとretentionを解放する。recurringの空previewを終了と解釈しない。
 
