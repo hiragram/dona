@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { definitionFingerprint, type DefinitionFingerprintInput } from "./fingerprint.js";
 
 // Core user_version is owned by the Dispatcher (including the independent v3 job migration).
 export function migrateScheduler(db: Database.Database): void {
@@ -7,15 +8,41 @@ export function migrateScheduler(db: Database.Database): void {
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL
     )`);
     const row = db.prepare("SELECT version FROM scheduler_schema WHERE singleton = 1").get() as { version: number } | undefined;
-    if (row && row.version !== 1) throw new Error("unsupported_scheduler_schema");
-    if (row?.version === 1) {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS schedule_claims (
+    if (row && row.version !== 1 && row.version !== 2) throw new Error("unsupported_scheduler_schema");
+    if (row) {
+      db.exec(`CREATE TABLE IF NOT EXISTS schedule_claims (
           schedule_id TEXT PRIMARY KEY REFERENCES schedules(schedule_id) ON DELETE CASCADE,
           claim_owner TEXT, claim_until TEXT, claim_fence INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS schedule_claims_lease_idx ON schedule_claims(claim_until, schedule_id);
-      `);
+        CREATE INDEX IF NOT EXISTS schedule_claims_lease_idx ON schedule_claims(claim_until, schedule_id);`);
+      const columns = db.prepare("SELECT name FROM pragma_table_info('schedules')").all() as Array<{ name: string }>;
+      if (!columns.some(column => column.name === "list_sequence")) {
+        db.exec("ALTER TABLE schedules ADD COLUMN list_sequence INTEGER");
+      }
+      if (!columns.some(column => column.name === "idempotency_key_hash")) {
+        db.exec("ALTER TABLE schedules ADD COLUMN idempotency_key_hash TEXT");
+      }
+      db.exec(`
+        UPDATE schedules SET list_sequence = (SELECT MIN(sequence) FROM schedule_audit
+          WHERE schedule_audit.schedule_id = schedules.schedule_id AND operation = 'create')
+          WHERE list_sequence IS NULL;
+        UPDATE schedules SET list_sequence = rowid + COALESCE((SELECT MAX(sequence) FROM schedule_audit), 0)
+          WHERE list_sequence IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS schedules_list_sequence_idx ON schedules(list_sequence);
+        CREATE TABLE IF NOT EXISTS schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
+        INSERT OR IGNORE INTO schedule_list_sequence VALUES (1, COALESCE((SELECT MAX(list_sequence) + 1 FROM schedules), 1));`);
+      if (!columns.some(column => column.name === "create_payload_hash")) {
+        db.exec("ALTER TABLE schedules ADD COLUMN create_payload_hash TEXT");
+        const revisions = db.prepare(`SELECT schedule_id, recurrence_json, policy_json, action, target_json, content_hash
+          FROM schedule_revisions WHERE revision = 1`).all() as Array<DefinitionFingerprintInput & { schedule_id: string }>;
+        const update = db.prepare("UPDATE schedules SET create_payload_hash = ? WHERE schedule_id = ?");
+        for (const revision of revisions) update.run(definitionFingerprint(revision), revision.schedule_id);
+        const missing = db.prepare("SELECT 1 FROM schedules WHERE create_payload_hash IS NULL LIMIT 1").get();
+        if (missing) throw new Error("scheduler_create_payload_unrecoverable");
+      }
+      // Version 2 existed only on an unmerged development head. Normalize it so the
+      // released version-1 reader can still open this expand-only schema on rollback.
+      if (row.version === 2) db.exec("UPDATE scheduler_schema SET version = 1 WHERE singleton = 1");
       return;
     }
     db.exec(`
@@ -24,10 +51,13 @@ export function migrateScheduler(db: Database.Database): void {
         state TEXT NOT NULL CHECK(state IN ('active','paused','expired','needs_review','cancelled','completed')),
         revision INTEGER NOT NULL CHECK(revision > 0), next_due TEXT, high_watermark TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT,
+        list_sequence INTEGER NOT NULL UNIQUE, idempotency_key_hash TEXT, create_payload_hash TEXT NOT NULL,
         FOREIGN KEY(schedule_id, revision) REFERENCES schedule_revisions(schedule_id, revision) DEFERRABLE INITIALLY DEFERRED
       );
       CREATE INDEX schedules_due_idx ON schedules(next_due, schedule_id) WHERE state = 'active';
       CREATE INDEX schedules_owner_idx ON schedules(tenant_id, owner_id, state);
+      CREATE TABLE schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
+      INSERT INTO schedule_list_sequence VALUES (1, 1);
       CREATE TABLE schedule_claims (
         schedule_id TEXT PRIMARY KEY REFERENCES schedules(schedule_id) ON DELETE CASCADE,
         claim_owner TEXT, claim_until TEXT, claim_fence INTEGER NOT NULL DEFAULT 0

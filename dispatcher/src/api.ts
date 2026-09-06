@@ -11,6 +11,8 @@ import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
+import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
+import { ScheduleError } from "./scheduler/errors.js";
 import {
   parseCancelJobRequest,
   parseCreateJobRequest,
@@ -106,6 +108,7 @@ export class DispatcherApi {
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
+  private readonly schedules: ScheduleApiService;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -116,7 +119,9 @@ export class DispatcherApi {
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
-  ) {}
+    scheduleNow: () => Date = () => new Date(),
+    wakeScheduler: () => void = () => {},
+  ) { this.schedules = new ScheduleApiService(database, scheduleNow, wakeScheduler); }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
@@ -282,6 +287,21 @@ export class DispatcherApi {
         await this.handleJobs(request, response, url);
         return;
       }
+      if (url.pathname === "/v1/schedules/preview" || url.pathname === "/v1/schedules" || url.pathname.startsWith("/v1/schedules/")) {
+        try {
+          await this.handleSchedules(request, response, url);
+        } catch (error) {
+          if (error instanceof ScheduleApiError) throw error;
+          if (error instanceof ScheduleError) throw new ScheduleApiError(400, error.code);
+          if (error instanceof Error && error.name === "ZodError") throw new ScheduleApiError(400, "invalid_request", "Schedule request is invalid");
+          const code = error instanceof Error ? error.message : "";
+          if (["invalid_limit", "invalid_identity", "schedule_not_found", "unauthorized", "revision_conflict"].includes(code)) {
+            throw new ScheduleApiError(code === "schedule_not_found" ? 404 : code === "unauthorized" ? 403 : code === "revision_conflict" ? 409 : 400, code);
+          }
+          throw error;
+        }
+        return;
+      }
       if (request.method !== "POST" || url.pathname !== "/v1/events") {
         sendJson(response, 404, errorBody("not_found", "Route not found"));
         return;
@@ -337,6 +357,10 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
+      } else if (error instanceof ScheduleApiError) {
+        sendJson(response, error.status, errorBody(error.code, error.message));
+      } else if (error instanceof Error && error.name === "ZodError") {
+        sendJson(response, 400, errorBody("invalid_request", "Schedule request is invalid"));
       } else if (error instanceof UpdaterClientError) {
         this.logger.warn("Updater request rejected", {
           error_code: error.code,
@@ -538,6 +562,27 @@ export class DispatcherApi {
       return;
     }
     throw new ApiRequestError(404, "not_found", "Route not found");
+  }
+
+  private async handleSchedules(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    if (this.shuttingDown && request.method !== "GET") throw new ScheduleApiError(503, "shutting_down");
+    if (request.method === "POST" && url.pathname === "/v1/schedules/preview") { sendJson(response, 200, this.schedules.preview(await this.readJson(request))); return; }
+    if (request.method === "POST" && url.pathname === "/v1/schedules") { const result = this.schedules.create(await this.readJson(request)); sendJson(response, result.duplicate ? 200 : 201, result); return; }
+    const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+    if (request.method === "GET" && url.pathname === "/v1/schedules") {
+      const limit = Number(url.searchParams.get("limit") ?? 50); sendJson(response, 200, this.schedules.list(sourceEventId, limit, url.searchParams.get("cursor") ?? undefined)); return;
+    }
+    const match = /^\/v1\/schedules\/([^/]+)(?:\/(pause|resume|cancel|runs))?$/.exec(url.pathname);
+    if (!match) throw new ScheduleApiError(404, "not_found");
+    let scheduleId: string;
+    try { scheduleId = decodeURIComponent(match[1]!); }
+    catch (error) { if (error instanceof URIError) throw new ScheduleApiError(400, "invalid_schedule_id"); throw error; }
+    const action = match[2];
+    if (request.method === "GET" && !action) { sendJson(response, 200, this.schedules.get(scheduleId, sourceEventId)); return; }
+    if (request.method === "GET" && action === "runs") { const limit = Number(url.searchParams.get("limit") ?? 50); sendJson(response, 200, this.schedules.history(scheduleId, sourceEventId, limit, url.searchParams.get("cursor") ?? undefined)); return; }
+    if (request.method === "PATCH" && !action) { sendJson(response, 200, this.schedules.update(scheduleId, await this.readJson(request))); return; }
+    if (request.method === "POST" && (action === "pause" || action === "resume" || action === "cancel")) { sendJson(response, 200, this.schedules.transition(scheduleId, action, await this.readJson(request))); return; }
+    throw new ScheduleApiError(404, "not_found");
   }
 
   private async readJson(request: IncomingMessage): Promise<unknown> {

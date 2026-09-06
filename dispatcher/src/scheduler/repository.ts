@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { EnqueueResult, EventEnvelope } from "../types.js";
 import type { ScheduleDefinition } from "./domain.js";
+import { definitionFingerprint } from "./fingerprint.js";
 
 export type ScheduleState = "active" | "paused" | "expired" | "needs_review" | "cancelled" | "completed";
 export type Action = "slack.reminder.post" | "work.read_only";
@@ -27,6 +28,7 @@ export interface Schedule {
   schedule_id: string; tenant_id: string; owner_id: string; state: ScheduleState;
   revision: number; next_due: string | null; high_watermark: string | null;
   created_at: string; updated_at: string; terminal_at: string | null;
+  list_sequence: number; idempotency_key_hash: string | null; create_payload_hash: string;
 }
 export interface ScheduleClaim extends Schedule { claim_owner: string; claim_until: string; claim_fence: number }
 export type MaterializationDefinition = ScheduleDefinition;
@@ -36,6 +38,11 @@ export interface Run {
   reason: string | null; event_id: string | null; job_id: string | null; created_at: string;
   started_at: string | null; terminal_at: string | null;
 }
+export interface ScheduleView extends Schedule {
+  action: Action; target: Target; timezone: string | null; tzdb_version: string | null;
+  expires_at: string; recurrence_json: string; policy_json: string; content_hash: string; authorization_id: string;
+}
+export interface ListedSchedule { schedule: ScheduleView; sequence: number }
 export interface Outbox {
   outbox_id: string; run_id: string; kind: "slack.reminder.post" | "slack.work_result.post";
   idempotency_key: string; target_json: string; content: string | null; content_hash: string;
@@ -83,6 +90,46 @@ export class SchedulerRepository {
 
   get(scheduleId: string): Schedule | undefined {
     return this.db.prepare("SELECT * FROM schedules WHERE schedule_id = ?").get(scheduleId) as Schedule | undefined;
+  }
+  getAuthorized(scheduleId: string, actor: Actor): ScheduleView | undefined {
+    const row = this.get(scheduleId);
+    if (!row) return undefined;
+    this.checked(scheduleId, row.revision, actor);
+    const revision = this.revision(row);
+    return this.view(row, revision);
+  }
+  private view(row: Schedule, revision: Revision): ScheduleView {
+    return { ...row, action: revision.action, target: JSON.parse(revision.target_json) as Target,
+      timezone: revision.timezone, tzdb_version: revision.tzdb_version, expires_at: revision.expires_at,
+      recurrence_json: revision.recurrence_json, policy_json: revision.policy_json, content_hash: revision.content_hash,
+      authorization_id: revision.authorization_id };
+  }
+  listAuthorized(actor: Actor, limit: number, afterSequence = 0): ListedSchedule[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("invalid_cursor");
+    id(actor.tenant_id); id(actor.actor_id);
+    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ?
+      AND list_sequence > ? ORDER BY list_sequence LIMIT ?`)
+      .all(actor.tenant_id, actor.actor_id, afterSequence, limit) as Schedule[];
+    return rows.map(row => ({ schedule: this.getAuthorized(row.schedule_id, actor)!, sequence: row.list_sequence }));
+  }
+  runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: { scheduled_for: string; run_id: string }): Run[] {
+    const schedule = this.get(scheduleId);
+    if (!schedule) throw new Error("schedule_not_found");
+    this.checked(scheduleId, schedule.revision, actor);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    const scheduledFor = cursor?.scheduled_for ?? ""; const runId = cursor?.run_id ?? "";
+    return this.db.prepare(`SELECT * FROM schedule_runs WHERE schedule_id = ? AND
+      (scheduled_for > ? OR (scheduled_for = ? AND run_id > ?))
+      ORDER BY scheduled_for, run_id LIMIT ?`).all(scheduleId, scheduledFor, scheduledFor, runId, limit) as Run[];
+  }
+  pendingMaterializedCount(scheduleId: string): number {
+    return (this.db.prepare("SELECT count(*) AS count FROM schedule_runs WHERE schedule_id = ? AND status = 'materialized'")
+      .get(scheduleId) as { count: number }).count;
+  }
+  hasAuditOperation(scheduleId: string, revision: number, operation: string, sourceEventId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM schedule_audit WHERE schedule_id = ? AND revision = ?
+      AND operation = ? AND source_event_id = ? LIMIT 1`).get(scheduleId, revision, operation, sourceEventId) !== undefined;
   }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
@@ -218,7 +265,8 @@ export class SchedulerRepository {
         ...(outbox ? { outbox: { outbox_id: outbox.outbox_id, run_id: outbox.run_id, kind: outbox.kind, status: outbox.status,
           attempt: outbox.attempt, request_started_at: outbox.request_started_at, receipt_id: outbox.receipt_id } } : {}) }), now);
   }
-  create(scheduleId: string, input: RevisionInput, nextDue: string, actor: Actor, now: string): Schedule {
+  create(scheduleId: string, input: RevisionInput, nextDue: string, actor: Actor, now: string,
+    idempotencyKeyHash: string | null = null): Schedule {
     id(scheduleId); id(actor.actor_id); id(actor.tenant_id); utc(nextDue); utc(now);
     if (actor.source_event_id !== null) id(actor.source_event_id);
     if (actor.role !== "owner" || nextDue <= now) throw new Error("invalid_creation");
@@ -226,8 +274,14 @@ export class SchedulerRepository {
     if (input.authorization_revision !== 1) throw new Error("authorization_revision_conflict");
     return this.db.transaction(() => {
       this.quota(actor.tenant_id, actor.actor_id);
-      this.db.prepare(`INSERT INTO schedules(schedule_id, tenant_id, owner_id, state, revision, next_due, created_at, updated_at)
-        VALUES (?,?,?,'active',1,?,?,?)`).run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now);
+      const sequence = (this.db.prepare("SELECT next_value FROM schedule_list_sequence WHERE singleton = 1").get() as { next_value: number }).next_value;
+      this.db.prepare("UPDATE schedule_list_sequence SET next_value = next_value + 1 WHERE singleton = 1").run();
+      const targetJson = JSON.stringify(input.target.kind === "none" ? { kind: "none" } : input.target);
+      const createPayloadHash = definitionFingerprint({ recurrence_json: input.recurrence_json, policy_json: input.policy_json,
+        action: input.action, target_json: targetJson, content_hash: digest(input.content) });
+      this.db.prepare(`INSERT INTO schedules(schedule_id, tenant_id, owner_id, state, revision, next_due, created_at, updated_at,
+        list_sequence, idempotency_key_hash, create_payload_hash) VALUES (?,?,?,'active',1,?,?,?,?,?,?)`)
+        .run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now, sequence, idempotencyKeyHash, createPayloadHash);
       this.insertRevision(scheduleId, 1, input, now);
       const row = this.get(scheduleId)!; this.audit(undefined, row, "create", actor, now); return row;
     }).immediate();
@@ -258,13 +312,15 @@ export class SchedulerRepository {
       const before = this.checked(scheduleId, expectedRevision, actor, true);
       const previousRevision = this.revision(before);
       const updateAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
-      if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
+      if (!["active", "paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
       if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, updateAt);
-      const reusedAuthorization = this.db.prepare("SELECT 1 FROM schedule_revisions WHERE schedule_id = ? AND authorization_id = ? LIMIT 1")
-        .get(scheduleId, input.authorization_id);
+      const sourceEventId = input.authorization_id.replace(/:\d+$/, "");
+      const reusedAuthorization = this.db.prepare(`SELECT 1 FROM schedule_revisions
+        WHERE schedule_id = ? AND (authorization_id = ? OR authorization_id GLOB ?) LIMIT 1`)
+        .get(scheduleId, sourceEventId, `${sourceEventId}:*`);
       if (input.authorization_revision !== expectedRevision + 1 || reusedAuthorization) throw new Error("authorization_revision_conflict");
       this.suppress(scheduleId, updateAt, "revision_replaced");
       this.retireRevisions(scheduleId, updateAt, expectedRevision);

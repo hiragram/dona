@@ -324,4 +324,30 @@ describe("DispatcherApi", () => {
     await api.stop();
     database.close();
   });
+
+  test("exposes preview, CRUD and transition contracts over UDS", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
+      undefined, undefined, undefined, () => new Date("2026-09-06T00:00:00Z"));
+    await api.start();
+    const event = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-schedule-uds"));
+    database.beginDispatch(event.body.event_id as string, path.join(root, "schedule-result.json"));
+    database.markWaiting(event.body.event_id as string);
+    const definition = { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "UDS確認" } };
+    const preview = await request(config.socketPath, "POST", "/v1/schedules/preview", { source_event_id: event.body.event_id, definition, after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10 });
+    assert.equal(preview.status, 200);
+    const invalid = await request(config.socketPath, "POST", "/v1/schedules/preview", { source_event_id: event.body.event_id, definition: { ...definition, recurrence: { version: 1, kind: "daily", start_date: "2026-09-01", local_time: "09:00:00", timezone: "Invalid/Zone", tzdb_version: "2025b", interval: 1 } }, after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10 });
+    assert.equal(invalid.status, 400);
+    assert.equal((invalid.body.error as { code: string }).code, "invalid_timezone");
+    const created = await request(config.socketPath, "POST", "/v1/schedules", { source_event_id: event.body.event_id, idempotency_key: "uds-create", definition });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const schedule = created.body.schedule as { schedule_id: string; revision: number };
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/${schedule.schedule_id}?source_event_id=${event.body.event_id}`)).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
+    assert.equal((await request(config.socketPath, "POST", `/v1/schedules/${schedule.schedule_id}/pause`, { source_event_id: event.body.event_id, expected_revision: 1 })).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/${schedule.schedule_id}/runs?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/%ZZ?source_event_id=${event.body.event_id}`)).status, 400);
+    await api.stop(); database.close();
+  });
 });
