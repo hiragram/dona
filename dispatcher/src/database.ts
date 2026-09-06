@@ -60,12 +60,13 @@ export class DispatcherDatabase {
       this.migrate();
       migrateScheduler(this.db);
       migrateJobRouting(this.db);
+      this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE)");
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
+        this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
-        else this.db.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown',last_error_message='Legacy agent may retain the shared result-directory grant' WHERE job_id=?").run(row.job_id);
       }
     } catch (error) {
       this.db.close();
@@ -375,8 +376,10 @@ export class DispatcherDatabase {
   }
 
   listLegacySharedGrantJobs():JobRow[] {
-    return this.db.prepare("SELECT * FROM jobs WHERE last_error_code='legacy_agent_sandbox_unknown' ORDER BY created_at,job_id").all() as JobRow[];
+    return this.db.prepare("SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) ORDER BY j.created_at,j.job_id").all() as JobRow[];
   }
+
+  markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("DELETE FROM legacy_job_agents_to_stop WHERE job_id=?").run(jobId);}
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
     return this.db.prepare(`
