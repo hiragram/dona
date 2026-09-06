@@ -64,7 +64,8 @@ describe("event validation", () => {
       type: "schedule_due",
       occurred_at: "2026-09-05T00:01:00Z",
       subject: { tenant_id: "T1", owner_id: "U1", schedule_id: "s1" },
-      payload: { run_id: "run_1", revision: 1, occurrence_key: '["s1","2026-09-05T00:01:00Z"]' },
+      payload: { run_id: "run_1", revision: 1, occurrence_key: '["s1","2026-09-05T00:01:00Z"]',
+        work: { objective: "read-only調査", scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } } },
       reply_target: null,
       trace: { schedule_id: "s1", run_id: "run_1" },
     };

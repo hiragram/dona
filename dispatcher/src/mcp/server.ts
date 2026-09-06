@@ -8,6 +8,7 @@ export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
+  listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
@@ -108,6 +109,16 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     } catch (error) {
       return failure(error, logger, "list_thread_jobs");
     }
+  });
+
+  server.registerTool("list_owner_jobs", {
+    title: "List owner jobs",
+    description: "現在eventと同じ永続ownerに属するjobを取得します。",
+    inputSchema: { source_event_id: eventId },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ source_event_id }) => {
+    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
+    catch(error){ return failure(error,logger,"list_owner_jobs"); }
   });
 
   server.registerTool("get_job_status", {

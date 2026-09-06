@@ -27,6 +27,10 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs?${query}`);
   }
 
+  listOwnerJobs(sourceEventId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs?${new URLSearchParams({ source_event_id: sourceEventId })}`);
+  }
+
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/steer`, input);
   }

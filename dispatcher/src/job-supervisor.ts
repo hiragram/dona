@@ -174,6 +174,10 @@ export class JobSupervisor {
     for (const job of this.database.listJobsNeedingNotification()) {
       try {
         const event = this.database.enqueueJobNotification(job.job_id);
+        if (event.row.source !== "dona_job") {
+          this.logger.info("Job completion persisted without a Dona notification event", { job_id: job.job_id, job_status: job.status });
+          continue;
+        }
         this.logger.info("Job notification event enqueued", {
           job_id: job.job_id,
           job_status: job.status,

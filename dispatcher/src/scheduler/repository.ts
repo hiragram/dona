@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { insertEventJobBinding } from "../job-routing.js";
 import type { EnqueueResult, EventEnvelope } from "../types.js";
 import type { ScheduleDefinition } from "./domain.js";
 
@@ -375,10 +376,16 @@ export class SchedulerRepository {
         const result = this.enqueue({ schema_version: 1, source: "dona_schedule", external_event_id: `schedule:v1:${scheduleId}:${scheduledFor}`,
           type: "schedule_due", occurred_at: scheduledFor,
           subject: { tenant_id: before.tenant_id, owner_id: before.owner_id, schedule_id: scheduleId },
-          payload: { run_id: runId, revision: expectedRevision, occurrence_key: occurrenceKey }, reply_target: null,
+          payload: { run_id: runId, revision: expectedRevision, occurrence_key: occurrenceKey,
+            work: { objective: revision.content, scope: "read_only", allowed_external_writes: [], result_destination: JSON.parse(revision.target_json) } }, reply_target: null,
           trace: { schedule_id: scheduleId, run_id: runId } }, new Date(materializedAt));
         if (result.duplicate || result.payloadMismatch) throw new Error("event_idempotency_conflict");
         this.db.prepare("UPDATE schedule_runs SET event_id = ? WHERE run_id = ?").run(result.row.event_id, runId);
+        const target=JSON.parse(revision.target_json) as Target;
+        insertEventJobBinding(this.db,result.row.event_id,{
+          owner:{kind:"schedule",tenant_id:before.tenant_id,owner_id:before.owner_id,schedule_id:scheduleId,run_id:runId,revision:expectedRevision},
+          destination:target.kind==="none"?{kind:"none"}:{kind:"slack",action:"slack.work_result.post",target},
+        });
       }
       this.db.prepare("UPDATE schedules SET high_watermark = ?, next_due = ?, updated_at = ? WHERE schedule_id = ?")
         .run(scheduledFor, nextDue, materializedAt, scheduleId);

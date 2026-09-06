@@ -495,6 +495,12 @@ export class DispatcherApi {
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(sourceEventId){
+        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId)});}
+        catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
+        return;
+      }
       const workspaceId = url.searchParams.get("workspace_id");
       const channelId = url.searchParams.get("channel_id");
       const threadTs = url.searchParams.get("thread_ts");
