@@ -993,6 +993,28 @@ test("配送完了時もlease由来のschedule時刻ではauthorizationを早期
   assert.equal(repo.get("finish_before_expiry")?.state, "paused");
 });
 
+test("配送完了時のmisfire判定はlease由来の保存時刻で早めない", () => {
+  const { repo, raw } = setup();
+  repo.create("finish_before_misfire", input, due, actor, now);
+  repo.materialize("finish_before_misfire", 1, due, later, due, actor);
+  const actual = "2026-09-05T00:12:40Z";
+  const claim = repo.claim(actual, 240)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, actual);
+  raw.prepare("UPDATE schedules SET updated_at = ? WHERE schedule_id = ?").run("2026-09-05T00:16:40Z", "finish_before_misfire");
+  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", actual).status, "pending");
+});
+
+test("起動時のclaim解放はupdated_atを巻き戻さない", () => {
+  const { repo, raw } = setup();
+  repo.create("recover_claim_clock", input, due, actor, now);
+  repo.materialize("recover_claim_clock", 1, due, later, due, actor);
+  const claimAt = "2026-09-05T00:10:00Z";
+  const claim = repo.claim(claimAt)!;
+  repo.recover("2026-09-05T00:05:00Z", true);
+  const row = raw.prepare("SELECT status, updated_at FROM connector_outbox WHERE outbox_id = ?").get(claim.outbox_id) as { status: string; updated_at: string };
+  assert.deepEqual(row, { status: "pending", updated_at: claimAt });
+});
+
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {
   const { repo, dispatcher, raw } = setup();
   repo.create("work_ambiguous", { ...input, action: "work.read_only" }, due, actor, now);

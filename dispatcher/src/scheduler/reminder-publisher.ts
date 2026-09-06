@@ -25,6 +25,10 @@ export interface SlackReminderPort {
   deliver(command: SlackReminderCommand): Promise<ReminderDelivery>;
 }
 
+export function reminderConnectorTimeoutMs(path: string, configuredMs: number): number {
+  return path.endsWith("/preflight") ? 180_000 : Math.min(Math.max(configuredMs, 180_000), 230_000);
+}
+
 function command(repository: SchedulerRepository, row: Outbox): SlackReminderCommand {
   if (row.kind !== "slack.reminder.post" || row.content === null) throw new Error("invalid_reminder_outbox");
   const target = JSON.parse(row.target_json) as Target;
@@ -166,7 +170,7 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
     return await this.call(input, "/v1/internal/slack-reminders", token);
   }
   private async call(input: SlackReminderCommand, path: string, token: string): Promise<ReminderDelivery> {
-    const timeoutMs = path.endsWith("/preflight") ? 180_000 : Math.max(this.config.jobCommandTimeoutMs, 180_000);
+    const timeoutMs = reminderConnectorTimeoutMs(path, this.config.jobCommandTimeoutMs);
     try { return await request(this.config.slackAdapterSocketPath, token, path, input, timeoutMs); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;

@@ -7,7 +7,7 @@ import { afterEach, test } from "node:test";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
 import { FakeClock } from "../src/scheduler/clock.js";
-import { ReminderPublisher, type ReminderDelivery, type SlackReminderCommand } from "../src/scheduler/reminder-publisher.js";
+import { ReminderPublisher, reminderConnectorTimeoutMs, type ReminderDelivery, type SlackReminderCommand } from "../src/scheduler/reminder-publisher.js";
 import type { Actor, RevisionInput } from "../src/scheduler/repository.js";
 
 const roots: string[] = [];
@@ -15,6 +15,12 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const at = "2026-09-06T00:00:00Z";
 const actor: Actor = { tenant_id: "T1", actor_id: "U1", role: "owner", source_event_id: null };
+
+test("deliver timeoutは240秒のclaim leaseより短く固定する", () => {
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders/preflight", 999_000), 180_000);
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 999_000), 230_000);
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 200_000), 200_000);
+});
 function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[], overrides: Partial<RevisionInput> = {}, nextDue: string | null = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-reminder-")); roots.push(root);
   const database = new DispatcherDatabase(path.join(root, "db.sqlite"));

@@ -599,19 +599,20 @@ export class SchedulerRepository {
     this.retireRevisions(scheduleId, completedAt);
     this.audit(before, this.get(scheduleId)!, "complete", { tenant_id: before.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, completedAt);
   }
-  private expireUnsent(row: Outbox, now: string, eligibilityAt = now): boolean {
+  private expireUnsent(row: Outbox, now: string, eligibilityAt?: string): boolean {
     if (row.status !== "pending" && row.status !== "claimed") return false;
     const run = this.getRun(row.run_id)!; const schedule = this.get(run.schedule_id)!;
     const terminalAt = [now, row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
       run.created_at, run.started_at ?? run.created_at, schedule.created_at, schedule.updated_at].sort().at(-1)!;
+    const effectiveAt = eligibilityAt ?? terminalAt;
     const snapshot = this.revision(run);
     const ageOrigin = run.scheduled_for;
-    const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(terminalAt) - Date.parse(row.created_at) > 900000;
+    const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(effectiveAt) - Date.parse(row.created_at) > 900000;
     const reason = schedule.state !== "active" || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
-      : snapshot.expires_at <= eligibilityAt ? "authorization_expired"
+      : snapshot.expires_at <= effectiveAt ? "authorization_expired"
       : workRetryExpired ? "retry_expired"
-      : row.kind === "slack.reminder.post" && Date.parse(terminalAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
-      : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= terminalAt) ? "cancelled"
+      : row.kind === "slack.reminder.post" && Date.parse(effectiveAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
+      : row.content === null || (row.content_delete_at !== null && row.content_delete_at <= effectiveAt) ? "cancelled"
       : null;
     if (reason === null) return false;
     if (reason === "authorization_expired") {
@@ -689,7 +690,7 @@ export class SchedulerRepository {
         AND (? = 1 OR lease_until <= ?)`).all(recoverAllStarted ? 1 : 0, now) as Outbox[];
       for (const row of ambiguous) this.markAmbiguous(row, now);
       const result = this.db.prepare(`UPDATE connector_outbox SET status = 'pending', claim_token = NULL, lease_until = NULL,
-        updated_at = ? WHERE status = 'claimed' AND (? = 1 OR lease_until <= ?) AND request_started_at IS NULL`)
+        updated_at = MAX(updated_at, ?) WHERE status = 'claimed' AND (? = 1 OR lease_until <= ?) AND request_started_at IS NULL`)
         .run(now, recoverAllStarted ? 1 : 0, now);
       let expired = 0;
       const unsent = this.db.prepare("SELECT * FROM connector_outbox WHERE status IN ('pending','claimed')").all() as Outbox[];
@@ -798,7 +799,7 @@ export class SchedulerRepository {
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
         const withinReminderGrace = row.kind !== "slack.reminder.post" ||
-          Date.parse(add(finishedAt, retryDelay)) <= Date.parse(add(run.scheduled_for, 900));
+          Date.parse(add(now, retryDelay)) <= Date.parse(add(run.scheduled_for, 900));
         const retry = (outcome === "not_accepted" || outcome === "authorization_unavailable" || outcome === "unavailable") &&
           (outcome === "unavailable" || row.attempt < 3) && authorized && withinWorkRetryDeadline &&
           (outcome !== "authorization_unavailable" || withinReminderGrace);
