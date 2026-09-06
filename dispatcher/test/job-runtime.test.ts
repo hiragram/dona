@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
+import { buildJobPrompt } from "../src/job-prompt.js";
 import { codexAgentArguments, HerdrJobAgentRuntime } from "../src/job-runtime.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -14,6 +15,19 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("omits the progress directory and prompt contract when progress is disabled", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-runtime-no-progress")).row;
+    const job = database.createJob({ source_event_id:source.event_id, objective:"調査する", workspace:{ kind:"scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const args = codexAgentArguments(job, config, false);
+    assert.equal(args.includes(path.dirname(job.workspace_path)), false);
+    const prompt = buildJobPrompt(job, false);
+    assert.equal(prompt.includes("progress_path"), false);
+    assert.equal(prompt.includes("工程が変わるたび"), false);
+    database.close();
+  });
+
   test("trusts only the Dispatcher-selected GitHub repository and worktree for the invocation", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -32,6 +46,8 @@ describe("Codex background agent arguments", () => {
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
       config.jobResultsDir,
+      "--add-dir",
+      path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
       `projects = { ${JSON.stringify(repositoryPath)} = { trust_level = "trusted" }, ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -50,10 +66,10 @@ describe("Codex background agent arguments", () => {
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", config.jobResultsDir, "-c", expectedOverride]);
-    assert.equal(args[3]!.match(/trust_level/g)?.length, 1);
-    assert.equal(args[3]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
-    assert.equal(args[3]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
+    assert.deepEqual(args, ["--add-dir", config.jobResultsDir, "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
+    assert.equal(args[5]!.match(/trust_level/g)?.length, 1);
+    assert.equal(args[5]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
+    assert.equal(args[5]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
     database.close();
   });
 
@@ -100,6 +116,8 @@ describe("Codex background agent arguments", () => {
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
       config.jobResultsDir,
+      "--add-dir",
+      path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
       `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -150,6 +168,7 @@ process.exit(1);
       "--timeout", String(config.jobAgentStartTimeoutMs),
       "--",
       "--add-dir", config.jobResultsDir,
+      "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
     assert.equal((await fs.stat(job.workspace_path)).mode & 0o777, 0o700);
