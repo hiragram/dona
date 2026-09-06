@@ -163,6 +163,10 @@ export class JobSupervisor {
         return { row: this.database.getJob(jobId)!, duplicate: false };
       }
       if (["preparing", "dispatching"].includes(before.status)) await this.active.get(jobId);
+      if(before.last_error_code==="legacy_agent_sandbox_unknown"&&this.database.isLegacySharedGrantAgentStopped(jobId)) {
+        this.database.markJobCancelled(jobId,reason); this.wake();
+        return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
       if(before.status==="preparing"&&!cancelled.timedOut&&["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
         this.database.markJobCancelled(jobId,reason); this.wake();

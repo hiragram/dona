@@ -380,6 +380,9 @@ export class DispatcherDatabase {
   }
 
   markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=? WHERE job_id=?").run(nowUtc(),jobId);}
+  isLegacySharedGrantAgentStopped(jobId:string):boolean {
+    return this.db.prepare("SELECT 1 FROM legacy_job_agents_to_stop WHERE job_id=? AND stopped_at IS NOT NULL").get(jobId)!==undefined;
+  }
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
     return this.db.prepare(`
@@ -849,8 +852,8 @@ export class DispatcherDatabase {
   recoverStaleDispatching(at = new Date()): number {
     return this.db.transaction(() => {
       const scheduled=(this.db.prepare("SELECT event_id FROM events WHERE status='dispatching' AND source='dona_schedule'").all() as Array<{event_id:string}>);
-      const notifications=(this.db.prepare(`SELECT event_id FROM events WHERE status='dispatching' AND source='dona_job'
-        AND event_id IN (SELECT notification_event_id FROM job_completion_results WHERE notification_event_id IS NOT NULL)`).all() as Array<{event_id:string}>);
+      const notifications=(this.db.prepare(`SELECT e.event_id,c.owner_json FROM events e JOIN job_completion_results c
+        ON c.notification_event_id=e.event_id WHERE e.status='dispatching' AND e.source='dona_job'`).all() as Array<{event_id:string;owner_json:string}>);
       const changed=this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
@@ -861,7 +864,11 @@ export class DispatcherDatabase {
       `).run(at.toISOString()).changes;
       const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
       for(const row of scheduled) this.scheduler.settleUndelegatedWorkEvent(row.event_id,"needs_review",timestamp);
-      for(const row of notifications) this.setNotificationState(row.event_id,"needs_review",at);
+      for(const row of notifications) {
+        this.setNotificationState(row.event_id,"needs_review",at);
+        const owner=JSON.parse(row.owner_json) as {kind?:unknown;run_id?:unknown};
+        if(owner.kind==="schedule"&&typeof owner.run_id==="string") this.scheduler.markWorkNotificationNeedsReview(owner.run_id,timestamp);
+      }
       return changed;
     }).immediate();
   }

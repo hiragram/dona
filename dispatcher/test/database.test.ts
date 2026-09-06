@@ -215,6 +215,9 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath), isolated=reopened.getJob(job.job_id)!;
     assert.equal(isolated.status,"needs_review"); assert.equal(isolated.last_error_code,"legacy_agent_sandbox_unknown");
     assert.equal(reopened.getJob(running.job_id)?.last_error_code,"legacy_agent_sandbox_unknown");
+    assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),false);
+    reopened.markLegacySharedGrantAgentStopped(running.job_id);
+    assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),true);
     reopened.close();
   });
 });
