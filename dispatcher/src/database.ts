@@ -414,6 +414,12 @@ export class DispatcherDatabase {
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
 
+  listAmbiguousScheduledJobs():JobRow[] {
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted')
+        AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
+  }
+
   listScheduledJobsRequiringCancellation(at = new Date()): JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       JOIN schedules s ON s.schedule_id=json_extract(b.owner_json,'$.schedule_id')

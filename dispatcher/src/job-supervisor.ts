@@ -185,6 +185,7 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
+      for(const job of this.database.listAmbiguousScheduledJobs()) await this.tryComplete(job,false);
       for (const job of this.database.listScheduledJobsRequiringCancellation()) {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
