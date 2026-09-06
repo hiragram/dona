@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import Database from "better-sqlite3";
 
@@ -18,8 +19,8 @@ export interface MigrationReceipt {
   to_schema: 3;
   backup: { opened: true; integrity_check: "ok"; foreign_key_violations: 0 };
   migrated: { integrity_check: "ok"; foreign_key_violations: 0; user_version: 3 };
-  preservation: Record<string, { before: number; after: number }>;
-  rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: true };
+  preservation: Record<string, { before: number; after: number; before_digest: string; after_digest: string }>;
+  rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: boolean };
   completed_at: string;
 }
 
@@ -49,6 +50,17 @@ export function countSnapshot(db: Database.Database): Record<string, number> {
   ]));
 }
 
+export function contentSnapshot(db: Database.Database): Record<string, string> {
+  const digestRows = (table: "events" | "jobs", orderBy: string): string => {
+    const columns = (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name)
+      .filter((name) => name !== "job_key");
+    const projection = columns.map((name) => `"${name.replaceAll('"', '""')}"`).join(", ");
+    const rows = db.prepare(`SELECT ${projection} FROM ${table} ORDER BY ${orderBy}`).all();
+    return crypto.createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+  };
+  return { events: digestRows("events", "sequence"), jobs: digestRows("jobs", "job_id") };
+}
+
 export function verifyDatabase(db: Database.Database, expectedVersion: number): void {
   const integrity = db.pragma("integrity_check", { simple: true });
   if (integrity !== "ok") throw new Error("database_integrity_check_failed");
@@ -67,12 +79,18 @@ export function assertReceiptMatchesDatabases(
   verifyDatabase(backup, 2);
   const migratedCounts = countSnapshot(migrated);
   const backupCounts = countSnapshot(backup);
+  const migratedDigests = contentSnapshot(migrated);
+  const backupDigests = contentSnapshot(backup);
   const names = Object.keys(receipt.preservation);
   if (names.length !== Object.keys(migratedCounts).length || names.some((name) =>
     !(name in migratedCounts) ||
-    receipt.preservation[name]?.before !== backupCounts[name] ||
     receipt.preservation[name]?.after !== migratedCounts[name] ||
-    backupCounts[name] !== migratedCounts[name]
+    receipt.preservation[name]?.after_digest !== migratedDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"] ||
+    (receipt.rollback.backup_restore_opened && (
+      receipt.preservation[name]?.before !== backupCounts[name] ||
+      receipt.preservation[name]?.before_digest !== backupDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"] ||
+      backupCounts[name] !== migratedCounts[name]
+    ))
   )) throw new Error("schema_rollout_receipt_state_mismatch");
 }
 
@@ -100,11 +118,12 @@ export async function migrateV2ToV3WithBackup(input: {
   drained: boolean;
   completedAt?: string;
   postMigrationHook?: () => void;
+  reuseVerifiedBackup?: boolean;
 }): Promise<MigrationReceipt> {
   if (!input.quiesced || !input.drained) throw new Error("schema_activation_requires_quiesced_drained_runtime");
   try {
     await fs.access(input.backupPath);
-    throw new Error("schema_backup_target_already_exists");
+    if (!input.reuseVerifiedBackup) throw new Error("schema_backup_target_already_exists");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -116,29 +135,39 @@ export async function migrateV2ToV3WithBackup(input: {
     assertSchemaActivationSafe(input.previous, input.target, actual);
     verifyDatabase(source, 2);
     const before = countSnapshot(source);
+    const beforeDigests = contentSnapshot(source);
 
     // better-sqlite3 uses SQLite's Online Backup API and includes committed WAL pages.
-    await source.backup(input.backupPath);
-    await fs.chmod(input.backupPath, 0o600);
+    if (!input.reuseVerifiedBackup) {
+      await source.backup(input.backupPath);
+      await fs.chmod(input.backupPath, 0o600);
+    }
     const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
     try {
       backup.pragma("foreign_keys = ON");
       verifyDatabase(backup, 2);
-      if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before)) throw new Error("schema_backup_count_mismatch");
+      if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before) ||
+        JSON.stringify(contentSnapshot(backup)) !== JSON.stringify(beforeDigests)) {
+        throw new Error("schema_backup_content_mismatch");
+      }
     } finally {
       backup.close();
     }
 
-    let preservation!: Record<string, { before: number; after: number }>;
+    let preservation!: MigrationReceipt["preservation"];
     source.transaction(() => {
       migrateDispatcherDatabase(source, () => {}, true);
       input.postMigrationHook?.();
       verifyDatabase(source, dispatcherSchemaCompatibility.write);
       const after = countSnapshot(source);
+      const afterDigests = contentSnapshot(source);
       preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
         before: before[name]!, after: after[name]!,
+        before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+        after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
       }]));
-      if (Object.values(preservation).some(({ before: left, after: right }) => left !== right)) {
+      if (Object.values(preservation).some(({ before: left, after: right, before_digest: leftDigest, after_digest: rightDigest }) =>
+        left !== right || leftDigest !== rightDigest)) {
         throw new Error("schema_migration_preservation_failed");
       }
     })();

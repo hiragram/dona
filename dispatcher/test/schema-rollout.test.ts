@@ -59,8 +59,12 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   db.close();
   assert.equal(receipt.migrated.user_version, 3);
   assert.equal((await fs.stat(backupPath)).mode & 0o777, 0o600);
-  assert.deepEqual(receipt.preservation.event_results, { before: 1, after: 1 });
-  assert.deepEqual(receipt.preservation.job_completions, { before: 1, after: 1 });
+  assert.equal(receipt.preservation.event_results?.before, 1);
+  assert.equal(receipt.preservation.event_results?.after, 1);
+  assert.equal(receipt.preservation.event_results?.before_digest, receipt.preservation.event_results?.after_digest);
+  assert.equal(receipt.preservation.job_completions?.before, 1);
+  assert.equal(receipt.preservation.job_completions?.after, 1);
+  assert.equal(receipt.preservation.job_completions?.before_digest, receipt.preservation.job_completions?.after_digest);
 
   const restored = new Database(backupPath, { readonly: true });
   assert.equal(restored.pragma("user_version", { simple: true }), 2);
@@ -72,6 +76,15 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   migrated.close();
 
   const changed = new Database(databasePath);
+  changed.prepare("UPDATE jobs SET attempt_count = attempt_count + 1 WHERE job_id = ?")
+    .run("job_01m1es03xy5cf8d9pm5cwx4srv");
+  const contentChangedRead = new Database(databasePath, { readonly: true });
+  const contentBackupRead = new Database(backupPath, { readonly: true });
+  assert.throws(() => assertReceiptMatchesDatabases(receipt, contentChangedRead, contentBackupRead), /receipt_state_mismatch/);
+  contentChangedRead.close();
+  contentBackupRead.close();
+  changed.prepare("UPDATE jobs SET attempt_count = attempt_count - 1 WHERE job_id = ?")
+    .run("job_01m1es03xy5cf8d9pm5cwx4srv");
   changed.prepare(`INSERT INTO events (
     event_id, schema_version, source, external_event_id, event_type, occurred_at,
     subject_json, payload_json, status, available_at, created_at, updated_at

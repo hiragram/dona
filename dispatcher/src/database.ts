@@ -4,7 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 
-import { jobResourceDefaults, jobResourceHardLimits } from "./config.js";
+import { expandHome, jobResourceDefaults, jobResourceHardLimits } from "./config.js";
 import type {
   CreateJobRequest,
   CreateJobResult,
@@ -84,7 +84,7 @@ export class JobCreationError extends Error {
 function configuredSchemaWrite(): 2 | 3 {
   const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
   if (!manifestPath) return 3;
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { compatibility?: { app_schema_write?: unknown } };
+  const manifest = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as { compatibility?: { app_schema_write?: unknown } };
   const write = manifest.compatibility?.app_schema_write;
   if (write !== 2 && write !== 3) throw new Error("Release manifest app_schema_write is invalid");
   return write;
@@ -344,8 +344,9 @@ export function migrateDispatcherDatabase(
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
   };
-  if (dispatcherSchemaCompatibility.write >= 3 && version < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
-  if (dispatcherSchemaCompatibility.write === 2 && version === 2) ensureV2BridgeSchema(db);
+  const currentVersion = db.pragma("user_version", { simple: true }) as number;
+  if (dispatcherSchemaCompatibility.write >= 3 && currentVersion < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
+  if (dispatcherSchemaCompatibility.write === 2 && currentVersion === 2) ensureV2BridgeSchema(db);
   if ((db.pragma("user_version", { simple: true }) as number) >= 3) {
     ensureJobsRunnableFairIndex(db);
     ensureJobsWorkspaceJobIndex(db);

@@ -447,7 +447,7 @@ export class UpdateController {
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
           throw new Error("slack_adapter_drain_incomplete");
         }
-      } else if (!persistedSlackStop) {
+      } else if (persistedSlackStop?.phase !== "observed") {
         throw new Error("slack_adapter_current_state_unverified");
       }
       const dispatcherHealth = await this.runtime.dispatcherHealth();
@@ -458,7 +458,7 @@ export class UpdateController {
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
           throw new Error("dispatcher_drain_incomplete");
         }
-      } else if (!persistedDispatcherStop) {
+      } else if (persistedDispatcherStop?.phase !== "observed") {
         throw new Error("dispatcher_current_state_unverified");
       }
       if (!persistedStop) {
@@ -980,6 +980,10 @@ export class UpdateController {
       this.needsReview(row, "rollback_main_agent_stop_rejected");
       return undefined;
     }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
+      return undefined;
+    }
     if (existing) {
       const observed = await this.runtime.mainAgentStatus(targetRelease);
       this.assertLease(row);
@@ -1140,6 +1144,10 @@ export class UpdateController {
     }
     if (existing?.phase === "rejected") {
       this.needsReview(row, `${kind}_rejected`, `The persisted ${kind} operation was definitively rejected`);
+      return false;
+    }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
       return false;
     }
     if (existing) {

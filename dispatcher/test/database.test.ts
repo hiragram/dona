@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
@@ -1180,5 +1181,26 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
     reopened.close();
+  });
+
+  test("expands a newly created schema-v2 database before bridge runtime queries", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const manifestPath = path.join(root, "bridge-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 2 } }));
+    const previous = process.env.DONA_RELEASE_MANIFEST_PATH;
+    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
+    try {
+      const database = new DispatcherDatabase(config.databasePath);
+      database.close();
+      const raw = new Database(config.databasePath, { readonly: true });
+      assert.equal(raw.pragma("user_version", { simple: true }), 2);
+      assert.equal((raw.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key"), true);
+      assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_groups'").get());
+      raw.close();
+    } finally {
+      if (previous === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+      else process.env.DONA_RELEASE_MANIFEST_PATH = previous;
+    }
   });
 });

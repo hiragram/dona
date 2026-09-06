@@ -309,7 +309,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
 
   if bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
-    CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.tmp"
+    CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
     $NODE_PATH -e '
 const fs = require("node:fs");
 const [target, sha] = process.argv.slice(1);
