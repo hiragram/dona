@@ -357,7 +357,8 @@ test("Issue全体の完了と残タスクIssueのhandoffを安全に分岐する
   const handoff = section(skill, "Issue完了と残タスクを確定する");
 
   assertContract(handoff, "whole-Issue completion and residual handoff", [
-    /current title／本文.*acceptance.*実際のdiff.*検証結果.*merge-target contract.*Issue全体が完了/,
+    /対象Issueがある場合.*current title／本文.*acceptance.*実際のdiff.*検証結果.*merge-target contract.*Issue全体が完了/,
+    /対象IssueがないSkill修正.*判定を要求せず.*closing targetなし/,
     /Issue全体が完了する場合.*`Closes #<Issue番号>`.*必ず記載/,
     /残タスク.*元Issueをclosing targetに含めず.*automatic closing referenceを除く/,
     /元Issueのclose.*acceptance縮小.*完了扱い.*`Merge Ready`化を行わない/,
@@ -366,5 +367,16 @@ test("Issue全体の完了と残タスクIssueのhandoffを安全に分岐する
     /native parent\/dependencyの代替にせず.*既存topologyを維持/,
     /writeの直前.*再取得.*作成後.*read-back.*blind retryせず/,
     /残タスクIssueを作成しても.*元Issueを完了したことにはならず.*元Issueの`Closes`を追加する根拠にもならない/,
+  ]);
+});
+
+test("部分対応は元IssueをIn Progressに保って提出cycleを完了できる", async () => {
+  const skill = await read(".agents/skills/code-submission-review-cycle/SKILL.md");
+  const completion = section(skill, "完了条件");
+  assertContract(completion, "partial submission terminal", [
+    /Issue全体を完了する場合だけ.*`Merge Ready`へ更新/,
+    /残タスクがある部分対応.*元Issueを`In Progress`のまま維持/,
+    /元Issueをclosing targetに含めない.*残タスクIssueの作成・read-backまたは未作成の境界.*PR提出cycle自体は完了できる/,
+    /Project更新が必要なのに失敗・未検証.*workflow全体を完了扱いしない/,
   ]);
 });
