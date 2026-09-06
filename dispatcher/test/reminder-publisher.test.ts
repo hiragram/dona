@@ -129,6 +129,20 @@ test("認可preflight中の通常pauseでauthorizationをretireしない", async
   state.database.close();
 });
 
+test("preflight決着の永続状態とauditにwrite fenceを残さない", async () => {
+  const state = setup([]);
+  const publisher = new ReminderPublisher(state.repo, {
+    async preflight() { return { outcome: "authorization_unavailable", code: "authorization_check_failed", retry_after_seconds: 1 }; },
+    async deliver() { throw new Error("write must not run"); },
+  }, new FakeClock(at), logger);
+  await publisher.publishOne();
+  const audit = state.repo.auditHistory("s1") as { operation: string; after_json: string }[];
+  assert.equal(audit.some(row => row.operation === "outbox_request_started"), false);
+  const settled = audit.filter(row => row.operation === "outbox_authorization_unavailable").at(-1)!;
+  assert.equal(JSON.parse(settled.after_json).outbox.request_started_at, null);
+  state.database.close();
+});
+
 test("認可preflight中のpause後も確定revocationを継承する", async () => {
   const state = setup([], {
     recurrence_json: '{"interval":1,"kind":"daily","local_time":"09:00:00","start_date":"2026-09-06","timezone":"Asia/Tokyo","tzdb_version":"2025b","version":1}\n',

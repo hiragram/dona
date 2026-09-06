@@ -760,6 +760,8 @@ export class SchedulerRepository {
       if (run) this.db.prepare(`DELETE FROM schedule_audit WHERE sequence = (
         SELECT sequence FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_request_started' ORDER BY sequence DESC LIMIT 1
       )`).run(run.schedule_id);
+      if (run) this.db.prepare(`UPDATE schedule_audit SET after_json = json_set(after_json, '$.outbox.request_started_at', NULL)
+        WHERE sequence = (SELECT sequence FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence DESC LIMIT 1)`).run(run.schedule_id);
       return this.getOutbox(outboxId, now) ?? settled;
     }).immediate();
   }

@@ -67,7 +67,7 @@ export class ReminderPublisher {
       return;
     }
     // This durable transition is the last operation before the provider write call. A crash afterwards is acceptance unknown.
-    this.repository.requestStarted(claimed.outbox_id, token, now);
+    this.repository.requestStarted(claimed.outbox_id, token, this.clock.now());
     try { result = await this.slack.deliver(input); }
     catch { result = { outcome: "acceptance_unknown", code: "connector_transport_error" }; }
     const finishedAt = this.clock.now();
@@ -143,7 +143,8 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   private async call(input: SlackReminderCommand, path: string): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
     if (!token) return { outcome: "unavailable", code: "missing_internal_token", retry_after_seconds: 5 };
-    try { return await request(this.config.slackAdapterSocketPath, token, path, input, Math.max(this.config.jobCommandTimeoutMs, 180_000)); }
+    const timeoutMs = path.endsWith("/preflight") ? 120_000 : Math.max(this.config.jobCommandTimeoutMs, 180_000);
+    try { return await request(this.config.slackAdapterSocketPath, token, path, input, timeoutMs); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (path.endsWith("/preflight")) {
