@@ -57,9 +57,16 @@ test("新規DB、v2既存データ、再open、WAL/FK、unknown extension versio
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
+  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
   reopened.close();
-  raw.exec("UPDATE scheduler_schema SET version = 2");
+  raw.exec(`ALTER TABLE schedules DROP COLUMN claim_owner;
+    ALTER TABLE schedules DROP COLUMN claim_until;
+    ALTER TABLE schedules DROP COLUMN claim_fence;
+    UPDATE scheduler_schema SET version = 1`);
+  migrateScheduler(raw);
+  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+  assert.deepEqual(raw.prepare("SELECT claim_owner, claim_until, claim_fence FROM schedules LIMIT 0").all(), []);
+  raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
@@ -612,16 +619,16 @@ test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持",
   assert.equal(count(raw, "schedule_runs"), 2);
 });
 
-test("専用routing未実装のscheduler eventが通常workerのqueueを妨げない", () => {
-  const { repo, dispatcher } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
+test("dona_schedule eventは既存queueのsequence順でSlack ingressと共存する", () => {
+  const { repo, dispatcher, raw } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
   const run = repo.materialize("work", 1, due, later, due, actor).run;
   assert.equal(dispatcher.get(run.event_id!)?.status, "queued");
-  assert.equal(dispatcher.nextAvailable(new Date(due)), undefined);
+  assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, run.event_id);
+  assert.equal(envelopeFromRow(dispatcher.nextAvailable(new Date(due))!).source, "dona_schedule");
   const slack = dispatcher.enqueue(eventEnvelope("slack-after-scheduler"), new Date(due)).row;
+  raw.prepare("UPDATE events SET status = 'completed' WHERE event_id = ?").run(run.event_id);
   assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
   assert.equal(envelopeFromRow(dispatcher.nextAvailable(new Date(due))!).source, "slack");
-  dispatcher.markBlocked(run.event_id!, "専用routing待ち"); dispatcher.manualRetry(run.event_id!, true, new Date(due));
-  assert.equal(dispatcher.nextAvailable(new Date(due))?.event_id, slack.event_id);
 });
 
 test("purgeはcurrent authorization失効とauditを原子的に反映する", () => {

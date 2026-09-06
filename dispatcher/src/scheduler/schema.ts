@@ -7,14 +7,24 @@ export function migrateScheduler(db: Database.Database): void {
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL
     )`);
     const row = db.prepare("SELECT version FROM scheduler_schema WHERE singleton = 1").get() as { version: number } | undefined;
-    if (row && row.version !== 1) throw new Error("unsupported_scheduler_schema");
-    if (row) return;
+    if (row && ![1, 2].includes(row.version)) throw new Error("unsupported_scheduler_schema");
+    if (row?.version === 2) return;
+    if (row?.version === 1) {
+      db.exec(`
+        ALTER TABLE schedules ADD COLUMN claim_owner TEXT;
+        ALTER TABLE schedules ADD COLUMN claim_until TEXT;
+        ALTER TABLE schedules ADD COLUMN claim_fence INTEGER NOT NULL DEFAULT 0;
+        UPDATE scheduler_schema SET version = 2 WHERE singleton = 1;
+      `);
+      return;
+    }
     db.exec(`
       CREATE TABLE schedules (
         schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('active','paused','expired','needs_review','cancelled','completed')),
         revision INTEGER NOT NULL CHECK(revision > 0), next_due TEXT, high_watermark TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT,
+        claim_owner TEXT, claim_until TEXT, claim_fence INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(schedule_id, revision) REFERENCES schedule_revisions(schedule_id, revision) DEFERRABLE INITIALLY DEFERRED
       );
       CREATE INDEX schedules_due_idx ON schedules(next_due, schedule_id) WHERE state = 'active';
@@ -65,7 +75,7 @@ export function migrateScheduler(db: Database.Database): void {
       );
       CREATE INDEX schedule_audit_order_idx ON schedule_audit(schedule_id, sequence);
       CREATE INDEX schedule_audit_retention_idx ON schedule_audit(created_at);
-      INSERT INTO scheduler_schema VALUES (1, 1);
+      INSERT INTO scheduler_schema VALUES (1, 2);
     `);
   }).immediate();
 }
