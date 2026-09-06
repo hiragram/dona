@@ -385,8 +385,9 @@ export class DispatcherDatabase {
   listOverdueScheduledJobs(at = new Date()): JobRow[] {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status IN ('running','blocked') AND j.prompt_accepted_at<=? AND json_extract(b.owner_json,'$.kind')='schedule'
-      ORDER BY j.prompt_accepted_at,j.job_id`).all(deadline) as JobRow[];
+      WHERE j.status IN ('running','blocked') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
+        AND json_extract(b.owner_json,'$.kind')='schedule'
+      ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
 
   listScheduledJobsRequiringCancellation(at = new Date()): JobRow[] {
@@ -522,13 +523,14 @@ export class DispatcherDatabase {
       validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
-    this.updateJob(jobId, ["running"], status, {
-      result_json: stableStringify(result),
-      result_path: resultPath,
-      completed_at: at.toISOString(),
-      last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
-      last_error_message: result.status === "failed" ? result.summary : null,
-    });
+    this.db.transaction(()=>{
+      this.updateJob(jobId, ["running"], status, {
+        result_json: stableStringify(result), result_path: resultPath, completed_at: at.toISOString(),
+        last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
+        last_error_message: result.status === "failed" ? result.summary : null,
+      });
+      if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,at);
+    }).immediate();
   }
 
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
@@ -610,7 +612,7 @@ export class DispatcherDatabase {
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const workState=job.status==="completed"?"completed":job.status==="needs_review"?"needs_review":"failed";
     const notificationState="none";
-    const completedAt=job.completed_at??at.toISOString();
+    const completedAt=job.completed_at??job.updated_at;
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
       (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(job.job_id,job.status,job.source_event_id,stableStringify(binding.owner),
@@ -627,7 +629,7 @@ export class DispatcherDatabase {
       } else try {
         this.scheduler.setRunState(binding.owner.run_id,"started",next,
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
-          next==="completed"?renderJobResult(result):null);
+          next==="completed"?renderJobResult(result):null,scheduleAt);
       } catch(error) {
         if(!(error instanceof Error)||error.message!=="content_requires_redaction") throw error;
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review',notification_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);

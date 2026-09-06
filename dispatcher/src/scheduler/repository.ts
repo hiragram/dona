@@ -461,7 +461,7 @@ export class SchedulerRepository {
     return result;
   }
   setRunState(runId: string, expected: Run["status"], next: "started" | "completed" | "failed" | "cancelled",
-    actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null): Run {
+    actor: Actor, now: string, jobId: string | null = null, resultContent: string | null = null, notificationAt: string | null = null): Run {
     utc(now); if (jobId !== null) id(jobId);
     const result = this.db.transaction(() => {
       const run = this.getRun(runId);
@@ -504,7 +504,7 @@ export class SchedulerRepository {
       if (resultContent !== null && !workCompletion) throw new Error("result_not_authorized");
       if (workCompletion && hasTarget && notificationReason === null) {
         if (resultContent === null) throw new Error("result_content_required");
-        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, truncateResultContent(resultContent), transitionAt);
+        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, truncateResultContent(resultContent), notificationAt??transitionAt);
       }
       const suppressed = next === "cancelled" || next === "failed"
         ? this.db.prepare("SELECT * FROM connector_outbox WHERE run_id = ? AND status IN ('pending','claimed')").all(runId) as Outbox[] : [];
@@ -516,7 +516,7 @@ export class SchedulerRepository {
           WHERE run_id = ? AND status IN ('pending','claimed')`).run(operationAt, operationAt, add(operationAt, 604800), runId);
       }
       if (next === "failed" && runSnapshot.action === "work.read_only" && hasTarget && notificationReason === null) {
-        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, "scheduled workが失敗しました", operationAt);
+        this.insertOutbox(runId, "slack.work_result.post", runSnapshot.target_json, "scheduled workが失敗しました", notificationAt??operationAt);
       }
       this.db.prepare(`UPDATE schedule_runs SET status = ?, reason = CASE WHEN ? = 'cancelled' THEN 'cancelled' ELSE reason END,
         job_id = COALESCE(?, job_id), started_at = CASE WHEN ? = 'started' THEN ? ELSE started_at END,
@@ -693,8 +693,9 @@ export class SchedulerRepository {
   }
   private insertOutbox(runId: string, kind: Outbox["kind"], targetJson: string, content: string, now: string): void {
     this.db.prepare(`INSERT INTO connector_outbox(outbox_id, run_id, kind, idempotency_key, target_json, content, content_hash,
-      status, available_at, created_at, updated_at, content_delete_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?,NULL)`).run(
-      `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now);
+      status, available_at, created_at, updated_at, content_delete_at, completion_job_status) VALUES (?,?,?,?,?,?,?,'pending',?,?,?,NULL,
+      (SELECT status FROM jobs WHERE job_id=(SELECT job_id FROM schedule_runs WHERE run_id=?)))`).run(
+      `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now,runId);
   }
   claim(now: string, leaseSeconds = 60): Outbox | undefined {
     utc(now); if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 300) throw new Error("invalid_lease");

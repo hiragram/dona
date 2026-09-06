@@ -219,6 +219,8 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, path.dirname(filename), path.dirname(filename), new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
   dispatcher.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "完了", output: { format: "markdown", text: "結果" }, completed_at: due }, job.result_path, new Date(due));
+  assert.equal(repo.getRun(run.run_id)?.status,"completed");
+  assert.ok(raw.prepare("SELECT 1 FROM job_completion_results WHERE job_id=? AND job_status='completed'").get(job.job_id));
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
   const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
@@ -268,13 +270,18 @@ test("blockedとredaction拒否をneeds_reviewへ隔離し取消しを確定で�
       assert.throws(()=>dispatcher.saveJobResult(job.job_id, {schema_version:1,job_id:job.job_id,status:"completed",summary:"secret: redacted",output:{format:"markdown",text:"結果"},completed_at:due},job.result_path),/content_requires_redaction/);
       dispatcher.markJobNeedsReview(job.job_id,"invalid_result","content_requires_redaction");
     }
-    dispatcher.enqueueJobNotification(job.job_id, new Date(due));
-    assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
-    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
-    const notice = repo.claim(due); assert.ok(notice); assert.equal(notice.kind, "slack.work_result.post");
+  dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
+    const notificationAt=(raw.prepare("SELECT available_at FROM connector_outbox WHERE run_id=?").get(run.run_id) as {available_at:string}).available_at;
+    const notice = repo.claim(notificationAt); assert.ok(notice); assert.equal(notice.kind, "slack.work_result.post");
     if (mode === "blocked") {
+      repo.requestStarted(notice.outbox_id,notice.claim_token!,notificationAt);
       dispatcher.beginJobCancellation(job.job_id, job.source_event_id); dispatcher.markJobCancelled(job.job_id, "取消し", new Date(due));
       dispatcher.enqueueJobNotification(job.job_id, new Date(due)); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+      repo.finishWrite(notice.outbox_id,notice.claim_token!,"sent",notificationAt,"1.000009");
+      const states=raw.prepare("SELECT job_status,notification_state FROM job_completion_results WHERE job_id=? ORDER BY job_status").all(job.job_id) as Array<{job_status:string;notification_state:string}>;
+      assert.deepEqual(states,[{job_status:"blocked",notification_state:"accepted"},{job_status:"cancelled",notification_state:"none"}]);
     }
   }
 });
@@ -292,7 +299,7 @@ test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", (
 });
 
 test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象へ出す", () => {
-  const { repo, dispatcher } = setup(); const objective = "取消対象の調査";
+  const { repo, dispatcher, raw } = setup(); const objective = "取消対象の調査";
   repo.create("cancel_job", { ...input, action: "work.read_only", content: objective }, due, actor, now);
   const run = repo.materialize("cancel_job", 1, due, later, due, actor).run;
   const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
@@ -303,7 +310,8 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答が不明");
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(repo.get("cancel_job")?.state,"needs_review");
-  assert.equal(repo.claim(due)?.kind,"slack.work_result.post");
+  const reviewAt=(raw.prepare("SELECT available_at FROM connector_outbox WHERE run_id=?").get(run.run_id) as {available_at:string}).available_at;
+  assert.equal(repo.claim(reviewAt)?.kind,"slack.work_result.post");
 
   repo.create("expiry_job", { ...input, action:"work.read_only",target:{kind:"none"},content:objective,
     expires_at:"2026-09-05T00:02:00Z" }, due, actor, now);

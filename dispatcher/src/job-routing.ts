@@ -44,6 +44,21 @@ export function migrateJobRouting(db: Database.Database): void {
     if (marker && marker.version !== 1) throw new Error("Unsupported job routing schema");
     const completionColumns=new Set((db.prepare("PRAGMA table_info(job_completion_results)").all() as Array<{name:string}>).map(row=>row.name));
     if(!completionColumns.has("result_file_deleted_at")) db.exec("ALTER TABLE job_completion_results ADD COLUMN result_file_deleted_at TEXT");
+    const outboxColumns=new Set((db.prepare("PRAGMA table_info(connector_outbox)").all() as Array<{name:string}>).map(row=>row.name));
+    if(!outboxColumns.has("completion_job_status")) db.exec("ALTER TABLE connector_outbox ADD COLUMN completion_job_status TEXT");
+    db.exec("DROP TRIGGER IF EXISTS job_completion_outbox_insert; DROP TRIGGER IF EXISTS job_completion_outbox_update;");
+    db.exec(`CREATE TRIGGER job_completion_outbox_insert AFTER INSERT ON connector_outbox
+      WHEN NEW.kind='slack.work_result.post' AND NEW.completion_job_status IS NOT NULL BEGIN
+        UPDATE job_completion_results SET notification_state='pending'
+        WHERE job_id=(SELECT job_id FROM schedule_runs WHERE run_id=NEW.run_id) AND job_status=NEW.completion_job_status;
+      END;
+      CREATE TRIGGER job_completion_outbox_update AFTER UPDATE OF status ON connector_outbox
+      WHEN NEW.kind='slack.work_result.post' AND NEW.completion_job_status IS NOT NULL BEGIN
+        UPDATE job_completion_results SET notification_state=CASE NEW.status
+          WHEN 'sent' THEN 'accepted' WHEN 'failed' THEN 'failed' WHEN 'needs_review' THEN 'needs_review'
+          WHEN 'cancelled' THEN 'none' ELSE 'pending' END
+        WHERE job_id=(SELECT job_id FROM schedule_runs WHERE run_id=NEW.run_id) AND job_status=NEW.completion_job_status;
+      END;`);
     const eventColumns=new Set((db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
     if(eventColumns.has("source")&&eventColumns.has("reply_target_json")) for (const row of db.prepare("SELECT * FROM events WHERE source='slack'").all() as EventRow[]) {
       const binding=legacySlackBinding(row); if(binding) insertEventJobBinding(db,row.event_id,binding);
