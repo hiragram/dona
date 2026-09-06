@@ -65,7 +65,7 @@ export class SlackReminderConnector {
         : { outcome: "not_accepted", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
     try {
-      if (channel.isArchived || channel.isShared || (!channel.isIm && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
+      if (channel.isArchived || (!channel.isIm && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
       if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };
       if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
       const current = Date.now();
