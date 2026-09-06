@@ -19,12 +19,13 @@ class WakeSignal {
     this.resolver = undefined;
   }
 
-  wait(milliseconds: number): Promise<void> {
+  wait(milliseconds: number, unref = false): Promise<void> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.resolver = undefined;
         resolve();
       }, milliseconds);
+      if(unref)timer.unref();
       this.resolver = () => {
         clearTimeout(timer);
         resolve();
@@ -57,6 +58,16 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
     function finish(): void { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); }
     signal.addEventListener("abort", finish, { once: true });
   });
+}
+
+async function directoryNames(parent: string): Promise<string[]> {
+  try {
+    return (await fs.readdir(parent, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 const schedulerStatsIntervalMs = 60_000;
@@ -237,31 +248,38 @@ export class JobSupervisor {
     if(this.cancelledCleanupRecovery)return;
     const recovery=(async()=>{
       while(!this.stopping){
-        let after="";
-        for(;;){
-          const batch=this.database.listStatusJobsAfter("cancelled",after,50);
-          for(const row of batch){
+        for await(const progressDir of this.cancelledProgressDirectories()){
+          if(this.stopping)return;
+          const jobId=path.basename(progressDir);
+          const row=this.database.getJob(jobId);
+          if(!row||row.status!=="cancelled"||path.dirname(jobProgressPath(row))!==progressDir)continue;
+          try {
+            const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);
+            if(waited.aborted||this.stopping)return;
+            const terminal=(waited.ok&&(waited.agentStatus==="idle"||waited.agentStatus==="done"))||(!waited.ok&&!waited.timedOut&&(waited.errorCode==="agent_not_found"||waited.errorCode==="agent_not_running"));
+            if(terminal)await fs.rm(progressDir,{recursive:true,force:true});
+          } catch(error) {
             if(this.stopping)return;
-            const progressDir=path.dirname(jobProgressPath(row));
-            try {await fs.access(progressDir);} catch {continue;}
-            try {
-              const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);
-              if(waited.aborted||this.stopping)return;
-              const terminal=(waited.ok&&(waited.agentStatus==="idle"||waited.agentStatus==="done"))||(!waited.ok&&!waited.timedOut&&(waited.errorCode==="agent_not_found"||waited.errorCode==="agent_not_running"));
-              if(terminal)await fs.rm(progressDir,{recursive:true,force:true});
-            } catch(error) {
-              if(this.stopping)return;
-              this.logger.warn("Cancelled worker progress cleanup attempt failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed",error_message:error instanceof Error?error.message:String(error)});
-            }
+            this.logger.warn("Cancelled worker progress cleanup attempt failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed",error_message:error instanceof Error?error.message:String(error)});
           }
-          if(batch.length<50)break;
-          after=batch.at(-1)!.job_id;
         }
-        await this.cancelledCleanupWake.wait(this.config.queuePollMs);
+        await this.cancelledCleanupWake.wait(this.config.queuePollMs,true);
       }
     })();
     this.cancelledCleanupRecovery=recovery;
     this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>{this.cancelledWorkerCleanups.delete(recovery);if(this.cancelledCleanupRecovery===recovery)this.cancelledCleanupRecovery=undefined;}).catch(()=>undefined);
+  }
+
+  private async *cancelledProgressDirectories():AsyncGenerator<string> {
+    const scratchRoot=path.join(this.config.jobsWorkspaceRoot,"scratch",".dona-progress");
+    for(const jobId of await directoryNames(scratchRoot))yield path.join(scratchRoot,jobId);
+    const githubRoot=path.join(this.config.jobsWorkspaceRoot,"github");
+    for(const owner of await directoryNames(githubRoot)){
+      for(const repository of await directoryNames(path.join(githubRoot,owner))){
+        const progressRoot=path.join(githubRoot,owner,repository,"worktrees",".dona-progress");
+        for(const jobId of await directoryNames(progressRoot))yield path.join(progressRoot,jobId);
+      }
+    }
   }
 
   private async loop(): Promise<void> {

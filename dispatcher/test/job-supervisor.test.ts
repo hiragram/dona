@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -1135,6 +1136,31 @@ describe("JobSupervisor", () => {
     supervisor.start();
     await waitFor(() => maximum > 0);
     assert.equal(maximum, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = Array.from({ length: 60 }, (_, index) => {
+      const job = createScratchJob(database, config, `Ev-cancelled-history-${index}`);
+      markRunning(database, job.job_id);
+      database.beginJobCancellation(job.job_id, job.source_event_id);
+      database.markJobCancelled(job.job_id, "cancelled before restart");
+      return job;
+    });
+    const candidate = jobs.at(-1)!;
+    const progressDir = path.dirname(jobProgressPath(candidate));
+    await fs.mkdir(progressDir, { recursive: true });
+    await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    let waits = 0;
+    const runtime = fakeRuntime({ async wait() { waits += 1; return ok("done"); } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => !existsSync(progressDir));
+    assert.equal(waits, 1);
     await supervisor.stop();
     database.close();
   });
