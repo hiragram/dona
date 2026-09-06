@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
@@ -99,6 +100,7 @@ describe("JobSupervisor", () => {
           output: { format: "markdown", text: "結果です" },
           completed_at: new Date().toISOString(),
         };
+        await fs.mkdir(path.dirname(job.result_path), { recursive: true });
         await fs.writeFile(`${job.result_path}.tmp`, JSON.stringify(result));
         await fs.rename(`${job.result_path}.tmp`, job.result_path);
         return ok("working");
@@ -307,6 +309,7 @@ describe("JobSupervisor", () => {
     const job = createScratchJob(database, config, "Ev-cross-job-result");
     markRunning(database, job.job_id);
     await fs.mkdir(config.jobResultsDir, { recursive: true });
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path, JSON.stringify({
       schema_version: 1,
       job_id: "job_01m1f3zzzzzzzzzzzzzzzzzzzz",
@@ -341,6 +344,7 @@ describe("JobSupervisor", () => {
     const job = createScratchJob(database, config, "Ev-reported-failure");
     markRunning(database, job.job_id);
     await fs.mkdir(config.jobResultsDir, { recursive: true });
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path, JSON.stringify({
       schema_version: 1,
       job_id: job.job_id,

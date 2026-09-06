@@ -65,7 +65,9 @@ export class DispatcherDatabase {
       throw error;
     }
     this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at), undefined, (jobId,resultPath) => {
-      if(path.basename(resultPath)!==`${jobId}.json`) return false;
+      const legacy=path.basename(resultPath)===`${jobId}.json`;
+      const isolated=path.basename(resultPath)==="result.json"&&path.basename(path.dirname(resultPath))===jobId;
+      if(!legacy&&!isolated) return false;
       try { fs.unlinkSync(resultPath); return true; } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
   }
@@ -301,7 +303,7 @@ export class DispatcherDatabase {
           "worktrees",
           jobId,
         );
-      const resultPath = path.join(resultDir, `${jobId}.json`);
+      const resultPath = path.join(resultDir, jobId, "result.json");
       const timestamp = at.toISOString();
       this.db.prepare(`
         INSERT INTO jobs (
@@ -620,7 +622,7 @@ export class DispatcherDatabase {
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
       (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(job.job_id,job.status,job.source_event_id,stableStringify(binding.owner),
-      stableStringify(binding.destination),workState,notificationState,at.toISOString(),new Date(Date.parse(completedAt)+604_800_000).toISOString());
+      stableStringify(binding.destination),workState,notificationState,completedAt,new Date(Date.parse(completedAt)+604_800_000).toISOString());
     if(binding.owner.kind==="schedule") {
       const scheduleAt=new Date(Math.floor(Date.parse(completedAt)/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
@@ -707,6 +709,7 @@ export class DispatcherDatabase {
   }
 
   nextWaiting(): EventRow | undefined {
+    this.suppressUnauthorizedScheduledNotifications(new Date());
     return this.db
       .prepare("SELECT * FROM events WHERE status = 'waiting_agent' ORDER BY sequence LIMIT 1")
       .get() as EventRow | undefined;
@@ -730,13 +733,13 @@ export class DispatcherDatabase {
       const rows=this.db.prepare(`SELECT e.event_id FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
-        WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching') AND json_extract(c.owner_json,'$.kind')='schedule'
+        WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent') AND json_extract(c.owner_json,'$.kind')='schedule'
           AND (julianday(c.materialized_at,'+900 seconds')<=julianday(?) OR s.state NOT IN ('active','needs_review')
             OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
         .all(timestamp,timestamp) as Array<{event_id:string}>;
       for(const row of rows) {
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
-          last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching')`).run(timestamp,timestamp,row.event_id);
+          last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')`).run(timestamp,timestamp,row.event_id);
         this.setNotificationState(row.event_id,"none",at);
       }
     }).immediate();
@@ -905,7 +908,19 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
-      this.setNotificationState(eventId,"accepted",new Date(result.completed_at));
+      const completion=this.db.prepare("SELECT destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {destination_json:string}|undefined;
+      if(completion) {
+        const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>};
+        const target=destination.kind==="slack"?destination.target:undefined;
+        const delivered=(result.actions??[]).some(action=>{
+          if(!action||typeof action!=="object"||Array.isArray(action)) return false;
+          const value=action as Record<string,unknown>;
+          return typeof value.tool==="string"&&value.tool.endsWith(".post_message")&&value.success===true&&typeof value.message_ts==="string"&&
+            target!==undefined&&value.workspace_id===target.workspace_id&&value.channel_id===target.channel_id&&
+            (target.kind!=="thread"||value.thread_ts===target.thread_ts);
+        });
+        this.setNotificationState(eventId,delivered?"accepted":"needs_review",new Date(result.completed_at));
+      }
     }).immediate();
   }
 

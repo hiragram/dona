@@ -99,7 +99,7 @@ describe("DispatcherDatabase", () => {
     assert.equal(created.row.agent_name, created.row.job_id);
     assert.equal(created.row.agent_name.length, 30);
     assert.equal(created.row.workspace_path, `${config.jobsWorkspaceRoot}/scratch/${created.row.job_id}`);
-    assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}.json`);
+    assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}/result.json`);
     assert.equal(database.createJob(
       { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
       config.jobsWorkspaceRoot,

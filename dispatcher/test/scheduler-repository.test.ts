@@ -247,10 +247,12 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal(repo.claim(due),undefined);
   const notificationPath=path.join(path.dirname(filename),`${completionEventId}.json`); fs.writeFileSync(notificationPath,"notification result");
   dispatcher.beginDispatch(completionEventId,notificationPath,new Date(due)); dispatcher.markWaiting(completionEventId,new Date(due));
-  dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",completed_at:due},notificationPath);
+  dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[{
+    tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",success:true,
+  }],completed_at:due},notificationPath);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
   assert.equal(repo.get("notify_work")?.state,"completed");
-  fs.writeFileSync(job.result_path,"sensitive result"); repo.purge("2026-09-12T00:01:01Z");
+  fs.mkdirSync(path.dirname(job.result_path),{recursive:true}); fs.writeFileSync(job.result_path,"sensitive result"); repo.purge("2026-09-12T00:01:01Z");
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json,null);
   assert.equal((raw.prepare("SELECT result_file_deleted_at FROM job_completion_results WHERE job_id=?").get(job.job_id) as {result_file_deleted_at:string|null}).result_file_deleted_at,"2026-09-12T00:01:01Z");
@@ -261,20 +263,25 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
 });
 
 test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite前に抑止する", () => {
-  for(const mode of ["deadline","retry","cancel"] as const) {
-    const {repo,dispatcher,raw}=setup(); const objective=`${mode}通知`;
+  for(const mode of ["deadline","retry","cancel","waiting"] as const) {
+    const {repo,dispatcher,raw,filename}=setup(); const objective=`${mode}通知`;
     repo.create(`notify_${mode}`,{...input,action:"work.read_only",content:objective},due,actor,now);
     const run=repo.materialize(`notify_${mode}`,1,due,later,due,actor).run;
     const job=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
     dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
     dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
     const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
-    if(mode==="cancel") repo.transition(`notify_${mode}`,1,"cancel",actor,"2026-09-05T00:01:30Z");
+    if(mode==="waiting") {
+      dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
+      dispatcher.markWaiting(eventId,new Date(due));
+    }
+    if(mode==="cancel"||mode==="waiting") repo.transition(`notify_${mode}`,1,"cancel",actor,"2026-09-05T00:01:30Z");
     if(mode==="retry") {
       dispatcher.recordPreDispatchFailure(eventId,"temporary","retry",3,new Date(due));
       assert.notEqual(dispatcher.get(eventId)?.available_at,due);
     }
     dispatcher.nextAvailable(new Date(mode==="deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
+    if(mode==="waiting") dispatcher.nextWaiting();
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
     assert.equal(dispatcher.get(eventId)?.status,"completed");
     assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");

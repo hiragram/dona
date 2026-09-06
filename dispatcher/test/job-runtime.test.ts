@@ -31,7 +31,7 @@ describe("Codex background agent arguments", () => {
     const repositoryPath = `${config.jobsWorkspaceRoot}/github/reirei-lab/boatrace/repository`;
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "-c",
       `projects = { ${JSON.stringify(repositoryPath)} = { trust_level = "trusted" }, ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -50,12 +50,12 @@ describe("Codex background agent arguments", () => {
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", config.jobResultsDir, "-c", expectedOverride]);
+    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "-c", expectedOverride]);
     assert.equal(args[3]!.match(/trust_level/g)?.length, 1);
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
     assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config),[
-      "--add-dir",config.jobResultsDir,"--sandbox","read-only","--ask-for-approval","never","-c",expectedOverride,
+      "--add-dir",path.dirname(job.result_path),"--sandbox","read-only","--ask-for-approval","never","-c",expectedOverride,
     ]);
     database.close();
   });
@@ -102,7 +102,7 @@ describe("Codex background agent arguments", () => {
 
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "-c",
       `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -152,7 +152,7 @@ process.exit(1);
       "--pane", "w1:p1",
       "--timeout", String(config.jobAgentStartTimeoutMs),
       "--",
-      "--add-dir", config.jobResultsDir,
+      "--add-dir", path.dirname(job.result_path),
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
     assert.equal((await fs.stat(job.workspace_path)).mode & 0o777, 0o700);

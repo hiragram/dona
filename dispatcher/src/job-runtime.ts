@@ -28,7 +28,10 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
 }
 
 export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
-  const args = ["--add-dir", config.jobResultsDir];
+  const resultDirectory=path.dirname(row.result_path);
+  const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
+  if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
+  const args = ["--add-dir", resultDirectory];
   if(row.source==="dona_schedule") args.push("--sandbox","read-only","--ask-for-approval","never");
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
@@ -186,8 +189,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
     await fs.mkdir(this.config.jobsWorkspaceRoot, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
-    await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
-    await fs.chmod(this.config.jobResultsDir, 0o700);
+    const resultDirectory=path.dirname(row.result_path);
+    await fs.mkdir(resultDirectory, { recursive: true, mode: 0o700 });
+    await fs.chmod(resultDirectory, 0o700);
 
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
