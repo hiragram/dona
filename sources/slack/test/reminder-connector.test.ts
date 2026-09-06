@@ -23,5 +23,5 @@ test("target・本文を制限しSlack結果を分類する", async () => {
   assert.equal((await (await connector(async () => { throw new SlackApiError("rate_limited", "rate", 3); })).deliver(input)).outcome, "not_accepted");
   assert.equal((await (await connector(async () => { throw new SlackApiError("slack_transport_error", "reset"); })).deliver(input)).outcome, "acceptance_unknown");
   assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }))).deliver({ ...input, text: "<!channel>" })).outcome, "rejected");
-  assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }))).deliver({ ...input, target: { ...input.target, workspace_id: "T2" } })).outcome, "rejected");
+  assert.equal((await (await connector(async () => ({ channelId: "C1", messageTs: "1.0" }))).deliver({ ...input, target: { ...input.target, workspace_id: "T2" } })).outcome, "revoked");
 });

@@ -74,6 +74,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
 
   try {
     await api.start();
+    // Clear stale/expired outbox fences before due materialization decides overlap for a newer occurrence.
+    database.scheduler.recover(new SystemClock().now());
     worker.start();
     scheduler.start();
     reminderPublisher.start();

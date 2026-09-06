@@ -47,12 +47,12 @@ export class SlackReminderConnector {
     try { input = parseSlackReminderCommand(value); } catch { return { outcome: "rejected", code: "invalid_command" }; }
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
-    catch { return { outcome: "rejected", code: "workspace_not_allowed" }; }
+    catch { return { outcome: "revoked", code: "workspace_not_allowed" }; }
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
       const owner = await connection.client.getUser(input.owner_id);
-      if (owner.isDeleted || owner.isBot || owner.isAppUser || (channel.isPrivate && (!connection.client.hasChannelMember ||
+      if (owner.isDeleted || owner.isBot || owner.isAppUser || (channel.isPrivate && !channel.isIm && (!connection.client.hasChannelMember ||
         !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))))) return { outcome: "revoked", code: "owner_not_authorized" };
     } catch (error) {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
@@ -61,7 +61,8 @@ export class SlackReminderConnector {
         : { outcome: "not_accepted", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     }
     try {
-      if (channel.isArchived || channel.isShared || (input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
+      if (channel.isArchived || channel.isShared || (!channel.isIm && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
+      if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };
       if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
       const current = Date.now();
       if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
