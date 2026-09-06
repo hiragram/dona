@@ -575,8 +575,8 @@ export class DispatcherDatabase {
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const job=this.getJobRequired(jobId);
     const recoverAmbiguous=job.status==="needs_review"&&["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted"].includes(job.last_error_code??"");
-    if(binding?.owner.kind==="schedule"&&job.prompt_accepted_at&&completedAt.getTime()<Date.parse(job.prompt_accepted_at))
-      throw new Error("completed_at_precedes_prompt_acceptance");
+    if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
+      throw new Error("completed_at_precedes_prompt_dispatch");
     this.db.transaction(()=>{
       if(recoverAmbiguous&&job.completion_event_id) {
         const prior=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
@@ -983,14 +983,14 @@ export class DispatcherDatabase {
   }
 
   private notificationDelivered(eventId:string,result:ResultEnvelope):{delivered:boolean;runId?:string} {
-    const completion=this.db.prepare("SELECT owner_json,destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string}|undefined;
+    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
     const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
-    return {delivered:actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:completion.notification_state==="needs_review"&&actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {

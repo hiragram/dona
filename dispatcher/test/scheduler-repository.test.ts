@@ -247,6 +247,8 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal(repo.claim(due),undefined);
   const notificationPath=path.join(path.dirname(filename),`${completionEventId}.json`); fs.writeFileSync(notificationPath,"notification result");
   dispatcher.beginDispatch(completionEventId,notificationPath,new Date(due)); dispatcher.markWaiting(completionEventId,new Date(due));
+  assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due)).authorized,true);
+  assert.throws(()=>dispatcher.authorizeJobNotification(completionEventId,new Date(due)),/schedule_notification_not_authorized/);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
@@ -477,7 +479,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   const job=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"future",completed_at:later},job.result_path,new Date(due)),/completed_at_is_in_the_future/);
-  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_acceptance/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
