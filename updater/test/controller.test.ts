@@ -306,9 +306,19 @@ describe("UpdateController isolated end-to-end", () => {
       schema_version: 1, phase: "compatibility_bridge", database_schema: 2,
       multi_job_enabled: false, capabilities: ["app_schema_read_v2_v3"],
     };
+    widening.build.compatibility = widening.git.targetCompatibility;
+    widening.runtime.setHealthCompatibility(targetSha, widening.git.targetCompatibility);
     const bridgePlan = await widening.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     assert.equal((bridgePlan.plan as { compatibility: Compatibility }).compatibility.app_schema_read_max, 3);
     assert.equal((bridgePlan.plan as { rollback_compatible: boolean }).rollback_compatible, true);
+    const plan = bridgePlan.plan as { plan_id: string; plan_hash: string };
+    widening.controller.apply({
+      source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-widening",
+    });
+    widening.dispatcher.terminal = true;
+    await widening.controller.processNext();
+    assert.equal(widening.database.get(bridgePlan.request_id as string)?.state, "succeeded");
     widening.database.close();
   });
 
