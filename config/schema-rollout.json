@@ -1,10 +1,17 @@
 {
   "schema_version": 1,
-  "phase": "compatibility_bridge",
-  "database_schema": 2,
-  "multi_job_enabled": false,
-  "capabilities": [
-    "app_schema_read_v2_v3",
-    "dispatcher_v2_to_v3_online_backup_v1"
-  ]
+  "phase": "activation",
+  "database_schema": 3,
+  "multi_job_enabled": true,
+  "previous_release_sha": "ec522107117098d2250f8147ce57f4c7f48da801",
+  "previous_release_contract": "release-compatibility.v2-v3-bridge.json",
+  "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1",
+  "migration": {
+    "from_schema": 2,
+    "to_schema": 3,
+    "requires_quiesce": true,
+    "requires_drain": true,
+    "backup": "sqlite_online_backup",
+    "restore_open_test": true
+  }
 }

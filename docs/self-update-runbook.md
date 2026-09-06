@@ -88,7 +88,9 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 ## app DB schema v2→v3 rollout
 
-schema rolloutは通常の単発self-updateへ混ぜない。最初に`config/release-compatibility.v2-v3-bridge.json`と同じcontractのcompatibility releaseを配布し、このreleaseではDBをv2のまま維持し、multi-job gateを無効にする。previous/targetの双方が`app_schema_read_min: 2`、`app_schema_read_max: 3`を公開したことをhealthで確認した後だけ、`config/schema-rollout.json`で機械的に区別したmigration/activation releaseへ進む。activation releaseは`app_schema_write: 3`とし、compatibility releaseだけをv3-compatible rollback targetにできる。
+schema rolloutは通常の単発self-updateへ混ぜない。先行bridgeはcommit `ec522107117098d2250f8147ce57f4c7f48da801`で、primary `config/release-compatibility.json`が`app_schema_write: 2`、`config/schema-rollout.json`が`multi_job_enabled: false`を宣言する実在release sourceである。このexact SHAを通常のrelease build/CIで検証してから配布し、previous/targetの双方が`app_schema_read_min: 2`、`app_schema_read_max: 3`を公開したことをhealthで確認した後だけ、activation releaseへ進む。activation releaseは`app_schema_write: 3`とし、このbridgeだけをv3-compatible rollback targetにできる。
+
+schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
 
 migration/activation planは次の順序を崩さない。
 
