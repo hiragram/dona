@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, test } from "node:test";
+import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../src/database.js";
 import { ScheduleApiError, ScheduleApiService } from "../src/scheduler/api.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
@@ -32,9 +33,12 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() });
   assert.equal(created.duplicate, false);
   assert.equal(JSON.stringify(created).includes("確認してください"), false);
+  const correlation = (created.schedule as { idempotency_key_hash: string }).idempotency_key_hash;
+  assert.match(correlation, /^[a-f0-9]{64}$/);
   const schedule = created.schedule as { schedule_id: string; revision: number };
   assert.equal((api.get(schedule.schedule_id, first.event_id).schedule as { revision: number }).revision, 1);
   assert.equal(api.list(first.event_id, 1).schedules.length, 1);
+  assert.equal((api.list(first.event_id, 1).schedules[0] as { idempotency_key_hash: string }).idempotency_key_hash, correlation);
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.equal(new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("別本文") }), (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
@@ -42,7 +46,7 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
 });
 
 test("schedule一覧cursorは同一秒に後から作成したscheduleを見落とさない", async () => {
-  const { database, first, api } = await fixture();
+  const { config, database, first, api } = await fixture();
   api.create({ source_event_id: first.event_id, idempotency_key: "first", definition: definition() });
   const firstPage = api.list(first.event_id, 1);
   assert.match(String(firstPage.next_cursor), /^\d+$/);
@@ -51,6 +55,11 @@ test("schedule一覧cursorは同一秒に後から作成したscheduleを見落�
   assert.equal(later.list(first.event_id, 1, String(firstPage.next_cursor)).schedules.length, 1);
   assert.throws(() => later.list(first.event_id, 1, "sch_random"), /invalid_cursor/);
   database.close();
+  const raw = new Database(config.databasePath);
+  raw.prepare("DELETE FROM schedule_audit WHERE operation = 'create'").run(); raw.close();
+  const reopened = new DispatcherDatabase(config.databasePath);
+  assert.equal(new ScheduleApiService(reopened).list(first.event_id, 10).schedules.length, 2);
+  reopened.close();
 });
 
 test("別actorを拒否しrevision conflictと冪等transitionを区別する", async () => {
@@ -77,6 +86,27 @@ test("resume成功後にmaterialize auditが追加されても同じ再送を照
   database.scheduler.materialize(scheduleId, 3, "2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z", "2026-09-03T00:00:00Z",
     { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: null });
   assert.equal(api.transition(scheduleId, "resume", { source_event_id: first.event_id, expected_revision: 2 }).duplicate, true);
+  database.close();
+});
+
+test("未送信one-shotのpauseでcompletedになった後も同じ再送を照合する", async () => {
+  const { database, first, api } = await fixture();
+  const once = { recurrence: { version: 1, kind: "once", at: "2026-09-03T00:00:00Z" }, action: { kind: "reminder", body: "確認" } };
+  const created = api.create({ source_event_id: first.event_id, idempotency_key: "once-pause", definition: once });
+  const scheduleId = (created.schedule as { schedule_id: string }).schedule_id;
+  database.scheduler.materialize(scheduleId, 1, "2026-09-03T00:00:00Z", null, "2026-09-03T00:00:00Z",
+    { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: null });
+  const paused = api.transition(scheduleId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  assert.equal((paused.schedule as { state: string }).state, "completed");
+  assert.equal(api.transition(scheduleId, "pause", { source_event_id: first.event_id, expected_revision: 1 }).duplicate, true);
+  database.close();
+});
+
+test("未知のrepository例外を4xxへ変換せず再throwする", async () => {
+  const { database, first, api } = await fixture();
+  (database.scheduler as unknown as { withCodecs(): { create(): never } }).withCodecs = () => ({ create() { throw new Error("SQLITE_IOERR private detail"); } });
+  assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "io-error", definition: definition() }),
+    (error: unknown) => error instanceof Error && !(error instanceof ScheduleApiError) && error.message === "SQLITE_IOERR private detail");
   database.close();
 });
 

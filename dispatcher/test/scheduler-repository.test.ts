@@ -51,15 +51,15 @@ test("新規DB、v2既存データ、再open、WAL/FK、unknown extension versio
   const { raw, filename, dispatcher } = setup();
   const event = dispatcher.enqueue(eventEnvelope("legacy")).row;
   raw.exec(`DROP TABLE schedule_audit; DROP TABLE connector_outbox; DROP TABLE schedule_runs;
-    DROP TABLE schedules; DROP TABLE schedule_revisions; DROP TABLE scheduler_schema`);
+    DROP TABLE schedules; DROP TABLE schedule_revisions; DROP TABLE schedule_list_sequence; DROP TABLE scheduler_schema`);
   assert.equal(raw.pragma("user_version", { simple: true }), 2);
   const reopened = new DispatcherDatabase(filename);
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
+  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
   reopened.close();
-  raw.exec("UPDATE scheduler_schema SET version = 2");
+  raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
@@ -71,6 +71,22 @@ test("extension migration失敗は全DDLをrollbackしcore versionを保持す�
     assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedules'").get(), undefined);
     assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'scheduler_schema'").get(), undefined);
     assert.equal(raw.pragma("user_version", { simple: true }), 2);
+  } finally { raw.close(); }
+});
+
+test("scheduler schema v1へ保持されるlist sequenceを追加する", () => {
+  const raw = new Database(":memory:");
+  try {
+    raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+      INSERT INTO scheduler_schema VALUES(1, 1);
+      CREATE TABLE schedules(schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL);
+      CREATE TABLE schedule_audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL, operation TEXT NOT NULL);
+      INSERT INTO schedules VALUES('legacy', 'T', 'U');
+      INSERT INTO schedule_audit(schedule_id, operation) VALUES('legacy', 'create');`);
+    migrateScheduler(raw);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+    assert.equal((raw.prepare("SELECT list_sequence FROM schedules WHERE schedule_id = 'legacy'").get() as { list_sequence: number }).list_sequence, 1);
+    assert.equal((raw.prepare("SELECT next_value FROM schedule_list_sequence").get() as { next_value: number }).next_value, 2);
   } finally { raw.close(); }
 });
 

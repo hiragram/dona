@@ -120,6 +120,11 @@ describe("Dona Dispatcher MCP server", () => {
       } });
       assert.equal(preview.isError, undefined);
       assert.equal(calls.at(-1)?.method, "previewSchedule");
+      const scheduleListed = await client.callTool({ name: "list_schedules", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", limit: 10, cursor: "12",
+      } });
+      assert.equal(scheduleListed.isError, undefined);
+      assert.deepEqual(calls.at(-1), { method: "listSchedules", args: ["evt_01M1ES03XY5CF8D9PM5CWX4SRV", 10, "12"] });
       const beforeInvalid = calls.length;
       const invalidKey = await client.callTool({ name: "create_schedule", arguments: {
         source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV", idempotency_key: "request.1",

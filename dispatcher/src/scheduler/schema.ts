@@ -7,18 +7,34 @@ export function migrateScheduler(db: Database.Database): void {
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL
     )`);
     const row = db.prepare("SELECT version FROM scheduler_schema WHERE singleton = 1").get() as { version: number } | undefined;
-    if (row && row.version !== 1) throw new Error("unsupported_scheduler_schema");
-    if (row) return;
+    if (row && row.version !== 1 && row.version !== 2) throw new Error("unsupported_scheduler_schema");
+    if (row?.version === 2) return;
+    if (row?.version === 1) {
+      db.exec(`ALTER TABLE schedules ADD COLUMN list_sequence INTEGER;
+        ALTER TABLE schedules ADD COLUMN idempotency_key_hash TEXT;
+        UPDATE schedules SET list_sequence = (SELECT MIN(sequence) FROM schedule_audit
+          WHERE schedule_audit.schedule_id = schedules.schedule_id AND operation = 'create');
+        UPDATE schedules SET list_sequence = rowid + COALESCE((SELECT MAX(sequence) FROM schedule_audit), 0)
+          WHERE list_sequence IS NULL;
+        CREATE UNIQUE INDEX schedules_list_sequence_idx ON schedules(list_sequence);
+        CREATE TABLE schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
+        INSERT INTO schedule_list_sequence VALUES (1, COALESCE((SELECT MAX(list_sequence) + 1 FROM schedules), 1));
+        UPDATE scheduler_schema SET version = 2 WHERE singleton = 1;`);
+      return;
+    }
     db.exec(`
       CREATE TABLE schedules (
         schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('active','paused','expired','needs_review','cancelled','completed')),
         revision INTEGER NOT NULL CHECK(revision > 0), next_due TEXT, high_watermark TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT,
+        list_sequence INTEGER NOT NULL UNIQUE, idempotency_key_hash TEXT,
         FOREIGN KEY(schedule_id, revision) REFERENCES schedule_revisions(schedule_id, revision) DEFERRABLE INITIALLY DEFERRED
       );
       CREATE INDEX schedules_due_idx ON schedules(next_due, schedule_id) WHERE state = 'active';
       CREATE INDEX schedules_owner_idx ON schedules(tenant_id, owner_id, state);
+      CREATE TABLE schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
+      INSERT INTO schedule_list_sequence VALUES (1, 1);
       CREATE TABLE schedule_revisions (
         schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id) ON DELETE CASCADE,
         revision INTEGER NOT NULL CHECK(revision > 0),
@@ -65,7 +81,7 @@ export function migrateScheduler(db: Database.Database): void {
       );
       CREATE INDEX schedule_audit_order_idx ON schedule_audit(schedule_id, sequence);
       CREATE INDEX schedule_audit_retention_idx ON schedule_audit(created_at);
-      INSERT INTO scheduler_schema VALUES (1, 1);
+      INSERT INTO scheduler_schema VALUES (1, 2);
     `);
   }).immediate();
 }

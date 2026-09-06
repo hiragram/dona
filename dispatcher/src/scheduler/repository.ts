@@ -26,6 +26,7 @@ export interface Schedule {
   schedule_id: string; tenant_id: string; owner_id: string; state: ScheduleState;
   revision: number; next_due: string | null; high_watermark: string | null;
   created_at: string; updated_at: string; terminal_at: string | null;
+  list_sequence: number; idempotency_key_hash: string | null;
 }
 export interface Run {
   run_id: string; schedule_id: string; revision: number; occurrence_key: string; scheduled_for: string;
@@ -100,11 +101,10 @@ export class SchedulerRepository {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
     if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("invalid_cursor");
     id(actor.tenant_id); id(actor.actor_id);
-    const rows = this.db.prepare(`SELECT s.*, a.sequence AS create_sequence FROM schedules s
-      JOIN schedule_audit a ON a.schedule_id = s.schedule_id AND a.operation = 'create'
-      WHERE s.tenant_id = ? AND s.owner_id = ? AND a.sequence > ? ORDER BY a.sequence LIMIT ?`)
-      .all(actor.tenant_id, actor.actor_id, afterSequence, limit) as (Schedule & { create_sequence: number })[];
-    return rows.map(({ create_sequence, ...row }) => ({ schedule: this.getAuthorized(row.schedule_id, actor)!, sequence: create_sequence }));
+    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ?
+      AND list_sequence > ? ORDER BY list_sequence LIMIT ?`)
+      .all(actor.tenant_id, actor.actor_id, afterSequence, limit) as Schedule[];
+    return rows.map(row => ({ schedule: this.getAuthorized(row.schedule_id, actor)!, sequence: row.list_sequence }));
   }
   runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: { scheduled_for: string; run_id: string }): Run[] {
     const schedule = this.get(scheduleId);
@@ -208,7 +208,8 @@ export class SchedulerRepository {
         ...(outbox ? { outbox: { outbox_id: outbox.outbox_id, run_id: outbox.run_id, kind: outbox.kind, status: outbox.status,
           attempt: outbox.attempt, request_started_at: outbox.request_started_at, receipt_id: outbox.receipt_id } } : {}) }), now);
   }
-  create(scheduleId: string, input: RevisionInput, nextDue: string, actor: Actor, now: string): Schedule {
+  create(scheduleId: string, input: RevisionInput, nextDue: string, actor: Actor, now: string,
+    idempotencyKeyHash: string | null = null): Schedule {
     id(scheduleId); id(actor.actor_id); id(actor.tenant_id); utc(nextDue); utc(now);
     if (actor.source_event_id !== null) id(actor.source_event_id);
     if (actor.role !== "owner" || nextDue <= now) throw new Error("invalid_creation");
@@ -216,8 +217,11 @@ export class SchedulerRepository {
     if (input.authorization_revision !== 1) throw new Error("authorization_revision_conflict");
     return this.db.transaction(() => {
       this.quota(actor.tenant_id, actor.actor_id);
-      this.db.prepare(`INSERT INTO schedules(schedule_id, tenant_id, owner_id, state, revision, next_due, created_at, updated_at)
-        VALUES (?,?,?,'active',1,?,?,?)`).run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now);
+      const sequence = (this.db.prepare("SELECT next_value FROM schedule_list_sequence WHERE singleton = 1").get() as { next_value: number }).next_value;
+      this.db.prepare("UPDATE schedule_list_sequence SET next_value = next_value + 1 WHERE singleton = 1").run();
+      this.db.prepare(`INSERT INTO schedules(schedule_id, tenant_id, owner_id, state, revision, next_due, created_at, updated_at,
+        list_sequence, idempotency_key_hash) VALUES (?,?,?,'active',1,?,?,?,?,?)`)
+        .run(scheduleId, actor.tenant_id, actor.actor_id, nextDue, now, now, sequence, idempotencyKeyHash);
       this.insertRevision(scheduleId, 1, input, now);
       const row = this.get(scheduleId)!; this.audit(undefined, row, "create", actor, now); return row;
     }).immediate();
