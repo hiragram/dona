@@ -13,12 +13,14 @@
 
 materialization transactionはwork eventとbindingを同時に保存する。通常workerは`dona_schedule`を処理し、promptに保存済みobjective、`read_only` scope、空の`allowed_external_writes`、Result destinationを明示する。`delegate_job`の重複は既存jobを返し、異なる内容ならpayload mismatchになる。
 
-job作成時に最新のschedule state、revision、authorization expiry、misfireを再確認してからrunを`started`へ移す。schedule cancel・pause・authorization expiry後も開始済みworkのResultは保存するが、repository policyに従って通知だけを抑止する。未開始runは既存scheduler遷移で`cancelled`または`skipped`となりjob作成を拒否する。
+job作成時に最新のschedule state、revision、authorization expiry、misfireを再確認してからrunを`started`へ移す。拒否時はjob INSERTだけを戻し、runの`cancelled`/`skipped`決定はcommitする。schedule cancel・pause・authorization expiry後も開始済みworkのResultは保存するが、repository policyに従って通知だけを抑止する。未開始runは既存scheduler遷移で`cancelled`または`skipped`となりjob作成を拒否する。
+
+schedule由来jobは永続化済み`prompt_accepted_at`から3600秒を実行期限とする。Dispatcher Supervisorは期限超過をcancelし、cancel acceptanceが曖昧なら既存job fenceとschedule runを`needs_review`へ移す。通常のworker wait timeoutは実行継続とdeadline超過を区別する。
 
 ## Resultとnotification
 
 `job_completion_results`はwork stateとnotification stateを別fieldで保存し、Result本文は既存`jobs.result_json`を唯一の保存先にする。destination `none`でもResultを保存し、`dona_job`通知eventを生成しない。Result本文は完了記録から7日後に消去し、owner・destination・work/notification stateの監査metadataは残す。
 
-Slack destinationを持つscheduled workは既存`connector_outbox`の`slack.work_result.post`へ渡し、outboxの`pending`、`accepted`、`failed`、`needs_review`をcompletion metadataへ同期する。job自体が`needs_review`になった場合はrunとscheduleも`needs_review`へ隔離し、adminの明示的な`reconcileWorkRun`だけが失敗または取消しへ確定できる。これによりjob失敗、notification failure、request acceptance unknownを別状態で監査する。Slack thread起点jobは従来どおり`dona_job` eventを生成する。
+Slack destinationを持つscheduled workは既存`connector_outbox`の`slack.work_result.post`へ渡し、outboxの`pending`、`accepted`、`failed`、`needs_review`をcompletion metadataへ同期する。jobが`blocked`/`needs_review`になった場合や通知本文のredactionを安全に確定できない場合は、runとscheduleも`needs_review`へ隔離し、固定の確認要求だけを通知できる。adminの明示的な`reconcileWorkRun`だけが失敗または取消しへ確定でき、scheduleは新revisionの再承認なしにresumeできない。これによりjob失敗、notification failure、request acceptance unknownを別状態で監査する。Slack thread起点jobは従来どおり`dona_job` eventを生成する。
 
 provider ingress一般、recurrence計算、Slack reminder送信実装はこのcontractの対象外である。

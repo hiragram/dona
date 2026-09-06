@@ -534,6 +534,10 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
       this.suppress(run.schedule_id, at, "cancelled");
       this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=? WHERE schedule_id=? AND state NOT IN ('cancelled','completed')").run(at, run.schedule_id);
+      const snapshot = this.revision(run); const target = JSON.parse(snapshot.target_json) as Target;
+      if (target.kind !== "none" && !this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(runId)) {
+        this.insertOutbox(runId, "slack.work_result.post", snapshot.target_json, "scheduled workの結果は確認が必要です", at);
+      }
       this.retireRevisions(run.schedule_id, at);
       this.audit(before, this.get(run.schedule_id)!, "work_result_needs_review",
         {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:sourceEventId}, at, undefined, this.getRun(runId)!);
@@ -551,7 +555,6 @@ export class SchedulerRepository {
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status=?, reason=?, terminal_at=? WHERE run_id=?")
         .run(outcome, outcome === "cancelled" ? "cancelled" : null, at, runId);
-      this.db.prepare("UPDATE schedules SET state='paused', updated_at=? WHERE schedule_id=? AND state='needs_review'").run(at, run.schedule_id);
       this.audit(before, this.get(run.schedule_id)!, `reconcile_work_${outcome}`, actor, at, undefined, this.getRun(runId)!);
       this.completeIfDrained(run.schedule_id, at);
       return this.getRun(runId)!;
@@ -607,7 +610,7 @@ export class SchedulerRepository {
     this.completeIfDrained(before.schedule_id, expiredAt);
   }
   private runCanSend(row: Outbox, run: Run): boolean {
-    return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : run.status === "completed";
+    return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : ["completed", "needs_review"].includes(run.status);
   }
   private completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
@@ -666,7 +669,7 @@ export class SchedulerRepository {
         JOIN schedules s ON s.schedule_id = r.schedule_id JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
         WHERE o.status = 'pending' AND o.available_at <= ? AND o.content IS NOT NULL AND s.state = 'active'
         AND ((o.kind = 'slack.reminder.post' AND r.status IN ('materialized','started'))
-          OR (o.kind = 'slack.work_result.post' AND r.status = 'completed'))
+          OR (o.kind = 'slack.work_result.post' AND r.status IN ('completed','needs_review')))
         AND s.revision = r.revision AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
         ORDER BY o.available_at, o.outbox_id LIMIT 1`).get(now, now, now) as Outbox | undefined;
       if (!row) return undefined;
@@ -801,8 +804,9 @@ export class SchedulerRepository {
       for (const row of expired) this.retireRevisions(row.schedule_id, now, row.revision);
       this.db.prepare("UPDATE schedule_revisions SET content = NULL WHERE content_delete_at <= ? OR expires_at <= ?").run(now, add(now, -604800));
       this.db.prepare("UPDATE connector_outbox SET content = NULL WHERE content_delete_at <= ?").run(now);
-      this.db.prepare(`UPDATE jobs SET result_json = NULL WHERE job_id IN
-        (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?)`).run(now);
+      this.db.prepare(`UPDATE jobs SET result_json = NULL,
+        last_error_message = CASE WHEN last_error_code='agent_reported_failure' THEN NULL ELSE last_error_message END
+        WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?)`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

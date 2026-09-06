@@ -7,6 +7,7 @@ import { afterEach, test } from "node:test";
 import Database from "better-sqlite3";
 import { envelopeFromRow } from "../src/prompt.js";
 import { DispatcherDatabase } from "../src/database.js";
+import { migrateJobRouting } from "../src/job-routing.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
 import type { Actor, RevisionInput, Run, SchedulerRepository } from "../src/scheduler/repository.js";
 import { eventEnvelope } from "./helpers.js";
@@ -224,6 +225,56 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
   repo.purge("2026-09-12T00:01:01Z");
   assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json, null);
+});
+
+test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
+  const { repo, dispatcher, raw } = setup(); const objective = "開始境界の調査";
+  repo.create("start_fence", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const run = repo.materialize("start_fence", 1, due, later, due, actor).run;
+  raw.prepare("UPDATE schedules SET state='paused' WHERE schedule_id='start_fence'").run();
+  assert.throws(() => dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)), /no longer authorized/);
+  assert.equal(dispatcher.listJobs().length, 0); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+});
+
+test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {
+  const { repo, dispatcher, raw } = setup(); const objective = "旧eventの調査";
+  repo.create("legacy_work", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const run = repo.materialize("legacy_work", 1, due, later, due, actor).run;
+  raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
+  raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
+  migrateJobRouting(raw);
+  const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
+  assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } });
+  assert.equal(dispatcher.listOwnerJobs(run.event_id!).length, 0);
+});
+
+test("blockedとredaction拒否をneeds_reviewへ隔離し取消しを確定できる", () => {
+  for (const mode of ["blocked", "redacted"] as const) {
+    const { repo, dispatcher, raw } = setup(); const objective = `${mode}調査`;
+    repo.create(mode, { ...input, action: "work.read_only", content: objective }, due, actor, now);
+    const run = repo.materialize(mode, 1, due, later, due, actor).run;
+    const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+    dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
+    if (mode === "blocked") dispatcher.markJobBlocked(job.job_id, "入力待ち");
+    else dispatcher.saveJobResult(job.job_id, {schema_version:1,job_id:job.job_id,status:"completed",summary:"secret: redacted",output:{format:"markdown",text:"結果"},completed_at:due},job.result_path);
+    dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+    assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
+    if (mode === "blocked") {
+      dispatcher.beginJobCancellation(job.job_id, job.source_event_id); dispatcher.markJobCancelled(job.job_id, "取消し", new Date(due));
+      dispatcher.enqueueJobNotification(job.job_id, new Date(due)); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+    }
+  }
+});
+
+test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", () => {
+  const { repo, dispatcher } = setup(); const objective = "deadline調査";
+  repo.create("deadline", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const run = repo.materialize("deadline", 1, due, later, due, actor).run;
+  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
+  assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:00:59Z")).length, 0);
+  assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id, job.job_id);
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {

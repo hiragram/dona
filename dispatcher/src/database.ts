@@ -275,7 +275,7 @@ export class DispatcherDatabase {
       }
     }
 
-    return this.db.transaction(() => {
+    const created = this.db.transaction((): CreateJobResult | undefined => {
       const existing = this.db
         .prepare("SELECT * FROM jobs WHERE source_event_id = ?")
         .get(request.source_event_id) as JobRow | undefined;
@@ -327,12 +327,21 @@ export class DispatcherDatabase {
         SELECT ?,event_id,owner_json,destination_json FROM event_job_bindings WHERE event_id=?`).run(jobId,sourceEvent.event_id);
       if (binding.owner.kind === "schedule") {
         const scheduleAt = new Date(Math.floor(at.getTime() / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
-        this.scheduler.setRunState(binding.owner.run_id, "materialized", "started",
-          { tenant_id: binding.owner.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: sourceEvent.event_id },
-          scheduleAt, jobId);
+        try {
+          this.scheduler.setRunState(binding.owner.run_id, "materialized", "started",
+            { tenant_id: binding.owner.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: sourceEvent.event_id },
+            scheduleAt, jobId);
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "run_not_authorized") throw error;
+          this.db.prepare("DELETE FROM job_owner_bindings WHERE job_id=?").run(jobId);
+          this.db.prepare("DELETE FROM jobs WHERE job_id=?").run(jobId);
+          return undefined;
+        }
       }
       return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
     }).immediate();
+    if (!created) throw new Error("Schedule run is no longer authorized for job creation");
+    return created;
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -368,6 +377,13 @@ export class DispatcherDatabase {
          OR status = 'running'
       ORDER BY created_at LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
+  }
+
+  listOverdueScheduledJobs(at = new Date()): JobRow[] {
+    const deadline = new Date(at.getTime() - 3_600_000).toISOString();
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE j.status='running' AND j.prompt_accepted_at<=? AND json_extract(b.owner_json,'$.kind')='schedule'
+      ORDER BY j.prompt_accepted_at,j.job_id`).all(deadline) as JobRow[];
   }
 
   listJobsNeedingNotification(limit = 100): JobRow[] {
@@ -581,10 +597,21 @@ export class DispatcherDatabase {
     if(binding.owner.kind==="schedule") {
       const scheduleAt=new Date(Math.floor(at.getTime()/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
-      if(next==="needs_review") this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
-      else this.scheduler.setRunState(binding.owner.run_id,"started",next,
-        {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
-        next==="completed"?renderJobResult(result):null);
+      if(next==="needs_review"||job.status==="blocked") {
+        this.db.prepare("UPDATE job_completion_results SET work_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+      } else if(next==="cancelled"&&this.scheduler.getRun(binding.owner.run_id)?.status==="needs_review") {
+        this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",
+          {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt);
+      } else try {
+        this.scheduler.setRunState(binding.owner.run_id,"started",next,
+          {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
+          next==="completed"?renderJobResult(result):null);
+      } catch(error) {
+        if(!(error instanceof Error)||error.message!=="content_requires_redaction") throw error;
+        this.db.prepare("UPDATE job_completion_results SET work_state='needs_review',notification_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+      }
     }
     if(binding.destination.kind==="none"||binding.owner.kind==="schedule") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
     const envelope: EventEnvelope = {
