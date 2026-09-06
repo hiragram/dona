@@ -43,7 +43,7 @@ export interface SchedulerServiceOptions {
   owner?: string;
 }
 
-function nextPersistedOccurrence(definition: ScheduleDefinition, after: string): ReturnType<typeof nextOccurrence> {
+export function nextPersistedOccurrence(definition: ScheduleDefinition, after: string): ReturnType<typeof nextOccurrence> {
   let cursor = after;
   const last = Date.parse(`${MAX_YEAR}-12-31T23:59:59Z`);
   while (Date.parse(cursor) < last) {

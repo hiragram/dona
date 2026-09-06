@@ -47,11 +47,12 @@ function startWork(repo: SchedulerRepository, dispatcher: DispatcherDatabase, ra
   repo.setRunState(run.run_id, "materialized", "started", actor, at, job.row.job_id);
 }
 
-test("新規DB、v2既存データ、再open、WAL/FK", () => {
+test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   const { raw, filename, dispatcher } = setup();
   const event = dispatcher.enqueue(eventEnvelope("legacy")).row;
-  raw.exec(`DROP TABLE schedule_audit; DROP TABLE connector_outbox; DROP TABLE schedule_runs; DROP TABLE schedule_claims;
-    DROP TABLE schedules; DROP TABLE schedule_revisions; DROP TABLE scheduler_schema`);
+  raw.exec(`DROP TABLE schedule_audit; DROP TABLE connector_outbox; DROP TABLE schedule_runs;
+    DROP TABLE schedule_claims; DROP TABLE schedules; DROP TABLE schedule_revisions;
+    DROP TABLE schedule_list_sequence; DROP TABLE scheduler_schema`);
   assert.equal(raw.pragma("user_version", { simple: true }), 2);
   const reopened = new DispatcherDatabase(filename);
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
@@ -60,13 +61,8 @@ test("新規DB、v2既存データ、再open、WAL/FK", () => {
   assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
   reopened.close();
-});
-
-test("unknown extension versionを拒否する", () => {
-  const raw = new Database(":memory:");
-  raw.exec("CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO scheduler_schema VALUES(1,2)");
-  assert.throws(() => migrateScheduler(raw), /unsupported_scheduler_schema/);
-  raw.close();
+  raw.exec("UPDATE scheduler_schema SET version = 3");
+  assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {
@@ -80,22 +76,41 @@ test("extension migration失敗は全DDLをrollbackしcore versionを保持す�
   } finally { raw.close(); }
 });
 
-test("既存scheduler v1 DBへrollback互換のclaim tableだけを追加する", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-scheduler-v1-"));
-  const filename = path.join(root, "legacy.sqlite");
-  const initial = new DispatcherDatabase(filename);
-  initial.close();
-  const legacy = new Database(filename);
-  legacy.exec("DROP TABLE schedule_claims");
-  assert.equal((legacy.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
-  legacy.close();
-  const migrated = new DispatcherDatabase(filename);
-  const raw = new Database(filename);
-  assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
-  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
-  raw.close();
-  migrated.close();
-  fs.rmSync(root, { recursive: true, force: true });
+test("scheduler schema v1へ保持されるlist sequenceを追加する", () => {
+  const raw = new Database(":memory:");
+  try {
+    raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+      INSERT INTO scheduler_schema VALUES(1, 1);
+      CREATE TABLE schedules(schedule_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL);
+      CREATE TABLE schedule_revisions(schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, recurrence_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL, action TEXT NOT NULL, target_json TEXT NOT NULL, content_hash TEXT NOT NULL);
+      CREATE TABLE schedule_audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL, operation TEXT NOT NULL);
+      INSERT INTO schedules VALUES('legacy', 'T', 'U');
+      INSERT INTO schedule_revisions VALUES('legacy', 1, '{}', '{}', 'work.read_only', '{"kind":"none"}', 'content');
+      INSERT INTO schedule_audit(schedule_id, operation) VALUES('legacy', 'create');`);
+    migrateScheduler(raw);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
+    assert.equal((raw.prepare("SELECT list_sequence FROM schedules WHERE schedule_id = 'legacy'").get() as { list_sequence: number }).list_sequence, 1);
+    assert.equal((raw.prepare("SELECT next_value FROM schedule_list_sequence").get() as { next_value: number }).next_value, 2);
+    assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
+    assert.match((raw.prepare("SELECT create_payload_hash FROM schedules WHERE schedule_id = 'legacy'").get() as { create_payload_hash: string }).create_payload_hash, /^[a-f0-9]{64}$/);
+  } finally { raw.close(); }
+});
+
+test("revision 1が欠落した既存DBへexpand列を不完全に追加しない", () => {
+  const raw = new Database(":memory:");
+  try {
+    raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+      INSERT INTO scheduler_schema VALUES(1, 1);
+      CREATE TABLE schedules(schedule_id TEXT PRIMARY KEY);
+      INSERT INTO schedules VALUES('missing-initial');
+      CREATE TABLE schedule_revisions(schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, recurrence_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL, action TEXT NOT NULL, target_json TEXT NOT NULL, content_hash TEXT NOT NULL);
+      CREATE TABLE schedule_audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL, operation TEXT NOT NULL);`);
+    assert.throws(() => migrateScheduler(raw), /scheduler_create_payload_unrecoverable/);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
+    assert.equal((raw.prepare("SELECT count(*) AS count FROM pragma_table_info('schedules') WHERE name = 'create_payload_hash'").get() as { count: number }).count, 0);
+  } finally { raw.close(); }
 });
 
 test("createとauditがatomic、revision conflict・不正遷移・tenant越境を拒否", () => {
