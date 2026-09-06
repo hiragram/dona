@@ -88,29 +88,22 @@ export class ReminderPublisher {
     try {
       // Start from one tenant-fair batch, then refill each of the at most 100 slots as soon as it
       // finishes so a slow authorization lookup cannot hold completed capacity behind a barrier.
-      const initialAt = this.clock.now();
-      const initial = this.repository.claimBatch(initialAt, 240, "slack.reminder.post", 100);
-      let activeClaims = initial.length;
-      const worker = async (first: Outbox | undefined): Promise<void> => {
-        let row: Outbox | undefined = first;
-        while (this.running) {
-          if (!row) {
-            row = this.repository.claim(this.clock.now(), 240, "slack.reminder.post");
-            if (row) activeClaims++;
-            else {
-              if (activeClaims === 0) return;
-              await new Promise<void>((resolve) => setTimeout(resolve, this.pollMs));
-              continue;
-            }
-          }
-          try { await this.publishClaimed(row, this.clock.now()); }
-          finally { activeClaims--; }
-          row = undefined;
-        }
+      const active = new Set<Promise<void>>();
+      const launch = (row: Outbox): void => {
+        let task!: Promise<void>;
+        task = this.publishClaimed(row, this.clock.now()).finally(() => active.delete(task));
+        active.add(task);
       };
-      const settled = await Promise.allSettled(Array.from({ length: 100 }, (_, index) => worker(initial[index])));
-      const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
-      if (failed) throw failed.reason;
+      for (const row of this.repository.claimBatch(this.clock.now(), 240, "slack.reminder.post", 100)) launch(row);
+      while (this.running && active.size > 0) {
+        if (active.size < 100) {
+          const claimed = this.repository.claimBatch(this.clock.now(), 240, "slack.reminder.post", 100 - active.size);
+          for (const row of claimed) launch(row);
+        }
+        if (active.size === 0) break;
+        try { await Promise.race([...active, new Promise<void>((resolve) => setTimeout(resolve, this.pollMs))]); }
+        catch (error) { await Promise.allSettled(active); throw error; }
+      }
     }
     catch (error) { this.logger.error("Slack reminder publisher failed", { error_code: error instanceof Error ? error.message : "publisher_failed" }); }
     if (this.running) { this.timer = setTimeout(() => { this.loopPromise = this.tick(); }, this.pollMs); this.timer.unref(); }

@@ -687,7 +687,8 @@ export class SchedulerRepository {
         AND (? = 1 OR lease_until <= ?)`).all(recoverAllStarted ? 1 : 0, now) as Outbox[];
       for (const row of ambiguous) this.markAmbiguous(row, now);
       const result = this.db.prepare(`UPDATE connector_outbox SET status = 'pending', claim_token = NULL, lease_until = NULL,
-        updated_at = ? WHERE status = 'claimed' AND lease_until <= ? AND request_started_at IS NULL`).run(now, now);
+        updated_at = ? WHERE status = 'claimed' AND (? = 1 OR lease_until <= ?) AND request_started_at IS NULL`)
+        .run(now, recoverAllStarted ? 1 : 0, now);
       let expired = 0;
       const unsent = this.db.prepare("SELECT * FROM connector_outbox WHERE status IN ('pending','claimed')").all() as Outbox[];
       for (const row of unsent) if (this.expireUnsent(row, now)) expired++;
