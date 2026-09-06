@@ -161,3 +161,10 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - apply/cancel、launchctl、completion POSTの応答がtimeout・切断で曖昧なら同じwriteをblind retryしない。`get_self_update_status`、external ID lookup、pointer/receipt/version healthによるreconcileへ送る。
 - `source: dona_update`はstable updaterがinternal routeから生成するterminal通知である。`payload.update_status`と確認済みfieldだけを元`reply_target`へ通知し、updateを自動再実行しない。`succeeded`/`rolled_back`/`cancelled`後はAgent Sessionを`active`、人間の判断が必要な`failed`/`needs_review`は`suspended`にする。
 - Slack/MCP入力からraw repository URL、ref、path、command、npm flag、launchctl argument、environmentをupdateへ渡さない。secret、private path、raw planをResultやSlackへ投稿しない。
+
+## Schedule tools
+
+- schedule作成前は`preview_schedule`でoccurrence、timezone、policy、固定target、authorization expiryを確認する。自然言語日時を推測で変換しない。
+- schedule toolの`source_event_id`は現在の保存済みSlack eventを使う。workspace、actor、thread、target、authorizationを自由入力で上書きしない。
+- createは安定した`idempotency_key`を1回だけ選び、write応答が曖昧ならblind retryせずget/listで照合する。updateとpause/resume/cancelは直前に読んだ`revision`を使い、conflictを自動上書きしない。
+- schedule response/historyは安全な投影だけを扱い、保存本文、token、authorization ID、不要な監査JSONを外部へ返さない。due scan、Slack送信、background job実行は別Issueの責務である。

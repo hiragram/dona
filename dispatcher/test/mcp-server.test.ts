@@ -52,6 +52,13 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "cancelSelfUpdate", args: [input] });
         return { schema_version: 1, state: "cancelled" };
       },
+      async previewSchedule(input) { calls.push({ method: "previewSchedule", args: [input] }); return { schema_version: 1 }; },
+      async createSchedule(input) { calls.push({ method: "createSchedule", args: [input] }); return { schema_version: 1 }; },
+      async getSchedule(...args) { calls.push({ method: "getSchedule", args }); return { schema_version: 1 }; },
+      async listSchedules(...args) { calls.push({ method: "listSchedules", args }); return { schema_version: 1 }; },
+      async updateSchedule(...args) { calls.push({ method: "updateSchedule", args }); return { schema_version: 1 }; },
+      async transitionSchedule(...args) { calls.push({ method: "transitionSchedule", args }); return { schema_version: 1 }; },
+      async getScheduleHistory(...args) { calls.push({ method: "getScheduleHistory", args }); return { schema_version: 1 }; },
     };
     const server = createDispatcherMcpServer(api, logger);
     const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -69,6 +76,15 @@ describe("Dona Dispatcher MCP server", () => {
         "apply_self_update",
         "get_self_update_status",
         "cancel_self_update",
+        "preview_schedule",
+        "create_schedule",
+        "get_schedule",
+        "list_schedules",
+        "update_schedule",
+        "pause_schedule",
+        "resume_schedule",
+        "cancel_schedule",
+        "get_schedule_history",
       ]);
       assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
@@ -94,6 +110,14 @@ describe("Dona Dispatcher MCP server", () => {
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
         }],
       }]);
+
+      const preview = await client.callTool({ name: "preview_schedule", arguments: {
+        source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+        definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },
+        after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10,
+      } });
+      assert.equal(preview.isError, undefined);
+      assert.equal(calls.at(-1)?.method, "previewSchedule");
 
       const body = {
         schema_version: 1,

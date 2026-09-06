@@ -14,6 +14,13 @@ export interface DispatcherJobClient {
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
   cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
+  previewSchedule(input: unknown): Promise<Record<string, unknown>>;
+  createSchedule(input: unknown): Promise<Record<string, unknown>>;
+  getSchedule(scheduleId: string, sourceEventId: string): Promise<Record<string, unknown>>;
+  listSchedules(sourceEventId: string, limit: number, cursor?: string): Promise<Record<string, unknown>>;
+  updateSchedule(scheduleId: string, input: unknown): Promise<Record<string, unknown>>;
+  transitionSchedule(scheduleId: string, action: "pause"|"resume"|"cancel", input: unknown): Promise<Record<string, unknown>>;
+  getScheduleHistory(scheduleId: string, sourceEventId: string, limit: number, cursor?: string): Promise<Record<string, unknown>>;
 }
 
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i).describe("現在処理中のDona event_id");
@@ -25,6 +32,13 @@ const updateRequestId = z.string().regex(/^upd_[0-9a-hjkmnp-tv-z]{26}$/);
 const updatePlanId = z.string().regex(/^plan_[0-9a-hjkmnp-tv-z]{26}$/);
 const planHash = z.string().regex(/^[0-9a-f]{64}$/);
 const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
+const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
+const recurrence = z.record(z.string(), z.unknown());
+const scheduleAction = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("reminder"), body: z.string().min(1).max(2000) }).strict(),
+  z.object({ kind: z.literal("work"), objective: z.string().min(1).max(4000), notify: z.enum(["origin_thread", "none"]) }).strict(),
+]);
+const scheduleDefinition = z.object({ recurrence, action: scheduleAction }).strict();
 
 function success(data: Record<string, unknown>) {
   return {
@@ -205,6 +219,14 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return failure(error, logger, "cancel_self_update");
     }
   });
+
+  server.registerTool("preview_schedule", { title: "Preview schedule", description: "作成前に固定宛先・権限期限・有限occurrenceを確認します。", inputSchema: { source_event_id: eventId, definition: scheduleDefinition, after: z.string(), before_or_equal: z.string(), limit: z.number().int().min(1).max(100) }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => { try { return success(await client.previewSchedule(input)); } catch (e) { return failure(e, logger, "preview_schedule"); } });
+  server.registerTool("create_schedule", { title: "Create schedule", description: "現在のSlack event contextへserver-side bindingしてscheduleを作成します。timeout時は同じidempotency_keyをblind retryせずget/listで照合します。", inputSchema: { source_event_id: eventId, idempotency_key: approvalId, definition: scheduleDefinition }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => { try { return success(await client.createSchedule(input)); } catch (e) { return failure(e, logger, "create_schedule"); } });
+  server.registerTool("get_schedule", { title: "Get schedule", description: "所有するscheduleの安全な投影を取得します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id}) => { try { return success(await client.getSchedule(schedule_id, source_event_id)); } catch (e) { return failure(e, logger, "get_schedule"); } });
+  server.registerTool("list_schedules", { title: "List schedules", description: "所有するscheduleをbounded paginationで列挙します。", inputSchema: { source_event_id: eventId, limit: z.number().int().min(1).max(100).default(50), cursor: scheduleId.optional() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, limit, cursor}) => { try { return success(await client.listSchedules(source_event_id, limit, cursor)); } catch (e) { return failure(e, logger, "list_schedules"); } });
+  server.registerTool("update_schedule", { title: "Update schedule", description: "optimistic revisionと新しいevent authorizationでscheduleを更新します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId, expected_revision: z.number().int().positive(), definition: scheduleDefinition }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } }, async ({schedule_id, ...input}) => { try { return success(await client.updateSchedule(schedule_id, input)); } catch (e) { return failure(e, logger, "update_schedule"); } });
+  for (const operation of ["pause", "resume", "cancel"] as const) server.registerTool(`${operation}_schedule`, { title: `${operation} schedule`, description: `optimistic revisionでscheduleを${operation}します。`, inputSchema: { source_event_id: eventId, schedule_id: scheduleId, expected_revision: z.number().int().positive() }, annotations: { readOnlyHint: false, destructiveHint: operation === "cancel", idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id, expected_revision}) => { try { return success(await client.transitionSchedule(schedule_id, operation, {source_event_id, expected_revision})); } catch (e) { return failure(e, logger, `${operation}_schedule`); } });
+  server.registerTool("get_schedule_history", { title: "Get schedule history", description: "run statusをbounded paginationで取得します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId, limit: z.number().int().min(1).max(100).default(50), cursor: z.string().max(160).optional() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id, limit, cursor}) => { try { return success(await client.getScheduleHistory(schedule_id, source_event_id, limit, cursor)); } catch (e) { return failure(e, logger, "get_schedule_history"); } });
 
   return server;
 }

@@ -33,6 +33,10 @@ export interface Run {
   reason: string | null; event_id: string | null; job_id: string | null; created_at: string;
   started_at: string | null; terminal_at: string | null;
 }
+export interface ScheduleView extends Schedule {
+  action: Action; target: Target; timezone: string | null; tzdb_version: string | null;
+  expires_at: string; recurrence_json: string; policy_json: string; content_hash: string; authorization_id: string;
+}
 export interface Outbox {
   outbox_id: string; run_id: string; kind: "slack.reminder.post" | "slack.work_result.post";
   idempotency_key: string; target_json: string; content: string | null; content_hash: string;
@@ -80,6 +84,35 @@ export class SchedulerRepository {
 
   get(scheduleId: string): Schedule | undefined {
     return this.db.prepare("SELECT * FROM schedules WHERE schedule_id = ?").get(scheduleId) as Schedule | undefined;
+  }
+  getAuthorized(scheduleId: string, actor: Actor): ScheduleView | undefined {
+    const row = this.get(scheduleId);
+    if (!row) return undefined;
+    this.checked(scheduleId, row.revision, actor);
+    const revision = this.revision(row);
+    return { ...row, action: revision.action, target: JSON.parse(revision.target_json) as Target,
+      timezone: revision.timezone, tzdb_version: revision.tzdb_version, expires_at: revision.expires_at,
+      recurrence_json: revision.recurrence_json, policy_json: revision.policy_json, content_hash: revision.content_hash,
+      authorization_id: revision.authorization_id };
+  }
+  listAuthorized(actor: Actor, limit: number, cursor?: string): ScheduleView[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    id(actor.tenant_id); id(actor.actor_id);
+    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ?
+      AND schedule_id > ? ORDER BY schedule_id LIMIT ?`).all(actor.tenant_id, actor.actor_id, cursor ?? "", limit) as Schedule[];
+    return rows.map(row => this.getAuthorized(row.schedule_id, actor)!);
+  }
+  runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: string): Run[] {
+    const schedule = this.get(scheduleId);
+    if (!schedule) throw new Error("schedule_not_found");
+    this.checked(scheduleId, schedule.revision, actor);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    return this.db.prepare(`SELECT * FROM schedule_runs WHERE schedule_id = ? AND run_id > ?
+      ORDER BY run_id LIMIT ?`).all(scheduleId, cursor ?? "", limit) as Run[];
+  }
+  pendingMaterializedCount(scheduleId: string): number {
+    return (this.db.prepare("SELECT count(*) AS count FROM schedule_runs WHERE schedule_id = ? AND status = 'materialized'")
+      .get(scheduleId) as { count: number }).count;
   }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
@@ -205,7 +238,7 @@ export class SchedulerRepository {
       const before = this.checked(scheduleId, expectedRevision, actor, true);
       const previousRevision = this.revision(before);
       const updateAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at].sort().at(-1)!;
-      if (!["paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
+      if (!["active", "paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
       if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
