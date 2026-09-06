@@ -28,16 +28,19 @@ async function fixture() {
   otherThreadEnvelope.reply_target = { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722031.123456" };
   const otherThread = database.enqueue(otherThreadEnvelope).row;
   for (const row of [first, other, otherThread]) activateEvent(config.databasePath, row.event_id);
-  return { root, config, database, first, other, otherThread, api: new ScheduleApiService(database, () => new Date("2026-09-02T00:00:00Z")) };
+  const wakes = { count: 0 };
+  return { root, config, database, first, other, otherThread, wakes,
+    api: new ScheduleApiService(database, () => new Date("2026-09-02T00:00:00Z"), () => { wakes.count++; }) };
 }
 
 test("preview/create/read/listはevent contextへ固定しsecret本文を投影しない", async () => {
-  const { config, database, first, api } = await fixture();
+  const { config, database, first, api, wakes } = await fixture();
   const preview = api.preview({ source_event_id: first.event_id, definition: definition(), after: "2026-09-02T00:00:00Z", before_or_equal: "2026-09-10T00:00:00Z", limit: 3 });
   assert.equal(preview.preview.occurrences.length, 3);
   assert.deepEqual(preview.target, { kind: "thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() });
   assert.equal(created.duplicate, false);
+  assert.equal(wakes.count, 1);
   assert.equal(JSON.stringify(created).includes("確認してください"), false);
   const correlation = (created.schedule as { idempotency_key_hash: string }).idempotency_key_hash;
   assert.match(correlation, /^[a-f0-9]{64}$/);
@@ -46,11 +49,13 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   assert.equal(api.list(first.event_id, 1).schedules.length, 1);
   assert.equal((api.list(first.event_id, 1).schedules[0] as { idempotency_key_hash: string }).idempotency_key_hash, correlation);
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
+  assert.equal(wakes.count, 1);
   assert.equal(new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("別本文") }), (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
   const updateEvent = database.enqueue(eventEnvelope("schedule-api-update")).row;
   activateEvent(config.databasePath, updateEvent.event_id);
   api.update(schedule.schedule_id, { source_event_id: updateEvent.event_id, expected_revision: 1, definition: definition("更新後") });
+  assert.equal(wakes.count, 2);
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("更新後") }),
     (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
@@ -78,6 +83,18 @@ test("schedule一覧cursorは同一秒に後から作成したscheduleを見落�
   const reopened = new DispatcherDatabase(config.databasePath);
   assert.equal(new ScheduleApiService(reopened).list(first.event_id, 10).schedules.length, 2);
   reopened.close();
+});
+
+test("schedule一覧はbinding永続データの異常をunauthorizedとして握り潰さない", async () => {
+  const { config, database, first, api } = await fixture();
+  api.create({ source_event_id: first.event_id, idempotency_key: "broken-binding", definition: definition() });
+  const followup = database.enqueue(eventEnvelope("schedule-api-followup")).row;
+  activateEvent(config.databasePath, followup.event_id);
+  const raw = new Database(config.databasePath);
+  raw.prepare("UPDATE events SET subject_json = ? WHERE event_id = ?").run("{", first.event_id);
+  raw.close();
+  assert.throws(() => api.list(followup.event_id, 10), SyntaxError);
+  database.close();
 });
 
 test("別actorを拒否しrevision conflictと冪等transitionを区別する", async () => {
@@ -167,6 +184,7 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
   assert.equal(JSON.stringify(updated).includes("更新本文"), false);
   assert.throws(() => api.list(first.event_id, 101), /invalid_limit/);
   assert.throws(() => api.history(id, first.event_id, 10, "run_random"), /invalid_cursor/);
+  assert.throws(() => api.history(id, first.event_id, 10, "9999-99-99T99:99:99Z|run_00000000-0000-0000-0000-000000000000"), /invalid_cursor/);
   database.close();
   const reopened = new DispatcherDatabase(config.databasePath);
   const reopenedApi = new ScheduleApiService(reopened, () => new Date("2026-09-02T00:00:00Z"));

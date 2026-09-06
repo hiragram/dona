@@ -64,6 +64,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       },
     },
     updateNotificationWorker,
+    undefined,
+    () => scheduler.wake(),
   );
 
   try {
