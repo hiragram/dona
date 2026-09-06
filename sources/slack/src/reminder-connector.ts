@@ -106,7 +106,9 @@ export class SlackReminderConnector {
     if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
     const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
     if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
-    const ticketExpiresAt = Date.now() + 60_000;
+    // The ticket is valid only for the one-second channel slot reserved above. If the
+    // dispatcher stalls, it must preflight again instead of bursting stale reservations.
+    const ticketExpiresAt = Date.now() + 1_000;
     const authorizationExpiresAt = Date.parse(input.expires_at);
     const misfireAt = Date.parse(input.misfire_at);
     this.prepared.set(input.outbox_id, { serialized, ticketExpiresAt, authorizationExpiresAt, misfireAt });
