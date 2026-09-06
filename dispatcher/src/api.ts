@@ -193,13 +193,17 @@ export class DispatcherApi {
         } catch {
           ready = false;
         }
+        const appSchema = this.database.schemaCompatibility();
         sendJson(response, ready ? 200 : 503, {
           schema_version: 1,
           status: ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: 2,
+          app_schema: appSchema.actual,
+          app_schema_read_min: appSchema.read_min,
+          app_schema_read_max: appSchema.read_max,
+          app_schema_write: appSchema.write,
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });

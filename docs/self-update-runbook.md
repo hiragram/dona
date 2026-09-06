@@ -86,7 +86,9 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 ## Backupとschema
 
-初期版はapp DB schema v2を変更しません。将来migrationする場合はN-1/N双方のread rangeを先に広げるexpand/contract release、quiesce後のSQLite Online Backup、restore open/integrity testを別途必須にします。WAL稼働中の`.sqlite3`単体copyは禁止です。irreversible migrationやsecret format変更はrollback不可としてactivation前に拒否します。
+bridge releaseはapp DB `user_version=2`とlegacy single-job write/result/completionを維持し、`multi_job_enabled=false`を固定する。healthとrelease manifestのactual build SHA、read range 2〜3、write schema 2、protocol/configが一致しない場合はplanまたはpointer切替前に拒否する。current→bridgeはfast-forwardでなければならず、timeoutやconnection lossはpointer、receipt、version healthをread-onlyで照合してblind retryしない。
+
+schema v3 migration、multi-job activation、SQLite Online Backup/restore、live Slack fan-out smokeは後続activation releaseの責務である。activation targetは実稼働bridge SHAの子孫でなければならず、rollback先もv3をread可能なbridgeに限定する。WAL稼働中の`.sqlite3`単体copyは禁止する。CIやrehearsalはlive rollout成功の代替にしない。
 
 ## Retention
 

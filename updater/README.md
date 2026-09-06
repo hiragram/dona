@@ -38,7 +38,7 @@ policyは次を固定します。
 - expected GitHub Actions check 3件と、任意のcommit signature gate
 - protocol/config/app schema read/write range
 
-candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)をexact SHAからplan時に読み、staging checkoutでも再照合します。現行app DBはschema v2のままで、live WAL DB fileをcopyするmigrationはありません。
+candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)をexact SHAからplan時に読み、staging checkoutでも再照合します。このbridgeはschema v2〜v3をreadしつつwrite schema 2を維持します。activation releaseはbridgeの実稼働exact SHAを祖先として別途検証し、live WAL DB fileの単体copyをbackup扱いしません。
 
 ## APIとCLI
 
