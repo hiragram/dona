@@ -80,6 +80,7 @@ function truncateResultContent(value: string): string {
   const points = [...value];
   return points.length <= 2000 ? value : `${points.slice(0, 1999).join("")}…`;
 }
+export function validateWorkResultContent(value: string): void { truncateResultContent(value); }
 
 export class SchedulerRepository {
   constructor(private readonly db: Database.Database, private readonly enqueue: (event: EventEnvelope, at: Date) => EnqueueResult,
@@ -545,6 +546,25 @@ export class SchedulerRepository {
     }).immediate();
   }
 
+  settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string): void {
+    utc(now); id(eventId);
+    this.db.transaction(() => {
+      const run = this.db.prepare("SELECT * FROM schedule_runs WHERE event_id=?").get(eventId) as Run | undefined;
+      if (!run || run.status !== "materialized" || run.job_id !== null) return;
+      const before = this.get(run.schedule_id)!;
+      const settledAt=[now,run.created_at,before.created_at,before.updated_at].sort().at(-1)!;
+      this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,terminal_at=? WHERE run_id=?")
+        .run(outcome, outcome === "needs_review" ? "ambiguous_write" : null, outcome === "failed" ? settledAt : null, run.run_id);
+      if (outcome === "needs_review") {
+        this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=?").run(settledAt, run.schedule_id);
+        this.retireRevisions(run.schedule_id, settledAt);
+      }
+      this.audit(before, this.get(run.schedule_id)!, `event_${outcome}`,
+        {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:eventId},settledAt,undefined,this.getRun(run.run_id)!);
+      this.completeIfDrained(run.schedule_id, settledAt);
+    }).immediate();
+  }
+
   reconcileWorkRun(runId: string, outcome: "failed" | "cancelled", actor: Actor, now: string): Run {
     utc(now); if (actor.role !== "admin") throw new Error("admin_required");
     return this.db.transaction(() => {
@@ -810,7 +830,8 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE connector_outbox SET content = NULL WHERE content_delete_at <= ?").run(now);
       this.db.prepare(`UPDATE jobs SET result_json = NULL,
         last_error_message = CASE WHEN last_error_code='agent_reported_failure' THEN NULL ELSE last_error_message END
-        WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?)`).run(now);
+        WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?
+          AND json_extract(owner_json,'$.kind')='schedule')`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

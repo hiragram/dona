@@ -121,7 +121,7 @@ export class DispatcherApi {
     private readonly updateNotifications?: ApiWorkerState,
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
-  ) { this.schedules = new ScheduleApiService(database, scheduleNow, wakeScheduler); }
+  ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });

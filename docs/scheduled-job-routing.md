@@ -15,7 +15,7 @@ materialization transactionはwork eventとbindingを同時に保存する。通
 
 job作成時に最新のschedule state、revision、authorization expiry、misfireを再確認してからrunを`started`へ移す。拒否時はjob INSERTだけを戻し、runの`cancelled`/`skipped`決定はcommitする。schedule cancel・pause・authorization expiry後も開始済みworkのResultは保存するが、repository policyに従って通知だけを抑止する。未開始runは既存scheduler遷移で`cancelled`または`skipped`となりjob作成を拒否する。
 
-schedule由来jobは永続化済み`prompt_accepted_at`から3600秒を実行期限とする。Dispatcher Supervisorは期限超過をcancelし、cancel acceptanceが曖昧なら既存job fenceとschedule runを`needs_review`へ移す。通常のworker wait timeoutは実行継続とdeadline超過を区別する。
+schedule由来jobは固定objectiveのためsteerを許可せず、cancelだけをowner操作として受け付ける。scheduleのcancelまたはauthorization expiryも対応jobのcancelへ接続する。永続化済み`prompt_accepted_at`から3600秒を実行期限とし、Dispatcher Supervisorは期限超過をcancelする。cancel acceptanceが曖昧なら既存job fenceとschedule runを`needs_review`へ移す。通常のworker wait timeoutは実行継続とdeadline超過を区別する。
 
 ## Resultとnotification
 

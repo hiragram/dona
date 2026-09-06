@@ -20,7 +20,7 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler } from "./scheduler/schema.js";
-import { SchedulerRepository } from "./scheduler/repository.js";
+import { SchedulerRepository, validateWorkResultContent } from "./scheduler/repository.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -386,6 +386,13 @@ export class DispatcherDatabase {
       ORDER BY j.prompt_accepted_at,j.job_id`).all(deadline) as JobRow[];
   }
 
+  listScheduledJobsRequiringCancellation(): JobRow[] {
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      JOIN schedules s ON s.schedule_id=json_extract(b.owner_json,'$.schedule_id')
+      WHERE json_extract(b.owner_json,'$.kind')='schedule' AND s.state IN ('cancelled','expired')
+      AND j.status IN ('queued','retryable_failed','running','blocked') ORDER BY j.created_at,j.job_id`).all() as JobRow[];
+  }
+
   listJobsNeedingNotification(limit = 100): JobRow[] {
     return this.db.prepare(`
       SELECT * FROM jobs
@@ -503,6 +510,8 @@ export class DispatcherDatabase {
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string): void {
+    const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
+    if (binding?.owner.kind === "schedule") validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     this.updateJob(jobId, ["running"], status, {
       result_json: stableStringify(result),
@@ -515,6 +524,7 @@ export class DispatcherDatabase {
 
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    this.assertJobSteerAllowed(jobId);
     const row = this.getJobRequired(jobId);
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
     if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
@@ -527,6 +537,7 @@ export class DispatcherDatabase {
 
   beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    this.assertJobSteerAllowed(jobId);
     const row = this.getJobRequired(jobId);
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
     if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
@@ -590,10 +601,11 @@ export class DispatcherDatabase {
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const workState=job.status==="completed"?"completed":job.status==="needs_review"?"needs_review":"failed";
     const notificationState="none";
+    const completedAt=job.completed_at??at.toISOString();
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
       (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(job.job_id,job.status,job.source_event_id,stableStringify(binding.owner),
-      stableStringify(binding.destination),workState,notificationState,at.toISOString(),new Date(at.getTime()+604_800_000).toISOString());
+      stableStringify(binding.destination),workState,notificationState,at.toISOString(),new Date(Date.parse(completedAt)+604_800_000).toISOString());
     if(binding.owner.kind==="schedule") {
       const scheduleAt=new Date(Math.floor(at.getTime()/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
@@ -653,6 +665,11 @@ export class DispatcherDatabase {
     if(!binding||!owner||stableStringify(binding.owner)!==owner.owner_json) throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
   }
 
+  private assertJobSteerAllowed(jobId:string):void {
+    const row=this.db.prepare("SELECT owner_json FROM job_owner_bindings WHERE job_id=?").get(jobId) as {owner_json:string}|undefined;
+    if(row&&(JSON.parse(row.owner_json) as {kind?:unknown}).kind==="schedule") throw new Error("Scheduled jobs cannot be steered");
+  }
+
   hasBlockedEvent(): boolean {
     return this.db.prepare("SELECT 1 FROM events WHERE status = 'blocked' LIMIT 1").get() !== undefined;
   }
@@ -707,16 +724,20 @@ export class DispatcherDatabase {
   }
 
   recoverStaleDispatching(at = new Date()): number {
-    return this.db
-      .prepare(`
+    return this.db.transaction(() => {
+      const scheduled=(this.db.prepare("SELECT event_id FROM events WHERE status='dispatching' AND source='dona_schedule'").all() as Array<{event_id:string}>);
+      const changed=this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
           last_error_code = 'stale_dispatching',
           last_error_message = 'Dispatcher restarted while prompt acceptance was unknown',
           updated_at = ?
         WHERE status = 'dispatching'
-      `)
-      .run(at.toISOString()).changes;
+      `).run(at.toISOString()).changes;
+      const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+      for(const row of scheduled) this.scheduler.settleUndelegatedWorkEvent(row.event_id,"needs_review",timestamp);
+      return changed;
+    }).immediate();
   }
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
@@ -743,17 +764,17 @@ export class DispatcherDatabase {
   }
 
   markBlocked(eventId: string, message: string, from: EventStatus[] = ["queued", "retryable_failed", "dispatching", "waiting_agent"]): void {
-    this.transition(eventId, from, "blocked", {
-      last_error_code: "agent_blocked",
-      last_error_message: message,
-    });
+    this.db.transaction(()=>{
+      this.transition(eventId, from, "blocked", {last_error_code: "agent_blocked",last_error_message: message});
+      this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date(Math.floor(Date.now()/1000)*1000).toISOString().replace(".000Z","Z"));
+    }).immediate();
   }
 
   markNeedsReview(eventId: string, code: string, message: string): void {
-    this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {
-      last_error_code: code,
-      last_error_message: message,
-    });
+    this.db.transaction(()=>{
+      this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {last_error_code: code,last_error_message: message});
+      this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
+    }).immediate();
   }
 
   recordPreDispatchFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
@@ -772,6 +793,7 @@ export class DispatcherDatabase {
           WHERE event_id = ?
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
+      if(status==="dead_letter") this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       return this.get(eventId)!;
     })();
   }
@@ -788,6 +810,7 @@ export class DispatcherDatabase {
             last_error_message = ?, updated_at = ? WHERE event_id = ?
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
+      if(status==="dead_letter") this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       return this.get(eventId)!;
     })();
   }

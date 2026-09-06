@@ -163,6 +163,11 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       this.publishNotifications();
+      for (const job of this.database.listScheduledJobsRequiringCancellation()) {
+        try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
+        catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
+          error_message: error instanceof Error ? error.message : String(error) }); }
+      }
       for (const job of this.database.listOverdueScheduledJobs()) {
         try { await this.cancel(job.job_id, job.source_event_id, "Scheduled work exceeded its 3600 second execution deadline"); }
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,

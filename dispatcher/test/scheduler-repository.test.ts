@@ -182,6 +182,7 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   const duplicate=dispatcher.createJob({source_event_id:event.event_id,objective:work.content,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
   assert.equal(duplicate.duplicate,true); assert.equal(duplicate.row.job_id,created.row.job_id);
   assert.equal(dispatcher.listOwnerJobs(event.event_id)[0]?.job_id,created.row.job_id);
+  assert.throws(()=>dispatcher.appendQueuedJobInstruction(created.row.job_id,event.event_id,"変更"),/cannot be steered/);
   assert.equal(repo.getRun(run.run_id)?.status,"started");
   const other=dispatcher.enqueue(eventEnvelope("other-owner")).row;
   assert.throws(()=>dispatcher.beginJobSteer(created.row.job_id,other.event_id),/does not belong/);
@@ -256,7 +257,10 @@ test("blockedとredaction拒否をneeds_reviewへ隔離し取消しを確定で�
     const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
     dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
     if (mode === "blocked") dispatcher.markJobBlocked(job.job_id, "入力待ち");
-    else dispatcher.saveJobResult(job.job_id, {schema_version:1,job_id:job.job_id,status:"completed",summary:"secret: redacted",output:{format:"markdown",text:"結果"},completed_at:due},job.result_path);
+    else {
+      assert.throws(()=>dispatcher.saveJobResult(job.job_id, {schema_version:1,job_id:job.job_id,status:"completed",summary:"secret: redacted",output:{format:"markdown",text:"結果"},completed_at:due},job.result_path),/content_requires_redaction/);
+      dispatcher.markJobNeedsReview(job.job_id,"invalid_result","content_requires_redaction");
+    }
     dispatcher.enqueueJobNotification(job.job_id, new Date(due));
     assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
     assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
@@ -276,6 +280,40 @@ test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", (
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:00:59Z")).length, 0);
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id, job.job_id);
+});
+
+test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象へ出す", () => {
+  const { repo, dispatcher } = setup(); const objective = "取消対象の調査";
+  repo.create("cancel_job", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  const run = repo.materialize("cancel_job", 1, due, later, due, actor).run;
+  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
+  repo.transition("cancel_job",1,"cancel",actor,due);
+  assert.equal(dispatcher.listScheduledJobsRequiringCancellation()[0]?.job_id,job.job_id);
+});
+
+test("schedule eventのdelegation前terminal failureをrunへ原子的に反映する", () => {
+  const { repo, dispatcher } = setup();
+  repo.create("dispatch_fail", { ...input, action: "work.read_only", target: { kind: "none" }, content: "失敗境界" }, due, actor, now);
+  const run = repo.materialize("dispatch_fail",1,due,later,due,actor).run;
+  dispatcher.recordPreDispatchFailure(run.event_id!,"preflight_failed","失敗",1,new Date(due));
+  assert.equal(dispatcher.get(run.event_id!)?.status,"dead_letter"); assert.equal(repo.getRun(run.run_id)?.status,"failed");
+});
+
+test("scheduled failed Resultを保存前にredactionし通常Slack Resultのretentionを変えない", () => {
+  const { repo, dispatcher, raw } = setup(); const objective="失敗結果";
+  repo.create("failed_secret",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);
+  const run=repo.materialize("failed_secret",1,due,later,due,actor).run;
+  const scheduled=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(scheduled.job_id,new Date(due)); dispatcher.beginJobDispatch(scheduled.job_id,new Date(due)); dispatcher.markJobRunning(scheduled.job_id,new Date(due));
+  assert.throws(()=>dispatcher.saveJobResult(scheduled.job_id,{schema_version:1,job_id:scheduled.job_id,status:"failed",summary:"token: secret",output:{format:"markdown",text:"失敗"},completed_at:due},scheduled.result_path),/content_requires_redaction/);
+  assert.equal(dispatcher.getJob(scheduled.job_id)?.result_json,null);
+  const event=dispatcher.enqueue(eventEnvelope("slack-retention"),new Date(due)).row;
+  const slack=dispatcher.createJob({source_event_id:event.event_id,objective:"通常job",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(slack.job_id,new Date(due)); dispatcher.beginJobDispatch(slack.job_id,new Date(due)); dispatcher.markJobRunning(slack.job_id,new Date(due));
+  dispatcher.saveJobResult(slack.job_id,{schema_version:1,job_id:slack.job_id,status:"completed",summary:"通常",output:{format:"markdown",text:"保持"},completed_at:due},slack.result_path);
+  dispatcher.enqueueJobNotification(slack.job_id,new Date("2026-09-20T00:00:00Z")); repo.purge("2026-09-21T00:00:00Z");
+  assert.notEqual((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(slack.job_id) as {result_json:string|null}).result_json,null);
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {
