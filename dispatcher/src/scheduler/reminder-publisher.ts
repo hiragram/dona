@@ -51,7 +51,7 @@ export class ReminderPublisher {
     const token = claimed.claim_token!;
     let input: SlackReminderCommand;
     try { input = command(this.repository, claimed); }
-    catch { this.repository.requestStarted(claimed.outbox_id, token, now); this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", now); return; }
+    catch { this.repository.rejectClaimBeforeWrite(claimed.outbox_id, token, now, "invalid_command"); return; }
     // This durable transition is the last operation before the connector call. A crash afterwards is acceptance unknown.
     this.repository.requestStarted(claimed.outbox_id, token, now);
     let result: ReminderDelivery;

@@ -67,11 +67,15 @@ export class SlackReminderConnector {
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
     catch { return { outcome: "revoked", code: "workspace_not_allowed" }; }
+    const authorizationKey = `${input.target.workspace_id}:${input.target.channel_id}`;
     const authorizationDelay = Math.max(0, (this.authorizationBlockedUntil.get(input.target.workspace_id) ?? 0) - Date.now());
-    if (authorizationDelay > 0 || this.authorizationInFlight.has(input.target.workspace_id)) {
+    if (authorizationDelay > 0) {
+      return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
+    }
+    if (this.authorizationInFlight.has(authorizationKey)) {
       return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: Math.max(1, Math.ceil(authorizationDelay / 1_000)) };
     }
-    this.authorizationInFlight.add(input.target.workspace_id);
+    this.authorizationInFlight.add(authorizationKey);
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
@@ -84,13 +88,13 @@ export class SlackReminderConnector {
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
         this.authorizationBlockedUntil.set(input.target.workspace_id, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000);
-        return { outcome: "unavailable", code: "authorization_rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
+        return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: error.retryAfterSeconds ?? 1 };
       }
       return revokedSlackErrors.has(code)
         ? { outcome: "revoked", code }
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
     } finally {
-      this.authorizationInFlight.delete(input.target.workspace_id);
+      this.authorizationInFlight.delete(authorizationKey);
     }
     try {
       if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };

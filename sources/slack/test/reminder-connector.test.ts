@@ -9,7 +9,7 @@ import { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 
 const keychain: KeychainStore = { async get() { return "xoxb-test"; }, async set() {} };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
-async function connector(post: () => Promise<{ channelId: string; messageTs: string }>, getChannel = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
+async function connector(post: (input: { channelId: string }) => Promise<{ channelId: string; messageTs: string }>, getChannel: (channelId: string) => Promise<{ id: string; isPrivate: boolean; isArchived: boolean; isMember: boolean; isShared: boolean; isMpim?: boolean }> = async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false })) {
   const client = { authenticate: async () => ({ teamId: "T1", botUserId: "U_BOT" }), getChannel,
     getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
   return new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
@@ -57,4 +57,32 @@ test("同一workspaceの同時認可照会を待機せずthrottleする", async 
   release();
   await first;
   assert.equal(calls, 1);
+});
+
+test("同一workspaceでも異なるchannelの認可照会を並行する", async () => {
+  let release!: () => void;
+  let authorizationCalls = 0;
+  const gate = new Promise<void>((resolve) => void (release = resolve));
+  const instance = await connector(async ({ channelId }) => ({ channelId, messageTs: "1.000001" }), async (channelId) => {
+    authorizationCalls++;
+    await gate;
+    return { id: channelId, isPrivate: false, isArchived: false, isMember: true, isShared: false };
+  });
+  const first = instance.deliver(input);
+  const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2", target: { ...input.target, channel_id: "C2" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(authorizationCalls, 2);
+  release();
+  assert.equal((await first).outcome, "accepted");
+  assert.equal((await second).outcome, "accepted");
+});
+
+test("認可rate limitをauthorization unavailableとして返す", async () => {
+  const instance = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }), async () => {
+    throw new SlackApiError("rate_limited", "rate", 901);
+  });
+  assert.deepEqual(await instance.deliver(input), {
+    outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: 901,
+  });
+  assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
 });

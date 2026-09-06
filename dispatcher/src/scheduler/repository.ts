@@ -714,6 +714,26 @@ export class SchedulerRepository {
     this.retireRevisions(run.schedule_id, ambiguousAt);
     this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
+  rejectClaimBeforeWrite(outboxId: string, token: string, now: string, rawDecisionCode: string): Outbox {
+    utc(now);
+    return this.db.transaction(() => {
+      const row = this.getOutbox(outboxId, now);
+      if (!row || row.status !== "claimed" || row.claim_token !== token || row.request_started_at !== null) throw new Error("claim_conflict");
+      const run = this.getRun(row.run_id)!;
+      const schedule = this.get(run.schedule_id)!;
+      const finishedAt = [now, row.created_at, row.updated_at, schedule.created_at, schedule.updated_at,
+        schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
+      this.db.prepare(`UPDATE connector_outbox SET status = 'failed', claim_token = NULL, lease_until = NULL,
+        terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
+        finishedAt, add(finishedAt, 604800), finishedAt, outboxId);
+      this.db.prepare("UPDATE schedule_runs SET status = 'failed', reason = ?, terminal_at = ? WHERE run_id = ? AND status IN ('materialized','started')")
+        .run(null, finishedAt, row.run_id);
+      const decisionCode = /^[a-z][a-z0-9_]{0,79}$/.test(rawDecisionCode) ? rawDecisionCode : "other";
+      this.auditOutbox(row, "outbox_rejected", finishedAt, schedule, decisionCode);
+      this.completeIfDrained(run.schedule_id, finishedAt);
+      return this.getOutbox(outboxId, finishedAt)!;
+    }).immediate();
+  }
   finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0, rawDecisionCode?: string): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
     if (!["sent", "not_accepted", "authorization_unavailable", "unavailable", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");

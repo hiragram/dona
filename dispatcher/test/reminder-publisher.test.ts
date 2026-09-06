@@ -63,6 +63,16 @@ test("claim後のpauseでconnectorを呼ばずoutboxを抑止する", async () =
   assert.equal(await state.publisher.publishOne(), false); assert.equal(state.commands.length, 0); state.database.close();
 });
 
+test("connector前のlocal command検証失敗はambiguousにしない", async () => {
+  const state = setup([{ outcome: "accepted", receipt_id: "1.000002" }]);
+  state.repo.reminderConstraints = () => undefined;
+  assert.equal(await state.publisher.publishOne(), true);
+  assert.equal(state.commands.length, 0);
+  assert.equal(state.repo.getRun(state.run.run_id)?.status, "failed");
+  assert.equal(state.repo.getRun(state.run.run_id)?.reason, null);
+  state.database.close();
+});
+
 test("独立reminderをbounded concurrencyで配送開始する", async () => {
   let finishFirst!: (value: ReminderDelivery) => void;
   let finishSecond!: (value: ReminderDelivery) => void;
