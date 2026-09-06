@@ -16,6 +16,7 @@ const command = z.strictObject({
   outbox_id: id,
   run_id: id,
   idempotency_key: id,
+  owner_id: id,
   target,
   text: z.string().min(1).refine((value) => [...value].length <= 2_000),
 });
@@ -26,7 +27,7 @@ export type SlackReminderResult =
   | { outcome: "rejected"; code: string }
   | { outcome: "acceptance_unknown"; code: string };
 
-const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)|xox[a-z]-|xapp-/i;
+const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)|https?:\/\/hooks\.slack\.com\/services\/|xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i;
 
 export function parseSlackReminderCommand(value: unknown): SlackReminderCommand {
   const parsed = command.safeParse(value);
@@ -43,10 +44,18 @@ export class SlackReminderConnector {
     let connection;
     try { connection = this.registry.getByTeamId(input.target.workspace_id); }
     catch { return { outcome: "rejected", code: "workspace_not_allowed" }; }
+    let channel;
     try {
-      const channel = await connection.client.getChannel(input.target.channel_id);
+      channel = await connection.client.getChannel(input.target.channel_id);
+      const owner = await connection.client.getUser(input.owner_id);
+      if (owner.isDeleted || owner.isBot || owner.isAppUser || !connection.client.hasChannelMember ||
+        !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))) return { outcome: "rejected", code: "owner_not_authorized" };
+    } catch (error) {
+      return { outcome: "not_accepted", code: error instanceof SlackApiError ? error.errorCode : "authorization_check_failed", retry_after_seconds: 1 };
+    }
+    try {
       if (channel.isArchived || !channel.isMember || channel.isShared) return { outcome: "rejected", code: "target_not_allowed" };
-      if (input.target.kind === "owner_dm" && !channel.isPrivate) return { outcome: "rejected", code: "target_not_allowed" };
+      if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "rejected", code: "target_not_allowed" };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,

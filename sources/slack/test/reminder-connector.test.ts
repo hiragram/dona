@@ -10,10 +10,11 @@ import { SlackWorkspaceRegistry } from "../src/workspace-registry.js";
 const keychain: KeychainStore = { async get() { return "xoxb-test"; }, async set() {} };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 async function connector(post: () => Promise<{ channelId: string; messageTs: string }>) {
-  const client = { authenticate: async () => ({ teamId: "T1" }), getChannel: async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false }), postMessage: post } as unknown as SlackApiClient;
+  const client = { authenticate: async () => ({ teamId: "T1" }), getChannel: async () => ({ id: "C1", isPrivate: false, isArchived: false, isMember: true, isShared: false }),
+    getUser: async () => ({ id: "U1", isBot: false, isAppUser: false, isDeleted: false }), hasChannelMember: async () => true, postMessage: post } as unknown as SlackApiClient;
   return new SlackReminderConnector(await SlackWorkspaceRegistry.load(["company"], keychain, logger, () => client));
 }
-const input = { schema_version: 1, action: "slack.reminder.post", outbox_id: "o1", run_id: "r1", idempotency_key: "k1",
+const input = { schema_version: 1, action: "slack.reminder.post", outbox_id: "o1", run_id: "r1", idempotency_key: "k1", owner_id: "U1",
   target: { kind: "channel", workspace_id: "T1", channel_id: "C1" }, text: "確認してください" } as const;
 
 test("target・本文を制限しSlack結果を分類する", async () => {

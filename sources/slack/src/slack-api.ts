@@ -58,6 +58,8 @@ export interface SlackChannel {
   topic?: string;
   purpose?: string;
   memberCount?: number;
+  isIm?: boolean;
+  userId?: string;
 }
 
 export interface SlackChannelPage {
@@ -123,6 +125,7 @@ export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
   getChannel(channelId: string): Promise<SlackChannel>;
+  hasChannelMember?(channelId: string, userId: string): Promise<boolean>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
@@ -173,6 +176,8 @@ function channelFromResponse(channel: {
   topic?: { value?: string };
   purpose?: { value?: string };
   num_members?: number;
+  is_im?: boolean;
+  user?: string;
 }): SlackChannel {
   return {
     id: nonEmpty(channel.id, "channel.id"),
@@ -184,6 +189,8 @@ function channelFromResponse(channel: {
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
+    ...(channel.is_im !== undefined ? { isIm: channel.is_im } : {}),
+    ...(channel.user ? { userId: channel.user } : {}),
   };
 }
 
@@ -367,6 +374,16 @@ export class SlackWebApiClient implements SlackApiClient {
       throw new SlackApiError("invalid_slack_response", "Slack response did not include channel");
     }
     return channelFromResponse(response.channel);
+  }
+
+  async hasChannelMember(channelId: string, userId: string): Promise<boolean> {
+    let cursor: string | undefined;
+    do {
+      const response = await callSlack(() => this.client.conversations.members({ channel: channelId, limit: 200, ...(cursor ? { cursor } : {}) }));
+      if ((response.members ?? []).includes(userId)) return true;
+      cursor = optionalCursor(response.response_metadata?.next_cursor);
+    } while (cursor);
+    return false;
   }
 
   async listUsers(limit: number, cursor?: string): Promise<SlackUserPage> {

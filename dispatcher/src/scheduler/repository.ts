@@ -562,17 +562,18 @@ export class SchedulerRepository {
       status, available_at, created_at, updated_at, content_delete_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?,NULL)`).run(
       `outbox_${randomUUID()}`, runId, kind, `${runId}:${kind}`, targetJson, content, digest(content), now, now, now);
   }
-  claim(now: string, leaseSeconds = 60): Outbox | undefined {
+  claim(now: string, leaseSeconds = 60, kind?: Outbox["kind"]): Outbox | undefined {
     utc(now); if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 300) throw new Error("invalid_lease");
     return this.db.transaction(() => {
       this.recover(now);
       const row = this.db.prepare(`SELECT o.* FROM connector_outbox o JOIN schedule_runs r USING(run_id)
         JOIN schedules s ON s.schedule_id = r.schedule_id JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
         WHERE o.status = 'pending' AND o.available_at <= ? AND o.content IS NOT NULL AND s.state = 'active'
+        AND (? IS NULL OR o.kind = ?)
         AND ((o.kind = 'slack.reminder.post' AND r.status IN ('materialized','started'))
           OR (o.kind = 'slack.work_result.post' AND r.status = 'completed'))
         AND s.revision = r.revision AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
-        ORDER BY o.available_at, o.outbox_id LIMIT 1`).get(now, now, now) as Outbox | undefined;
+        ORDER BY o.available_at, o.outbox_id LIMIT 1`).get(now, kind ?? null, kind ?? null, now, now) as Outbox | undefined;
       if (!row) return undefined;
       this.db.prepare("UPDATE connector_outbox SET status = 'claimed', claim_token = ?, lease_until = ?, updated_at = ? WHERE outbox_id = ?")
         .run(randomUUID(), add(now, leaseSeconds), now, row.outbox_id);
