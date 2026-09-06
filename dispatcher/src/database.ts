@@ -62,9 +62,9 @@ export class DispatcherDatabase {
       migrateJobRouting(this.db);
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
-        if(["preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
+        if(["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status)) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
-        else if(["queued","retryable_failed"].includes(row.status)) this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
+        else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
         else this.db.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown',last_error_message='Legacy agent may retain the shared result-directory grant' WHERE job_id=?").run(row.job_id);
       }
     } catch (error) {
