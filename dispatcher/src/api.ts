@@ -572,7 +572,10 @@ export class DispatcherApi {
     }
     const match = /^\/v1\/schedules\/([^/]+)(?:\/(pause|resume|cancel|runs))?$/.exec(url.pathname);
     if (!match) throw new ScheduleApiError(404, "not_found");
-    const scheduleId = decodeURIComponent(match[1]!); const action = match[2];
+    let scheduleId: string;
+    try { scheduleId = decodeURIComponent(match[1]!); }
+    catch (error) { if (error instanceof URIError) throw new ScheduleApiError(400, "invalid_schedule_id"); throw error; }
+    const action = match[2];
     if (request.method === "GET" && !action) { sendJson(response, 200, this.schedules.get(scheduleId, sourceEventId)); return; }
     if (request.method === "GET" && action === "runs") { const limit = Number(url.searchParams.get("limit") ?? 50); sendJson(response, 200, this.schedules.history(scheduleId, sourceEventId, limit, url.searchParams.get("cursor") ?? undefined)); return; }
     if (request.method === "PATCH" && !action) { sendJson(response, 200, this.schedules.update(scheduleId, await this.readJson(request))); return; }

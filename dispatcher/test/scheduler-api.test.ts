@@ -41,13 +41,13 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   database.close();
 });
 
-test("schedule一覧cursorはpage途中に後から作成したscheduleを見落とさない", async () => {
+test("schedule一覧cursorは同一秒に後から作成したscheduleを見落とさない", async () => {
   const { database, first, api } = await fixture();
   api.create({ source_event_id: first.event_id, idempotency_key: "first", definition: definition() });
   const firstPage = api.list(first.event_id, 1);
-  assert.match(String(firstPage.next_cursor), /^2026-09-02T00:00:00Z\|sch_/);
-  const later = new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z"));
-  later.create({ source_event_id: first.event_id, idempotency_key: "later", definition: { ...definition(), recurrence: { ...recurrence, start_date: "2026-09-03" } } });
+  assert.match(String(firstPage.next_cursor), /^\d+$/);
+  const later = new ScheduleApiService(database, () => new Date("2026-09-02T00:00:00Z"));
+  later.create({ source_event_id: first.event_id, idempotency_key: "later", definition: definition() });
   assert.equal(later.list(first.event_id, 1, String(firstPage.next_cursor)).schedules.length, 1);
   assert.throws(() => later.list(first.event_id, 1, "sch_random"), /invalid_cursor/);
   database.close();
@@ -68,12 +68,29 @@ test("別actorを拒否しrevision conflictと冪等transitionを区別する", 
   database.close();
 });
 
+test("resume成功後にmaterialize auditが追加されても同じ再送を照合する", async () => {
+  const { database, first, api } = await fixture();
+  const created = api.create({ source_event_id: first.event_id, idempotency_key: "resume-retry", definition: definition() });
+  const scheduleId = (created.schedule as { schedule_id: string }).schedule_id;
+  api.transition(scheduleId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  api.transition(scheduleId, "resume", { source_event_id: first.event_id, expected_revision: 2 });
+  database.scheduler.materialize(scheduleId, 3, "2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z", "2026-09-03T00:00:00Z",
+    { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: null });
+  assert.equal(api.transition(scheduleId, "resume", { source_event_id: first.event_id, expected_revision: 2 }).duplicate, true);
+  database.close();
+});
+
 test("更新・pagination上限・DB reopen後の永続読取を検証する", async () => {
   const { config, database, first, api } = await fixture();
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-3", definition: definition() });
   const id = (created.schedule as { schedule_id: string }).schedule_id;
   const updated = api.update(id, { source_event_id: first.event_id, expected_revision: 1, definition: definition("更新本文") });
   assert.equal((updated.schedule as { revision: number }).revision, 2);
+  const fingerprint = (updated.schedule as { fingerprint: Record<string, string> }).fingerprint;
+  assert.match(fingerprint.recurrence_hash!, /^[a-f0-9]{64}$/);
+  assert.match(fingerprint.policy_hash!, /^[a-f0-9]{64}$/);
+  assert.match(fingerprint.content_hash!, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(updated).includes("更新本文"), false);
   assert.throws(() => api.list(first.event_id, 101), /invalid_limit/);
   assert.throws(() => api.history(id, first.event_id, 10, "run_random"), /invalid_cursor/);
   database.close();

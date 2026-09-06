@@ -344,6 +344,7 @@ describe("DispatcherApi", () => {
     assert.equal((await request(config.socketPath, "GET", `/v1/schedules?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
     assert.equal((await request(config.socketPath, "POST", `/v1/schedules/${schedule.schedule_id}/pause`, { source_event_id: event.body.event_id, expected_revision: 1 })).status, 200);
     assert.equal((await request(config.socketPath, "GET", `/v1/schedules/${schedule.schedule_id}/runs?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/%ZZ?source_event_id=${event.body.event_id}`)).status, 400);
     await api.stop(); database.close();
   });
 });

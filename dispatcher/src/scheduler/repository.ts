@@ -37,6 +37,7 @@ export interface ScheduleView extends Schedule {
   action: Action; target: Target; timezone: string | null; tzdb_version: string | null;
   expires_at: string; recurrence_json: string; policy_json: string; content_hash: string; authorization_id: string;
 }
+export interface ListedSchedule { schedule: ScheduleView; sequence: number }
 export interface Outbox {
   outbox_id: string; run_id: string; kind: "slack.reminder.post" | "slack.work_result.post";
   idempotency_key: string; target_json: string; content: string | null; content_hash: string;
@@ -95,14 +96,15 @@ export class SchedulerRepository {
       recurrence_json: revision.recurrence_json, policy_json: revision.policy_json, content_hash: revision.content_hash,
       authorization_id: revision.authorization_id };
   }
-  listAuthorized(actor: Actor, limit: number, cursor?: { created_at: string; schedule_id: string }): ScheduleView[] {
+  listAuthorized(actor: Actor, limit: number, afterSequence = 0): ListedSchedule[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("invalid_cursor");
     id(actor.tenant_id); id(actor.actor_id);
-    const createdAt = cursor?.created_at ?? ""; const scheduleId = cursor?.schedule_id ?? "";
-    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ? AND
-      (created_at > ? OR (created_at = ? AND schedule_id > ?)) ORDER BY created_at, schedule_id LIMIT ?`)
-      .all(actor.tenant_id, actor.actor_id, createdAt, createdAt, scheduleId, limit) as Schedule[];
-    return rows.map(row => this.getAuthorized(row.schedule_id, actor)!);
+    const rows = this.db.prepare(`SELECT s.*, a.sequence AS create_sequence FROM schedules s
+      JOIN schedule_audit a ON a.schedule_id = s.schedule_id AND a.operation = 'create'
+      WHERE s.tenant_id = ? AND s.owner_id = ? AND a.sequence > ? ORDER BY a.sequence LIMIT ?`)
+      .all(actor.tenant_id, actor.actor_id, afterSequence, limit) as (Schedule & { create_sequence: number })[];
+    return rows.map(({ create_sequence, ...row }) => ({ schedule: this.getAuthorized(row.schedule_id, actor)!, sequence: create_sequence }));
   }
   runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: { scheduled_for: string; run_id: string }): Run[] {
     const schedule = this.get(scheduleId);
@@ -118,9 +120,9 @@ export class SchedulerRepository {
     return (this.db.prepare("SELECT count(*) AS count FROM schedule_runs WHERE schedule_id = ? AND status = 'materialized'")
       .get(scheduleId) as { count: number }).count;
   }
-  lastAuditOperation(scheduleId: string): string | undefined {
-    return (this.db.prepare("SELECT operation FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence DESC LIMIT 1")
-      .get(scheduleId) as { operation: string } | undefined)?.operation;
+  hasAuditOperation(scheduleId: string, revision: number, operation: string, sourceEventId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM schedule_audit WHERE schedule_id = ? AND revision = ?
+      AND operation = ? AND source_event_id = ? LIMIT 1`).get(scheduleId, revision, operation, sourceEventId) !== undefined;
   }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
