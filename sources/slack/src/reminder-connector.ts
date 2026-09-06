@@ -95,6 +95,7 @@ export class SlackReminderConnector {
     }
     const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
     if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
+    const reservedUntil = this.nextPostAt.get(authorizationKey);
     this.authorizationInFlight.add(authorizationKey);
     let channel;
     let authorizationMethod = "channel";
@@ -114,7 +115,7 @@ export class SlackReminderConnector {
       if (channel.isMpim && (!connection.botUserId || !connection.client.hasChannelMember ||
         !(await connection.client.hasChannelMember(input.target.channel_id, connection.botUserId)))) return { outcome: "revoked", code: "target_not_allowed" };
     } catch (error) {
-      this.nextPostAt.delete(authorizationKey);
+      if (this.nextPostAt.get(authorizationKey) === reservedUntil) this.nextPostAt.delete(authorizationKey);
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
       if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
         const key = `${input.target.workspace_id}:${authorizationMethod}`;

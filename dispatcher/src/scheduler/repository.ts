@@ -680,10 +680,11 @@ export class SchedulerRepository {
     if (!result) throw new Error("write_not_authorized");
     return result;
   }
-  recover(now: string): number {
+  recover(now: string, recoverAllStarted = false): number {
     utc(now);
     return this.db.transaction(() => {
-      const ambiguous = this.db.prepare("SELECT * FROM connector_outbox WHERE status = 'request_started' AND lease_until <= ?").all(now) as Outbox[];
+      const ambiguous = this.db.prepare(`SELECT * FROM connector_outbox WHERE status = 'request_started'
+        AND (? = 1 OR lease_until <= ?)`).all(recoverAllStarted ? 1 : 0, now) as Outbox[];
       for (const row of ambiguous) this.markAmbiguous(row, now);
       const result = this.db.prepare(`UPDATE connector_outbox SET status = 'pending', claim_token = NULL, lease_until = NULL,
         updated_at = ? WHERE status = 'claimed' AND lease_until <= ? AND request_started_at IS NULL`).run(now, now);
@@ -743,17 +744,20 @@ export class SchedulerRepository {
         if (outcome === "revoked") {
           const run = this.getRun(current.run_id)!;
           const schedule = this.get(run.schedule_id)!;
+          const revokedAt = [now, current.created_at, current.updated_at, current.terminal_at ?? current.created_at,
+            run.created_at, run.started_at ?? run.created_at, run.terminal_at ?? run.created_at,
+            schedule.created_at, schedule.updated_at, schedule.terminal_at ?? schedule.created_at].sort().at(-1)!;
           const runAuthorization = this.revision(run);
           const currentAuthorization = this.revision(schedule);
           if (runAuthorization.authorization_id === currentAuthorization.authorization_id &&
             runAuthorization.authorization_revision === currentAuthorization.authorization_revision) {
             if (schedule.state === "active") {
               this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND state = 'active'")
-                .run(now, run.schedule_id);
-              this.suppress(run.schedule_id, now, "cancelled");
+                .run(revokedAt, run.schedule_id);
+              this.suppress(run.schedule_id, revokedAt, "cancelled");
             }
-            this.retireRevisions(run.schedule_id, now, schedule.revision);
-            this.auditOutbox(current, "outbox_revoked", now, schedule, decisionCode);
+            this.retireRevisions(run.schedule_id, revokedAt, schedule.revision);
+            this.auditOutbox(current, "outbox_revoked", revokedAt, schedule, decisionCode);
           }
         }
         return this.getOutbox(outboxId, now)!;
