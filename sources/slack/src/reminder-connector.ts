@@ -19,6 +19,7 @@ const command = z.strictObject({
   owner_id: id,
   expires_at: z.string().datetime({ offset: false }),
   misfire_at: z.string().datetime({ offset: false }),
+  lease_until: z.string().datetime({ offset: false }),
   target,
   text: z.string().min(1).refine((value) => [...value].length <= 2_000),
 });

@@ -8,7 +8,8 @@ import type { Outbox, SchedulerRepository, Target } from "./repository.js";
 
 export interface SlackReminderCommand {
   schema_version: 1; action: "slack.reminder.post"; outbox_id: string; run_id: string;
-  idempotency_key: string; owner_id: string; expires_at: string; misfire_at: string; target: Exclude<Target, { kind: "none" }>; text: string;
+  idempotency_key: string; owner_id: string; expires_at: string; misfire_at: string; lease_until: string;
+  target: Exclude<Target, { kind: "none" }>; text: string;
 }
 export type ReminderDelivery =
   | { outcome: "prepared" }
@@ -25,8 +26,9 @@ export interface SlackReminderPort {
   deliver(command: SlackReminderCommand): Promise<ReminderDelivery>;
 }
 
-export function reminderConnectorTimeoutMs(path: string, configuredMs: number): number {
-  return path.endsWith("/preflight") ? 180_000 : Math.min(Math.max(configuredMs, 180_000), 230_000);
+export function reminderConnectorTimeoutMs(path: string, configuredMs: number, leaseUntil: string, nowMs = Date.now()): number {
+  const phaseMaximum = path.endsWith("/preflight") ? 180_000 : Math.min(Math.max(configuredMs, 180_000), 230_000);
+  return Math.max(1, Math.min(phaseMaximum, Date.parse(leaseUntil) - nowMs - 10_000));
 }
 
 function command(repository: SchedulerRepository, row: Outbox): SlackReminderCommand {
@@ -36,7 +38,7 @@ function command(repository: SchedulerRepository, row: Outbox): SlackReminderCom
   const constraints = repository.reminderConstraints(row.outbox_id);
   if (!constraints) throw new Error("invalid_reminder_owner");
   return { schema_version: 1, action: "slack.reminder.post", outbox_id: row.outbox_id, run_id: row.run_id, ...constraints,
-    idempotency_key: row.idempotency_key, target, text: row.content };
+    idempotency_key: row.idempotency_key, lease_until: row.lease_until!, target, text: row.content };
 }
 
 export class ReminderPublisher {
@@ -170,7 +172,7 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
     return await this.call(input, "/v1/internal/slack-reminders", token);
   }
   private async call(input: SlackReminderCommand, path: string, token: string): Promise<ReminderDelivery> {
-    const timeoutMs = reminderConnectorTimeoutMs(path, this.config.jobCommandTimeoutMs);
+    const timeoutMs = reminderConnectorTimeoutMs(path, this.config.jobCommandTimeoutMs, input.lease_until);
     try { return await request(this.config.slackAdapterSocketPath, token, path, input, timeoutMs); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;

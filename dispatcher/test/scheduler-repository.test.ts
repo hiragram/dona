@@ -1001,7 +1001,21 @@ test("配送完了時のmisfire判定はlease由来の保存時刻で早めな�
   const claim = repo.claim(actual, 240)!;
   repo.requestStarted(claim.outbox_id, claim.claim_token!, actual);
   raw.prepare("UPDATE schedules SET updated_at = ? WHERE schedule_id = ?").run("2026-09-05T00:16:40Z", "finish_before_misfire");
-  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", actual).status, "pending");
+  const retried = repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", actual);
+  assert.equal(retried.status, "pending");
+  assert.equal(retried.available_at, "2026-09-05T00:12:41Z");
+});
+
+test("one-shotの認可失敗はpausedをcompletedで上書きしない", () => {
+  const { dispatcher } = setup();
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  repo.create("once_revoked", once, due, actor, now);
+  repo.materialize("once_revoked", 1, due, null, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due, null, 0, "owner_not_authorized");
+  assert.equal(repo.get("once_revoked")?.state, "paused");
 });
 
 test("起動時のclaim解放はupdated_atを巻き戻さない", () => {

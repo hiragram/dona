@@ -588,6 +588,8 @@ export class SchedulerRepository {
     const before = this.get(scheduleId)!;
     if (!["active", "paused", "expired", "needs_review"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
+    // A paused current authorization that has been retired by the connector must remain renewable.
+    if (before.state === "paused" && this.revision(before).terminal_at !== null) return;
     const unsettled = this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o
         WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review'))) LIMIT 1`).get(scheduleId);
@@ -806,7 +808,7 @@ export class SchedulerRepository {
         const status = outcome === "sent" ? "sent" : retry ? "pending" : authorized ? "failed" : "cancelled";
         this.db.prepare(`UPDATE connector_outbox SET status = ?, available_at = ?, request_started_at = ?, receipt_id = ?,
           claim_token = NULL, lease_until = NULL, terminal_at = ?, content_delete_at = ?, updated_at = ? WHERE outbox_id = ?`).run(
-          status, add(finishedAt, retryDelay), retry ? null : row.request_started_at,
+          status, add(now, retryDelay), retry ? null : row.request_started_at,
           receiptId, retry ? null : finishedAt, retry ? null : add(finishedAt, 604800), finishedAt, outboxId);
         if (outcome === "unavailable" && retry) this.db.prepare("UPDATE connector_outbox SET attempt = attempt - 1 WHERE outbox_id = ?").run(outboxId);
         const authorizationFailedWhileActive = outcome === "authorization_unavailable" && schedule.state === "active" && !retry;

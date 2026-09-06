@@ -21,7 +21,7 @@ async function connector(post: (input: { channelId: string }) => Promise<{ chann
   } };
 }
 const input = { schema_version: 1, action: "slack.reminder.post", outbox_id: "o1", run_id: "r1", idempotency_key: "k1", owner_id: "U1",
-  expires_at: "2099-09-07T00:00:00Z", misfire_at: "2099-09-06T23:00:00Z",
+  expires_at: "2099-09-07T00:00:00Z", misfire_at: "2099-09-06T23:00:00Z", lease_until: "2099-09-06T23:04:00Z",
   target: { kind: "channel", workspace_id: "T1", channel_id: "C1" }, text: "確認してください" } as const;
 
 test("target・本文を制限しSlack結果を分類する", async () => {

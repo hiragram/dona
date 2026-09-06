@@ -17,9 +17,12 @@ const at = "2026-09-06T00:00:00Z";
 const actor: Actor = { tenant_id: "T1", actor_id: "U1", role: "owner", source_event_id: null };
 
 test("deliver timeoutは240秒のclaim leaseより短く固定する", () => {
-  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders/preflight", 999_000), 180_000);
-  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 999_000), 230_000);
-  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 200_000), 200_000);
+  const nowMs = Date.parse(at);
+  const lease = "2026-09-06T00:04:00Z";
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders/preflight", 999_000, lease, nowMs), 180_000);
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 999_000, lease, nowMs), 230_000);
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 999_000, lease, nowMs + 170_000), 60_000);
+  assert.equal(reminderConnectorTimeoutMs("/v1/internal/slack-reminders", 999_000, lease, nowMs + 231_000), 1);
 });
 function setup(outcomes: (ReminderDelivery | Promise<ReminderDelivery>)[], overrides: Partial<RevisionInput> = {}, nextDue: string | null = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-reminder-")); roots.push(root);
