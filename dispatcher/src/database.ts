@@ -60,7 +60,7 @@ export class DispatcherDatabase {
       this.migrate();
       migrateScheduler(this.db);
       migrateJobRouting(this.db);
-      this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE)");
+      this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,stopped_at TEXT)");
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
         this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
@@ -376,10 +376,10 @@ export class DispatcherDatabase {
   }
 
   listLegacySharedGrantJobs():JobRow[] {
-    return this.db.prepare("SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) ORDER BY j.created_at,j.job_id").all() as JobRow[];
+    return this.db.prepare("SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) WHERE l.stopped_at IS NULL ORDER BY j.created_at,j.job_id").all() as JobRow[];
   }
 
-  markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("DELETE FROM legacy_job_agents_to_stop WHERE job_id=?").run(jobId);}
+  markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=? WHERE job_id=?").run(nowUtc(),jobId);}
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {
     return this.db.prepare(`
@@ -409,7 +409,7 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result_agent_stop_unknown'))
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
@@ -421,7 +421,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result_agent_stop_unknown'))
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -542,6 +542,10 @@ export class DispatcherDatabase {
     });
   }
 
+  recordInvalidResultAgentStopFailure(jobId:string,message:string):void {
+    this.db.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stop_unknown',last_error_message=?,updated_at=? WHERE job_id=? AND status='needs_review'").run(message,nowUtc(),jobId);
+  }
+
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
     const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
     if (binding?.owner.kind === "schedule") {
@@ -556,6 +560,11 @@ export class DispatcherDatabase {
     if(binding?.owner.kind==="schedule"&&job.prompt_accepted_at&&completedAt.getTime()<Date.parse(job.prompt_accepted_at))
       throw new Error("completed_at_precedes_prompt_acceptance");
     this.db.transaction(()=>{
+      if(recoverAmbiguous&&job.completion_event_id) {
+        this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
+        this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
+      }
       this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
@@ -756,14 +765,18 @@ export class DispatcherDatabase {
   private suppressUnauthorizedScheduledNotifications(at: Date): void {
     const timestamp=at.toISOString();
     this.db.transaction(()=>{
-      const rows=this.db.prepare(`SELECT e.event_id FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
+      const rows=this.db.prepare(`SELECT e.event_id,c.notification_state FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent') AND json_extract(c.owner_json,'$.kind')='schedule'
           AND (julianday(c.materialized_at,'+900 seconds')<julianday(?) OR s.state NOT IN ('active','needs_review')
             OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
-        .all(timestamp,timestamp) as Array<{event_id:string}>;
+        .all(timestamp,timestamp) as Array<{event_id:string;notification_state:string}>;
       for(const row of rows) {
+        if(row.notification_state==="needs_review") {
+          this.db.prepare("UPDATE events SET status='needs_review',updated_at=?,last_error_code='notification_delivery_ambiguous',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(timestamp,row.event_id);
+          continue;
+        }
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
           last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')`).run(timestamp,timestamp,row.event_id);
         this.setNotificationState(row.event_id,"none",at);
@@ -849,7 +862,11 @@ export class DispatcherDatabase {
         WHERE event_id = ? AND status IN ('queued', 'retryable_failed')
       `)
       .run(timestamp, resultPath, timestamp, eventId).changes;
-    if (changed !== 1) throw new Error(`Event ${eventId} is no longer dispatchable`);
+    if (changed !== 1) {
+      const current=this.get(eventId);
+      if(current?.status==="completed"&&current.last_error_code==="schedule_notification_suppressed") return current;
+      throw new Error(`Event ${eventId} is no longer dispatchable`);
+    }
     return this.get(eventId)!;
   }
 

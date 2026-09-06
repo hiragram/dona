@@ -189,7 +189,7 @@ export class JobSupervisor {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
         if(["completed","failed"].includes(current?.status??"")) continue;
-        if(current?.status==="needs_review"&&current.last_error_code==="invalid_result") {await this.runtime.cancel(job.agent_name,this.abortController.signal);continue;}
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);if(!stopped.ok)this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));continue;}
         try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
         catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
@@ -198,7 +198,7 @@ export class JobSupervisor {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
         if(["completed","failed"].includes(current?.status??"")) continue;
-        if(current?.status==="needs_review"&&current.last_error_code==="invalid_result") {await this.runtime.cancel(job.agent_name,this.abortController.signal);continue;}
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);if(!stopped.ok)this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));continue;}
         try { await this.cancel(job.job_id, job.source_event_id, "Scheduled work exceeded its 3600 second execution deadline"); }
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }

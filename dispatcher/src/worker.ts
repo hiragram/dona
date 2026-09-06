@@ -144,6 +144,7 @@ export class DispatcherWorker {
     try {
       await fs.access(resultPath);
       const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+      if(dispatching.status==="completed") return;
       this.database.markNeedsReview(
         row.event_id,
         "result_path_exists",
@@ -165,6 +166,7 @@ export class DispatcherWorker {
     }
 
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+    if(dispatching.status==="completed") return;
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
