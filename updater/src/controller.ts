@@ -498,6 +498,17 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
       ))) return;
+      const previousCompatibility = (await this.releases.readCurrentManifest()).compatibility;
+      if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
+        const migration = await this.runtime.migrateAppSchema(
+          row.request_id, row.target_sha, previousCompatibility, targetCompatibility,
+        );
+        this.assertLease(row);
+        if (migration.timed_out || migration.output_truncated || migration.exit_code !== 0) {
+          this.needsReview(row, "app_schema_migration_unverified");
+          return;
+        }
+      }
       row = this.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced", {}, this.clock.now());
     }
     if (row.state === "activating") {

@@ -121,6 +121,7 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
 export function migrateDispatcherDatabase(
   db: Database.Database,
   migrationHook: DispatcherMigrationHook = () => {},
+  outerTransaction = false,
 ): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > dispatcherSchemaCompatibility.read_max) {
@@ -193,7 +194,7 @@ export function migrateDispatcherDatabase(
     CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
     PRAGMA user_version = 2;
   `);
-  if (version < 3) db.transaction(() => {
+  const migrateV3 = () => {
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -292,7 +293,8 @@ export function migrateDispatcherDatabase(
     `);
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
-  })();
+  };
+  if (version < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
   ensureJobsRunnableFairIndex(db);
 }
 

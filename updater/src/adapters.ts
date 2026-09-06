@@ -470,6 +470,23 @@ export class RealRuntime implements RuntimePort {
     return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
   }
 
+  migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
+    const root = path.resolve(this.policy.config_root, "..");
+    const backupRoot = path.join(this.policy.control_root, "schema-backups", requestId);
+    return this.runner.run(this.policy.executables.node, [
+      path.join(this.policy.release_root, targetSha, "dispatcher", "dist", "schema-rollout-cli.js"),
+      path.join(root, "dona.sqlite3"),
+      path.join(backupRoot, "dispatcher-v2.sqlite3"),
+      path.join(backupRoot, "migration-receipt.json"),
+      JSON.stringify(previous),
+      JSON.stringify(target),
+    ], {
+      timeoutMs: this.policy.timeouts.command_ms,
+      outputLimitBytes: this.policy.output_limit_bytes,
+      env: minimalEnvironment(),
+    });
+  }
+
   startDispatcher(): Promise<CommandResult> {
     return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
   }

@@ -53,6 +53,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   });
   db.close();
   assert.equal(receipt.migrated.user_version, 3);
+  assert.equal((await fs.stat(backupPath)).mode & 0o777, 0o600);
   assert.deepEqual(receipt.preservation.event_results, { before: 1, after: 1 });
   assert.deepEqual(receipt.preservation.job_completions, { before: 1, after: 1 });
 
@@ -71,4 +72,32 @@ test("migration refuses to run before drain and never overwrites a backup", asyn
     databasePath: "/not/opened", backupPath: "/not/written", previous: bridge, target: activation,
     quiesced: false, drained: true,
   }), /quiesced_drained/);
+});
+
+test("a wrong source path creates no database file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-missing-"));
+  roots.push(root);
+  const databasePath = path.join(root, "missing.sqlite3");
+  await assert.rejects(migrateV2ToV3WithBackup({
+    databasePath, backupPath: path.join(root, "backup.sqlite3"), previous: bridge, target: activation,
+    quiesced: true, drained: true,
+  }), /unable to open database file/);
+  await assert.rejects(fs.access(databasePath));
+});
+
+test("a failed post-migration check rolls the source back to v2", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-rollback-"));
+  roots.push(root);
+  const databasePath = path.join(root, "dispatcher.sqlite3");
+  const db = new Database(databasePath);
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+  await assert.rejects(migrateV2ToV3WithBackup({
+    databasePath, backupPath: path.join(root, "backup.sqlite3"), previous: bridge, target: activation,
+    quiesced: true, drained: true, postMigrationHook: () => { throw new Error("injected_post_check_failure"); },
+  }), /injected_post_check_failure/);
+  const reopened = new Database(databasePath, { readonly: true });
+  assert.equal(reopened.pragma("user_version", { simple: true }), 2);
+  assert.equal(reopened.prepare("SELECT name FROM sqlite_master WHERE name='job_groups'").get(), undefined);
+  reopened.close();
 });

@@ -70,6 +70,7 @@ export async function migrateV2ToV3WithBackup(input: {
   quiesced: boolean;
   drained: boolean;
   completedAt?: string;
+  postMigrationHook?: () => void;
 }): Promise<MigrationReceipt> {
   if (!input.quiesced || !input.drained) throw new Error("schema_activation_requires_quiesced_drained_runtime");
   try {
@@ -79,7 +80,7 @@ export async function migrateV2ToV3WithBackup(input: {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
-  const source = new Database(input.databasePath);
+  const source = new Database(input.databasePath, { fileMustExist: true });
   source.pragma("foreign_keys = ON");
   try {
     const actual = source.pragma("user_version", { simple: true }) as number;
@@ -89,6 +90,7 @@ export async function migrateV2ToV3WithBackup(input: {
 
     // better-sqlite3 uses SQLite's Online Backup API and includes committed WAL pages.
     await source.backup(input.backupPath);
+    await fs.chmod(input.backupPath, 0o600);
     const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
     try {
       backup.pragma("foreign_keys = ON");
@@ -98,15 +100,19 @@ export async function migrateV2ToV3WithBackup(input: {
       backup.close();
     }
 
-    migrateDispatcherDatabase(source);
-    verify(source, dispatcherSchemaCompatibility.write);
-    const after = countSnapshot(source);
-    const preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
-      before: before[name]!, after: after[name]!,
-    }]));
-    if (Object.values(preservation).some(({ before: left, after: right }) => left !== right)) {
-      throw new Error("schema_migration_preservation_failed");
-    }
+    let preservation!: Record<string, { before: number; after: number }>;
+    source.transaction(() => {
+      migrateDispatcherDatabase(source, () => {}, true);
+      input.postMigrationHook?.();
+      verify(source, dispatcherSchemaCompatibility.write);
+      const after = countSnapshot(source);
+      preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
+        before: before[name]!, after: after[name]!,
+      }]));
+      if (Object.values(preservation).some(({ before: left, after: right }) => left !== right)) {
+        throw new Error("schema_migration_preservation_failed");
+      }
+    })();
     return {
       schema_version: 1,
       from_schema: 2,

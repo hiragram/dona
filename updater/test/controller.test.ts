@@ -99,6 +99,7 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
+  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
@@ -427,6 +428,9 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
 
     assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.equal(f.runtime.calls.filter((call) => call === "migrateAppSchema").length, 1);
+    assert.ok(f.runtime.calls.indexOf("stopDispatcher") < f.runtime.calls.indexOf("migrateAppSchema"));
+    assert.ok(f.runtime.calls.indexOf("migrateAppSchema") < f.runtime.calls.indexOf(`startMainAgent:${targetSha}`));
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
