@@ -84,8 +84,8 @@ export class JobSupervisor {
   private loopPromise: Promise<void> | undefined;
   private progressLoopPromise: Promise<void> | undefined;
   private readonly cancelledWorkerCleanups = new Set<Promise<void>>();
-  private readonly cancelledCleanupQueue = new Map<string, JobRow>();
-  private cancelledCleanupPump: Promise<void> | undefined;
+  private readonly cancelledCleanupWake = new WakeSignal();
+  private cancelledCleanupRecovery: Promise<void> | undefined;
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
@@ -156,6 +156,7 @@ export class JobSupervisor {
     const progressStop=this.progress?.stop();
     this.abortController.abort();
     this.wake();
+    this.cancelledCleanupWake.wake();
     await this.loopPromise;
     await this.progressLoopPromise;
     await progressStop;
@@ -227,27 +228,40 @@ export class JobSupervisor {
     });
   }
 
-  private trackCancelledWorkerCleanup(row:JobRow):void {
-    if(!this.cancelledCleanupQueue.has(row.job_id))this.cancelledCleanupQueue.set(row.job_id,row);
-    if(this.cancelledCleanupPump)return;
-    const pump=(async()=>{
-      while(!this.stopping&&this.cancelledCleanupQueue.size>0){
-        const [jobId,current]=this.cancelledCleanupQueue.entries().next().value!;
-        this.cancelledCleanupQueue.delete(jobId);
-        let retry=false;
-        try {const waited=await this.runtime.wait(current.agent_name,this.abortController.signal);if(waited.aborted||this.stopping)return;retry=(waited.ok&&waited.agentStatus==="blocked")||(!waited.ok&&(waited.timedOut||waited.errorCode==="timeout"));}
-        catch {if(this.stopping)return;retry=true;}
-        if(retry){this.cancelledCleanupQueue.set(jobId,current);await abortableDelay(this.config.queuePollMs,this.abortController.signal);continue;}
-        await fs.rm(path.dirname(jobProgressPath(current)),{recursive:true,force:true}).catch(()=>{this.logger.warn("Cancelled worker progress cleanup failed",{job_id:current.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed"});});
-      }
-    })();
-    this.cancelledCleanupPump=pump;
-    this.cancelledWorkerCleanups.add(pump);void pump.finally(()=>{this.cancelledWorkerCleanups.delete(pump);if(this.cancelledCleanupPump===pump)this.cancelledCleanupPump=undefined;const next=this.cancelledCleanupQueue.values().next().value;if(next&&!this.stopping)this.trackCancelledWorkerCleanup(next);}).catch(()=>undefined);
+  private trackCancelledWorkerCleanup(_row:JobRow):void {
+    this.trackRecoveredCancelledWorkerCleanups();
+    this.cancelledCleanupWake.wake();
   }
 
   private trackRecoveredCancelledWorkerCleanups():void {
-    const recovery=(async()=>{let after="";for(;;){const batch=this.database.listStatusJobsAfter("cancelled",after,500);for(const row of batch){if(this.stopping)return;try{await fs.access(path.dirname(jobProgressPath(row)));this.trackCancelledWorkerCleanup(row);}catch{} }if(batch.length<500)break;after=batch.at(-1)!.job_id;}})();
-    this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>this.cancelledWorkerCleanups.delete(recovery)).catch(()=>undefined);
+    if(this.cancelledCleanupRecovery)return;
+    const recovery=(async()=>{
+      while(!this.stopping){
+        let after="";
+        for(;;){
+          const batch=this.database.listStatusJobsAfter("cancelled",after,50);
+          for(const row of batch){
+            if(this.stopping)return;
+            const progressDir=path.dirname(jobProgressPath(row));
+            try {await fs.access(progressDir);} catch {continue;}
+            try {
+              const waited=await this.runtime.wait(row.agent_name,this.abortController.signal);
+              if(waited.aborted||this.stopping)return;
+              const terminal=(waited.ok&&(waited.agentStatus==="idle"||waited.agentStatus==="done"))||(!waited.ok&&!waited.timedOut&&(waited.errorCode==="agent_not_found"||waited.errorCode==="agent_not_running"));
+              if(terminal)await fs.rm(progressDir,{recursive:true,force:true});
+            } catch(error) {
+              if(this.stopping)return;
+              this.logger.warn("Cancelled worker progress cleanup attempt failed",{job_id:row.job_id,error_code:"job_progress_cancelled_worker_cleanup_failed",error_message:error instanceof Error?error.message:String(error)});
+            }
+          }
+          if(batch.length<50)break;
+          after=batch.at(-1)!.job_id;
+        }
+        await this.cancelledCleanupWake.wait(this.config.queuePollMs);
+      }
+    })();
+    this.cancelledCleanupRecovery=recovery;
+    this.cancelledWorkerCleanups.add(recovery);void recovery.finally(()=>{this.cancelledWorkerCleanups.delete(recovery);if(this.cancelledCleanupRecovery===recovery)this.cancelledCleanupRecovery=undefined;}).catch(()=>undefined);
   }
 
   private async loop(): Promise<void> {

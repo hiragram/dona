@@ -1148,6 +1148,11 @@ describe("JobSupervisor", () => {
       markRunning(database, job.job_id);
       return job;
     });
+    await Promise.all(jobs.map(async (job) => {
+      const progressDir = path.dirname(jobProgressPath(job));
+      await fs.mkdir(progressDir, { recursive: true });
+      await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
+    }));
     let concurrent = 0;
     let maximum = 0;
     const runtime = fakeRuntime({
@@ -1168,7 +1173,7 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
-  test("interrupts cancelled worker cleanup backoff during shutdown", async () => {
+  test("retries an unclassified cleanup failure and interrupts backoff during shutdown", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -1180,7 +1185,7 @@ describe("JobSupervisor", () => {
     await fs.mkdir(progressDir, { recursive: true });
     await fs.writeFile(path.join(progressDir, "progress.json"), "{}");
     let waited = false;
-    const runtime = fakeRuntime({ async wait() { waited = true; return failed("timeout", true); } });
+    const runtime = fakeRuntime({ async wait() { waited = true; return failed("transport_failed"); } });
     const supervisor = new JobSupervisor(database, runtime, { ...config, queuePollMs: 60_000 }, logger, () => undefined);
     supervisor.start();
     await waitFor(() => waited);
