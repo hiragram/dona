@@ -76,6 +76,16 @@ test("frontmatterとUI metadataは全Issue依頼のimplicit routingを維持す�
   assert.match(metadata, /\$github-issue-decomposition/);
 });
 
+test("code submission由来の残タスクIssueは明示権限と両linkを要求する", () => {
+  const skill = fs.readFileSync(path.join(skillDirectory, "SKILL.md"), "utf8");
+  assert.match(skill, /code submission workflow.*残タスクIssue.*同じscope判定/);
+  assert.match(skill, /元Issueと当該PRから残ったtask.*日本語/);
+  assert.match(skill, /元Issueと当該PRの両方.*link/);
+  assert.match(skill, /Markdown linkでnative graphを置き換えず/);
+  assert.match(skill, /Issue作成を明示的に許可した場合だけ.*create-or-update/);
+  assert.match(skill, /PR提出権限からIssue作成権限を推測しない/);
+});
+
 test("Skill内のrelative Markdown linkはすべて解決できる", () => {
   for (const markdownPath of markdownFiles(skillDirectory)) {
     const markdown = fs.readFileSync(markdownPath, "utf8");

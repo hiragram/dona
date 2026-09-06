@@ -1,6 +1,6 @@
 ---
 name: github-issue-decomposition
-description: "GitHub Issueの作成・更新依頼を規模にかかわらず扱い、最初にscopeを判定して、implementation-readyな単一Issue、またはEpic・review可能なnative sub-issues・必要なDecision/ADR・最小blocker DAGとして設計または再編する。Issueの起票、既存Issue整理、backlog topology更新に使用し、code/PR実装だけの依頼には使用しない。"
+description: "GitHub Issueの作成・更新依頼を規模にかかわらず扱い、最初にscopeを判定して、implementation-readyな単一Issue、またはEpic・review可能なnative sub-issues・必要なDecision/ADR・最小blocker DAGとして設計または再編する。Issueの起票、既存Issue整理、backlog topology更新、およびcode submissionから明示的に許可された残タスクIssueの切り出しに使用し、Issue writeを伴わないcode/PR実装だけの依頼には使用しない。"
 ---
 
 # GitHub Issue分解
@@ -16,10 +16,13 @@ Issue数を決める前に、repositoryの事実と依頼された成果から�
 
 ユーザーが「Issueを1件作って」と述べたこと、変更行数、file数、見積りだけを規模判定の代用にしない。依頼された出力数とscopeが矛盾する場合は、事実に基づく判定と理由を示し、write前に必要な確認を行う。
 
+code submission workflowから残タスクIssueを切り出す場合も同じscope判定を使う。元Issueを誤ってcloseしないための切り出しは、元Issueのacceptanceを縮小したり完了扱いにしたりする操作ではない。新Issueの人向け本文へ、元Issueと当該PRから残ったtaskであること、残作業とacceptanceの境界を日本語で明記し、元Issueと当該PRの両方を解決可能なlinkで含める。既存のparent、native sub-issue、dependencyを再取得し、単なるMarkdown linkでnative graphを置き換えず、許可されていないreparentやdependency変更を行わない。
+
 ## modeを選ぶ
 
 - Issueの設計、下書き、評価、提案を求められた場合、またはGitHubへのwriteが明示的に許可されていない場合は、**plan-only**を使う。Issue、relation、label、Project、Milestone、assignmentを作成・変更しない。
 - 明示的に依頼された種類のwriteだけを行う場合は、**create-or-update**を使う。対象を指定repository、テーマ、resource種別に限定する。close、delete、reparent、detach、dependency削除の許可を推測しない。
+- code submission workflowからの残タスクIssue作成は、元依頼がIssue作成を明示的に許可した場合だけ**create-or-update**として受け付ける。許可がなければplan-onlyで候補を返し、PR提出権限からIssue作成権限を推測しない。
 - 構造化Issue routeでIssue作成、feature branchのpush、integration PR作成をすべて明示的に依頼された場合だけ、完全なintegration workflowを実行する。このrouteでは親Epicへ既存のexact `epic` labelを付け、integration PRをDraftで作成する。Issue作成だけの依頼からbranchやPRの作成を推測しない。既存backlogのtopology整理では、依頼された既存Issueだけを変更し、明示されていないbranchやPRを作成しない。
 - 単一Issue routeでIssue作成に加えてbranchやPRのwriteも明示されている場合、この親子integration workflowへroutingせず、依頼されたbranch/PR操作を黙って未処理にもしない。最初のwrite前に、単一Issueだけを作るか、親子構造を伴わない別のcode submission workflowを実行するか確認する。ここから`epic` labelやDraft状態を推測しない。
 - read-only調査後もmode、repository、またはwrite範囲に実質的な曖昧さが残る場合は、plan-onlyに留めるか、write前に質問する。

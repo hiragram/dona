@@ -19,6 +19,18 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 Dona Projectの対象Issueがある場合、実装前に[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Dispatcher job IDと担当を再確認し、`Dona Job ID`の記録と`Todo` → `In Progress`の更新・read-backを行う。別jobの担当を無断で上書きしない。対象IssueのないSkill修正等では適用せず、架空Issueを作らない。
 
+## Issue完了と残タスクを確定する
+
+対象Issueがある場合は、PR本文を作成・更新する前に、そのIssueのcurrent title／本文、acceptance、実際のdiffと検証結果、selected baseへのmerge-target contractを照合し、このPRのmergeだけでIssue全体が完了するかを判定する。file数、実装量、PRが存在すること、または一部のacceptanceを満たしたことをwhole-Issue completionの代用にしない。対象IssueがないSkill修正等ではこの判定を要求せず、closing targetなしで標準template手順へ進む。
+
+- Issue全体が完了する場合は、後述のclosing target、identity、relationship検証を満たした標準形式の`Closes #<Issue番号>`（cross-repositoryでは`Closes OWNER/REPOSITORY#<Issue番号>`）をPR本文へ必ず記載する。default branch向けでは、`closingIssuesReferences`にrelationshipが現れ、期待するclose mechanismがmerge時のautomatic closeであることを確認する。未実行のmergeや実際のIssue closeをPR提出の完了条件にはしない。
+- 残タスクがありIssue全体を完了しない場合は、元Issueをclosing targetに含めず、PR title／本文とtask/review commitから元Issueを対象とするautomatic closing referenceを除く。元Issueのclose、acceptance縮小、完了扱い、Projectの`Merge Ready`化を行わない。
+- 残タスクを新しいIssueへ切り出すのは、依頼がIssue作成を明示的に許可する場合だけとする。許可がなければ候補を報告して確認を求め、Issueを作成しない。許可がある場合は[$github-issue-decomposition](../github-issue-decomposition/SKILL.md)の単一Issue／構造化Issue判定、重複確認、native sub-issue／dependency、write前後の検証を使う。
+- 新しい残タスクIssueの人向け本文には、元Issueと当該PRから残ったtaskであること、残作業とacceptanceの境界を日本語で明記し、元Issueと当該PRの両方をGitHub上で解決できるlinkとして含める。単なるURL記載をnative parent/dependencyの代替にせず、元IssueがEpicまたは既存parentを持つ場合は、権限と依頼範囲内で既存topologyを維持する。
+- Issue作成writeの直前に元Issue、PR head/base/body、同成果のIssue、current native graphを再取得し、作成後に新Issueのtitle/body/stateと両link、意図したnative relationをread-backする。write結果が曖昧ならblind retryせず、重複の有無を再取得して一意に照合する。
+
+残タスクIssueを作成しても、元Issueを完了したことにはならず、このPRへ元Issueの`Closes`を追加する根拠にもならない。新Issue作成後にPR本文を更新する場合は、標準templateのCAS手順とreview identityの固定をやり直す。
+
 ## review targetを固定する
 
 1. latest remote default branch、current branch、upstream、local diff、同じhead/baseのopen/closed Pull Requestを再取得する。ユーザーまたは既存workflowが指定したbaseを優先し、指定がない場合だけdefault branchをbaseに選ぶ。
@@ -75,6 +87,6 @@ Pull Requestの作成・title／本文更新では、repository標準の`.github
 - selected baseからcurrent headまでのSkillが作成したtask/review commit messageにautomatic closing referenceがなく、既存commit内の各referenceはsource PRがcurrent task branchへmerge済みであること、commit provenance、current Issue identity、merge-target contractを再取得して`verified inherited closing reference`と確認済みである。未検証のreferenceは残っていない。
 - repository workflowとbranch ruleから期待するCI suite/check contextが少なくとも1回観測され、各accepted check/workflow runがcurrent head/base pairを検証したことをPull Request association、tested merge commit、または同等のGitHub API evidenceで確認でき、required/current CIがすべてterminal successである。checkが空の状態、base driftより前のrun、head/base pairを証明できないrunを成功としない。CIが構成されていない、またはcurrent pairのrunを安全に起動できない場合は未検証境界として停止する。current changeに起因するfailureは修正し、新しいheadにfresh review roundを行う。
 
-上記の提出条件をすべて満たした後、対象Issueがある場合は[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)のscope・担当再確認を経て`Merge Ready`へ更新・read-backする。未検証ならPR提出条件の達成とProject更新未完了を分けて報告する。
+上記の提出条件をすべて満たした後、対象Issueがあり、このPRでIssue全体を完了する場合だけ[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)のscope・担当再確認を経て`Merge Ready`へ更新・read-backする。対象Issueに残タスクがある部分対応では、元Issueを`In Progress`のまま維持し、元Issueをclosing targetに含めないことと、許可された残タスクIssueの作成・read-backまたは未作成の境界を確認できれば、PR提出cycle自体は完了できる。Project更新が必要なのに失敗・未検証なら、PR提出条件の達成とProject更新未完了を分け、workflow全体を完了扱いしない。
 
 Pull Request URL、final SHA、各roundのtarget SHA・trigger URL・clean/finding、feedbackの修正commit、inline reply URL、mergeability、CI結果、変更しなかったscope、未検証境界を報告する。明示的な別依頼がない限りPull Requestをmergeしない。
