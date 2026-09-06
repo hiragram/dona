@@ -119,7 +119,7 @@ function request(socketPath: string, token: string, path: string, body: SlackRem
           }
           const error = parsed?.error && typeof parsed.error === "object" ? parsed.error as Record<string, unknown> : undefined;
           const code = typeof error?.code === "string" ? error.code : "connector_unavailable";
-          if (response.statusCode === 403) resolve({ outcome: "rejected", code: "internal_auth_failed" });
+          if (response.statusCode === 403) resolve({ outcome: "unavailable", code: "internal_auth_failed", retry_after_seconds: 5 });
           else if (response.statusCode !== undefined && response.statusCode >= 500) resolve({ outcome: "unavailable", code, retry_after_seconds: 5 });
           else throw new Error("invalid_connector_response");
         } catch (error) { reject(error); }

@@ -760,8 +760,10 @@ export class SchedulerRepository {
       if (run) this.db.prepare(`DELETE FROM schedule_audit WHERE sequence = (
         SELECT sequence FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_request_started' ORDER BY sequence DESC LIMIT 1
       )`).run(run.schedule_id);
+      const settlementOperation = outcome === "misfire" ? "outbox_misfire" : `outbox_${outcome}`;
       if (run) this.db.prepare(`UPDATE schedule_audit SET after_json = json_set(after_json, '$.outbox.request_started_at', NULL)
-        WHERE sequence = (SELECT sequence FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence DESC LIMIT 1)`).run(run.schedule_id);
+        WHERE sequence = (SELECT sequence FROM schedule_audit WHERE schedule_id = ? AND operation = ? ORDER BY sequence DESC LIMIT 1)`)
+        .run(run.schedule_id, settlementOperation);
       return this.getOutbox(outboxId, now) ?? settled;
     }).immediate();
   }
