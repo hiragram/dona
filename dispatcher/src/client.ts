@@ -18,6 +18,10 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
+  authorizeJobNotification(eventId:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,{});
+  }
+
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {
     const query = new URLSearchParams({
       workspace_id: workspaceId,

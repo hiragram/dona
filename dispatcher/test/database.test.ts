@@ -191,10 +191,12 @@ describe("DispatcherDatabase", () => {
       agent_name: string;
     };
     assert.equal(persisted.agent_name, job.job_id);
+    raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(`${config.jobResultsDir}/${job.job_id}.json`,job.job_id);
     raw.close();
 
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
+    assert.equal(reopened.getJob(job.job_id)?.result_path,`${config.jobResultsDir}/${job.job_id}/result.json`);
     reopened.close();
   });
 });

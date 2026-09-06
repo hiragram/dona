@@ -326,7 +326,9 @@ export class SchedulerRepository {
       if (!["active", "paused", "expired", "needs_review"].includes(before.state) || nextDue <= updateAt) throw new Error("invalid_transition");
       if (before.high_watermark !== null && nextDue <= before.high_watermark) throw new Error("invalid_next_due");
       if (this.db.prepare(`SELECT 1 FROM schedule_runs r WHERE r.schedule_id = ? AND (r.status = 'needs_review' OR
-        EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
+        EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review') OR
+        EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+          AND c.notification_state IN ('pending','needs_review'))) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, updateAt);
       const sourceEventId = input.authorization_id.replace(/:\d+$/, "");
       const reusedAuthorization = this.db.prepare(`SELECT 1 FROM schedule_revisions

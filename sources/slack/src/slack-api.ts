@@ -123,6 +123,7 @@ export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
   getChannel(channelId: string): Promise<SlackChannel>;
+  hasChannelMember?(channelId: string, userId: string): Promise<boolean>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
@@ -367,6 +368,18 @@ export class SlackWebApiClient implements SlackApiClient {
       throw new SlackApiError("invalid_slack_response", "Slack response did not include channel");
     }
     return channelFromResponse(response.channel);
+  }
+
+  async hasChannelMember(channelId: string, userId: string): Promise<boolean> {
+    let cursor: string | undefined;
+    do {
+      const response = await callSlack(() => this.client.conversations.members({
+        channel: channelId, limit: 200, ...(cursor ? { cursor } : {}),
+      }));
+      if ((response.members ?? []).includes(userId)) return true;
+      cursor = optionalCursor(response.response_metadata?.next_cursor);
+    } while (cursor);
+    return false;
   }
 
   async listUsers(limit: number, cursor?: string): Promise<SlackUserPage> {

@@ -283,6 +283,13 @@ export class DispatcherApi {
         await this.handleSelfUpdate(request, response, url);
         return;
       }
+      const notificationAuthorization=/^\/v1\/job-notifications\/([^/]+)\/authorize$/.exec(url.pathname);
+      if(request.method==="POST"&&notificationAuthorization) {
+        await this.readJson(request);
+        try { sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!))}); }
+        catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
+        return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;

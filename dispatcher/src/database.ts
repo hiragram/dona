@@ -60,6 +60,10 @@ export class DispatcherDatabase {
       this.migrate();
       migrateScheduler(this.db);
       migrateJobRouting(this.db);
+      for(const row of this.db.prepare("SELECT job_id,result_path FROM jobs WHERE status IN ('queued','retryable_failed','preparing')").all() as Array<{job_id:string;result_path:string}>) {
+        if(path.basename(row.result_path)===`${row.job_id}.json`) this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?")
+          .run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
+      }
     } catch (error) {
       this.db.close();
       throw error;
@@ -745,6 +749,18 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  authorizeJobNotification(eventId:string,at=new Date()):Record<string,unknown> {
+    this.suppressUnauthorizedScheduledNotifications(at);
+    const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json FROM events e
+      JOIN job_completion_results c ON c.notification_event_id=e.event_id
+      WHERE e.event_id=? AND e.source='dona_job' AND json_extract(c.owner_json,'$.kind')='schedule'`).get(eventId) as
+      {status:string;owner_json:string;destination_json:string}|undefined;
+    if(!row||row.status!=="waiting_agent") throw new Error("schedule_notification_not_authorized");
+    const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
+    return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
+      destination:JSON.parse(row.destination_json) as Record<string,unknown>};
+  }
+
   updateEventsNeedingNotification(): EventRow[] {
     return this.db.prepare(`
       SELECT * FROM events
@@ -912,13 +928,14 @@ export class DispatcherDatabase {
       if(completion) {
         const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>};
         const target=destination.kind==="slack"?destination.target:undefined;
-        const delivered=(result.actions??[]).some(action=>{
-          if(!action||typeof action!=="object"||Array.isArray(action)) return false;
-          const value=action as Record<string,unknown>;
-          return typeof value.tool==="string"&&value.tool.endsWith(".post_message")&&value.success===true&&typeof value.message_ts==="string"&&
-            target!==undefined&&value.workspace_id===target.workspace_id&&value.channel_id===target.channel_id&&
-            (target.kind!=="thread"||value.thread_ts===target.thread_ts);
-        });
+        const owner=JSON.parse((this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string}).owner_json) as {owner_id?:unknown};
+        const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
+        const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
+        const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&
+          value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
+        const delivered=actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&
+          typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&
+          (target?.kind!=="thread"||value.thread_ts===target.thread_ts));
         this.setNotificationState(eventId,delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();

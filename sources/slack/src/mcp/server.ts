@@ -203,6 +203,22 @@ export function createSlackMcpServer(
     },
   );
 
+  server.registerTool("check_user_channel_access", {
+    title: "Check current Slack access",
+    description: "外部write直前に、指定userが現在もworkspaceに存在し対象channelのmemberであることを確認します。照会失敗は許可として扱いません。",
+    inputSchema: { workspace: workspaceSchema, channel_id: channelSchema, user_id: userSchema },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({workspace,channel_id,user_id}) => {
+    try {
+      const connection=registry.get(workspace);
+      if(!connection.client.hasChannelMember) throw new SlackApiError("access_check_unavailable","Current membership check is unavailable");
+      const user=await connection.client.getUser(user_id);
+      const channel=await connection.client.getChannel(channel_id);
+      const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized});
+    } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
+  });
+
   server.registerTool(
     "list_users",
     {
