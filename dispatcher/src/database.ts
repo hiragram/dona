@@ -579,6 +579,8 @@ export class DispatcherDatabase {
       throw new Error("completed_at_precedes_prompt_acceptance");
     this.db.transaction(()=>{
       if(recoverAmbiguous&&job.completion_event_id) {
+        const prior=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
+        if(prior&&prior.notification_state!=="pending") throw new Error("prior_notification_requires_reconciliation");
         this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
         this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
@@ -805,16 +807,25 @@ export class DispatcherDatabase {
 
   authorizeJobNotification(eventId:string,at=new Date()):Record<string,unknown> {
     this.suppressUnauthorizedScheduledNotifications(at);
-    const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json FROM events e
-      JOIN job_completion_results c ON c.notification_event_id=e.event_id
-      WHERE e.event_id=? AND e.source='dona_job' AND json_extract(c.owner_json,'$.kind')='schedule'`).get(eventId) as
-      {status:string;owner_json:string;destination_json:string}|undefined;
-    if(!row||!["dispatching","waiting_agent"].includes(row.status)) throw new Error("schedule_notification_not_authorized");
-    if(row.status==="dispatching") this.markWaiting(eventId,at);
-    this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId);
-    const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
-    return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
-      destination:JSON.parse(row.destination_json) as Record<string,unknown>};
+    return this.db.transaction(()=>{
+      const timestamp=at.toISOString();
+      const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json FROM events e
+        JOIN job_completion_results c ON c.notification_event_id=e.event_id
+        JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
+        JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
+        WHERE e.event_id=? AND e.source='dona_job' AND e.status IN ('dispatching','waiting_agent')
+          AND c.notification_state='pending' AND json_extract(c.owner_json,'$.kind')='schedule'
+          AND julianday(c.materialized_at,'+900 seconds')>=julianday(?) AND s.state IN ('active','needs_review')
+          AND s.revision=json_extract(c.owner_json,'$.revision') AND julianday(r.expires_at)>julianday(?)`).get(eventId,timestamp,timestamp) as
+        {status:string;owner_json:string;destination_json:string}|undefined;
+      if(!row) throw new Error("schedule_notification_not_authorized");
+      if(row.status==="dispatching") this.markWaiting(eventId,at);
+      const changed=this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId).changes;
+      if(changed!==1) throw new Error("schedule_notification_not_authorized");
+      const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
+      return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
+        destination:JSON.parse(row.destination_json) as Record<string,unknown>};
+    }).immediate();
   }
 
   updateEventsNeedingNotification(): EventRow[] {
