@@ -97,6 +97,21 @@ test("scheduler schema v1へ保持されるlist sequenceを追加する", () => 
   } finally { raw.close(); }
 });
 
+test("revision 1が欠落したv2 DBを不完全なv3として受理しない", () => {
+  const raw = new Database(":memory:");
+  try {
+    raw.exec(`CREATE TABLE scheduler_schema(singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+      INSERT INTO scheduler_schema VALUES(1, 2);
+      CREATE TABLE schedules(schedule_id TEXT PRIMARY KEY);
+      INSERT INTO schedules VALUES('missing-initial');
+      CREATE TABLE schedule_revisions(schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, recurrence_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL, action TEXT NOT NULL, target_json TEXT NOT NULL, content_hash TEXT NOT NULL);`);
+    assert.throws(() => migrateScheduler(raw), /scheduler_create_payload_unrecoverable/);
+    assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 2);
+    assert.equal((raw.prepare("SELECT count(*) AS count FROM pragma_table_info('schedules') WHERE name = 'create_payload_hash'").get() as { count: number }).count, 0);
+  } finally { raw.close(); }
+});
+
 test("createとauditがatomic、revision conflict・不正遷移・tenant越境を拒否", () => {
   const { repo, raw } = setup();
   assert.throws(() => repo.create("s_fail", input, due, { ...actor, source_event_id: "evt_missing" }, now), /FOREIGN KEY/);

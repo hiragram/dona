@@ -33,6 +33,8 @@ export function migrateScheduler(db: Database.Database): void {
         FROM schedule_revisions WHERE revision = 1`).all() as Array<DefinitionFingerprintInput & { schedule_id: string }>;
       const update = db.prepare("UPDATE schedules SET create_payload_hash = ? WHERE schedule_id = ?");
       for (const revision of revisions) update.run(definitionFingerprint(revision), revision.schedule_id);
+      const missing = db.prepare("SELECT 1 FROM schedules WHERE create_payload_hash IS NULL LIMIT 1").get();
+      if (missing) throw new Error("scheduler_create_payload_unrecoverable");
       db.exec("UPDATE scheduler_schema SET version = 3 WHERE singleton = 1");
       return;
     }
