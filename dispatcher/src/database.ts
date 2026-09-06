@@ -1035,8 +1035,8 @@ export class DispatcherDatabase {
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
       this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
-      this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
       if(delivery.runId)this.scheduler.markWorkNotificationNeedsReview(delivery.runId,new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
   }
 
