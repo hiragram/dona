@@ -41,6 +41,18 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   database.close();
 });
 
+test("schedule一覧cursorはpage途中に後から作成したscheduleを見落とさない", async () => {
+  const { database, first, api } = await fixture();
+  api.create({ source_event_id: first.event_id, idempotency_key: "first", definition: definition() });
+  const firstPage = api.list(first.event_id, 1);
+  assert.match(String(firstPage.next_cursor), /^2026-09-02T00:00:00Z\|sch_/);
+  const later = new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z"));
+  later.create({ source_event_id: first.event_id, idempotency_key: "later", definition: { ...definition(), recurrence: { ...recurrence, start_date: "2026-09-03" } } });
+  assert.equal(later.list(first.event_id, 1, String(firstPage.next_cursor)).schedules.length, 1);
+  assert.throws(() => later.list(first.event_id, 1, "sch_random"), /invalid_cursor/);
+  database.close();
+});
+
 test("別actorを拒否しrevision conflictと冪等transitionを区別する", async () => {
   const { database, first, other, otherThread, api } = await fixture();
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-2", definition: definition() });

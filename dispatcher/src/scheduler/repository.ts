@@ -95,11 +95,13 @@ export class SchedulerRepository {
       recurrence_json: revision.recurrence_json, policy_json: revision.policy_json, content_hash: revision.content_hash,
       authorization_id: revision.authorization_id };
   }
-  listAuthorized(actor: Actor, limit: number, cursor?: string): ScheduleView[] {
+  listAuthorized(actor: Actor, limit: number, cursor?: { created_at: string; schedule_id: string }): ScheduleView[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
     id(actor.tenant_id); id(actor.actor_id);
-    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ?
-      AND schedule_id > ? ORDER BY schedule_id LIMIT ?`).all(actor.tenant_id, actor.actor_id, cursor ?? "", limit) as Schedule[];
+    const createdAt = cursor?.created_at ?? ""; const scheduleId = cursor?.schedule_id ?? "";
+    const rows = this.db.prepare(`SELECT * FROM schedules WHERE tenant_id = ? AND owner_id = ? AND
+      (created_at > ? OR (created_at = ? AND schedule_id > ?)) ORDER BY created_at, schedule_id LIMIT ?`)
+      .all(actor.tenant_id, actor.actor_id, createdAt, createdAt, scheduleId, limit) as Schedule[];
     return rows.map(row => this.getAuthorized(row.schedule_id, actor)!);
   }
   runHistory(scheduleId: string, actor: Actor, limit: number, cursor?: { scheduled_for: string; run_id: string }): Run[] {
