@@ -70,7 +70,9 @@ export class ReminderPublisher {
     if (!this.running) return;
     try {
       while (this.running) {
-        const settled = await Promise.all(Array.from({ length: 4 }, () => this.publishOne()));
+        // The policy permits 100 schedules per tenant and one authorization check may take 150s.
+        // Twenty-five workers keep a full due cohort within the 900s misfire grace (four waves).
+        const settled = await Promise.all(Array.from({ length: 25 }, () => this.publishOne()));
         if (!settled.some(Boolean)) break;
       }
     }

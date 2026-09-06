@@ -751,7 +751,7 @@ export class SchedulerRepository {
             .run(finished.status === "sent" ? "completed" : finished.status === "cancelled" ? "cancelled" : "failed",
               finished.status === "cancelled" ? "cancelled" : null, finishedAt, row.run_id);
         }
-        this.auditOutbox(row, outcome === "misfire" && !authorized ? "outbox_cancelled" : `outbox_${outcome}`, finishedAt);
+        this.auditOutbox(row, outcome === "misfire" && !authorized ? "outbox_cancelled" : `outbox_${outcome}`, finishedAt, schedule);
       }
       this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, finishedAt);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;

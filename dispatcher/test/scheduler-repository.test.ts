@@ -781,13 +781,16 @@ test("outbox送信直前の期限判定は保存済みschedule時刻を使用す
 });
 
 test("connector revocationは旧authorizationの通常resumeを拒否する", () => {
-  const { repo } = setup();
+  const { repo, raw } = setup();
   repo.create("revoked_resume", input, due, actor, now);
   repo.materialize("revoked_resume", 1, due, later, due, actor);
   const claim = repo.claim(due)!;
   repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
   repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due);
   assert.equal(repo.get("revoked_resume")?.state, "paused");
+  const audit = raw.prepare("SELECT before_json, after_json FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_revoked'").get("revoked_resume") as { before_json: string; after_json: string };
+  assert.equal(JSON.parse(audit.before_json).state, "active");
+  assert.equal(JSON.parse(audit.after_json).state, "paused");
   assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
 });
 
