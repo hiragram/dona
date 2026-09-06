@@ -195,6 +195,26 @@ test("失効したsource event authorizationではwriteを拒否する", async (
   database.close();
 });
 
+test("失効境界のresumeを4xx化しpauseのexpire結果を同一eventで照合する", async () => {
+  const { database, first, api } = await fixture();
+  const paused = api.create({ source_event_id: first.event_id, idempotency_key: "resume-expired", definition: definition() });
+  const pausedId = (paused.schedule as { schedule_id: string }).schedule_id;
+  api.transition(pausedId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  const expiredApi = new ScheduleApiService(database, () => new Date("2026-10-02T00:00:01Z"));
+  assert.throws(() => expiredApi.transition(pausedId, "resume", { source_event_id: first.event_id, expected_revision: 2 }),
+    (error: unknown) => error instanceof ScheduleApiError && error.status === 400 && error.code === "authorization_expired");
+
+  const active = api.create({ source_event_id: first.event_id, idempotency_key: "pause-expired", definition: definition() });
+  const activeId = (active.schedule as { schedule_id: string }).schedule_id;
+  const firstPause = expiredApi.transition(activeId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  assert.equal((firstPause.schedule as { state: string }).state, "expired");
+  assert.equal(firstPause.duplicate, false);
+  const retry = expiredApi.transition(activeId, "pause", { source_event_id: first.event_id, expected_revision: 1 });
+  assert.equal((retry.schedule as { state: string }).state, "expired");
+  assert.equal(retry.duplicate, true);
+  database.close();
+});
+
 test("古いrecurrence anchorをcreate時に拒否し本文上限をcode pointで数える", async () => {
   const { database, first, api } = await fixture();
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "old-anchor", definition: { ...definition(), recurrence: { ...recurrence, start_date: "2026-09-01" } } }), /invalid_creation_time/);
