@@ -136,12 +136,12 @@ export class SchedulerRepository {
   reminderConstraints(outboxId: string): { owner_id: string; expires_at: string; misfire_at: string } | undefined {
     const row = this.db.prepare(`SELECT s.owner_id, v.expires_at,
       strftime('%Y-%m-%dT%H:%M:%SZ', r.scheduled_for, '+900 seconds') AS misfire_at
-      , o.target_json, v.target_json AS revision_target, o.content, o.content_hash, v.content_hash AS revision_content_hash
+      , o.target_json, v.target_json AS revision_target, o.content, o.content_hash, v.content_hash AS revision_content_hash, v.action
       FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
       JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
       WHERE o.outbox_id = ? AND o.kind = 'slack.reminder.post'`).get(outboxId) as { owner_id: string; expires_at: string; misfire_at: string;
-        target_json: string; revision_target: string; content: string | null; content_hash: string; revision_content_hash: string } | undefined;
-    if (!row || row.content === null || row.target_json !== row.revision_target || row.content_hash !== row.revision_content_hash || digest(row.content) !== row.content_hash) return undefined;
+        target_json: string; revision_target: string; content: string | null; content_hash: string; revision_content_hash: string; action: string } | undefined;
+    if (!row || row.action !== "slack.reminder.post" || row.content === null || row.target_json !== row.revision_target || row.content_hash !== row.revision_content_hash || digest(row.content) !== row.content_hash) return undefined;
     return { owner_id: row.owner_id, expires_at: row.expires_at, misfire_at: row.misfire_at };
   }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
@@ -260,7 +260,7 @@ export class SchedulerRepository {
       input.timezone, input.tzdb_version, input.authorization_id, input.authorization_revision, input.action === "slack.reminder.post" ? "fixed_body" : "fixed_objective_redacted_result", input.approver_id, input.approved_at, input.expires_at,
       input.action, JSON.stringify(target), input.content, digest(input.content), now);
   }
-  private audit(before: Schedule | undefined, after: Schedule, operation: string, actor: Actor, now: string, outbox?: Outbox, run?: Run, compactSkip?: CompactSkip): void {
+  private audit(before: Schedule | undefined, after: Schedule, operation: string, actor: Actor, now: string, outbox?: Outbox, run?: Run, compactSkip?: CompactSkip, decisionCode?: string): void {
     // Explicit allowlist: no caller-provided before/after JSON, targets, bodies or error text.
     const auditRun = outbox ? this.getRun(outbox.run_id)! : run;
     const snapshot = this.revision(auditRun ?? after);
@@ -273,6 +273,7 @@ export class SchedulerRepository {
       before ? JSON.stringify({ ...metadata(before), ...revisionMetadata(this.revision(before)) }) : null,
       JSON.stringify({ ...metadata(after), operation_revision: snapshot.revision, action: snapshot.action, policy_version: snapshot.policy_version, tzdb_version: snapshot.tzdb_version, content_hash: outbox?.content_hash ?? snapshot.content_hash, recurrence_hash: snapshot.recurrence_hash,
         ...(compactSkip ? { compact_skip: { from: compactSkip.from, through: compactSkip.through, count: compactSkip.count, reason: "misfire" } } : {}),
+        ...(decisionCode ? { decision_code: decisionCode } : {}),
         ...(auditRun ? { run: { run_id: auditRun.run_id, revision: auditRun.revision, status: auditRun.status, reason: auditRun.reason, event_id: auditRun.event_id, job_id: auditRun.job_id } } : {}),
         ...(outbox ? { outbox: { outbox_id: outbox.outbox_id, run_id: outbox.run_id, kind: outbox.kind, status: outbox.status,
           attempt: outbox.attempt, request_started_at: outbox.request_started_at, receipt_id: outbox.receipt_id } } : {}) }), now);
@@ -680,10 +681,10 @@ export class SchedulerRepository {
       return result.changes + ambiguous.length + expired;
     }).immediate();
   }
-  private auditOutbox(row: Outbox, operation: string, now: string, before?: Schedule): void {
+  private auditOutbox(row: Outbox, operation: string, now: string, before?: Schedule, decisionCode?: string): void {
     const run = this.getRun(row.run_id)!;
     const schedule = this.get(run.schedule_id)!;
-    this.audit(before ?? schedule, schedule, operation, { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now, this.getOutbox(row.outbox_id, now)!);
+    this.audit(before ?? schedule, schedule, operation, { tenant_id: schedule.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, now, this.getOutbox(row.outbox_id, now)!, undefined, undefined, decisionCode);
   }
   private markAmbiguous(row: Outbox, now: string): void {
     const run = this.getRun(row.run_id)!;
@@ -701,7 +702,7 @@ export class SchedulerRepository {
     this.retireRevisions(run.schedule_id, ambiguousAt);
     this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
-  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
+  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "authorization_unavailable" | "unavailable" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0, rawDecisionCode?: string): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
     if (!["sent", "not_accepted", "authorization_unavailable", "unavailable", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
     if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds < 0 || retryAfterSeconds > 2592000) throw new Error("invalid_retry_after");
@@ -754,7 +755,8 @@ export class SchedulerRepository {
             .run(finished.status === "sent" ? "completed" : finished.status === "cancelled" ? "cancelled" : "failed",
               finished.status === "cancelled" ? "cancelled" : null, finishedAt, row.run_id);
         }
-        this.auditOutbox(row, outcome === "misfire" && !authorized ? "outbox_cancelled" : `outbox_${outcome}`, finishedAt, schedule);
+        const decisionCode = rawDecisionCode && /^[a-z][a-z0-9_]{0,79}$/.test(rawDecisionCode) ? rawDecisionCode : rawDecisionCode ? "other" : undefined;
+        this.auditOutbox(row, outcome === "misfire" && !authorized ? "outbox_cancelled" : `outbox_${outcome}`, finishedAt, schedule, decisionCode);
       }
       this.completeIfDrained(this.getRun(row.run_id)!.schedule_id, finishedAt);
       const current = this.get(this.getRun(row.run_id)!.schedule_id)!;

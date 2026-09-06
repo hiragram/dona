@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { SlackApiError } from "./slack-api.js";
-import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
+import type { SlackWorkspaceConnection, SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 const id = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
 const thread = z.string().regex(/^\d{1,20}\.\d{6}$/);
@@ -46,7 +46,29 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 }
 
 export class SlackReminderConnector {
+  private readonly channelQueues = new Map<string, Promise<void>>();
+  private readonly blockedUntil = new Map<string, number>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
+
+  private post(workspaceId: string, channelId: string, operation: () => ReturnType<SlackWorkspaceConnection["client"]["postMessage"]>): ReturnType<SlackWorkspaceConnection["client"]["postMessage"]> {
+    const key = `${workspaceId}:${channelId}`;
+    const previous = this.channelQueues.get(key) ?? Promise.resolve();
+    const result = previous.then(async () => {
+      const delay = Math.max(0, (this.blockedUntil.get(key) ?? 0) - Date.now());
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      try { return await operation(); }
+      catch (error) {
+        if (error instanceof SlackApiError && error.errorCode === "rate_limited") {
+          this.blockedUntil.set(key, Date.now() + (error.retryAfterSeconds ?? 1) * 1_000);
+        }
+        throw error;
+      }
+    });
+    const tail = result.then(() => undefined, () => undefined);
+    this.channelQueues.set(key, tail);
+    void tail.finally(() => { if (this.channelQueues.get(key) === tail) this.channelQueues.delete(key); });
+    return result;
+  }
 
   async deliver(value: unknown): Promise<SlackReminderResult> {
     let input: SlackReminderCommand;
@@ -75,14 +97,14 @@ export class SlackReminderConnector {
       const current = Date.now();
       if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
       if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
-      const posted = await connection.client.postMessage({
+      const posted = await this.post(input.target.workspace_id, input.target.channel_id, () => connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,
         ...(input.target.kind === "thread" ? { threadTs: input.target.thread_ts } : {}),
         replyBroadcast: false,
         mrkdwn: false,
         parse: "none",
-      });
+      }));
       if (posted.channelId !== input.target.channel_id) return { outcome: "acceptance_unknown", code: "receipt_mismatch" };
       return { outcome: "accepted", receipt_id: posted.messageTs };
     } catch (error) {

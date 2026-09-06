@@ -40,3 +40,20 @@ test("target・本文を制限しSlack結果を分類する", async () => {
     throw new SlackApiError("restricted_action_thread_locked", "locked");
   })).deliver(input), { outcome: "revoked", code: "restricted_action_thread_locked" });
 });
+
+test("同一channelのpostを直列化する", async () => {
+  let release!: () => void;
+  let calls = 0;
+  const instance = await connector(async () => {
+    calls++;
+    if (calls === 1) await new Promise<void>((resolve) => void (release = resolve));
+    return { channelId: "C1", messageTs: `1.00000${calls}` };
+  });
+  const first = instance.deliver(input);
+  const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(calls, 2);
+});

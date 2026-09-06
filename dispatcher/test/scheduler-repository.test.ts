@@ -786,12 +786,22 @@ test("connector revocationは旧authorizationの通常resumeを拒否する", ()
   repo.materialize("revoked_resume", 1, due, later, due, actor);
   const claim = repo.claim(due)!;
   repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
-  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due, null, 0, "owner_not_authorized");
   assert.equal(repo.get("revoked_resume")?.state, "paused");
   const audit = raw.prepare("SELECT before_json, after_json FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_revoked'").get("revoked_resume") as { before_json: string; after_json: string };
   assert.equal(JSON.parse(audit.before_json).state, "active");
   assert.equal(JSON.parse(audit.after_json).state, "paused");
+  assert.equal(JSON.parse(audit.after_json).decision_code, "owner_not_authorized");
   assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
+});
+
+test("reminder outbox kindをimmutable revision actionと照合する", () => {
+  const { repo, raw } = setup();
+  repo.create("action_tamper", input, due, actor, now);
+  repo.materialize("action_tamper", 1, due, later, due, actor);
+  const outbox = raw.prepare("SELECT outbox_id FROM connector_outbox").get() as { outbox_id: string };
+  raw.prepare("UPDATE schedule_revisions SET action = 'work.read_only' WHERE schedule_id = 'action_tamper'").run();
+  assert.equal(repo.reminderConstraints(outbox.outbox_id), undefined);
 });
 
 test("認可照会中のpause複製も遅着revocationでresume不能にする", () => {

@@ -55,13 +55,13 @@ export class ReminderPublisher {
     catch { result = { outcome: "acceptance_unknown", code: "connector_transport_error" }; }
     const finishedAt = this.clock.now();
     if (result.outcome === "accepted") this.repository.finishWrite(claimed.outbox_id, token, "sent", finishedAt, result.receipt_id);
-    else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds);
-    else if (result.outcome === "authorization_unavailable") this.repository.finishWrite(claimed.outbox_id, token, "authorization_unavailable", finishedAt, null, result.retry_after_seconds);
-    else if (result.outcome === "unavailable") this.repository.finishWrite(claimed.outbox_id, token, "unavailable", finishedAt, null, result.retry_after_seconds);
-    else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt);
-    else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt);
-    else if (result.outcome === "misfire") this.repository.finishWrite(claimed.outbox_id, token, "misfire", finishedAt);
-    else this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", finishedAt);
+    else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds, result.code);
+    else if (result.outcome === "authorization_unavailable") this.repository.finishWrite(claimed.outbox_id, token, "authorization_unavailable", finishedAt, null, result.retry_after_seconds, result.code);
+    else if (result.outcome === "unavailable") this.repository.finishWrite(claimed.outbox_id, token, "unavailable", finishedAt, null, result.retry_after_seconds, result.code);
+    else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt, null, 0, result.code);
+    else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt, null, 0, result.code);
+    else if (result.outcome === "misfire") this.repository.finishWrite(claimed.outbox_id, token, "misfire", finishedAt, null, 0, result.code);
+    else this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", finishedAt, null, 0, result.code);
     this.logger.info("Slack reminder delivery settled", { outbox_id: claimed.outbox_id, run_id: claimed.run_id, outcome: result.outcome,
       code: "code" in result ? result.code : undefined });
     return true;
