@@ -38,6 +38,10 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   const preview = api.preview({ source_event_id: first.event_id, definition: definition(), after: "2026-09-02T00:00:00Z", before_or_equal: "2026-09-10T00:00:00Z", limit: 3 });
   assert.equal(preview.preview.occurrences.length, 3);
   assert.deepEqual(preview.target, { kind: "thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
+  const expiryPreview = api.preview({ source_event_id: first.event_id, definition: definition(), after: "2026-09-30T00:00:00Z", before_or_equal: "2026-10-10T00:00:00Z", limit: 100 });
+  assert.ok(expiryPreview.preview.occurrences.every(occurrence => occurrence.occurrence_at < expiryPreview.authorization_expires_at));
+  assert.equal(expiryPreview.preview.occurrences.at(-1)?.occurrence_at, "2026-10-01T00:00:00Z");
+  assert.equal(expiryPreview.preview.truncated, false);
   const created = api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() });
   assert.equal(created.duplicate, false);
   assert.equal(wakes.count, 1);
@@ -203,6 +207,13 @@ test("更新時も366日を越える次回occurrenceを永続化する", async (
   const updated = new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).update(scheduleId,
     { source_event_id: updateEvent.event_id, expected_revision: 1, definition: longInterval });
   assert.equal((updated.schedule as { next_due: string }).next_due, "2027-10-02T00:00:00Z");
+  const onceEvent = database.enqueue(eventEnvelope("schedule-api-once-update")).row;
+  activateEvent(config.databasePath, onceEvent.event_id);
+  assert.throws(() => new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).update(scheduleId,
+    { source_event_id: onceEvent.event_id, expected_revision: 2,
+      definition: { recurrence: { version: 1, kind: "once", at: "2027-09-05T00:00:01Z" }, action: { kind: "reminder", body: "遠すぎる" } } }),
+    /invalid_creation_time/);
+  assert.equal(database.scheduler.get(scheduleId)?.revision, 2);
   database.close();
 });
 
