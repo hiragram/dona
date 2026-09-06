@@ -240,6 +240,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
   const completionEventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const completionEvent=dispatcher.get(completionEventId)!; assert.equal(completionEvent.source,"dona_job");
+  assert.deepEqual(JSON.parse(completionEvent.reply_target_json!),input.target);
   assert.equal(repo.claim(due),undefined);
   dispatcher.beginDispatch(completionEventId,path.join(path.dirname(filename),"notification.json"),new Date(due)); dispatcher.markWaiting(completionEventId,new Date(due));
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",completed_at:due},path.join(path.dirname(filename),"notification.json"));
@@ -250,6 +251,23 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT result_file_deleted_at FROM job_completion_results WHERE job_id=?").get(job.job_id) as {result_file_deleted_at:string|null}).result_file_deleted_at,"2026-09-12T00:01:01Z");
   assert.equal((raw.prepare("SELECT objective FROM jobs WHERE job_id=?").get(job.job_id) as {objective:string}).objective,"[deleted]");
   assert.equal(JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(run.event_id) as {payload_json:string}).payload_json).work.objective,"[deleted]");
+  assert.equal(JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(completionEventId) as {payload_json:string}).payload_json).result,undefined);
+});
+
+test("Dona result通知を900秒超過とschedule取消でwrite前に抑止する", () => {
+  for(const mode of ["deadline","cancel"] as const) {
+    const {repo,dispatcher,raw}=setup(); const objective=`${mode}通知`;
+    repo.create(`notify_${mode}`,{...input,action:"work.read_only",content:objective},due,actor,now);
+    const run=repo.materialize(`notify_${mode}`,1,due,later,due,actor).run;
+    const job=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+    dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+    dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+    const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+    if(mode==="cancel") repo.transition(`notify_${mode}`,1,"cancel",actor,"2026-09-05T00:01:30Z");
+    dispatcher.nextAvailable(new Date(mode==="deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
+    assert.equal(dispatcher.get(eventId)?.status,"completed");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
+  }
 });
 
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
@@ -318,7 +336,7 @@ test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", (
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id, job.job_id);
   dispatcher.markJobBlocked(job.job_id,"入力待ち");
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
-  dispatcher.markJobNeedsReview(job.job_id,"ambiguous_job_control","確認待ち");
+  dispatcher.markJobNeedsReview(job.job_id,"ambiguous_prompt_acceptance","確認待ち");
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
   assert.equal(dispatcher.beginJobCancellation(job.job_id,job.source_event_id).status,"cancelling");
 });
@@ -335,7 +353,7 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答が不明");
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(repo.get("cancel_job")?.state,"cancelled");
-  assert.equal(dispatcher.listScheduledJobsRequiringCancellation()[0]?.job_id,job.job_id);
+  assert.equal(dispatcher.listScheduledJobsRequiringCancellation().some(row=>row.job_id===job.job_id),false);
   assert.equal(raw.prepare("SELECT 1 FROM connector_outbox WHERE run_id=?").get(run.run_id),undefined);
 
   repo.create("expiry_job", { ...input, action:"work.read_only",target:{kind:"none"},content:objective,

@@ -386,6 +386,7 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
+        AND (j.status!='needs_review' OR j.last_error_code='ambiguous_prompt_acceptance')
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
@@ -397,6 +398,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
+        AND (j.status!='needs_review' OR j.last_error_code='ambiguous_prompt_acceptance')
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -420,7 +422,8 @@ export class DispatcherDatabase {
     `).run(timestamp, timestamp).changes;
     const needsReview = this.db.prepare(`
       UPDATE jobs SET status = 'needs_review',
-        last_error_code = 'ambiguous_job_control',
+        last_error_code = CASE WHEN status='cancelling' THEN 'ambiguous_cancel_acceptance'
+          WHEN status='dispatching' THEN 'ambiguous_prompt_acceptance' ELSE 'ambiguous_steer_acceptance' END,
         last_error_message = 'Dispatcher restarted while job prompt, steer, or cancellation acceptance was unknown',
         steer_state = NULL, updated_at = ?
       WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
@@ -659,7 +662,7 @@ export class DispatcherDatabase {
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
         ...(job.last_error_message ? { error_message: job.last_error_message } : {}),
       },
-      reply_target: binding.destination,
+          reply_target: binding.destination.kind==="slack"?binding.destination.target:binding.destination,
       trace: { job_id: job.job_id, source_event_id: job.source_event_id },
     };
     const enqueued = this.enqueue(envelope, at);
@@ -694,6 +697,7 @@ export class DispatcherDatabase {
   }
 
   nextAvailable(at = new Date()): EventRow | undefined {
+    this.suppressUnauthorizedScheduledNotifications(at);
     const head = this.db
       .prepare(`
         SELECT * FROM events
@@ -702,6 +706,23 @@ export class DispatcherDatabase {
       `)
       .get() as EventRow | undefined;
     return head && head.available_at <= at.toISOString() ? head : undefined;
+  }
+
+  private suppressUnauthorizedScheduledNotifications(at: Date): void {
+    const timestamp=at.toISOString();
+    this.db.transaction(()=>{
+      const rows=this.db.prepare(`SELECT e.event_id FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
+        JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
+        JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
+        WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed') AND json_extract(c.owner_json,'$.kind')='schedule'
+          AND (julianday(e.available_at,'+900 seconds')<=julianday(?) OR s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))`)
+        .all(timestamp,timestamp) as Array<{event_id:string}>;
+      for(const row of rows) {
+        this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
+          last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')`).run(timestamp,timestamp,row.event_id);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=?").run(row.event_id);
+      }
+    }).immediate();
   }
 
   updateEventsNeedingNotification(): EventRow[] {
@@ -749,11 +770,13 @@ export class DispatcherDatabase {
       `).run(at.toISOString()).changes;
       const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
       for(const row of scheduled) this.scheduler.settleUndelegatedWorkEvent(row.event_id,"needs_review",timestamp);
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id IN (SELECT event_id FROM events WHERE status='needs_review')").run();
       return changed;
     }).immediate();
   }
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
+    this.suppressUnauthorizedScheduledNotifications(at);
     const timestamp = at.toISOString();
     const changed = this.db
       .prepare(`
@@ -781,6 +804,7 @@ export class DispatcherDatabase {
       const scheduled=this.getRequired(eventId).source==="dona_schedule";
       this.transition(eventId, from, scheduled ? "needs_review" : "blocked", {last_error_code: "agent_blocked",last_error_message: message});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?").run(eventId);
     }).immediate();
   }
 
@@ -788,6 +812,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {last_error_code: code,last_error_message: message});
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?").run(eventId);
     }).immediate();
   }
 
@@ -807,7 +832,10 @@ export class DispatcherDatabase {
           WHERE event_id = ?
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
-      if(status==="dead_letter") this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      if(status==="dead_letter") {
+        this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+        this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+      }
       return this.get(eventId)!;
     })();
   }
@@ -824,7 +852,10 @@ export class DispatcherDatabase {
             last_error_message = ?, updated_at = ? WHERE event_id = ?
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
-      if(status==="dead_letter") this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      if(status==="dead_letter") {
+        this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+        this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
+      }
       return this.get(eventId)!;
     })();
   }
@@ -906,6 +937,7 @@ export class DispatcherDatabase {
         WHERE event_id = ?
       `)
       .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
+    this.db.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(eventId);
     return this.getRequired(eventId);
   }
 
@@ -917,6 +949,7 @@ export class DispatcherDatabase {
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
+    this.db.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE notification_event_id=?").run(eventId);
     return this.getRequired(eventId);
   }
 

@@ -872,6 +872,9 @@ export class SchedulerRepository {
         WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
           WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
           WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
+      this.db.prepare(`UPDATE events SET payload_json=json_remove(payload_json,'$.result'),result_json=NULL
+        WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
+          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.

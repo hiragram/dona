@@ -153,7 +153,7 @@ export class JobSupervisor {
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
-          cancelled.errorCode ?? "cancel_acceptance_unknown",
+          "cancel_acceptance_unknown",
           commandMessage(cancelled),
         );
         this.wake();

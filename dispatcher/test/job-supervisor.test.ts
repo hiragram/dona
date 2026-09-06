@@ -388,7 +388,7 @@ describe("JobSupervisor", () => {
     );
     const updated = database.getJob(job.job_id)!;
     assert.equal(updated.status, "needs_review");
-    assert.equal(updated.last_error_code, "timeout");
+    assert.equal(updated.last_error_code, "cancel_acceptance_unknown");
     assert.equal(cancelCount, 1);
     database.close();
   });
