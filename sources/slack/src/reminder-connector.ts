@@ -18,7 +18,7 @@ const command = z.strictObject({
   idempotency_key: id,
   owner_id: id,
   expires_at: z.string().datetime({ offset: false }),
-  send_before: z.string().datetime({ offset: false }),
+  misfire_at: z.string().datetime({ offset: false }),
   target,
   text: z.string().min(1).refine((value) => [...value].length <= 2_000),
 });
@@ -28,6 +28,7 @@ export type SlackReminderResult =
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
+  | { outcome: "misfire"; code: string }
   | { outcome: "acceptance_unknown"; code: string };
 
 const forbidden = /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret)\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)|https?:\/\/hooks\.slack\.com\/services\/|xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i;
@@ -54,12 +55,17 @@ export class SlackReminderConnector {
       if (owner.isDeleted || owner.isBot || owner.isAppUser || !connection.client.hasChannelMember ||
         !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))) return { outcome: "revoked", code: "owner_not_authorized" };
     } catch (error) {
-      return { outcome: "not_accepted", code: error instanceof SlackApiError ? error.errorCode : "authorization_check_failed", retry_after_seconds: 1 };
+      const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
+      return ["channel_not_found", "user_not_found", "missing_scope", "not_in_channel"].includes(code)
+        ? { outcome: "revoked", code }
+        : { outcome: "not_accepted", code, retry_after_seconds: 1 };
     }
     try {
-      if (channel.isArchived || !channel.isMember || channel.isShared) return { outcome: "revoked", code: "target_not_allowed" };
+      if (channel.isArchived || channel.isShared || (input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
       if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
-      if (new Date().toISOString() >= input.send_before || input.send_before > input.expires_at) return { outcome: "revoked", code: "authorization_expired" };
+      const current = Date.now();
+      if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
+      if (current >= Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
       const posted = await connection.client.postMessage({
         channelId: input.target.channel_id,
         text: input.text,

@@ -8,13 +8,14 @@ import type { Outbox, SchedulerRepository, Target } from "./repository.js";
 
 export interface SlackReminderCommand {
   schema_version: 1; action: "slack.reminder.post"; outbox_id: string; run_id: string;
-  idempotency_key: string; owner_id: string; expires_at: string; send_before: string; target: Exclude<Target, { kind: "none" }>; text: string;
+  idempotency_key: string; owner_id: string; expires_at: string; misfire_at: string; target: Exclude<Target, { kind: "none" }>; text: string;
 }
 export type ReminderDelivery =
   | { outcome: "accepted"; receipt_id: string }
   | { outcome: "not_accepted"; code: string; retry_after_seconds: number }
   | { outcome: "rejected"; code: string }
   | { outcome: "revoked"; code: string }
+  | { outcome: "misfire"; code: string }
   | { outcome: "acceptance_unknown"; code: string };
 export interface SlackReminderPort { deliver(command: SlackReminderCommand): Promise<ReminderDelivery> }
 
@@ -55,6 +56,7 @@ export class ReminderPublisher {
     else if (result.outcome === "not_accepted") this.repository.finishWrite(claimed.outbox_id, token, "not_accepted", finishedAt, null, result.retry_after_seconds);
     else if (result.outcome === "rejected") this.repository.finishWrite(claimed.outbox_id, token, "rejected", finishedAt);
     else if (result.outcome === "revoked") this.repository.finishWrite(claimed.outbox_id, token, "revoked", finishedAt);
+    else if (result.outcome === "misfire") this.repository.finishWrite(claimed.outbox_id, token, "misfire", finishedAt);
     else this.repository.finishWrite(claimed.outbox_id, token, "ambiguous", finishedAt);
     this.logger.info("Slack reminder delivery settled", { outbox_id: claimed.outbox_id, run_id: claimed.run_id, outcome: result.outcome,
       code: "code" in result ? result.code : undefined });
@@ -96,7 +98,7 @@ export class SlackAdapterReminderClient implements SlackReminderPort {
   async deliver(input: SlackReminderCommand): Promise<ReminderDelivery> {
     const token = await readPrivateToken(this.config.updateInternalTokenPath);
     if (!token) return { outcome: "not_accepted", code: "missing_internal_token", retry_after_seconds: 1 };
-    try { return await request(this.config.slackAdapterSocketPath, token, input, this.config.jobCommandTimeoutMs); }
+    try { return await request(this.config.slackAdapterSocketPath, token, input, Math.max(this.config.jobCommandTimeoutMs, 60_000)); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       return code === "ENOENT" || code === "ECONNREFUSED"

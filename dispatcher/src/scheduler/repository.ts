@@ -132,12 +132,12 @@ export class SchedulerRepository {
       AND operation = ? AND source_event_id = ? LIMIT 1`).get(scheduleId, revision, operation, sourceEventId) !== undefined;
   }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
-  reminderConstraints(outboxId: string): { owner_id: string; expires_at: string; send_before: string } | undefined {
+  reminderConstraints(outboxId: string): { owner_id: string; expires_at: string; misfire_at: string } | undefined {
     return this.db.prepare(`SELECT s.owner_id, v.expires_at,
-      MIN(v.expires_at, strftime('%Y-%m-%dT%H:%M:%SZ', r.scheduled_for, '+900 seconds')) AS send_before
+      strftime('%Y-%m-%dT%H:%M:%SZ', r.scheduled_for, '+900 seconds') AS misfire_at
       FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
       JOIN schedule_revisions v ON v.schedule_id = r.schedule_id AND v.revision = r.revision
-      WHERE o.outbox_id = ? AND o.kind = 'slack.reminder.post'`).get(outboxId) as { owner_id: string; expires_at: string; send_before: string } | undefined;
+      WHERE o.outbox_id = ? AND o.kind = 'slack.reminder.post'`).get(outboxId) as { owner_id: string; expires_at: string; misfire_at: string } | undefined;
   }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
     utc(now);
@@ -696,9 +696,9 @@ export class SchedulerRepository {
     this.retireRevisions(run.schedule_id, ambiguousAt);
     this.auditOutbox(row, "outbox_needs_review", ambiguousAt, before);
   }
-  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "rejected" | "revoked" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
+  finishWrite(outboxId: string, token: string, outcome: "sent" | "not_accepted" | "rejected" | "revoked" | "misfire" | "ambiguous", now: string, receiptId: string | null = null, retryAfterSeconds = 0): Outbox {
     utc(now); if (receiptId !== null) validateReceipt(receiptId);
-    if (!["sent", "not_accepted", "rejected", "revoked", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
+    if (!["sent", "not_accepted", "rejected", "revoked", "misfire", "ambiguous"].includes(outcome)) throw new Error("invalid_outcome");
     if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds < 0 || retryAfterSeconds > 2592000) throw new Error("invalid_retry_after");
     return this.db.transaction(() => {
       const row = this.getOutbox(outboxId, now);
@@ -723,6 +723,10 @@ export class SchedulerRepository {
         if (outcome === "revoked") {
           this.db.prepare("UPDATE schedules SET state = 'paused', updated_at = ? WHERE schedule_id = ? AND state = 'active'").run(finishedAt, run.schedule_id);
           this.suppress(run.schedule_id, finishedAt, "cancelled");
+        }
+        if (outcome === "misfire") {
+          this.db.prepare("UPDATE connector_outbox SET status = 'cancelled' WHERE outbox_id = ?").run(outboxId);
+          this.db.prepare("UPDATE schedule_runs SET status = 'skipped', reason = 'misfire', terminal_at = ? WHERE run_id = ?").run(finishedAt, run.run_id);
         }
       }
       if (outcome !== "ambiguous") {

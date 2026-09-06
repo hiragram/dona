@@ -36,7 +36,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     { pollMilliseconds: Math.min(config.queuePollMs, 60_000) },
   );
   const reminderPublisher = new ReminderPublisher(database.scheduler, new SlackAdapterReminderClient(config),
-    new SystemClock(), createLogger("dispatcher_slack_reminders"), config.queuePollMs);
+    new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   const jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),
