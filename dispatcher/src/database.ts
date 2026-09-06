@@ -64,7 +64,10 @@ export class DispatcherDatabase {
       this.db.close();
       throw error;
     }
-    this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at));
+    this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at), undefined, (jobId,resultPath) => {
+      if(path.basename(resultPath)!==`${jobId}.json`) return false;
+      try { fs.unlinkSync(resultPath); return true; } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
+    });
   }
 
   private migrate(): void {
@@ -269,7 +272,7 @@ export class DispatcherDatabase {
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
-      if (payload.work?.objective !== request.objective || payload.work.scope !== "read_only" ||
+      if (typeof payload.work?.objective!=="string" || payload.work.objective.trim() !== request.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
         throw new Error("Scheduled work request does not match its persisted read-only scope");
       }
@@ -509,14 +512,14 @@ export class DispatcherDatabase {
     });
   }
 
-  saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string): void {
+  saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
     const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
     if (binding?.owner.kind === "schedule") validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     this.updateJob(jobId, ["running"], status, {
       result_json: stableStringify(result),
       result_path: resultPath,
-      completed_at: result.completed_at,
+      completed_at: at.toISOString(),
       last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
       last_error_message: result.status === "failed" ? result.summary : null,
     });
@@ -835,13 +838,11 @@ export class DispatcherDatabase {
   }
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
-    this.transition(eventId, ["waiting_agent"], "dead_letter", {
-      result_json: stableStringify(result),
-      result_path: resultPath,
-      completed_at: result.completed_at,
-      last_error_code: "agent_reported_failure",
-      last_error_message: result.summary ?? "Agent reported failure",
-    });
+    this.db.transaction(()=>{
+      this.transition(eventId, ["waiting_agent"], "dead_letter", {result_json: stableStringify(result),result_path: resultPath,
+        completed_at: result.completed_at,last_error_code: "agent_reported_failure",last_error_message: result.summary ?? "Agent reported failure"});
+      this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
+    }).immediate();
   }
 
   manualRetry(eventId: string, force: boolean, at = new Date()): EventRow {

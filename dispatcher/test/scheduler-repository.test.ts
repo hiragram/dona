@@ -187,7 +187,7 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   const other=dispatcher.enqueue(eventEnvelope("other-owner")).row;
   assert.throws(()=>dispatcher.beginJobSteer(created.row.job_id,other.event_id),/does not belong/);
   dispatcher.beginJobPreparation(created.row.job_id,new Date(due)); dispatcher.beginJobDispatch(created.row.job_id,new Date(due)); dispatcher.markJobRunning(created.row.job_id,new Date(due));
-  dispatcher.saveJobResult(created.row.job_id,{schema_version:1,job_id:created.row.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"結果"},completed_at:"2026-09-05T00:02:00Z"},created.row.result_path);
+  dispatcher.saveJobResult(created.row.job_id,{schema_version:1,job_id:created.row.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"結果"},completed_at:"2026-09-05T00:02:00Z"},created.row.result_path,new Date("2026-09-05T00:02:00Z"));
   assert.equal(dispatcher.enqueueJobNotification(created.row.job_id,new Date("2026-09-05T00:02:00Z")).row.event_id,event.event_id);
   assert.equal(repo.getRun(run.run_id)?.status,"completed");
   const completion=raw.prepare("SELECT work_state,notification_state,notification_event_id FROM job_completion_results").get() as Record<string,unknown>;
@@ -212,20 +212,22 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
 });
 
 test("work result通知のdelivery stateと本文retentionをjob resultへ同期する", () => {
-  const { repo, dispatcher, raw } = setup();
+  const { repo, dispatcher, raw, filename } = setup();
   const objective = "通知付きread-only作業";
   repo.create("notify_work", { ...input, action: "work.read_only", content: objective }, due, actor, now);
   const run = repo.materialize("notify_work", 1, due, later, due, actor).run;
-  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
+  const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, path.dirname(filename), path.dirname(filename), new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
-  dispatcher.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "完了", output: { format: "markdown", text: "結果" }, completed_at: due }, job.result_path);
+  dispatcher.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "完了", output: { format: "markdown", text: "結果" }, completed_at: due }, job.result_path, new Date(due));
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
   const claim = repo.claim(due)!; repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
   repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", due, "1.000002");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
-  repo.purge("2026-09-12T00:01:01Z");
-  assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json, null);
+  fs.writeFileSync(job.result_path,"sensitive result"); repo.purge("2026-09-12T00:01:01Z");
+  assert.equal(fs.existsSync(job.result_path),false);
+  assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json,null);
+  assert.equal((raw.prepare("SELECT result_file_deleted_at FROM job_completion_results WHERE job_id=?").get(job.job_id) as {result_file_deleted_at:string|null}).result_file_deleted_at,"2026-09-12T00:01:01Z");
 });
 
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {

@@ -84,10 +84,10 @@ export function validateWorkResultContent(value: string): void { truncateResultC
 
 export class SchedulerRepository {
   constructor(private readonly db: Database.Database, private readonly enqueue: (event: EventEnvelope, at: Date) => EnqueueResult,
-    private readonly codecs?: StorageCodecs) {}
+    private readonly codecs?: StorageCodecs, private readonly deleteJobResult?: (jobId:string,resultPath:string)=>boolean) {}
 
   withCodecs(codecs: StorageCodecs): SchedulerRepository {
-    return new SchedulerRepository(this.db, this.enqueue, codecs);
+    return new SchedulerRepository(this.db, this.enqueue, codecs, this.deleteJobResult);
   }
 
   get(scheduleId: string): Schedule | undefined {
@@ -817,6 +817,8 @@ export class SchedulerRepository {
   }
   purge(now: string): void {
     utc(now);
+    const resultFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
+      WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`).all(now) as Array<{job_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
@@ -845,5 +847,8 @@ export class SchedulerRepository {
         AND NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedule_revisions.schedule_id AND r.revision = schedule_revisions.revision)`)
         .run(add(now, -2592000));
     }).immediate();
+    if(this.deleteJobResult) for(const row of resultFiles) if(this.deleteJobResult(row.job_id,row.result_path)) {
+      this.db.prepare("UPDATE job_completion_results SET result_file_deleted_at=? WHERE job_id=? AND result_file_deleted_at IS NULL").run(now,row.job_id);
+    }
   }
 }
