@@ -100,7 +100,7 @@ test("認可rate limitをauthorization unavailableとして返す", async () => 
   assert.deepEqual(await instance.deliver(input), {
     outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: 901,
   });
-  assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "unavailable");
+  assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
 });
 
 test("認可rate limitを各preflightのRetry-Afterへ分離する", async () => {
