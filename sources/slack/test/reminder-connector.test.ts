@@ -75,7 +75,7 @@ test("同一channelの同時preflightをremote認可前にthrottleする", async
   assert.equal(calls, 1);
 });
 
-test("同一workspaceでも異なるchannelの認可照会を並行する", async () => {
+test("同一workspaceの異なるchannelでも認可methodをboundedにする", async () => {
   let release!: () => void;
   let authorizationCalls = 0;
   const gate = new Promise<void>((resolve) => void (release = resolve));
@@ -87,10 +87,10 @@ test("同一workspaceでも異なるchannelの認可照会を並行する", asyn
   const first = instance.deliver(input);
   const second = instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2", target: { ...input.target, channel_id: "C2" } });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(authorizationCalls, 2);
+  assert.equal(authorizationCalls, 1);
   release();
   assert.equal((await first).outcome, "accepted");
-  assert.equal((await second).outcome, "accepted");
+  assert.equal((await second).outcome, "unavailable");
 });
 
 test("認可rate limitをauthorization unavailableとして返す", async () => {
@@ -103,7 +103,7 @@ test("認可rate limitをauthorization unavailableとして返す", async () => 
   assert.equal((await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2" })).outcome, "authorization_unavailable");
 });
 
-test("認可rate limitを各preflightのRetry-Afterへ分離する", async () => {
+test("認可methodのin-flight中は後続attemptを消費しない", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => void (release = resolve));
   const instance = await connector(async () => ({ channelId: "C1", messageTs: "1.000001" }), async (channelId) => {
@@ -112,8 +112,7 @@ test("認可rate limitを各preflightのRetry-Afterへ分離する", async () =>
   });
   const short = instance.deliver(input);
   const long = await instance.deliver({ ...input, outbox_id: "o2", run_id: "r2", idempotency_key: "k2", target: { ...input.target, channel_id: "C2" } });
-  assert.equal(long.outcome, "authorization_unavailable");
+  assert.equal(long.outcome, "unavailable");
   release();
   assert.equal((await short).outcome, "authorization_unavailable");
-  assert.equal(long.outcome === "authorization_unavailable" ? long.retry_after_seconds : 0, 60);
 });

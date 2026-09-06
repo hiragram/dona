@@ -50,6 +50,7 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
   private readonly authorizationInFlight = new Set<string>();
+  private readonly authorizationMethodInFlight = new Set<string>();
   private readonly authorizationBlockedUntil = new Map<string, number>();
   private readonly channelTicket = new Map<string, string>();
   private readonly prepared = new Map<string, { serialized: string; ticketExpiresAt: number; authorizationExpiresAt: number; misfireAt: number }>();
@@ -74,7 +75,8 @@ export class SlackReminderConnector {
     const prepared = this.prepared.get(input.outbox_id);
     if (!preflightOnly) {
       const now = Date.now();
-      if (prepared?.serialized !== serialized || prepared.ticketExpiresAt <= now || prepared.authorizationExpiresAt <= now || prepared.misfireAt < now) {
+      const nowSecond = Math.floor(now / 1_000) * 1_000;
+      if (prepared?.serialized !== serialized || prepared.ticketExpiresAt <= now || prepared.authorizationExpiresAt <= nowSecond || prepared.misfireAt < nowSecond) {
         this.prepared.delete(input.outbox_id);
         return { outcome: "not_accepted", code: "preflight_required", retry_after_seconds: 0 };
       }
@@ -102,18 +104,42 @@ export class SlackReminderConnector {
     try {
       const blocked = this.authorizationBlockedUntil.get(`${input.target.workspace_id}:${authorizationMethod}`) ?? 0;
       if (blocked > Date.now()) return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.ceil((blocked - Date.now()) / 1_000) };
-      channel = await connection.client.getChannel(input.target.channel_id);
+      const channelMethodKey = `${input.target.workspace_id}:${authorizationMethod}`;
+      if (this.authorizationMethodInFlight.has(channelMethodKey)) return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 };
+      this.authorizationMethodInFlight.add(channelMethodKey);
+      try { channel = await connection.client.getChannel(input.target.channel_id); }
+      finally { this.authorizationMethodInFlight.delete(channelMethodKey); }
       authorizationMethod = "user";
       const userBlocked = this.authorizationBlockedUntil.get(`${input.target.workspace_id}:${authorizationMethod}`) ?? 0;
       if (userBlocked > Date.now()) return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.ceil((userBlocked - Date.now()) / 1_000) };
-      const owner = await connection.client.getUser(input.owner_id);
+      const userMethodKey = `${input.target.workspace_id}:${authorizationMethod}`;
+      if (this.authorizationMethodInFlight.has(userMethodKey)) return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 };
+      this.authorizationMethodInFlight.add(userMethodKey);
+      let owner;
+      try { owner = await connection.client.getUser(input.owner_id); }
+      finally { this.authorizationMethodInFlight.delete(userMethodKey); }
       authorizationMethod = "members";
       const membersBlocked = this.authorizationBlockedUntil.get(`${input.target.workspace_id}:${authorizationMethod}`) ?? 0;
       if (!channel.isIm && membersBlocked > Date.now()) return { outcome: "authorization_unavailable", code: "authorization_rate_limited", retry_after_seconds: Math.ceil((membersBlocked - Date.now()) / 1_000) };
-      if (owner.isDeleted || owner.isBot || owner.isAppUser || (!channel.isIm && (!connection.client.hasChannelMember ||
-        !(await connection.client.hasChannelMember(input.target.channel_id, input.owner_id))))) return { outcome: "revoked", code: "owner_not_authorized" };
-      if (channel.isMpim && (!connection.botUserId || !connection.client.hasChannelMember ||
-        !(await connection.client.hasChannelMember(input.target.channel_id, connection.botUserId)))) return { outcome: "revoked", code: "target_not_allowed" };
+      let ownerMember = true;
+      if (!channel.isIm) {
+        const membersMethodKey = `${input.target.workspace_id}:${authorizationMethod}`;
+        if (this.authorizationMethodInFlight.has(membersMethodKey)) return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 };
+        this.authorizationMethodInFlight.add(membersMethodKey);
+        try { ownerMember = !!connection.client.hasChannelMember && await connection.client.hasChannelMember(input.target.channel_id, input.owner_id); }
+        finally { this.authorizationMethodInFlight.delete(membersMethodKey); }
+      }
+      if (owner.isDeleted || owner.isBot || owner.isAppUser || !ownerMember) return { outcome: "revoked", code: "owner_not_authorized" };
+      if (channel.isMpim) {
+        if (!connection.botUserId || !connection.client.hasChannelMember) return { outcome: "revoked", code: "target_not_allowed" };
+        const membersMethodKey = `${input.target.workspace_id}:${authorizationMethod}`;
+        if (this.authorizationMethodInFlight.has(membersMethodKey)) return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 };
+        this.authorizationMethodInFlight.add(membersMethodKey);
+        let botMember;
+        try { botMember = await connection.client.hasChannelMember(input.target.channel_id, connection.botUserId); }
+        finally { this.authorizationMethodInFlight.delete(membersMethodKey); }
+        if (!botMember) return { outcome: "revoked", code: "target_not_allowed" };
+      }
     } catch (error) {
       if (this.nextPostAt.get(authorizationKey) === reservedUntil) this.nextPostAt.delete(authorizationKey);
       const code = error instanceof SlackApiError ? error.errorCode : "authorization_check_failed";
@@ -134,7 +160,7 @@ export class SlackReminderConnector {
     if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
     if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };
     if (input.target.kind === "owner_dm" && (!channel.isIm || channel.userId !== input.owner_id)) return { outcome: "revoked", code: "target_not_allowed" };
-    const current = Date.now();
+    const current = Math.floor(Date.now() / 1_000) * 1_000;
     if (current >= Date.parse(input.expires_at)) return { outcome: "revoked", code: "authorization_expired" };
     if (current > Date.parse(input.misfire_at)) return { outcome: "misfire", code: "misfire" };
     // The ticket is valid only for the one-second channel slot reserved above. If the
@@ -144,7 +170,7 @@ export class SlackReminderConnector {
     const misfireAt = Date.parse(input.misfire_at);
     this.prepared.set(input.outbox_id, { serialized, ticketExpiresAt, authorizationExpiresAt, misfireAt });
     this.channelTicket.set(authorizationKey, input.outbox_id);
-    const cleanupAt = Math.min(ticketExpiresAt, authorizationExpiresAt, misfireAt + 1);
+    const cleanupAt = Math.min(ticketExpiresAt, authorizationExpiresAt, misfireAt + 1_000);
     const cleanup = setTimeout(() => {
       if (this.prepared.get(input.outbox_id)?.ticketExpiresAt === ticketExpiresAt) this.prepared.delete(input.outbox_id);
       if (this.channelTicket.get(authorizationKey) === input.outbox_id) this.channelTicket.delete(authorizationKey);
