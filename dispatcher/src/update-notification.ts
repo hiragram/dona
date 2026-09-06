@@ -565,11 +565,13 @@ export class UpdateNotificationWorker {
     }
     const row = this.notifications.beginDelivery(candidate.event_id);
     const replyTarget = JSON.parse(row.reply_target_json) as Record<string, unknown>;
+    const payload = JSON.parse(row.payload_json) as { update_status: string };
     const outcome = await this.slack.deliver({
       schema_version: 1,
       notification_id: row.notification_id,
       request_id: row.request_id,
       terminal_fence: row.terminal_fence,
+      terminal_status: payload.update_status,
       workspace_id: replyTarget.workspace_id,
       channel_id: replyTarget.channel_id,
       thread_ts: replyTarget.thread_ts,
