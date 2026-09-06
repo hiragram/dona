@@ -42,6 +42,10 @@ test("preview/create/read/listはevent contextへ固定しsecret本文を投影�
   assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.equal(new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
   assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("別本文") }), (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
+  api.update(schedule.schedule_id, { source_event_id: first.event_id, expected_revision: 1, definition: definition("更新後") });
+  assert.equal(api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition() }).duplicate, true);
+  assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "request-1", definition: definition("更新後") }),
+    (error: unknown) => error instanceof ScheduleApiError && error.code === "idempotency_conflict");
   database.close();
 });
 
@@ -128,6 +132,18 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
   const reopenedApi = new ScheduleApiService(reopened, () => new Date("2026-09-02T00:00:00Z"));
   assert.equal((reopenedApi.get(id, first.event_id).schedule as { revision: number }).revision, 2);
   reopened.close();
+});
+
+test("更新時も366日を越える次回occurrenceを永続化する", async () => {
+  const { database, first, api } = await fixture();
+  const created = api.create({ source_event_id: first.event_id, idempotency_key: "long-interval", definition: definition() });
+  const scheduleId = (created.schedule as { schedule_id: string }).schedule_id;
+  const longInterval = { recurrence: { version: 1, kind: "monthly", start_date: "2026-09-02", local_time: "09:00:00",
+    timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 13, day: 2 }, action: { kind: "reminder", body: "長周期" } };
+  const updated = new ScheduleApiService(database, () => new Date("2026-09-03T00:00:00Z")).update(scheduleId,
+    { source_event_id: first.event_id, expected_revision: 1, definition: longInterval });
+  assert.equal((updated.schedule as { next_due: string }).next_due, "2027-10-02T00:00:00Z");
+  database.close();
 });
 
 test("失効したsource event authorizationではwriteを拒否する", async () => {

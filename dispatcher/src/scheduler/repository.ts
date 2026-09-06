@@ -95,6 +95,17 @@ export class SchedulerRepository {
     if (!row) return undefined;
     this.checked(scheduleId, row.revision, actor);
     const revision = this.revision(row);
+    return this.view(row, revision);
+  }
+  getAuthorizedRevision(scheduleId: string, revisionNumber: number, actor: Actor): ScheduleView | undefined {
+    const row = this.get(scheduleId);
+    if (!row) return undefined;
+    this.checked(scheduleId, row.revision, actor);
+    const revision = this.db.prepare("SELECT * FROM schedule_revisions WHERE schedule_id = ? AND revision = ?")
+      .get(scheduleId, revisionNumber) as Revision | undefined;
+    return revision ? this.view(row, revision) : undefined;
+  }
+  private view(row: Schedule, revision: Revision): ScheduleView {
     return { ...row, action: revision.action, target: JSON.parse(revision.target_json) as Target,
       timezone: revision.timezone, tzdb_version: revision.tzdb_version, expires_at: revision.expires_at,
       recurrence_json: revision.recurrence_json, policy_json: revision.policy_json, content_hash: revision.content_hash,
