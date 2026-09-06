@@ -534,6 +534,9 @@ export class DispatcherDatabase {
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
+    const job=this.getJobRequired(jobId);
+    if(binding?.owner.kind==="schedule"&&job.prompt_accepted_at&&completedAt.getTime()<Date.parse(job.prompt_accepted_at))
+      throw new Error("completed_at_precedes_prompt_acceptance");
     this.db.transaction(()=>{
       this.updateJob(jobId, ["running"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
@@ -936,7 +939,7 @@ export class DispatcherDatabase {
           value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
         const delivered=actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&
           typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&
-          (target?.kind!=="thread"||value.thread_ts===target.thread_ts));
+          (target?.kind!=="thread"||(value.thread_ts===target.thread_ts&&value.reply_broadcast===false)));
         this.setNotificationState(eventId,delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
@@ -976,7 +979,10 @@ export class DispatcherDatabase {
 
   manualComplete(eventId: string, at = new Date()): EventRow {
     const row = this.getRequired(eventId);
-    if (row.status === "completed") return row;
+    if (row.status === "completed") {
+      this.setNotificationState(eventId,"accepted",at);
+      return this.getRequired(eventId);
+    }
     const result: ResultEnvelope = {
       schema_version: 1,
       event_id: eventId,

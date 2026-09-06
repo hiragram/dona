@@ -516,6 +516,7 @@ export function createSlackMcpServer(
           workspace,
           channel_id: result.channelId,
           message_ts: result.messageTs,
+          reply_broadcast,
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
       } catch (error) {

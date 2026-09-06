@@ -259,6 +259,7 @@ describe("Dona Slack MCP server", () => {
         channel_id: "C123",
         message_ts: "2.3",
         thread_ts: "1.2",
+        reply_broadcast: false,
       });
 
       const fileResult = await client.callTool({

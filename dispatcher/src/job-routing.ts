@@ -60,10 +60,10 @@ export function migrateJobRouting(db: Database.Database): void {
         WHERE job_id=(SELECT job_id FROM schedule_runs WHERE run_id=NEW.run_id) AND job_status=NEW.completion_job_status;
       END;`);
     const eventColumns=new Set((db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
-    if(eventColumns.has("source")&&eventColumns.has("reply_target_json")) for (const row of db.prepare("SELECT * FROM events WHERE source='slack'").all() as EventRow[]) {
+    if(!marker&&eventColumns.has("source")&&eventColumns.has("reply_target_json")) for (const row of db.prepare("SELECT * FROM events WHERE source='slack'").all() as EventRow[]) {
       const binding=legacySlackBinding(row); if(binding) insertEventJobBinding(db,row.event_id,binding);
     }
-    if(eventColumns.has("source")) for(const row of db.prepare(`SELECT e.event_id,e.subject_json,r.run_id,r.revision,r.occurrence_key,v.target_json,v.content
+    if(!marker&&eventColumns.has("source")) for(const row of db.prepare(`SELECT e.event_id,e.subject_json,r.run_id,r.revision,r.occurrence_key,v.target_json,v.content
       FROM events e JOIN schedule_runs r ON r.event_id=e.event_id JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
       WHERE e.source='dona_schedule' AND v.action='work.read_only'`).all() as Array<{event_id:string;subject_json:string;run_id:string;revision:number;occurrence_key:string;target_json:string;content:string|null}>){
       const subject=JSON.parse(row.subject_json) as {tenant_id:string;owner_id:string;schedule_id:string};
@@ -77,7 +77,7 @@ export function migrateJobRouting(db: Database.Database): void {
         typeof (existingPayload.work as Record<string,unknown>).objective==="string")) db.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(stableStringify({run_id:row.run_id,revision:row.revision,
         occurrence_key:row.occurrence_key,work:{objective:row.content,scope:"read_only",allowed_external_writes:[],result_destination:rawTarget}}),row.event_id);
     }
-    db.exec(`INSERT OR IGNORE INTO job_owner_bindings SELECT j.job_id,b.event_id,b.owner_json,b.destination_json FROM jobs j JOIN event_job_bindings b ON b.event_id=j.source_event_id`);
+    if(!marker) db.exec(`INSERT OR IGNORE INTO job_owner_bindings SELECT j.job_id,b.event_id,b.owner_json,b.destination_json FROM jobs j JOIN event_job_bindings b ON b.event_id=j.source_event_id`);
     db.prepare("INSERT OR IGNORE INTO job_routing_schema VALUES(1,1)").run();
   }).immediate();
 }

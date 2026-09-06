@@ -614,7 +614,7 @@ export class SchedulerRepository {
       this.db.prepare(`UPDATE connector_outbox SET status = ?, receipt_id = ?, terminal_at = ?, updated_at = ?,
         content_delete_at = MIN(COALESCE(content_delete_at, ?), ?), claim_token = NULL, lease_until = NULL WHERE outbox_id = ?`)
         .run(outcome, receiptId, reconciledAt, reconciledAt, add(reconciledAt, 604800), add(reconciledAt, 604800), outboxId);
-      if (!(row.kind === "slack.work_result.post" && ["blocked", "needs_review"].includes(row.completion_job_status ?? ""))) {
+      if (!(row.kind === "slack.work_result.post" && (row.completion_job_status===null||["blocked", "needs_review"].includes(row.completion_job_status ?? "")))) {
         this.db.prepare("UPDATE schedule_runs SET status = ?, terminal_at = ? WHERE run_id = ? AND status = 'needs_review'")
           .run(outcome === "sent" ? "completed" : "failed", reconciledAt, run.run_id);
       }

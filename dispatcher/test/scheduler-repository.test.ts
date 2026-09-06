@@ -250,10 +250,13 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
   ],completed_at:due},notificationPath);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
   assert.equal(repo.get("notify_work")?.state,"completed");
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
+  dispatcher.manualComplete(completionEventId,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
   fs.mkdirSync(path.dirname(job.result_path),{recursive:true}); fs.writeFileSync(job.result_path,"sensitive result"); repo.purge("2026-09-12T00:01:01Z");
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json,null);
@@ -305,6 +308,7 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   const run = repo.materialize("legacy_work", 1, due, later, due, actor).run;
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
+  raw.prepare("DELETE FROM job_routing_schema").run();
   migrateJobRouting(raw);
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
   assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } });
@@ -403,13 +407,17 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
 });
 
 test("未委任の成功Resultをneeds_reviewへ隔離し取消済みeventをdispatchしない", () => {
-  const {repo,dispatcher,filename}=setup();
+  const {repo,dispatcher,filename,raw}=setup();
   repo.create("undelegated_success",{...input,action:"work.read_only",content:"未委任"},due,actor,now);
   const run=repo.materialize("undelegated_success",1,due,later,due,actor).run;
   const resultPath=path.join(path.dirname(filename),`${run.event_id}.json`); fs.writeFileSync(resultPath,"result");
   dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
   dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:due},resultPath);
   assert.equal(dispatcher.get(run.event_id!)?.status,"needs_review"); assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  const outbox=raw.prepare("SELECT outbox_id FROM connector_outbox WHERE run_id=?").get(run.run_id) as {outbox_id:string};
+  raw.prepare("UPDATE connector_outbox SET status='needs_review' WHERE outbox_id=?").run(outbox.outbox_id);
+  repo.reconcile(outbox.outbox_id,"sent","receipt",{...actor,role:"admin"},due);
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
   repo.purge("2026-09-12T00:01:00Z");
   assert.equal(dispatcher.get(run.event_id!)?.result_json,null); assert.equal(dispatcher.get(run.event_id!)?.result_path,null);
 
@@ -464,6 +472,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   const job=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"future",completed_at:later},job.result_path,new Date(due)),/completed_at_is_in_the_future/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_acceptance/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
