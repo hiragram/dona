@@ -549,10 +549,11 @@ export class DispatcherDatabase {
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const job=this.getJobRequired(jobId);
+    const recoverAmbiguous=job.status==="needs_review"&&["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted"].includes(job.last_error_code??"");
     if(binding?.owner.kind==="schedule"&&job.prompt_accepted_at&&completedAt.getTime()<Date.parse(job.prompt_accepted_at))
       throw new Error("completed_at_precedes_prompt_acceptance");
     this.db.transaction(()=>{
-      this.updateJob(jobId, ["running"], status, {
+      this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
         last_error_message: result.status === "failed" ? result.summary : null,
@@ -775,6 +776,7 @@ export class DispatcherDatabase {
       {status:string;owner_json:string;destination_json:string}|undefined;
     if(!row||!["dispatching","waiting_agent"].includes(row.status)) throw new Error("schedule_notification_not_authorized");
     if(row.status==="dispatching") this.markWaiting(eventId,at);
+    this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId);
     const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
     return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
       destination:JSON.parse(row.destination_json) as Record<string,unknown>};

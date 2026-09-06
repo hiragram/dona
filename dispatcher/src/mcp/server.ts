@@ -156,7 +156,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     title:"Authorize scheduled job notification",
     description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。",
     inputSchema:{event_id:eventId},
-    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
   },async({event_id})=>{
     try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id)); }
     catch(error){return failure(error,logger,"authorize_job_notification");}
