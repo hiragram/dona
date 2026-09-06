@@ -49,6 +49,7 @@ export function parseSlackReminderCommand(value: unknown): SlackReminderCommand 
 
 export class SlackReminderConnector {
   private readonly nextPostAt = new Map<string, number>();
+  private readonly authorizationInFlight = new Set<string>();
   private readonly prepared = new Map<string, { serialized: string; ticketExpiresAt: number; authorizationExpiresAt: number; misfireAt: number }>();
   constructor(private readonly registry: SlackWorkspaceRegistry) {}
 
@@ -84,8 +85,13 @@ export class SlackReminderConnector {
       // The read-only checks below were completed by the immediately preceding preflight.
       return await this.postPrepared(connection, input);
     }
+    const authorizationKey = `${input.target.workspace_id}:${input.target.channel_id}`;
+    if (this.authorizationInFlight.has(authorizationKey)) {
+      return { outcome: "unavailable", code: "authorization_throttled", retry_after_seconds: 1 };
+    }
     const throttleDelay = this.reservePost(input.target.workspace_id, input.target.channel_id);
     if (throttleDelay > 0) return { outcome: "unavailable", code: "channel_throttled", retry_after_seconds: throttleDelay };
+    this.authorizationInFlight.add(authorizationKey);
     let channel;
     try {
       channel = await connection.client.getChannel(input.target.channel_id);
@@ -102,6 +108,8 @@ export class SlackReminderConnector {
       return revokedSlackErrors.has(code)
         ? { outcome: "revoked", code }
         : { outcome: "authorization_unavailable", code, retry_after_seconds: error instanceof SlackApiError ? error.retryAfterSeconds ?? 1 : 1 };
+    } finally {
+      this.authorizationInFlight.delete(authorizationKey);
     }
     if (channel.isArchived || (!channel.isIm && !channel.isMpim && input.target.kind !== "owner_dm" && !channel.isMember)) return { outcome: "revoked", code: "target_not_allowed" };
     if (channel.isIm && channel.userId !== input.owner_id) return { outcome: "revoked", code: "target_not_allowed" };

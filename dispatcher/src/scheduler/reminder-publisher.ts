@@ -103,8 +103,8 @@ export class ReminderPublisher {
               continue;
             }
           }
-          await this.publishClaimed(row, this.clock.now());
-          activeClaims--;
+          try { await this.publishClaimed(row, this.clock.now()); }
+          finally { activeClaims--; }
           row = undefined;
         }
       };
