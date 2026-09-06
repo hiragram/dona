@@ -204,6 +204,27 @@ describe("SlackHealthServer", () => {
       );
       assert.equal(invalid.status, 400);
       assert.equal(deliveryCount, 1);
+      const invalidFenceZero = await request(
+        socketPath,
+        "/v1/internal/update-notifications",
+        "POST",
+        {
+          ...input,
+          notification_id: `update:${input.request_id}:terminal:0`,
+          terminal_fence: 0,
+          terminal_status: "failed",
+        },
+        { "x-dona-update-token": token },
+      );
+      assert.equal(invalidFenceZero.status, 400);
+      assert.deepEqual(invalidFenceZero.body, {
+        schema_version: 1,
+        error: {
+          code: "invalid_update_notification",
+          message: "notification terminal fence 0 is reserved for an unclaimed cancellation",
+        },
+      });
+      assert.equal(deliveryCount, 1);
     } finally {
       await server.stop();
     }

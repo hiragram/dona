@@ -79,7 +79,7 @@ export function parseUpdateNotificationRequest(input: unknown): UpdateNotificati
   if (value.terminal_fence === 0 && (
     value.terminal_status !== "cancelled" || value.desired_session_status !== "active"
   )) {
-    throw new Error("terminal fence 0 is reserved for an unclaimed cancellation");
+    throw new Error("notification terminal fence 0 is reserved for an unclaimed cancellation");
   }
   return value as unknown as UpdateNotificationRequest;
 }
