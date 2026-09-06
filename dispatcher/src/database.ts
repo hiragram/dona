@@ -76,7 +76,10 @@ export class DispatcherDatabase {
       if(!legacy&&!isolated) return false;
       try {
         if(isolated) fs.rmSync(path.dirname(resultPath),{recursive:true,force:true});
-        else fs.unlinkSync(resultPath);
+        else {
+          const directory=path.dirname(resultPath), prefix=`${jobId}.json`;
+          for(const name of fs.readdirSync(directory)) if(name===prefix||name.startsWith(`${prefix}.`)) fs.unlinkSync(path.join(directory,name));
+        }
         return true;
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
@@ -368,6 +371,10 @@ export class DispatcherDatabase {
       return this.db.prepare("SELECT * FROM jobs WHERE status = ? ORDER BY created_at LIMIT ?").all(status, limit) as JobRow[];
     }
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at LIMIT ?").all(limit) as JobRow[];
+  }
+
+  listLegacySharedGrantJobs():JobRow[] {
+    return this.db.prepare("SELECT * FROM jobs WHERE last_error_code='legacy_agent_sandbox_unknown' ORDER BY created_at,job_id").all() as JobRow[];
   }
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string, limit = 100): JobRow[] {

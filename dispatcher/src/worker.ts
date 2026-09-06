@@ -137,6 +137,8 @@ export class DispatcherWorker {
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
+    const current=this.database.get(row.event_id);
+    if(current?.status!==row.status) return;
 
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {

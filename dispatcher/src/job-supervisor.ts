@@ -88,7 +88,7 @@ export class JobSupervisor {
   }
 
   private async stopLegacySharedGrantAgents():Promise<void> {
-    for(const job of this.database.listJobs().filter(row=>row.last_error_code==="legacy_agent_sandbox_unknown")) {
+    for(const job of this.database.listLegacySharedGrantJobs()) {
       const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
     }
@@ -180,6 +180,7 @@ export class JobSupervisor {
           error_message: error instanceof Error ? error.message : String(error) }); }
       }
       for (const job of this.database.listOverdueScheduledJobs()) {
+        if(await this.tryComplete(job,false)) continue;
         try { await this.cancel(job.job_id, job.source_event_id, "Scheduled work exceeded its 3600 second execution deadline"); }
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
