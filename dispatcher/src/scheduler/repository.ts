@@ -114,6 +114,10 @@ export class SchedulerRepository {
     return (this.db.prepare("SELECT count(*) AS count FROM schedule_runs WHERE schedule_id = ? AND status = 'materialized'")
       .get(scheduleId) as { count: number }).count;
   }
+  lastAuditOperation(scheduleId: string): string | undefined {
+    return (this.db.prepare("SELECT operation FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence DESC LIMIT 1")
+      .get(scheduleId) as { operation: string } | undefined)?.operation;
+  }
   getRun(runId: string): Run | undefined { return this.db.prepare("SELECT * FROM schedule_runs WHERE run_id = ?").get(runId) as Run | undefined; }
   getOutbox(outboxId: string, now: string): Outbox | undefined {
     utc(now);

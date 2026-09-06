@@ -34,9 +34,10 @@ const planHash = z.string().regex(/^[0-9a-f]{64}$/);
 const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
 const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
 const recurrence = z.record(z.string(), z.unknown());
+const scheduleContent = (max: number) => z.string().min(1).refine(value => [...value].length <= max);
 const scheduleAction = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("reminder"), body: z.string().min(1).max(2000) }).strict(),
-  z.object({ kind: z.literal("work"), objective: z.string().min(1).max(4000), notify: z.enum(["origin_thread", "none"]) }).strict(),
+  z.object({ kind: z.literal("reminder"), body: scheduleContent(2000) }).strict(),
+  z.object({ kind: z.literal("work"), objective: scheduleContent(4000), notify: z.enum(["origin_thread", "none"]) }).strict(),
 ]);
 const scheduleDefinition = z.object({ recurrence, action: scheduleAction }).strict();
 

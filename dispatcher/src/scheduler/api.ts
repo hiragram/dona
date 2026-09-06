@@ -3,16 +3,18 @@ import { z } from "zod";
 import type { DispatcherDatabase } from "../database.js";
 import type { EventRow } from "../types.js";
 import { nextOccurrence, previewOccurrences } from "./calculator.js";
-import { parseDefinition } from "./domain.js";
+import { parseDefinition, validateCreation } from "./domain.js";
+import { FakeClock } from "./clock.js";
 import { encodePolicy, defaultPolicy } from "./policy.js";
 import { encodeRecurrence, parseRecurrence } from "./recurrence.js";
 import type { Actor, RevisionInput, Schedule, ScheduleView, Target } from "./repository.js";
 
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i);
+const content = (max: number) => z.string().min(1).refine(value => [...value].length <= max);
 const action = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("reminder"), body: z.string().min(1).max(2000) }),
-  z.strictObject({ kind: z.literal("work"), objective: z.string().min(1).max(4000), notify: z.enum(["origin_thread", "none"]) }),
+  z.strictObject({ kind: z.literal("reminder"), body: content(2000) }),
+  z.strictObject({ kind: z.literal("work"), objective: content(4000), notify: z.enum(["origin_thread", "none"]) }),
 ]);
 const definition = z.strictObject({ recurrence: z.unknown(), action });
 const previewInput = z.strictObject({ source_event_id: eventId, definition, after: z.string(), before_or_equal: z.string(), limit: z.number().int().min(1).max(100) });
@@ -77,6 +79,7 @@ export class ScheduleApiService {
     const value = createInput.parse(input); const context = this.context(value.source_event_id);
     const scheduleId = `sch_${hash(`${context.actor.tenant_id}\0${context.actor.actor_id}\0${JSON.stringify(context.target)}\0${value.idempotency_key}`).slice(0, 32)}`;
     const built = this.built(value.definition, context, scheduleId, 1); const at = second(this.now().toISOString());
+    validateCreation(built.parsed, new FakeClock(at));
     const existing = this.database.scheduler.getAuthorized(scheduleId, context.actor);
     if (existing) {
       this.assertBinding(existing, context);
@@ -93,7 +96,7 @@ export class ScheduleApiService {
   get(scheduleId: string, sourceEventId: string) { const c = this.context(sourceEventId); const row = this.database.scheduler.getAuthorized(scheduleId, c.actor); if (!row) throw new ScheduleApiError(404, "schedule_not_found"); this.assertBinding(row, c); return { schema_version: 1, schedule: this.project(row) }; }
   list(sourceEventId: string, limit: number, cursor?: string) { const c = this.context(sourceEventId); const candidates = this.database.scheduler.listAuthorized(c.actor, limit, cursor); const rows = candidates.filter(row => { try { this.assertBinding(row, c); return true; } catch { return false; } }); return { schema_version: 1, schedules: rows.map(row => this.project(row)), next_cursor: candidates.length === limit ? candidates.at(-1)!.schedule_id : null }; }
   update(scheduleId: string, input: unknown) { const value = updateInput.parse(input); const c = this.context(value.source_event_id); const current = this.database.scheduler.getAuthorized(scheduleId, c.actor); if (!current) throw new ScheduleApiError(404, "schedule_not_found"); this.assertBinding(current, c); const built = this.built(value.definition, c, scheduleId, value.expected_revision + 1); const at = second(this.now().toISOString()); const occurrence = nextOccurrence(built.parsed, at); if (!occurrence) throw new ScheduleApiError(400, "no_occurrence_in_horizon"); try { const row = this.database.scheduler.withCodecs(codecs).update(scheduleId, value.expected_revision, built.input, occurrence.occurrence_at, c.actor, at); return { schema_version: 1, schedule: this.project(this.database.scheduler.getAuthorized(row.schedule_id, c.actor)!) }; } catch (error) { throw this.map(error); } }
-  transition(scheduleId: string, operation: "pause"|"resume"|"cancel", input: unknown) { const value = transitionInput.parse(input); const c = this.context(value.source_event_id); const current = this.database.scheduler.getAuthorized(scheduleId, c.actor); if (!current) throw new ScheduleApiError(404, "schedule_not_found"); this.assertBinding(current, c); const desired = operation === "pause" ? "paused" : operation === "resume" ? "active" : "cancelled"; if (current.state === desired && (current.revision === value.expected_revision || current.revision === value.expected_revision + 1)) return { schema_version: 1, duplicate: true, materialized_runs_affected: 0, schedule: this.project(current) }; const before = this.database.scheduler.pendingMaterializedCount(scheduleId); try { const row = this.database.scheduler.transition(scheduleId, value.expected_revision, operation, c.actor, second(this.now().toISOString())); const after = this.database.scheduler.pendingMaterializedCount(scheduleId); return { schema_version: 1, duplicate: false, materialized_runs_affected: before - after, schedule: this.project(this.database.scheduler.getAuthorized(row.schedule_id, c.actor)!) }; } catch (error) { throw this.map(error); } }
+  transition(scheduleId: string, operation: "pause"|"resume"|"cancel", input: unknown) { const value = transitionInput.parse(input); const c = this.context(value.source_event_id); const current = this.database.scheduler.getAuthorized(scheduleId, c.actor); if (!current) throw new ScheduleApiError(404, "schedule_not_found"); this.assertBinding(current, c); const desired = operation === "pause" ? "paused" : operation === "resume" ? "active" : "cancelled"; const exactRetry = current.revision === value.expected_revision + 1 && this.database.scheduler.lastAuditOperation(scheduleId) === operation; if (current.state === desired && (current.revision === value.expected_revision || exactRetry)) return { schema_version: 1, duplicate: true, materialized_runs_affected: 0, schedule: this.project(current) }; const before = this.database.scheduler.pendingMaterializedCount(scheduleId); try { const row = this.database.scheduler.transition(scheduleId, value.expected_revision, operation, c.actor, second(this.now().toISOString())); const after = this.database.scheduler.pendingMaterializedCount(scheduleId); return { schema_version: 1, duplicate: false, materialized_runs_affected: before - after, schedule: this.project(this.database.scheduler.getAuthorized(row.schedule_id, c.actor)!) }; } catch (error) { throw this.map(error); } }
   history(scheduleId: string, sourceEventId: string, limit: number, cursor?: string) { const c = this.context(sourceEventId); const current = this.database.scheduler.getAuthorized(scheduleId, c.actor); if (!current) throw new ScheduleApiError(404, "schedule_not_found"); this.assertBinding(current, c); const rows = this.database.scheduler.runHistory(scheduleId, c.actor, limit, cursor); return { schema_version: 1, runs: rows.map(row => ({ ...row, status: row.status === "materialized" ? "scheduled" : row.status === "skipped" && row.reason === "misfire" ? "misfired" : row.status })), next_cursor: rows.length === limit ? rows.at(-1)!.run_id : null }; }
 
   private project(row: Schedule | ScheduleView) { const { schedule_id, state, revision, next_due, created_at, updated_at, terminal_at } = row; return { schedule_id, state, revision, next_due, created_at, updated_at, terminal_at, ...( "action" in row ? { action: row.action, target: row.target, timezone: row.timezone, tzdb_version: row.tzdb_version, authorization_expires_at: row.expires_at } : {}) }; }

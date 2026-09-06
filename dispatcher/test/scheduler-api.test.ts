@@ -8,7 +8,7 @@ import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))));
-const recurrence = { version: 1, kind: "daily", start_date: "2026-09-01", local_time: "09:00:00", timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 1 };
+const recurrence = { version: 1, kind: "daily", start_date: "2026-09-02", local_time: "09:00:00", timezone: "Asia/Tokyo", tzdb_version: "2025b", interval: 1 };
 const definition = (body = "確認してください") => ({ recurrence, action: { kind: "reminder", body } });
 
 async function fixture() {
@@ -50,6 +50,8 @@ test("別actorを拒否しrevision conflictと冪等transitionを区別する", 
   assert.equal(paused.duplicate, false);
   assert.equal(api.transition(id, "pause", { source_event_id: first.event_id, expected_revision: 1 }).duplicate, true);
   assert.throws(() => api.transition(id, "resume", { source_event_id: first.event_id, expected_revision: 1 }), (error: unknown) => error instanceof ScheduleApiError && error.code === "revision_conflict");
+  api.update(id, { source_event_id: first.event_id, expected_revision: 2, definition: definition("更新後") });
+  assert.throws(() => api.transition(id, "resume", { source_event_id: first.event_id, expected_revision: 2 }), (error: unknown) => error instanceof ScheduleApiError && error.code === "revision_conflict");
   database.close();
 });
 
@@ -70,6 +72,14 @@ test("更新・pagination上限・DB reopen後の永続読取を検証する", a
 test("失効したsource event authorizationではwriteを拒否する", async () => {
   const { database, first } = await fixture();
   const api = new ScheduleApiService(database, () => new Date("2026-10-02T00:00:00Z"));
-  assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "expired", definition: definition() }), (error: unknown) => error instanceof ScheduleApiError && error.code === "invalid_authorization");
+  assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "expired", definition: { ...definition(), recurrence: { ...recurrence, start_date: "2026-10-02" } } }), (error: unknown) => error instanceof ScheduleApiError && error.code === "invalid_authorization");
+  database.close();
+});
+
+test("古いrecurrence anchorをcreate時に拒否し本文上限をcode pointで数える", async () => {
+  const { database, first, api } = await fixture();
+  assert.throws(() => api.create({ source_event_id: first.event_id, idempotency_key: "old-anchor", definition: { ...definition(), recurrence: { ...recurrence, start_date: "2026-09-01" } } }), /invalid_creation_time/);
+  const created = api.create({ source_event_id: first.event_id, idempotency_key: "emoji", definition: definition("😀".repeat(1500)) });
+  assert.equal(created.duplicate, false);
   database.close();
 });
