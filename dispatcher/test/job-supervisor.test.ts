@@ -221,6 +221,21 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("does not overwrite an accepted cancellation when monitor returns", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-cancel-monitor-race"); markRunning(database,job.job_id);
+    let resolveWait!: (value:HerdrCommandResult)=>void; let waiting=false;
+    const runtime=fakeRuntime({
+      async wait(){waiting=true; return await new Promise<HerdrCommandResult>(resolve=>{resolveWait=resolve;});},
+      async cancel(){return ok("idle");},
+    });
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined); supervisor.start();
+    await waitFor(()=>waiting); await supervisor.cancel(job.job_id,job.source_event_id); resolveWait(ok("done"));
+    await waitFor(()=>database.getJob(job.job_id)?.status==="cancelled"); await supervisor.stop();
+    assert.equal(database.getJob(job.job_id)?.status,"cancelled"); database.close();
+  });
+
   test("requires review when initial prompt acceptance times out instead of retrying", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

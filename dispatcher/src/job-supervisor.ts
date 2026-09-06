@@ -289,9 +289,11 @@ export class JobSupervisor {
   }
 
   private async monitor(row: JobRow): Promise<void> {
+    if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (await this.tryComplete(row, false)) return;
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
     if (waited.aborted || this.stopping) return;
+    if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
         this.logger.debug("Background job remains active", {
@@ -323,6 +325,7 @@ export class JobSupervisor {
       this.logTransition(row, this.database.getJob(row.job_id)!);
       return true;
     } catch (error) {
+      if (["cancelling","cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return true;
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
       this.database.markJobNeedsReview(
         row.job_id,

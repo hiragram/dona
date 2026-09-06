@@ -334,6 +334,21 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
   }
 });
 
+test("未委任の成功Resultをneeds_reviewへ隔離し取消済みeventをdispatchしない", () => {
+  const {repo,dispatcher}=setup();
+  repo.create("undelegated_success",{...input,action:"work.read_only",content:"未委任"},due,actor,now);
+  const run=repo.materialize("undelegated_success",1,due,later,due,actor).run;
+  dispatcher.beginDispatch(run.event_id!,"/tmp/result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:due},"/tmp/result.json");
+  assert.equal(dispatcher.get(run.event_id!)?.status,"needs_review"); assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+
+  repo.create("cancelled_event",{...input,action:"work.read_only",target:{kind:"none"},content:"取消"},due,actor,now);
+  const cancelled=repo.materialize("cancelled_event",1,due,later,due,actor).run;
+  repo.transition("cancelled_event",1,"cancel",actor,due);
+  assert.equal(dispatcher.get(cancelled.event_id!)?.status,"completed");
+  assert.notEqual(dispatcher.nextAvailable(new Date(due))?.event_id,cancelled.event_id);
+});
+
 test("scheduled failed Resultを保存前にredactionし通常Slack Resultのretentionを変えない", () => {
   const { repo, dispatcher, raw } = setup(); const objective="失敗結果";
   repo.create("failed_secret",{...input,action:"work.read_only",content:objective},due,actor,now);

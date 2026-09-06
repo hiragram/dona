@@ -835,13 +835,23 @@ export class DispatcherDatabase {
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
-    this.transition(eventId, ["waiting_agent"], "completed", {
-      result_json: stableStringify(result),
-      result_path: resultPath,
-      completed_at: result.completed_at,
-      last_error_code: null,
-      last_error_message: null,
-    });
+    this.db.transaction(()=>{
+      const event=this.getRequired(eventId);
+      if(event.source==="dona_schedule") {
+        const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
+        if(!run?.job_id||run.status==="materialized") {
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"schedule_job_not_delegated",last_error_message:"Scheduled work completed without a bound job"});
+          this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",
+            new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+          return;
+        }
+      }
+      this.transition(eventId, ["waiting_agent"], "completed", {
+        result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
+        last_error_code: null, last_error_message: null,
+      });
+    }).immediate();
   }
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {

@@ -309,6 +309,9 @@ export class SchedulerRepository {
     this.db.prepare(`UPDATE schedule_runs SET status = 'cancelled', reason = ?, terminal_at = ?
       WHERE schedule_id = ? AND status = 'materialized' AND NOT EXISTS
       (SELECT 1 FROM connector_outbox o WHERE o.run_id = schedule_runs.run_id AND o.status IN ('request_started','needs_review','sent'))`).run(reason, now, scheduleId);
+    this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_suppressed',
+      last_error_message=NULL WHERE event_id IN (SELECT event_id FROM schedule_runs WHERE schedule_id=? AND status='cancelled' AND job_id IS NULL)
+      AND source='dona_schedule' AND status IN ('queued','retryable_failed')`).run(now,now,scheduleId);
     for (const row of suppressed) this.auditOutbox(row, `outbox_${reason}`, now);
   }
   update(scheduleId: string, expectedRevision: number, input: RevisionInput, nextDue: string, actor: Actor, now: string): Schedule {
