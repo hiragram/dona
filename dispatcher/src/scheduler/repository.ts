@@ -537,7 +537,7 @@ export class SchedulerRepository {
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
       this.suppress(run.schedule_id, at, "cancelled");
-      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=? WHERE schedule_id=? AND state NOT IN ('cancelled','completed')").run(at, run.schedule_id);
+      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND state!='completed'").run(at, run.schedule_id);
       const snapshot = this.revision(run); const target = JSON.parse(snapshot.target_json) as Target;
       if (target.kind !== "none" && !this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(runId)) {
         this.insertOutbox(runId, "slack.work_result.post", snapshot.target_json, "scheduled workの結果は確認が必要です", at);
@@ -558,13 +558,14 @@ export class SchedulerRepository {
       const settledAt=[now,run.created_at,before.created_at,before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,terminal_at=? WHERE run_id=?")
         .run(outcome, outcome === "needs_review" ? "ambiguous_write" : null, outcome === "failed" ? settledAt : null, run.run_id);
+      const snapshot=this.revision(run); const target=JSON.parse(snapshot.target_json) as Target;
       if (outcome === "needs_review") {
         this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=?").run(settledAt, run.schedule_id);
-        const snapshot=this.revision(run); const target=JSON.parse(snapshot.target_json) as Target;
-        if(target.kind!=="none"&&!this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(run.run_id)) {
-          this.insertOutbox(run.run_id,"slack.work_result.post",snapshot.target_json,"scheduled workの開始前処理は確認が必要です",settledAt);
-        }
         this.retireRevisions(run.schedule_id, settledAt);
+      }
+      if(target.kind!=="none"&&!this.db.prepare("SELECT 1 FROM connector_outbox WHERE run_id=? AND kind='slack.work_result.post'").get(run.run_id)) {
+        this.insertOutbox(run.run_id,"slack.work_result.post",snapshot.target_json,
+          outcome==="needs_review"?"scheduled workの開始前処理は確認が必要です":"scheduled workを開始できませんでした",settledAt);
       }
       this.audit(before, this.get(run.schedule_id)!, `event_${outcome}`,
         {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:eventId},settledAt,undefined,this.getRun(run.run_id)!);
@@ -663,7 +664,7 @@ export class SchedulerRepository {
     const ageOrigin = run.scheduled_for;
     const workRetryExpired = row.kind === "slack.work_result.post" && Date.parse(terminalAt) - Date.parse(row.created_at) > 900000;
     const reviewNotification = row.kind === "slack.work_result.post" && run.status === "needs_review" && schedule.state === "needs_review";
-    const reason = (!reviewNotification && schedule.state !== "active") || schedule.revision !== run.revision || !this.runCanSend(row, run) ? "cancelled"
+    const reason = (!reviewNotification && schedule.state !== "active") || (!reviewNotification && schedule.revision !== run.revision) || !this.runCanSend(row, run) ? "cancelled"
       : snapshot.expires_at <= terminalAt ? "authorization_expired"
       : workRetryExpired ? "retry_expired"
       : row.kind === "slack.reminder.post" && Date.parse(terminalAt) - Date.parse(ageOrigin) > 900000 ? "misfire"
@@ -699,7 +700,8 @@ export class SchedulerRepository {
         AND (s.state = 'active' OR (o.kind = 'slack.work_result.post' AND s.state = 'needs_review' AND r.status = 'needs_review'))
         AND ((o.kind = 'slack.reminder.post' AND r.status IN ('materialized','started'))
           OR (o.kind = 'slack.work_result.post' AND r.status IN ('completed','failed','needs_review')))
-        AND s.revision = r.revision AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
+        AND (s.revision = r.revision OR (o.kind='slack.work_result.post' AND s.state='needs_review' AND r.status='needs_review'))
+        AND v.expires_at > ? AND (o.content_delete_at IS NULL OR o.content_delete_at > ?)
         ORDER BY o.available_at, o.outbox_id LIMIT 1`).get(now, now, now) as Outbox | undefined;
       if (!row) return undefined;
       this.db.prepare("UPDATE connector_outbox SET status = 'claimed', claim_token = ?, lease_until = ?, updated_at = ? WHERE outbox_id = ?")
@@ -777,7 +779,7 @@ export class SchedulerRepository {
         if (outcome === "sent" && receiptId === null) throw new Error("receipt_required");
         const reviewNotification = row.kind === "slack.work_result.post" && run.status === "needs_review" && schedule.state === "needs_review";
         const authorized = this.runCanSend(row, run) && (schedule.state === "active" || reviewNotification) &&
-          schedule.revision === run.revision && this.revision(schedule).expires_at > now;
+          (schedule.revision === run.revision || reviewNotification) && this.revision(run).expires_at > now;
         const retryDelay = Math.max(retryAfterSeconds, row.attempt === 1 ? 1 : 5);
         const withinWorkRetryDeadline = row.kind !== "slack.work_result.post" || Date.parse(add(now, retryDelay)) <= Date.parse(add(row.created_at, 900));
         const retry = outcome === "not_accepted" && row.attempt < 3 && authorized && withinWorkRetryDeadline;
@@ -842,7 +844,7 @@ export class SchedulerRepository {
         last_error_message = CASE WHEN last_error_code='agent_reported_failure' THEN NULL ELSE last_error_message END
         WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?
           AND json_extract(owner_json,'$.kind')='schedule')`).run(now);
-      this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.action.objective','[deleted]')
+      this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]')
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'`).run(now);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
