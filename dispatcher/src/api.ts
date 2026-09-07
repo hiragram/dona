@@ -178,7 +178,6 @@ export class DispatcherApi {
   private quiesceComplete = false;
   private quiesceError: string | undefined;
   private readonly externalIngress: ExternalIngressProcessor;
-  private readonly ingressLimits = new Map<string, {tokens:number; time:number}>();
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -502,13 +501,9 @@ export class DispatcherApi {
       );
     }
 
+    // 未認証 request が認証済み delivery の source quota を消費しないよう、共有 bucket はここに置かない。
+    // raw body の size/time limit 後、認証済み connection 単位の durable queue admission が rate を制限する。
     const monotonicNow = performance.now();
-    const bucket = this.ingressLimits.get(resolved.source) ?? { tokens: 100, time: monotonicNow };
-    bucket.tokens = Math.min(100, bucket.tokens + Math.max(0,monotonicNow-bucket.time)/100);
-    bucket.time = monotonicNow;
-    this.ingressLimits.set(resolved.source,bucket);
-    if (bucket.tokens < 1) { request.resume(); throw new QueueAdmissionError("queue_rate"); }
-    bucket.tokens--;
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
     if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
@@ -522,6 +517,7 @@ export class DispatcherApi {
       method: "POST",
       requestTarget: request.url!,
       receivedAt,
+      receivedAtMonotonic: monotonicNow,
     });
 
     let result;
