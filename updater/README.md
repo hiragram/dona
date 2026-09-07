@@ -38,7 +38,7 @@ policyは次を固定します。
 - expected GitHub Actions check 3件と、任意のcommit signature gate
 - protocol/config/app schema read/write range
 
-candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)と`config/schema-rollout.json`をexact SHAからplan時に読み、staging checkoutでも再照合します。bootstrapはread/write schema 2を維持し、current releaseとapproved policyが完全一致する場合に限って、rollback-compatibleなread max拡張を次のbridgeとして許可します。write schema、read min、protocol/config、rollback safetyの変更やfeature activationは停止前に拒否します。activation releaseはbridgeの実稼働exact SHAを祖先として別途検証し、live WAL DB fileの単体copyをbackup扱いしません。
+candidate自身の[`config/release-compatibility.json`](../config/release-compatibility.json)をexact SHAからplan時に読み、staging checkoutでも再照合します。schema v3 writing releaseはv2〜v3をreadできるmetadataを持ちますが、v2-only releaseからの直接更新はcompatibility判定で拒否されます。先にwrite schema 2のcompatibility bridgeを配布してからv3へ進める必要があります。live WAL DB fileの単体copyをbackup扱いしません。
 
 ## APIとCLI
 

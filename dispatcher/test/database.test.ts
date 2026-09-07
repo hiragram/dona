@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -7,10 +9,12 @@ import Database from "better-sqlite3";
 
 import {
   DispatcherDatabase,
+  JobCreationError,
   migrateDispatcherDatabase,
   type DispatcherMigrationStep,
 } from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
+import { canonicalJobPayloadSha256, parseCreateJobRequest } from "../src/validation.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -141,44 +145,13 @@ afterEach(async () => {
 });
 
 describe("DispatcherDatabase", () => {
-  test("migrates a bridge-initialized v2 database and expands a tilde manifest path", async () => {
-    const { root, config } = await tempConfig();
-    roots.push(root);
-    await createSchemaV2Fixture(config.databasePath);
-    const bridge = new DispatcherDatabase(config.databasePath);
-    assert.equal(bridge.schemaCompatibility().actual, 2);
-    bridge.close();
-
-    const previousHome = process.env.HOME;
-    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
-    process.env.HOME = root;
-    process.env.DONA_RELEASE_MANIFEST_PATH = "~/activation-manifest.json";
-    await fs.writeFile(path.join(root, "activation-manifest.json"), JSON.stringify({
-      compatibility: { app_schema_read_max: 3, app_schema_write: 3 },
-    }));
-    try {
-      const activated = new DispatcherDatabase(config.databasePath);
-      assert.equal(activated.schemaCompatibility().actual, 3);
-      activated.close();
-      const verified = new Database(config.databasePath);
-      assert.deepEqual(verified.pragma("integrity_check"), [{ integrity_check: "ok" }]);
-      verified.close();
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
-      else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
-    }
-  });
-
   test("transactionally migrates a real schema v2 fixture to v3 without losing job state", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const before = await createSchemaV2Fixture(config.databasePath);
-    const manifestPath = path.join(root, "activation-manifest.json");
-    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_read_max: 3, app_schema_write: 3 } }));
-    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
-    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
+    const migration = new Database(config.databasePath);
+    migrateDispatcherDatabase(migration, () => {}, false, 3);
+    migration.close();
 
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 3, write: 3 });
@@ -187,6 +160,10 @@ describe("DispatcherDatabase", () => {
       .sort((left, right) => String(left.job_id).localeCompare(String(right.job_id)));
     assert.deepEqual(after, before);
     assert.deepEqual(new Set(database.listJobs().map((row) => row.job_key)), new Set(["legacy-default"]));
+    assert.equal(
+      database.reconcileEventJob("evt-source-queued", "legacy-default", "0".repeat(64)),
+      "unverified_legacy",
+    );
     assert.equal(database.getJobGroup("evt-source-completed")?.notification_mode, "legacy");
     assert.equal(database.getJobGroup("evt-source-running")?.notification_mode, "grouped");
     assert.equal(database.getJobGroup("evt-source-running")?.sealed_at, null);
@@ -230,9 +207,57 @@ describe("DispatcherDatabase", () => {
     const migratedIndexes = new Set(
       (migrated.pragma("index_list('jobs')") as Array<{ name: string }>).map((index) => index.name),
     );
-    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx"]) {
+    for (const name of ["jobs_event_idx", "jobs_thread_idx", "jobs_run_idx", "jobs_runnable_fair_idx", "jobs_workspace_job_idx", "jobs_nonterminal_workspace_job_idx", "jobs_status_job_idx", "jobs_nonterminal_job_idx"]) {
       assert.equal(migratedIndexes.has(name), true);
     }
+    const workspacePlan=migrated.prepare("EXPLAIN QUERY PLAN SELECT job_id FROM jobs WHERE workspace_id=? AND job_id>? ORDER BY job_id LIMIT 500").all("T1","") as Array<{detail:string}>;
+    assert.equal(workspacePlan.some((step)=>step.detail.includes("jobs_workspace_job_idx")),true);
+    const nonterminalPlan=migrated.prepare("EXPLAIN QUERY PLAN SELECT * FROM jobs WHERE job_id>? AND status NOT IN ('blocked','completed','failed','cancelled','needs_review') ORDER BY job_id LIMIT 500").all("") as Array<{detail:string}>;
+    assert.equal(nonterminalPlan.some((step)=>step.detail.includes("jobs_nonterminal_job_idx")),true);
+    const workspaceNonterminalPlan=migrated.prepare("EXPLAIN QUERY PLAN SELECT job_id FROM jobs WHERE workspace_id=? AND job_id>? AND status NOT IN ('blocked','completed','failed','cancelled','needs_review') ORDER BY job_id LIMIT 500").all("T1","") as Array<{detail:string}>;
+    assert.equal(workspaceNonterminalPlan.some((step)=>step.detail.includes("jobs_nonterminal_workspace_job_idx")),true);
+    const runnablePlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+        AND source_event_id > ?
+        AND source_event_id <= ?
+      ORDER BY source_event_id, created_at, job_id
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z", "", "evt_zzzz") as Array<{ detail: string }>;
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(runnablePlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const runnableIndexSql = migrated.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(runnableIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(runnableIndexSql, /retryable_failed/);
+    const cycleEndPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
+      WHERE status = 'queued' AND available_at <= ?
+      ORDER BY source_event_id DESC
+      LIMIT 1
+    `).all("2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("jobs_runnable_fair_idx")), true);
+    assert.equal(cycleEndPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const retryPromotionPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      UPDATE jobs INDEXED BY jobs_run_idx
+      SET status = 'queued', updated_at = ?
+      WHERE status = 'retryable_failed' AND available_at <= ?
+    `).all("2026-09-04T00:00:00.000Z", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPromotionPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
+    const retryPlan = migrated.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT available_at FROM jobs INDEXED BY jobs_run_idx
+      WHERE status = ? AND available_at > ?
+      ORDER BY available_at, created_at
+      LIMIT 1
+    `).all("retryable_failed", "2026-09-04T00:00:00.000Z") as Array<{ detail: string }>;
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("jobs_run_idx")), true);
+    assert.equal(retryPlan.some(({ detail }) => detail.includes("TEMP B-TREE")), false);
     assert.equal(
       (migrated.pragma("index_list('job_groups')") as Array<{ name: string }>).some(
         (index) => index.name === "job_groups_transition_idx",
@@ -266,18 +291,27 @@ describe("DispatcherDatabase", () => {
         'agent-duplicate-key', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z'
       );
     `), /UNIQUE constraint failed: jobs.source_event_id, jobs.job_key/);
+    migrated.exec(`
+      DROP INDEX jobs_runnable_fair_idx;
+      CREATE INDEX jobs_runnable_fair_idx
+        ON jobs(source_event_id, created_at, job_id, available_at)
+        WHERE status IN ('queued', 'retryable_failed');
+    `);
     migrated.close();
-    if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
-    else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
+
+    const existingV3 = new DispatcherDatabase(config.databasePath);
+    assert.doesNotThrow(() => existingV3.nextRunnableJob(new Date("2026-09-04T00:00:00.000Z")));
+    existingV3.close();
+    const reopened = new Database(config.databasePath);
+    const repairedIndexSql = reopened.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'jobs_runnable_fair_idx'
+    `).pluck().get() as string;
+    assert.match(repairedIndexSql, /WHERE status = 'queued'/);
+    assert.doesNotMatch(repairedIndexSql, /retryable_failed/);
+    reopened.close();
   });
 
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
-    const manifestRoot = await fs.mkdtemp("/tmp/dona-v3-migration-");
-    roots.push(manifestRoot);
-    const manifestPath = path.join(manifestRoot, "release-manifest.json");
-    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_read_max: 3, app_schema_write: 3 } }));
-    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
-    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
       const { root, config } = await tempConfig();
       roots.push(root);
@@ -305,8 +339,53 @@ describe("DispatcherDatabase", () => {
       assert.deepEqual(fixture.pragma("foreign_key_check"), []);
       fixture.close();
     }
-    if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
-    else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
+  });
+
+  test("does not guess schema-v3 write activation for an existing v2 database without a release manifest", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+
+    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
+    delete process.env.DONA_RELEASE_MANIFEST_PATH;
+    try {
+      const database = new DispatcherDatabase(config.databasePath);
+      assert.deepEqual(database.schemaCompatibility(), { actual: 2, read_min: 2, read_max: 3, write: 2 });
+      database.close();
+    } finally {
+      if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+      else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
+    }
+
+    const reopened = new Database(config.databasePath, { readonly: true });
+    assert.equal(reopened.pragma("user_version", { simple: true }), 2);
+    assert.equal((reopened.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key"), true);
+    assert.notEqual(reopened.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_groups'").get(), undefined);
+    reopened.close();
+  });
+
+  test("keeps migrated v2 jobs reusable without inventing an immutable payload fingerprint", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const fixture = new Database(config.databasePath);
+    fixture.prepare("UPDATE jobs SET objective = ? WHERE job_id = 'job-queued'")
+      .run(`objective-queued\n\n[DONA_FOLLOW_UP]\n${"x".repeat(100_001)}\n[/DONA_FOLLOW_UP]`);
+    fixture.close();
+
+    const database = new DispatcherDatabase(config.databasePath);
+    assert.equal(
+      database.reconcileEventJob("evt-source-queued", "legacy-default", "0".repeat(64)),
+      "unverified_legacy",
+    );
+    const reused = database.createJob({
+      source_event_id: "evt-source-queued",
+      objective: "objective-queued",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(reused.outcome, "reused");
+    assert.equal(reused.row.job_id, "job-queued");
+    database.close();
   });
 
   test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {
@@ -322,6 +401,15 @@ describe("DispatcherDatabase", () => {
     );
     assert.equal(created.row.job_key, "legacy-default");
     assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "legacy");
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "unexpected.second",
+        objective: "別の調査",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
     assert.deepEqual(database.ensureJobGroup(source.event_id, "legacy").created, false);
     assert.throws(() => database.ensureJobGroup(source.event_id, "grouped"), /already uses legacy/);
 
@@ -337,6 +425,588 @@ describe("DispatcherDatabase", () => {
     const duplicateClaim = database.claimJobGroupTransition(source.event_id, "attention", contender.event_id);
     assert.equal(duplicateClaim.claimed, false);
     assert.equal(duplicateClaim.row.attention_event_id, owner.event_id);
+    database.close();
+  });
+
+  test("seals queued grouped events on every manual terminal path", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+
+    for (const [suffix, terminal] of [
+      ["completed", "complete"],
+      ["dead-letter", "dead-letter"],
+    ] as const) {
+      const source = database.enqueue(eventEnvelope(`Ev-manual-${suffix}`)).row;
+      const job = database.createJob({
+        source_event_id: source.event_id,
+        job_key: "only",
+        objective: "complete before the source event",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id, `workspace-${suffix}`, `pane-${suffix}`);
+      database.beginJobDispatch(job.job_id);
+      database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id, {
+        schema_version: 1,
+        job_id: job.job_id,
+        status: "completed",
+        summary: "completed before manual source termination",
+        completed_at: "2026-09-05T04:00:00.000Z",
+      }, job.result_path);
+      assert.deepEqual(database.listJobsNeedingNotification(), []);
+
+      const terminalAt = new Date("2026-09-05T04:01:00.000Z");
+      if (terminal === "complete") {
+        database.manualComplete(source.event_id, terminalAt);
+        database.manualComplete(source.event_id, new Date("2026-09-05T04:02:00.000Z"));
+      } else {
+        database.manualDeadLetter(source.event_id, terminalAt);
+      }
+
+      assert.equal(database.getJobGroup(source.event_id)?.sealed_at, terminalAt.toISOString());
+      assert.deepEqual(database.listJobsNeedingNotification().map(({ job_id }) => job_id), [job.job_id]);
+      const notification = database.enqueueJobNotification(job.job_id);
+      assert.equal(
+        (envelopeFromRow(notification.row).payload.group as Record<string, unknown>).transition,
+        "all_terminal",
+      );
+    }
+    database.close();
+  });
+
+  test("creates distinct keyed jobs and reconciles reuse, conflict, and closed groups", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-keyed-jobs")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "research.primary",
+      objective: "  first objective  ",
+      workspace: { kind: "scratch" as const },
+    };
+    const firstCanonicalPayloadSha256 = canonicalJobPayloadSha256(parseCreateJobRequest(firstRequest));
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "research.secondary",
+      objective: "second objective",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.equal(first.outcome, "created");
+    assert.equal(first.duplicate, false);
+    assert.equal(first.row.objective, "first objective");
+    assert.equal(second.outcome, "created");
+    assert.notEqual(first.row.job_id, second.row.job_id);
+    assert.notEqual(first.row.workspace_path, second.row.workspace_path);
+    assert.notEqual(first.row.result_path, second.row.result_path);
+    assert.notEqual(first.row.agent_name, second.row.agent_name);
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
+
+    const reused = database.createJob(
+      firstRequest,
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    assert.equal(reused.outcome, "reused");
+    assert.equal(reused.duplicate, true);
+    assert.equal(reused.row.job_id, first.row.job_id);
+
+    const followUp = database.enqueue(eventEnvelope("Ev-keyed-jobs-follow-up")).row;
+    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "include the latest data");
+    assert.match(database.getJob(first.row.job_id)!.objective, /include the latest data/);
+    const reusedAfterSteer = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(reusedAfterSteer.outcome, "reused");
+    assert.equal(reusedAfterSteer.row.job_id, first.row.job_id);
+    assert.equal(
+      database.reconcileEventJob(source.event_id, first.row.job_key, firstCanonicalPayloadSha256),
+      "matched",
+    );
+
+    const persistedBeforeConflict = database.getJob(first.row.job_id);
+    assert.throws(
+      () => database.createJob(
+        { ...firstRequest, objective: "different" },
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError && error.code === "job_idempotency_conflict",
+    );
+    assert.deepEqual(database.getJob(first.row.job_id), persistedBeforeConflict);
+    assert.equal(database.listEventJobs(source.event_id).length, 2);
+
+    database.beginJobPreparation(first.row.job_id);
+    database.setJobRuntime(first.row.job_id, "workspace-1", "pane-1");
+    database.beginJobDispatch(first.row.job_id);
+    database.markJobRunning(first.row.job_id);
+    database.saveJobResult(first.row.job_id, {
+      schema_version: 1,
+      job_id: first.row.job_id,
+      status: "completed",
+      summary: "first completed",
+      completed_at: new Date().toISOString(),
+    }, first.row.result_path);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.throws(() => database.enqueueJobNotification(first.row.job_id), /is not sealed/);
+    const createdAfterSiblingCompletion = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "research.after-sibling",
+      objective: "third objective",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.equal(createdAfterSiblingCompletion.outcome, "created");
+
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      summary: "delegation complete",
+      actions: [],
+      memory_candidates: [],
+      completed_at: new Date().toISOString(),
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    const notification = database.enqueueJobNotification(first.row.job_id);
+    const notificationPayload = envelopeFromRow(notification.row).payload;
+    assert.deepEqual(notificationPayload.workspace, { kind: "scratch" });
+    const groupSnapshot = notificationPayload.group as Record<string, unknown>;
+    assert.equal(groupSnapshot.source_event_id, source.event_id);
+    assert.equal(groupSnapshot.total, 3);
+    assert.equal(groupSnapshot.pending, 2);
+    assert.deepEqual(groupSnapshot.status_counts, { completed: 1, queued: 2 });
+    assert.equal(groupSnapshot.transition, "progress");
+    assert.deepEqual(
+      (groupSnapshot.jobs as Array<{ job_key: string }>).map(({ job_key }) => job_key).sort(),
+      ["research.after-sibling", "research.primary", "research.secondary"],
+    );
+    assert.equal(database.getJobGroup(source.event_id)?.notification_mode, "grouped");
+    assert.notEqual(database.getJobGroup(source.event_id)?.sealed_at, null);
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).outcome,
+      "reused",
+    );
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.after-completion",
+        objective: "fourth objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
+    assert.deepEqual(database.listEventJobs(source.event_id, "missing"), []);
+    assert.equal(
+      database.reconcileEventJob(source.event_id, first.row.job_key, firstCanonicalPayloadSha256),
+      "matched",
+    );
+    assert.equal(database.reconcileEventJob(source.event_id, first.row.job_key, "0".repeat(64)), "conflict");
+    assert.equal(database.reconcileEventJob(source.event_id, "missing", "0".repeat(64)), "not_found");
+    assert.deepEqual(
+      database.listEventJobs(source.event_id, first.row.job_key).map(({ job_id }) => job_id),
+      [first.row.job_id],
+    );
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes(config.jobsWorkspaceRoot), false);
+    assert.equal(JSON.stringify(database.listEventJobs(source.event_id)).includes("first objective"), false);
+    database.close();
+  });
+
+  test("enforces count admission transactionally while preserving idempotent reuse", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const limits = { jobsPerEventMax: 3, jobObjectiveTotalMaxBytes: 400_000 };
+    const database = new DispatcherDatabase(config.databasePath, limits);
+    const competingConnection = new DispatcherDatabase(config.databasePath, limits);
+    const source = database.enqueue(eventEnvelope("Ev-job-count-limit")).row;
+    const request = (jobKey: string) => ({
+      source_event_id: source.event_id,
+      job_key: jobKey,
+      objective: `objective ${jobKey}`,
+      workspace: { kind: "scratch" as const },
+    });
+
+    const first = database.createJob(request("job.one"), config.jobsWorkspaceRoot, config.jobResultsDir);
+    const second = competingConnection.createJob(
+      request("job.two"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+    const cancellation = database.enqueue(eventEnvelope("Ev-job-count-cancel")).row;
+    database.beginJobCancellation(first.row.job_id, cancellation.event_id);
+    database.markJobCancelled(first.row.job_id, "test cancellation");
+    database.beginJobPreparation(second.row.job_id);
+    database.recordJobPreparationFailure(second.row.job_id, "worker_start_failed", "failed", 1);
+    const third = competingConnection.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    );
+
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    assert.equal(database.createJob(
+      request("job.three"),
+      config.jobsWorkspaceRoot,
+      config.jobResultsDir,
+    ).row.job_id, third.row.job_id);
+    assert.throws(
+      () => competingConnection.createJob(
+        request("job.four"),
+        config.jobsWorkspaceRoot,
+        config.jobResultsDir,
+      ),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "jobs_per_event" &&
+        error.limitDetails.attempted === 4,
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 3);
+    competingConnection.close();
+    database.close();
+  });
+
+  for (const resource of ["jobs_per_event", "objective_utf8_bytes_per_event"] as const) {
+    test(`serializes independent process INSERTs competing for the last ${resource} allowance`, { timeout: 15_000 }, async (t) => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const limits = {
+        jobsPerEventMax: resource === "jobs_per_event" ? 2 : 8,
+        jobObjectiveTotalMaxBytes: resource === "jobs_per_event" ? 400_000 : 6,
+      };
+      const database = new DispatcherDatabase(config.databasePath, limits);
+      t.after(() => database.close());
+      const source = database.enqueue(eventEnvelope(`Ev-process-${resource}`)).row;
+      const request = (jobKey: string) => ({
+        source_event_id: source.event_id, job_key: jobKey,
+        objective: "あ", workspace: { kind: "scratch" as const },
+      });
+      const seed = database.createJob(request("seed"), config.jobsWorkspaceRoot, config.jobResultsDir);
+      const children = ["competitor.one", "competitor.two"].map((key) => {
+        const child = fork(new URL("./fixtures/job-admission-child.ts", import.meta.url), [], {
+          execArgv: ["--import", "tsx"], stdio: ["ignore", "ignore", "inherit", "ipc"],
+        });
+        t.after(() => { if (child.exitCode === null) child.kill(); });
+        const ready = once(child, "message");
+        const exited = once(child, "exit");
+        child.send({
+          databasePath: config.databasePath, limits, request: request(key),
+          workspaceRoot: config.jobsWorkspaceRoot, resultDir: config.jobResultsDir,
+        });
+        return { child, ready, exited, key };
+      });
+      assert.deepEqual((await Promise.all(children.map(({ ready }) => ready))).map(([value]) => value), [{ ready: true }, { ready: true }]);
+      const results = children.map(({ child }) => once(child, "message"));
+      for (const { child } of children) child.send({ go: true });
+      const outcomes = (await Promise.all(results)).map(([value]) => value);
+      assert.deepEqual(await Promise.all(children.map(({ exited }) => exited)), [[0, null], [0, null]]);
+      assert.equal(outcomes.filter((value) => value.outcome === "created").length, 1);
+      const rejected = outcomes.filter((value) => value.code === "job_group_limit_exceeded");
+      assert.equal(rejected.length, 1);
+      assert.deepEqual(rejected[0].details, {
+        resource,
+        current: resource === "jobs_per_event" ? 2 : 6,
+        attempted: resource === "jobs_per_event" ? 3 : 9,
+        maximum: resource === "jobs_per_event" ? 2 : 6,
+      });
+      const rows = database.listEventJobs(source.event_id);
+      assert.equal(rows.length, 2);
+      assert.equal(rows.reduce((sum, row) => sum + Buffer.byteLength(database.getJob(row.job_id)!.objective, "utf8"), 0), 6);
+      assert.equal(database.createJob(request("seed"), config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id, seed.row.job_id);
+      const winnerIndex = outcomes.findIndex((value) => value.outcome === "created");
+      const reused = database.createJob(request(children[winnerIndex]!.key), config.jobsWorkspaceRoot, config.jobResultsDir);
+      assert.equal(reused.outcome, "reused");
+      assert.equal(reused.row.job_id, outcomes[winnerIndex].jobId);
+    });
+  }
+
+  test("allows the default eight jobs and rejects the ninth", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-default-job-limit")).row;
+    for (let index = 1; index <= 8; index += 1) {
+      database.createJob({
+        source_event_id: source.event_id,
+        job_key: `default.${index}`,
+        objective: `objective ${index}`,
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    }
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "default.9",
+        objective: "ninth objective",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_limit_exceeded",
+    );
+    assert.equal(database.listEventJobs(source.event_id).length, 8);
+    database.close();
+  });
+
+  test("enforces canonical objective UTF-8 bytes without counting queued steer text", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: 8,
+      jobObjectiveTotalMaxBytes: 6,
+    });
+    const source = database.enqueue(eventEnvelope("Ev-job-byte-limit")).row;
+    const firstRequest = {
+      source_event_id: source.event_id,
+      job_key: "unicode.one",
+      objective: "あ",
+      workspace: { kind: "scratch" as const },
+    };
+    const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    const followUp = database.enqueue(eventEnvelope("Ev-job-byte-steer")).row;
+    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "追加条件".repeat(100));
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.two",
+      objective: "ab",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+    database.createJob({
+      ...firstRequest,
+      job_key: "unicode.three",
+      objective: "c",
+    }, config.jobsWorkspaceRoot, config.jobResultsDir);
+
+    assert.throws(
+      () => database.createJob({
+        ...firstRequest,
+        job_key: "unicode.four",
+        objective: "d",
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError &&
+        error.code === "job_group_limit_exceeded" &&
+        error.limitDetails?.resource === "objective_utf8_bytes_per_event" &&
+        error.limitDetails.current === 6 &&
+        error.limitDetails.attempted === 7,
+    );
+    assert.equal(
+      database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id,
+      first.row.job_id,
+    );
+    database.close();
+  });
+
+  test("claims one attention transition and a later all-terminal transition after explicit cancel", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-attention")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const blocked = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "blocked",
+      objective: "承認を待つ",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const completed = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "completed",
+      objective: "完了する",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+
+    for (const job of [blocked, completed]) {
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id, `workspace-${job.job_key}`, `pane-${job.job_key}`);
+      database.beginJobDispatch(job.job_id);
+      database.markJobRunning(job.job_id);
+    }
+    database.markJobBlocked(blocked.job_id, "human input required");
+    database.saveJobResult(completed.job_id, {
+      schema_version: 1,
+      job_id: completed.job_id,
+      status: "completed",
+      summary: "完了",
+      completed_at: "2026-09-05T00:01:00.000Z",
+    }, completed.result_path);
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T00:02:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+
+    const attention = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:03:00.000Z"));
+    const progress = database.enqueueJobNotification(completed.job_id, new Date("2026-09-05T00:04:00.000Z"));
+    assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).transition, "attention");
+    assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 1);
+    assert.equal((envelopeFromRow(progress.row).payload.group as Record<string, unknown>).transition, "progress");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attention.row.event_id);
+
+    database.beginJobCancellation(blocked.job_id, source.event_id);
+    database.markJobCancelled(blocked.job_id, "利用者が中止");
+    const allTerminal = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:05:00.000Z"));
+    const finalSnapshot = envelopeFromRow(allTerminal.row).payload.group as Record<string, unknown>;
+    assert.equal(finalSnapshot.transition, "all_terminal");
+    assert.equal(finalSnapshot.pending, 0);
+    assert.deepEqual(finalSnapshot.status_counts, { cancelled: 1, completed: 1 });
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, allTerminal.row.event_id);
+    assert.equal(database.getJob(blocked.job_id)?.completion_event_id, allTerminal.row.event_id);
+    database.close();
+  });
+
+  test("keeps grouped snapshots bounded and redacts job content", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: 32,
+      jobObjectiveTotalMaxBytes: 400_000,
+    });
+    const source = database.enqueue(eventEnvelope("Ev-bounded-group")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs = Array.from({ length: 32 }, (_, index) => database.createJob({
+      source_event_id: source.event_id,
+      job_key: `job-${index.toString().padStart(2, "0")}`,
+      objective: `SECRET-OBJECTIVE-${index}`,
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row);
+    const preQuotaDatabase = new Database(config.databasePath);
+    const seed = preQuotaDatabase.prepare("SELECT * FROM jobs WHERE job_id = ?")
+      .get(jobs[0]!.job_id) as SqliteRow;
+    const columns = Object.keys(seed);
+    const insertPreQuotaJob = preQuotaDatabase.prepare(`
+      INSERT INTO jobs (${columns.join(", ")})
+      VALUES (${columns.map((column) => `@${column}`).join(", ")})
+    `);
+    for (let index = 32; index < 35; index += 1) {
+      insertPreQuotaJob.run({
+        ...seed,
+        job_id: `job-pre-quota-${index}`,
+        job_key: `job-${index.toString().padStart(2, "0")}`,
+        objective: `SECRET-OBJECTIVE-${index}`,
+        workspace_path: `${config.jobsWorkspaceRoot}/scratch/job-pre-quota-${index}`,
+        result_path: `${config.jobResultsDir}/job-pre-quota-${index}.json`,
+        agent_name: `job-pre-quota-${index}`,
+      });
+    }
+    preQuotaDatabase.close();
+    const attentionJob = jobs[0]!;
+    database.beginJobPreparation(attentionJob.job_id);
+    database.setJobRuntime(attentionJob.job_id, "secret-workspace-id", "secret-pane-id");
+    database.beginJobDispatch(attentionJob.job_id);
+    database.markJobRunning(attentionJob.job_id);
+    database.markJobBlocked(attentionJob.job_id, "operator input required");
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T01:00:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+
+    const notification = database.enqueueJobNotification(attentionJob.job_id);
+    const group = envelopeFromRow(notification.row).payload.group as Record<string, unknown>;
+    assert.equal(group.total, 35);
+    assert.equal(group.pending, 35);
+    assert.equal((group.jobs as unknown[]).length, 32);
+    const encoded = JSON.stringify(group);
+    assert.equal(encoded.includes("SECRET-OBJECTIVE"), false);
+    assert.equal(encoded.includes(config.jobsWorkspaceRoot), false);
+    assert.equal(encoded.includes(config.jobResultsDir), false);
+    assert.equal(encoded.includes("secret-workspace-id"), false);
+    assert.equal(encoded.includes("secret-pane-id"), false);
+    database.close();
+  });
+
+  test("rolls back notification enqueue, transition claim, and job link at every injected boundary", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-notification-faults")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const job = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "only",
+      objective: "complete once",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id, {
+      schema_version: 1,
+      job_id: job.job_id,
+      status: "completed",
+      summary: "done",
+      completed_at: "2026-09-05T02:00:00.000Z",
+    }, job.result_path);
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T02:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+
+    for (const step of ["event_enqueued", "transition_claimed", "job_linked"] as const) {
+      assert.throws(
+        () => database.enqueueJobNotification(job.job_id, new Date("2026-09-05T02:02:00.000Z"), (current) => {
+          if (current === step) throw new Error(`fault:${step}`);
+        }),
+        new RegExp(`fault:${step}`),
+      );
+      assert.equal(database.getJob(job.job_id)?.completion_event_id, null);
+      assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+      assert.equal(database.getByExternalId("dona_job", `${job.job_id}:completed`), undefined);
+    }
+
+    const recovered = database.enqueueJobNotification(job.job_id);
+    assert.equal((envelopeFromRow(recovered.row).payload.group as Record<string, unknown>).transition, "all_terminal");
+    assert.equal(database.enqueueJobNotification(job.job_id).row.event_id, recovered.row.event_id);
+    database.close();
+  });
+
+  test("recovers a sealed terminal job without duplicating its grouped transition", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    let database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-restart")).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const job = database.createJob({
+      source_event_id: source.event_id,
+      job_key: "restart",
+      objective: "survive restart",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id, {
+      schema_version: 1,
+      job_id: job.job_id,
+      status: "completed",
+      summary: "done",
+      completed_at: "2026-09-05T03:00:00.000Z",
+    }, job.result_path);
+    database.saveCompleted(source.event_id, {
+      schema_version: 1,
+      event_id: source.event_id,
+      status: "completed",
+      completed_at: "2026-09-05T03:01:00.000Z",
+    }, `${config.resultsDir}/${source.event_id}.json`);
+    database.close();
+
+    database = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(database.listJobsNeedingNotification().map(({ job_id }) => job_id), [job.job_id]);
+    const notification = database.enqueueJobNotification(job.job_id);
+    assert.equal((envelopeFromRow(notification.row).payload.group as Record<string, unknown>).transition, "all_terminal");
+    database.close();
+
+    database = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.equal(database.enqueueJobNotification(job.job_id).row.event_id, notification.row.event_id);
     database.close();
   });
 
@@ -368,10 +1038,35 @@ describe("DispatcherDatabase", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const first = database.enqueue(eventEnvelope("Ev-1")).row;
     const second = database.enqueue(eventEnvelope("Ev-2")).row;
+    const job = database.createJob({
+      source_event_id: first.event_id,
+      job_key: "recovery",
+      objective: "survive source recovery",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
     assert.equal(database.nextAvailable()?.event_id, first.event_id);
     database.beginDispatch(first.event_id, `${config.resultsDir}/${first.event_id}.json`);
     assert.equal(database.recoverStaleDispatching(), 1);
     assert.equal(database.get(first.event_id)?.status, "needs_review");
+    assert.notEqual(database.getJobGroup(first.event_id)?.sealed_at, null);
+    assert.equal(
+      database.createJob({
+        source_event_id: first.event_id,
+        job_key: "recovery",
+        objective: "survive source recovery",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).row.job_id,
+      job.job_id,
+    );
+    assert.throws(
+      () => database.createJob({
+        source_event_id: first.event_id,
+        job_key: "late",
+        objective: "too late",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
     assert.equal(database.nextAvailable()?.event_id, second.event_id);
     database.close();
   });
@@ -512,5 +1207,46 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
     reopened.close();
+  });
+
+  test("expands a newly created schema-v2 database before bridge runtime queries", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const manifestPath = path.join(root, "bridge-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify({ compatibility: { app_schema_write: 2 } }));
+    const previous = process.env.DONA_RELEASE_MANIFEST_PATH;
+    process.env.DONA_RELEASE_MANIFEST_PATH = manifestPath;
+    try {
+      const database = new DispatcherDatabase(config.databasePath);
+      const source = database.enqueue(eventEnvelope("Ev-bridge-explicit-key")).row;
+      const first = database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.primary",
+        objective: "調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir);
+      assert.equal(first.row.job_key, "research.primary");
+      assert.equal(database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.primary",
+        objective: "調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).outcome, "reused");
+      assert.throws(() => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "research.secondary",
+        objective: "追加調査する",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir), /multi_job_feature_disabled_for_schema_v2_bridge/);
+      database.close();
+      const raw = new Database(config.databasePath, { readonly: true });
+      assert.equal(raw.pragma("user_version", { simple: true }), 2);
+      assert.equal((raw.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key"), true);
+      assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_groups'").get());
+      raw.close();
+    } finally {
+      if (previous === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+      else process.env.DONA_RELEASE_MANIFEST_PATH = previous;
+    }
   });
 });

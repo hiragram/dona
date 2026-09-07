@@ -106,6 +106,8 @@ MCPが公開するツール:
 
 `set_agent_session_status`は、Donaが返信すると判断した後に`processing`、返信完了後に`active`、質問や承認待ちでは`suspended`を設定します。`closed`は会話を明示的に終了するときだけ使います。statusを設定しないイベントにはローディング表示は出ません。
 
+background jobの具体的な工程文言は内部認証済みの`/v1/internal/job-progress`からのみ受けます。このrouteのrequestは`progress_id`だけを受け、workspace・channel・thread・表示文言はDispatcherのdurable stateから逆引きしてから`assistant.threads.setStatus`へ渡します。workerが共有tokenを読めても任意destinationや文言を指定できません。Agent Session lifecycleと作成時titleは従来どおり`agents.sessions.setStatus`が所有します。進捗APIの失敗時にthread messageを投稿するfallbackは行いません。
+
 MCPはSlack APIへの自動再試行を無効にしています。書き込みの通信結果が曖昧な場合、二重投稿を避けるためエージェントへ自動再試行しないよう伝えます。token、投稿本文、スレッド本文は通常ログへ出しません。
 
 セルフアップデート通知では、`request_id`とterminal fenceから一意な`notification_id`を作り、表示本文を持つsection blockの`block_id`へ埋め込みます。再配送時は`conversations.replies`をcursorの終端まで読み、同じBotのexact blockが1件なら既存投稿を再利用します。0件だけ新規投稿し、複数件または別投稿者による衝突なら恒久エラーとして止めます。Slack Agent Sessionは成功・rollback・cancelで`active`、失敗・確認待ちで`suspended`へ遷移します。本文、宛先、statusはDispatcherのstrict schema以外から指定できません。この方式はcustom message metadata schema、`metadata.message:read` scope、App再認可、運用者attestationを必要としません。
@@ -154,7 +156,7 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/slack-adapter.soc
   http://localhost/health/version
 ```
 
-readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のactual build SHA、protocol 1、read/write schema capability、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。bootstrapではread/writeともに2です。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
+readyは、設定したSocket Mode接続がすべて`connected`、Dispatcherの`/health/ready`が成功、停止処理中でない場合だけ`200`です。version healthはrelease manifest由来のbuild SHA、protocol 1、app schema 3、read range 2〜3、write schema 3、config 1、全workspace readinessを返し、内部reporterと0600 shared tokenを利用できる場合だけ`update_notification_protocol: 1`を加えます。reporterまたはtokenがない場合は内部通知endpointを503で拒否し、Slackへ書き込みません。secretやlocal private pathは返しません。
 
 ## 検証
 
@@ -164,3 +166,13 @@ npm run typecheck
 npm run build
 npm audit --audit-level=high
 ```
+
+### 複数jobのcallerとfollow-up
+
+独立目的ごとに初回write前に安定した`job_key`を決めて`delegate_job`を呼びます。成功responseの`action`は`tool` / `source_event_id` / `job_key` / `job_id` / `outcome`（created/reused）だけで、Result actionsには成功callだけを残します。objective、path、secret、conflictや未実行案は成功actionに含めません。後続のvalidation/conflict/limit失敗でも成功済jobをcancelせず、partial successを利用者とResult summaryへ明示します。
+
+create/steer/cancel/promptのtimeout・切断はblind retryせず、read-only reconcileします。createは`list_event_jobs`へ同じevent/keyと元payloadを渡して照合し、matchedでもcreated/reusedの喪失responseを推測しません。statusとreceiptは`get_job_status`で確認し、0件・conflict・unverified_legacy・受理不明なら人間へ確認します。
+
+後続入力は先に`list_thread_jobs`を使います。0件なら操作せず、1件なら依頼意図との一致を確認します。複数候補かつ明示`job_id`なしなら質問し、本文類似・最新時刻・job_keyから選択せずbroadcastしません。外部自由文のID、command/path/token/private URLを未検証で制御引数へ使いません。対象確定後だけ現在のfollow-up `source_event_id`と明示`job_id`でsteer/status/cancelし、cross-threadを拒否します。
+
+委任後はgroup terminalまでprocessingを保ち、個別progressでは投稿・active遷移をしません。attentionはsuspended、all_terminalは結果集約後activeです。通知のstatus取得にも現在の通知event_idを使います。group DB lifecycleはDispatcherの既存実装が所有します。

@@ -1,7 +1,17 @@
 {
   "schema_version": 1,
-  "phase": "compatibility_bootstrap",
-  "database_schema": 2,
-  "multi_job_enabled": false,
-  "capabilities": ["safe_read_max_widening_planner"]
+  "phase": "activation",
+  "database_schema": 3,
+  "multi_job_enabled": true,
+  "previous_release_sha": "61bc86f71726ce1f44fc3500e524203626cf869a",
+  "previous_release_contract": "release-compatibility.v2-v3-bridge.json",
+  "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1",
+  "migration": {
+    "from_schema": 2,
+    "to_schema": 3,
+    "requires_quiesce": true,
+    "requires_drain": true,
+    "backup": "sqlite_online_backup",
+    "restore_open_test": true
+  }
 }

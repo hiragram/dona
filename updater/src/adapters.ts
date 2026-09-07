@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseDotenv } from "dotenv";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
@@ -168,9 +170,19 @@ export class RealGit implements GitPort {
       "--git-dir", this.cachePath, "show", `${targetSha}:config/schema-rollout.json`,
     ]));
     const value = JSON.parse(raw) as Partial<SchemaRollout>;
-    if (value.schema_version !== 1 || typeof value.phase !== "string" ||
-      !Number.isInteger(value.database_schema) || typeof value.multi_job_enabled !== "boolean" ||
-      !Array.isArray(value.capabilities) || !value.capabilities.every((entry) => typeof entry === "string")) {
+    const commonValid = value.schema_version === 1 && typeof value.phase === "string" &&
+      Number.isInteger(value.database_schema) && typeof value.multi_job_enabled === "boolean";
+    const bootstrapValid = Array.isArray(value.capabilities) &&
+      value.capabilities.every((entry) => typeof entry === "string");
+    const migration = value.migration;
+    const activationValid = value.phase === "activation" &&
+      typeof value.previous_release_sha === "string" && /^[0-9a-f]{40}$/.test(value.previous_release_sha) &&
+      typeof value.previous_release_contract === "string" &&
+      typeof value.required_control_plane_capability === "string" && migration !== undefined &&
+      Number.isInteger(migration.from_schema) && Number.isInteger(migration.to_schema) &&
+      typeof migration.requires_quiesce === "boolean" && typeof migration.requires_drain === "boolean" &&
+      typeof migration.backup === "string" && typeof migration.restore_open_test === "boolean";
+    if (!commonValid || (!bootstrapValid && !activationValid)) {
       throw new Error("target_schema_rollout_is_invalid");
     }
     return value as SchemaRollout;
@@ -478,12 +490,80 @@ export class RealRuntime implements RuntimePort {
     return snapshot;
   }
 
+  async schemaMigrationCapability(): Promise<{ ready: boolean; build_sha: string | null }> {
+    const buildSha = process.env.DONA_UPDATER_BUILD_SHA?.trim() ?? null;
+    if (!buildSha || !/^[0-9a-f]{40}$/.test(buildSha)) return { ready: false, build_sha: null };
+    try {
+      const receiptPath = path.join(this.policy.control_root, "control-plane-receipt.json");
+      const stats = await fs.lstat(receiptPath);
+      const uid = process.getuid?.();
+      if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+      this.dispatcherDatabasePath();
+      return {
+        ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
+          receipt.schema_migration_capability === "dispatcher_v2_to_v3_online_backup_v1",
+        build_sha: buildSha,
+      };
+    } catch {
+      return { ready: false, build_sha: buildSha };
+    }
+  }
+
   stopSlack(): Promise<CommandResult> {
     return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.slack_label)]);
   }
 
   stopDispatcher(): Promise<CommandResult> {
     return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  }
+
+  migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
+    const databasePath = this.dispatcherDatabasePath();
+    // The schema transition outlives an individual update request. A later
+    // activation attempt must be able to validate and reuse the durable v2
+    // backup/receipt left by an earlier attempt that rolled the release back.
+    const backupRoot = path.join(this.policy.control_root, "schema-backups", "dispatcher-v2-to-v3");
+    return this.runner.run(this.policy.executables.node, [
+      path.join(this.policy.release_root, targetSha, "dispatcher", "dist", "schema-rollout-cli.js"),
+      databasePath,
+      path.join(backupRoot, "dispatcher-v2.sqlite3"),
+      path.join(backupRoot, "migration-receipt.json"),
+      JSON.stringify(previous),
+      JSON.stringify(target),
+    ], {
+      timeoutMs: this.policy.timeouts.command_ms,
+      outputLimitBytes: this.policy.output_limit_bytes,
+      env: minimalEnvironment(),
+    });
+  }
+
+  private dispatcherDatabasePath(): string {
+    const environmentPath = path.join(this.policy.config_root, "dispatcher.env");
+    const stats = fsSync.lstatSync(environmentPath);
+    const uid = process.getuid?.();
+    if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      throw new Error("dispatcher_environment_identity_invalid");
+    }
+    const configured = parseDotenv(fsSync.readFileSync(environmentPath)).DONA_DATABASE_PATH;
+    if (configured !== undefined && (!configured || /[\0\r\n]/.test(configured))) {
+      throw new Error("dispatcher_database_path_invalid");
+    }
+    const base = path.resolve(this.policy.config_root, "..");
+    if (configured !== undefined && configured !== "~" && !configured.startsWith("~/") && !path.isAbsolute(configured)) {
+      throw new Error("dispatcher_database_path_must_be_absolute");
+    }
+    const resolved = configured === undefined ? path.join(base, "dona.sqlite3")
+      : configured === "~" ? os.homedir()
+        : configured.startsWith("~/") ? path.join(os.homedir(), configured.slice(2)) : path.resolve(configured);
+    if (!path.isAbsolute(resolved) || path.normalize(resolved) !== resolved) throw new Error("dispatcher_database_path_invalid");
+    const database = fsSync.lstatSync(resolved);
+    if (!database.isFile() || database.isSymbolicLink() || database.uid !== uid || (database.mode & 0o077) !== 0) {
+      throw new Error("dispatcher_database_identity_invalid");
+    }
+    return resolved;
   }
 
   startDispatcher(): Promise<CommandResult> {

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { DispatcherDatabase } from "../src/database.js";
+import { DispatcherDatabase, JobCreationError } from "../src/database.js";
 import type { HerdrClient, HerdrCommandResult } from "../src/herdr.js";
 import type { Logger } from "../src/logger.js";
 import { DispatcherWorker } from "../src/worker.js";
@@ -77,6 +77,67 @@ describe("DispatcherWorker", () => {
     await waitFor(() => database.get(second.event_id)?.status === "completed");
     await worker.stop();
     assert.deepEqual(prompted, [first.event_id, second.event_id]);
+    database.close();
+  });
+
+  test("atomically seals a delegated group when its source event completes and wakes the job supervisor", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await fs.mkdir(config.resultsDir, { recursive: true });
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-group-seal-worker")).row;
+    let wakeCount = 0;
+    const herdr: HerdrClient = {
+      async get() { return ok("idle"); },
+      async prompt(prompt) {
+        const fields = promptFields(prompt);
+        database.createJob({
+          source_event_id: fields.eventId,
+          job_key: "one",
+          objective: "first",
+          workspace: { kind: "scratch" },
+        }, config.jobsWorkspaceRoot, config.jobResultsDir);
+        database.createJob({
+          source_event_id: fields.eventId,
+          job_key: "two",
+          objective: "second",
+          workspace: { kind: "scratch" },
+        }, config.jobsWorkspaceRoot, config.jobResultsDir);
+        await fs.writeFile(fields.resultPath, JSON.stringify({
+          schema_version: 1,
+          event_id: fields.eventId,
+          status: "completed",
+          completed_at: "2026-09-05T07:00:00.000Z",
+        }));
+        return ok("working");
+      },
+      async wait() { return ok("done"); },
+    };
+    const worker = new DispatcherWorker(database, herdr, config, logger, () => { wakeCount += 1; });
+    worker.start();
+    await waitFor(() => database.get(source.event_id)?.status === "completed");
+    await worker.stop();
+
+    assert.notEqual(database.getJobGroup(source.event_id)?.sealed_at, null);
+    assert.ok(wakeCount >= 1);
+    assert.throws(
+      () => database.createJob({
+        source_event_id: source.event_id,
+        job_key: "three",
+        objective: "too late",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error) => error instanceof JobCreationError && error.code === "job_group_closed",
+    );
+    assert.equal(
+      database.createJob({
+        source_event_id: source.event_id,
+        job_key: "one",
+        objective: "first",
+        workspace: { kind: "scratch" },
+      }, config.jobsWorkspaceRoot, config.jobResultsDir).outcome,
+      "reused",
+    );
     database.close();
   });
 

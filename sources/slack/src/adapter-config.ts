@@ -21,7 +21,7 @@ export interface SlackAdapterConfig {
 
 function appSchemaCompatibility(env: NodeJS.ProcessEnv): { readMax: 2 | 3; write: 2 | 3 } {
   const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
-  if (!manifestPath) return { readMax: 2, write: 2 };
+  if (!manifestPath) return { readMax: 3, write: 3 };
   const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as {
     compatibility?: { app_schema_read_max?: unknown; app_schema_write?: unknown };
   };
