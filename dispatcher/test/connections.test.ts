@@ -144,8 +144,8 @@ test("capability matrix: UI/manualはcreate不可、non-renewableは期限更新
   }
 });
 
-test("verification deliveryはpending subscriptionを通常event allowlistから分離して永続化する", (t) => {
-  const { db } = fixture(t);
+test("verification deliveryはpending subscriptionを通常event allowlist・queue制限から分離して永続化する", (t) => {
+  const { db, file } = fixture(t);
   db.connections.register({ id: "verify", provider: "drive", account: "account1", credentialRef: "cred_fixture",
     credentialRevision: 1, allowlist: [{ resource: "folder1", events: ["changed"] }],
     capability: { kind: "manual", cursor: false } });
@@ -160,7 +160,15 @@ test("verification deliveryはpending subscriptionを通常event allowlistから
   assert.throws(() => db.enqueueExternal(envelope, verifyBinding), /not_authorized/);
   const result = db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true);
   assert.equal(result.outcome, "created");
-  assert.equal(db.get(result.row.event_id)?.status, "completed");
+  const saved = db.get(result.row.event_id);
+  assert.equal(saved?.status, "completed");
+  assert.match(saved?.result_json ?? "", /Provider verification receipt accepted/);
+  assert.doesNotMatch(saved?.result_json ?? "", /Manually marked completed/);
+  const raw = new Database(file, { readonly: true });
+  try {
+    const bucket = raw.prepare("SELECT tokens FROM queue_sources WHERE source=?").get(source) as { tokens: number };
+    assert.equal(bucket.tokens, db.queuePolicy.defaults.burst);
+  } finally { raw.close(); }
   assert.equal(db.nextAvailable(), undefined);
 });
 

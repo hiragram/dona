@@ -252,11 +252,12 @@ export class DispatcherDatabase {
 
   enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, owner?: ProviderOwner, at = new Date(), context?: QueueAdmissionContext,
     verification = false): EnqueueResult {
-    const queueContext: QueueAdmissionContext | undefined = context ? {
-      connectionId: context.connectionId,
-      ...(context.coalesce ? { coalesce: context.coalesce } : {}),
+    const connectionId = context?.connectionId ?? binding?.connectionId;
+    const queueContext: QueueAdmissionContext | undefined = connectionId ? {
+      connectionId,
+      ...(context?.coalesce ? { coalesce: context.coalesce } : {}),
       ...(verification ? { terminalVerification: true as const } : {}),
-    } : binding ? { connectionId: binding.connectionId } : undefined;
+    } : undefined;
     if (!binding) {
       if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
       return this.enqueueProvider(envelope, owner, at, queueContext);
@@ -265,7 +266,7 @@ export class DispatcherDatabase {
       return this.db.transaction(() => {
         const result = this.connections.delivery(binding, envelope,
           () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
-        if (verification && result.row.status !== "completed") this.manualComplete(result.row.event_id, at);
+        if (verification && result.row.status !== "completed") this.completeVerification(result.row.event_id, at);
         return result;
       }).immediate();
     } catch (error) {
@@ -396,7 +397,8 @@ export class DispatcherDatabase {
       }
       if (!bypassAdmission && (laneUsage.depth+addedDepth > policy.depth || usage.reduce((n,u)=>n+u.depth,0)+addedDepth+reservedDepth > this.queuePolicy.depth)) reject("queue_depth");
       if (!bypassAdmission && (laneUsage.bytes+bytes > policy.bytes || usage.reduce((n,u)=>n+u.bytes,0)+bytes+reservedBytes > this.queuePolicy.bytes)) reject("queue_bytes");
-      this.db.prepare("INSERT INTO queue_sources VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET tokens=excluded.tokens,clock_ms=excluded.clock_ms").run(envelope.source,sourceTokens-1,sourceClock);
+      this.db.prepare("INSERT INTO queue_sources VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET tokens=excluded.tokens,clock_ms=excluded.clock_ms")
+        .run(envelope.source,bypassAdmission ? sourceTokens : sourceTokens-1,sourceClock);
       this.db.prepare("UPDATE queue_lanes SET tokens=?,clock_ms=? WHERE lane=?").run(bypassAdmission ? tokens : tokens-1,clock,identity.lane);
       if (coalesced) {
         this.db.prepare("INSERT INTO queue_deliveries VALUES (?,?,?,?,?)").run(envelope.source,envelope.external_event_id,coalesced.event_id,createHash("sha256").update(fingerprint+envelope.occurred_at).digest("hex"),timestamp);
@@ -1114,6 +1116,28 @@ export class DispatcherDatabase {
       event_id: eventId,
       status: "completed",
       summary: "Manually marked completed after operator review",
+      actions: [],
+      memory_candidates: [],
+      completed_at: at.toISOString(),
+    };
+    this.db
+      .prepare(`
+        UPDATE events SET status = 'completed', result_json = ?, completed_at = ?,
+          last_error_code = NULL, last_error_message = NULL, updated_at = ?
+        WHERE event_id = ?
+      `)
+      .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
+    return this.getRequired(eventId);
+  }
+
+  private completeVerification(eventId: string, at: Date): EventRow {
+    const row = this.getRequired(eventId);
+    if (row.status === "completed") return row;
+    const result: ResultEnvelope = {
+      schema_version: 1,
+      event_id: eventId,
+      status: "completed",
+      summary: "Provider verification receipt accepted",
       actions: [],
       memory_candidates: [],
       completed_at: at.toISOString(),
