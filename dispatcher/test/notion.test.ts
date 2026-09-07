@@ -114,7 +114,7 @@ describe("Notion ingress", () => {
       credentialRef: "cred_integration", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
     assert.throws(() => serviceExternalIngressRegistry(config, database), /notion provider/);
   });
-  test("同一webhook provider IDの複数resource bindingを起動時に許可する", (t) => {
+  test("pilot scope外の複数resource bindingを起動時に拒否する", (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-resources-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
@@ -129,7 +129,7 @@ describe("Notion ingress", () => {
       database.connections.observe("notion_test", 1, resource, 1,
         { providerId: "sub_1", expiresAt: null, verified: false, cutoverConfirmed: false });
     }
-    assert.doesNotThrow(() => serviceExternalIngressRegistry(config, database));
+    assert.throws(() => serviceExternalIngressRegistry(config, database), /exactly one resource/);
   });
   test("verification token is stored but omitted from the normalized event", async () => {
     const { registration, secret } = setup();

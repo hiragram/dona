@@ -5,6 +5,7 @@ import { HerdrProcessClient } from "./herdr.js";
 import { ExternalIngressRegistry, type ExternalEventSourceRegistration } from "./ingress.js";
 import { githubPilotRegistration } from "./providers/github.js";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionError } from "./connections/domain.js";
 import { createNotionRegistration, fetchLatestNotionState } from "./notion.js";
 import { PrivateFileSecretStore } from "./connections/secret-store.js";
@@ -51,11 +52,12 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
     const pilot = config.notionPilot;
     const notionConnection = database.connections.get(pilot.connectionId);
     if (notionConnection.provider !== "notion") throw new Error("Notion pilot connection must use the notion provider");
+    if (notionConnection.allowlist.length !== 1) throw new Error("Notion pilot supports exactly one resource per connection");
     if (notionConnection.credentialRef === pilot.verificationCredentialRef) {
       throw new Error("Notion verification credential reference must be separate from the integration credential");
     }
     const providerIds = new Set(database.connections.subscriptions(pilot.connectionId)
-      .filter(subscription => subscription.providerId !== null && subscription.state !== "stopped")
+      .filter(subscription => subscription.providerId !== null && subscription.revision === notionConnection.revision && subscription.state !== "stopped")
       .map(subscription => subscription.providerId));
     if (providerIds.size > 1) {
       throw new Error("Notion pilot supports exactly one webhook provider ID per connection");
@@ -147,15 +149,22 @@ export async function runService(
       const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       return fetchLatestNotionState({ async fetch(resourceId) {
         const request = async (url: string) => {
-          const response = await fetch(url, {
-          method: "GET", signal: fetchSignal,
-          headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
-          const retry = response.headers.get("retry-after");
-          if (!response.ok) {
-            await response.body?.cancel().catch(() => undefined);
-            return { status: response.status, ...(retry === null ? {} : { retryAfter: Number(retry) }) };
+          for (let attempt = 0; ; attempt += 1) {
+            const response = await fetch(url, {
+              method: "GET", signal: fetchSignal,
+              headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
+            const retry = response.headers.get("retry-after");
+            if (!response.ok) {
+              await response.body?.cancel().catch(() => undefined);
+              const retryAfter = retry === null ? undefined : Number(retry);
+              if (response.status === 429 && attempt < 2 && Number.isFinite(retryAfter)) {
+                await delay(Math.max(0, retryAfter! * 1_000), undefined, { signal: fetchSignal });
+                continue;
+              }
+              return { status: response.status, ...(retryAfter === undefined ? {} : { retryAfter }) };
+            }
+            return { status: response.status, value: await response.json() as Record<string, unknown> };
           }
-          return { status: response.status, value: await response.json() as Record<string, unknown> };
         };
         const resource = await request(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`);
         // coalesce前のevent typeではなくpageのcurrent stateを取得し、混在signalでもcontentを落とさない。
@@ -225,6 +234,15 @@ export async function runService(
           content_truncated: truncated } };
       } }, subject.entity_id);
     } finally { token.fill(0); }
+  }, async quarantine(row) {
+    if (row.source !== "notion") return;
+    const subject = JSON.parse(row.subject_json) as Record<string, unknown>;
+    if (subject.connection_id !== config.notionPilot!.connectionId || typeof subject.entity_id !== "string") return;
+    const connection = database.connections.get(config.notionPilot!.connectionId);
+    const subscription = database.connections.subscriptions(connection.id).filter(candidate =>
+      candidate.resource === subject.entity_id && candidate.revision === connection.revision && candidate.verifiedAt !== null).at(-1);
+    if (subscription) database.connections.quarantine(connection.id, connection.revision,
+      subscription.resource, subscription.generation, subscription.verificationEpoch);
   } } : undefined);
   const jobSupervisor = new JobSupervisor(
     database,

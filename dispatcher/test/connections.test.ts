@@ -542,6 +542,13 @@ test("provider fetchを含むdispatching中はconnection disableを拒否する"
   assert.notEqual(db.connections.get("pilot").state,"disabled");
 });
 
+test("provider fetchを含むdispatching中はbinding quarantineを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.quarantine("pilot",1,"folder1",1),/operation_pending/);
+  assert.notEqual(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+});
+
 test("手動retry可能なeventがあるconnectionのrevision更新を拒否する",async(t)=>{
   const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   const accepted=db.enqueueExternal(event(),binding());db.manualDeadLetter(accepted.row.event_id,new Date(clock.now()));

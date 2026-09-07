@@ -125,6 +125,9 @@ export class ConnectionRegistry {
       const c = this.get(id);
       if (c.revision !== revision || c.state === "disabled") return;
       if (epoch !== undefined && this.sub(id, resource, generation).verificationEpoch !== epoch) return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND resource=? AND generation=? AND status='dispatching' LIMIT 1`)
+        .get(id, revision, resource, generation)) throw new ConnectionError("operation_pending");
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET verified_at=NULL,error='verification_failed',last_reconcile_at=?
         WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);

@@ -10,7 +10,10 @@ import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import { QueueClaimUnavailableError } from "./queue.js";
 import type { EventRow } from "./types.js";
 
-export interface EventStateFetcher { fetch(row: Readonly<EventRow>, signal: AbortSignal): Promise<unknown>; }
+export interface EventStateFetcher {
+  fetch(row: Readonly<EventRow>, signal: AbortSignal): Promise<unknown>;
+  quarantine?(row: Readonly<EventRow>): Promise<void>;
+}
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -180,6 +183,13 @@ export class DispatcherWorker {
     if (metadata.requires_fetch && this.stateFetcher) {
       try {
         const result = await this.stateFetcher.fetch(row, this.abortController.signal) as { outcome?: string; retryAfter?: number };
+        if (result.outcome === "permission_lost") {
+          const updated = this.database.recordSafePromptFailure(row.event_id, "provider_fetch_permission_lost",
+            "Provider access was revoked", this.config.maxAttempts);
+          await this.stateFetcher.quarantine?.(row);
+          this.logTransition(dispatching, updated, started);
+          return;
+        }
         if (["rate_limited", "degraded"].includes(result.outcome ?? "")) {
           const delay = result.outcome === "rate_limited" && Number.isFinite(result.retryAfter) ? Math.max(0, result.retryAfter! * 1_000) : 0;
           const updated = this.database.recordSafePromptFailure(row.event_id, `provider_fetch_${result.outcome}`,
