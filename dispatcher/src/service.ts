@@ -12,26 +12,45 @@ import {
   UpdateNotificationDatabase,
   UpdateNotificationWorker,
 } from "./update-notification.js";
+import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
-  const database = new DispatcherDatabase(config.databasePath);
+  const database = new DispatcherDatabase(config.databasePath, {
+    jobsPerEventMax: config.jobsPerEventMax,
+    jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
+  });
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+  let jobProgressStore: JobProgressStore | undefined;
+  try {
+    jobProgressStore = new JobProgressStore(config.jobProgressDatabasePath);
+  } catch (error) {
+    apiLogger.warn("Job progress disabled after initialization failure", {
+      error_code: "job_progress_initialization_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
+  }
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
     session: config.herdrSession,
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger);
-  const jobSupervisor = new JobSupervisor(
+  let jobSupervisor!: JobSupervisor;
+  let jobProgress = jobProgressStore
+    ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
+    : undefined;
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
+  jobSupervisor = new JobSupervisor(
     database,
-    new HerdrJobAgentRuntime(config),
+    new HerdrJobAgentRuntime(config, jobProgress !== undefined),
     config,
     createLogger("dispatcher_jobs"),
     () => worker.wake(),
+    jobProgress,
   );
+  if (!jobProgressStore) await jobSupervisor.disableProgress();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
     updateNotificationDatabase,
@@ -54,10 +73,32 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       },
     },
     updateNotificationWorker,
+    jobProgress,
   );
 
   try {
     await api.start();
+    jobSupervisor.recoverStaleJobs();
+    try { await jobProgress?.recover(); }
+    catch (error) {
+      if((error as Error&{progressRecoveryDeferred?:boolean}).progressRecoveryDeferred&&jobProgress){
+        apiLogger.warn("Job progress recovery deferred without releasing delivery fences",{
+          error_code:"job_progress_recovery_deferred",
+          error_message:error instanceof Error?error.message:String(error),
+        });
+        void jobProgress.recoverInBackground();
+      } else {
+      apiLogger.warn("Job progress disabled after recovery failure", {
+        error_code: "job_progress_recovery_failed",
+        error_message: error instanceof Error ? error.message : String(error),
+      });
+      jobProgressStore?.close();
+      jobProgressStore = undefined;
+      jobProgress = undefined;
+      await jobSupervisor.disableProgress();
+      api.disableJobProgress();
+      }
+    }
     worker.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
@@ -67,6 +108,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     if (worker.isRunning()) await worker.stop();
     database.close();
     updateNotificationDatabase.close();
+    jobProgressStore?.close();
     throw error;
   }
 
@@ -84,6 +126,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         await worker.stop();
         database.close();
         updateNotificationDatabase.close();
+        jobProgressStore?.close();
         resolve();
       } catch (error) {
         reject(error);

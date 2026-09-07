@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { releaseCompatibilityMatches, targetCompatibilityAllowedByPolicy, UpdateController } from "../src/controller.js";
+import { releaseCompatibilityMatches, UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
@@ -16,6 +16,7 @@ import type {
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
+  SchemaRollout,
 } from "../src/types.js";
 import { currentSha, installPointers, logger, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
@@ -26,6 +27,23 @@ const sourceEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRV";
 const approvalEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRW";
 const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
 const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: false, output_truncated: false };
+const activationRollout: SchemaRollout = {
+  schema_version: 1,
+  phase: "activation",
+  database_schema: 3,
+  multi_job_enabled: true,
+  previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
+  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  migration: {
+    from_schema: 2,
+    to_schema: 3,
+    requires_quiesce: true,
+    requires_drain: true,
+    backup: "sqlite_online_backup",
+    restore_open_test: true,
+  },
+};
 
 test("requires a v2/v3 compatibility bridge before a schema-v3 writing release", () => {
   const schemaV2 = {
@@ -40,26 +58,68 @@ test("requires a v2/v3 compatibility bridge before a schema-v3 writing release",
   assert.equal(releaseCompatibilityMatches(schemaV3, bridge), true);
 });
 
-test("allows only rollback-compatible read-max widening from the approved current policy", () => {
-  const approved = {
-    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+test("refuses schema-v3 planning without an exact stable updater migration capability receipt", async () => {
+  const f = await fixture();
+  const bridgeCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
     app_schema_write: 2, rollback_safe: true,
   };
-  const bridge = { ...approved, app_schema_read_max: 3 };
-  assert.equal(targetCompatibilityAllowedByPolicy(approved, approved, approved), true);
-  assert.equal(targetCompatibilityAllowedByPolicy(approved, bridge, approved), true);
-  assert.equal(targetCompatibilityAllowedByPolicy(approved, { ...bridge, app_schema_read_max: 4 }, approved), false);
-  for (const unsafe of [
-    { ...bridge, protocol: 2 },
-    { ...bridge, config: 2 },
-    { ...bridge, app_schema_read_min: 3 },
-    { ...bridge, app_schema_write: 3 },
-    { ...bridge, rollback_safe: false },
-    { ...bridge, app_schema_read_min: 1, app_schema_read_max: 1 },
-  ]) {
-    assert.equal(targetCompatibilityAllowedByPolicy(approved, unsafe, approved), false);
-  }
-  assert.equal(targetCompatibilityAllowedByPolicy(bridge, { ...bridge, app_schema_read_max: 4 }, approved), false);
+  const activationCompatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["schema_v3_read", "schema_v3_backup_restore"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_target_compatibility/,
+  );
+  f.git.targetRollout = activationRollout;
+  f.runtime.schemaMigrationReady = false;
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = "3".repeat(40);
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  assert.equal(f.database.list().length, 0);
+  f.database.close();
+});
+
+test("validates the post-activation rollout contract on schema-v3 to schema-v3 plans", async () => {
+  const f = await fixture();
+  const activationCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 3, rollback_safe: true,
+  };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: activationCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_target_compatibility/,
+  );
+  f.git.targetRollout = activationRollout;
+  await assert.doesNotReject(f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }));
+  f.database.close();
 });
 
 class FakeGit implements GitPort {
@@ -67,9 +127,12 @@ class FakeGit implements GitPort {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
     app_schema_write: 2, rollback_safe: true,
   };
-  targetRollout = {
-    schema_version: 1 as const, phase: "compatibility_bootstrap", database_schema: 2,
-    multi_job_enabled: false, capabilities: ["safe_read_max_widening_planner"],
+  targetRollout: SchemaRollout = {
+    schema_version: 1,
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
   };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
@@ -126,6 +189,13 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
+  schemaMigrationReady = true;
+  schemaMigrationBuildSha = targetSha;
+  async schemaMigrationCapability() {
+    this.calls.push("schemaMigrationCapability");
+    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null };
+  }
+  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
@@ -294,34 +364,6 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
-  test("rehearses stable-to-bootstrap exact policy and bootstrap-to-bridge widening plans", async () => {
-    const exact = await fixture();
-    const bootstrapPlan = await exact.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
-    assert.deepEqual((bootstrapPlan.plan as { compatibility: Compatibility }).compatibility, exact.policy.compatibility);
-    exact.database.close();
-
-    const widening = await fixture();
-    widening.git.targetCompatibility = { ...widening.policy.compatibility, app_schema_read_max: 3 };
-    widening.git.targetRollout = {
-      schema_version: 1, phase: "compatibility_bridge", database_schema: 2,
-      multi_job_enabled: false, capabilities: ["app_schema_read_v2_v3"],
-    };
-    widening.build.compatibility = widening.git.targetCompatibility;
-    widening.runtime.setHealthCompatibility(targetSha, widening.git.targetCompatibility);
-    const bridgePlan = await widening.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
-    assert.equal((bridgePlan.plan as { compatibility: Compatibility }).compatibility.app_schema_read_max, 3);
-    assert.equal((bridgePlan.plan as { rollback_compatible: boolean }).rollback_compatible, true);
-    const plan = bridgePlan.plan as { plan_id: string; plan_hash: string };
-    widening.controller.apply({
-      source_event_id: approvalEventId, reply_target: replyTarget,
-      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-widening",
-    });
-    widening.dispatcher.terminal = true;
-    await widening.controller.processNext();
-    assert.equal(widening.database.get(bridgePlan.request_id as string)?.state, "succeeded");
-    widening.database.close();
-  });
-
   test("waits for the source Result terminal barrier, then stages, activates, verifies, and routes completion", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -361,6 +403,44 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.deliverOutbox();
     assert.notEqual(f.database.outboxFor(requestId)?.slack_reported_at, null);
     assert.equal((await f.controller.status(requestId)).notification_state, "reported");
+    f.database.close();
+  });
+
+  test("validates target health against the compatibility persisted in the approved plan", async () => {
+    const f = await fixture();
+    const schemaV2Compatibility = { ...f.policy.compatibility };
+    const bridgeCompatibility: Compatibility = {
+      ...schemaV2Compatibility,
+      app_schema_read_max: 3,
+    };
+    f.policy.compatibility = bridgeCompatibility;
+    f.git.targetCompatibility = bridgeCompatibility;
+    f.build.compatibility = bridgeCompatibility;
+    f.runtime.setHealthCompatibility(targetSha, bridgeCompatibility);
+
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-bridge",
+    });
+    f.dispatcher.terminal = true;
+
+    // A restarted controller may load a different current policy, but target
+    // runtime evidence stays bound to the compatibility persisted in the plan.
+    f.policy.compatibility = schemaV2Compatibility;
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "succeeded", JSON.stringify({
+      error: row.last_error_code,
+      calls: f.runtime.calls,
+      operations: f.database.runtimeOperations(row.request_id),
+    }));
+    assert.deepEqual(JSON.parse(row.compatibility_json), bridgeCompatibility);
     f.database.close();
   });
 
@@ -424,6 +504,7 @@ describe("UpdateController isolated end-to-end", () => {
     );
     f.policy.compatibility = schemaV3Compatibility;
     f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
     f.build.compatibility = schemaV3Compatibility;
     f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
     f.runtime.setHealthCompatibility(targetSha, schemaV3Compatibility);
@@ -444,6 +525,9 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
 
     assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.equal(f.runtime.calls.filter((call) => call === "migrateAppSchema").length, 1);
+    assert.ok(f.runtime.calls.indexOf("stopDispatcher") < f.runtime.calls.indexOf("migrateAppSchema"));
+    assert.ok(f.runtime.calls.indexOf("migrateAppSchema") < f.runtime.calls.indexOf(`startMainAgent:${targetSha}`));
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
@@ -793,7 +877,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
-  test("fails planning closed for untrusted, unsafe, or feature-activating candidates", async () => {
+  test("fails planning closed when CI trust or candidate compatibility is not exact", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     await installPointers(policy);
@@ -823,20 +907,6 @@ describe("UpdateController isolated end-to-end", () => {
     });
     const incompatible = new UpdateController(database, policy, incompatibleGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(incompatible.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /approved_policy/);
-    const activatingGit = new FakeGit();
-    activatingGit.targetCompatibility = { ...policy.compatibility, app_schema_read_max: 3 };
-    activatingGit.targetRollout = { ...activatingGit.targetRollout, multi_job_enabled: true };
-    const activating = new UpdateController(database, policy, activatingGit, new FakeBuild(), store, runtime, dispatcher, logger);
-    await assert.rejects(activating.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /feature_activation/);
-    const disguisedActivationGit = new FakeGit();
-    disguisedActivationGit.targetCompatibility = { ...policy.compatibility, app_schema_read_max: 3 };
-    disguisedActivationGit.targetRollout = {
-      ...disguisedActivationGit.targetRollout, phase: "schema_v3_activation", capabilities: ["app_schema_read_v2_v3"],
-    };
-    const disguisedActivation = new UpdateController(
-      database, policy, disguisedActivationGit, new FakeBuild(), store, runtime, dispatcher, logger,
-    );
-    await assert.rejects(disguisedActivation.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /feature_activation/);
     database.close();
   });
 
