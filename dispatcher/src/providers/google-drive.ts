@@ -223,18 +223,22 @@ export async function drainDriveChanges(
       const trackedBefore = members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId));
       const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && trackedBefore;
-      const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
+      const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent)||members.has(parent));
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
-      const currentlyAllowed = !providerRemoved && !leftUserFeed && (members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
+      const alternativelyAllowed=allowlist.fileIds.has(change.fileId)||
+        (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId));
+      if(members.has(change.fileId)&&!folderAllowed&&!alternativelyAllowed&&!providerRemoved&&!leftUserFeed)
+        throw new ConnectionError("operation_pending");
+      const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         folderAllowed);
       const tombstone = !currentlyAllowed && (providerRemoved || leftUserFeed) && (trackedBefore || folderAllowed);
       if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
-      if ((folderAllowed||members.has(change.fileId)) && !providerRemoved&&!leftUserFeed) members.add(change.fileId); else members.delete(change.fileId);
+      if (folderAllowed && !providerRemoved&&!leftUserFeed) members.add(change.fileId); else members.delete(change.fileId);
     }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
