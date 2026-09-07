@@ -35,7 +35,7 @@ export const systemClock: Clock = { now: () => Date.now() };
 export class ConnectionError extends Error {
   constructor(readonly code: "invalid_input" | "not_found" | "revision_conflict" | "not_authorized" |
     "disabled" | "credential_unavailable" | "clock_skew" | "cursor_conflict" | "incomplete_batch" |
-    "duplicate_conflict" | "operation_pending" | "invalid_transition" | "capability_mismatch") {
+    "duplicate_conflict" | "operation_pending" | "invalid_transition" | "capability_mismatch" | "durability_unconfirmed") {
     super(code); this.name = "ConnectionError";
   }
 }
