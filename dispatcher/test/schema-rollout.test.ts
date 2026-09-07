@@ -80,6 +80,26 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   assert.equal(migrated.prepare("SELECT job_key FROM jobs").pluck().get(), "research.primary");
   migrated.close();
 
+  const legacyReceiptPath = path.join(root, "legacy-false-receipt.json");
+  await fs.writeFile(legacyReceiptPath, JSON.stringify({
+    ...receipt,
+    rollback: { ...receipt.rollback, backup_restore_opened: false },
+  }));
+  const legacyReceiptChild = spawn(path.resolve("node_modules/.bin/tsx"), [
+    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    databasePath,
+    backupPath,
+    legacyReceiptPath,
+    JSON.stringify(bridge),
+    JSON.stringify(activation),
+  ]);
+  let legacyReceiptStderr = "";
+  legacyReceiptChild.stderr.setEncoding("utf8");
+  legacyReceiptChild.stderr.on("data", (chunk: string) => { legacyReceiptStderr += chunk; });
+  const legacyReceiptExit = await new Promise<number | null>((resolve) => legacyReceiptChild.once("close", resolve));
+  assert.notEqual(legacyReceiptExit, 0);
+  assert.match(legacyReceiptStderr, /schema_rollout_receipt_invalid/);
+
   const changed = new Database(databasePath);
   changed.prepare("UPDATE jobs SET attempt_count = attempt_count + 1 WHERE job_id = ?")
     .run("job_01m1es03xy5cf8d9pm5cwx4srv");

@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   try {
     const existing = JSON.parse(await fs.readFile(receiptPath, "utf8")) as MigrationReceipt;
     if (existing.schema_version !== 1 || existing.from_schema !== 2 || existing.to_schema !== 3 ||
-      typeof existing.rollback?.backup_restore_opened !== "boolean") throw new Error("schema_rollout_receipt_invalid");
+      existing.rollback?.backup_restore_opened !== true) throw new Error("schema_rollout_receipt_invalid");
     const migrated = new Database(databasePath, { readonly: true, fileMustExist: true });
     const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
     try {
