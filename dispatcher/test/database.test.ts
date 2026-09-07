@@ -149,6 +149,9 @@ describe("DispatcherDatabase", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const before = await createSchemaV2Fixture(config.databasePath);
+    const migration = new Database(config.databasePath);
+    migrateDispatcherDatabase(migration, () => {}, false, 3);
+    migration.close();
 
     const database = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 3, write: 3 });
@@ -336,6 +339,29 @@ describe("DispatcherDatabase", () => {
       assert.deepEqual(fixture.pragma("foreign_key_check"), []);
       fixture.close();
     }
+  });
+
+  test("does not guess schema-v3 write activation for an existing v2 database without a release manifest", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+
+    const previousManifest = process.env.DONA_RELEASE_MANIFEST_PATH;
+    delete process.env.DONA_RELEASE_MANIFEST_PATH;
+    try {
+      const database = new DispatcherDatabase(config.databasePath);
+      assert.deepEqual(database.schemaCompatibility(), { actual: 2, read_min: 2, read_max: 3, write: 2 });
+      database.close();
+    } finally {
+      if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;
+      else process.env.DONA_RELEASE_MANIFEST_PATH = previousManifest;
+    }
+
+    const reopened = new Database(config.databasePath, { readonly: true });
+    assert.equal(reopened.pragma("user_version", { simple: true }), 2);
+    assert.equal((reopened.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key"), true);
+    assert.notEqual(reopened.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_groups'").get(), undefined);
+    reopened.close();
   });
 
   test("keeps migrated v2 jobs reusable without inventing an immutable payload fingerprint", async () => {

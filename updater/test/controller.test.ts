@@ -52,6 +52,18 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
     `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`);
   f.policy.compatibility = activationCompatibility;
   f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["schema_v3_read", "schema_v3_backup_restore"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_activation_contract/,
+  );
+  f.git.targetRollout = new FakeGit().targetRollout;
   f.runtime.schemaMigrationReady = false;
   await assert.rejects(
     f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),

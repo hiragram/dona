@@ -171,6 +171,7 @@ export function migrateDispatcherDatabase(
   db: Database.Database,
   migrationHook: DispatcherMigrationHook = () => {},
   outerTransaction = false,
+  targetWrite: 2 | 3 = dispatcherSchemaCompatibility.write,
 ): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > dispatcherSchemaCompatibility.read_max) {
@@ -343,11 +344,11 @@ export function migrateDispatcherDatabase(
       GROUP BY jobs.source_event_id;
     `);
     migrationHook("groups_backfilled");
-    db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
+    db.pragma(`user_version = ${targetWrite}`);
   };
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
-  if (dispatcherSchemaCompatibility.write >= 3 && currentVersion < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
-  if (dispatcherSchemaCompatibility.write === 2 && currentVersion === 2) ensureV2BridgeSchema(db);
+  if (targetWrite >= 3 && currentVersion < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
+  if (targetWrite === 2 && currentVersion === 2) ensureV2BridgeSchema(db);
   if ((db.pragma("user_version", { simple: true }) as number) >= 3) {
     ensureJobsRunnableFairIndex(db);
     ensureJobsWorkspaceJobIndex(db);
@@ -358,6 +359,7 @@ export function migrateDispatcherDatabase(
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
+  private readonly schemaWrite: 2 | 3;
 
   constructor(
     databasePath: string,
@@ -384,7 +386,11 @@ export class DispatcherDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    migrateDispatcherDatabase(this.db);
+    const existingVersion = this.db.pragma("user_version", { simple: true }) as number;
+    this.schemaWrite = !process.env.DONA_RELEASE_MANIFEST_PATH && existingVersion === 2
+      ? 2
+      : dispatcherSchemaCompatibility.write;
+    migrateDispatcherDatabase(this.db, () => {}, false, this.schemaWrite);
   }
 
   close(): void {
@@ -404,7 +410,9 @@ export class DispatcherDatabase {
   } {
     return {
       actual: this.db.pragma("user_version", { simple: true }) as number,
-      ...dispatcherSchemaCompatibility,
+      read_min: dispatcherSchemaCompatibility.read_min,
+      read_max: dispatcherSchemaCompatibility.read_max,
+      write: this.schemaWrite,
     };
   }
 
@@ -589,7 +597,7 @@ export class DispatcherDatabase {
       const admittedJobs = this.db.prepare(`
         SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
       `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
-      if (dispatcherSchemaCompatibility.write === 2 && admittedJobs.length > 0) {
+      if (this.schemaWrite === 2 && admittedJobs.length > 0) {
         throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
       }
       if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {

@@ -66,6 +66,7 @@ async function main(): Promise<void> {
       const afterDigests = contentSnapshot(migrated);
       const backupStillMatches = JSON.stringify(before) === JSON.stringify(after) &&
         JSON.stringify(beforeDigests) === JSON.stringify(afterDigests);
+      if (!backupStillMatches) throw new Error("schema_backup_content_mismatch");
       const recovered: MigrationReceipt = {
         schema_version: 1,
         from_schema: 2,
@@ -73,13 +74,11 @@ async function main(): Promise<void> {
         backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
         migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
         preservation: Object.fromEntries(Object.keys(before).map((name) => [name, {
-          before: backupStillMatches ? before[name]! : after[name]!, after: after[name]!,
-          before_digest: backupStillMatches
-            ? beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!
-            : afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+          before: before[name]!, after: after[name]!,
+          before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
           after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
         }])),
-        rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: backupStillMatches },
+        rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
         completed_at: new Date().toISOString(),
       };
       await publishMigrationReceipt(receiptPath, recovered);

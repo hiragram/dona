@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 
 import Database from "better-sqlite3";
 
-import { dispatcherSchemaCompatibility, migrateDispatcherDatabase } from "./database.js";
+import { migrateDispatcherDatabase } from "./database.js";
 
 export interface SchemaCompatibility {
   app_schema_read_min: number;
@@ -163,9 +163,9 @@ export async function migrateV2ToV3WithBackup(input: {
 
     let preservation!: MigrationReceipt["preservation"];
     source.transaction(() => {
-      migrateDispatcherDatabase(source, () => {}, true);
+      migrateDispatcherDatabase(source, () => {}, true, 3);
       input.postMigrationHook?.();
-      verifyDatabase(source, dispatcherSchemaCompatibility.write);
+      verifyDatabase(source, 3);
       const after = countSnapshot(source);
       const afterDigests = contentSnapshot(source);
       preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {

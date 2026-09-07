@@ -13,6 +13,7 @@ import type {
   OutboxRow,
   PlanRequest,
   ReleaseManifest,
+  SchemaRollout,
   RuntimeOperationKind,
   UpdateRow,
 } from "./types.js";
@@ -20,6 +21,23 @@ import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
 const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
+const schemaV3ActivationRollout: SchemaRollout = {
+  schema_version: 1,
+  phase: "activation",
+  database_schema: 3,
+  multi_job_enabled: true,
+  previous_release_sha: schemaV3BridgeSha,
+  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  migration: {
+    from_schema: 2,
+    to_schema: 3,
+    requires_quiesce: true,
+    requires_drain: true,
+    backup: "sqlite_online_backup",
+    restore_open_test: true,
+  },
+};
 interface TerminalObservation {
   status: "succeeded" | "rolled_back";
   activeSha: string;
@@ -89,6 +107,9 @@ export class UpdateController {
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
     if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
       if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
+      if (canonicalJson(git.target_rollout) !== canonicalJson(schemaV3ActivationRollout)) {
+        throw new Error("target_schema_rollout_does_not_match_activation_contract");
+      }
       controlPlane = await this.runtime.schemaMigrationCapability();
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");

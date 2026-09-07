@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -100,6 +101,23 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   assert.throws(() => assertReceiptMatchesDatabases(receipt, changedRead, backupRead), /receipt_state_mismatch/);
   changedRead.close();
   backupRead.close();
+
+  const recoveryReceiptPath = path.join(root, "recovered-receipt.json");
+  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    databasePath,
+    backupPath,
+    recoveryReceiptPath,
+    JSON.stringify(bridge),
+    JSON.stringify(activation),
+  ]);
+  let recoveryStderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { recoveryStderr += chunk; });
+  const recoveryExit = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  assert.notEqual(recoveryExit, 0);
+  assert.match(recoveryStderr, /schema_backup_content_mismatch/);
+  await assert.rejects(fs.access(recoveryReceiptPath));
 });
 
 test("migration refuses to run before drain and never overwrites a backup", async () => {
