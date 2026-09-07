@@ -65,6 +65,7 @@ export class SchedulerService {
   private running = false;
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
+  private lastPurgeAt: number | undefined;
 
   constructor(
     private readonly repository: SchedulerRepository,
@@ -109,6 +110,15 @@ export class SchedulerService {
   runBatch(): number {
     let materialized = 0;
     const visited: string[] = [];
+    const maintenanceAt=Date.parse(this.clock.now());
+    if(this.lastPurgeAt===undefined||maintenanceAt-this.lastPurgeAt>=3_600_000) {
+      try {
+        this.repository.purge(this.clock.now());
+        this.lastPurgeAt=maintenanceAt;
+      } catch(error) {
+        this.logger.error("Scheduler retention purge failed",{error_code:"scheduler_purge_failed",error_message:error instanceof Error?error.message:String(error)});
+      }
+    }
     this.repository.expireDue(this.clock.now(), this.batchSize);
     for (let index = 0; index < this.batchSize && !this.stopping; index++) {
       const now = this.clock.now();

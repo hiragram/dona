@@ -70,6 +70,19 @@ test("FakeClockのbefore/exact/afterとduplicate wakeで一度だけrun/eventを
   assert.deepEqual(event, { source: "dona_schedule", external_event_id: `schedule:v1:exact:${due}` });
 });
 
+test("retention purgeを起動時と1時間ごとに実行する", () => {
+  const { repo, clock } = setup();
+  const original=repo.purge.bind(repo);
+  const calls:string[]=[];
+  repo.purge=(at:string)=>{calls.push(at);original(at);};
+  const service=new SchedulerService(repo,clock,()=>{},logger,{owner:"scheduler_a"});
+  service.runBatch();
+  service.runBatch();
+  clock.set("2026-09-05T01:00:00Z");
+  service.runBatch();
+  assert.deepEqual(calls,["2026-09-05T00:00:00Z","2026-09-05T01:00:00Z"]);
+});
+
 test("multiple dueをbounded batchで処理しqueueのsequence順を保持する", () => {
   const { repo, database, raw, clock } = setup();
   const due = "2026-09-05T00:01:00Z";

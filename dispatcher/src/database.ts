@@ -607,10 +607,10 @@ export class DispatcherDatabase {
     const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
     if (binding?.owner.kind === "schedule") {
       validateWorkResultEnvelope(stableStringify(result));
-      validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
-      const hasWriteAction=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-        typeof (action as Record<string,unknown>).tool==="string"&&/(?:post|send|create|update|delete|edit|write|cancel|steer|apply|merge|close|react)/i.test(String((action as Record<string,unknown>).tool)));
-      if(hasWriteAction) throw new Error("scheduled_work_external_write_reported");
+      const rendered=renderJobResult(result as unknown as Record<string,unknown>);
+      validateWorkResultContent(rendered);
+      if(/\/(?:Users|home|var|tmp|private)\//.test(rendered)) throw new Error("scheduled_work_local_path_reported");
+      if((result.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     const completedAt = new Date(result.completed_at);
@@ -885,7 +885,8 @@ export class DispatcherDatabase {
       if(row.notification_authorization_phase==="preflight"&&(!receipt||destination.kind!=="slack"||receipt.workspace_id!==destination.target?.workspace_id||receipt.channel_id!==destination.target.channel_id||receipt.user_id!==owner.owner_id||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000)) throw new Error("schedule_notification_access_receipt_invalid");
       if(row.status==="dispatching") this.markWaiting(eventId,at);
       const nextPhase=row.notification_authorization_phase==="none"?"preflight":"write";
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase=? WHERE notification_event_id=?").run(nextPhase,eventId);
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase=?,notification_write_authorized_at=? WHERE notification_event_id=?")
+        .run(nextPhase,nextPhase==="write"?timestamp:null,eventId);
       return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
         access_receipt_verified:nextPhase==="write",destination:JSON.parse(row.destination_json) as Record<string,unknown>};
     }).immediate();
@@ -1058,7 +1059,7 @@ export class DispatcherDatabase {
   }
 
   private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date):{delivered:boolean;runId?:string} {
-    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;materialized_at:string}|undefined;
+    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
@@ -1069,7 +1070,8 @@ export class DispatcherDatabase {
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
-    return {delivered:withinDeadline&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
+    return {delivered:withinDeadline&&withinWriteAuthorization&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
@@ -1143,7 +1145,7 @@ export class DispatcherDatabase {
             last_error_message = NULL, schedule_access_checked_at = NULL,
             schedule_access_consumed_at = NULL, updated_at = ? WHERE event_id = ?
         `).run(at.toISOString(), at.toISOString(), eventId);
-        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_write_authorized_at=NULL WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
       }).immediate();
     } catch(error) {
       if(row.result_path&&resultBackupPath&&fs.existsSync(resultBackupPath)&&!fs.existsSync(row.result_path)) fs.renameSync(resultBackupPath,row.result_path);

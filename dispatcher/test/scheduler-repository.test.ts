@@ -346,6 +346,27 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
   }
 });
 
+test("二段目認可から120秒を越えた通知Resultをacceptedにしない", () => {
+  const {repo,dispatcher,raw,filename}=setup(); const objective="通知直前認可";
+  repo.create("notify_write_expiry",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_write_expiry",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
+  dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
+  dispatcher.authorizeJobNotification(eventId,new Date(due));
+  dispatcher.authorizeJobNotification(eventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n"});
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
+  ],completed_at:due},resultPath,new Date("2026-09-05T00:03:01Z"));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+});
+
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
   const { repo, dispatcher, raw } = setup(); const objective = "開始境界の調査";
   repo.create("start_fence", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
@@ -623,6 +644,8 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"future",completed_at:later},job.result_path,new Date(due)),/completed_at_is_in_the_future/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.post_message"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.set_agent_session_status"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"path",output:{format:"markdown",text:"/Users/example/private/result"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
