@@ -58,6 +58,30 @@ describe("DispatcherWorker", () => {
     await worker.stop(); database.close();
   });
 
+  for(const prompted of [failed("agent_not_running"),failed("agent_blocked")]) test(`keeps running when ${prompted.errorCode} prompt result arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-prompt-race-${prompted.errorCode}`)).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){await gate;return prompted;},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="dispatching"); database.manualComplete(event.event_id); release();
+    await new Promise(resolve=>setTimeout(resolve,20)); assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
+  for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){await gate;return waited;}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="waiting_agent"); database.manualComplete(event.event_id); release();
+    await new Promise(resolve=>setTimeout(resolve,20)); assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
   test("prompts and completes events one at a time in sequence order", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

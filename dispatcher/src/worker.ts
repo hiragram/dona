@@ -168,6 +168,8 @@ export class DispatcherWorker {
     if(dispatching.status==="completed") return;
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
+    const afterPrompt=this.database.get(row.event_id);
+    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) return;
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
         row.event_id,
@@ -200,8 +202,6 @@ export class DispatcherWorker {
       return;
     }
 
-    const afterPrompt=this.database.get(row.event_id);
-    if(afterPrompt?.status==="completed"&&afterPrompt.last_error_code==="schedule_notification_suppressed") return;
     if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
     else if(afterPrompt?.status!=="waiting_agent") return;
     const waiting = this.database.get(row.event_id)!;
@@ -219,6 +219,7 @@ export class DispatcherWorker {
     if (existing) return;
     const started = Date.now();
     const waited = await this.herdr.wait(this.abortController.signal);
+    if(this.database.get(row.event_id)?.status!=="waiting_agent") return;
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       const errorCode = waited.errorCode ?? (waited.timedOut ? "agent_wait_timeout" : "agent_wait_failed");
