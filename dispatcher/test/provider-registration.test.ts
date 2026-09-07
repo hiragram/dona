@@ -57,6 +57,8 @@ test("registration失敗は新secretをrollbackし、rotation失敗でも旧revi
   assert.equal(db.connections.get("pilot").credentialRevision, 1);
   assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret"]);
   assert.equal((await service.register({ ...config, id: "pilot" }, Buffer.alloc(32, 1))).revision, 1);
+  await assert.rejects(service.register({ ...config, allowlist: [{ resource: "page:one", events: ["deleted"] }] }, Buffer.alloc(32, 1)), /revision_conflict/);
+  assert.equal((await store.read("cred_pilot", 1)).length, 32);
   assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret"]);
 });
 
@@ -69,6 +71,15 @@ test("secret publish後の応答喪失は内容をread-backして二重writeな�
   const service = new ProviderRegistrationService(db.connections, ambiguous);
   assert.equal((await service.register(config, Buffer.alloc(32, 7))).revision, 1);
   assert.equal(writes, 1);
+});
+
+test("同一revisionの並行publishは既存targetを置換しない", async (t) => {
+  const { store } = fixture(t), first = Buffer.alloc(32, 1), second = Buffer.alloc(32, 2);
+  const results = await Promise.allSettled([store.write("cred_race", 1, first), store.write("cred_race", 1, second)]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  const stored = await store.read("cred_race", 1);
+  assert.ok(stored.equals(first) || stored.equals(second));
 });
 
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
@@ -114,6 +125,48 @@ test("verification pending bindingでもattemptを発行・consumeでき、activ
   assert.deepEqual(db.providerRegistration.consume(token, claim.claimId), expected);
 });
 
+test("停止済みbindingへのattempt発行とclaimを拒否する", (t) => {
+  const { db, file } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const token = db.providerRegistration.issue(identity, 5_000);
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connection_subscriptions SET state='stopped' WHERE connection_id=?").run("pilot");
+  assert.throws(() => db.providerRegistration.issue(identity, 5_000), /not_authorized/);
+  assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /not_authorized/);
+});
+
+test("claim後のrevision変更はconsumeをfail closedにする", (t) => {
+  const { db } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const token = db.providerRegistration.issue(identity, 5_000), claim = db.providerRegistration.claim(token, binding, 1_000);
+  db.connections.revise("pilot", 1, { ...config, credentialRevision: 2 });
+  assert.throws(() => db.providerRegistration.consume(token, claim.claimId), /not_authorized/);
+});
+
+test("clock rewind時はverification attemptをfail closedにする", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const token2 = db.providerRegistration.issue(identity, 5_000);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.claim(token2, binding, 1_000), /clock_skew/);
+});
+
+test("attempt発行時のretentionは期限切れrowをboundedに削除する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const raw = new Database(file); t.after(() => raw.close());
+  const insert = raw.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,
+    resource,generation,provider_id,expires_at,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`);
+  for (let index = 0; index < 101; index++) insert.run(index.toString(16).padStart(64, "0"), "pilot", "notion", "workspace:one", 1, 1,
+    "page:one", 1, "subscription:one", clock.value - 1, clock.value - 2);
+  db.providerRegistration.issue(identity, 5_000);
+  assert.equal((raw.prepare("SELECT count(*) n FROM verification_attempts").get() as { n: number }).n, 2);
+});
+
 async function raceClaims(file: string, now: number, token: string, binding: unknown): Promise<Array<{ ok: boolean; code?: string }>> {
   const module = pathToFileURL(path.resolve("src/database.ts")).href;
   const script = `import {DispatcherDatabase} from ${JSON.stringify(module)};
@@ -143,7 +196,7 @@ test("connection schema v1からv2へadditive migrationし既存rowとuser_versi
   const userVersion = raw.pragma("user_version", { simple: true });
   const before = raw.prepare("SELECT * FROM connections").all();
   migrateConnections(raw);
-  assert.equal((raw.prepare("SELECT version FROM connection_schema").get() as { version: number }).version, 2);
+  assert.equal((raw.prepare("SELECT version FROM connection_schema").get() as { version: number }).version, 1);
   assert.equal(raw.pragma("user_version", { simple: true }), userVersion);
   assert.deepEqual(raw.prepare("SELECT * FROM connections").all(), before);
   assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");

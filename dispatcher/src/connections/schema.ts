@@ -5,11 +5,10 @@ export function migrateConnections(db: Database.Database): void {
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS connection_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)`);
     const row = db.prepare("SELECT version FROM connection_schema WHERE singleton=1").get() as { version: number } | undefined;
-    if (row && ![1, 2].includes(row.version)) throw new Error("Unsupported connection schema");
-    if (row?.version === 2) return;
+    if (row && row.version !== 1) throw new Error("Unsupported connection schema");
     if (row?.version === 1) {
       db.exec(`
-        CREATE TABLE verification_attempts (
+        CREATE TABLE IF NOT EXISTS verification_attempts (
           digest TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id),
           provider TEXT NOT NULL, account TEXT NOT NULL, revision INTEGER NOT NULL,
           credential_revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -20,8 +19,7 @@ export function migrateConnections(db: Database.Database): void {
             OR (state='claimed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NULL)
             OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
         );
-        CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
-        UPDATE connection_schema SET version=2 WHERE singleton=1;
+        CREATE INDEX IF NOT EXISTS verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
       `);
       return;
     }
@@ -79,7 +77,7 @@ export function migrateConnections(db: Database.Database): void {
           OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
       );
       CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
-      INSERT INTO connection_schema VALUES(1,2);
+      INSERT INTO connection_schema VALUES(1,1);
     `);
   }).immediate();
 }
