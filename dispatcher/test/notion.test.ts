@@ -174,5 +174,8 @@ describe("Notion ingress", () => {
     assert.equal("request_id" in normalized, false);
     assert.equal("workspace_secret" in normalized, false);
     assert.ok(Buffer.byteLength(JSON.stringify(normalized)) <= 48 * 1024);
+    const emptyContainers = normalizeNotionFetchValue({ children: Array.from({ length: 100_000 }, () => ({})) });
+    assert.ok(Buffer.byteLength(JSON.stringify(emptyContainers)) <= 48 * 1024);
+    assert.equal(emptyContainers.children_truncated, true);
   });
 });

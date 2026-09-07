@@ -153,51 +153,41 @@ export interface NotionReadClient {
 }
 const NOTION_FETCH_MAX_BYTES = 48 * 1024;
 const NOTION_FIELDS = new Set(["id", "object", "type", "url", "created_time", "last_edited_time", "archived",
-  "in_trash", "parent", "properties", "title", "description", "children", "results"]);
+  "in_trash", "parent", "properties", "title", "description", "children", "results", "content_truncated"]);
 
-function boundedValue(value: unknown, remaining: { bytes: number }, depth = 0): unknown {
-  if (remaining.bytes <= 0 || depth > 8) return undefined;
-  if (value === null || typeof value === "boolean" || typeof value === "number") {
-    const size = Buffer.byteLength(JSON.stringify(value));
-    if (size > remaining.bytes) return undefined;
-    remaining.bytes -= size;
-    return value;
+function preview(value: unknown, maxBytes: number): { text: string; truncated: boolean } {
+  const encoded = JSON.stringify(value);
+  if (Buffer.byteLength(encoded) <= maxBytes) return { text: encoded, truncated: false };
+  let low = 0, high = encoded.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(encoded.slice(0, middle)) <= maxBytes) low = middle;
+    else high = middle - 1;
   }
-  if (typeof value === "string") {
-    let candidate = value;
-    while (candidate && Buffer.byteLength(JSON.stringify(candidate)) > remaining.bytes) candidate = candidate.slice(0, -64);
-    if (!candidate) return undefined;
-    remaining.bytes -= Buffer.byteLength(JSON.stringify(candidate));
-    return candidate;
-  }
-  if (Array.isArray(value)) {
-    const result: unknown[] = [];
-    for (const item of value) {
-      const normalized = boundedValue(item, remaining, depth + 1);
-      if (normalized === undefined) break;
-      result.push(normalized);
-    }
-    return result;
-  }
-  if (typeof value === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (depth === 0 && !NOTION_FIELDS.has(key)) continue;
-      const keyBytes = Buffer.byteLength(JSON.stringify(key)) + 2;
-      if (keyBytes > remaining.bytes) break;
-      const before = remaining.bytes;
-      remaining.bytes -= keyBytes;
-      const normalized = boundedValue(item, remaining, depth + 1);
-      if (normalized === undefined) { remaining.bytes = before; continue; }
-      result[key] = normalized;
-    }
-    return result;
-  }
-  return undefined;
+  return { text: encoded.slice(0, low), truncated: true };
 }
 
 export function normalizeNotionFetchValue(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
-  return boundedValue(value, { bytes: NOTION_FETCH_MAX_BYTES }) as Readonly<Record<string, unknown>>;
+  const normalized: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (NOTION_FIELDS.has(key) && !["properties", "children", "results"].includes(key)) normalized[key] = item;
+  }
+  for (const key of ["properties", "children", "results"] as const) {
+    if (!(key in value)) continue;
+    const result = preview(value[key], 20 * 1024);
+    normalized[`${key}_json`] = result.text;
+    if (result.truncated) normalized[`${key}_truncated`] = true;
+  }
+  while (Buffer.byteLength(JSON.stringify(normalized)) > NOTION_FETCH_MAX_BYTES) {
+    const candidates = ["children_json", "properties_json", "results_json"]
+      .filter(key => typeof normalized[key] === "string")
+      .sort((a, b) => String(normalized[b]).length - String(normalized[a]).length);
+    if (candidates.length === 0) return { truncated: true };
+    const key = candidates[0]!;
+    normalized[key] = String(normalized[key]).slice(0, Math.max(0, String(normalized[key]).length - 256));
+    normalized[`${key.replace("_json", "")}_truncated`] = true;
+  }
+  return normalized;
 }
 export async function fetchLatestNotionState(client: NotionReadClient, resourceId: string): Promise<{
   outcome: NotionFetchOutcome; retryAfter?: number; value?: Readonly<Record<string, unknown>> }> {

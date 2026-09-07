@@ -132,10 +132,11 @@ export async function runService(
     const token = await secretStore.read(connection.credentialRef, connection.credentialRevision);
     try {
       const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
+      const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       return fetchLatestNotionState({ async fetch(resourceId) {
         const request = async (url: string) => {
           const response = await fetch(url, {
-          method: "GET", signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+          method: "GET", signal: fetchSignal,
           headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
           const retry = response.headers.get("retry-after");
           if (!response.ok) {
@@ -145,21 +146,40 @@ export async function runService(
           return { status: response.status, value: await response.json() as Record<string, unknown> };
         };
         const resource = await request(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`);
-        if (resource.status !== 200 || row.event_type !== "page.content_updated") return resource;
-        const children: unknown[] = [];
-        let cursor: string | undefined;
-        do {
-          const url = new URL(`https://api.notion.com/v1/blocks/${encodeURIComponent(resourceId)}/children`);
-          url.searchParams.set("page_size", "100");
-          if (cursor) url.searchParams.set("start_cursor", cursor);
-          const page = await request(url.toString());
-          if (page.status !== 200 || !page.value) return page;
-          const results = Array.isArray(page.value.results) ? page.value.results : [];
-          children.push(...results);
-          cursor = page.value.has_more === true && typeof page.value.next_cursor === "string"
-            ? page.value.next_cursor : undefined;
-        } while (cursor);
-        return { ...resource, value: { ...resource.value, children } };
+        // coalesce前のevent typeではなくpageのcurrent stateを取得し、混在signalでもcontentを落とさない。
+        if (resource.status !== 200 || subject.entity_type !== "page") return resource;
+        let requests = 0, blocks = 0, truncated = false;
+        const readChildren = async (parentId: string, depth: number): Promise<unknown[] | { failure: typeof resource }> => {
+          if (depth > 8 || requests >= 100 || blocks >= 1_000) { truncated = true; return []; }
+          const children: unknown[] = [];
+          let cursor: string | undefined;
+          do {
+            if (requests >= 100 || blocks >= 1_000) { truncated = true; break; }
+            requests += 1;
+            const url = new URL(`https://api.notion.com/v1/blocks/${encodeURIComponent(parentId)}/children`);
+            url.searchParams.set("page_size", "100");
+            if (cursor) url.searchParams.set("start_cursor", cursor);
+            const page = await request(url.toString());
+            if (page.status !== 200 || !page.value) return { failure: page };
+            const results = Array.isArray(page.value.results) ? page.value.results : [];
+            for (const candidate of results) {
+              if (blocks >= 1_000) { truncated = true; break; }
+              blocks += 1;
+              if (candidate && typeof candidate === "object" && (candidate as Record<string, unknown>).has_children === true &&
+                typeof (candidate as Record<string, unknown>).id === "string") {
+                const nested = await readChildren(String((candidate as Record<string, unknown>).id), depth + 1);
+                if (!Array.isArray(nested)) return nested;
+                children.push({ ...(candidate as Record<string, unknown>), children: nested });
+              } else children.push(candidate);
+            }
+            cursor = page.value.has_more === true && typeof page.value.next_cursor === "string"
+              ? page.value.next_cursor : undefined;
+          } while (cursor);
+          return children;
+        };
+        const children = await readChildren(resourceId, 0);
+        if (!Array.isArray(children)) return children.failure;
+        return { ...resource, value: { ...resource.value, children, content_truncated: truncated } };
       } }, subject.entity_id);
     } finally { token.fill(0); }
   } } : undefined);
