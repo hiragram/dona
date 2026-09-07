@@ -151,11 +151,59 @@ export type NotionFetchOutcome = "fetched" | "not_found_or_inaccessible" | "perm
 export interface NotionReadClient {
   fetch(resourceId: string): Promise<{ status: number; retryAfter?: number; value?: Readonly<Record<string, unknown>> }>;
 }
+const NOTION_FETCH_MAX_BYTES = 48 * 1024;
+const NOTION_FIELDS = new Set(["id", "object", "type", "url", "created_time", "last_edited_time", "archived",
+  "in_trash", "parent", "properties", "title", "description", "children", "results"]);
+
+function boundedValue(value: unknown, remaining: { bytes: number }, depth = 0): unknown {
+  if (remaining.bytes <= 0 || depth > 8) return undefined;
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    const size = Buffer.byteLength(JSON.stringify(value));
+    if (size > remaining.bytes) return undefined;
+    remaining.bytes -= size;
+    return value;
+  }
+  if (typeof value === "string") {
+    let candidate = value;
+    while (candidate && Buffer.byteLength(JSON.stringify(candidate)) > remaining.bytes) candidate = candidate.slice(0, -64);
+    if (!candidate) return undefined;
+    remaining.bytes -= Buffer.byteLength(JSON.stringify(candidate));
+    return candidate;
+  }
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    for (const item of value) {
+      const normalized = boundedValue(item, remaining, depth + 1);
+      if (normalized === undefined) break;
+      result.push(normalized);
+    }
+    return result;
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (depth === 0 && !NOTION_FIELDS.has(key)) continue;
+      const keyBytes = Buffer.byteLength(JSON.stringify(key)) + 2;
+      if (keyBytes > remaining.bytes) break;
+      const before = remaining.bytes;
+      remaining.bytes -= keyBytes;
+      const normalized = boundedValue(item, remaining, depth + 1);
+      if (normalized === undefined) { remaining.bytes = before; continue; }
+      result[key] = normalized;
+    }
+    return result;
+  }
+  return undefined;
+}
+
+export function normalizeNotionFetchValue(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  return boundedValue(value, { bytes: NOTION_FETCH_MAX_BYTES }) as Readonly<Record<string, unknown>>;
+}
 export async function fetchLatestNotionState(client: NotionReadClient, resourceId: string): Promise<{
   outcome: NotionFetchOutcome; retryAfter?: number; value?: Readonly<Record<string, unknown>> }> {
   let response: Awaited<ReturnType<NotionReadClient["fetch"]>>;
   try { response = await client.fetch(resourceId); } catch { return { outcome: "degraded" }; }
-  if (response.status === 200 && response.value) return { outcome: "fetched", value: response.value };
+  if (response.status === 200 && response.value) return { outcome: "fetched", value: normalizeNotionFetchValue(response.value) };
   if (response.status === 404) return { outcome: "not_found_or_inaccessible" };
   if (response.status === 401 || response.status === 403) return { outcome: "permission_lost" };
   if (response.status === 429) return { outcome: "rate_limited", ...(response.retryAfter === undefined ? {} : { retryAfter: response.retryAfter }) };

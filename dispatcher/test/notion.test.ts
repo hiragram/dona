@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { describe, test } from "node:test";
-import { createNotionRegistration, fetchLatestNotionState } from "../src/notion.js";
+import { createNotionRegistration, fetchLatestNotionState, normalizeNotionFetchValue } from "../src/notion.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -166,5 +166,13 @@ describe("Notion ingress", () => {
     }
     assert.deepEqual(await fetchLatestNotionState({ async fetch() { throw new Error("timeout"); } }, "page_1"),
       { outcome: "degraded" });
+  });
+  test("latest-state fetchは必要fieldだけを明示上限内へ正規化する", async () => {
+    const normalized = normalizeNotionFetchValue({ id: "page_1", last_edited_time: receivedAt,
+      properties: { title: { rich_text: [{ plain_text: "x".repeat(100_000) }] } },
+      request_id: "omit", workspace_secret: "omit" });
+    assert.equal("request_id" in normalized, false);
+    assert.equal("workspace_secret" in normalized, false);
+    assert.ok(Buffer.byteLength(JSON.stringify(normalized)) <= 48 * 1024);
   });
 });
