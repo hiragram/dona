@@ -31,6 +31,8 @@ export interface QueueAdmissionContext {
   /** 認証後のregistrationだけが渡す。Envelopeの自己申告を使わない。 */
   connectionId: string;
   coalesce?: { resourceKey: string; signalKey: string; requiresFetch: true };
+  /** 認証済みverification receiptを即時terminal化する内部経路だけが設定する。 */
+  terminalVerification?: true;
 }
 export const admissionCodes = ["created", "duplicate_same", "duplicate_conflict", "coalesced", "queue_depth", "queue_bytes", "queue_rate", "queue_lanes", "queue_deliveries", "queue_quiescing", "queue_identity"] as const;
 export type AdmissionCode = typeof admissionCodes[number];

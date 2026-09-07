@@ -47,6 +47,16 @@ describe("Notion ingress", () => {
     await assert.rejects(registration.authenticate(request(Buffer.from(JSON.stringify({
       verification_token: "secret-verification-token" })))), /temporarily unavailable|dependency is unavailable/i);
   });
+  test("keeps event secret and binding dependency failures retryable", async () => {
+    for (const failing of ["secret", "binding"] as const) {
+      const registration = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
+        secrets: { async get() { if (failing === "secret") throw new Error("busy"); return Buffer.from("secret-verification-token"); } },
+        verification: { async claim() { return undefined; } },
+        bindings: { async resolve() { if (failing === "binding") throw new Error("busy"); return undefined; } } });
+      const signature = createHmac("sha256", "secret-verification-token").update(body).digest("hex");
+      await assert.rejects(registration.authenticate(request(body, signature)), /dependency is unavailable/i);
+    }
+  });
   test("authenticates exact raw bytes and strictly normalizes an allowlisted event", async () => {
     const { registration } = setup();
     const verification = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));

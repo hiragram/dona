@@ -255,6 +255,7 @@ export class DispatcherDatabase {
     const queueContext: QueueAdmissionContext | undefined = context ? {
       connectionId: context.connectionId,
       ...(context.coalesce ? { coalesce: context.coalesce } : {}),
+      ...(verification ? { terminalVerification: true as const } : {}),
     } : binding ? { connectionId: binding.connectionId } : undefined;
     if (!binding) {
       if (this.connections.manages(envelope.source)) throw new ConnectionError("not_authorized");
@@ -301,6 +302,7 @@ export class DispatcherDatabase {
     const bytes = Buffer.byteLength(stableStringify(envelope));
     const sourcePolicy = Object.hasOwn(this.queuePolicy.sources, envelope.source) ? this.queuePolicy.sources[envelope.source]! : this.queuePolicy.defaults;
     const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
+    const bypassAdmission = context?.terminalVerification === true;
     try { return this.db.transaction(() => {
       const reject = (code: ConstructorParameters<typeof QueueAdmissionError>[0]): never => { throw new QueueAdmissionError(code); };
       const ownerMatches = (eventId: string): boolean => {
@@ -360,18 +362,18 @@ export class DispatcherDatabase {
       if (!lane) {
         const count = (this.db.prepare("SELECT count(*) n FROM queue_lanes WHERE class=?").get(identity.queueClass) as {n:number}).n;
         // classごとのslotにより外部connection乱立が予約laneの生成を妨げない。
-        if (count >= this.queuePolicy.maxLanes) reject("queue_lanes");
+        if (!bypassAdmission && count >= this.queuePolicy.maxLanes) reject("queue_lanes");
         this.db.prepare("INSERT INTO queue_lanes(lane,source,connection,class,tokens,clock_ms) VALUES (?,?,?,?,?,?)")
           .run(identity.lane, envelope.source, identity.connection, identity.queueClass, policy.burst, at.getTime());
         lane = { tokens: policy.burst, clock_ms: at.getTime() };
       }
       const clock = Math.max(lane.clock_ms, at.getTime());
       const tokens = Math.min(policy.burst, lane.tokens + Math.min(60000, clock-lane.clock_ms) * policy.rate / 1000);
-      if (tokens < 1) reject("queue_rate");
+      if (!bypassAdmission && tokens < 1) reject("queue_rate");
       const sourceBucket = this.db.prepare("SELECT tokens,clock_ms FROM queue_sources WHERE source=?").get(envelope.source) as {tokens:number;clock_ms:number} | undefined;
       const sourceClock = Math.max(sourceBucket?.clock_ms ?? at.getTime(),at.getTime());
       const sourceTokens = Math.min(sourcePolicy.burst,(sourceBucket?.tokens ?? sourcePolicy.burst)+Math.min(60000,sourceClock-(sourceBucket?.clock_ms ?? sourceClock))*sourcePolicy.rate/1000);
-      if (sourceTokens < 1) reject("queue_rate");
+      if (!bypassAdmission && sourceTokens < 1) reject("queue_rate");
       const coalescedCandidate = !restoring && policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
         WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
         AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
@@ -383,8 +385,8 @@ export class DispatcherDatabase {
       const laneUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE q.lane=? AND e.status!='completed'`).get(identity.lane) as {depth:number;bytes:number};
       const sourceUsage = this.db.prepare(`SELECT count(*) depth,coalesce(sum(q.bytes),0) bytes FROM queue_events q JOIN events e USING(event_id) WHERE e.source=? AND e.status!='completed'`).get(envelope.source) as {depth:number;bytes:number};
       const addedDepth = coalesced ? 0 : 1;
-      if (sourceUsage.depth+addedDepth > sourcePolicy.depth) reject("queue_depth");
-      if (sourceUsage.bytes+bytes > sourcePolicy.bytes) reject("queue_bytes");
+      if (!bypassAdmission && sourceUsage.depth+addedDepth > sourcePolicy.depth) reject("queue_depth");
+      if (!bypassAdmission && sourceUsage.bytes+bytes > sourcePolicy.bytes) reject("queue_bytes");
       let reservedDepth = 0, reservedBytes = 0;
       for (const c of ["slack","internal","update"] as const) {
         if (c === identity.queueClass) continue;
@@ -392,10 +394,10 @@ export class DispatcherDatabase {
         reservedDepth += Math.max(0,this.queuePolicy.reservations[c]-(used?.depth??0));
         reservedBytes += Math.max(0,this.queuePolicy.reservedBytes[c]-(used?.bytes??0));
       }
-      if (laneUsage.depth+addedDepth > policy.depth || usage.reduce((n,u)=>n+u.depth,0)+addedDepth+reservedDepth > this.queuePolicy.depth) reject("queue_depth");
-      if (laneUsage.bytes+bytes > policy.bytes || usage.reduce((n,u)=>n+u.bytes,0)+bytes+reservedBytes > this.queuePolicy.bytes) reject("queue_bytes");
+      if (!bypassAdmission && (laneUsage.depth+addedDepth > policy.depth || usage.reduce((n,u)=>n+u.depth,0)+addedDepth+reservedDepth > this.queuePolicy.depth)) reject("queue_depth");
+      if (!bypassAdmission && (laneUsage.bytes+bytes > policy.bytes || usage.reduce((n,u)=>n+u.bytes,0)+bytes+reservedBytes > this.queuePolicy.bytes)) reject("queue_bytes");
       this.db.prepare("INSERT INTO queue_sources VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET tokens=excluded.tokens,clock_ms=excluded.clock_ms").run(envelope.source,sourceTokens-1,sourceClock);
-      this.db.prepare("UPDATE queue_lanes SET tokens=?,clock_ms=? WHERE lane=?").run(tokens-1,clock,identity.lane);
+      this.db.prepare("UPDATE queue_lanes SET tokens=?,clock_ms=? WHERE lane=?").run(bypassAdmission ? tokens : tokens-1,clock,identity.lane);
       if (coalesced) {
         this.db.prepare("INSERT INTO queue_deliveries VALUES (?,?,?,?,?)").run(envelope.source,envelope.external_event_id,coalesced.event_id,createHash("sha256").update(fingerprint+envelope.occurred_at).digest("hex"),timestamp);
         this.db.prepare("UPDATE queue_events SET delivery_count=delivery_count+1,bytes=bytes+? WHERE event_id=?").run(bytes,coalesced.event_id);

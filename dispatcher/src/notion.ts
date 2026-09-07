@@ -81,16 +81,20 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       }
       const parsed = eventSchema.safeParse(candidate);
       if (!parsed.success) throw new ExternalIngressAuthenticationError();
-      const secret = await options.secrets.get(options.verificationSecretRef);
+      let secret: Buffer | undefined;
+      try { secret = await options.secrets.get(options.verificationSecretRef); }
+      catch { throw new ExternalIngressUnavailableError(); }
       const supplied = signatureBytes(header(request, "x-notion-signature") ?? "");
       if (!secret || !supplied) throw new ExternalIngressAuthenticationError();
       const expected = createHmac("sha256", secret).update(request.body).digest();
       if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
         throw new ExternalIngressAuthenticationError();
       }
-      const binding = await options.bindings.resolve({ connectionId: options.connectionId,
+      let binding: DeliveryBinding | undefined;
+      try { binding = await options.bindings.resolve({ connectionId: options.connectionId,
         subscriptionId: parsed.data.subscription_id, integrationId: parsed.data.integration_id,
-        workspaceId: parsed.data.workspace_id, resourceId: parsed.data.entity.id, eventType: parsed.data.type });
+        workspaceId: parsed.data.workspace_id, resourceId: parsed.data.entity.id, eventType: parsed.data.type }); }
+      catch { throw new ExternalIngressUnavailableError(); }
       if (!binding || binding.connectionId !== options.connectionId || binding.resource !== parsed.data.entity.id) {
         throw new ExternalIngressAuthenticationError();
       }
