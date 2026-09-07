@@ -706,6 +706,11 @@ test("accepted済み旧通知を保持したままscheduled jobを取消開始�
   raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(notification.event_id);
   assert.equal(dispatcher.beginJobCancellation(job.job_id,job.source_event_id).status,"cancelling");
   assert.equal(dispatcher.get(notification.event_id)?.status,"completed");
+  dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答不明");
+  dispatcher.settleAmbiguousCancellation(job.job_id,"停止確認済み",new Date(due));
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"cancelled");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(notification.event_id) as {notification_state:string}).notification_state,"accepted");
+  assert.notEqual(dispatcher.enqueueJobNotification(job.job_id,new Date(due)).row.event_id,notification.event_id);
 });
 
 test("取消応答不明jobの終了観測はstarted runを隔離してから決着する", () => {
@@ -745,6 +750,16 @@ test("schedule eventのdelegation前terminal failureをrunへ原子的に反映�
     const payload=JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(eventId) as {payload_json:string}).payload_json);
     assert.equal(payload.work.objective,"[deleted]");
   }
+});
+
+test("未委任のscheduled eventは手動完了でrunと分離しない", () => {
+  const {repo,dispatcher}=setup();
+  repo.create("manual_complete_guard",{...input,action:"work.read_only",content:"手動完了guard"},due,actor,now);
+  const run=repo.materialize("manual_complete_guard",1,due,later,due,actor).run;
+  dispatcher.recordPreDispatchFailure(run.event_id!,"preflight_failed","一時失敗",3,new Date(due));
+  assert.equal(dispatcher.get(run.event_id!)?.status,"retryable_failed");
+  assert.throws(()=>dispatcher.manualComplete(run.event_id!,new Date(due)),/scheduled_event_completion_requires_reconciliation/);
+  assert.equal(repo.getRun(run.run_id)?.status,"materialized");
 });
 
 test("未委任の成功Resultをneeds_reviewへ隔離し取消済みeventをdispatchしない", () => {

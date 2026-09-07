@@ -469,10 +469,11 @@ export class DispatcherDatabase {
       if(binding?.owner.kind!=="schedule") throw new Error("scheduled_job_binding_required");
       if(job.completion_event_id) {
         const completion=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
-        if(completion?.notification_state!=="pending") return;
-        const changed=this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(at.toISOString(),at.toISOString(),job.completion_event_id).changes;
-        if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
-        this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
+        if(completion?.notification_state==="pending") {
+          const changed=this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(at.toISOString(),at.toISOString(),job.completion_event_id).changes;
+          if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
+          this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
+        } else if(!completion||!["none","accepted"].includes(completion.notification_state)) throw new Error("prior_notification_requires_reconciliation");
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
       const reconciledAt=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
@@ -1242,6 +1243,7 @@ export class DispatcherDatabase {
 
   manualComplete(eventId: string, at = new Date()): EventRow {
     const row = this.getRequired(eventId);
+    if(row.source==="dona_schedule") throw new Error("scheduled_event_completion_requires_reconciliation");
     const scheduledNotification=this.db.prepare(`SELECT 1 FROM job_completion_results WHERE notification_event_id=?
       AND json_extract(owner_json,'$.kind')='schedule' AND notification_state!='accepted'`).get(eventId);
     if(scheduledNotification) throw new Error("scheduled_notification_receipt_required");
