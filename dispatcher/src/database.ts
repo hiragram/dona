@@ -748,12 +748,13 @@ export class DispatcherDatabase {
   }
 
   private setNotificationState(eventId:string,state:"none"|"accepted"|"failed"|"needs_review",at:Date):void {
-    const rows=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id FROM job_completion_results
-      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).all(eventId) as Array<{run_id:string}>;
-    const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
-    if(state==="failed"||state==="needs_review") for(const row of rows) this.scheduler.markWorkNotificationNeedsReview(row.run_id,timestamp);
+    const rows=this.db.prepare(`SELECT json_extract(c.owner_json,'$.run_id') AS run_id,c.materialized_at,r.created_at AS run_created_at,r.started_at,r.terminal_at,s.updated_at AS schedule_updated_at
+      FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id') JOIN schedules s USING(schedule_id)
+      WHERE c.notification_event_id=? AND json_extract(c.owner_json,'$.kind')='schedule'`).all(eventId) as Array<{run_id:string;materialized_at:string;run_created_at:string;started_at:string|null;terminal_at:string|null;schedule_updated_at:string}>;
+    const requested=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+    if(state==="failed"||state==="needs_review") for(const row of rows) this.scheduler.markWorkNotificationNeedsReview(row.run_id,[requested,row.materialized_at,row.run_created_at,row.started_at,row.terminal_at,row.schedule_updated_at].filter((value):value is string=>value!==null).sort().at(-1)!);
     this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId);
-    for(const row of rows) this.scheduler.settleWorkNotification(row.run_id,timestamp);
+    for(const row of rows) this.scheduler.settleWorkNotification(row.run_id,[requested,row.materialized_at,row.run_created_at,row.started_at,row.terminal_at,row.schedule_updated_at].filter((value):value is string=>value!==null).sort().at(-1)!);
   }
 
   assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
@@ -822,14 +823,13 @@ export class DispatcherDatabase {
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.event_id=? AND e.source='dona_job' AND e.status IN ('dispatching','waiting_agent')
-          AND c.notification_state='pending' AND json_extract(c.owner_json,'$.kind')='schedule'
+          AND c.notification_state IN ('pending','needs_review') AND json_extract(c.owner_json,'$.kind')='schedule'
           AND julianday(c.materialized_at,'+900 seconds')>=julianday(?) AND s.state IN ('active','needs_review')
           AND s.revision=json_extract(c.owner_json,'$.revision') AND julianday(r.expires_at)>julianday(?)`).get(eventId,timestamp,timestamp) as
         {status:string;owner_json:string;destination_json:string}|undefined;
       if(!row) throw new Error("schedule_notification_not_authorized");
       if(row.status==="dispatching") this.markWaiting(eventId,at);
-      const changed=this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId).changes;
-      if(changed!==1) throw new Error("schedule_notification_not_authorized");
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId);
       const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
       return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
         destination:JSON.parse(row.destination_json) as Record<string,unknown>};
@@ -885,8 +885,6 @@ export class DispatcherDatabase {
       for(const row of scheduled) this.scheduler.settleUndelegatedWorkEvent(row.event_id,"needs_review",timestamp);
       for(const row of notifications) {
         this.setNotificationState(row.event_id,"needs_review",at);
-        const owner=JSON.parse(row.owner_json) as {kind?:unknown;run_id?:unknown};
-        if(owner.kind==="schedule"&&typeof owner.run_id==="string") this.scheduler.markWorkNotificationNeedsReview(owner.run_id,timestamp);
       }
       return changed;
     }).immediate();
@@ -999,7 +997,8 @@ export class DispatcherDatabase {
     const ambiguousPost=actions.some(({value})=>typeof value.tool==="string"&&value.tool.endsWith(".post_message")&&value.ambiguous===true);
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
-    return {delivered:!ambiguousPost&&completion.notification_state==="needs_review"&&actions.some(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
+    return {delivered:!ambiguousPost&&completion.notification_state==="needs_review"&&actions.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
@@ -1024,7 +1023,6 @@ export class DispatcherDatabase {
       const delivery=this.notificationDelivered(eventId,result);
       if(delivery.runId) {
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
-        if(!delivery.delivered)this.scheduler.markWorkNotificationNeedsReview(delivery.runId,new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       }
     }).immediate();
   }
@@ -1046,7 +1044,6 @@ export class DispatcherDatabase {
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
       this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
-      if(delivery.runId)this.scheduler.markWorkNotificationNeedsReview(delivery.runId,new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
   }

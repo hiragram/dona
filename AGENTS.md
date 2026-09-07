@@ -92,7 +92,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - `@channel`、`@here`、多数のユーザーへのメンションは、明示的に求められない限り使わない。
 - 秘密情報、token、private download URL、ローカルの秘密情報をSlackへ投稿しない。
 - 投稿内容は簡潔で自然な日本語を基本とし、Donaが確認できていない事実を断定しない。
-- `source: "dona_job"`かつ永続ownerがscheduleの結果通知では、Slack write直前にDispatcher MCPの`authorize_job_notification`を現在の`event_id`で呼ぶ。返された`owner_id`と固定destinationを使い、Slack MCPの`check_user_channel_access`でownerが現在もworkspace/channelへアクセスできることを確認する。両方が`authorized: true`の場合だけ、その直後に固定destinationへ`post_message`する。照会失敗・不一致・非許可ではfail-closedとし投稿しない。3つのtool結果は順序を保ってResult Envelopeの`actions`へ記録する。
+- `source: "dona_job"`かつ永続ownerがscheduleの結果通知では、Dispatcher MCPの`authorize_job_notification`を現在の`event_id`で呼ぶ。返された`owner_id`と固定destinationを使い、Slack MCPの`check_user_channel_access`でownerが現在もworkspace/channelへアクセスできることを確認した後、Slack write直前に同じ`authorize_job_notification`を再度呼ぶ。2回の認可とaccess確認がすべて`authorized: true`の場合だけ、その直後に固定destinationへ`post_message`する。照会失敗・不一致・非許可ではfail-closedとし投稿しない。4つのtool結果は順序を保ってResult Envelopeの`actions`へ記録する。
 
 外部書き込みの結果がtimeoutや接続切断などで曖昧な場合、同じ書き込みを自動再試行しない。重複投稿の可能性をResult Envelopeへ記録し、該当actionには`ambiguous: true`を記録する。実行環境が承認を要求した場合は、その承認フローに従い、承認を迂回しない。
 
