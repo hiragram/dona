@@ -35,7 +35,7 @@ export interface QueueAdmissionContext {
 export const admissionCodes = ["created", "duplicate_same", "duplicate_conflict", "coalesced", "queue_depth", "queue_bytes", "queue_rate", "queue_lanes", "queue_deliveries", "queue_quiescing", "queue_identity"] as const;
 export type AdmissionCode = typeof admissionCodes[number];
 export class QueueClaimUnavailableError extends Error {
-  constructor() { super("Event is no longer selected or claims are closed"); }
+  constructor() { super("Event is no longer dispatchable because it is not selected or claims are closed"); }
 }
 export class QueueAdmissionError extends Error {
   readonly ackAllowed = false;

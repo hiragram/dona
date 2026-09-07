@@ -625,6 +625,57 @@ describe("external ingress contract", () => {
   });
 });
 
+test("永続connection bindingを認証結果からcommitへ渡しdisable/revision不一致ではACKしない", async () => {
+  const {root, config} = await tempConfig(); roots.push(root);
+  let now=Date.now();const database = new DispatcherDatabase(config.databasePath,{now:()=>now});
+  const connection = {id:"connection-a",provider:"fake",account:"tenant1",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"resource-1",events:["fake.changed"]}],capability:{kind:"manual" as const,cursor:false}};
+  database.connections.register(connection);
+  database.connections.attachManual(connection.id,1,"resource-1","fixture-subscription",null);
+  database.connections.observe(connection.id,1,"resource-1",1,{providerId:"fixture-subscription",expiresAt:null,verified:true,cutoverConfirmed:false});
+  let revision=1;let generation=1; let ackCount=0;
+  const base=registration({onAcknowledge:()=>{ackCount++;}});
+  const registry=new ExternalIngressRegistry([{...base,async authenticate(raw){
+    const verified=await base.authenticate(raw);
+    return {...verified,connection:{account:"tenant1",revision,credentialRevision:1,resource:"resource-1",generation}};
+  },normalize(raw,verified){
+    (verified.connection as {account:string}).account="forged";
+    return base.normalize(raw,verified);
+  },queueSignal(normalized,verified){
+    (verified.connection as {revision:number}).revision=99;
+    return base.queueSignal?.(normalized,verified);
+  }}]);
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
+  await api.start();
+  try {
+    const body=fakeBody();
+    const initial=await request(config.socketPath,"fake",body,signedHeaders(body));
+    assert.equal(initial.status,202,JSON.stringify(initial.body));
+    generation=0;
+    assert.equal((await request(config.socketPath,"fake",fakeBody({providerEventId:"invalid-binding"}),signedHeaders(fakeBody({providerEventId:"invalid-binding"})))).status,401);
+    generation=1;now+=100;
+    const anchor=fakeBody({providerEventId:"clock-anchor"});assert.equal((await request(config.socketPath,"fake",anchor,signedHeaders(anchor))).status,202);
+    now-=100;
+    const rewind=fakeBody({providerEventId:"clock-rewind"});assert.equal((await request(config.socketPath,"fake",rewind,signedHeaders(rewind))).status,503);
+    now+=100;
+    revision=2;
+    const rejected=await request(config.socketPath,"fake",body,signedHeaders(body));
+    assert.equal(rejected.status,403);
+    assert.deepEqual(rejected.body,{schema_version:1,error:{code:"connection_not_authorized",message:"Connection binding is not authorized"}});
+    revision=1;database.connections.disable(connection.id,1);
+    assert.equal((await request(config.socketPath,"fake",body,signedHeaders(body))).status,403);
+    assert.equal(ackCount,2);assert.equal(database.list().length,2);
+    const rawHttp=(method:string,route:string,payload?:unknown)=>new Promise<{status:number;body:Record<string,unknown>}>((resolve,reject)=>{
+      const req=http.request({socketPath:config.socketPath,method,path:route,headers:{"content-type":"application/json"}},response=>{
+        const chunks:Buffer[]=[];response.on("data",chunk=>chunks.push(chunk));response.on("end",()=>resolve({status:response.statusCode!,body:JSON.parse(Buffer.concat(chunks).toString())}));
+      });req.on("error",reject);req.end(payload===undefined?undefined:JSON.stringify(payload));
+    });
+    const health=await rawHttp("GET","/health/ready");
+    assert.equal(health.status,200);assert.equal((health.body.connections as {disabled:number}).disabled,1);
+    const normalRoute=await rawHttp("POST","/v1/events",{schema_version:1,source:"fake",external_event_id:"bypass",type:"fake.changed",occurred_at:"2026-09-05T00:00:00.000Z",subject:{},payload:{},reply_target:null});
+    assert.equal(normalRoute.status,400);assert.equal(database.list().length,2);
+  } finally {await api.stop();database.close();}
+});
 test("binds owner from authenticated transport metadata before normalization and persists it before ACK", async () => {
   const { root, config } = await tempConfig(); roots.push(root);
   const database = new DispatcherDatabase(config.databasePath);
@@ -646,7 +697,19 @@ test("binds owner from authenticated transport metadata before normalization and
   assert.deepEqual(database.getEventBinding(result.receipt.eventId)?.owner, owner);
   assert.equal(database.getEventBinding(result.receipt.eventId)?.execution.background_job, true);
   assert.equal(database.get(result.receipt.eventId)?.reply_target_json, null);
-  database.close();
+   database.close();
+});
+
+test("managed bindingとprovider ownerのresource不一致を認証失敗にする",async()=>{
+  const definition=registration();
+  const registered={...definition,async authenticate(raw:RawIngressRequest){
+    const verified=await definition.authenticate(raw);
+    return {...verified,resourceId:"resource-2",connection:{account:"tenant1",revision:1,credentialRevision:1,resource:"resource-1",generation:1}};
+  }};
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[],method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),/authentication/i);
 });
 
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
@@ -670,6 +733,7 @@ test("queue receipts expose coalescing and reject overload before provider ACK",
     const rejected=await request(config.socketPath,"fake",mismatch,signedHeaders(mismatch));
     assert.equal(rejected.status,429);assert.equal(rejected.body.ack_allowed,false);
     assert.equal((rejected.body.error as any).code,"queue_depth");assert.equal(ackCount,2);
+    assert.equal((database.queueHealth().metrics as {code:string;count:number}[]).find(metric=>metric.code==="queue_depth")?.count,1);
     const unauth=fakeBody({providerEventId:"bad"});
     assert.equal((await request(config.socketPath,"fake",unauth,{...signedHeaders(unauth),"X-Fake-Signature":"wrong"})).status,401);
     assert.equal(database.list().length,1);assert.equal(database.queueDispatchMetadata(database.list()[0]!.event_id).requires_fetch,true);

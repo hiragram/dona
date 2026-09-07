@@ -6,6 +6,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
+import { ConnectionError } from "./connections/domain.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
@@ -262,7 +263,7 @@ export class DispatcherApi {
         } catch {
           ready = false;
         }
-        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready", connections: this.database.connections.health() });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
@@ -279,6 +280,7 @@ export class DispatcherApi {
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
+          connections: this.database.connections.health(),
           app_schema: 4,
           config: 1,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
@@ -429,6 +431,12 @@ export class DispatcherApi {
         sendJson(response, 408, errorBody("request_timeout", "Provider ingress did not finish within its configured limit"));
       } else if (error instanceof IncompleteBodyError) {
         sendJson(response, 400, errorBody("request_incomplete", "Request body was not received completely"), true);
+      } else if (error instanceof ConnectionError) {
+        if (error.code === "clock_skew") {
+          sendJson(response, 503, errorBody("connection_temporarily_unavailable", "Connection clock is temporarily unavailable"));
+        } else {
+          sendJson(response, 403, errorBody("connection_not_authorized", "Connection binding is not authorized"));
+        }
       } else if (error instanceof ExternalIngressAuthenticationError) {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
       } else if (error instanceof ExternalIngressValidationError) {
@@ -524,13 +532,14 @@ export class DispatcherApi {
         rawRequest,
         (envelope, context) => {
           if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
-          const persisted = this.database.enqueueProvider(envelope, context.owner, new Date(), context);
+          const persisted = this.database.enqueueExternal(envelope, context.binding, context.owner, new Date(), context);
           if (persisted.outcome !== "duplicate_conflict") this.worker.wake();
           return persisted;
         },
       );
     } catch (error) {
       if (
+        error instanceof ConnectionError ||
         error instanceof QueueAdmissionError ||
         error instanceof ExternalIngressAuthenticationError ||
         error instanceof ExternalIngressValidationError ||

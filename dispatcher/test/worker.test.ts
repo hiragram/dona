@@ -292,6 +292,48 @@ describe("DispatcherWorker", () => {
   });
 });
 
+test("connection eligibilityをpreflight中に失ってもworkerは後続Slackを処理する",async()=>{
+  for (const mutation of ["disable", "revise", "expire", "disable_failure", "revise_failure"] as const) {
+  const {root,config}=await tempConfig();roots.push(root);await fs.mkdir(config.resultsDir,{recursive:true});
+  const database=new DispatcherDatabase(config.databasePath);
+  database.connections.register({id:"race",provider:"fake",account:"fixture",credentialRef:"cred_fixture",credentialRevision:1,
+    allowlist:[{resource:"resource",events:["changed"]}],capability:{kind:"manual",cursor:false}});
+  database.connections.attachManual("race",1,"resource","provider-id",null);
+  database.connections.observe("race",1,"resource",1,{providerId:"provider-id",expiresAt:null,verified:true,cutoverConfirmed:false});
+  const {externalEventSource,scopedExternalEventId}=await import("../src/ingress.js");
+  const source=externalEventSource("fake");
+  const provider=database.enqueueExternal({...eventEnvelope("provider"),source,type:"changed",external_event_id:scopedExternalEventId(source,"race","provider")},
+    {connectionId:"race",account:"fixture",revision:1,credentialRevision:1,resource:"resource",generation:1}).row;
+  let slackId="";let preflights=0;const prompted:string[]=[];
+  const herdr:HerdrClient={
+    async get(){
+      if (++preflights===1) {
+        if (mutation==="disable" || mutation==="disable_failure") {
+          database.connections.disable("race",1);
+          await fs.writeFile(path.join(config.resultsDir,`${provider.event_id}.json`),"{}");
+        } else if (mutation==="revise" || mutation==="revise_failure") {
+          const {revision:_revision,state:_state,...configuration}=database.connections.get("race");
+          database.connections.revise("race",1,configuration);
+        } else {
+          database.connections.observe("race",1,"resource",1,{providerId:"provider-id",expiresAt:Date.now()+100,verified:true,cutoverConfirmed:false});
+          await new Promise(resolve=>setTimeout(resolve,120));
+        }
+        slackId=database.enqueue(eventEnvelope("later-slack")).row.event_id;
+        if (mutation.endsWith("_failure")) return failed("herdr_unavailable");
+      }
+      return ok("idle");
+    },
+    async prompt(prompt){const fields=promptFields(prompt);prompted.push(fields.eventId);
+      await fs.writeFile(fields.resultPath,JSON.stringify({schema_version:1,event_id:fields.eventId,status:"completed",completed_at:new Date().toISOString(),actions:[],memory_candidates:[]}));
+      return ok("working");},async wait(){return ok("done");}
+  };
+  const worker=new DispatcherWorker(database,herdr,config,logger);worker.start();
+  try {await waitFor(()=>slackId!==""&&database.get(slackId)?.status==="completed");assert.equal(worker.isRunning(),true);
+    assert.equal(database.get(provider.event_id)!.status,mutation==="expire"?"queued":"completed");assert.deepEqual(prompted,[slackId]);}
+  finally {await worker.stop();database.close();}
+  }
+});
+
 test("quiesce during awaited preflight prevents the subsequent claim and prompt", async () => {
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath);

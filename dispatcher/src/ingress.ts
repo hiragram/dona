@@ -7,6 +7,8 @@ import type { ProviderOwner } from "./event-routing.js";
 
 import type { EnqueueResult, EventEnvelope, ExternalEventSource } from "./types.js";
 
+import { deliverySchema, type DeliveryBinding } from "./connections/domain.js";
+
 const externalSourcePattern = /^[a-z][a-z0-9._-]{0,63}$/;
 const connectionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
@@ -63,9 +65,10 @@ export interface RawIngressRequest {
 export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
+  readonly connection?: Omit<DeliveryBinding, "connectionId">;
   readonly resourceId?: string;
 }
-type IngressPersistenceContext = QueueAdmissionContext & { readonly owner?: ProviderOwner };
+type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding; readonly owner?: ProviderOwner };
 
 export interface NormalizedExternalEvent {
   readonly providerEventId: string;
@@ -244,7 +247,7 @@ function isUtcRfc3339Timestamp(value: string): boolean {
     parsed.getUTCSeconds() === Number(match[6]);
 }
 
-function validateNormalized(input: NormalizedExternalEvent): NormalizedExternalEvent {
+export function validateNormalizedExternalEvent(input: NormalizedExternalEvent): NormalizedExternalEvent {
   if (
     !input.providerEventId.trim() || input.providerEventId.length > 512 ||
     !input.type.trim() || input.type.length > 128 ||
@@ -336,12 +339,17 @@ export class ExternalIngressProcessor {
   ): Promise<ExternalIngressResult> {
     const processingDeadline = performance.now() + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
+    let verifiedBinding: DeliveryBinding | undefined;
     try {
       const authenticated = await within(
         Promise.resolve().then(() => registration.authenticate(request)),
         remainingProcessingTime(processingDeadline),
       );
       verified = validatePrincipal(authenticated);
+      verifiedBinding = verified.connection === undefined ? undefined : deliverySchema.parse({
+        ...verified.connection,
+        connectionId: verified.connectionId,
+      });
       remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;
@@ -350,9 +358,11 @@ export class ExternalIngressProcessor {
 
     const verifiedConnectionId = verified.connectionId;
     let owner: ProviderOwner | undefined;
-    if (verified.resourceId !== undefined) {
+    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) throw new ExternalIngressAuthenticationError();
+    const verifiedResourceId = verifiedBinding?.resource ?? verified.resourceId;
+    if (verifiedResourceId !== undefined) {
       const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
-        connection_id: verifiedConnectionId, resource_id: verified.resourceId });
+        connection_id: verifiedConnectionId, resource_id: verifiedResourceId });
       if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
       owner = parsed.data;
     }
@@ -362,7 +372,7 @@ export class ExternalIngressProcessor {
         Promise.resolve().then(() => registration.normalize(request, verified)),
         remainingProcessingTime(processingDeadline),
       );
-      normalized = validateNormalized(registration.parseNormalized(candidate));
+      normalized = validateNormalizedExternalEvent(registration.parseNormalized(candidate));
       remainingProcessingTime(processingDeadline);
     } catch (error) {
       if (error instanceof ExternalIngressTimeoutError) throw error;
@@ -382,7 +392,12 @@ export class ExternalIngressProcessor {
     };
     if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
     const signal = registration.queueSignal?.(normalized, verified);
-    const result = persist(envelope, { connectionId: verifiedConnectionId, ...(signal ? { coalesce: signal } : {}), ...(owner ? { owner } : {}) });
+    const result = persist(envelope, {
+      connectionId: verifiedConnectionId,
+      ...(signal ? { coalesce: signal } : {}),
+      ...(verifiedBinding ? { binding: verifiedBinding } : {}),
+      ...(owner ? { owner } : {}),
+    });
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,
