@@ -1,6 +1,6 @@
 # Figma Webhooks V2 1-file pilot
 
-このpilotは1つの`file_key`と明示したevent allowlistだけを受け付けます。Figmaのpayload内`passcode`をbounded raw bodyから取り出してconstant-time比較し、認証後にだけstrict schema、`webhook_id`、file、eventを検証します。`PING`はactivation確認として200を返し、business event queueへ追加しません。
+このpilotは1つの`file_key`と`FILE_UPDATE`だけを受け付けます。Figmaのpayload内`passcode`をbounded raw bodyから取り出してconstant-time比較し、認証後にだけstrict schema、`webhook_id`、file、eventを検証します。`PING`はactivation確認として200を返し、business event queueへ追加しません。
 
 dedup keyは`figma-raw-v1`と受信raw bytesのSHA-256です。Figmaに共通stable delivery IDがないため、同じ意味でもraw bytesが異なる配送は別receiptとして保持します。これにより別eventのsilent dropを避け、downstreamのidempotencyを併用します。保持期間はDispatcher event retentionに従い、`fingerprint_version`で将来の変更を識別します。
 

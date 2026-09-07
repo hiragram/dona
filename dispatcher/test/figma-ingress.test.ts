@@ -33,6 +33,16 @@ describe("Figma Webhooks V2 ingress", () => {
     await assert.rejects(Promise.resolve().then(() => registration.normalize(raw(event({ event_type: "FILE_COMMENT" })), verified)));
   });
 
+  test("fails startup for an invalid connection or unsupported event configuration", () => {
+    assert.throws(() => figmaIngress({ ...config, connectionId: "figma:pilot" }));
+    assert.throws(() => figmaIngress({ ...config, allowedEvents: new Set(["FILE_COMMENT"]) }));
+  });
+
+  test("binds the verified owner to the configured file instead of payload data", async () => {
+    const verified = await registration.authenticate(raw(event()));
+    assert.equal(verified.resourceId, config.fileKey);
+  });
+
   test("converges exact retries, separates different raw payloads, and keeps PING out of persistence", async () => {
     const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([registration]));
     const request = raw(event());

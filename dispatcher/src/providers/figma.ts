@@ -9,7 +9,8 @@ import {
 } from "../ingress.js";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,255}$/);
-const eventType = z.enum(["PING", "FILE_UPDATE", "FILE_VERSION_UPDATE", "FILE_COMMENT", "LIBRARY_PUBLISH"]);
+const connectionIdentifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+const eventType = z.enum(["PING", "FILE_UPDATE"]);
 const payloadSchema = z.object({
   passcode: z.string().min(1).max(512),
   webhook_id: identifier,
@@ -51,7 +52,9 @@ function rawFingerprint(body: Buffer): string {
 }
 
 export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceRegistration {
-  if (!config.passcode || !identifier.safeParse(config.webhookId).success || !identifier.safeParse(config.fileKey).success) {
+  if (!config.passcode || !connectionIdentifier.safeParse(config.connectionId).success ||
+    !identifier.safeParse(config.webhookId).success || !identifier.safeParse(config.fileKey).success ||
+    config.allowedEvents.size !== 1 || !config.allowedEvents.has("FILE_UPDATE")) {
     throw new Error("Figma ingress configuration is invalid");
   }
   return {
@@ -65,7 +68,7 @@ export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceReg
       if (passcode === undefined || !equalSecret(passcode, config.passcode)) {
         throw new ExternalIngressAuthenticationError();
       }
-      return { connectionId: config.connectionId, principal: { kind: "figma_webhook" } };
+      return { connectionId: config.connectionId, resourceId: config.fileKey, principal: { kind: "figma_webhook" } };
     },
     normalize(request) {
       const parsed = payloadSchema.safeParse(decode(request.body));
