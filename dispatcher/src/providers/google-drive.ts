@@ -101,6 +101,24 @@ export interface DriveAllowlist {
 
 export type DriveFeed = { readonly kind: "user" } | { readonly kind: "drive"; readonly driveId: string };
 
+function errorReasons(error: unknown): string[] {
+  if (typeof error !== "object" || error === null) return [];
+  const result: string[] = [];
+  const add = (value: unknown) => { if (typeof value === "string" && value.length <= 128) result.push(value); };
+  const candidate = error as {reason?:unknown;errors?:unknown;response?:unknown};
+  add(candidate.reason);
+  if (Array.isArray(candidate.errors)) for (const item of candidate.errors) {
+    if (typeof item === "object" && item !== null) add((item as {reason?:unknown}).reason);
+  }
+  const response = typeof candidate.response === "object" && candidate.response !== null ? candidate.response as {data?:unknown} : undefined;
+  const data = typeof response?.data === "object" && response.data !== null ? response.data as {error?:unknown} : undefined;
+  const apiError = typeof data?.error === "object" && data.error !== null ? data.error as {errors?:unknown} : undefined;
+  if (Array.isArray(apiError?.errors)) for (const item of apiError.errors) {
+    if (typeof item === "object" && item !== null) add((item as {reason?:unknown}).reason);
+  }
+  return result;
+}
+
 function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): string {
   const canonical = { fileId: change.fileId, removed: change.removed ?? false, changeType: change.changeType,
     time: change.time, driveId: change.driveId ?? null, file: change.file === undefined ? null : {
@@ -145,10 +163,10 @@ export async function drainDriveChanges(
   feed: DriveFeed = { kind: "user" },
   limits?: { pages: number; events: number; timeoutMs: number; bytes?: number },
 ): Promise<void> {
-  if (feed.kind === "drive" && !allowlist.driveIds.has(feed.driveId)) throw new ConnectionError("not_authorized");
   const bounded = limits ?? { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 };
   const deadline = performance.now() + bounded.timeoutMs;
   let totalEvents = 0, totalBytes = 0;
+  const members = new Set(allowlist.priorFileIds ?? []);
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
     if (remaining <= 0) throw new ConnectionError("incomplete_batch");
@@ -165,10 +183,10 @@ export async function drainDriveChanges(
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
         fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
-      const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;reason?:unknown;errors?:unknown;response?:unknown} : {};
+      const candidate = typeof error === "object" && error !== null ? error as {status?:unknown} : {};
       const status = candidate.status;
-      const serialized = JSON.stringify({ reason:candidate.reason, errors:candidate.errors, response:candidate.response });
-      const quota403 = status === 403 && /(?:rateLimitExceeded|userRateLimitExceeded|sharingRateLimitExceeded)/.test(serialized);
+      const quota403 = status === 403 && errorReasons(error).some((reason) =>
+        ["rateLimitExceeded","userRateLimitExceeded","sharingRateLimitExceeded"].includes(reason));
       if (status === 401 || (status === 403 && !quota403)) throw new ConnectionError("credential_unavailable");
       if (status === 410) throw new ConnectionError("cursor_conflict");
       throw new ConnectionError("incomplete_batch");
@@ -177,13 +195,16 @@ export async function drainDriveChanges(
     if (!parsed.success) throw new ConnectionError("incomplete_batch");
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
       .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined);
-    const events = fileChanges.filter((change) => allowed(change, allowlist)).map((change) => {
+    const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
+    for (const change of fileChanges) {
       const currentlyAllowed = allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
-      const tombstone = !currentlyAllowed && (allowlist.priorFileIds?.has(change.fileId) ?? false);
-      return { providerEventId: canonicalChangeId(change), envelope: envelope(binding, change, tombstone) };
-    });
+      const tombstone = !currentlyAllowed && members.has(change.fileId);
+      if (!currentlyAllowed && !tombstone && !allowed(change, allowlist)) continue;
+      events.push({ providerEventId: canonicalChangeId(change), envelope: envelope(binding, change, tombstone) });
+      if (currentlyAllowed && !change.removed) members.add(change.fileId); else members.delete(change.fileId);
+    }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
     if (totalEvents > bounded.events || totalBytes > (bounded.bytes ?? 16_777_216)) throw new ConnectionError("incomplete_batch");

@@ -27,6 +27,24 @@ test("push headerは空body・channel/token/resourceを束縛し、syncと非連
   assert.throws(() => verifyDrivePush(Buffer.alloc(0), headers("update"), [channel]), /not_authorized/);
 });
 
+test("同じdrain内のfolder加入後の離脱をtombstone化する", async (t) => {
+  const db=fixture(t); let page=0;
+  const client={list:async()=> ++page===1 ? {changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving",parents:["folder-1"]}}],nextPageToken:"page-2"} :
+    {changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"moving",parents:["outside"],name:"private"}}],newStartPageToken:"next"}};
+  await drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()});
+  assert.equal(db.list().length,2);
+  assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
+});
+
+test("shared drive routing IDと全drive allowlistを分離して個別fileだけ許可する", async (t) => {
+  const db=fixture(t); const client={list:async()=>({changes:[
+    {fileId:"allowed",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"allowed"}},
+    {fileId:"denied",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"denied"}},
+  ],newStartPageToken:"next"})};
+  await drainDriveChanges(db,binding,client,{fileIds:new Set(["allowed"]),folderIds:new Set(),driveIds:new Set()}, {kind:"drive",driveId:"drive-1"});
+  assert.equal(db.list().length,1);
+});
+
 function fixture(t: { after(fn: () => void): void }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dona-drive-"));
   const db = new DispatcherDatabase(path.join(dir, "db.sqlite"), clock);
@@ -124,4 +142,7 @@ test("credential失効とcursor期限切れをretryable page失敗から分離�
     await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
       (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === code);
   }
+  const db=fixture(t); const circular:{status:number;response?:unknown}={status:410}; circular.response={data:{error:{errors:[{reason:"pageTokenExpired"}]}},request:circular};
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>{throw circular;}},{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
+    (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="cursor_conflict");
 });
