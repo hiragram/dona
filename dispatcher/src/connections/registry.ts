@@ -100,6 +100,10 @@ export class ConnectionRegistry {
       const c = this.get(id);
       if (c.revision !== revision) throw new ConnectionError("revision_conflict");
       if (c.state === "disabled") return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND status='dispatching' LIMIT 1`).get(id, revision)) {
+        throw new ConnectionError("operation_pending");
+      }
       const now = this.tick(id, true);
       const superseded = this.completeUndispatched(id, revision, now, "Connection disabled before dispatch", "connection_disabled");
       this.db.prepare("UPDATE connections SET state='disabled' WHERE id=?").run(id);
@@ -111,6 +115,10 @@ export class ConnectionRegistry {
     this.db.transaction(() => {
       const c = this.get(id);
       if (c.revision !== revision || c.state === "disabled") return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND status='dispatching' LIMIT 1`).get(id, revision)) {
+        throw new ConnectionError("operation_pending");
+      }
       const now = this.tick(id);
       this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
       this.audit(c, "credential_unavailable", now);
@@ -121,6 +129,9 @@ export class ConnectionRegistry {
       const c = this.get(id);
       if (c.revision !== revision || c.state === "disabled") return;
       if (epoch !== undefined && this.sub(id, resource, generation).verificationEpoch !== epoch) return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND resource=? AND generation=? AND status='dispatching' LIMIT 1`)
+        .get(id, revision, resource, generation)) throw new ConnectionError("operation_pending");
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET verified_at=NULL,error='verification_failed',last_reconcile_at=?
         WHERE connection_id=? AND resource=? AND generation=?`).run(now, id, resource, generation);
@@ -140,6 +151,9 @@ export class ConnectionRegistry {
   beginVerification(id: string, revision: number, resource: string, generation: number): Subscription {
     return this.db.transaction(() => {
       this.assertVerifiable(id, revision, resource, generation);
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND resource=? AND generation=? AND status='dispatching' LIMIT 1`)
+        .get(id, revision, resource, generation)) throw new ConnectionError("operation_pending");
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET state='verification_pending',verified_at=NULL,
         verification_epoch=verification_epoch+1,last_reconcile_at=?,error=NULL
@@ -294,12 +308,15 @@ export class ConnectionRegistry {
       this.audit(c, "stopped", now);
     }).immediate();
   }
-  delivery(binding: DeliveryBinding, envelope: EventEnvelope, persist: () => EnqueueResult): EnqueueResult {
+  delivery(binding: DeliveryBinding, envelope: EventEnvelope, persist: () => EnqueueResult, verification = false): EnqueueResult {
     return this.db.transaction(() => {
       if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
       const c = this.current(binding.connectionId, binding.revision, binding.resource);
-      if (c.state !== "active" || c.provider !== envelope.source || c.account !== binding.account ||
-        c.credentialRevision !== binding.credentialRevision || !c.allowlist.some((a) => a.resource === binding.resource && a.events.includes(envelope.type))) throw new ConnectionError("not_authorized");
+      const allowlisted = c.allowlist.some((a) => a.resource === binding.resource &&
+        (verification ? envelope.type === `${c.provider}.verification` : a.events.includes(envelope.type)));
+      if ((!verification && c.state !== "active") || (verification && !["verification_pending", "active"].includes(c.state)) ||
+        c.provider !== envelope.source || c.account !== binding.account || c.credentialRevision !== binding.credentialRevision ||
+        !allowlisted) throw new ConnectionError("not_authorized");
       const now = this.tick(c.id);
       const s = this.sub(c.id, binding.resource, binding.generation);
       // stop の外部call待ちに旧channelへ届いた通知も、cutover済みの新generationへbindingする。
@@ -307,8 +324,9 @@ export class ConnectionRegistry {
       const replacement = stopping ? this.subscriptions(c.id).filter((candidate) => candidate.resource === binding.resource &&
         candidate.generation > binding.generation && candidate.revision === c.revision && candidate.verifiedAt !== null &&
         ["active","expiring"].includes(candidate.state) && (candidate.expiresAt === null || candidate.expiresAt > now)).at(-1) : undefined;
-      const deliverableState=["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
-      if (s.revision !== c.revision || s.verifiedAt === null || !deliverableState ||
+      const deliverableState = verification ? ["verification_pending", "active"].includes(s.state) :
+        ["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
+      if (s.revision !== c.revision || (!verification && s.verifiedAt === null) || !deliverableState ||
         (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
       if (stopping && !replacement) throw new ConnectionError("not_authorized");
       const dispatchGeneration = replacement?.generation ?? binding.generation;

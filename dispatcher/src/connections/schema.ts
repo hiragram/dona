@@ -21,6 +21,7 @@ export function migrateConnections(db: Database.Database): void {
         );
         CREATE INDEX IF NOT EXISTS verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
         CREATE INDEX IF NOT EXISTS verification_attempt_expires_at_idx ON verification_attempts(expires_at);
+        CREATE INDEX IF NOT EXISTS verification_attempt_consumed_at_idx ON verification_attempts(consumed_at) WHERE state='consumed';
       `);
       const columns = db.prepare("PRAGMA table_info(verification_attempts)").all() as Array<{ name: string }>;
       if (!columns.some((column) => column.name === "verification_epoch"))
@@ -82,6 +83,7 @@ export function migrateConnections(db: Database.Database): void {
       );
       CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
       CREATE INDEX verification_attempt_expires_at_idx ON verification_attempts(expires_at);
+      CREATE INDEX verification_attempt_consumed_at_idx ON verification_attempts(consumed_at) WHERE state='consumed';
       INSERT INTO connection_schema VALUES(1,1);
     `);
   }).immediate();

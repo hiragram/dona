@@ -144,6 +144,65 @@ test("capability matrix: UI/manualはcreate不可、non-renewableは期限更新
   }
 });
 
+test("verification deliveryはpending subscriptionを通常event allowlist・queue制限から分離して永続化する", (t) => {
+  const { db, file } = fixture(t);
+  db.connections.register({ id: "verify", provider: "drive", account: "account1", credentialRef: "cred_fixture",
+    credentialRevision: 1, allowlist: [{ resource: "folder1", events: ["changed"] }],
+    capability: { kind: "manual", cursor: false } });
+  db.connections.attachManual("verify", 1, "folder1", "subscription1", null);
+  const verifyBinding = { connectionId: "verify", account: "account1", revision: 1, credentialRevision: 1,
+    resource: "folder1", generation: 1 };
+  const source = externalEventSource("drive");
+  const envelope: EventEnvelope = { schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification1"), type: "drive.verification",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { verified: true },
+    reply_target: null };
+  assert.throws(() => db.enqueueExternal(envelope, verifyBinding), /not_authorized/);
+  const result = db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true);
+  assert.equal(result.outcome, "created");
+  const saved = db.get(result.row.event_id);
+  assert.equal(saved?.status, "completed");
+  assert.match(saved?.result_json ?? "", /Provider verification receipt accepted/);
+  assert.doesNotMatch(saved?.result_json ?? "", /Manually marked completed/);
+  const raw = new Database(file, { readonly: true });
+  try {
+    const bucket = raw.prepare("SELECT tokens FROM queue_sources WHERE source=?").get(source) as { tokens: number };
+    assert.equal(bucket.tokens, db.queuePolicy.defaults.burst);
+    assert.equal((raw.prepare("SELECT count(*) count FROM queue_events WHERE event_id=?")
+      .get(result.row.event_id) as { count: number }).count, 0);
+    assert.equal((raw.prepare("SELECT count(*) count FROM queue_lanes WHERE source=?")
+      .get(source) as { count: number }).count, 0);
+  } finally { raw.close(); }
+  db.connections.observe("verify", 1, "folder1", 1,
+    { providerId: "subscription1", expiresAt: null, verified: true, cutoverConfirmed: false });
+  assert.equal(db.connections.get("verify").state, "active");
+  const replay = db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true);
+  assert.equal(replay.outcome, "duplicate_same");
+  assert.equal(replay.row.event_id, result.row.event_id);
+  assert.equal(db.nextAvailable(), undefined);
+});
+
+test("verification duplicate conflictは既存eventを完了させない", (t) => {
+  const { db, clock } = fixture(t);
+  const operation = db.connections.claim("pilot", 1, "folder1", 10);
+  db.connections.observe("pilot", 1, "folder1", 1,
+    { providerId: "subscription1", expiresAt: clock.now() + 10_000, verified: true, cutoverConfirmed: false }, operation);
+  const deliveryBinding = { connectionId: "pilot", account: "account1", revision: 1,
+    credentialRevision: 1, resource: "folder1", generation: 1 };
+  const source = externalEventSource("drive");
+  const original = db.enqueueExternal({ schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification-conflict"), type: "changed",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { value: 1 },
+    reply_target: null }, deliveryBinding);
+  const conflict: EventEnvelope = { schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification-conflict"), type: "drive.verification",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { verified: true },
+    reply_target: null };
+  const result = db.enqueueExternal(conflict, deliveryBinding, undefined, new Date(), undefined, true);
+  assert.equal(result.outcome, "duplicate_conflict");
+  assert.equal(db.get(original.row.event_id)?.status, "queued");
+});
+
 test("allowlistとcredential revisionを同時bindingし変更時はfail closed", async (t) => {
   const {db,lifecycle,clock} = fixture(t); await lifecycle.createOrRenew("pilot","folder1");
   for (const b of [{...binding(),account:"other"},{...binding(),credentialRevision:2},{...binding(),resource:"other"},{...binding(),revision:2}])
@@ -474,6 +533,34 @@ test("in-flight eventがあるconnectionのrevision更新を拒否する",async(
   const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()));
   assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
+});
+
+test("provider fetchを含むdispatching中はconnection disableを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.disable("pilot",1),/operation_pending/);
+  assert.notEqual(db.connections.get("pilot").state,"disabled");
+});
+
+test("provider fetchを含むdispatching中はbinding quarantineを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.quarantine("pilot",1,"folder1",1),/operation_pending/);
+  assert.notEqual(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+});
+
+test("provider fetchを含むdispatching中は再verification開始を拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.beginVerification("pilot",1,"folder1",1),/operation_pending/);
+  assert.notEqual(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
+});
+
+test("provider fetchを含むdispatching中はconnection degradeを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.degrade("pilot",1),/operation_pending/);
+  assert.equal(db.connections.get("pilot").state,"active");
 });
 
 test("手動retry可能なeventがあるconnectionのrevision更新を拒否する",async(t)=>{

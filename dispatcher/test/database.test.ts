@@ -129,6 +129,29 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("provider fetch中のrestartだけはprompt未送信としてretry可能に戻す", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-fetch")).row;
+    database.beginDispatch(event.event_id, `${config.resultsDir}/${event.event_id}.json`, new Date(), true);
+    assert.equal(database.recoverStaleDispatching(), 1);
+    assert.equal(database.get(event.event_id)?.status, "retryable_failed");
+    assert.equal(database.get(event.event_id)?.attempt_count, 0);
+    assert.equal(database.get(event.event_id)?.last_error_code, "provider_fetch_interrupted");
+    database.close();
+  });
+
+  test("shutdownで中断したprovider fetchはattemptを消費せずretryへ戻す", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-stop")).row;
+    database.beginDispatch(event.event_id, `${config.resultsDir}/${event.event_id}.json`, new Date(), true);
+    const recovered = database.recordInterruptedProviderFetch(event.event_id);
+    assert.equal(recovered.status, "retryable_failed"); assert.equal(recovered.attempt_count, 0);
+    database.close();
+  });
+
   test("requires force before retrying an ambiguous event", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

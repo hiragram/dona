@@ -1,5 +1,29 @@
 # Dona Dispatcher
 
+## Notion webhook pilot
+
+`createNotionRegistration`は、少数resourceに限定したNotion webhook adapterを提供する。初回の
+`verification_token`はsecret storeへ直接保存し、event/receipt/logへ含めない。通常eventは受信したraw
+bytesと`X-Notion-Signature`をHMAC-SHA256で検証してから、connection revision、subscription、
+workspace、integration、resource、event typeのallowlistを解決する。Dispatcherのdurable commit後だけ
+200 ACKを返し、同一event IDは同じreceiptへ収束する。
+
+eventは変更内容ではなくlatest-state fetchのsignalとして扱う。同一entityのeventは`latest` modeで
+coalesceし、payloadのtimestampを永続snapshotの順序根拠にしない。read clientは必要最小fieldだけを取得し、
+404を削除・共有解除の曖昧性を保つ`not_found_or_inaccessible`、401/403を`permission_lost`、429を
+`rate_limited`、通信例外とその他の失敗を`degraded`として記録する。
+subscription設定変更後にevent typeが自動追加されるとは仮定せず、allowlist revisionを更新して再検証する。
+provider resourceへのwriteと、曖昧なsubscription writeのblind retryは行わない。
+
+通常の`dona-dispatcher serve`でpilotを有効にする場合は、`DONA_NOTION_PILOT_CONFIG`へ
+`connectionId`、固定の`integrationId`、verification token専用の`verificationCredentialRef`、owner-onlyな
+`secretStoreRoot`をJSONで設定する。connection/subscriptionはprovider-neutral registryのcurrent revisionを正本とし、
+`providerRegistration.issue(...)`が発行した期限付きattemptだけをcallbackの`verification_attempt`へ使用する。
+verificationのclaim/secret publish/consumeとactive化はrestart後もSQLiteとsecret storeから照合し、同じtokenの
+ACK-loss再送だけを同じreceiptへ収束させる。通常eventのlatest-state signalは永続queueに残るため、Dispatcher再起動後も
+workerへ再配送され、処理時点のallowlisted resourceをread-only fetchする。実Notion workspaceのsubscription作成や
+page更新、credential投入、public endpoint公開はこの起動配線には含めない。
+
 AdapterからUnix Domain Socket上のHTTP/1.1でイベントを受け、SQLiteへ永続化した後にHerdrの`dona-main`へ1件ずつ投入します。長い作業は別のCodexワーカーへ委任でき、`dona-main`は次のイベント受付へ戻れます。セルフアップデートのterminal通知だけは専用の永続workerが処理し、停止・再起動される`dona-main`を経由しません。
 
 ## セットアップと起動
