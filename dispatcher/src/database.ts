@@ -1074,9 +1074,14 @@ export class DispatcherDatabase {
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
+    const allowedActions=actions.every(({value})=>{
+      if(["dona_dispatcher.authorize_job_notification","dona_slack.check_user_channel_access","dona_slack.post_message"].includes(String(value.tool))) return true;
+      return value.tool==="dona_slack.set_agent_session_status"&&value.channel_id===target?.channel_id&&
+        (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&["processing","active"].includes(String(value.status));
+    });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
-    return {delivered:withinDeadline&&withinWriteAuthorization&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
@@ -1140,6 +1145,8 @@ export class DispatcherDatabase {
       .get(eventId) as {notification_state:string;notification_authorization_phase:string}|undefined;
     if(notification&&!((notification.notification_state==="failed")||(notification.notification_state==="needs_review"&&["none","preflight"].includes(notification.notification_authorization_phase))))
       throw new Error("scheduled_notification_retry_requires_reconciliation");
+    const undelegatedRun=row.source==="dona_schedule"?this.db.prepare("SELECT status,job_id FROM schedule_runs WHERE event_id=?").get(eventId) as {status:string;job_id:string|null}|undefined:undefined;
+    if(undelegatedRun?.job_id===null&&undelegatedRun.status!=="materialized") throw new Error("schedule_event_retry_requires_reconciliation");
     const resultBackupPath=row.result_path?`${row.result_path}.retry-backup`:null;
     if(resultBackupPath&&fs.existsSync(resultBackupPath)) throw new Error("retry_result_backup_exists");
     if(row.result_path&&fs.existsSync(row.result_path)) {

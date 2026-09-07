@@ -286,6 +286,16 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.add_reaction",workspace:"test",channel_id:"C_TEST",message_ts:"2.000001",reaction:"white_check_mark"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002",reply_broadcast:false},
+  ],completed_at:due},notificationPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
+  dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002",reply_broadcast:false},
   ],completed_at:due},notificationPath,new Date("2026-09-05T00:16:01Z"));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
@@ -657,6 +667,7 @@ test("委任前current access失敗はscheduleをneeds_reviewへ固定する", (
   assert.equal(dispatcher.get(run.event_id!)?.status,"dead_letter");
   assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
   assert.equal(repo.get("access_denied")?.state,"needs_review");
+  assert.throws(()=>dispatcher.manualRetry(run.event_id!,true,new Date(due)),/requires_reconciliation/);
 });
 
 test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにする", () => {
