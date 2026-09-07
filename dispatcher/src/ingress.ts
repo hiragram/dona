@@ -32,6 +32,9 @@ export class ExternalIngressAuthenticationError extends Error {
     this.name = "ExternalIngressAuthenticationError";
   }
 }
+export class ExternalIngressUnavailableError extends Error {
+  constructor() { super("Provider ingress dependency is unavailable"); this.name = "ExternalIngressUnavailableError"; }
+}
 
 export class ExternalIngressValidationError extends Error {
   constructor() {
@@ -66,10 +69,12 @@ export interface RawIngressRequest {
 export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
+  readonly purpose?: "verification";
   readonly connection?: Omit<DeliveryBinding, "connectionId">;
   readonly resourceId?: string;
 }
-type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding; readonly owner?: ProviderOwner };
+type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding; readonly owner?: ProviderOwner;
+  readonly verification?: true };
 
 export interface NormalizedExternalEvent {
   readonly providerEventId: string;
@@ -353,7 +358,7 @@ export class ExternalIngressProcessor {
       });
       remainingProcessingTime(processingDeadline);
     } catch (error) {
-      if (error instanceof ExternalIngressTimeoutError) throw error;
+      if (error instanceof ExternalIngressTimeoutError || error instanceof ExternalIngressUnavailableError) throw error;
       throw new ExternalIngressAuthenticationError();
     }
 
@@ -398,6 +403,7 @@ export class ExternalIngressProcessor {
       ...(signal ? { coalesce: signal } : {}),
       ...(verifiedBinding ? { binding: verifiedBinding } : {}),
       ...(owner ? { owner } : {}),
+      ...(verified.purpose === "verification" ? { verification: true as const } : {}),
     });
     remainingProcessingTime(processingDeadline);
     const receipt: PersistReceipt = {

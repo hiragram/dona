@@ -294,12 +294,15 @@ export class ConnectionRegistry {
       this.audit(c, "stopped", now);
     }).immediate();
   }
-  delivery(binding: DeliveryBinding, envelope: EventEnvelope, persist: () => EnqueueResult): EnqueueResult {
+  delivery(binding: DeliveryBinding, envelope: EventEnvelope, persist: () => EnqueueResult, verification = false): EnqueueResult {
     return this.db.transaction(() => {
       if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
       const c = this.current(binding.connectionId, binding.revision, binding.resource);
-      if (c.state !== "active" || c.provider !== envelope.source || c.account !== binding.account ||
-        c.credentialRevision !== binding.credentialRevision || !c.allowlist.some((a) => a.resource === binding.resource && a.events.includes(envelope.type))) throw new ConnectionError("not_authorized");
+      const allowlisted = c.allowlist.some((a) => a.resource === binding.resource &&
+        (verification ? envelope.type === `${c.provider}.verification` : a.events.includes(envelope.type)));
+      if ((!verification && c.state !== "active") || (verification && !["verification_pending", "active"].includes(c.state)) ||
+        c.provider !== envelope.source || c.account !== binding.account || c.credentialRevision !== binding.credentialRevision ||
+        !allowlisted) throw new ConnectionError("not_authorized");
       const now = this.tick(c.id);
       const s = this.sub(c.id, binding.resource, binding.generation);
       // stop の外部call待ちに旧channelへ届いた通知も、cutover済みの新generationへbindingする。
@@ -307,8 +310,9 @@ export class ConnectionRegistry {
       const replacement = stopping ? this.subscriptions(c.id).filter((candidate) => candidate.resource === binding.resource &&
         candidate.generation > binding.generation && candidate.revision === c.revision && candidate.verifiedAt !== null &&
         ["active","expiring"].includes(candidate.state) && (candidate.expiresAt === null || candidate.expiresAt > now)).at(-1) : undefined;
-      const deliverableState=["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
-      if (s.revision !== c.revision || s.verifiedAt === null || !deliverableState ||
+      const deliverableState = verification ? ["verification_pending", "active"].includes(s.state) :
+        ["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
+      if (s.revision !== c.revision || (!verification && s.verifiedAt === null) || !deliverableState ||
         (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");
       if (stopping && !replacement) throw new ConnectionError("not_authorized");
       const dispatchGeneration = replacement?.generation ?? binding.generation;
