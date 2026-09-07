@@ -198,6 +198,7 @@ export async function drainDriveChanges(
       const status = candidate.status ?? response?.status;
       const authorization403 = status === 403 && errorReasons(error).some((reason) =>
         ["authError","insufficientPermissions","forbidden"].includes(reason));
+      if(status===404&&feed.kind==="drive")throw new ConnectionError("operation_pending");
       if (oauthErrorCode(error) === "invalid_grant" || status === 401 || authorization403)
         throw new ConnectionError("credential_unavailable");
       if (status === 410) throw new ConnectionError("cursor_conflict");
@@ -225,19 +226,15 @@ export async function drainDriveChanges(
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
-      const alternativelyAllowed=allowlist.fileIds.has(change.fileId)||
-        (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId));
-      if(members.has(change.fileId)&&!folderAllowed&&!alternativelyAllowed&&change.removed!==true&&!leftUserFeed)
-        throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
-      const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
+      const currentlyAllowed = !providerRemoved && !leftUserFeed && (members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         folderAllowed);
       const tombstone = !currentlyAllowed && (providerRemoved || leftUserFeed) && (trackedBefore || folderAllowed);
       if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
-      if (folderAllowed && !providerRemoved) members.add(change.fileId); else members.delete(change.fileId);
+      if ((folderAllowed||members.has(change.fileId)) && !providerRemoved&&!leftUserFeed) members.add(change.fileId); else members.delete(change.fileId);
     }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);

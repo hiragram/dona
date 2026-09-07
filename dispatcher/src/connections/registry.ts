@@ -396,6 +396,13 @@ export class ConnectionRegistry {
         if (result.outcome === "duplicate_conflict") throw new ConnectionError("duplicate_conflict");
         return result;
       });
+      if(batch.continuation===true){
+        const history=this.db.prepare(`SELECT COUNT(*) count,COALESCE(SUM(length(token)),0) bytes
+          FROM connection_cursor_history WHERE connection_id=? AND resource=?`).get(c.id,b.resource) as {count:number;bytes:number};
+        const exists=!!this.db.prepare("SELECT 1 FROM connection_cursor_history WHERE connection_id=? AND resource=? AND token=?")
+          .get(c.id,b.resource,batch.checkpoint);
+        if(!exists&&(history.count>=1000||history.bytes+batch.checkpoint.length>16_777_216))throw new ConnectionError("operation_pending");
+      }
       this.db.prepare(`INSERT INTO connection_cursors VALUES(?,?,?,?,?) ON CONFLICT(connection_id,resource)
         DO UPDATE SET revision=excluded.revision,version=excluded.version,checkpoint=excluded.checkpoint`)
         .run(c.id, b.resource, c.revision, cursor.version + 1, batch.checkpoint);
