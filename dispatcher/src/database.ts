@@ -697,7 +697,7 @@ export class DispatcherDatabase {
             .run(nowUtc(),nowUtc(),row.completion_event_id).changes;
           if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
           this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(row.completion_event_id);
-        } else if(prior&&prior.notification_state!=="none") throw new Error("prior_notification_requires_reconciliation");
+        } else if(prior&&! ["none","accepted"].includes(prior.notification_state)) throw new Error("prior_notification_requires_reconciliation");
       }
       this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
     }).immediate();
@@ -850,15 +850,15 @@ export class DispatcherDatabase {
   private suppressUnauthorizedScheduledNotifications(at: Date): void {
     const timestamp=at.toISOString();
     this.db.transaction(()=>{
-      const rows=this.db.prepare(`SELECT e.event_id,c.notification_state FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
+      const rows=this.db.prepare(`SELECT e.event_id,c.notification_state,c.notification_authorization_phase FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent') AND json_extract(c.owner_json,'$.kind')='schedule'
           AND (julianday(c.materialized_at,'+900 seconds')<julianday(?) OR s.state NOT IN ('active','needs_review')
             OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
-        .all(timestamp,timestamp) as Array<{event_id:string;notification_state:string}>;
+        .all(timestamp,timestamp) as Array<{event_id:string;notification_state:string;notification_authorization_phase:string}>;
       for(const row of rows) {
-        if(row.notification_state==="needs_review") {
+        if(row.notification_state==="needs_review"&&row.notification_authorization_phase==="write") {
           this.db.prepare("UPDATE events SET status='needs_review',updated_at=?,last_error_code='notification_delivery_ambiguous',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(timestamp,row.event_id);
           this.setNotificationState(row.event_id,"needs_review",at);
           continue;
@@ -1087,14 +1087,18 @@ export class DispatcherDatabase {
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
-    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
+    const processing=actions.find(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing");
+    const terminalStatus=["blocked","needs_review"].includes(completion.job_status)?"suspended":"active";
+    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus);
+    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
-      if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
+      if(event.status==="completed"&&["schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
       if(event.source==="dona_schedule") {
         const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
@@ -1121,7 +1125,7 @@ export class DispatcherDatabase {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
-      if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
+      if(event.status==="completed"&&["schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
       const delivery=this.notificationDelivered(eventId,result,acceptedAt);
       if(delivery.delivered) {

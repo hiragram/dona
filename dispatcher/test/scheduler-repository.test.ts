@@ -353,12 +353,12 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     dispatcher.nextAvailable(new Date(mode==="deadline"||mode==="authorized_deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
     if(mode==="waiting") dispatcher.nextWaiting();
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
-    assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"?"needs_review":"completed");
-    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"?"needs_review":"none");
+    assert.equal(dispatcher.get(eventId)?.status,"completed");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
     if(mode==="authorized_deadline") {
-      assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
+      assert.equal(repo.get(`notify_${mode}`)?.state,"active");
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:16:01Z"},path.join(path.dirname(filename),`${eventId}.json`));
-      assert.equal(dispatcher.get(eventId)?.status,"needs_review");
+      assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
     }
     if(mode==="waiting") {
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:01:31Z"},path.join(path.dirname(filename),`${eventId}.json`));
@@ -385,6 +385,15 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
   ],completed_at:due},resultPath,new Date("2026-09-05T00:03:01Z"));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000003",reply_broadcast:false},
+  ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
 });
 
@@ -576,6 +585,22 @@ test("scheduled job取消前に未送信の旧completion通知をsupersedeする
   dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
   assert.equal(dispatcher.get(notification.event_id)?.last_error_code,"job_result_superseded");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(notification.event_id) as {notification_state:string}).notification_state,"none");
+  dispatcher.saveCompleted(notification.event_id,{schema_version:1,event_id:notification.event_id,status:"completed",completed_at:due},"/tmp/superseded-result.json",new Date(due));
+  assert.equal(dispatcher.get(notification.event_id)?.last_error_code,"job_result_superseded");
+});
+
+test("accepted済み旧通知を保持したままscheduled jobを取消開始する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="配送済み取消";
+  repo.create("cancel_accepted",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("cancel_accepted",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.markJobNeedsReview(job.job_id,"agent_blocked","入力待ち");
+  const notification=dispatcher.enqueueJobNotification(job.job_id,new Date(due)).row;
+  raw.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(notification.event_id);
+  raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE notification_event_id=?").run(notification.event_id);
+  assert.equal(dispatcher.beginJobCancellation(job.job_id,job.source_event_id).status,"cancelling");
+  assert.equal(dispatcher.get(notification.event_id)?.status,"completed");
 });
 
 test("取消応答不明jobの終了観測はstarted runを隔離してから決着する", () => {
