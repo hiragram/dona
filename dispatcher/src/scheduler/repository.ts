@@ -591,7 +591,7 @@ export class SchedulerRepository {
     const run=this.getRun(runId);
     if(!run||run.status!=="needs_review"||run.job_id!==jobId||run.event_id!==sourceEventId) return;
     this.db.prepare("UPDATE schedule_runs SET status='started',reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
-    const activated=this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND state='needs_review'").run(now,run.schedule_id).changes;
+    const activated=this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes;
     if(activated===1) this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);
   }
   markWorkNotificationNeedsReview(runId:string,now:string):void {
@@ -1044,6 +1044,7 @@ export class SchedulerRepository {
         (SELECT c.rowid FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
           WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(deletedOwner,metadataDeadline);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
+      this.db.prepare("DELETE FROM schedule_access_receipt_nonces WHERE consumed_at <= ?").run(add(now,-86400));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
       // each schedule retains its high-watermark independently of its run ledger.
       this.db.prepare(`DELETE FROM schedule_runs WHERE terminal_at <= ? AND NOT EXISTS

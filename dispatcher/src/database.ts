@@ -431,7 +431,7 @@ export class DispatcherDatabase {
 
   listAmbiguousScheduledJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','invalid_result_agent_stop_unknown','agent_wait_observation_unknown')
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','invalid_result','invalid_result_agent_stop_unknown','agent_wait_observation_unknown')
         AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
   }
 
@@ -604,18 +604,18 @@ export class DispatcherDatabase {
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
-    const binding = readEventJobBinding(this.db, this.getJobRequired(jobId).source_event_id);
+    const job=this.getJobRequired(jobId);
+    const binding = readEventJobBinding(this.db,job.source_event_id);
     if (binding?.owner.kind === "schedule") {
       validateWorkResultEnvelope(stableStringify(result));
       const rendered=renderJobResult(result as unknown as Record<string,unknown>);
       validateWorkResultContent(rendered);
-      if(/\/(?:Users|home|var|tmp|private)\//.test(rendered)) throw new Error("scheduled_work_local_path_reported");
+      if(rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
       if((result.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
-    const job=this.getJobRequired(jobId);
     const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown"].includes(job.last_error_code??"")||
       (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
     if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
@@ -743,6 +743,8 @@ export class DispatcherDatabase {
       } else if(next==="cancelled"&&this.scheduler.getRun(binding.owner.run_id)?.status==="needs_review") {
         this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt);
+      } else if(this.scheduler.getRun(binding.owner.run_id)?.status===next) {
+        // Reconciliation may terminalize the run before completion notification materialization.
       } else try {
         this.scheduler.setRunState(binding.owner.run_id,"started",next,
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt,job.job_id,
@@ -900,6 +902,9 @@ export class DispatcherDatabase {
       if(event.source!=="dona_schedule"||!["dispatching","waiting_agent"].includes(event.status)||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
         receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000) throw new Error("schedule_access_receipt_mismatch");
       if(event.status==="dispatching") this.markWaiting(eventId,at);
+      const nonce=this.db.prepare("INSERT OR IGNORE INTO schedule_access_receipt_nonces(nonce,event_id,consumed_at) VALUES(?,?,?)")
+        .run(receipt.nonce,eventId,at.toISOString()).changes;
+      if(nonce!==1) throw new Error("schedule_access_receipt_already_consumed");
       const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(receipt.issued_at,eventId).changes;
       if(changed!==1) throw new Error("schedule_access_receipt_already_recorded");
       return {authorized:true,event_id:eventId,checked_at:at.toISOString()};
@@ -1131,6 +1136,10 @@ export class DispatcherDatabase {
     if (!["blocked", "needs_review", "dead_letter", "retryable_failed"].includes(row.status)) {
       throw new Error(`Event in status ${row.status} cannot be retried`);
     }
+    const notification=this.db.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?")
+      .get(eventId) as {notification_state:string;notification_authorization_phase:string}|undefined;
+    if(notification&&!((notification.notification_state==="failed")||(notification.notification_state==="needs_review"&&["none","preflight"].includes(notification.notification_authorization_phase))))
+      throw new Error("scheduled_notification_retry_requires_reconciliation");
     const resultBackupPath=row.result_path?`${row.result_path}.retry-backup`:null;
     if(resultBackupPath&&fs.existsSync(resultBackupPath)) throw new Error("retry_result_backup_exists");
     if(row.result_path&&fs.existsSync(row.result_path)) {
@@ -1145,7 +1154,7 @@ export class DispatcherDatabase {
             last_error_message = NULL, schedule_access_checked_at = NULL,
             schedule_access_consumed_at = NULL, updated_at = ? WHERE event_id = ?
         `).run(at.toISOString(), at.toISOString(), eventId);
-        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_write_authorized_at=NULL WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_write_authorized_at=NULL WHERE notification_event_id=? AND (notification_state='failed' OR (notification_state='needs_review' AND notification_authorization_phase IN ('none','preflight')))").run(eventId);
       }).immediate();
     } catch(error) {
       if(row.result_path&&resultBackupPath&&fs.existsSync(resultBackupPath)&&!fs.existsSync(row.result_path)) fs.renameSync(resultBackupPath,row.result_path);

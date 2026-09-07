@@ -367,6 +367,25 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
 });
 
+test("外部write前の通知retryだけをpending preflightへ戻す", () => {
+  const {repo,dispatcher,raw,filename}=setup(); const objective="通知retry";
+  repo.create("notify_retry_phase",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_retry_phase",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
+  dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.authorizeJobNotification(eventId,new Date(due));
+  raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(eventId);
+  dispatcher.manualRetry(eventId,true,new Date(due));
+  assert.deepEqual(raw.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?").get(eventId),
+    {notification_state:"pending",notification_authorization_phase:"none"});
+  raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(eventId);
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
+  assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
+});
+
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
   const { repo, dispatcher, raw } = setup(); const objective = "開始境界の調査";
   repo.create("start_fence", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
@@ -384,16 +403,19 @@ test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費
   dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due));
   assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/current access receipt/);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",issued_at:due,nonce:"n1"},new Date(due)),/receipt_mismatch/);
-  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date("2026-09-05T00:02:59Z")).authorized,true);
+  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date("2026-09-05T00:01:59Z")).authorized,true);
   assert.equal(dispatcher.get(run.event_id!)?.status,"waiting_agent");
   assert.equal((raw.prepare("SELECT schedule_access_checked_at FROM events WHERE event_id=?").get(run.event_id) as {schedule_access_checked_at:string}).schedule_access_checked_at,due);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n3"},new Date(due)),/already_recorded/);
-  const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z"));
-  assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z")).duplicate,true);
+  const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:02:00Z"));
+  assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:02:00Z")).duplicate,true);
   raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(run.event_id);
-  dispatcher.manualRetry(run.event_id!,true,new Date("2026-09-05T00:04:00Z"));
+  dispatcher.manualRetry(run.event_id!,true,new Date("2026-09-05T00:02:01Z"));
   assert.deepEqual(raw.prepare("SELECT schedule_access_checked_at,schedule_access_consumed_at FROM events WHERE event_id=?").get(run.event_id),
     {schedule_access_checked_at:null,schedule_access_consumed_at:null});
+  dispatcher.beginDispatch(run.event_id!,"/tmp/access-result-2.json",new Date("2026-09-05T00:02:01Z"));
+  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date("2026-09-05T00:02:01Z")),/already_consumed/);
+  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:"2026-09-05T00:02:01Z",nonce:"n4"},new Date("2026-09-05T00:02:01Z")).authorized,true);
 });
 
 test("authorization targetを復元できないscheduled workは委任を拒否する", () => {
@@ -527,6 +549,7 @@ test("取消応答不明jobの終了観測はstarted runを隔離してから決
   dispatcher.settleAmbiguousCancellation(job.job_id,"停止確認済み",new Date(due));
   assert.equal(repo.getRun(run.run_id)?.status,"cancelled");
   assert.equal(dispatcher.getJob(job.job_id)?.status,"cancelled");
+  assert.equal(dispatcher.enqueueJobNotification(job.job_id,new Date(due)).row.source,"dona_job");
 });
 
 test("schedule eventのdelegation前terminal failureをrunへ原子的に反映する", () => {
@@ -645,7 +668,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"future",completed_at:later},job.result_path,new Date(due)),/completed_at_is_in_the_future/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.post_message"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.set_agent_session_status"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
-  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"path",output:{format:"markdown",text:"/Users/example/private/result"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"path",output:{format:"markdown",text:`${job.workspace_path}/private/result`},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
@@ -874,6 +897,10 @@ test("旧requestのreceiptは新revisionへ更新後も旧snapshot/hashに帰属
   startWork(repo, dispatcher, raw, oldRun, due);
   repo.transition("work_audit", 1, "pause", actor, due);
   repo.update("work_audit", 2, { ...input, action: "work.read_only", authorization_id: "work_auth", authorization_revision: 3, content: "新objective" }, later, actor, due);
+  repo.markWorkRunNeedsReview(oldRun.run_id,repo.getRun(oldRun.run_id)!.job_id!,due,oldRun.event_id!);
+  raw.prepare("UPDATE schedules SET state='needs_review' WHERE schedule_id='work_audit'").run();
+  repo.recoverWorkRunForResult(oldRun.run_id,repo.getRun(oldRun.run_id)!.job_id!,oldRun.event_id!,due);
+  assert.equal(repo.get("work_audit")?.state,"needs_review");
   repo.setRunState(oldRun.run_id, "started", "failed", actor, due);
   const runAudit = (repo.auditHistory("work_audit") as { revision: number; operation: string; after_json: string }[]).find(x => x.operation === "run_failed")!;
   assert.equal(runAudit.revision, 1); assert.equal(JSON.parse(runAudit.after_json).run.run_id, oldRun.run_id);

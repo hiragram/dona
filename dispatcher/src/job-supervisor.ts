@@ -245,6 +245,7 @@ export class JobSupervisor {
   }
 
   private async reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean> {
+    if(job.last_error_code==="invalid_result") {await this.stopInvalidResultAgent(job);return true;}
     if(job.last_error_code!=="invalid_result_agent_stop_unknown") return this.tryComplete(job,false);
     const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
     if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||

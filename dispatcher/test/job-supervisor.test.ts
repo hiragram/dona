@@ -394,6 +394,24 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("routes a newly invalid Result directly to the agent stop fence", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-now");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    let cancels=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async cancel(){cancels+=1;return ok("idle");},
+      async get(){return ok("idle");},
+    }),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(cancels,1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stopped");
+    database.close();
+  });
+
   test("preserves a worker-reported failure and emits a job_failed notification", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
