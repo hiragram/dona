@@ -27,12 +27,13 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[]=[]): string[] {
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
   const args = row.source==="dona_schedule"
-    ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never"]
+    ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+        ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
     : ["--add-dir", resultDirectory];
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
@@ -214,6 +215,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       throw commandError("Herdr workspace creation failed", created);
     }
 
+    let disabledMcpServers:string[]=[];
+    if(row.source==="dona_schedule") {
+      const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
+      if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
+      const inventory=parseJson(listed.stdout);
+      if(!Array.isArray(inventory)) throw new Error("Scheduled Codex MCP inventory was invalid");
+      disabledMcpServers=inventory.map(item=>findValue(item,["name"])).map(String);
+      if(disabledMcpServers.some(name=>!/^[A-Za-z0-9_-]+$/.test(name))) throw new Error("Scheduled Codex MCP identity was invalid");
+    }
+
     let started: HerdrCommandResult | undefined;
     const deadline = Date.now() + 5_000;
     do {
@@ -225,7 +236,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config),
+          "--", ...codexAgentArguments(row, this.config,disabledMcpServers),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,

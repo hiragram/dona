@@ -9,6 +9,7 @@ export interface DispatcherConfig {
   herdrSession: string;
   agentName: string;
   herdrPath: string;
+  codexPath: string;
   requestMaxBytes: number;
   agentWaitTimeoutMs: number;
   agentMissingGraceMs: number;
@@ -68,6 +69,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     herdrSession: nonEmpty(env.HERDR_SESSION, "dona", "HERDR_SESSION"),
     agentName: nonEmpty(env.DONA_AGENT_NAME, "dona-main", "DONA_AGENT_NAME"),
     herdrPath: nonEmpty(env.DONA_HERDR_PATH, "herdr", "DONA_HERDR_PATH"),
+    codexPath: nonEmpty(env.DONA_CODEX_PATH, "codex", "DONA_CODEX_PATH"),
     requestMaxBytes: positiveInteger(env.DONA_REQUEST_MAX_BYTES, 1_048_576, "DONA_REQUEST_MAX_BYTES"),
     agentWaitTimeoutMs: positiveInteger(
       env.DONA_AGENT_WAIT_TIMEOUT_MS,

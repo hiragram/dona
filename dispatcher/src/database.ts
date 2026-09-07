@@ -62,10 +62,10 @@ export class DispatcherDatabase {
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
       const eventColumns=new Set((this.db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
-      const legacyScheduleResults=!routingMarker&&["source","status","result_path"].every(column=>eventColumns.has(column))?(this.db.prepare(`SELECT e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
+      const legacyScheduleResults=!routingMarker&&["source","status","result_path"].every(column=>eventColumns.has(column))?(this.db.prepare(`SELECT e.event_id,e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
         JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
         WHERE e.source='dona_schedule' AND e.status='completed' AND e.result_path IS NOT NULL AND v.action='work.read_only'
-          AND r.status='materialized' AND r.job_id IS NULL AND NOT EXISTS (SELECT 1 FROM jobs WHERE source_event_id=e.event_id)`).all() as Array<{result_path:string}>):[];
+          AND r.status='materialized' AND r.job_id IS NULL AND NOT EXISTS (SELECT 1 FROM jobs WHERE source_event_id=e.event_id)`).all() as Array<{event_id:string;result_path:string}>):[];
       const movedResults:Array<{from:string;to:string}>=[];
       try {
         for(const row of legacyScheduleResults) if(fs.existsSync(row.result_path)) {
@@ -93,9 +93,11 @@ export class DispatcherDatabase {
     this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at), undefined, (jobId,resultPath) => {
       const legacy=path.basename(resultPath)===`${jobId}.json`;
       const isolated=path.basename(resultPath)==="result.json"&&path.basename(path.dirname(resultPath))===jobId;
-      if(!legacy&&!isolated) return false;
+      const migrationBackup=path.basename(resultPath)===`${jobId}.json.routing-migration-backup`;
+      if(!legacy&&!isolated&&!migrationBackup) return false;
       try {
         if(isolated) fs.rmSync(path.dirname(resultPath),{recursive:true,force:true});
+        else if(migrationBackup) fs.unlinkSync(resultPath);
         else {
           const directory=path.dirname(resultPath), prefix=`${jobId}.json`;
           for(const name of fs.readdirSync(directory)) if(name===prefix||name.startsWith(`${prefix}.`)) fs.unlinkSync(path.join(directory,name));
@@ -460,7 +462,8 @@ export class DispatcherDatabase {
       if(job.completion_event_id) {
         const completion=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
         if(completion?.notification_state!=="pending") return;
-        this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(at.toISOString(),at.toISOString(),job.completion_event_id);
+        const changed=this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(at.toISOString(),at.toISOString(),job.completion_event_id).changes;
+        if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
         this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
@@ -990,6 +993,10 @@ export class DispatcherDatabase {
 
   beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
     this.suppressUnauthorizedScheduledNotifications(at);
+    const before=this.getRequired(eventId);
+    if(before.source==="dona_schedule"&&before.result_path&&path.basename(before.result_path)===`${eventId}.json.routing-migration-backup`) {
+      try { fs.unlinkSync(before.result_path); } catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
+    }
     const timestamp = at.toISOString();
     const changed = this.db
       .prepare(`
@@ -1100,16 +1107,16 @@ export class DispatcherDatabase {
     const allowedActions=actions.every(({value})=>{
       if(value.tool==="dona_dispatcher.authorize_job_notification") return value.event_id===eventId;
       if(["dona_slack.check_user_channel_access","dona_slack.post_message"].includes(String(value.tool))) return true;
-      return value.tool==="dona_slack.set_agent_session_status"&&value.channel_id===target?.channel_id&&
+      return value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.channel_id===target?.channel_id&&
         (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:["processing","active"]).includes(String(value.status));
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
     const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
-    const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
+      const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatus=["blocked","needs_review"].includes(completion.job_status)?"suspended":"active";
-    const sessionSettled=!processing||actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing.index)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
+    const sessionSettled=!processing||actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing.index)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
     return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
@@ -1256,7 +1263,9 @@ export class DispatcherDatabase {
   }
 
   manualDeadLetter(eventId: string, at = new Date()): EventRow {
-    this.getRequired(eventId);
+    const row=this.getRequired(eventId);
+    const notification=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}|undefined;
+    if(notification?.notification_state==="accepted") return row;
     this.db.transaction(()=>{
       this.db.prepare(`
         UPDATE events SET status = 'dead_letter', last_error_code = 'operator_dead_letter',

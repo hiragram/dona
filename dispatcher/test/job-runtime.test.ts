@@ -55,7 +55,11 @@ describe("Codex background agent arguments", () => {
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[3]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
     assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config),[
-      "-C",path.dirname(job.result_path),"--sandbox","workspace-write","--ask-for-approval","never","-c",expectedOverride,
+      "-C",path.dirname(job.result_path),"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","-c",expectedOverride,
+    ]);
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"]),[
+      "-C",path.dirname(job.result_path),"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","-c",expectedOverride,
     ]);
     database.close();
   });
@@ -123,6 +127,10 @@ if (args.includes("get")) {
 }
 if (args.includes("workspace") && args.includes("create")) {
   process.stdout.write(JSON.stringify({ result: { workspace_id: "w1", pane_id: "w1:p1" } }));
+  process.exit(0);
+}
+if (args.includes("pane") && args.includes("run")) {
+  process.stdout.write(JSON.stringify({ result: { ok: true } }));
   process.exit(0);
 }
 if (args.includes("agent") && args.includes("start")) {

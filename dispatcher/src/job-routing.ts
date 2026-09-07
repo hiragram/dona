@@ -87,7 +87,7 @@ export function migrateJobRouting(db: Database.Database): void {
         typeof (existingPayload.work as Record<string,unknown>).objective==="string")) db.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(stableStringify({run_id:row.run_id,revision:row.revision,
         occurrence_key:row.occurrence_key,work:{objective:row.content,scope:"read_only",allowed_external_writes:[],result_destination:rawTarget,...(authorizationTarget?{authorization_target:authorizationTarget}:{})}}),row.event_id);
       db.prepare(`UPDATE events SET status='queued',attempt_count=0,available_at=updated_at,dispatch_started_at=NULL,prompt_accepted_at=NULL,
-        completed_at=NULL,result_json=NULL,result_path=NULL,last_error_code=NULL,last_error_message=NULL
+        completed_at=NULL,result_json=NULL,result_path=CASE WHEN result_path IS NULL THEN NULL ELSE result_path||'.routing-migration-backup' END,last_error_code=NULL,last_error_message=NULL
         WHERE event_id=? AND status='completed' AND NOT EXISTS (SELECT 1 FROM jobs WHERE source_event_id=events.event_id)
           AND EXISTS (SELECT 1 FROM schedule_runs WHERE event_id=events.event_id AND status='materialized' AND job_id IS NULL)`).run(row.event_id);
     }

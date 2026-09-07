@@ -282,6 +282,9 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
   assert.equal(repo.get("notify_work")?.state,"completed");
+  dispatcher.manualDeadLetter(completionEventId,new Date(due));
+  assert.equal(dispatcher.get(completionEventId)?.status,"completed");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET job_status='needs_review',notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
@@ -289,7 +292,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
   raw.prepare("UPDATE job_completion_results SET job_status='completed' WHERE job_id=?").run(job.job_id);
@@ -393,9 +396,9 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000003",reply_broadcast:false},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",success:false},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",success:false},
   ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
@@ -404,9 +407,9 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000005",reply_broadcast:false},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",error:{code:"unavailable",message:"failed"}},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",error:{code:"unavailable",message:"failed"}},
   ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
@@ -419,6 +422,7 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_dispatcher.authorize_job_notification",event_id:"evt_other",authorized:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"invalid",reply_broadcast:false},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000006",reply_broadcast:false,error:{code:"failed"}},
+    {tool:"dona_slack.set_agent_session_status",workspace:"other",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
   ]) {
     raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
     dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
@@ -435,8 +439,8 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000007",reply_broadcast:false},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
-    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
   ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
 });
@@ -537,6 +541,7 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   const reopened=new DispatcherDatabase(filename); reopened.close();
   assert.equal(fs.existsSync(legacyResult),false);
   assert.equal(fs.readFileSync(`${legacyResult}.routing-migration-backup`,"utf8"),"old result");
+  assert.equal(dispatcher.get(run.event_id!)?.result_path,`${legacyResult}.routing-migration-backup`);
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
   assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" },authorization_target:{workspace_id:"T_TEST",channel_id:"C_TEST"} });
   assert.equal(dispatcher.get(run.event_id!)?.status,"queued");
@@ -544,6 +549,23 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   raw.prepare("UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]') WHERE event_id=?").run(run.event_id);
   migrateJobRouting(raw);
   assert.equal((JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string}}).work.objective,"[deleted]");
+  repo.transition("legacy_work",1,"cancel",actor,"2026-09-05T00:01:01Z");
+  repo.purge("2026-09-12T00:01:02Z");
+  assert.equal(fs.existsSync(`${legacyResult}.routing-migration-backup`),false);
+  assert.equal(dispatcher.get(run.event_id!)?.result_path,null);
+});
+
+test("job作成前のin-flight scheduled eventをschedule取消で抑止する", () => {
+  for(const waiting of [false,true]) {
+    const {repo,dispatcher}=setup(),scheduleId=`inflight_${waiting}`;
+    repo.create(scheduleId,{...input,action:"work.read_only",content:"取消対象"},due,actor,now);
+    const run=repo.materialize(scheduleId,1,due,later,due,actor).run;
+    dispatcher.beginDispatch(run.event_id!,`/tmp/${run.event_id}.json`,new Date(due));
+    if(waiting) dispatcher.markWaiting(run.event_id!,new Date(due));
+    repo.transition(scheduleId,1,"cancel",actor,"2026-09-05T00:01:01Z");
+    assert.equal(dispatcher.get(run.event_id!)?.status,"completed");
+    assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");
+  }
 });
 
 test("delegated blockedとredaction拒否はDona eventだけを一意に生成する", () => {
