@@ -90,7 +90,7 @@ const drivePageSchema = z.object({
 
 export interface DriveChangesClient {
   list(input: Readonly<{ pageToken: string; supportsAllDrives: true; includeItemsFromAllDrives: true;
-    driveId?: string; fields: string }>): Promise<unknown>;
+    driveId?: string; pageSize: number; fields: string }>): Promise<unknown>;
 }
 
 export interface DriveAllowlist {
@@ -123,10 +123,7 @@ function errorReasons(error: unknown): string[] {
 
 function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): string {
   const canonical = { fileId: change.fileId, removed: change.removed ?? false, changeType: change.changeType,
-    time: change.time, driveId: change.driveId ?? null, file: change.file === undefined ? null : {
-      id: change.file.id, name: change.file.name ?? null, mimeType: change.file.mimeType ?? null,
-      parents: [...(change.file.parents ?? [])].sort(), trashed: change.file.trashed ?? false,
-    } };
+    time: change.time, driveId: change.driveId ?? null };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
@@ -145,10 +142,8 @@ function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChan
     subject: { account: binding.account, resource: binding.resource, file_id: change.fileId },
     payload: tombstone ? { removed: true, drive_id: null, file: null } : {
       removed: change.removed ?? false, drive_id: change.driveId ?? null,
-      file: change.file === undefined ? null : {
-        id: change.file.id, name: change.file.name ?? null, mime_type: change.file.mimeType ?? null,
-        parent_ids: change.file.parents ?? [], trashed: change.file.trashed ?? false,
-      },
+      // changes.listのfile snapshotは再取得時に変わり得るため、Envelopeにはchange identityと同じ安定fieldだけを出す。
+      file: change.file === undefined ? null : { id: change.file.id },
     },
     reply_target: null,
   };
@@ -188,6 +183,7 @@ export async function drainDriveChanges(
     try {
       raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true,
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
+        pageSize: Math.min(1000, remainingEvents),
         fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
       const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;response?:unknown} : {};

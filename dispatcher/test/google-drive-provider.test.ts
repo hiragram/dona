@@ -191,12 +191,19 @@ test("quota系403はretryable、未知fieldはdedup IDへ影響せずuser feed�
   await assert.rejects(drainDriveChanges(db,binding,retry,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
     (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "incomplete_batch");
   const client = { list: async () => { round++; return { changes: [
-    { fileId:"same",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"same"},unknown:round },
+    { fileId:"same",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"same",name:`snapshot-${round}`},unknown:round },
     ...(round === 2 ? [{ fileId:"shared",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"shared"} }] : []),
   ],...(round === 1 ? {nextPageToken:"page-2"} : {newStartPageToken:"next"}) }; } };
   const allowlist={fileIds:new Set(["same","shared"]),folderIds:new Set<string>(),driveIds:new Set(["drive-1"])};
   await drainDriveChanges(db,binding,client,allowlist);
   assert.equal(db.list().length,1);
+});
+
+test("API pageSizeを残りevent budget以下に固定する",async(t)=>{
+  const db=fixture(t); const calls:unknown[]=[];
+  await drainDriveChanges(db,binding,{list:async(input)=>{calls.push(input);return {changes:[],newStartPageToken:"next"};}},
+    {fileIds:new Set(),folderIds:new Set(),driveIds:new Set()},{kind:"user"},{pages:2,events:50,bytes:10000,timeoutMs:1000});
+  assert.equal((calls[0] as {pageSize:number}).pageSize,50);
 });
 
 test("複数pageでevent/byte/time上限を共有しdurable continuationで停止する", async (t) => {
