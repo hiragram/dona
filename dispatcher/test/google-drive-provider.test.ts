@@ -137,6 +137,26 @@ test("allowlisted folder自身の削除はcursor commit前にreconciliationへ�
   assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
 });
 
+test("folder/drive経路で初観測したTrash fileもreconciliationへ隔離する",async(t)=>{
+  for(const [allowlist,feed,change] of [
+    [{fileIds:new Set<string>(),folderIds:new Set(["folder-1"]),driveIds:new Set<string>()},{kind:"user"} as const,
+      {fileId:"trashed-folder",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"trashed-folder",parents:["folder-1"],trashed:true}}],
+    [{fileIds:new Set<string>(),folderIds:new Set<string>(),driveIds:new Set(["drive-1"])},{kind:"drive",driveId:"drive-1"} as const,
+      {fileId:"trashed-drive",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"trashed-drive",trashed:true}}],
+  ] as const){
+    const db=fixture(t);
+    await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[change],newStartPageToken:"next"})},allowlist,feed),/operation_pending/);
+    assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
+  }
+});
+
+test("newStartPageTokenが既訪問tokenへ戻るresponseをcommitしない",async(t)=>{
+  const db=fixture(t); let page=0;
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>++page===1?{changes:[],nextPageToken:"page-2"}:
+    {changes:[],newStartPageToken:"start-token"}},{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),/incomplete_batch/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
+});
+
 function fixture(t: { after(fn: () => void): void }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dona-drive-"));
   const db = new DispatcherDatabase(path.join(dir, "db.sqlite"), clock);

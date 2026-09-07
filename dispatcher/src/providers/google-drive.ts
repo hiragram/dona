@@ -215,14 +215,16 @@ export async function drainDriveChanges(
         change.driveId === undefined || members.has(change.fileId) || allowlist.fileIds.has(change.fileId));
     if (fileChanges.some((change)=>allowlist.folderIds.has(change.fileId)&&
       (change.removed===true||change.file?.trashed===true))) throw new ConnectionError("operation_pending");
-    if (fileChanges.some((change)=>change.file?.trashed===true&&
-      (members.has(change.fileId)||allowlist.fileIds.has(change.fileId)))) throw new ConnectionError("operation_pending");
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
+    const touchedMembers = new Map<string,boolean>();
     for (const change of fileChanges) {
+      if(!touchedMembers.has(change.fileId))touchedMembers.set(change.fileId,members.has(change.fileId));
       const trackedBefore = members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId));
       const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && trackedBefore;
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
+      if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
+        (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
       const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
@@ -236,17 +238,24 @@ export async function drainDriveChanges(
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
     if (totalEvents > bounded.events || totalBytes > (bounded.bytes ?? 16_777_216)) throw new ConnectionError("incomplete_batch");
+    const membershipChanges={add:[] as string[],remove:[] as string[]};
+    for(const [member,wasMember] of touchedMembers){
+      const isMember=members.has(member);
+      if(!wasMember&&isMember)membershipChanges.add.push(member);
+      if(wasMember&&!isMember)membershipChanges.remove.push(member);
+    }
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
       if (seenPageTokens.has(parsed.data.nextPageToken)) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
       committedCheckpoint = parsed.data.nextPageToken;
-      return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort(), continuation:true };
+      return { done: true, checkpoint: parsed.data.nextPageToken, events, membershipChanges, continuation:true };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
+    if(seenPageTokens.has(parsed.data.newStartPageToken)) throw new ConnectionError("incomplete_batch");
     final = true;
     committedCheckpoint = parsed.data.newStartPageToken;
-    return { done: true, checkpoint: parsed.data.newStartPageToken, events, membership:[...members].sort() };
+    return { done: true, checkpoint: parsed.data.newStartPageToken, events, membershipChanges };
     }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining }, expected);
     if (committedCheckpoint === undefined) throw new ConnectionError("incomplete_batch");
     expected = { revision: expected.revision, version: expected.version + 1,

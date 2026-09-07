@@ -6,6 +6,7 @@ import type { Cursor, CursorBatch } from "./registry.js";
 export type CursorPage = {
   events: CursorBatch["events"];
   membership?: CursorBatch["membership"];
+  membershipChanges?: CursorBatch["membershipChanges"];
   continuation?: boolean;
 } & ({ done: false; nextPage: string } | { done: true; checkpoint: string });
 
@@ -52,6 +53,7 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
     if(result.done===true) {
       database.commitConnectionBatch({binding,expected,checkpoint:result.checkpoint,complete:true,events,
         ...(result.membership === undefined ? {} : {membership:result.membership}),
+        ...(result.membershipChanges === undefined ? {} : {membershipChanges:result.membershipChanges}),
         ...(result.continuation === undefined ? {} : {continuation:result.continuation})}); return;
     }
     if(result.done!==false||typeof result.nextPage!=="string"||result.nextPage.length>16_384||seen.has(result.nextPage)) throw new ConnectionError("incomplete_batch");

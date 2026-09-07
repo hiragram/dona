@@ -20,6 +20,7 @@ export interface CursorBatch {
   binding: DeliveryBinding; expected: Cursor; checkpoint: string; complete: boolean;
   events: readonly { providerEventId: string; envelope: EventEnvelope }[];
   membership?: readonly string[];
+  membershipChanges?: { add: readonly string[]; remove: readonly string[] };
   continuation?: boolean;
 }
 export class ConnectionRegistry {
@@ -374,6 +375,11 @@ export class ConnectionRegistry {
     if (!batch.complete || typeof batch.checkpoint !== "string" || batch.checkpoint.length > 16_384) throw new ConnectionError("incomplete_batch");
     if (batch.membership !== undefined && (new Set(batch.membership).size !== batch.membership.length ||
       batch.membership.some((member)=>!identifier.safeParse(member).success))) throw new ConnectionError("invalid_input");
+    if (batch.membershipChanges !== undefined) {
+      const {add,remove}=batch.membershipChanges;
+      if(new Set(add).size!==add.length||new Set(remove).size!==remove.length||add.some((member)=>!identifier.safeParse(member).success)||
+        remove.some((member)=>!identifier.safeParse(member).success)||add.some((member)=>remove.includes(member))) throw new ConnectionError("invalid_input");
+    }
     return this.db.transaction(() => {
       const b = batch.binding; const c = this.current(b.connectionId, b.revision, b.resource);
       if (!c.capability.cursor) throw new ConnectionError("capability_mismatch");
@@ -397,6 +403,12 @@ export class ConnectionRegistry {
         this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=?").run(c.id,b.resource);
         const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?)");
         for(const member of batch.membership) insert.run(c.id,b.resource,member);
+      }
+      if(batch.membershipChanges!==undefined){
+        const remove=this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND member=?");
+        for(const member of batch.membershipChanges.remove)remove.run(c.id,b.resource,member);
+        const add=this.db.prepare("INSERT OR IGNORE INTO connection_resource_memberships VALUES(?,?,?)");
+        for(const member of batch.membershipChanges.add)add.run(c.id,b.resource,member);
       }
       if (batch.continuation !== true)
         this.db.prepare("DELETE FROM connection_cursor_history WHERE connection_id=? AND resource=?").run(c.id,b.resource);
