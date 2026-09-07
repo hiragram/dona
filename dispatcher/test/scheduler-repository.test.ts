@@ -384,8 +384,8 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     dispatcher.nextAvailable(new Date(mode==="deadline"||mode==="authorized_deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
     if(mode==="waiting") dispatcher.nextWaiting();
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
-    assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"?"needs_review":"completed");
-    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"?"needs_review":"none");
+    assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"||mode==="waiting"?"needs_review":"completed");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"||mode==="waiting"?"needs_review":"none");
     if(mode==="authorized_deadline") {
       assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:16:01Z"},path.join(path.dirname(filename),`${eventId}.json`));
@@ -393,7 +393,7 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     }
     if(mode==="waiting") {
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:01:31Z"},path.join(path.dirname(filename),`${eventId}.json`));
-      assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+      assert.equal(dispatcher.get(eventId)?.last_error_code,"notification_delivery_ambiguous");
     }
   }
 });
@@ -528,7 +528,7 @@ test("preflight中でも投稿実績がある通知はschedule取消前にreconc
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}).notification_state,"needs_review");
 });
 
-test("pending認可前の通知をschedule pauseで抑止する", () => {
+test("実行中のpending認可前通知はschedule pauseでも未回収Resultをreconcileする", () => {
   const {repo,dispatcher,raw,filename}=setup(),objective="認可前通知";
   repo.create("notify_pending_pause",{...input,action:"work.read_only",content:objective},due,actor,now);
   const run=repo.materialize("notify_pending_pause",1,due,later,due,actor).run;
@@ -538,10 +538,10 @@ test("pending認可前の通知をschedule pauseで抑止する", () => {
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
   repo.transition("notify_pending_pause",1,"pause",actor,"2026-09-05T00:01:01Z");
-  assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
-  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
+  assert.equal(dispatcher.get(eventId)?.status,"needs_review");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"後着",completed_at:"2026-09-05T00:01:01Z"},resultPath,new Date("2026-09-05T00:01:01Z"));
-  assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+  assert.equal(dispatcher.get(eventId)?.last_error_code,"notification_delivery_ambiguous");
 });
 
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {

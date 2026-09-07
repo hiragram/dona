@@ -334,7 +334,7 @@ export class SchedulerRepository {
     this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',last_error_message=NULL
       WHERE event_id IN (SELECT c.notification_event_id FROM job_completion_results c
         WHERE json_extract(c.owner_json,'$.schedule_id')=? AND c.notification_state='pending' AND c.notification_authorization_phase='none')
-        AND source='dona_job' AND status IN ('queued','retryable_failed','dispatching','waiting_agent')`).run(now,now,scheduleId);
+        AND source='dona_job' AND status IN ('queued','retryable_failed')`).run(now,now,scheduleId);
     this.db.prepare(`UPDATE job_completion_results SET notification_state='none' WHERE json_extract(owner_json,'$.schedule_id')=?
       AND notification_state='pending' AND notification_authorization_phase='none' AND notification_event_id IN
         (SELECT event_id FROM events WHERE status='completed' AND last_error_code='schedule_notification_suppressed')`).run(scheduleId);
@@ -394,10 +394,20 @@ export class SchedulerRepository {
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',last_error_message=NULL
           WHERE event_id IN (SELECT c.notification_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
             WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase IN ('none','preflight'))
-          AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`).run(transitionAt,transitionAt,scheduleId);
-        this.db.prepare(`UPDATE job_completion_results SET notification_state='none' WHERE rowid IN
-          (SELECT c.rowid FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-            WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase IN ('none','preflight'))`).run(scheduleId);
+          AND status IN ('queued','retryable_failed','blocked','needs_review')`).run(transitionAt,transitionAt,scheduleId);
+        this.db.prepare(`UPDATE job_completion_results SET notification_state='none'
+          WHERE notification_state='needs_review' AND notification_authorization_phase IN ('none','preflight')
+            AND notification_event_id IN (SELECT event_id FROM events
+              WHERE status='completed' AND last_error_code='schedule_notification_suppressed')
+            AND json_extract(owner_json,'$.run_id') IN (SELECT run_id FROM schedule_runs WHERE schedule_id=?)`).run(scheduleId);
+        this.db.prepare(`UPDATE events SET status='needs_review',updated_at=?,last_error_code='notification_delivery_ambiguous',last_error_message=NULL
+          WHERE event_id IN (SELECT c.notification_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+            WHERE r.schedule_id=? AND c.notification_state IN ('pending','needs_review') AND c.notification_authorization_phase IN ('none','preflight'))
+          AND status IN ('dispatching','waiting_agent')`).run(transitionAt,scheduleId);
+        this.db.prepare(`UPDATE job_completion_results SET notification_state='needs_review'
+          WHERE notification_state='pending' AND notification_event_id IN (SELECT event_id FROM events
+            WHERE status='needs_review' AND last_error_code='notification_delivery_ambiguous')
+          AND json_extract(owner_json,'$.run_id') IN (SELECT run_id FROM schedule_runs WHERE schedule_id=?)`).run(scheduleId);
       }
       // A claim lease is a future fencing deadline, not the wall clock at which this operation occurs.
       // Keep transitionAt monotonic for persisted timestamps, but evaluate authorization lifetime at now.
