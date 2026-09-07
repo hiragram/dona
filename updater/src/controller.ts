@@ -62,6 +62,16 @@ function mainAgentMatches(agent: MainAgentObservation): boolean {
     agent.interactive_ready && agent.matches_release && agent.status !== null && agent.status !== "unknown";
 }
 
+function rolloutMatchesTargetCompatibility(rollout: SchemaRollout, compatibility: ReleaseManifest["compatibility"]): boolean {
+  if (compatibility.app_schema_write === 3) {
+    return canonicalJson(rollout) === canonicalJson(schemaV3ActivationRollout);
+  }
+  return rollout.database_schema === 2 && !rollout.multi_job_enabled && rollout.phase !== "activation" &&
+    Array.isArray(rollout.capabilities) && rollout.migration === undefined &&
+    rollout.previous_release_sha === undefined && rollout.previous_release_contract === undefined &&
+    rollout.required_control_plane_capability === undefined;
+}
+
 export class UpdateController {
   constructor(
     private readonly database: UpdateDatabase,
@@ -90,6 +100,9 @@ export class UpdateController {
     if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
+    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility)) {
+      throw new Error("target_schema_rollout_does_not_match_target_compatibility");
+    }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
     const targetManifest: ReleaseManifest = {
       schema_version: 1,
@@ -107,9 +120,6 @@ export class UpdateController {
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
     if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
       if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
-      if (canonicalJson(git.target_rollout) !== canonicalJson(schemaV3ActivationRollout)) {
-        throw new Error("target_schema_rollout_does_not_match_activation_contract");
-      }
       controlPlane = await this.runtime.schemaMigrationCapability();
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");

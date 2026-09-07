@@ -27,6 +27,23 @@ const sourceEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRV";
 const approvalEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRW";
 const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
 const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: false, output_truncated: false };
+const activationRollout: SchemaRollout = {
+  schema_version: 1,
+  phase: "activation",
+  database_schema: 3,
+  multi_job_enabled: true,
+  previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
+  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  migration: {
+    from_schema: 2,
+    to_schema: 3,
+    requires_quiesce: true,
+    requires_drain: true,
+    backup: "sqlite_online_backup",
+    restore_open_test: true,
+  },
+};
 
 test("requires a v2/v3 compatibility bridge before a schema-v3 writing release", () => {
   const schemaV2 = {
@@ -61,9 +78,9 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   };
   await assert.rejects(
     f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
-    /target_schema_rollout_does_not_match_activation_contract/,
+    /target_schema_rollout_does_not_match_target_compatibility/,
   );
-  f.git.targetRollout = new FakeGit().targetRollout;
+  f.git.targetRollout = activationRollout;
   f.runtime.schemaMigrationReady = false;
   await assert.rejects(
     f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
@@ -79,6 +96,32 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   f.database.close();
 });
 
+test("validates the post-activation rollout contract on schema-v3 to schema-v3 plans", async () => {
+  const f = await fixture();
+  const activationCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 3, rollback_safe: true,
+  };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: activationCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_target_compatibility/,
+  );
+  f.git.targetRollout = activationRollout;
+  await assert.doesNotReject(f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }));
+  f.database.close();
+});
+
 class FakeGit implements GitPort {
   targetCompatibility: Compatibility = {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
@@ -86,20 +129,10 @@ class FakeGit implements GitPort {
   };
   targetRollout: SchemaRollout = {
     schema_version: 1,
-    phase: "activation",
-    database_schema: 3,
-    multi_job_enabled: true,
-    previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
-    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
-    migration: {
-      from_schema: 2,
-      to_schema: 3,
-      requires_quiesce: true,
-      requires_drain: true,
-      backup: "sqlite_online_backup",
-      restore_open_test: true,
-    },
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
   };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
@@ -471,6 +504,7 @@ describe("UpdateController isolated end-to-end", () => {
     );
     f.policy.compatibility = schemaV3Compatibility;
     f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
     f.build.compatibility = schemaV3Compatibility;
     f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
     f.runtime.setHealthCompatibility(targetSha, schemaV3Compatibility);
