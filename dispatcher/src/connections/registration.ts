@@ -62,15 +62,15 @@ export class ProviderRegistrationRegistry {
         input.resource ?? null, input.resource ?? null) as Array<{ connection_id: string; provider: string; config_json: string;
           revision: number; last_clock: number; resource: string; generation: number; subscription_revision: number; provider_id: string;
           verification_epoch: number; expires_at: number | null }>;
-    if (rows.some((row) => now < row.last_clock)) throw new ConnectionError("clock_skew");
-    const matches = rows.flatMap((row) => {
+    const candidates = rows.flatMap((row) => {
       const config = JSON.parse(row.config_json) as ConnectionConfig;
-      return input.account !== undefined && config.account !== input.account ? [] : [{
-        provider: row.provider, providerId: row.provider_id, verificationEpoch: row.verification_epoch,
-        delivery: { connectionId: row.connection_id, account: config.account, revision: row.revision,
-          credentialRevision: config.credentialRevision, resource: row.resource, generation: row.generation },
-      }];
+      return (input.account !== undefined && config.account !== input.account) ||
+        !config.allowlist.some((entry) => entry.resource === row.resource) ? [] : [{ row, config }];
     });
+    if (candidates.some(({ row }) => now < row.last_clock)) throw new ConnectionError("clock_skew");
+    const matches = candidates.map(({ row, config }) => ({ provider: row.provider, providerId: row.provider_id,
+      verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: config.account,
+        revision: row.revision, credentialRevision: config.credentialRevision, resource: row.resource, generation: row.generation } }));
     if (matches.length !== 1) throw new ConnectionError(matches.length === 0 ? "not_authorized" : "invalid_transition");
     return matches[0]!;
   }

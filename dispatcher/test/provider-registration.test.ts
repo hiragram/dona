@@ -269,6 +269,25 @@ test("revision更新後の既存generationをcurrent revisionで再verification�
   assert.deepEqual(db.providerRegistration.consume(token, claim.claimId), expected);
 });
 
+test("current allowlistから削除した旧subscriptionへattemptを発行しない", (t) => {
+  const { db } = fixture(t); db.connections.register(config); const old = activate(db);
+  db.connections.revise("pilot", 1, { ...config, allowlist: [{ resource: "page:two", events: ["updated"] }] });
+  assert.throws(() => db.providerRegistration.issue({ provider: old.provider, providerId: old.providerId,
+    connectionId: old.delivery.connectionId, account: old.delivery.account, resource: old.delivery.resource }, 5_000), /not_authorized/);
+});
+
+test("accountで除外したconnectionのclockは対象bindingへ影響しない", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); activate(db);
+  const other = { ...config, id: "other", account: "workspace:two", credentialRef: "cred_other" };
+  db.connections.register(other); db.connections.attachManual("other", 1, "page:one", "subscription:one", null);
+  db.connections.observe("other", 1, "page:one", 1,
+    { providerId: "subscription:one", expiresAt: null, verified: true, cutoverConfirmed: false });
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connections SET last_clock=? WHERE id='other'").run(clock.value + 100);
+  assert.equal(db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
+    account: "workspace:one" }).delivery.connectionId, "pilot");
+});
+
 test("clock rewind時はverification attemptをfail closedにする", (t) => {
   const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,
