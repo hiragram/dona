@@ -41,6 +41,23 @@ function promptFields(prompt: string): { eventId: string; resultPath: string } {
 }
 
 describe("DispatcherWorker", () => {
+  for(const preflight of [failed("unavailable"),ok("blocked")]) test(`keeps running when ${preflight.ok?"blocked":"failed"} preflight arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const event=database.enqueue(eventEnvelope(`Ev-preflight-race-${preflight.ok?"blocked":"failed"}`)).row;
+    let release!:()=>void,started=false;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){started=true;await gate;return preflight;},async prompt(){throw new Error("must not prompt");},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>started);
+    database.manualComplete(event.event_id);
+    release();
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(worker.isRunning(),true);
+    assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
   test("prompts and completes events one at a time in sequence order", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

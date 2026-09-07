@@ -121,6 +121,8 @@ export class DispatcherWorker {
     const started = Date.now();
     const preflight = await this.herdr.get(this.abortController.signal);
     if (this.stopping || preflight.aborted) return;
+    const current=this.database.get(row.event_id);
+    if(current?.status!==row.status) return;
     if (!preflight.ok || !preflight.agentStatus) {
       const updated = this.database.recordPreDispatchFailure(
         row.event_id,
@@ -137,9 +139,6 @@ export class DispatcherWorker {
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
-    const current=this.database.get(row.event_id);
-    if(current?.status!==row.status) return;
-
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {
       await fs.access(resultPath);

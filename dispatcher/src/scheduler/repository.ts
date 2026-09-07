@@ -374,7 +374,10 @@ export class SchedulerRepository {
     return this.db.transaction(() => {
       const before = this.checked(scheduleId, expectedRevision, actor, operation === "resume");
       if(this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-        WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase='write' AND c.notification_event_id IS NOT NULL LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
+        JOIN events e ON e.event_id=c.notification_event_id
+        WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_event_id IS NOT NULL
+          AND (c.notification_authorization_phase='write' OR EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') a
+            WHERE json_extract(a.value,'$.tool') LIKE '%.post_message')) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       if ((operation === "pause" && before.state !== "active") || (operation === "resume" && before.state !== "paused") ||
           (operation === "cancel" && ["cancelled", "completed"].includes(before.state))) throw new Error("invalid_transition");
       const old = this.revision(before);

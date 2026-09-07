@@ -511,6 +511,20 @@ test("preflight中にblockedとなった通知をschedule取消で抑止する",
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}).notification_state,"none");
 });
 
+test("preflight中でも投稿実績がある通知はschedule取消前にreconcileを要求する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="未認可投稿";
+  repo.create("notify_preflight_posted",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_preflight_posted",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='preflight' WHERE notification_event_id=?").run(eventId);
+  raw.prepare("UPDATE events SET status='needs_review',result_json=? WHERE event_id=?").run(JSON.stringify({actions:[{tool:"dona_slack.post_message",message_ts:"2.000001"}]}),eventId);
+  assert.throws(()=>repo.transition("notify_preflight_posted",1,"cancel",actor,"2026-09-05T00:01:01Z"),/reconcile_required/);
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}).notification_state,"needs_review");
+});
+
 test("pending認可前の通知をschedule pauseで抑止する", () => {
   const {repo,dispatcher,raw,filename}=setup(),objective="認可前通知";
   repo.create("notify_pending_pause",{...input,action:"work.read_only",content:objective},due,actor,now);
