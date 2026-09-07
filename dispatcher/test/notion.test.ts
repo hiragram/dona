@@ -73,6 +73,14 @@ describe("Notion ingress", () => {
     await restarted.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
       requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
     assert.equal(database.connections.subscriptions("notion_test")[0]!.verifiedAt, null);
+    database.connections.beginVerification("notion_test", 1, "page_1", 1);
+    const nextAttempt = database.providerRegistration.issue({ provider: "notion", providerId: "sub_1",
+      connectionId: "notion_test", account: "ws_1", resource: "page_1" }, 60_000);
+    const nextVerification = Buffer.from(JSON.stringify({ verification_token: "next-secret-verification-token" }));
+    await restarted.authenticate({ body: nextVerification, headers: [], method: "POST", receivedAt,
+      requestTarget: `/v1/ingress/notion?verification_attempt=${nextAttempt}` });
+    const nextSignature = createHmac("sha256", "next-secret-verification-token").update(body).digest("hex");
+    assert.equal((await restarted.authenticate(request(body, nextSignature))).connection?.resource, "page_1");
   });
 
   test("Notion起動configはpartial・不正識別子をfail closedにする", () => {
@@ -93,7 +101,7 @@ describe("Notion ingress", () => {
       credentialRef: "cred_shared", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
     assert.throws(() => serviceExternalIngressRegistry(config, database), /must be separate/);
   });
-  test("Notion pilotはprovider不一致と複数subscriptionを起動時に拒否する", (t) => {
+  test("Notion pilotはprovider不一致を起動時に拒否する", (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-topology-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
@@ -105,6 +113,23 @@ describe("Notion ingress", () => {
       allowlist: [{ resource: "page_1", events: ["page.content_updated"] }],
       credentialRef: "cred_integration", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
     assert.throws(() => serviceExternalIngressRegistry(config, database), /notion provider/);
+  });
+  test("同一webhook provider IDの複数resource bindingを起動時に許可する", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-resources-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
+      DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+    const database = new DispatcherDatabase(config.databasePath); t.after(() => database.close());
+    database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
+      allowlist: ["page_1", "page_2"].map(resource => ({ resource, events: ["page.content_updated"] })),
+      credentialRef: "cred_integration", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
+    for (const resource of ["page_1", "page_2"]) {
+      database.connections.attachManual("notion_test", 1, resource, "sub_1", null);
+      database.connections.observe("notion_test", 1, resource, 1,
+        { providerId: "sub_1", expiresAt: null, verified: false, cutoverConfirmed: false });
+    }
+    assert.doesNotThrow(() => serviceExternalIngressRegistry(config, database));
   });
   test("verification token is stored but omitted from the normalized event", async () => {
     const { registration, secret } = setup();

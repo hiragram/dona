@@ -26,7 +26,8 @@ const verificationSchema = z.object({ verification_token: z.string().min(16).max
 const verificationAttemptSchema = z.string().min(16).max(255).regex(/^[A-Za-z0-9_-]+$/);
 
 export interface NotionSecretStore {
-  get(reference: string): Promise<Buffer | { secret: Buffer; credentialRevision: number } | undefined>;
+  get(reference: string, event: Readonly<{ subscriptionId: string; workspaceId: string;
+    resourceId: string }>): Promise<Buffer | { secret: Buffer; credentialRevision: number } | undefined>;
 }
 export interface NotionVerificationClaim {
   binding: DeliveryBinding;
@@ -100,7 +101,9 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       const parsed = eventSchema.safeParse(candidate);
       if (!parsed.success) throw new ExternalIngressAuthenticationError();
       let resolvedSecret: Awaited<ReturnType<NotionSecretStore["get"]>>;
-      try { resolvedSecret = await options.secrets.get(options.verificationSecretRef); }
+      try { resolvedSecret = await options.secrets.get(options.verificationSecretRef, {
+        subscriptionId: parsed.data.subscription_id, workspaceId: parsed.data.workspace_id,
+        resourceId: parsed.data.entity.id }); }
       catch { throw new ExternalIngressUnavailableError(); }
       const secret = Buffer.isBuffer(resolvedSecret) ? resolvedSecret : resolvedSecret?.secret;
       const credentialRevision = Buffer.isBuffer(resolvedSecret) ? undefined : resolvedSecret?.credentialRevision;

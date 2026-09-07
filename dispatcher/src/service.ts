@@ -54,15 +54,21 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
     if (notionConnection.credentialRef === pilot.verificationCredentialRef) {
       throw new Error("Notion verification credential reference must be separate from the integration credential");
     }
-    if (database.connections.subscriptions(pilot.connectionId).length > 1) {
-      throw new Error("Notion pilot supports exactly one webhook subscription per connection");
+    const providerIds = new Set(database.connections.subscriptions(pilot.connectionId)
+      .filter(subscription => subscription.providerId !== null && subscription.state !== "stopped")
+      .map(subscription => subscription.providerId));
+    if (providerIds.size > 1) {
+      throw new Error("Notion pilot supports exactly one webhook provider ID per connection");
     }
     const secrets = new PrivateFileSecretStore(pilot.secretStoreRoot);
+    const verificationRevision = (epoch: number) => epoch + 1;
     registrations.push(createNotionRegistration({ connectionId: pilot.connectionId,
       verificationSecretRef: pilot.verificationCredentialRef,
-      secrets: { async get() {
+      secrets: { async get(_reference, event) {
         const connection = database.connections.get(pilot.connectionId);
-        return { secret: await secrets.read(pilot.verificationCredentialRef, connection.credentialRevision),
+        const binding = database.providerRegistration.resolve({ provider: "notion", providerId: event.subscriptionId,
+          connectionId: pilot.connectionId, account: event.workspaceId, resource: event.resourceId });
+        return { secret: await secrets.read(pilot.verificationCredentialRef, verificationRevision(binding.verificationEpoch)),
           credentialRevision: connection.credentialRevision };
       } },
       verification: { async claim(input) {
@@ -75,7 +81,7 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
           undefined, expected.verificationEpoch);
         const eventId = `verification:${createHash("sha256").update(input.attemptId).digest("hex")}`;
         if (snapshot.state === "consumed") {
-          const stored = await secrets.read(pilot.verificationCredentialRef, expected.delivery.credentialRevision);
+          const stored = await secrets.read(pilot.verificationCredentialRef, verificationRevision(expected.verificationEpoch));
           const supplied = Buffer.from(input.token);
           const matches = stored.length === supplied.length && timingSafeEqual(stored, supplied);
           stored.fill(0); supplied.fill(0);
@@ -83,10 +89,10 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
             occurredAt: new Date(snapshot.createdAt).toISOString() } : undefined;
         }
         const claim = database.providerRegistration.claim(input.attemptId, expected, 30_000);
-        try { await secrets.write(pilot.verificationCredentialRef, expected.delivery.credentialRevision, input.token); }
+        try { await secrets.write(pilot.verificationCredentialRef, verificationRevision(expected.verificationEpoch), input.token); }
         catch {
           const reconciled = await secrets.reconcile(pilot.verificationCredentialRef,
-            expected.delivery.credentialRevision, input.token).catch(() => false);
+            verificationRevision(expected.verificationEpoch), input.token).catch(() => false);
           if (!reconciled) throw new Error("Notion verification secret is unavailable");
         }
         const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId, activate);
@@ -166,6 +172,7 @@ export async function runService(
             url.searchParams.set("page_size", "100");
             if (cursor) url.searchParams.set("start_cursor", cursor);
             const page = await request(url.toString());
+            if (page.status === 404 && depth > 0) { truncated = true; return []; }
             if (page.status !== 200 || !page.value) return { failure: page };
             const results = Array.isArray(page.value.results) ? page.value.results : [];
             for (const candidate of results) {
