@@ -105,8 +105,8 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
           const reconciled = await secrets.reconcile(verificationReference(expected), 1, input.token).catch(() => false);
           if (!reconciled) throw new Error("Notion verification secret is unavailable");
         }
-        const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId, activate);
-        return { binding: consumed.delivery, providerEventId: eventId, occurredAt: new Date(snapshot.createdAt).toISOString() };
+        return { binding: expected.delivery, providerEventId: eventId, occurredAt: new Date(snapshot.createdAt).toISOString(),
+          commit: () => database.providerRegistration.consume(input.attemptId, claim.claimId, activate) };
       } },
       bindings: { async resolve(input) {
         if (input.integrationId !== pilot.integrationId) return undefined;
@@ -157,9 +157,14 @@ export async function runService(
     try {
       const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
       const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      let requests = 0;
       return fetchLatestNotionState({ async fetch(resourceId) {
         const request = async (url: string, allowPartial = false) => {
           for (let attempt = 0; ; attempt += 1) {
+            if (requests >= 100) return allowPartial
+              ? { status: 200, value: { results: [], has_more: false, content_truncated: true } }
+              : { status: 429 };
+            requests += 1;
             let response: Response;
             try { response = await fetch(url, {
               method: "GET", signal: fetchSignal,
@@ -174,7 +179,12 @@ export async function runService(
               await response.body?.cancel().catch(() => undefined);
               const retryAfter = retry === null ? undefined : Number(retry);
               if (response.status === 429 && attempt < 2 && Number.isFinite(retryAfter)) {
-                await delay(Math.max(0, retryAfter! * 1_000), undefined, { signal: fetchSignal });
+                try { await delay(Math.max(0, retryAfter! * 1_000), undefined, { signal: fetchSignal }); }
+                catch (error) {
+                  if (signal.aborted) throw error;
+                  if (fetchSignal.aborted && allowPartial) return { status: 200, value: { results: [], has_more: false, content_truncated: true } };
+                  throw error;
+                }
                 continue;
               }
               return { status: response.status, ...(retryAfter === undefined ? {} : { retryAfter }) };
@@ -190,14 +200,13 @@ export async function runService(
         const resource = await request(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`);
         // coalesce前のevent typeではなくpageのcurrent stateを取得し、混在signalでもcontentを落とさない。
         if (resource.status !== 200 || subject.entity_type !== "page") return resource;
-        let requests = 0, blocks = 0, truncated = false;
+        let blocks = 0, truncated = false;
         const readChildren = async (parentId: string, depth: number): Promise<unknown[] | { failure: typeof resource }> => {
           if (depth > 8 || requests >= 100 || blocks >= 1_000) { truncated = true; return []; }
           const children: unknown[] = [];
           let cursor: string | undefined;
           do {
             if (requests >= 100 || blocks >= 1_000) { truncated = true; break; }
-            requests += 1;
             const url = new URL(`https://api.notion.com/v1/blocks/${encodeURIComponent(parentId)}/children`);
             url.searchParams.set("page_size", "100");
             if (cursor) url.searchParams.set("start_cursor", cursor);
@@ -238,7 +247,6 @@ export async function runService(
             let cursor: string | undefined;
             do {
               if (requests >= 100) { truncated = true; break; }
-              requests += 1;
               const url = new URL(`https://api.notion.com/v1/pages/${encodeURIComponent(resourceId)}/properties/${propertyPathId}`);
               url.searchParams.set("page_size", "100");
               if (cursor) url.searchParams.set("start_cursor", cursor);

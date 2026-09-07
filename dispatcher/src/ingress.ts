@@ -70,11 +70,12 @@ export interface VerifiedIngressPrincipal {
   readonly connectionId: string;
   readonly principal: Readonly<Record<string, unknown>>;
   readonly purpose?: "verification";
+  readonly verificationCommit?: () => void;
   readonly connection?: Omit<DeliveryBinding, "connectionId">;
   readonly resourceId?: string;
 }
 type IngressPersistenceContext = QueueAdmissionContext & { readonly binding?: DeliveryBinding; readonly owner?: ProviderOwner;
-  readonly verification?: true };
+  readonly verification?: true; readonly verificationCommit?: () => void };
 
 export interface NormalizedExternalEvent {
   readonly providerEventId: string;
@@ -420,7 +421,8 @@ export class ExternalIngressProcessor {
       ...(signal ? { coalesce: signal } : {}),
       ...(verifiedBinding ? { binding: verifiedBinding } : {}),
       ...(owner ? { owner } : {}),
-      ...(verified.purpose === "verification" ? { verification: true as const } : {}),
+      ...(verified.purpose === "verification" ? { verification: true as const,
+        ...(verified.verificationCommit ? { verificationCommit: verified.verificationCommit } : {}) } : {}),
     });
     remainingProcessingTime(processingDeadline);
     const receipt: PersistReceipt = {

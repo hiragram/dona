@@ -254,7 +254,7 @@ export class DispatcherDatabase {
   }
 
   enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, owner?: ProviderOwner, at = new Date(), context?: QueueAdmissionContext,
-    verification = false): EnqueueResult {
+    verification = false, verificationCommit?: () => void): EnqueueResult {
     const connectionId = context?.connectionId ?? binding?.connectionId;
     const queueContext: QueueAdmissionContext | undefined = connectionId ? {
       connectionId,
@@ -269,7 +269,10 @@ export class DispatcherDatabase {
       return this.db.transaction(() => {
         const result = this.connections.delivery(binding, envelope,
           () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
-        if (verification && result.outcome !== "duplicate_conflict") this.completeVerification(result.row.event_id, at);
+        if (verification && result.outcome !== "duplicate_conflict") {
+          verificationCommit?.();
+          this.completeVerification(result.row.event_id, at);
+        }
         return result;
       }).immediate();
     } catch (error) {

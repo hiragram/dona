@@ -532,7 +532,7 @@ export class DispatcherApi {
         (envelope, context) => {
           if (this.shuttingDown) throw new QueueAdmissionError("queue_quiescing");
           const persisted = this.database.enqueueExternal(envelope, context.binding, context.owner, new Date(), context,
-            context.verification === true);
+            context.verification === true, context.verificationCommit);
           if (persisted.outcome !== "duplicate_conflict") this.worker.wake();
           return persisted;
         },

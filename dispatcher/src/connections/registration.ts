@@ -247,7 +247,7 @@ export class ProviderRegistrationRegistry {
         WHERE digest=? AND state='claimed' AND claim_id=?`).run(now, digest(token), claimId).changes;
       if (changed !== 1) throw new ConnectionError("not_authorized");
       onConsume?.(actual);
-      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.delivery.connectionId);
+      this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
       return { binding: actual };
     }).immediate();
     if (result.error) throw result.error;

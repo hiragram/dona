@@ -55,8 +55,9 @@ describe("Notion ingress", () => {
       connectionId: "notion_test", account: "ws_1", resource: "page_1" }, 60_000);
     const verification = Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" }));
     const registration = serviceExternalIngressRegistry(config, database).get("notion")!.registration;
-    await registration.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
+    const verified = await registration.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
       requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
+    verified.verificationCommit?.();
     assert.equal(database.connections.get("notion_test").state, "active");
     database.close();
 
@@ -80,8 +81,9 @@ describe("Notion ingress", () => {
     const nextAttempt = database.providerRegistration.issue({ provider: "notion", providerId: "sub_1",
       connectionId: "notion_test", account: "ws_1", resource: "page_1" }, 60_000);
     const nextVerification = Buffer.from(JSON.stringify({ verification_token: "next-secret-verification-token" }));
-    await restarted.authenticate({ body: nextVerification, headers: [], method: "POST", receivedAt,
+    const nextVerified = await restarted.authenticate({ body: nextVerification, headers: [], method: "POST", receivedAt,
       requestTarget: `/v1/ingress/notion?verification_attempt=${nextAttempt}` });
+    nextVerified.verificationCommit?.();
     const nextSignature = createHmac("sha256", "next-secret-verification-token").update(body).digest("hex");
     assert.equal((await restarted.authenticate(request(body, nextSignature))).connection?.resource, "page_1");
   });

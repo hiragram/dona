@@ -33,6 +33,7 @@ export interface NotionVerificationClaim {
   binding: DeliveryBinding;
   providerEventId: string;
   occurredAt: string;
+  commit?: () => void;
 }
 export interface NotionVerificationStore {
   // 推測不能なpending attemptだけを原子的にconsumeする。ACK loss時は同じattempt/tokenのreceiptを返せる。
@@ -95,7 +96,7 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
         }
         if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
         return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,
-          purpose: "verification",
+          purpose: "verification", ...(claim.commit ? { verificationCommit: claim.commit } : {}),
           principal: { kind: "verification", provider_event_id: claim.providerEventId, occurred_at: claim.occurredAt } };
       }
       const parsed = eventSchema.safeParse(candidate);
