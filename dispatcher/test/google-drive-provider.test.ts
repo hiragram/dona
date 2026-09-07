@@ -56,6 +56,14 @@ test("静的prior membershipのfolder外snapshotをreconciliationへ隔離する
   assert.equal(db.list().length,0);
 });
 
+test("folder外へ移動しても明示file許可があれば通常配送してmembershipだけ除去する",async(t)=>{
+  const db=fixture(t); await drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"moving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving",parents:["outside"]}}],newStartPageToken:"next"})},
+    {fileIds:new Set(["moving"]),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["moving"])});
+  assert.equal(db.list().length,1);
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
+});
+
 test("changes省略の正常な空pageでもnewStartPageTokenをcommitする", async (t) => {
   const db=fixture(t); await drainDriveChanges(db,binding,{list:async()=>({kind:"drive#changeList",newStartPageToken:"empty-next"})},
     {fileIds:new Set(),folderIds:new Set(),driveIds:new Set()});

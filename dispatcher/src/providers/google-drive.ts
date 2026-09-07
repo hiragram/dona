@@ -225,7 +225,9 @@ export async function drainDriveChanges(
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
-      if(members.has(change.fileId)&&!folderAllowed&&change.removed!==true&&!leftUserFeed)
+      const alternativelyAllowed=allowlist.fileIds.has(change.fileId)||
+        (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId));
+      if(members.has(change.fileId)&&!folderAllowed&&!alternativelyAllowed&&change.removed!==true&&!leftUserFeed)
         throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
       const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
