@@ -94,15 +94,22 @@ test("同一revisionの並行publishは既存targetを置換しない", async (t
 });
 
 test("link後crashで残った同一inodeのtemporary fileをreconcileが回収する", async (t) => {
-  const { secrets, store } = fixture(t), secret = Buffer.alloc(32, 4);
+  const { db, secrets, store } = fixture(t), secret = Buffer.alloc(32, 4);
   await store.write("cred_crash", 1, secret);
   const target = path.join(secrets, "cred_crash.1.secret");
   const temporary = path.join(secrets, ".cred_crash.1.0123456789abcdef01234567.tmp");
   fs.linkSync(target, temporary);
   assert.equal(fs.statSync(target).nlink, 2);
-  assert.equal(await store.reconcile("cred_crash", 1, secret), true);
+  const service = new ProviderRegistrationService(db.connections, store);
+  assert.equal((await service.register({ ...config, credentialRef: "cred_crash" }, secret)).revision, 1);
   assert.equal(fs.existsSync(temporary), false);
   assert.equal(fs.statSync(target).nlink, 1);
+});
+
+test("secret readは保存fileのsizeを読込前に拒否する", async (t) => {
+  const { secrets, store } = fixture(t);
+  fs.writeFileSync(path.join(secrets, "cred_large.1.secret"), Buffer.alloc(65_537), { mode: 0o600 });
+  await assert.rejects(store.read("cred_large", 1), /not_authorized/);
 });
 
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
@@ -120,6 +127,14 @@ test("resolverはcurrent active bindingだけを返しcross-workspace/provider/r
 
 test("connectionId省略resolverも永続clockの後退を拒否する", (t) => {
   const { db, clock } = fixture(t); db.connections.register(config); activate(db); clock.value--;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
+});
+
+test("resolver成功時刻をhigh-waterとして保存する", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); activate(db);
+  clock.value += 100;
+  db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" });
+  clock.value--;
   assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
 });
 
@@ -182,6 +197,22 @@ test("clock rewind時はverification attemptをfail closedにする", (t) => {
   assert.throws(() => db.providerRegistration.claim(token2, binding, 1_000), /clock_skew/);
 });
 
+test("一度期限切れを観測したattemptはclock rewindでも復活しない", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
+    connectionId: binding.connectionId, account: binding.account, resource: binding.resource }, 1_000);
+  clock.value += 1_000;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 100), /not_authorized/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 100), /clock_skew/);
+});
+
+test("verification tokenとclaim IDはhash・query前に固定形式で拒否する", (t) => {
+  const { db } = fixture(t);
+  assert.throws(() => db.providerRegistration.claim("a".repeat(1_000_000), {} as never, 100), /invalid_input/);
+  assert.throws(() => db.providerRegistration.consume("a".repeat(1_000_000), "x"), /invalid_input/);
+});
+
 test("transactionは単一clock値をbinding検査・期限判定・保存に使う", (t) => {
   const { file, db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
@@ -214,6 +245,14 @@ test("attempt発行時のretentionは期限切れrowをboundedに削除する", 
     "page:one", 1, "subscription:one", clock.value - 1, clock.value - 2);
   db.providerRegistration.issue(identity, 5_000);
   assert.equal((raw.prepare("SELECT count(*) n FROM verification_attempts").get() as { n: number }).n, 2);
+  assert.match(JSON.stringify(raw.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM verification_attempts WHERE expires_at<=? ORDER BY expires_at LIMIT 100").all(clock.value)),
+    /verification_attempt_expires_at_idx/);
+});
+
+test("registration retryもstrict config validationを迂回しない", async (t) => {
+  const { db, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
+  await service.register(config, Buffer.alloc(32, 1));
+  await assert.rejects(service.register({ ...config, state: "active" } as ConnectionConfig, Buffer.alloc(32, 1)), /invalid_input/);
 });
 
 async function raceClaims(file: string, now: number, token: string, binding: unknown): Promise<Array<{ ok: boolean; code?: string }>> {

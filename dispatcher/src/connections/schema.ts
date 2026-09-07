@@ -20,6 +20,7 @@ export function migrateConnections(db: Database.Database): void {
             OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
         );
         CREATE INDEX IF NOT EXISTS verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
+        CREATE INDEX IF NOT EXISTS verification_attempt_expires_at_idx ON verification_attempts(expires_at);
       `);
       return;
     }
@@ -77,6 +78,7 @@ export function migrateConnections(db: Database.Database): void {
           OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
       );
       CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
+      CREATE INDEX verification_attempt_expires_at_idx ON verification_attempts(expires_at);
       INSERT INTO connection_schema VALUES(1,1);
     `);
   }).immediate();

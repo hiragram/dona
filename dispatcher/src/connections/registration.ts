@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { ConnectionError, identifier, systemClock, type Clock, type ConnectionConfig, type DeliveryBinding } from "./domain.js";
 
 const digest = (token: string): string => createHash("sha256").update(token, "utf8").digest("hex");
+const validToken = (token: unknown): token is string => typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token);
 const sameBinding = (left: VerificationBinding, right: VerificationBinding): boolean =>
   left.connectionId === right.connectionId && left.provider === right.provider && left.account === right.account &&
   left.revision === right.revision && left.credentialRevision === right.credentialRevision &&
@@ -60,7 +61,11 @@ export class ProviderRegistrationRegistry {
   }
 
   resolve(input: Readonly<{ provider: string; providerId: string; connectionId?: string; account?: string; resource?: string }>): VerificationBinding {
-    return this.binding(input, true);
+    return this.db.transaction(() => {
+      const now = this.clock.now(), binding = this.binding(input, true, now);
+      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.connectionId);
+      return binding;
+    }).immediate();
   }
 
   issue(input: Readonly<{ provider: string; providerId: string; connectionId: string; account: string; resource: string }>, ttlMs: number): string {
@@ -70,7 +75,9 @@ export class ProviderRegistrationRegistry {
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.connectionId);
       // 1回のmaintenanceが長時間lockを保持しないよう削除数をboundedにする。
       this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
-        WHERE expires_at<=? OR state='consumed' ORDER BY expires_at LIMIT 100)`).run(now);
+        WHERE state='consumed' ORDER BY expires_at LIMIT 100)`).run();
+      this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
+        WHERE expires_at<=? ORDER BY expires_at LIMIT 100)`).run(now);
       const token = randomBytes(32).toString("base64url");
       this.db.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,
         resource,generation,provider_id,expires_at,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`)
@@ -81,12 +88,16 @@ export class ProviderRegistrationRegistry {
   }
 
   claim(token: string, expected: VerificationBinding, leaseMs: number): VerificationClaim {
-    if (typeof token !== "string" || token.length < 40 || !Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000)
+    if (!validToken(token) || !Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000)
       throw new ConnectionError("invalid_input");
-    return this.db.transaction(() => {
+    const result = this.db.transaction((): VerificationClaim | undefined => {
       const now = this.clock.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
-      if (!row || row.expires_at <= now || row.state === "consumed") throw new ConnectionError("not_authorized");
+      if (!row || row.state === "consumed") throw new ConnectionError("not_authorized");
+      if (row.expires_at <= now) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
+        return undefined;
+      }
       const actual: VerificationBinding = { connectionId: row.connection_id, provider: row.provider, account: row.account,
         revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource,
         generation: row.generation, providerId: row.provider_id };
@@ -104,14 +115,22 @@ export class ProviderRegistrationRegistry {
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.connectionId);
       return { claimId, binding: actual, claimUntil };
     }).immediate();
+    if (!result) throw new ConnectionError("not_authorized");
+    return result;
   }
 
   consume(token: string, claimId: string): VerificationBinding {
-    return this.db.transaction(() => {
+    if (!validToken(token) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(claimId))
+      throw new ConnectionError("invalid_input");
+    const result = this.db.transaction((): VerificationBinding | undefined => {
       const now = this.clock.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
-      if (!row || row.state !== "claimed" || row.claim_id !== claimId || row.claim_until! <= now || row.expires_at <= now)
+      if (!row || row.state !== "claimed" || row.claim_id !== claimId)
         throw new ConnectionError("not_authorized");
+      if (row.claim_until! <= now || row.expires_at <= now) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
+        return undefined;
+      }
       const actual: VerificationBinding = { connectionId: row.connection_id, provider: row.provider, account: row.account,
         revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource,
         generation: row.generation, providerId: row.provider_id };
@@ -124,5 +143,7 @@ export class ProviderRegistrationRegistry {
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.connectionId);
       return actual;
     }).immediate();
+    if (!result) throw new ConnectionError("not_authorized");
+    return result;
   }
 }

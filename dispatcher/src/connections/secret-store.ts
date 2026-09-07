@@ -87,7 +87,8 @@ export class PrivateFileSecretStore {
     const handle = await fs.open(this.file(reference, revision), constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stats = await handle.stat();
-      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0)
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0 ||
+        stats.size < 16 || stats.size > 65_536)
         throw new ConnectionError("not_authorized");
       return await handle.readFile();
     } finally { await handle.close(); }
