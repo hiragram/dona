@@ -87,7 +87,9 @@ export class PrivateFileSecretStore {
       await handle.close(); handle = undefined;
       // link(2) は既存targetを置換せず、同一filesystem上でpublishを原子的に確定する。
       await fs.link(temporary, target); published = true;
-      await fs.unlink(temporary);
+      await fs.unlink(temporary).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      });
       const pending = await fs.open(pendingDirectory, constants.O_RDONLY);
       try { await pending.sync(); } finally { await pending.close(); }
       const directory = await fs.open(this.root, constants.O_RDONLY);
@@ -151,7 +153,14 @@ export class PrivateFileSecretStore {
       if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0 ||
         stats.size < 16 || stats.size > 65_536)
         throw new ConnectionError("not_authorized");
-      return await handle.readFile();
+      const bounded = Buffer.allocUnsafe(65_537); let offset = 0;
+      while (offset < bounded.length) {
+        const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset < 16 || offset > 65_536) { bounded.fill(0); throw new ConnectionError("not_authorized"); }
+      const result = Buffer.from(bounded.subarray(0, offset)); bounded.fill(0); return result;
     } finally { await handle.close(); }
   }
 

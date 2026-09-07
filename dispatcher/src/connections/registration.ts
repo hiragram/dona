@@ -135,7 +135,11 @@ export class ProviderRegistrationRegistry {
     const result = this.db.transaction((): { claim?: VerificationClaim; error?: unknown } => {
       const now = this.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
-      if (!row || row.state === "consumed") throw new ConnectionError("not_authorized");
+      if (!row) throw new ConnectionError("not_authorized");
+      if (row.state === "consumed") {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
+        return { error: new ConnectionError("not_authorized") };
+      }
       if (row.expires_at <= now) {
         this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
         return { error: new ConnectionError("not_authorized") };

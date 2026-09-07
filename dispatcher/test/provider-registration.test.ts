@@ -277,6 +277,19 @@ test("一度期限切れを観測したattemptはclock rewindでも復活しな�
   assert.throws(() => db.providerRegistration.claim(token, binding, 100), /clock_skew/);
 });
 
+test("consumed replayの観測時刻をcommitし別tokenの復活を防ぐ", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,
+    account: binding.delivery.account, resource: binding.delivery.resource };
+  const consumed = db.providerRegistration.issue(identity, 5_000), pending = db.providerRegistration.issue(identity, 1_000);
+  const claim = db.providerRegistration.claim(consumed, binding, 1_000);
+  db.providerRegistration.consume(consumed, claim.claimId);
+  clock.value += 1_000;
+  assert.throws(() => db.providerRegistration.claim(consumed, binding, 100), /not_authorized/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.claim(pending, binding, 100), /clock_skew/);
+});
+
 test("issueとclaimのbinding失敗時刻もcommitしclock rewindを拒否する", (t) => {
   const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,
