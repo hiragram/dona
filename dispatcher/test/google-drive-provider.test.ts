@@ -36,6 +36,18 @@ test("同じdrain内のfolder加入後の離脱をtombstone化する", async (t)
   assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
 });
 
+test("page continuationとmembershipを同時commitし再起動後の離脱を保持する", async (t) => {
+  const db=fixture(t);
+  const first={list:async()=>({changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving",parents:["folder-1"]}}],nextPageToken:"page-2"})};
+  await assert.rejects(drainDriveChanges(db,binding,first,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()},
+    {kind:"user"},{pages:1,events:10,bytes:10000,timeoutMs:1000}),/incomplete_batch/);
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),["moving"]);
+  const second={list:async()=>({changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"moving",parents:["outside"]}}],newStartPageToken:"next"})};
+  await drainDriveChanges(db,binding,second,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()});
+  assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
+});
+
 test("tombstone後のfolder外changeで静的prior membershipを再適用しない", async (t) => {
   const db=fixture(t); const client={list:async()=>({changes:[
     {fileId:"leaving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"leaving",parents:["outside"]}},
@@ -58,6 +70,21 @@ test("shared drive routing IDと全drive allowlistを分離して個別fileだ�
   ],newStartPageToken:"next"})};
   await drainDriveChanges(db,binding,client,{fileIds:new Set(["allowed"]),folderIds:new Set(),driveIds:new Set()}, {kind:"drive",driveId:"drive-1"});
   assert.equal(db.list().length,1);
+});
+
+test("user feedの既存memberがshared driveへ移動したchangeをtombstone化する",async(t)=>{
+  const db=fixture(t); const client={list:async()=>({changes:[{fileId:"moving",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving"}}],newStartPageToken:"next"})};
+  await drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set(),priorFileIds:new Set(["moving"])});
+  assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
+});
+
+test("pages上限を事前検証しallowlisted drive removalはreconciliationへ隔離する",async(t)=>{
+  const db=fixture(t);let calls=0;const client={list:async()=>{calls++;return {changes:[],newStartPageToken:"next"};}};
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}, {kind:"user"},{pages:1.5,events:1,bytes:1,timeoutMs:1}),/invalid_input/);
+  assert.equal(calls,0);
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[{changeType:"drive",driveId:"drive-1",removed:true}],newStartPageToken:"next"})},
+    {fileIds:new Set(),folderIds:new Set(),driveIds:new Set(["drive-1"])},{kind:"drive",driveId:"drive-1"}),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
 });
 
 function fixture(t: { after(fn: () => void): void }) {

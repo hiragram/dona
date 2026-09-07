@@ -4,6 +4,10 @@ import type Database from "better-sqlite3";
 export function migrateConnections(db: Database.Database): void {
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS connection_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)`);
+    db.exec(`CREATE TABLE IF NOT EXISTS connection_resource_memberships (
+      connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, member TEXT NOT NULL,
+      PRIMARY KEY(connection_id,resource,member)
+    )`);
     const row = db.prepare("SELECT version FROM connection_schema WHERE singleton=1").get() as { version: number } | undefined;
     if (row && row.version !== 1) throw new Error("Unsupported connection schema");
     if (row) return;

@@ -19,6 +19,7 @@ export interface Cursor { revision: number; version: number; checkpoint: string 
 export interface CursorBatch {
   binding: DeliveryBinding; expected: Cursor; checkpoint: string; complete: boolean;
   events: readonly { providerEventId: string; envelope: EventEnvelope }[];
+  membership?: readonly string[];
 }
 export class ConnectionRegistry {
   constructor(private readonly db: Database.Database, readonly clock: Clock = systemClock) {}
@@ -331,6 +332,10 @@ export class ConnectionRegistry {
     return this.db.prepare("SELECT revision,version,checkpoint FROM connection_cursors WHERE connection_id=? AND resource=?").get(id, resource) as Cursor | undefined ??
       { revision: c.revision, version: 0, checkpoint: null };
   }
+  membership(id: string, resource: string): string[] {
+    return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? ORDER BY member")
+      .all(id,resource) as {member:string}[]).map(({member})=>member);
+  }
   assertPolling(binding: DeliveryBinding): void {
     this.db.transaction(() => {
       if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
@@ -357,6 +362,8 @@ export class ConnectionRegistry {
   }
   commitBatch(batch: CursorBatch, enqueue: (envelope: EventEnvelope) => EnqueueResult): EnqueueResult[] {
     if (!batch.complete || typeof batch.checkpoint !== "string" || batch.checkpoint.length > 16_384) throw new ConnectionError("incomplete_batch");
+    if (batch.membership !== undefined && (batch.membership.length > 10_000 || new Set(batch.membership).size !== batch.membership.length ||
+      batch.membership.some((member)=>!identifier.safeParse(member).success))) throw new ConnectionError("invalid_input");
     return this.db.transaction(() => {
       const b = batch.binding; const c = this.current(b.connectionId, b.revision, b.resource);
       if (!c.capability.cursor) throw new ConnectionError("capability_mismatch");
@@ -376,6 +383,11 @@ export class ConnectionRegistry {
       this.db.prepare(`INSERT INTO connection_cursors VALUES(?,?,?,?,?) ON CONFLICT(connection_id,resource)
         DO UPDATE SET revision=excluded.revision,version=excluded.version,checkpoint=excluded.checkpoint`)
         .run(c.id, b.resource, c.revision, cursor.version + 1, batch.checkpoint);
+      if (batch.membership !== undefined) {
+        this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=?").run(c.id,b.resource);
+        const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?)");
+        for(const member of batch.membership) insert.run(c.id,b.resource,member);
+      }
       this.audit(c, "checkpoint_committed", now); return results;
     }).immediate();
   }

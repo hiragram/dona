@@ -76,6 +76,8 @@ const driveFileChangeSchema = z.object({
 
 const driveOtherChangeSchema = z.object({
   changeType: z.string().min(1).max(64).refine((value) => value !== "file"),
+  driveId: z.string().min(1).max(256).optional(),
+  removed: z.boolean().optional(),
 }).passthrough();
 
 const driveChangeSchema = z.union([driveFileChangeSchema, driveOtherChangeSchema]);
@@ -157,9 +159,11 @@ export async function drainDriveChanges(
   limits?: { pages: number; events: number; timeoutMs: number; bytes?: number },
 ): Promise<void> {
   const bounded = limits ?? { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 };
+  if (![bounded.pages,bounded.events,bounded.timeoutMs,bounded.bytes ?? 16_777_216].every((value)=>Number.isSafeInteger(value)&&value>0))
+    throw new ConnectionError("invalid_input");
   const deadline = performance.now() + bounded.timeoutMs;
   let totalEvents = 0, totalBytes = 0;
-  const members = new Set(allowlist.priorFileIds ?? []);
+  const members = new Set([...database.connections.membership(binding.connectionId,binding.resource),...(allowlist.priorFileIds ?? [])]);
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
     if (remaining <= 0) throw new ConnectionError("incomplete_batch");
@@ -186,8 +190,10 @@ export async function drainDriveChanges(
     }
     const parsed = drivePageSchema.safeParse(raw);
     if (!parsed.success) throw new ConnectionError("incomplete_batch");
+    if (parsed.data.changes.some((change)=>change.changeType==="drive"&&change.removed===true&&
+      change.driveId!==undefined&&allowlist.driveIds.has(change.driveId))) throw new ConnectionError("operation_pending");
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
-      .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined);
+      .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined || members.has(change.fileId));
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
     for (const change of fileChanges) {
       const currentlyAllowed = allowlist.fileIds.has(change.fileId) ||
@@ -204,11 +210,11 @@ export async function drainDriveChanges(
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
-      return { done: true, checkpoint: parsed.data.nextPageToken, events };
+      return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort() };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
     final = true;
-    return { done: true, checkpoint: parsed.data.newStartPageToken, events };
+    return { done: true, checkpoint: parsed.data.newStartPageToken, events, membership:[...members].sort() };
     }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining });
     if (final) return;
   }
