@@ -362,7 +362,7 @@ export class ConnectionRegistry {
   }
   commitBatch(batch: CursorBatch, enqueue: (envelope: EventEnvelope) => EnqueueResult): EnqueueResult[] {
     if (!batch.complete || typeof batch.checkpoint !== "string" || batch.checkpoint.length > 16_384) throw new ConnectionError("incomplete_batch");
-    if (batch.membership !== undefined && (batch.membership.length > 10_000 || new Set(batch.membership).size !== batch.membership.length ||
+    if (batch.membership !== undefined && (new Set(batch.membership).size !== batch.membership.length ||
       batch.membership.some((member)=>!identifier.safeParse(member).success))) throw new ConnectionError("invalid_input");
     return this.db.transaction(() => {
       const b = batch.binding; const c = this.current(b.connectionId, b.revision, b.resource);

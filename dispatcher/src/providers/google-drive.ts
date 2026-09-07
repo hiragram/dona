@@ -130,8 +130,12 @@ function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): strin
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
+function resourceChangeId(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>): string {
+  return createHash("sha256").update(`${binding.resource}\0${canonicalChangeId(change)}`).digest("hex");
+}
+
 function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>, tombstone: boolean): EventEnvelope {
-  const providerEventId = canonicalChangeId(change);
+  const providerEventId = resourceChangeId(binding, change);
   return {
     schema_version: 1,
     source: driveSource,
@@ -164,6 +168,7 @@ export async function drainDriveChanges(
   const deadline = performance.now() + bounded.timeoutMs;
   let totalEvents = 0, totalBytes = 0;
   const members = new Set([...database.connections.membership(binding.connectionId,binding.resource),...(allowlist.priorFileIds ?? [])]);
+  const seenPageTokens = new Set<string>();
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
     if (remaining <= 0) throw new ConnectionError("incomplete_batch");
@@ -174,6 +179,8 @@ export async function drainDriveChanges(
     await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
     if (pageToken === null) throw new ConnectionError("cursor_conflict");
+    if (seenPageTokens.has(pageToken)) throw new ConnectionError("incomplete_batch");
+    seenPageTokens.add(pageToken);
     let raw: unknown;
     try {
       raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true,
@@ -191,24 +198,29 @@ export async function drainDriveChanges(
     const parsed = drivePageSchema.safeParse(raw);
     if (!parsed.success) throw new ConnectionError("incomplete_batch");
     if (parsed.data.changes.some((change)=>change.changeType==="drive"&&change.removed===true&&
-      change.driveId!==undefined&&allowlist.driveIds.has(change.driveId))) throw new ConnectionError("operation_pending");
+      change.driveId!==undefined&&(allowlist.driveIds.has(change.driveId)||(feed.kind==="drive"&&feed.driveId===change.driveId))))
+      throw new ConnectionError("operation_pending");
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
       .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined || members.has(change.fileId));
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
     for (const change of fileChanges) {
-      const currentlyAllowed = allowlist.fileIds.has(change.fileId) ||
+      const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && members.has(change.fileId);
+      const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
+      const currentlyAllowed = !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
-        (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
+        folderAllowed);
       const tombstone = !currentlyAllowed && members.has(change.fileId);
       if (!currentlyAllowed && !tombstone) continue;
-      events.push({ providerEventId: canonicalChangeId(change), envelope: envelope(binding, change, tombstone) });
-      if (currentlyAllowed && !change.removed) members.add(change.fileId); else members.delete(change.fileId);
+      events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
+      // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
+      if (folderAllowed && !change.removed) members.add(change.fileId); else members.delete(change.fileId);
     }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
     if (totalEvents > bounded.events || totalBytes > (bounded.bytes ?? 16_777_216)) throw new ConnectionError("incomplete_batch");
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
+      if (seenPageTokens.has(parsed.data.nextPageToken)) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
       return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort() };
     }

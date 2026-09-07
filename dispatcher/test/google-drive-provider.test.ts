@@ -78,6 +78,13 @@ test("user feedの既存memberがshared driveへ移動したchangeをtombstone�
   assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
 });
 
+test("明示file allowlistでもuser feedからshared driveへの離脱を優先してtombstone化する",async(t)=>{
+  const db=fixture(t); const client={list:async()=>({changes:[{fileId:"moving",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving"}}],newStartPageToken:"next"})};
+  await drainDriveChanges(db,binding,client,{fileIds:new Set(["moving"]),folderIds:new Set(),driveIds:new Set(),priorFileIds:new Set(["moving"])});
+  assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
+});
+
 test("pages上限を事前検証しallowlisted drive removalはreconciliationへ隔離する",async(t)=>{
   const db=fixture(t);let calls=0;const client={list:async()=>{calls++;return {changes:[],newStartPageToken:"next"};}};
   await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}, {kind:"user"},{pages:1.5,events:1,bytes:1,timeoutMs:1}),/invalid_input/);
@@ -85,6 +92,29 @@ test("pages上限を事前検証しallowlisted drive removalはreconciliationへ
   await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[{changeType:"drive",driveId:"drive-1",removed:true}],newStartPageToken:"next"})},
     {fileIds:new Set(),folderIds:new Set(),driveIds:new Set(["drive-1"])},{kind:"drive",driveId:"drive-1"}),/operation_pending/);
   assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
+});
+
+test("個別fileだけを許可したshared driveでもdrive削除をreconciliationへ隔離する",async(t)=>{
+  const db=fixture(t);
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[{changeType:"drive",driveId:"drive-1",removed:true}],newStartPageToken:"next"})},
+    {fileIds:new Set(["allowed"]),folderIds:new Set(),driveIds:new Set()},{kind:"drive",driveId:"drive-1"}),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
+});
+
+test("全shared drive許可ではfolder離脱用membershipを蓄積しない",async(t)=>{
+  const db=fixture(t); await drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"one",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"one"}},
+    {fileId:"two",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"two"}},
+  ],newStartPageToken:"next"})},{fileIds:new Set(),folderIds:new Set(),driveIds:new Set(["drive-1"])},{kind:"drive",driveId:"drive-1"});
+  assert.equal(db.list().length,2);
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
+});
+
+test("drain全体の循環page tokenをcommit前に拒否する",async(t)=>{
+  const db=fixture(t); const client={list:async({pageToken}:{pageToken:string})=>
+    pageToken==="start-token"?{changes:[],nextPageToken:"page-2"}:{changes:[],nextPageToken:"start-token"}};
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),/incomplete_batch/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
 });
 
 function fixture(t: { after(fn: () => void): void }) {
