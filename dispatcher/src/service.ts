@@ -69,8 +69,13 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
       verificationSecretRef: pilot.verificationCredentialRef,
       secrets: { async get(_reference, event) {
         const connection = database.connections.get(pilot.connectionId);
-        const binding = database.providerRegistration.resolve({ provider: "notion", providerId: event.subscriptionId,
-          connectionId: pilot.connectionId, account: event.workspaceId, resource: event.resourceId });
+        let binding;
+        try { binding = database.providerRegistration.resolve({ provider: "notion", providerId: event.subscriptionId,
+          connectionId: pilot.connectionId, account: event.workspaceId, resource: event.resourceId }); }
+        catch (error) {
+          if (error instanceof ConnectionError && ["not_found", "not_authorized", "disabled", "revision_conflict"].includes(error.code)) return undefined;
+          throw error;
+        }
         return { secret: await secrets.read(verificationReference(binding), 1),
           credentialRevision: connection.credentialRevision };
       } },

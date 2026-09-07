@@ -69,6 +69,9 @@ describe("Notion ingress", () => {
     const signature = createHmac("sha256", "secret-verification-token").update(body).digest("hex");
     const event = await restarted.authenticate(request(body, signature));
     assert.equal(event.connection?.generation, 1);
+    const unknownBody = Buffer.from(JSON.stringify({ ...JSON.parse(body.toString()), subscription_id: "sub_unknown" }));
+    const unknownSignature = createHmac("sha256", "secret-verification-token").update(unknownBody).digest("hex");
+    await assert.rejects(restarted.authenticate(request(unknownBody, unknownSignature)), /authentication failed/i);
     database.connections.quarantine("notion_test", 1, "page_1", 1);
     await restarted.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
       requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
