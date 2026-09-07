@@ -75,7 +75,7 @@ function hasCredentialPattern(value: string): boolean {
   return /xox[a-z]-|xapp-|https?:\/\/hooks\.slack\.com\/services\/|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}/i.test(value);
 }
 function hasSensitiveContentPattern(value: string): boolean {
-  return /<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)["']?\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)/i.test(value);
+  return /-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|<!(?:channel|here|everyone)>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+>|(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)["']?\s*[:=]|https?:\/\/[^\s]*(?:token=|signature=|files\.slack\.com)/i.test(value);
 }
 function safeContent(value: string, limit: number): void {
   if (!value || [...value].length > limit || hasCredentialPattern(value) || hasSensitiveContentPattern(value)) throw new Error("content_requires_redaction");

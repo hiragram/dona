@@ -595,7 +595,7 @@ export class DispatcherDatabase {
       const reconciledAt=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
-        this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='needs_review'")
+        this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')")
           .run(outcome,reconciledAt,reconciledAt,row.job_id);
         this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
       }
@@ -1090,7 +1090,7 @@ export class DispatcherDatabase {
     const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
     const processing=actions.find(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing");
     const terminalStatus=["blocked","needs_review"].includes(completion.job_status)?"suspended":"active";
-    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus);
+    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&typeof value.error!=="string");
     return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
@@ -1135,11 +1135,15 @@ export class DispatcherDatabase {
       const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
         typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
         (action as Record<string,unknown>).ambiguous===true);
-      this.transition(eventId, ["waiting_agent"], ambiguous?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
-        completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":"agent_reported_failure",
+      const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+        typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+        typeof (action as Record<string,unknown>).message_ts==="string");
+      const needsReview=ambiguous||posted;
+      this.transition(eventId, ["waiting_agent"], needsReview?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
+        completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":posted?"incomplete_delivery_after_post":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
-      this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
-      this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
+      this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.setNotificationState(eventId,needsReview?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
   }
 
