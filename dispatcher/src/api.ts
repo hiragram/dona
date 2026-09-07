@@ -287,8 +287,19 @@ export class DispatcherApi {
       }
       const notificationAuthorization=/^\/v1\/job-notifications\/([^/]+)\/authorize$/.exec(url.pathname);
       if(request.method==="POST"&&notificationAuthorization) {
-        await this.readJson(request);
-        try { sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!))}); }
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try {
+          let decoded:Record<string,unknown>|undefined;
+          if(body.receipt!==undefined) {
+            const token=await readPrivateToken(this.config.updateInternalTokenPath),[payload,signature,...extra]=String(body.receipt).split(".");
+            if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+            const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+            if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+            decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+            if(decoded.event_id!==decodeURIComponent(notificationAuthorization[1]!)) throw new Error("schedule_access_receipt_mismatch");
+          }
+          sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??"")}:undefined)});
+        }
         catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
         return;
       }

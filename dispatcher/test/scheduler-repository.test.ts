@@ -249,12 +249,12 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   const notificationPath=path.join(path.dirname(filename),`${completionEventId}.json`); fs.writeFileSync(notificationPath,"notification result");
   dispatcher.beginDispatch(completionEventId,notificationPath,new Date(due)); dispatcher.markWaiting(completionEventId,new Date(due));
   assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due)).authorized,true);
-  assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due)).authorized,true);
+  assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n"}).authorized,true);
   assert.throws(()=>dispatcher.authorizeJobNotification(completionEventId,new Date(due)),/schedule_notification_not_authorized/);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
-    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
   ],completed_at:due},notificationPath);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
@@ -264,7 +264,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
-    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",ambiguous:true,reply_broadcast:false},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002",reply_broadcast:false},
   ],completed_at:due},notificationPath);

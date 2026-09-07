@@ -600,6 +600,7 @@ export class RealRuntime implements RuntimePort {
     })}`;
     const slackMcpEnvironment = `mcp_servers.dona_slack.env = ${tomlInlineTable({
       DOTENV_CONFIG_PATH: path.join(canonicalConfigRoot, "slack.env"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
     })}`;
     const deadline = Date.now() + this.policy.timeouts.agent_exit_ms;
     let result: CommandResult;

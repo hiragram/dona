@@ -18,8 +18,8 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
-  authorizeJobNotification(eventId:string):Promise<Record<string,unknown>> {
-    return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,{});
+  authorizeJobNotification(eventId:string,receipt?:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,receipt?{receipt}:{});
   }
   recordScheduleJobAccess(eventId:string,receipt:string):Promise<Record<string,unknown>> {
     return this.request("POST",`/v1/scheduled-jobs/${encodeURIComponent(eventId)}/access`,{receipt});

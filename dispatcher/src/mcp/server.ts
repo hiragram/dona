@@ -7,7 +7,7 @@ import type { Logger } from "../logger.js";
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
-  authorizeJobNotification?(eventId:string):Promise<Record<string,unknown>>;
+  authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
@@ -156,10 +156,10 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("authorize_job_notification", {
     title:"Authorize scheduled job notification",
     description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。",
-    inputSchema:{event_id:eventId},
+    inputSchema:{event_id:eventId,access_receipt:z.string().min(32).max(2_000).optional()},
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
-  },async({event_id})=>{
-    try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id)); }
+  },async({event_id,access_receipt})=>{
+    try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id,access_receipt)); }
     catch(error){return failure(error,logger,"authorize_job_notification");}
   });
 
