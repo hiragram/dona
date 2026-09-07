@@ -141,7 +141,10 @@ export class ProviderRegistrationRegistry {
         return { error };
       }
       if (!sameBinding(current, actual)) throw new ConnectionError("not_authorized");
-      if (row.state === "claimed" && row.claim_until! > now) throw new ConnectionError("operation_pending");
+      if (row.state === "claimed" && row.claim_until! > now) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.connectionId);
+        return { error: new ConnectionError("operation_pending") };
+      }
       const claimId = randomUUID(), claimUntil = Math.min(row.expires_at, now + leaseMs);
       const changed = this.db.prepare(`UPDATE verification_attempts SET state='claimed',claim_id=?,claim_until=?
         WHERE digest=? AND state!='consumed' AND expires_at>? AND (state='pending' OR claim_until<=?)`)

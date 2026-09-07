@@ -97,7 +97,7 @@ test("link後crashで残った同一inodeのtemporary fileをreconcileが回収�
   const { db, secrets, store } = fixture(t), secret = Buffer.alloc(32, 4);
   await store.write("cred_crash", 1, secret);
   const target = path.join(secrets, "cred_crash.1.secret");
-  const temporary = path.join(secrets, ".pending", ".cred_crash.1.0123456789abcdef01234567.tmp");
+  const temporary = path.join(secrets, ".pending", "cred_crash.1", ".0123456789abcdef01234567.tmp");
   fs.linkSync(target, temporary);
   assert.equal(fs.statSync(target).nlink, 2);
   const service = new ProviderRegistrationService(db.connections, store);
@@ -119,11 +119,12 @@ test("secret readは保存fileのsizeを読込前に拒否する", async (t) => 
 test("publish前crashの古いtemporary secretだけをboundedに回収する", async (t) => {
   const { secrets, store } = fixture(t);
   await store.write("cred_seed", 1, Buffer.alloc(32, 9));
-  const stale = path.join(secrets, ".pending", ".cred_stale.1.0123456789abcdef01234567.tmp");
+  fs.mkdirSync(path.join(secrets, ".pending", "cred_stale.1"), { mode: 0o700 });
+  const stale = path.join(secrets, ".pending", "cred_stale.1", ".0123456789abcdef01234567.tmp");
   fs.writeFileSync(stale, Buffer.alloc(32, 1), { mode: 0o600 });
   const old = new Date(Date.now() - 10 * 60_000); fs.utimesSync(stale, old, old);
   await store.write("cred_stale", 1, Buffer.alloc(32, 2));
-  assert.deepEqual(fs.readdirSync(path.join(secrets, ".pending")), []);
+  assert.deepEqual(fs.readdirSync(path.join(secrets, ".pending", "cred_stale.1")), []);
 });
 
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
@@ -301,7 +302,25 @@ test("commit済みrotationの再試行はsecret一致を照合して受理する
   const rotated = { ...config, credentialRevision: 2 };
   assert.equal((await service.rotate("pilot", 1, rotated, Buffer.alloc(32, 2))).revision, 2);
   assert.equal((await service.rotate("pilot", 1, rotated, Buffer.alloc(32, 2))).revision, 2);
-  await assert.rejects(service.rotate("pilot", 1, rotated, Buffer.alloc(32, 3)), /revision_conflict/);
+  await assert.rejects(service.rotate("pilot", 1, rotated, Buffer.alloc(32, 3)), /credential_unavailable/);
+});
+
+test("採用済みrevisionの欠損secretはretryで再作成しない", async (t) => {
+  const { db, secrets, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
+  await service.register(config, Buffer.alloc(32, 1));
+  fs.unlinkSync(path.join(secrets, "cred_pilot.1.secret"));
+  await assert.rejects(service.register(config, Buffer.alloc(32, 2)), /credential_unavailable/);
+  assert.equal(fs.existsSync(path.join(secrets, "cred_pilot.1.secret")), false);
+});
+
+test("operation_pending観測時刻をcommitしclock rewindを拒否する", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
+    connectionId: binding.connectionId, account: binding.account, resource: binding.resource }, 5_000);
+  db.providerRegistration.claim(token, binding, 1_000); clock.value += 100;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /operation_pending/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /clock_skew/);
 });
 
 test("attempt発行時のretentionは期限切れrowをboundedに削除する", (t) => {

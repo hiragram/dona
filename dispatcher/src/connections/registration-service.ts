@@ -16,6 +16,11 @@ export class ProviderRegistrationService {
     }
   }
 
+  private async reconcileAdopted(config: ConnectionConfig, secret: Uint8Array): Promise<void> {
+    const accepted = await this.secrets.reconcile(config.credentialRef, config.credentialRevision, secret).catch(() => false);
+    if (!accepted) throw new ConnectionError("credential_unavailable");
+  }
+
   private accepted(id: string, config: ConnectionConfig, revision: number): Connection | undefined {
     try {
       const current = this.connections.get(id);
@@ -26,6 +31,11 @@ export class ProviderRegistrationService {
 
   async register(config: ConnectionConfig, secret: Uint8Array): Promise<Connection> {
     const parsed = parseConfig(config);
+    const alreadyAccepted = this.accepted(parsed.id, parsed, 1);
+    if (alreadyAccepted) {
+      await this.reconcileAdopted(parsed, secret);
+      return alreadyAccepted;
+    }
     await this.writeReconciled(parsed, secret);
     try { return this.connections.register(parsed); }
     catch (error) {
@@ -41,7 +51,7 @@ export class ProviderRegistrationService {
     const current = this.connections.get(id);
     const alreadyAccepted = this.accepted(id, parsed, expectedRevision + 1);
     if (alreadyAccepted) {
-      await this.writeReconciled(parsed, secret);
+      await this.reconcileAdopted(parsed, secret);
       return alreadyAccepted;
     }
     if (parsed.credentialRevision <= current.credentialRevision) throw new ConnectionError("revision_conflict");
