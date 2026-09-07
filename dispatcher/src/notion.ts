@@ -25,7 +25,7 @@ const verificationSchema = z.object({ verification_token: z.string().min(16).max
 const verificationAttemptSchema = z.string().min(16).max(255).regex(/^[A-Za-z0-9_-]+$/);
 
 export interface NotionSecretStore {
-  get(reference: string): Promise<Buffer | undefined>;
+  get(reference: string): Promise<Buffer | { secret: Buffer; credentialRevision: number } | undefined>;
 }
 export interface NotionVerificationClaim {
   binding: DeliveryBinding;
@@ -39,7 +39,7 @@ export interface NotionVerificationStore {
 }
 export interface NotionBindingResolver {
   resolve(input: Readonly<{ connectionId: string; subscriptionId: string; integrationId: string;
-    workspaceId: string; resourceId: string; eventType: string }>): Promise<DeliveryBinding | undefined>;
+    workspaceId: string; resourceId: string; eventType: string; credentialRevision?: number }>): Promise<DeliveryBinding | undefined>;
 }
 export interface NotionRegistrationOptions {
   connectionId: string;
@@ -94,19 +94,22 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       }
       const parsed = eventSchema.safeParse(candidate);
       if (!parsed.success) throw new ExternalIngressAuthenticationError();
-      let secret: Buffer | undefined;
-      try { secret = await options.secrets.get(options.verificationSecretRef); }
+      let resolvedSecret: Awaited<ReturnType<NotionSecretStore["get"]>>;
+      try { resolvedSecret = await options.secrets.get(options.verificationSecretRef); }
       catch { throw new ExternalIngressUnavailableError(); }
+      const secret = Buffer.isBuffer(resolvedSecret) ? resolvedSecret : resolvedSecret?.secret;
+      const credentialRevision = Buffer.isBuffer(resolvedSecret) ? undefined : resolvedSecret?.credentialRevision;
       const supplied = signatureBytes(header(request, "x-notion-signature") ?? "");
       if (!secret || !supplied) throw new ExternalIngressAuthenticationError();
-      const expected = createHmac("sha256", secret).update(request.body).digest();
-      if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
-        throw new ExternalIngressAuthenticationError();
-      }
+      try {
+        const expected = createHmac("sha256", secret).update(request.body).digest();
+        if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new ExternalIngressAuthenticationError();
+      } finally { secret.fill(0); }
       let binding: DeliveryBinding | undefined;
       try { binding = await options.bindings.resolve({ connectionId: options.connectionId,
         subscriptionId: parsed.data.subscription_id, integrationId: parsed.data.integration_id,
-        workspaceId: parsed.data.workspace_id, resourceId: parsed.data.entity.id, eventType: parsed.data.type }); }
+        workspaceId: parsed.data.workspace_id, resourceId: parsed.data.entity.id, eventType: parsed.data.type,
+        ...(credentialRevision === undefined ? {} : { credentialRevision }) }); }
       catch { throw new ExternalIngressUnavailableError(); }
       if (!binding || binding.connectionId !== options.connectionId || binding.resource !== parsed.data.entity.id) {
         throw new ExternalIngressAuthenticationError();
@@ -121,7 +124,7 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
           payload: { verified: true }, replyTarget: null } satisfies NormalizedExternalEvent;
       }
       const parsed = eventSchema.parse(json(request.body));
-      return { providerEventId: parsed.id, type: `notion.${parsed.type}`, occurredAt: parsed.timestamp,
+      return { providerEventId: parsed.id, type: parsed.type, occurredAt: parsed.timestamp,
         subject: { connection_id: options.connectionId, workspace_id: parsed.workspace_id,
           subscription_id: parsed.subscription_id, integration_id: parsed.integration_id,
           entity_id: parsed.entity.id, entity_type: parsed.entity.type },

@@ -10,6 +10,8 @@ import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import { QueueClaimUnavailableError } from "./queue.js";
 import type { EventRow } from "./types.js";
 
+export interface EventStateFetcher { fetch(row: Readonly<EventRow>): Promise<unknown>; }
+
 class WakeSignal {
   private resolver: (() => void) | undefined;
 
@@ -53,6 +55,7 @@ export class DispatcherWorker {
     private readonly herdr: HerdrClient,
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
+    private readonly stateFetcher?: EventStateFetcher,
   ) {}
 
   isRunning(): boolean {
@@ -169,12 +172,24 @@ export class DispatcherWorker {
       }
     }
 
+    const metadata = this.database.queueDispatchMetadata(row.event_id);
+    let fetched = "";
+    if (metadata.requires_fetch && this.stateFetcher) {
+      try {
+        const result = await this.stateFetcher.fetch(row);
+        fetched = `\nprovider_fetch_result: ${JSON.stringify(result)}\n`;
+      } catch (error) {
+        const updated = this.database.recordPreDispatchFailure(row.event_id, "provider_fetch_failed",
+          error instanceof Error ? error.message : String(error), this.config.maxAttempts);
+        if (updated) this.logTransition(row, updated, started);
+        return;
+      }
+    }
     if (this.stopping || this.quiescing) return;
     const dispatching = this.tryClaim(row.event_id, resultPath);
     if (!dispatching) return;
-    const metadata = this.database.queueDispatchMetadata(row.event_id);
-    const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row)) +
-      (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(metadata)}\nこのsignalは処理時点のresourceをfetchする必要があります。deliveryの集約をfetch完了とみなさないでください。` : "");
+    const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row)) + fetched +
+      (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(metadata)}\nこのsignalは処理時点のresourceをfetch済みです。deliveryの集約をfetch完了とみなさず、provider_fetch_resultを評価してください。` : "");
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(

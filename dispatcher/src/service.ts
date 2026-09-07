@@ -5,7 +5,8 @@ import { HerdrProcessClient } from "./herdr.js";
 import { ExternalIngressRegistry, type ExternalEventSourceRegistration } from "./ingress.js";
 import { githubPilotRegistration } from "./providers/github.js";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { createNotionRegistration } from "./notion.js";
+import { ConnectionError } from "./connections/domain.js";
+import { createNotionRegistration, fetchLatestNotionState } from "./notion.js";
 import { PrivateFileSecretStore } from "./connections/secret-store.js";
 import { readPrivateBuffer } from "./private-token.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
@@ -53,7 +54,8 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
       verificationSecretRef: pilot.verificationCredentialRef,
       secrets: { async get() {
         const connection = database.connections.get(pilot.connectionId);
-        return secrets.read(pilot.verificationCredentialRef, connection.credentialRevision);
+        return { secret: await secrets.read(pilot.verificationCredentialRef, connection.credentialRevision),
+          credentialRevision: connection.credentialRevision };
       } },
       verification: { async claim(input) {
         const snapshot = database.providerRegistration.inspectAttempt(input.attemptId);
@@ -86,8 +88,11 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
       } },
       bindings: { async resolve(input) {
         if (input.integrationId !== pilot.integrationId) return undefined;
-        const resolved = database.providerRegistration.resolve({ provider: "notion", providerId: input.subscriptionId,
-          connectionId: pilot.connectionId, account: input.workspaceId, resource: input.resourceId });
+        let resolved;
+        try { resolved = database.providerRegistration.resolve({ provider: "notion", providerId: input.subscriptionId,
+          connectionId: pilot.connectionId, account: input.workspaceId, resource: input.resourceId }); }
+        catch (error) { if (error instanceof ConnectionError) return undefined; throw error; }
+        if (input.credentialRevision !== undefined && input.credentialRevision !== resolved.delivery.credentialRevision) return undefined;
         const connection = database.connections.get(pilot.connectionId);
         const allowed = connection.allowlist.find(candidate => candidate.resource === input.resourceId)?.events.includes(input.eventType);
         return allowed ? resolved.delivery : undefined;
@@ -113,7 +118,25 @@ export async function runService(
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger);
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger, config.notionPilot ? { async fetch(row) {
+    if (row.source !== "notion") return { outcome: "degraded" };
+    const subject = JSON.parse(row.subject_json) as Record<string, unknown>;
+    if (subject.connection_id !== config.notionPilot!.connectionId || typeof subject.entity_id !== "string" ||
+      !["page", "database", "data_source"].includes(String(subject.entity_type))) return { outcome: "degraded" };
+    const connection = database.connections.get(config.notionPilot!.connectionId);
+    const secretStore = new PrivateFileSecretStore(config.notionPilot!.secretStoreRoot);
+    const token = await secretStore.read(connection.credentialRef, connection.credentialRevision);
+    try {
+      const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
+      return fetchLatestNotionState({ async fetch(resourceId) {
+        const response = await fetch(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`, {
+          method: "GET", headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
+        const retry = response.headers.get("retry-after");
+        return { status: response.status, ...(retry === null ? {} : { retryAfter: Number(retry) }),
+          ...(response.ok ? { value: await response.json() as Record<string, unknown> } : {}) };
+      } }, subject.entity_id);
+    } finally { token.fill(0); }
+  } } : undefined);
   const jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),

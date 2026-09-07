@@ -22,7 +22,7 @@ function setup() {
   let secret: Buffer | undefined;
   let pending = true;
   const registration = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
-    secrets: { async get() { return secret; } },
+    secrets: { async get() { return secret && Buffer.from(secret); } },
     verification: { async claim(input) {
       if (input.attemptId !== verificationAttempt) return undefined;
       if (!pending && !secret?.equals(input.token)) return undefined;
@@ -108,6 +108,16 @@ describe("Notion ingress", () => {
       const signature = createHmac("sha256", "secret-verification-token").update(body).digest("hex");
       await assert.rejects(registration.authenticate(request(body, signature)), /dependency is unavailable/i);
     }
+  });
+  test("secret revisionをbindingへ固定し、使用後のbufferを消去する", async () => {
+    const secret = Buffer.from("secret-verification-token");
+    const registration = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
+      secrets: { async get() { return { secret, credentialRevision: 1 }; } }, verification: { async claim() { return undefined; } },
+      bindings: { async resolve(input) { return input.credentialRevision === 2 ? { connectionId: "notion_test", account: "ws_1", revision: 2,
+        credentialRevision: 2, resource: "page_1", generation: 2 } : undefined; } } });
+    const signature = createHmac("sha256", secret).update(body).digest("hex");
+    await assert.rejects(registration.authenticate(request(body, signature)));
+    assert.ok(secret.every(byte => byte === 0));
   });
   test("authenticates exact raw bytes and strictly normalizes an allowlisted event", async () => {
     const { registration } = setup();
