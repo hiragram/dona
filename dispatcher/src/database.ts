@@ -86,6 +86,14 @@ export class DispatcherDatabase {
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
+      if(["status","result_path","last_error_code","last_error_message","updated_at"].every(column=>eventColumns.has(column))) {
+        for(const row of this.db.prepare("SELECT event_id,result_path FROM events WHERE status='queued' AND last_error_code='manual_retry_cleanup_pending' AND result_path IS NOT NULL").all() as Array<{event_id:string;result_path:string}>) {
+          if(!row.result_path.endsWith(".retry-backup")) throw new Error("invalid_retry_backup_path");
+          fs.rmSync(row.result_path,{force:true});
+          this.db.prepare("UPDATE events SET result_path=NULL,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE event_id=? AND status='queued' AND last_error_code='manual_retry_cleanup_pending'")
+            .run(nowUtc(),row.event_id);
+        }
+      }
     } catch (error) {
       this.db.close();
       throw error;
@@ -652,7 +660,7 @@ export class DispatcherDatabase {
     const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
     if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
       throw new Error("scheduled_work_result_deadline_exceeded");
-    const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown"].includes(job.last_error_code??"")||
+    const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
       (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
     if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
       throw new Error("completed_at_precedes_prompt_dispatch");
@@ -1213,17 +1221,21 @@ export class DispatcherDatabase {
         this.db.prepare(`
           UPDATE events SET status = 'queued', attempt_count = 0, available_at = ?,
             dispatch_started_at = NULL, prompt_accepted_at = NULL, completed_at = NULL,
-            result_json = NULL, result_path = NULL, last_error_code = NULL,
+            result_json = NULL, result_path = ?, last_error_code = ?,
             last_error_message = NULL, schedule_access_checked_at = NULL,
             schedule_access_consumed_at = NULL, updated_at = ? WHERE event_id = ?
-        `).run(at.toISOString(), at.toISOString(), eventId);
+        `).run(at.toISOString(), resultBackupPath, resultBackupPath?"manual_retry_cleanup_pending":null, at.toISOString(), eventId);
         this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_preflight_authorized_at=NULL,notification_write_authorized_at=NULL WHERE notification_event_id=? AND (notification_state='failed' OR (notification_state='needs_review' AND notification_authorization_phase IN ('none','preflight')))").run(eventId);
       }).immediate();
     } catch(error) {
       if(row.result_path&&resultBackupPath&&fs.existsSync(resultBackupPath)&&!fs.existsSync(row.result_path)) fs.renameSync(resultBackupPath,row.result_path);
       throw error;
     }
-    if(resultBackupPath) fs.rmSync(resultBackupPath,{force:true});
+    if(resultBackupPath) {
+      fs.rmSync(resultBackupPath,{force:true});
+      this.db.prepare("UPDATE events SET result_path=NULL,last_error_code=NULL,updated_at=? WHERE event_id=? AND status='queued' AND last_error_code='manual_retry_cleanup_pending'")
+        .run(nowUtc(),eventId);
+    }
     return this.getRequired(eventId);
   }
 

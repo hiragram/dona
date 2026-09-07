@@ -98,6 +98,29 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("removes a committed manual retry backup when the database reopens", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    let database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-retry-cleanup")).row;
+    const resultPath = `${config.resultsDir}/${event.event_id}.json`;
+    const backupPath = `${resultPath}.retry-backup`;
+    database.beginDispatch(event.event_id, resultPath);
+    database.markNeedsReview(event.event_id, "prompt_timeout", "unknown acceptance");
+    await fs.mkdir(config.resultsDir,{recursive:true});
+    await fs.writeFile(backupPath,"old result");
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE events SET status='queued',result_path=?,last_error_code='manual_retry_cleanup_pending' WHERE event_id=?").run(backupPath,event.event_id);
+    raw.close();
+    database.close();
+
+    database = new DispatcherDatabase(config.databasePath);
+    await assert.rejects(fs.access(backupPath));
+    assert.equal(database.get(event.event_id)?.result_path,null);
+    assert.equal(database.get(event.event_id)?.last_error_code,null);
+    database.close();
+  });
+
   test("does not skip a head event while its retry backoff is active", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

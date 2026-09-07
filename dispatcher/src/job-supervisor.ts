@@ -250,8 +250,8 @@ export class JobSupervisor {
     const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
     if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
       (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
-      if(await this.tryComplete(job,false)) return true;
       this.database.recordInvalidResultAgentStopped(job.job_id);
+      if(await this.tryComplete(job,false)) return true;
     }
     return true;
   }

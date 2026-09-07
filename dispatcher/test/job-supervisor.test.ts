@@ -394,6 +394,22 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("accepts a valid Result after an unknown invalid Result stop is confirmed", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-recovered");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    database.recordInvalidResultAgentStopFailure(job.job_id,"cancel acceptance unknown");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return ok("idle");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(database.getJob(job.job_id)?.status,"completed");
+    database.close();
+  });
+
   test("routes a newly invalid Result directly to the agent stop fence", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
