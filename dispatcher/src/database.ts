@@ -1130,8 +1130,8 @@ export class DispatcherDatabase {
       if(value.tool==="dona_dispatcher.authorize_job_notification") return value.event_id===eventId&&value.authorized===true&&value.success!==false&&value.ok!==false&&!("error" in value);
       if(value.tool==="dona_slack.check_user_channel_access") return value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id;
       if(value.tool==="dona_slack.post_message") return value.mrkdwn===false&&value.parse==="none";
-      return value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.channel_id===target?.channel_id&&
-        (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&
+      return target?.kind==="thread"&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.channel_id===target.channel_id&&
+        value.thread_ts===target.thread_ts&&
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:completion.job_status==="failed"?["processing","active","suspended"]:["processing","active"]).includes(String(value.status));
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
@@ -1140,7 +1140,7 @@ export class DispatcherDatabase {
       const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatuses=["blocked","needs_review"].includes(completion.job_status)?["suspended"]:completion.job_status==="failed"?["active","suspended"]:["active"];
     const sessionSettled=actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing?.index??-1)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&terminalStatuses.includes(String(value.status))&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
-    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&(target?.kind!=="thread"||sessionSettled)&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {

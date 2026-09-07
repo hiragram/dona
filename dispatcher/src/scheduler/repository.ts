@@ -637,6 +637,7 @@ export class SchedulerRepository {
     if(changed===1) {
       this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);
       this.audit(schedule,this.get(run.schedule_id)!,"work_notification_not_sent_reconciled",{tenant_id:schedule.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},now,undefined,run);
+      this.completeIfDrained(run.schedule_id,now);
     }
   }
 

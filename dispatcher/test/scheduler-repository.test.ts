@@ -473,6 +473,42 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
 });
 
+test("threadを持たないwork通知はsession actionなしで配送を終端する", () => {
+  const {repo,dispatcher,raw,filename}=setup(),objective="DM通知";
+  const target={kind:"owner_dm" as const,workspace_id:"T_TEST",channel_id:"C_TEST",owner_id:"U_TEST"};
+  repo.create("notify_dm",{...input,action:"work.read_only",content:objective,target},due,actor,now);
+  const run=repo.materialize("notify_dm",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
+  dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
+  dispatcher.authorizeJobNotification(eventId,new Date(due));
+  dispatcher.authorizeJobNotification(eventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"dm"});
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",message_ts:"2.000001",mrkdwn:false,parse:"none"},
+  ],completed_at:due},resultPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+});
+
+test("not_sent reconciliationはdrained one-shotをcompletedへ進める", () => {
+  const {dispatcher,raw}=setup();
+  const repo=dispatcher.scheduler.withCodecs({recurrence:text=>text,policy:text=>text});
+  const once={...input,action:"work.read_only" as const,recurrence_json:`{"at":"${due}","kind":"once","version":1}\n`,timezone:null,tzdb_version:null};
+  repo.create("not_sent_once",once,due,actor,now);
+  const run=repo.materialize("not_sent_once",1,due,null,due,actor).run;
+  startWork(repo,dispatcher,raw,run,due);
+  repo.setRunState(run.run_id,"started","completed",actor,due,null,"結果",null,true);
+  repo.markWorkNotificationNeedsReview(run.run_id,due);
+  raw.prepare("UPDATE job_completion_results SET notification_state='none' WHERE json_extract(owner_json,'$.run_id')=?").run(run.run_id);
+  repo.reconcileWorkNotificationNotSent(run.run_id,due);
+  assert.equal(repo.get("not_sent_once")?.state,"completed");
+});
+
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   const {repo,dispatcher,raw,filename}=setup(); const objective="通知retry";
   repo.create("notify_retry_phase",{...input,action:"work.read_only",content:objective},due,actor,now);

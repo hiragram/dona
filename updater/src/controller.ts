@@ -30,6 +30,12 @@ function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseM
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
 }
 
+function policyCompatible(policy: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
+  const { rollback_safe: _policyRollback, ...approved } = policy;
+  const { rollback_safe: _targetRollback, ...candidate } = target;
+  return canonicalJson(approved) === canonicalJson(candidate);
+}
+
 function resultSucceeded(result: { exit_code: number | null; timed_out: boolean }): boolean {
   return result.exit_code === 0 && !result.timed_out;
 }
@@ -64,7 +70,7 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
+    if (!policyCompatible(this.policy.compatibility, git.target_compatibility)) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
