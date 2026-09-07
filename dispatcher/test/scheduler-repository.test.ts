@@ -402,6 +402,10 @@ test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   dispatcher.manualRetry(eventId,true,new Date(due));
   assert.deepEqual(raw.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?").get(eventId),
     {notification_state:"pending",notification_authorization_phase:"none"});
+  dispatcher.beginDispatch(eventId,resultPath,new Date("2026-09-05T00:01:01Z"));
+  dispatcher.authorizeJobNotification(eventId,new Date("2026-09-05T00:01:01Z"));
+  assert.throws(()=>dispatcher.authorizeJobNotification(eventId,new Date("2026-09-05T00:01:01Z"),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"old"}),/receipt_invalid/);
+  assert.equal(dispatcher.authorizeJobNotification(eventId,new Date("2026-09-05T00:01:01Z"),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:"2026-09-05T00:01:01Z",nonce:"new"}).authorized,true);
   raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(eventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
   assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);

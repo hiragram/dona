@@ -874,7 +874,7 @@ export class DispatcherDatabase {
     this.suppressUnauthorizedScheduledNotifications(at);
     return this.db.transaction(()=>{
       const timestamp=at.toISOString();
-      const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json,c.notification_authorization_phase FROM events e
+      const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json,c.notification_authorization_phase,c.notification_preflight_authorized_at FROM events e
         JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
@@ -883,15 +883,17 @@ export class DispatcherDatabase {
             (c.notification_state='needs_review' AND c.notification_authorization_phase='preflight')) AND json_extract(c.owner_json,'$.kind')='schedule'
           AND julianday(c.materialized_at,'+900 seconds')>=julianday(?) AND s.state IN ('active','needs_review')
           AND s.revision=json_extract(c.owner_json,'$.revision') AND julianday(r.expires_at)>julianday(?)`).get(eventId,timestamp,timestamp) as
-        {status:string;owner_json:string;destination_json:string;notification_authorization_phase:string}|undefined;
+        {status:string;owner_json:string;destination_json:string;notification_authorization_phase:string;notification_preflight_authorized_at:string|null}|undefined;
       if(!row) throw new Error("schedule_notification_not_authorized");
       const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number},destination=JSON.parse(row.destination_json) as {kind?:string;target?:{workspace_id?:string;channel_id?:string}};
       if(row.notification_authorization_phase==="none"&&receipt) throw new Error("schedule_notification_receipt_unexpected");
-      if(row.notification_authorization_phase==="preflight"&&(!receipt||destination.kind!=="slack"||receipt.workspace_id!==destination.target?.workspace_id||receipt.channel_id!==destination.target.channel_id||receipt.user_id!==owner.owner_id||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000)) throw new Error("schedule_notification_access_receipt_invalid");
+      if(row.notification_authorization_phase==="preflight"&&(!receipt||destination.kind!=="slack"||receipt.workspace_id!==destination.target?.workspace_id||receipt.channel_id!==destination.target.channel_id||receipt.user_id!==owner.owner_id||row.notification_preflight_authorized_at===null||Date.parse(receipt.issued_at)<Date.parse(row.notification_preflight_authorized_at)||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000)) throw new Error("schedule_notification_access_receipt_invalid");
+      if(row.notification_authorization_phase==="preflight"&&this.db.prepare("INSERT OR IGNORE INTO schedule_access_receipt_nonces(nonce,event_id,consumed_at) VALUES(?,?,?)").run(receipt!.nonce,eventId,timestamp).changes!==1)
+        throw new Error("schedule_notification_access_receipt_already_consumed");
       if(row.status==="dispatching") this.markWaiting(eventId,at);
       const nextPhase=row.notification_authorization_phase==="none"?"preflight":"write";
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase=?,notification_write_authorized_at=? WHERE notification_event_id=?")
-        .run(nextPhase,nextPhase==="write"?timestamp:null,eventId);
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase=?,notification_preflight_authorized_at=?,notification_write_authorized_at=? WHERE notification_event_id=?")
+        .run(nextPhase,nextPhase==="preflight"?timestamp:row.notification_preflight_authorized_at,nextPhase==="write"?timestamp:null,eventId);
       return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
         access_receipt_verified:nextPhase==="write",destination:JSON.parse(row.destination_json) as Record<string,unknown>};
     }).immediate();
@@ -1165,7 +1167,7 @@ export class DispatcherDatabase {
             last_error_message = NULL, schedule_access_checked_at = NULL,
             schedule_access_consumed_at = NULL, updated_at = ? WHERE event_id = ?
         `).run(at.toISOString(), at.toISOString(), eventId);
-        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_write_authorized_at=NULL WHERE notification_event_id=? AND (notification_state='failed' OR (notification_state='needs_review' AND notification_authorization_phase IN ('none','preflight')))").run(eventId);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none',notification_preflight_authorized_at=NULL,notification_write_authorized_at=NULL WHERE notification_event_id=? AND (notification_state='failed' OR (notification_state='needs_review' AND notification_authorization_phase IN ('none','preflight')))").run(eventId);
       }).immediate();
     } catch(error) {
       if(row.result_path&&resultBackupPath&&fs.existsSync(resultBackupPath)&&!fs.existsSync(row.result_path)) fs.renameSync(resultBackupPath,row.result_path);
