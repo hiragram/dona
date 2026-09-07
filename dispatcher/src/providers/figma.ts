@@ -7,6 +7,7 @@ import {
   type ExternalEventSourceRegistration,
   type RawIngressRequest,
 } from "../ingress.js";
+import { stableStringify } from "../validation.js";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,255}$/);
 const connectionIdentifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
@@ -47,8 +48,22 @@ function equalSecret(actual: string, expected: string): boolean {
   return timingSafeEqual(actualDigest, expectedDigest);
 }
 
-function rawFingerprint(body: Buffer): string {
-  return createHash("sha256").update("figma-raw-v1\0").update(body).digest("hex");
+function payloadFingerprint(value: z.infer<typeof payloadSchema>): string {
+  const { passcode: _passcode, ...authenticatedPayload } = value;
+  return createHash("sha256").update("figma-payload-v1\0").update(stableStringify(authenticatedPayload)).digest("hex");
+}
+
+const figmaEnvironmentKeys = ["FIGMA_CONNECTION_ID", "FIGMA_WEBHOOK_ID", "FIGMA_FILE_KEY", "FIGMA_ALLOWED_EVENTS", "FIGMA_WEBHOOK_PASSCODE"] as const;
+
+export function figmaIngressFromEnv(env: NodeJS.ProcessEnv): ExternalEventSourceRegistration | undefined {
+  const configured = figmaEnvironmentKeys.filter((key) => (env[key]?.trim().length ?? 0) > 0);
+  if (configured.length === 0) return undefined;
+  if (configured.length !== figmaEnvironmentKeys.length) throw new Error("Figma ingress configuration is incomplete");
+  return figmaIngress({
+    connectionId: env.FIGMA_CONNECTION_ID!, webhookId: env.FIGMA_WEBHOOK_ID!, fileKey: env.FIGMA_FILE_KEY!,
+    allowedEvents: new Set(env.FIGMA_ALLOWED_EVENTS!.split(",").map((value) => value.trim()).filter(Boolean)),
+    passcode: env.FIGMA_WEBHOOK_PASSCODE!,
+  });
 }
 
 export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceRegistration {
@@ -80,15 +95,15 @@ export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceReg
           throw new ExternalIngressValidationError();
         }
       }
-      const fingerprint = rawFingerprint(request.body);
+      const fingerprint = payloadFingerprint(value);
       return {
-        providerEventId: `raw-v1:${fingerprint}`,
+        providerEventId: `payload-v1:${fingerprint}`,
         type: value.event_type === "PING" ? "figma.ping" : `figma.${value.event_type.toLowerCase()}`,
         occurredAt: new Date(value.timestamp).toISOString(),
         subject: { webhook_id: value.webhook_id, ...(value.file_key ? { file_key: value.file_key } : {}) },
         payload: {
           fingerprint_version: 1,
-          raw_fingerprint: fingerprint,
+          payload_fingerprint: fingerprint,
           ...(value.file_name ? { file_name: value.file_name } : {}),
           ...(value.description ? { description: value.description } : {}),
           ...(value.triggered_by ? { actor: { id: value.triggered_by.id, handle: value.triggered_by.handle } } : {}),

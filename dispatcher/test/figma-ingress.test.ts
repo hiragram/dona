@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import { externalEventSource, ExternalIngressAuthenticationError, ExternalIngressProcessor, ExternalIngressRegistry } from "../src/ingress.js";
-import { figmaIngress } from "../src/providers/figma.js";
+import { figmaIngress, figmaIngressFromEnv } from "../src/providers/figma.js";
 
 const config = { connectionId: "figma-pilot", webhookId: "webhook-1", fileKey: "file-1", allowedEvents: new Set(["FILE_UPDATE"]), passcode: "top-secret" };
 const registration = figmaIngress(config);
@@ -22,7 +22,11 @@ describe("Figma Webhooks V2 ingress", () => {
     const normalized = registration.parseNormalized(await registration.normalize(request, verified));
     assert.equal(normalized.type, "figma.file_update");
     assert.equal(JSON.stringify(normalized).includes(config.passcode), false);
-    assert.match(normalized.providerEventId, /^raw-v1:[0-9a-f]{64}$/);
+    assert.match(normalized.providerEventId, /^payload-v1:[0-9a-f]{64}$/);
+    const rotated = raw(event({ passcode: "replacement-secret" }));
+    const rotatedRegistration = figmaIngress({ ...config, passcode: "replacement-secret" });
+    const rotatedEvent = rotatedRegistration.parseNormalized(await rotatedRegistration.normalize(rotated, await rotatedRegistration.authenticate(rotated)));
+    assert.equal(rotatedEvent.providerEventId, normalized.providerEventId, "passcode rotation must not change or expose the fingerprint");
   });
 
   test("rejects wrong passcode, unknown fields, resources, and events", async () => {
@@ -36,6 +40,13 @@ describe("Figma Webhooks V2 ingress", () => {
   test("fails startup for an invalid connection or unsupported event configuration", () => {
     assert.throws(() => figmaIngress({ ...config, connectionId: "figma:pilot" }));
     assert.throws(() => figmaIngress({ ...config, allowedEvents: new Set(["FILE_COMMENT"]) }));
+  });
+
+  test("rejects partial environment configuration instead of silently disabling ingress", () => {
+    assert.equal(figmaIngressFromEnv({}), undefined);
+    assert.throws(() => figmaIngressFromEnv({ FIGMA_WEBHOOK_ID: config.webhookId }));
+    assert.ok(figmaIngressFromEnv({ FIGMA_CONNECTION_ID: config.connectionId, FIGMA_WEBHOOK_ID: config.webhookId,
+      FIGMA_FILE_KEY: config.fileKey, FIGMA_ALLOWED_EVENTS: "FILE_UPDATE", FIGMA_WEBHOOK_PASSCODE: config.passcode }));
   });
 
   test("binds the verified owner to the configured file instead of payload data", async () => {
