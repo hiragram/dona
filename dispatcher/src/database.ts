@@ -597,7 +597,7 @@ export class DispatcherDatabase {
       const admittedJobs = this.db.prepare(`
         SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
       `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
-      if (this.schemaWrite === 2 && admittedJobs.length > 0) {
+      if (this.schemaWrite === 2 && (parsedRequest.job_key !== undefined || admittedJobs.length > 0)) {
         throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
       }
       if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {

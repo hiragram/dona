@@ -566,7 +566,7 @@ export class UpdateController {
         const controlPlane = await this.runtime.schemaMigrationCapability();
         this.assertLease(row);
         if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
-          this.needsReview(row, "stable_updater_schema_migration_capability_unverified");
+          await this.restoreQuiescedServices(row, "stable_updater_schema_migration_capability_unverified");
           return;
         }
         const migration = await this.runtime.migrateAppSchema(

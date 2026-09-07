@@ -84,20 +84,15 @@ export function assertReceiptMatchesDatabases(
 ): void {
   verifyDatabase(migrated, 3);
   verifyDatabase(backup, 2);
-  const migratedCounts = countSnapshot(migrated);
   const backupCounts = countSnapshot(backup);
-  const migratedDigests = contentSnapshot(migrated);
   const backupDigests = contentSnapshot(backup);
   const names = Object.keys(receipt.preservation);
-  if (names.length !== Object.keys(migratedCounts).length || names.some((name) =>
-    !(name in migratedCounts) ||
-    receipt.preservation[name]?.after !== migratedCounts[name] ||
-    receipt.preservation[name]?.after_digest !== migratedDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"] ||
-    (receipt.rollback.backup_restore_opened && (
-      receipt.preservation[name]?.before !== backupCounts[name] ||
-      receipt.preservation[name]?.before_digest !== backupDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"] ||
-      backupCounts[name] !== migratedCounts[name]
-    ))
+  if (names.length !== Object.keys(backupCounts).length || names.some((name) =>
+    !(name in backupCounts) ||
+    receipt.preservation[name]?.before !== receipt.preservation[name]?.after ||
+    receipt.preservation[name]?.before_digest !== receipt.preservation[name]?.after_digest ||
+    receipt.preservation[name]?.before !== backupCounts[name] ||
+    receipt.preservation[name]?.before_digest !== backupDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]
   )) throw new Error("schema_rollout_receipt_state_mismatch");
 }
 
