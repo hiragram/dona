@@ -74,7 +74,7 @@ describe("Notion ingress", () => {
     assert.equal(normalized.providerEventId, "evt_1");
     assert.deepEqual(normalized.payload, {});
     assert.deepEqual(registration.queueSignal?.(normalized, principal),
-      { resourceKey: "page_1", signalKey: "page_1", requiresFetch: true });
+      { resourceKey: "page_1", signalKey: "page_1", requiresFetch: true, latestState: true });
     await assert.rejects(registration.authenticate(request(Buffer.concat([body, Buffer.from(" ")]), signature)));
   });
   test("accepts documented metadata and keeps retries fingerprint-equivalent", async () => {

@@ -30,7 +30,7 @@ export type QueuePolicy = z.infer<typeof queuePolicySchema>;
 export interface QueueAdmissionContext {
   /** 認証後のregistrationだけが渡す。Envelopeの自己申告を使わない。 */
   connectionId: string;
-  coalesce?: { resourceKey: string; signalKey: string; requiresFetch: true };
+  coalesce?: { resourceKey: string; signalKey: string; requiresFetch: true; latestState?: true };
   /** 認証済みverification receiptを即時terminal化する内部経路だけが設定する。 */
   terminalVerification?: true;
 }

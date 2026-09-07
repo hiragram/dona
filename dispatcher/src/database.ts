@@ -300,6 +300,12 @@ export class DispatcherDatabase {
     const identity = queueIdentity(envelope, context);
     const fingerprint = this.queueFingerprint(envelope);
     const key = identity.queueClass === "external" ? coalesceKey(context) : null;
+    const queueFingerprint = key === null || context?.coalesce?.latestState !== true ? fingerprint : createHash("sha256").update(stableStringify({
+      schema_version: envelope.schema_version,
+      source: envelope.source,
+      connection: identity.connection,
+      signal: context!.coalesce,
+    })).digest("hex");
     const bytes = Buffer.byteLength(stableStringify(envelope));
     const sourcePolicy = Object.hasOwn(this.queuePolicy.sources, envelope.source) ? this.queuePolicy.sources[envelope.source]! : this.queuePolicy.defaults;
     const policy = this.queuePolicy.connections[JSON.stringify([envelope.source, identity.connection])] ?? sourcePolicy;
@@ -378,7 +384,7 @@ export class DispatcherDatabase {
       const coalescedCandidate = !restoring && policy.coalescing && key ? this.db.prepare(`SELECT e.*,q.delivery_count FROM events e JOIN queue_events q USING(event_id)
         WHERE q.lane=? AND q.coalesce_key=? AND q.fingerprint=? AND e.status='queued' AND e.attempt_count=0
         AND e.sequence=(SELECT max(tail.sequence) FROM queue_events tq JOIN events tail USING(event_id) WHERE tq.lane=q.lane)
-        ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,fingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
+        ORDER BY e.sequence DESC LIMIT 1`).get(identity.lane,key,queueFingerprint) as (EventRow & {delivery_count:number}) | undefined : undefined;
       const coalesced = coalescedCandidate && bindingMatches(coalescedCandidate.event_id) ? coalescedCandidate : undefined;
       if (coalesced && coalesced.delivery_count >= this.queuePolicy.maxDeliveries) reject("queue_deliveries");
       const usage = this.db.prepare(`SELECT l.class, count(*) depth, coalesce(sum(q.bytes),0) bytes FROM queue_events q
@@ -440,8 +446,9 @@ export class DispatcherDatabase {
         insertBinding(this.db, eventId, resolvedBinding);
       }
       if (restoring) this.db.prepare(`UPDATE queue_events SET lane=?,bytes=?,coalesce_key=?,fingerprint=?,requires_fetch=? WHERE event_id=?`)
-        .run(identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1,eventId);
-      else this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)").run(eventId,identity.lane,bytes,policy.coalescing ? key : null,fingerprint,key === null ? 0 : 1);
+        .run(identity.lane,bytes,policy.coalescing ? key : null,queueFingerprint,key === null ? 0 : 1,eventId);
+      else this.db.prepare("INSERT INTO queue_events(event_id,lane,bytes,coalesce_key,fingerprint,requires_fetch) VALUES (?,?,?,?,?,?)")
+        .run(eventId,identity.lane,bytes,policy.coalescing ? key : null,queueFingerprint,key === null ? 0 : 1);
       this.queueMetric("created");
       return { row, outcome: restoring ? "duplicate_same" as const : "created" as const, duplicate: !!restoring, payloadMismatch: false };
     }).immediate();

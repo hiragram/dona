@@ -131,7 +131,7 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
     parseNormalized(input) { return input as NormalizedExternalEvent; },
     queueSignal(event) {
       const entity = event.subject.entity_id;
-      return typeof entity === "string" ? { resourceKey: entity, signalKey: entity, requiresFetch: true } : undefined;
+      return typeof entity === "string" ? { resourceKey: entity, signalKey: entity, requiresFetch: true, latestState: true } : undefined;
     },
     buildAcknowledgement(receipt) {
       return { statusCode: 200, body: { accepted: true, event_id: receipt.eventId, outcome: receipt.outcome } };

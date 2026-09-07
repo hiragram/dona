@@ -15,7 +15,7 @@ const at = new Date("2026-09-05T00:00:00Z");
 const policy = { defaults: {depth:1000,bytes:8_388_608,rate:1000,burst:1000,coalescing:true} };
 function provider(id: string, source="fake") { return {...eventEnvelope(id),source:externalEventSource(source),reply_target:null}; }
 const context = {connectionId:"tenant-a"};
-const signal = {...context,coalesce:{resourceKey:"resource-a",signalKey:"changed",requiresFetch:true as const}};
+const signal = {...context,coalesce:{resourceKey:"resource-a",signalKey:"changed",requiresFetch:true as const,latestState:true as const}};
 async function fixture(options: unknown=policy) {
   const {root,config}=await tempConfig(); roots.push(root);
   return {root,config,db:new DispatcherDatabase(config.databasePath,options)};
@@ -95,11 +95,14 @@ test("coalescing retains delivery identity, rejects mismatch and never crosses a
   const leader=db.enqueue(provider("first"),at,signal).row;
   const combined=db.enqueue(provider("second"),at,signal);
   assert.equal(combined.admission,"coalesced");assert.equal(combined.row.event_id,leader.event_id);
-  assert.equal(db.coalescedDeliveries(leader.event_id).length,1);
+  const differentType=db.enqueue({...provider("properties"),type:"properties_updated"},at,signal);
+  assert.equal(differentType.admission,"coalesced");assert.equal(differentType.row.event_id,leader.event_id);
+  assert.equal(db.coalescedDeliveries(leader.event_id).length,2);
   assert.equal(db.getByExternalId("fake","second")?.event_id,leader.event_id);
   assert.equal(db.enqueue(provider("second"),at,signal).outcome,"duplicate_same");
   assert.equal(db.enqueue({...provider("second"),payload:{different:true}},at,signal).outcome,"duplicate_conflict");
-  const mismatch=db.enqueue({...provider("different"),payload:{different:true}},at,signal);
+  const mismatch=db.enqueue({...provider("different"),payload:{different:true}},at,
+    {...signal,coalesce:{...signal.coalesce,signalKey:"other"}});
   assert.equal(mismatch.admission,undefined);
   const tail=db.enqueue(provider("tail"),at,signal);
   assert.notEqual(tail.row.event_id,leader.event_id);
@@ -110,7 +113,7 @@ test("coalescing retains delivery identity, rejects mismatch and never crosses a
   db.close();
   const reopen=new DispatcherDatabase(config.databasePath,policy);
   assert.equal(reopen.enqueue(provider("second"),at,signal).outcome,"duplicate_same");
-  assert.equal(reopen.coalescedDeliveries(leader.event_id).length,1);
+  assert.equal(reopen.coalescedDeliveries(leader.event_id).length,2);
   reopen.close();
 });
 
