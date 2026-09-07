@@ -1513,18 +1513,18 @@ export class DispatcherDatabase {
     const statusCounts: Partial<Record<JobStatus, number>> = {};
     let total = 0;
     let pending = 0;
-    let onlySuccessfulTerminalStatuses = true;
+    let allJobsTerminal = true;
     for (const row of counts) {
       statusCounts[row.status] = row.count;
       total += row.count;
-      if (row.status !== "completed" && row.status !== "cancelled") pending += row.count;
-      if (row.status !== "completed" && row.status !== "cancelled") onlySuccessfulTerminalStatuses = false;
+      if (!["completed", "cancelled", "failed", "needs_review"].includes(row.status)) pending += row.count;
+      if (!["completed", "cancelled", "failed", "needs_review"].includes(row.status)) allJobsTerminal = false;
     }
 
     let transition: JobGroupTransition = "progress";
     if (jobAttentionStatuses.has(notificationJob.status) && group.attention_event_id === null) {
       transition = "attention";
-    } else if (total > 0 && onlySuccessfulTerminalStatuses && group.all_terminal_event_id === null) {
+    } else if (total > 0 && allJobsTerminal && group.all_terminal_event_id === null) {
       transition = "all_terminal";
     }
 

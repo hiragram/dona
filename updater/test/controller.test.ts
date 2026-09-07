@@ -204,6 +204,8 @@ class FakeRuntime implements RuntimePort {
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   previousMainStartUnknownOnce = false;
+  mainAgentSessionGeneration = 0;
+  rotateMainAgentSessionOnStart = false;
   notificationProtocolReady = true;
   actualAppSchema = 2;
   afterSlackStart: (() => Promise<void>) | undefined;
@@ -284,6 +286,7 @@ class FakeRuntime implements RuntimePort {
     }
     this.mainAgentExists = true;
     this.mainAgentSha = path.basename(releasePath);
+    if (this.rotateMainAgentSessionOnStart) this.mainAgentSessionGeneration += 1;
     return { outcome: "started" as const, observation: this.mainAgent(this.mainAgentSha, "idle", releasePath), error_code: null };
   }
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
@@ -335,7 +338,9 @@ class FakeRuntime implements RuntimePort {
       status: this.mainAgentExists ? status : null,
       interactive_ready: this.mainAgentExists,
       working_directory: this.mainAgentExists ? workingDirectory : null,
-      session_id: this.mainAgentExists ? `session-${sha}` : null,
+      session_id: this.mainAgentExists
+        ? `session-${sha}${this.mainAgentSessionGeneration === 0 ? "" : `-${this.mainAgentSessionGeneration}`}`
+        : null,
       matches_release: this.mainAgentExists && expectedRelease !== undefined && workingDirectory === expectedRelease,
       error_code: null,
     };
@@ -529,6 +534,47 @@ describe("UpdateController isolated end-to-end", () => {
     assert.ok(f.runtime.calls.indexOf("stopDispatcher") < f.runtime.calls.indexOf("migrateAppSchema"));
     assert.ok(f.runtime.calls.indexOf("migrateAppSchema") < f.runtime.calls.indexOf(`startMainAgent:${targetSha}`));
     assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+
+  test("restores the stopped current main agent when migration capability changes before activation", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-capability-changed",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.schemaMigrationReady = false;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "stable_updater_schema_migration_capability_unverified");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-3), [
+      `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+    ]);
     f.database.close();
   });
 

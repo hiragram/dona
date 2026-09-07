@@ -1387,6 +1387,14 @@ export class UpdateController {
   }
 
   private async restoreQuiescedServices(row: UpdateRow, causeCode: string): Promise<void> {
+    const stoppedMainAgent = this.database.runtimeOperation(row.request_id, "stop_main_agent");
+    if (stoppedMainAgent?.phase === "observed") {
+      if (!stoppedMainAgent.target_ref || !(await this.ensurePreviousMainAgentStarted(
+        row,
+        stoppedMainAgent.target_ref,
+        stoppedMainAgent.previous_session_id ?? undefined,
+      ))) return;
+    }
     if (!(await this.restartQuiescedService(
       row,
       "restart_current_dispatcher",

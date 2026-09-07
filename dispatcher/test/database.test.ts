@@ -794,7 +794,7 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("claims one attention transition and a later all-terminal transition after explicit cancel", async () => {
+  test("claims attention and all-terminal transitions for a group containing a failure", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -820,7 +820,13 @@ describe("DispatcherDatabase", () => {
       database.beginJobDispatch(job.job_id);
       database.markJobRunning(job.job_id);
     }
-    database.markJobBlocked(blocked.job_id, "human input required");
+    database.saveJobResult(blocked.job_id, {
+      schema_version: 1,
+      job_id: blocked.job_id,
+      status: "failed",
+      summary: "失敗",
+      completed_at: "2026-09-05T00:00:30.000Z",
+    }, blocked.result_path);
     database.saveJobResult(completed.job_id, {
       schema_version: 1,
       job_id: completed.job_id,
@@ -836,21 +842,17 @@ describe("DispatcherDatabase", () => {
     }, `${config.resultsDir}/${source.event_id}.json`);
 
     const attention = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:03:00.000Z"));
-    const progress = database.enqueueJobNotification(completed.job_id, new Date("2026-09-05T00:04:00.000Z"));
+    const allTerminal = database.enqueueJobNotification(completed.job_id, new Date("2026-09-05T00:04:00.000Z"));
     assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).transition, "attention");
-    assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 1);
-    assert.equal((envelopeFromRow(progress.row).payload.group as Record<string, unknown>).transition, "progress");
+    assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 0);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attention.row.event_id);
 
-    database.beginJobCancellation(blocked.job_id, source.event_id);
-    database.markJobCancelled(blocked.job_id, "利用者が中止");
-    const allTerminal = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:05:00.000Z"));
     const finalSnapshot = envelopeFromRow(allTerminal.row).payload.group as Record<string, unknown>;
     assert.equal(finalSnapshot.transition, "all_terminal");
     assert.equal(finalSnapshot.pending, 0);
-    assert.deepEqual(finalSnapshot.status_counts, { cancelled: 1, completed: 1 });
+    assert.deepEqual(finalSnapshot.status_counts, { completed: 1, failed: 1 });
     assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, allTerminal.row.event_id);
-    assert.equal(database.getJob(blocked.job_id)?.completion_event_id, allTerminal.row.event_id);
+    assert.equal(database.getJob(completed.job_id)?.completion_event_id, allTerminal.row.event_id);
     database.close();
   });
 
