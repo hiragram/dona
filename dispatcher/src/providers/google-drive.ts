@@ -121,6 +121,16 @@ function errorReasons(error: unknown): string[] {
   return result;
 }
 
+function oauthErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const response = (error as {response?:unknown}).response;
+  if (typeof response !== "object" || response === null) return undefined;
+  const data = (response as {data?:unknown}).data;
+  if (typeof data !== "object" || data === null) return undefined;
+  const code = (data as {error?:unknown}).error;
+  return typeof code === "string" && code.length <= 128 ? code : undefined;
+}
+
 function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): string {
   const canonical = { fileId: change.fileId, removed: change.removed ?? false, changeType: change.changeType,
     time: change.time, driveId: change.driveId ?? null };
@@ -191,7 +201,8 @@ export async function drainDriveChanges(
       const status = candidate.status ?? response?.status;
       const quota403 = status === 403 && errorReasons(error).some((reason) =>
         ["rateLimitExceeded","userRateLimitExceeded","sharingRateLimitExceeded"].includes(reason));
-      if (status === 401 || (status === 403 && !quota403)) throw new ConnectionError("credential_unavailable");
+      if (oauthErrorCode(error) === "invalid_grant" || status === 401 || (status === 403 && !quota403))
+        throw new ConnectionError("credential_unavailable");
       if (status === 410) throw new ConnectionError("cursor_conflict");
       throw new ConnectionError("incomplete_batch");
     }
@@ -201,15 +212,19 @@ export async function drainDriveChanges(
       change.driveId!==undefined&&(allowlist.driveIds.has(change.driveId)||(feed.kind==="drive"&&feed.driveId===change.driveId))))
       throw new ConnectionError("operation_pending");
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
-      .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined || members.has(change.fileId));
+      .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId :
+        change.driveId === undefined || members.has(change.fileId) || allowlist.fileIds.has(change.fileId));
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
     for (const change of fileChanges) {
-      const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && members.has(change.fileId);
+      const trackedBefore = members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
+        (change.driveId !== undefined && allowlist.driveIds.has(change.driveId));
+      const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && trackedBefore;
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
-      const currentlyAllowed = !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
+      const providerRemoved = change.removed === true || change.file?.trashed === true;
+      const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         folderAllowed);
-      const tombstone = !currentlyAllowed && members.has(change.fileId);
+      const tombstone = !currentlyAllowed && (trackedBefore || folderAllowed);
       if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。

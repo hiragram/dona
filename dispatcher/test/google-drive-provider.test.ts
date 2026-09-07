@@ -85,6 +85,16 @@ test("明示file allowlistでもuser feedからshared driveへの離脱を優先
   assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
 });
 
+test("prior membershipなしの明示file離脱とTrash移動をtombstone化する",async(t)=>{
+  const db=fixture(t); let round=0; const client={list:async()=>({changes:[++round===1?
+    {fileId:"moving",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving"}}:
+    {fileId:"trashed",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"trashed",trashed:true}}],newStartPageToken:`next-${round}`})};
+  const allowlist={fileIds:new Set(["moving","trashed"]),folderIds:new Set<string>(),driveIds:new Set<string>()};
+  await drainDriveChanges(db,binding,client,allowlist); await drainDriveChanges(db,binding,client,allowlist);
+  assert.equal(db.list().length,2);
+  for(const row of db.list()) assert.deepEqual(JSON.parse(row.payload_json),{removed:true,drive_id:null,file:null});
+});
+
 test("pages上限を事前検証しallowlisted drive removalはreconciliationへ隔離する",async(t)=>{
   const db=fixture(t);let calls=0;const client={list:async()=>{calls++;return {changes:[],newStartPageToken:"next"};}};
   await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}, {kind:"user"},{pages:1.5,events:1,bytes:1,timeoutMs:1}),/invalid_input/);
@@ -185,7 +195,7 @@ test("以前のfolder memberは離脱・権限喪失時もtombstoneとして配�
   for (const row of db.list()) assert.deepEqual(JSON.parse(row.payload_json), { removed:true,drive_id:null,file:null });
 });
 
-test("quota系403はretryable、未知fieldはdedup IDへ影響せずuser feedはshared-drive changeを除外する", async (t) => {
+test("quota系403はretryable、可変snapshotはdedupし明示fileのfeed離脱はtombstone化する", async (t) => {
   const db = fixture(t); let round = 0;
   const retry = { list: async () => { throw { status:403, errors:[{reason:"userRateLimitExceeded"}] }; } };
   await assert.rejects(drainDriveChanges(db,binding,retry,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
@@ -196,7 +206,8 @@ test("quota系403はretryable、未知fieldはdedup IDへ影響せずuser feed�
   ],...(round === 1 ? {nextPageToken:"page-2"} : {newStartPageToken:"next"}) }; } };
   const allowlist={fileIds:new Set(["same","shared"]),folderIds:new Set<string>(),driveIds:new Set(["drive-1"])};
   await drainDriveChanges(db,binding,client,allowlist);
-  assert.equal(db.list().length,1);
+  assert.equal(db.list().length,2);
+  assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
 });
 
 test("API pageSizeを残りevent budget以下に固定する",async(t)=>{
@@ -229,4 +240,8 @@ test("credential失効とcursor期限切れをretryable page失敗から分離�
     await assert.rejects(drainDriveChanges(responseDb,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
       (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code===code);
   }
+  const revoked=fixture(t);
+  await assert.rejects(drainDriveChanges(revoked,binding,{list:async()=>{throw {response:{status:400,data:{error:"invalid_grant"}}};}},
+    {fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
+    (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="credential_unavailable");
 });
