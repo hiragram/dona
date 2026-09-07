@@ -34,10 +34,7 @@ async function main(): Promise<void> {
   }
   if (!["event", "job"].includes(args[0]!)) usage();
   const command = args[1];
-  const database = new DispatcherDatabase(config.databasePath, {
-    jobsPerEventMax: config.jobsPerEventMax,
-    jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
-  });
+  const database = new DispatcherDatabase(config.databasePath);
   try {
     if (args[0] === "job") {
       if (command === "list") {

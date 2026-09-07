@@ -12,7 +12,6 @@ import { createSlackLogger, createSocketSdkLogger } from "./logger.js";
 import { promptSecret } from "./prompt.js";
 import { SlackSocketAdapter, type WorkspaceSocket } from "./socket-adapter.js";
 import { SlackUpdateNotificationReporter } from "./update-notification.js";
-import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 async function main(): Promise<void> {
@@ -38,7 +37,6 @@ async function main(): Promise<void> {
     socketPath: config.dispatcherSocketPath,
     connectTimeoutMs: config.dispatcherConnectTimeoutMs,
     timeoutMs: config.dispatcherTimeoutMs,
-    internalTokenPath: config.updateInternalTokenPath,
   });
   const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
   const updateNotifications = new SlackUpdateNotificationReporter(registry);
@@ -51,7 +49,6 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
-    new SlackJobProgressReporter(registry, (progressId, deliveryToken) => dispatcher.resolveJobProgress(progressId, deliveryToken)),
     config.appSchemaWrite,
     config.appSchemaReadMax,
   );
