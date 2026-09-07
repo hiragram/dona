@@ -116,14 +116,22 @@ export class ProviderRegistrationRegistry {
 
   inspectAttempt(token: string): VerificationAttemptSnapshot {
     if (!validToken(token)) throw new ConnectionError("invalid_input");
-    const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as
-      (AttemptRow & { created_at: number }) | undefined;
-    if (!row || !["pending", "claimed", "consumed"].includes(row.state)) throw new ConnectionError("not_authorized");
-    if (this.now() > row.expires_at) throw new ConnectionError("not_authorized");
-    const binding: VerificationBinding = { provider: row.provider, providerId: row.provider_id,
-      verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: row.account,
-        revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
-    return { binding, createdAt: row.created_at, state: row.state as VerificationAttemptSnapshot["state"] };
+    const result = this.db.transaction((): { snapshot?: VerificationAttemptSnapshot; error?: unknown } => {
+      const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as
+        (AttemptRow & { created_at: number }) | undefined;
+      if (!row || !["pending", "claimed", "consumed"].includes(row.state)) throw new ConnectionError("not_authorized");
+      const now = this.now();
+      const clock = this.db.prepare("SELECT last_clock FROM connections WHERE id=?").get(row.connection_id) as { last_clock: number } | undefined;
+      if (!clock || now < clock.last_clock) throw new ConnectionError("clock_skew");
+      this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
+      if (now > row.expires_at) return { error: new ConnectionError("not_authorized") };
+      const binding: VerificationBinding = { provider: row.provider, providerId: row.provider_id,
+        verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: row.account,
+          revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
+      return { snapshot: { binding, createdAt: row.created_at, state: row.state as VerificationAttemptSnapshot["state"] } };
+    }).immediate();
+    if (result.error) throw result.error;
+    return result.snapshot!;
   }
 
   issue(input: Readonly<{ provider: string; providerId: string; connectionId: string; account: string; resource: string }>, ttlMs: number): string {

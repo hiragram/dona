@@ -362,6 +362,8 @@ test("期限切れconsumed attemptをinspect replayで再認可しない", (t) =
   db.providerRegistration.consume(token, claim.claimId);
   clock.value += 1_001;
   assert.throws(() => db.providerRegistration.inspectAttempt(token), /not_authorized/);
+  clock.value -= 1;
+  assert.throws(() => db.providerRegistration.inspectAttempt(token), /clock_skew/);
 });
 
 test("activation失敗時はattempt consumeも同じtransactionでrollbackする", (t) => {

@@ -158,9 +158,15 @@ export async function runService(
       return fetchLatestNotionState({ async fetch(resourceId) {
         const request = async (url: string) => {
           for (let attempt = 0; ; attempt += 1) {
-            const response = await fetch(url, {
+            let response: Response;
+            try { response = await fetch(url, {
               method: "GET", signal: fetchSignal,
-              headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
+              headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } }); }
+            catch (error) {
+              if (signal.aborted) throw error;
+              if (fetchSignal.aborted) return { status: 200, value: { results: [], has_more: false, content_truncated: true } };
+              throw error;
+            }
             const retry = response.headers.get("retry-after");
             if (!response.ok) {
               await response.body?.cancel().catch(() => undefined);
@@ -191,6 +197,7 @@ export async function runService(
             const page = await request(url.toString());
             if (page.status === 404 && depth > 0) { truncated = true; return []; }
             if (page.status !== 200 || !page.value) return { failure: page };
+            if (page.value.content_truncated === true) truncated = true;
             const results = Array.isArray(page.value.results) ? page.value.results : [];
             for (const candidate of results) {
               if (blocks >= 1_000) { truncated = true; break; }
@@ -231,6 +238,7 @@ export async function runService(
               const page = await request(url.toString());
               if (page.status === 404) { truncated = true; break; }
               if (page.status !== 200 || !page.value) return page;
+              if (page.value.content_truncated === true) truncated = true;
               if (page.value.property_item !== undefined) propertyItem = page.value.property_item;
               if (Array.isArray(page.value.results)) items.push(...page.value.results);
               else items.push(page.value);

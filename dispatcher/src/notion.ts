@@ -187,7 +187,11 @@ export function normalizeNotionFetchValue(value: Readonly<Record<string, unknown
 export async function fetchLatestNotionState(client: NotionReadClient, resourceId: string): Promise<{
   outcome: NotionFetchOutcome; retryAfter?: number; value?: Readonly<Record<string, unknown>> }> {
   let response: Awaited<ReturnType<NotionReadClient["fetch"]>>;
-  try { response = await client.fetch(resourceId); } catch { return { outcome: "degraded" }; }
+  try { response = await client.fetch(resourceId); }
+  catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    return { outcome: "degraded" };
+  }
   if (response.status === 200 && response.value) return { outcome: "fetched", value: normalizeNotionFetchValue(response.value) };
   if (response.status === 404) return { outcome: "not_found_or_inaccessible" };
   if (response.status === 401 || response.status === 403) return { outcome: "permission_lost" };
