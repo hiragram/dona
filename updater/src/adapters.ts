@@ -442,10 +442,17 @@ export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
   async quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot> {
-    const response = await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
+    let snapshot = drainSnapshot(await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
-    }, this.policy.timeouts.drain_ms);
-    return drainSnapshot(response, "slack_adapter");
+    }, this.policy.timeouts.drain_ms), "slack_adapter");
+    const deadline = Date.now() + this.policy.timeouts.agent_drain_ms;
+    while (!snapshot.drained && Date.now() < deadline) {
+      await delay(100);
+      snapshot = drainSnapshot(await udsRequest(
+        this.policy.slack_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
+      ), "slack_adapter");
+    }
+    return snapshot;
   }
 
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {

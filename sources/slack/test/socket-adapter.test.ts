@@ -277,4 +277,22 @@ describe("SlackSocketAdapter", () => {
     assert.equal(ignoredAck, false);
     assert.equal(client.disconnects, 1);
   });
+
+  test("quiesceは進行中のreminder配送もdrain対象にする", async () => {
+    const client = new FakeSocketClient();
+    const adapter = new SlackSocketAdapter(
+      [{ workspace: "company", client }],
+      { postEvent: async () => ({ statusCode: 202, body: "{}" }), healthReady: async () => true },
+      { ...config, shutdownGraceMs: 10 },
+      logger,
+    );
+    await adapter.start();
+    let finish: (() => void) | undefined;
+    const delivery = adapter.trackOperation(new Promise<void>((resolve) => void (finish = resolve)));
+    await adapter.quiesce();
+    assert.equal(adapter.drainStatus().drained, false);
+    finish!();
+    await delivery;
+    await waitFor(() => adapter.drainStatus().drained);
+  });
 });
