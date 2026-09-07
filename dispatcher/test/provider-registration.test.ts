@@ -101,7 +101,11 @@ test("link後crashで残った同一inodeのtemporary fileをreconcileが回収�
   fs.linkSync(target, temporary);
   assert.equal(fs.statSync(target).nlink, 2);
   const service = new ProviderRegistrationService(db.connections, store);
-  assert.equal((await service.register({ ...config, credentialRef: "cred_crash" }, secret)).revision, 1);
+  const reconciled = await Promise.all([
+    service.register({ ...config, credentialRef: "cred_crash" }, secret),
+    service.register({ ...config, credentialRef: "cred_crash" }, secret),
+  ]);
+  assert.deepEqual(reconciled.map((connection) => connection.revision), [1, 1]);
   assert.equal(fs.existsSync(temporary), false);
   assert.equal(fs.statSync(target).nlink, 1);
 });

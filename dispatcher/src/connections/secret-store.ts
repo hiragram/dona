@@ -98,19 +98,25 @@ export class PrivateFileSecretStore {
     await this.checkedRoot();
     const target = this.file(reference, revision), targetStats = await fs.lstat(target);
     const temporaryPattern = new RegExp(`^\\.${reference}\\.${revision}\\.[a-f0-9]{24}\\.tmp$`);
-    let removedLink = false;
     if (targetStats.isFile() && !targetStats.isSymbolicLink() && targetStats.uid === process.getuid?.() && (targetStats.mode & 0o077) === 0) {
-      for (const entry of await fs.readdir(this.pending)) {
-        if (!temporaryPattern.test(entry)) continue;
-        const temporary = path.join(this.pending, entry), stats = await fs.lstat(temporary);
-        if (stats.isFile() && !stats.isSymbolicLink() && stats.uid === targetStats.uid && stats.dev === targetStats.dev && stats.ino === targetStats.ino)
-          await fs.unlink(temporary), removedLink = true;
+      let inspected = 0;
+      const directory = await fs.opendir(this.pending);
+      for await (const entry of directory) {
+        if (inspected++ >= 100) break;
+        if (!temporaryPattern.test(entry.name)) continue;
+        const temporary = path.join(this.pending, entry.name);
+        try {
+          const stats = await fs.lstat(temporary);
+          if (stats.isFile() && !stats.isSymbolicLink() && stats.uid === targetStats.uid && stats.dev === targetStats.dev && stats.ino === targetStats.ino)
+            await fs.unlink(temporary);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
       }
     }
-    if (removedLink) {
-      const pending = await fs.open(this.pending, constants.O_RDONLY);
-      try { await pending.sync(); } finally { await pending.close(); }
-    }
+    // publish時のunlink応答が曖昧だった場合も、reconcile成功前に必ずdurabilityを確定する。
+    const pending = await fs.open(this.pending, constants.O_RDONLY);
+    try { await pending.sync(); } finally { await pending.close(); }
     const stored = await this.read(reference, revision);
     const candidate = Buffer.from(expected);
     const matches = stored.length === candidate.length && timingSafeEqual(stored, candidate);
