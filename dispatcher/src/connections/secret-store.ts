@@ -1,0 +1,75 @@
+import { constants } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { ConnectionError } from "./domain.js";
+
+const credentialReference = /^cred_[A-Za-z0-9_-]{1,100}$/;
+
+export class PrivateFileSecretStore {
+  constructor(private readonly root: string) {}
+
+  private async checkedRoot(): Promise<void> {
+    const stats = await fs.lstat(this.root);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0)
+      throw new ConnectionError("not_authorized");
+  }
+
+  private file(reference: string, revision: number): string {
+    if (!credentialReference.test(reference) || !Number.isSafeInteger(revision) || revision < 1) throw new ConnectionError("invalid_input");
+    return path.join(this.root, `${reference}.${revision}.secret`);
+  }
+
+  async write(reference: string, revision: number, secret: Uint8Array): Promise<void> {
+    if (!(secret instanceof Uint8Array) || secret.byteLength < 16 || secret.byteLength > 65_536) throw new ConnectionError("invalid_input");
+    await this.checkedRoot();
+    const target = this.file(reference, revision);
+    try {
+      const existing = await fs.lstat(target);
+      if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1 || existing.uid !== process.getuid?.() || (existing.mode & 0o077) !== 0)
+        throw new ConnectionError("not_authorized");
+      throw new ConnectionError("revision_conflict");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const temporary = path.join(this.root, `.${reference}.${revision}.${randomBytes(12).toString("hex")}.tmp`);
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      await handle.writeFile(secret);
+      await handle.chmod(0o600);
+      await handle.sync();
+      await handle.close(); handle = undefined;
+      await fs.rename(temporary, target);
+      const directory = await fs.open(this.root, constants.O_RDONLY);
+      try { await directory.sync(); } finally { await directory.close(); }
+      const published = await fs.lstat(target);
+      if (!published.isFile() || published.isSymbolicLink() || published.nlink !== 1 || published.uid !== process.getuid?.() || (published.mode & 0o077) !== 0)
+        throw new ConnectionError("not_authorized");
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      await fs.unlink(temporary).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async read(reference: string, revision: number): Promise<Buffer> {
+    await this.checkedRoot();
+    const handle = await fs.open(this.file(reference, revision), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0)
+        throw new ConnectionError("not_authorized");
+      return await handle.readFile();
+    } finally { await handle.close(); }
+  }
+
+  async discard(reference: string, revision: number): Promise<void> {
+    await this.checkedRoot();
+    const target = this.file(reference, revision);
+    const stats = await fs.lstat(target);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.uid !== process.getuid?.())
+      throw new ConnectionError("not_authorized");
+    await fs.unlink(target);
+  }
+}

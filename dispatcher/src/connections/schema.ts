@@ -5,8 +5,26 @@ export function migrateConnections(db: Database.Database): void {
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS connection_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)`);
     const row = db.prepare("SELECT version FROM connection_schema WHERE singleton=1").get() as { version: number } | undefined;
-    if (row && row.version !== 1) throw new Error("Unsupported connection schema");
-    if (row) return;
+    if (row && ![1, 2].includes(row.version)) throw new Error("Unsupported connection schema");
+    if (row?.version === 2) return;
+    if (row?.version === 1) {
+      db.exec(`
+        CREATE TABLE verification_attempts (
+          digest TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id),
+          provider TEXT NOT NULL, account TEXT NOT NULL, revision INTEGER NOT NULL,
+          credential_revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
+          provider_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed')),
+          claim_id TEXT, claim_until INTEGER, created_at INTEGER NOT NULL, consumed_at INTEGER,
+          CHECK((state='pending' AND claim_id IS NULL AND claim_until IS NULL AND consumed_at IS NULL)
+            OR (state='claimed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NULL)
+            OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
+        );
+        CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
+        UPDATE connection_schema SET version=2 WHERE singleton=1;
+      `);
+      return;
+    }
     db.exec(`
       CREATE TABLE connections (
         id TEXT PRIMARY KEY, provider TEXT NOT NULL, config_json TEXT NOT NULL,
@@ -49,7 +67,19 @@ export function migrateConnections(db: Database.Database): void {
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, connection_id TEXT NOT NULL REFERENCES connections(id),
         revision INTEGER NOT NULL, action TEXT NOT NULL, at INTEGER NOT NULL
       );
-      INSERT INTO connection_schema VALUES(1,1);
+      CREATE TABLE verification_attempts (
+        digest TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id),
+        provider TEXT NOT NULL, account TEXT NOT NULL, revision INTEGER NOT NULL,
+        credential_revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
+        provider_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed')),
+        claim_id TEXT, claim_until INTEGER, created_at INTEGER NOT NULL, consumed_at INTEGER,
+        CHECK((state='pending' AND claim_id IS NULL AND claim_until IS NULL AND consumed_at IS NULL)
+          OR (state='claimed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NULL)
+          OR (state='consumed' AND claim_id IS NOT NULL AND claim_until IS NOT NULL AND consumed_at IS NOT NULL))
+      );
+      CREATE INDEX verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
+      INSERT INTO connection_schema VALUES(1,2);
     `);
   }).immediate();
 }
