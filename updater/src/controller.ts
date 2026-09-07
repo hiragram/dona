@@ -450,7 +450,8 @@ export class UpdateController {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
       const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
       const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
-      const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
+      const persistedRecovery = this.database.runtimeOperation(row.request_id, "start_previous_main_agent") ??
+        this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
         let evidence: Record<string, unknown> = {};

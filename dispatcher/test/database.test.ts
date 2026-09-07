@@ -491,6 +491,12 @@ describe("DispatcherDatabase", () => {
     };
     const firstCanonicalPayloadSha256 = canonicalJobPayloadSha256(parseCreateJobRequest(firstRequest));
     const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
+    assert.throws(() => database.createJob({
+      source_event_id: source.event_id,
+      objective: "implicit legacy job",
+      workspace: { kind: "scratch" },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir), (error) =>
+      error instanceof JobCreationError && error.code === "job_group_closed");
     const second = database.createJob({
       source_event_id: source.event_id,
       job_key: "research.secondary",
@@ -807,14 +813,7 @@ describe("DispatcherDatabase", () => {
       objective: "承認を待つ",
       workspace: { kind: "scratch" },
     }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
-    const completed = database.createJob({
-      source_event_id: source.event_id,
-      job_key: "completed",
-      objective: "完了する",
-      workspace: { kind: "scratch" },
-    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
-
-    for (const job of [blocked, completed]) {
+    for (const job of [blocked]) {
       database.beginJobPreparation(job.job_id);
       database.setJobRuntime(job.job_id, `workspace-${job.job_key}`, `pane-${job.job_key}`);
       database.beginJobDispatch(job.job_id);
@@ -827,13 +826,6 @@ describe("DispatcherDatabase", () => {
       summary: "失敗",
       completed_at: "2026-09-05T00:00:30.000Z",
     }, blocked.result_path);
-    database.saveJobResult(completed.job_id, {
-      schema_version: 1,
-      job_id: completed.job_id,
-      status: "completed",
-      summary: "完了",
-      completed_at: "2026-09-05T00:01:00.000Z",
-    }, completed.result_path);
     database.saveCompleted(source.event_id, {
       schema_version: 1,
       event_id: source.event_id,
@@ -842,17 +834,18 @@ describe("DispatcherDatabase", () => {
     }, `${config.resultsDir}/${source.event_id}.json`);
 
     const attention = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:03:00.000Z"));
-    const allTerminal = database.enqueueJobNotification(completed.job_id, new Date("2026-09-05T00:04:00.000Z"));
     assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).transition, "attention");
     assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 0);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attention.row.event_id);
 
+    assert.equal(database.listJobsNeedingNotification()[0]?.job_id, blocked.job_id);
+    const allTerminal = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:04:00.000Z"));
     const finalSnapshot = envelopeFromRow(allTerminal.row).payload.group as Record<string, unknown>;
     assert.equal(finalSnapshot.transition, "all_terminal");
     assert.equal(finalSnapshot.pending, 0);
-    assert.deepEqual(finalSnapshot.status_counts, { completed: 1, failed: 1 });
+    assert.deepEqual(finalSnapshot.status_counts, { failed: 1 });
     assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, allTerminal.row.event_id);
-    assert.equal(database.getJob(completed.job_id)?.completion_event_id, allTerminal.row.event_id);
+    assert.equal(database.getJob(blocked.job_id)?.completion_event_id, attention.row.event_id);
     database.close();
   });
 

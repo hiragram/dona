@@ -584,6 +584,12 @@ export class DispatcherDatabase {
       if (group?.sealed_at) {
         throw new JobCreationError("job_group_closed", `Job group ${parsedRequest.source_event_id} is sealed`);
       }
+      if (group?.notification_mode === "grouped" && parsedRequest.job_key === undefined) {
+        throw new JobCreationError(
+          "job_group_closed",
+          `Grouped job group ${parsedRequest.source_event_id} requires an explicit job key`,
+        );
+      }
       const hasLegacyDefaultJob = group?.notification_mode === "legacy" && this.db.prepare(`
         SELECT 1 FROM jobs WHERE source_event_id = ? AND job_key = ?
       `).get(parsedRequest.source_event_id, legacyJobKey) !== undefined;
@@ -932,7 +938,19 @@ export class DispatcherDatabase {
       SELECT jobs.* FROM jobs
       JOIN job_groups ON job_groups.source_event_id = jobs.source_event_id
       WHERE jobs.status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
-        AND jobs.completion_event_id IS NULL
+        AND (
+          jobs.completion_event_id IS NULL
+          OR (
+            job_groups.notification_mode = 'grouped'
+            AND job_groups.attention_event_id IS NOT NULL
+            AND job_groups.all_terminal_event_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs AS sibling
+              WHERE sibling.source_event_id = jobs.source_event_id
+                AND sibling.status NOT IN ('completed', 'failed', 'cancelled', 'needs_review')
+            )
+          )
+        )
         AND (job_groups.notification_mode = 'legacy' OR job_groups.sealed_at IS NOT NULL)
       ORDER BY
         CASE WHEN jobs.status IN ('blocked', 'failed', 'needs_review') THEN 0 ELSE 1 END,
@@ -1128,7 +1146,14 @@ export class DispatcherDatabase {
       if (job.completion_event_id) {
         const existing = this.get(job.completion_event_id);
         if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
-        return { row: existing, duplicate: true, payloadMismatch: false };
+        const needsAllTerminal = group.notification_mode === "grouped" &&
+          group.attention_event_id !== null && group.all_terminal_event_id === null &&
+          this.db.prepare(`
+            SELECT 1 FROM jobs
+            WHERE source_event_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'needs_review')
+            LIMIT 1
+          `).get(job.source_event_id) === undefined;
+        if (!needsAllTerminal) return { row: existing, duplicate: true, payloadMismatch: false };
       }
       if (!jobNotificationStatuses.has(job.status)) {
         throw new Error(`Job ${jobId} in status ${job.status} does not need a notification`);
@@ -1158,7 +1183,7 @@ export class DispatcherDatabase {
       const envelope: EventEnvelope = {
         schema_version: 1,
         source: "dona_job",
-        external_event_id: `${job.job_id}:${job.status}`,
+        external_event_id: `${job.job_id}:${job.status}${job.completion_event_id ? ":all_terminal" : ""}`,
         type: `job_${job.status}`,
         occurred_at: timestamp,
         subject: {
@@ -1198,8 +1223,10 @@ export class DispatcherDatabase {
         if (claimed !== 1) throw new Error(`Job group ${job.source_event_id} lost ${snapshot.transition} ownership`);
       }
       notificationHook("transition_claimed");
-      this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
-        .run(enqueued.row.event_id, timestamp, jobId);
+      if (!job.completion_event_id) {
+        this.db.prepare("UPDATE jobs SET completion_event_id = ?, updated_at = ? WHERE job_id = ?")
+          .run(enqueued.row.event_id, timestamp, jobId);
+      }
       notificationHook("job_linked");
       return enqueued;
     }).immediate();
