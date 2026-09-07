@@ -73,6 +73,7 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
           secretRef: options.verificationSecretRef, token: Buffer.from(verification.data.verification_token) });
         if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
         return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,
+          purpose: "verification",
           principal: { kind: "verification", provider_event_id: claim.providerEventId, occurred_at: claim.occurredAt } };
       }
       const parsed = eventSchema.safeParse(candidate);

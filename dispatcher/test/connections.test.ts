@@ -144,6 +144,23 @@ test("capability matrix: UI/manualはcreate不可、non-renewableは期限更新
   }
 });
 
+test("verification deliveryはpending subscriptionを通常event allowlistから分離して永続化する", (t) => {
+  const { db } = fixture(t);
+  db.connections.register({ id: "verify", provider: "drive", account: "account1", credentialRef: "cred_fixture",
+    credentialRevision: 1, allowlist: [{ resource: "folder1", events: ["changed"] }],
+    capability: { kind: "manual", cursor: false } });
+  db.connections.attachManual("verify", 1, "folder1", "subscription1", null);
+  const verifyBinding = { connectionId: "verify", account: "account1", revision: 1, credentialRevision: 1,
+    resource: "folder1", generation: 1 };
+  const source = externalEventSource("drive");
+  const envelope: EventEnvelope = { schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification1"), type: "drive.verification",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { verified: true },
+    reply_target: null };
+  assert.throws(() => db.enqueueExternal(envelope, verifyBinding), /not_authorized/);
+  assert.equal(db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true).outcome, "created");
+});
+
 test("allowlistとcredential revisionを同時bindingし変更時はfail closed", async (t) => {
   const {db,lifecycle,clock} = fixture(t); await lifecycle.createOrRenew("pilot","folder1");
   for (const b of [{...binding(),account:"other"},{...binding(),credentialRevision:2},{...binding(),resource:"other"},{...binding(),revision:2}])

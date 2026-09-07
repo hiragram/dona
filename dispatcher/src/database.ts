@@ -250,7 +250,8 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, owner?: ProviderOwner, at = new Date(), context?: QueueAdmissionContext): EnqueueResult {
+  enqueueExternal(envelope: EventEnvelope, binding?: DeliveryBinding, owner?: ProviderOwner, at = new Date(), context?: QueueAdmissionContext,
+    verification = false): EnqueueResult {
     const queueContext: QueueAdmissionContext | undefined = context ? {
       connectionId: context.connectionId,
       ...(context.coalesce ? { coalesce: context.coalesce } : {}),
@@ -260,7 +261,7 @@ export class DispatcherDatabase {
       return this.enqueueProvider(envelope, owner, at, queueContext);
     }
     try {
-      return this.connections.delivery(binding, envelope, () => this.enqueueProvider(envelope, owner, at, queueContext));
+      return this.connections.delivery(binding, envelope, () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
     } catch (error) {
       if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
       throw error;
