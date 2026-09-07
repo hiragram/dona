@@ -40,7 +40,7 @@ test("secret-storeはowner-only atomic fileだけを公開しsymlink/hard-link/p
   const target = path.join(secrets, "cred_safe.1.secret");
   assert.equal(fs.statSync(target).mode & 0o777, 0o600);
   assert.equal((await store.read("cred_safe", 1)).toString(), "0123456789abcdef0123456789abcdef");
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_safe.1.secret"]);
+  assert.deepEqual(fs.readdirSync(secrets), [".pending", "cred_safe.1.secret"]);
   assert.rejects(store.write("../escape", 1, Buffer.alloc(32)), /invalid_input/);
   fs.symlinkSync(target, path.join(secrets, "cred_link.1.secret"));
   await assert.rejects(store.write("cred_link", 1, Buffer.alloc(32)), /not_authorized/);
@@ -55,11 +55,11 @@ test("registration競合は既存secretを保ち、rotation失敗は旧revision�
   assert.equal(db.connections.get("pilot").credentialRevision, 1);
   await assert.rejects(service.rotate("pilot", 99, { ...config, credentialRevision: 2 }, Buffer.alloc(32, 2)), /revision_conflict/);
   assert.equal(db.connections.get("pilot").credentialRevision, 1);
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret", "cred_pilot.2.secret"]);
+  assert.deepEqual(fs.readdirSync(secrets), [".pending", "cred_pilot.1.secret", "cred_pilot.2.secret"]);
   assert.equal((await service.register({ ...config, id: "pilot" }, Buffer.alloc(32, 1))).revision, 1);
   await assert.rejects(service.register({ ...config, allowlist: [{ resource: "page:one", events: ["deleted"] }] }, Buffer.alloc(32, 1)), /revision_conflict/);
   assert.equal((await store.read("cred_pilot", 1)).length, 32);
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret", "cred_pilot.2.secret"]);
+  assert.deepEqual(fs.readdirSync(secrets), [".pending", "cred_pilot.1.secret", "cred_pilot.2.secret"]);
 });
 
 test("durability未確認ではDB commitせず、次の明示reconcileでdirectory fsync後に継続する", async (t) => {
@@ -97,7 +97,7 @@ test("link後crashで残った同一inodeのtemporary fileをreconcileが回収�
   const { db, secrets, store } = fixture(t), secret = Buffer.alloc(32, 4);
   await store.write("cred_crash", 1, secret);
   const target = path.join(secrets, "cred_crash.1.secret");
-  const temporary = path.join(secrets, ".cred_crash.1.0123456789abcdef01234567.tmp");
+  const temporary = path.join(secrets, ".pending", ".cred_crash.1.0123456789abcdef01234567.tmp");
   fs.linkSync(target, temporary);
   assert.equal(fs.statSync(target).nlink, 2);
   const service = new ProviderRegistrationService(db.connections, store);
@@ -114,11 +114,12 @@ test("secret readは保存fileのsizeを読込前に拒否する", async (t) => 
 
 test("publish前crashの古いtemporary secretだけをboundedに回収する", async (t) => {
   const { secrets, store } = fixture(t);
-  const stale = path.join(secrets, ".cred_stale.1.0123456789abcdef01234567.tmp");
+  await store.write("cred_seed", 1, Buffer.alloc(32, 9));
+  const stale = path.join(secrets, ".pending", ".cred_stale.1.0123456789abcdef01234567.tmp");
   fs.writeFileSync(stale, Buffer.alloc(32, 1), { mode: 0o600 });
   const old = new Date(Date.now() - 10 * 60_000); fs.utimesSync(stale, old, old);
   await store.write("cred_stale", 1, Buffer.alloc(32, 2));
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_stale.1.secret"]);
+  assert.deepEqual(fs.readdirSync(path.join(secrets, ".pending")), []);
 });
 
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
@@ -162,6 +163,14 @@ test("active resolverは検証済みstop_candidateを配信可能として解決
   const raw = new Database(file); t.after(() => raw.close());
   raw.prepare("UPDATE connection_subscriptions SET state='stop_candidate' WHERE connection_id='pilot'").run();
   assert.deepEqual(db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), binding);
+});
+
+test("binding optional identityはSQL実行前にtyped validationする", (t) => {
+  const { db } = fixture(t);
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
+    resource: { untrusted: true } as never }), /invalid_input/);
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
+    connectionId: "x".repeat(10_000) }), /invalid_input/);
 });
 
 test("verification attemptはdigestのみ永続化しexpiry/replay/restart/tamperを拒否する", (t) => {
@@ -239,6 +248,29 @@ test("一度期限切れを観測したattemptはclock rewindでも復活しな�
   assert.throws(() => db.providerRegistration.claim(token, binding, 100), /not_authorized/);
   clock.value--;
   assert.throws(() => db.providerRegistration.claim(token, binding, 100), /clock_skew/);
+});
+
+test("issueとclaimのbinding失敗時刻もcommitしclock rewindを拒否する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const token = db.providerRegistration.issue(identity, 5_000), raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connection_subscriptions SET expires_at=? WHERE connection_id='pilot'").run(clock.value + 100);
+  clock.value += 100;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 100), /not_authorized/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.issue(identity, 5_000), /clock_skew/);
+});
+
+test("consumeのcurrent binding失敗時刻もcommitする", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const token = db.providerRegistration.issue(identity, 5_000), claim = db.providerRegistration.claim(token, binding, 1_000);
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connection_subscriptions SET state='stopped'").run(); clock.value += 100;
+  assert.throws(() => db.providerRegistration.consume(token, claim.claimId), /not_authorized/);
+  assert.equal((raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock, clock.value);
 });
 
 test("verification tokenとclaim IDはhash・query前に固定形式で拒否する", (t) => {
