@@ -168,6 +168,10 @@ test("verification deliveryはpending subscriptionを通常event allowlist・que
   try {
     const bucket = raw.prepare("SELECT tokens FROM queue_sources WHERE source=?").get(source) as { tokens: number };
     assert.equal(bucket.tokens, db.queuePolicy.defaults.burst);
+    assert.equal((raw.prepare("SELECT count(*) count FROM queue_events WHERE event_id=?")
+      .get(result.row.event_id) as { count: number }).count, 0);
+    assert.equal((raw.prepare("SELECT count(*) count FROM queue_lanes WHERE source=?")
+      .get(source) as { count: number }).count, 0);
   } finally { raw.close(); }
   db.connections.observe("verify", 1, "folder1", 1,
     { providerId: "subscription1", expiresAt: null, verified: true, cutoverConfirmed: false });
@@ -176,6 +180,27 @@ test("verification deliveryはpending subscriptionを通常event allowlist・que
   assert.equal(replay.outcome, "duplicate_same");
   assert.equal(replay.row.event_id, result.row.event_id);
   assert.equal(db.nextAvailable(), undefined);
+});
+
+test("verification duplicate conflictは既存eventを完了させない", (t) => {
+  const { db, clock } = fixture(t);
+  const operation = db.connections.claim("pilot", 1, "folder1", 10);
+  db.connections.observe("pilot", 1, "folder1", 1,
+    { providerId: "subscription1", expiresAt: clock.now() + 10_000, verified: true, cutoverConfirmed: false }, operation);
+  const deliveryBinding = { connectionId: "pilot", account: "account1", revision: 1,
+    credentialRevision: 1, resource: "folder1", generation: 1 };
+  const source = externalEventSource("drive");
+  const original = db.enqueueExternal({ schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification-conflict"), type: "changed",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { value: 1 },
+    reply_target: null }, deliveryBinding);
+  const conflict: EventEnvelope = { schema_version: 1, source,
+    external_event_id: scopedExternalEventId(source, "verify", "verification-conflict"), type: "drive.verification",
+    occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { verified: true },
+    reply_target: null };
+  const result = db.enqueueExternal(conflict, deliveryBinding, undefined, new Date(), undefined, true);
+  assert.equal(result.outcome, "duplicate_conflict");
+  assert.equal(db.get(original.row.event_id)?.status, "queued");
 });
 
 test("allowlistとcredential revisionを同時bindingし変更時はfail closed", async (t) => {

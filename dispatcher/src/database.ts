@@ -266,7 +266,7 @@ export class DispatcherDatabase {
       return this.db.transaction(() => {
         const result = this.connections.delivery(binding, envelope,
           () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
-        if (verification && result.row.status !== "completed") this.completeVerification(result.row.event_id, at);
+        if (verification && result.outcome !== "duplicate_conflict") this.completeVerification(result.row.event_id, at);
         return result;
       }).immediate();
     } catch (error) {
@@ -1132,23 +1132,30 @@ export class DispatcherDatabase {
 
   private completeVerification(eventId: string, at: Date): EventRow {
     const row = this.getRequired(eventId);
-    if (row.status === "completed") return row;
-    const result: ResultEnvelope = {
-      schema_version: 1,
-      event_id: eventId,
-      status: "completed",
-      summary: "Provider verification receipt accepted",
-      actions: [],
-      memory_candidates: [],
-      completed_at: at.toISOString(),
-    };
-    this.db
-      .prepare(`
-        UPDATE events SET status = 'completed', result_json = ?, completed_at = ?,
-          last_error_code = NULL, last_error_message = NULL, updated_at = ?
-        WHERE event_id = ?
-      `)
-      .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
+    if (row.status !== "completed") {
+      const result: ResultEnvelope = {
+        schema_version: 1,
+        event_id: eventId,
+        status: "completed",
+        summary: "Provider verification receipt accepted",
+        actions: [],
+        memory_candidates: [],
+        completed_at: at.toISOString(),
+      };
+      this.db
+        .prepare(`
+          UPDATE events SET status = 'completed', result_json = ?, completed_at = ?,
+            last_error_code = NULL, last_error_message = NULL, updated_at = ?
+          WHERE event_id = ?
+        `)
+        .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
+    }
+    const queued = this.db.prepare("SELECT lane FROM queue_events WHERE event_id=?").get(eventId) as { lane: string } | undefined;
+    if (queued) {
+      this.db.prepare("DELETE FROM queue_events WHERE event_id=?").run(eventId);
+      this.db.prepare("DELETE FROM queue_lanes WHERE lane=? AND NOT EXISTS (SELECT 1 FROM queue_events WHERE lane=?)")
+        .run(queued.lane, queued.lane);
+    }
     return this.getRequired(eventId);
   }
 
