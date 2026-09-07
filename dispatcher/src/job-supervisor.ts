@@ -205,7 +205,7 @@ export class JobSupervisor {
     while (!this.stopping) {
       for(const job of this.database.listAmbiguousScheduledJobs()) {
         if(await this.tryComplete(job,false)) continue;
-        if(!["cancel_acceptance_unknown","cancel_exit_unknown"].includes(job.last_error_code??"")) continue;
+        if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;
         const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
         if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
           (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {

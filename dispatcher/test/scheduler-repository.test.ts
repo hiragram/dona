@@ -382,6 +382,7 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation()[0]?.job_id,job.job_id);
   dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
   dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答が不明");
+  raw.prepare("UPDATE jobs SET last_error_code='ambiguous_cancel_acceptance' WHERE job_id=?").run(job.job_id);
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(repo.get("cancel_job")?.state,"cancelled");
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation().some(row=>row.job_id===job.job_id),false);
@@ -500,9 +501,11 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
+  assert.throws(()=>dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"future",completed_at:new Date(Date.now()+60_000).toISOString()},resultPath),/completed_at_is_in_the_future/);
   dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"投稿結果不明",actions:[{tool:"dona_slack.post_message",ambiguous:true}],completed_at:due},resultPath);
   assert.equal(dispatcher.get(eventId)?.status,"needs_review");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  assert.equal(repo.get("result_fence")?.state,"needs_review");
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {

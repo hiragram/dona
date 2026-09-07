@@ -419,7 +419,7 @@ export class DispatcherDatabase {
 
   listAmbiguousScheduledJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown')
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance')
         AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
   }
 
@@ -749,8 +749,9 @@ export class DispatcherDatabase {
   private setNotificationState(eventId:string,state:"none"|"accepted"|"failed"|"needs_review",at:Date):void {
     const rows=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id FROM job_completion_results
       WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).all(eventId) as Array<{run_id:string}>;
-    this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId);
     const timestamp=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+    if(state==="failed"||state==="needs_review") for(const row of rows) this.scheduler.markWorkNotificationNeedsReview(row.run_id,timestamp);
+    this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId);
     for(const row of rows) this.scheduler.settleWorkNotification(row.run_id,timestamp);
   }
 
@@ -999,6 +1000,7 @@ export class DispatcherDatabase {
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    if(Date.parse(result.completed_at)>Date.now()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
@@ -1025,6 +1027,7 @@ export class DispatcherDatabase {
   }
 
   saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
+    if(Date.parse(result.completed_at)>Date.now()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
