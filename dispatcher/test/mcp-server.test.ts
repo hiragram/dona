@@ -27,6 +27,10 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "listThreadJobs", args });
         return { schema_version: 1, jobs: [] };
       },
+      async listOwnerJobs(sourceEventId) {
+        calls.push({ method: "listOwnerJobs", args: [sourceEventId] });
+        return { schema_version: 1, jobs: [] };
+      },
       async steerJob(jobId, input) {
         calls.push({ method: "steerJob", args: [jobId, input] });
         return { schema_version: 1, job: { job_id: jobId, status: "running" } };
@@ -69,7 +73,10 @@ describe("Dona Dispatcher MCP server", () => {
       assert.deepEqual(listed.tools.map(({ name }) => name), [
         "delegate_job",
         "list_thread_jobs",
+        "list_owner_jobs",
         "get_job_status",
+        "authorize_job_notification",
+        "record_schedule_job_access",
         "steer_job",
         "cancel_job",
         "plan_self_update",

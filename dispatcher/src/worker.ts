@@ -137,11 +137,14 @@ export class DispatcherWorker {
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
+    const current=this.database.get(row.event_id);
+    if(current?.status!==row.status) return;
 
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {
       await fs.access(resultPath);
       const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+      if(dispatching.status==="completed") return;
       this.database.markNeedsReview(
         row.event_id,
         "result_path_exists",
@@ -163,6 +166,7 @@ export class DispatcherWorker {
     }
 
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+    if(dispatching.status==="completed") return;
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
@@ -197,7 +201,10 @@ export class DispatcherWorker {
       return;
     }
 
-    this.database.markWaiting(row.event_id);
+    const afterPrompt=this.database.get(row.event_id);
+    if(afterPrompt?.status==="completed"&&afterPrompt.last_error_code==="schedule_notification_suppressed") return;
+    if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
+    else if(afterPrompt?.status!=="waiting_agent") return;
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
@@ -276,6 +283,8 @@ export class DispatcherWorker {
       return true;
     } catch (error) {
       if (error instanceof ResultNotFoundError && !terminalAgentState) return false;
+      const current = this.database.get(row.event_id);
+      if (current?.status === "completed" && current.last_error_code === "schedule_notification_suppressed") return true;
       this.database.markNeedsReview(
         row.event_id,
         error instanceof ResultNotFoundError ? "result_missing" : "invalid_result",

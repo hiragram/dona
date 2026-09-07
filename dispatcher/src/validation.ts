@@ -72,6 +72,9 @@ const scheduleEventEnvelopeSchema = z.object({
   }).strict(),
   payload: z.object({
     run_id: z.string().min(1).max(160), revision: z.number().int().positive(), occurrence_key: z.string().min(1).max(512),
+    work: z.object({ objective: z.string().min(1).max(4_000), scope: z.literal("read_only"),
+      allowed_external_writes: z.tuple([]), result_destination: z.unknown(),
+      authorization_target: z.object({workspace_id:z.string().min(1).max(160),channel_id:z.string().min(1).max(160)}).strict().optional() }).strict().optional(),
   }).strict(),
   reply_target: z.null(),
   trace: z.object({ schedule_id: z.string().min(1).max(160), run_id: z.string().min(1).max(160) }).strict(),
@@ -103,7 +106,7 @@ const gitRef = z
 
 const createJobSchema = z.object({
   source_event_id: z.string().trim().min(1),
-  objective: z.string().trim().min(1).max(100_000),
+  objective: z.string().min(1).max(100_000).refine(value=>value.trim().length>0,"must contain non-whitespace content"),
   workspace: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("scratch") }).strip(),
     z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),

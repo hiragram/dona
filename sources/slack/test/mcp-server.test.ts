@@ -74,6 +74,7 @@ class FakeSlackClient implements SlackApiClient {
       isShared: false,
     };
   }
+  async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
   async listUsers(): Promise<SlackUserPage> {
     return { users: [await this.getUser()] };
   }
@@ -179,6 +180,7 @@ describe("Dona Slack MCP server", () => {
           "list_workspaces",
           "list_channels",
           "get_channel",
+          "check_user_channel_access",
           "list_users",
           "get_user",
           "get_thread",
@@ -193,6 +195,8 @@ describe("Dona Slack MCP server", () => {
         listed.tools.find(({ name }) => name === "get_thread")?.annotations?.readOnlyHint,
         true,
       );
+      const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1"}});
+      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true});
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
@@ -255,6 +259,7 @@ describe("Dona Slack MCP server", () => {
         channel_id: "C123",
         message_ts: "2.3",
         thread_ts: "1.2",
+        reply_broadcast: false,
       });
 
       const fileResult = await client.callTool({

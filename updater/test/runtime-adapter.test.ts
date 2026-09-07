@@ -206,7 +206,7 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
   const canonicalTargetRelease = await fs.realpath(targetRelease);
   const canonicalConfigRoot = await fs.realpath(policy.config_root);
   const dispatcherMcpEnvironment = `mcp_servers.dona_dispatcher.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "dispatcher.env"))}, "DONA_RELEASE_MANIFEST_PATH" = ${JSON.stringify(path.join(policy.current_pointer, "release-manifest.json"))}, "DONA_UPDATER_SOCKET_PATH" = ${JSON.stringify(path.join(policy.control_root, "updater.sock"))}, "DONA_UPDATE_INTERNAL_TOKEN_PATH" = ${JSON.stringify(policy.dispatcher_internal_token_file)}, "DONA_HERDR_PATH" = ${JSON.stringify(policy.executables.herdr)}, "DONA_GH_PATH" = ${JSON.stringify(policy.executables.gh)}, "DONA_GIT_PATH" = ${JSON.stringify(policy.executables.git)} }`;
-  const slackMcpEnvironment = `mcp_servers.dona_slack.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "slack.env"))} }`;
+  const slackMcpEnvironment = `mcp_servers.dona_slack.env = { "DOTENV_CONFIG_PATH" = ${JSON.stringify(path.join(canonicalConfigRoot, "slack.env"))}, "DONA_UPDATE_INTERNAL_TOKEN_PATH" = ${JSON.stringify(policy.dispatcher_internal_token_file)} }`;
   const runner = new AgentRunner(currentRelease);
   const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner);
   try {

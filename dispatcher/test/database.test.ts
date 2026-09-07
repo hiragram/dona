@@ -68,8 +68,32 @@ describe("DispatcherDatabase", () => {
     const event = database.enqueue(eventEnvelope("Ev-1")).row;
     database.beginDispatch(event.event_id, `${config.resultsDir}/${event.event_id}.json`);
     database.markNeedsReview(event.event_id, "prompt_timeout", "unknown acceptance");
+    await fs.mkdir(config.resultsDir,{recursive:true});
+    await fs.writeFile(`${config.resultsDir}/${event.event_id}.json`,"old result");
     assert.throws(() => database.manualRetry(event.event_id, false), /--force/);
     assert.equal(database.manualRetry(event.event_id, true).status, "queued");
+    await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json`));
+    await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json.retry-backup`));
+    database.close();
+  });
+
+  test("restores the Result when a manual retry transaction fails", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-retry-rollback")).row;
+    const resultPath = `${config.resultsDir}/${event.event_id}.json`;
+    database.beginDispatch(event.event_id, resultPath);
+    database.markNeedsReview(event.event_id, "prompt_timeout", "unknown acceptance");
+    await fs.mkdir(config.resultsDir,{recursive:true});
+    await fs.writeFile(resultPath,"old result");
+    const trigger = new Database(config.databasePath);
+    trigger.exec("CREATE TRIGGER reject_manual_retry BEFORE UPDATE ON events WHEN OLD.external_event_id = 'Ev-retry-rollback' BEGIN SELECT RAISE(ABORT, 'retry rejected'); END;");
+    trigger.close();
+    assert.throws(() => database.manualRetry(event.event_id, true), /retry rejected/);
+    assert.equal(await fs.readFile(resultPath,"utf8"),"old result");
+    await assert.rejects(fs.access(`${resultPath}.retry-backup`));
+    assert.equal(database.get(event.event_id)?.status,"needs_review");
     database.close();
   });
 
@@ -99,7 +123,7 @@ describe("DispatcherDatabase", () => {
     assert.equal(created.row.agent_name, created.row.job_id);
     assert.equal(created.row.agent_name.length, 30);
     assert.equal(created.row.workspace_path, `${config.jobsWorkspaceRoot}/scratch/${created.row.job_id}`);
-    assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}.json`);
+    assert.equal(created.row.result_path, `${config.jobResultsDir}/${created.row.job_id}/result.json`);
     assert.equal(database.createJob(
       { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
       config.jobsWorkspaceRoot,
@@ -191,10 +215,37 @@ describe("DispatcherDatabase", () => {
       agent_name: string;
     };
     assert.equal(persisted.agent_name, job.job_id);
+    raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(`${config.jobResultsDir}/${job.job_id}.json`,job.job_id);
     raw.close();
 
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.equal(reopened.getJob(job.job_id)?.agent_name, job.job_id);
+    assert.equal(reopened.getJob(job.job_id)?.result_path,`${config.jobResultsDir}/${job.job_id}/result.json`);
+    assert.equal(reopened.listLegacySharedGrantJobs().some(row=>row.job_id===job.job_id),false);
+    reopened.close();
+  });
+
+  test("isolates legacy preparing and running jobs whose existing agent grants cannot be verified", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-legacy-preparing")).row;
+    const job = database.createJob({source_event_id:source.event_id,objective:"調査する",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const secondSource=database.enqueue(eventEnvelope("Ev-job-legacy-running")).row;
+    const running=database.createJob({source_event_id:secondSource.event_id,objective:"実行する",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id); database.close();
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(`${config.jobResultsDir}/${job.job_id}.json`,job.job_id); raw.close();
+    const rawRunning=new Database(config.databasePath); rawRunning.prepare("UPDATE jobs SET status='running',result_path=? WHERE job_id=?").run(`${config.jobResultsDir}/${running.job_id}.json`,running.job_id); rawRunning.close();
+    const reopened = new DispatcherDatabase(config.databasePath), isolated=reopened.getJob(job.job_id)!;
+    assert.equal(isolated.status,"needs_review"); assert.equal(isolated.last_error_code,"legacy_agent_sandbox_unknown");
+    assert.equal(reopened.getJob(running.job_id)?.last_error_code,"legacy_agent_sandbox_unknown");
+    assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),false);
+    const recoveredResult={schema_version:1 as const,job_id:running.job_id,status:"completed" as const,summary:"回収済み",completed_at:new Date().toISOString()};
+    assert.throws(()=>reopened.saveJobResult(running.job_id,recoveredResult,`${config.jobResultsDir}/${running.job_id}.json`),/Invalid status transition/);
+    reopened.markLegacySharedGrantAgentStopped(running.job_id);
+    assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),true);
+    reopened.saveJobResult(running.job_id,recoveredResult,`${config.jobResultsDir}/${running.job_id}.json`);
+    assert.equal(reopened.getJob(running.job_id)?.status,"completed");
     reopened.close();
   });
 });

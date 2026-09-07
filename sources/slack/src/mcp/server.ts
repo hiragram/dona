@@ -92,6 +92,7 @@ function failure(error: unknown, logger: SlackLogger, fields: Record<string, unk
 export function createSlackMcpServer(
   registry: SlackWorkspaceRegistry,
   logger: SlackLogger,
+  signAccessReceipt?: (input:{event_id:string;workspace_id:string;channel_id:string;user_id:string})=>string,
 ): McpServer {
   const server = new McpServer(
     { name: "dona-slack", version: "0.1.0" },
@@ -202,6 +203,22 @@ export function createSlackMcpServer(
       }
     },
   );
+
+  server.registerTool("check_user_channel_access", {
+    title: "Check current Slack access",
+    description: "外部write直前に、指定userが現在もworkspaceに存在し対象channelのmemberであることを確認します。照会失敗は許可として扱いません。",
+    inputSchema: { workspace: workspaceSchema, channel_id: channelSchema, user_id: userSchema,event_id:z.string().min(1).max(128).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({workspace,channel_id,user_id,event_id}) => {
+    try {
+      const connection=registry.get(workspace);
+      if(!connection.client.hasChannelMember) throw new SlackApiError("access_check_unavailable","Current membership check is unavailable");
+      const user=await connection.client.getUser(user_id);
+      const channel=await connection.client.getChannel(channel_id);
+      const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,...(authorized&&event_id&&signAccessReceipt?{access_receipt:signAccessReceipt({event_id,workspace_id:connection.teamId,channel_id,user_id})}:{})});
+    } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
+  });
 
   server.registerTool(
     "list_users",
@@ -500,6 +517,7 @@ export function createSlackMcpServer(
           workspace,
           channel_id: result.channelId,
           message_ts: result.messageTs,
+          reply_broadcast,
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
       } catch (error) {

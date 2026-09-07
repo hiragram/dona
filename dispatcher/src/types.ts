@@ -109,6 +109,8 @@ export interface EventRow {
   last_error_message: string | null;
   created_at: string;
   updated_at: string;
+  schedule_access_checked_at: string | null;
+  schedule_access_consumed_at: string | null;
 }
 
 export interface EnqueueResult {
