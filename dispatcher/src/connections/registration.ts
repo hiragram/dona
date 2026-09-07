@@ -53,11 +53,18 @@ export class ProviderRegistrationRegistry {
       s.resource,s.generation,s.revision subscription_revision,s.provider_id,s.verification_epoch,s.expires_at
       FROM connections c JOIN connection_subscriptions s ON s.connection_id=c.id
       WHERE c.provider=? AND s.provider_id=? AND c.state!='disabled' AND (?=0 OR s.revision=c.revision)
-        AND ((?=1 AND c.state='active' AND s.verified_at IS NOT NULL AND s.state IN ('active','expiring','stop_candidate'))
+        AND ((?=1 AND c.state='active' AND s.verified_at IS NOT NULL AND
+          (s.state IN ('active','expiring','stop_candidate') OR (s.state='renewal_unknown'
+            AND EXISTS (SELECT 1 FROM connection_operations o WHERE o.connection_id=s.connection_id
+              AND o.resource=s.resource AND o.generation=s.generation AND o.kind='stop' AND o.state!='done')
+            AND EXISTS (SELECT 1 FROM connection_subscriptions replacement WHERE replacement.connection_id=s.connection_id
+              AND replacement.resource=s.resource AND replacement.generation>s.generation AND replacement.revision=c.revision
+              AND replacement.verified_at IS NOT NULL AND replacement.state IN ('active','expiring')
+              AND (replacement.expires_at IS NULL OR replacement.expires_at>?)))))
           OR (?=0 AND s.state IN ('verification_pending','active','expiring')))
         AND (s.expires_at IS NULL OR s.expires_at>?)
         AND (? IS NULL OR c.id=?) AND (? IS NULL OR s.resource=?)`)
-      .all(input.provider, input.providerId, activeOnly ? 1 : 0, activeOnly ? 1 : 0, activeOnly ? 1 : 0, now,
+      .all(input.provider, input.providerId, activeOnly ? 1 : 0, activeOnly ? 1 : 0, now, activeOnly ? 1 : 0, now,
         input.connectionId ?? null, input.connectionId ?? null,
         input.resource ?? null, input.resource ?? null) as Array<{ connection_id: string; provider: string; config_json: string;
           revision: number; last_clock: number; resource: string; generation: number; subscription_revision: number; provider_id: string;
@@ -108,14 +115,13 @@ export class ProviderRegistrationRegistry {
       let binding: VerificationBinding;
       try { binding = this.binding(input, false, now); }
       catch (error) {
-        if (connectionIdentifier.safeParse(input.connectionId).success && identifier.safeParse(input.provider).success)
+        if (connectionIdentifier.safeParse(input.connectionId).success && identifier.safeParse(input.provider).success &&
+          identifier.safeParse(input.providerId).success && identifier.safeParse(input.account).success && identifier.safeParse(input.resource).success)
           this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=? AND provider=?").run(now, input.connectionId, input.provider);
         return { error };
       }
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.delivery.connectionId);
       // 1回のmaintenanceが長時間lockを保持しないよう削除数をboundedにする。
-      this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
-        WHERE state='consumed' ORDER BY expires_at LIMIT 100)`).run();
       this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
         WHERE expires_at<=? ORDER BY expires_at LIMIT 100)`).run(now);
       const token = randomBytes(32).toString("base64url");

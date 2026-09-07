@@ -189,12 +189,31 @@ test("active resolverは検証済みstop_candidateを配信可能として解決
   assert.deepEqual(db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), binding);
 });
 
+test("active resolverは未解決stop中の旧generationをreplacement存在時だけ解決する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare(`INSERT INTO connection_subscriptions
+    SELECT connection_id,resource,2,revision,'subscription:two','active',created_at,?,expires_at,renewal_window_ms,verification_epoch,
+      last_delivery_at,last_reconcile_at,error FROM connection_subscriptions WHERE connection_id='pilot' AND generation=1`).run(clock.value);
+  raw.prepare(`INSERT INTO connection_operations(id,connection_id,resource,generation,revision,kind,state,lease_until)
+    VALUES('stop-one','pilot','page:one',1,1,'stop','unknown',?)`).run(clock.value + 1_000);
+  raw.prepare("UPDATE connection_subscriptions SET state='renewal_unknown' WHERE connection_id='pilot' AND generation=1").run();
+  assert.deepEqual(db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), binding);
+  raw.prepare("DELETE FROM connection_operations WHERE id='stop-one'").run();
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /not_authorized/);
+});
+
 test("binding optional identityはSQL実行前にtyped validationする", (t) => {
-  const { db } = fixture(t);
+  const { db, file } = fixture(t); db.connections.register(config); activate(db);
+  const raw = new Database(file); t.after(() => raw.close());
+  const before = (raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock;
   assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
     resource: { untrusted: true } as never }), /invalid_input/);
   assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
     connectionId: "x".repeat(10_000) }), /invalid_input/);
+  assert.throws(() => db.providerRegistration.issue({ provider: "notion", providerId: {} as never, connectionId: "pilot",
+    account: "workspace:one", resource: "page:one" }, 5_000), /invalid_input/);
+  assert.equal((raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock, before);
 });
 
 test("verification attemptはdigestのみ永続化しexpiry/replay/restart/tamperを拒否する", (t) => {
@@ -463,8 +482,13 @@ test("attempt発行時のretentionは期限切れrowをboundedに削除する", 
     resource,generation,provider_id,expires_at,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`);
   for (let index = 0; index < 101; index++) insert.run(index.toString(16).padStart(64, "0"), "pilot", "notion", "workspace:one", 1, 1,
     "page:one", 1, "subscription:one", clock.value - 1, clock.value - 2);
+  raw.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,resource,generation,
+    provider_id,expires_at,state,claim_id,claim_until,created_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,?,'consumed','claim',?,?,?)`)
+    .run("f".repeat(64), "pilot", "notion", "workspace:one", 1, 1, "page:one", 1, "subscription:one",
+      clock.value + 5_000, clock.value + 1_000, clock.value - 2, clock.value - 1);
   db.providerRegistration.issue(identity, 5_000);
-  assert.equal((raw.prepare("SELECT count(*) n FROM verification_attempts").get() as { n: number }).n, 2);
+  assert.equal((raw.prepare("SELECT count(*) n FROM verification_attempts").get() as { n: number }).n, 3);
+  assert.equal((raw.prepare("SELECT state FROM verification_attempts WHERE digest=?").get("f".repeat(64)) as { state: string }).state, "consumed");
   assert.match(JSON.stringify(raw.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM verification_attempts WHERE expires_at<=? ORDER BY expires_at LIMIT 100").all(clock.value)),
     /verification_attempt_expires_at_idx/);
 });
