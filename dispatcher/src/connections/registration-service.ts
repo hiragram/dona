@@ -1,4 +1,4 @@
-import { ConnectionError, parseConfig, type Connection, type ConnectionConfig } from "./domain.js";
+import { ConnectionError, connectionIdentifier, parseConfig, type Connection, type ConnectionConfig } from "./domain.js";
 import { ConnectionRegistry } from "./registry.js";
 import { PrivateFileSecretStore } from "./secret-store.js";
 import { stableStringify } from "../validation.js";
@@ -47,7 +47,8 @@ export class ProviderRegistrationService {
   }
 
   async rotate(id: string, expectedRevision: number, config: ConnectionConfig, secret: Uint8Array): Promise<Connection> {
-    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ConnectionError("invalid_input");
+    if (!connectionIdentifier.safeParse(id).success || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+      throw new ConnectionError("invalid_input");
     const parsed = parseConfig(config);
     const current = this.connections.get(id);
     const alreadyAccepted = this.accepted(id, parsed, expectedRevision + 1);

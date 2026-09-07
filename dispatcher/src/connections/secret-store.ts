@@ -154,13 +154,17 @@ export class PrivateFileSecretStore {
         stats.size < 16 || stats.size > 65_536)
         throw new ConnectionError("not_authorized");
       const bounded = Buffer.allocUnsafe(65_537); let offset = 0;
-      while (offset < bounded.length) {
-        const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset);
-        if (bytesRead === 0) break;
-        offset += bytesRead;
+      try {
+        while (offset < bounded.length) {
+          const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
+        if (offset < 16 || offset > 65_536) throw new ConnectionError("not_authorized");
+        return Buffer.from(bounded.subarray(0, offset));
+      } finally {
+        bounded.fill(0);
       }
-      if (offset < 16 || offset > 65_536) { bounded.fill(0); throw new ConnectionError("not_authorized"); }
-      const result = Buffer.from(bounded.subarray(0, offset)); bounded.fill(0); return result;
     } finally { await handle.close(); }
   }
 

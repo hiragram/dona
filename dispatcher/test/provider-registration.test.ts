@@ -392,6 +392,7 @@ test("rotationはrevision 0をresponse-loss retryとして受理しない", asyn
   const { db, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
   await service.register(config, Buffer.alloc(32, 1));
   await assert.rejects(service.rotate("pilot", 0, config, Buffer.alloc(32, 1)), /invalid_input/);
+  await assert.rejects(service.rotate({ untrusted: true } as never, 1, config, Buffer.alloc(32, 1)), /invalid_input/);
 });
 
 test("attempt発行時のretentionは期限切れrowをboundedに削除する", (t) => {
