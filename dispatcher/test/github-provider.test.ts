@@ -9,6 +9,7 @@ import { DispatcherDatabase } from "../src/database.js";
 import { DispatcherApi } from "../src/api.js";
 import { ExternalIngressRegistry } from "../src/ingress.js";
 import { GitHubReadOnlyInstallationClient, githubPilotRegistration, verifyGitHubSignature } from "../src/providers/github.js";
+import { serviceExternalIngressRegistry } from "../src/service.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))); });
@@ -20,8 +21,9 @@ const payload = Buffer.from(JSON.stringify({ action: "opened", installation: { i
 const signature = (body = payload) => `sha256=${createHmac("sha256", secretText).update(body).digest("hex")}`;
 
 function registration() {
-  return githubPilotRegistration({ connectionId: "github-pilot", account: "installation:77", connectionRevision: 1, credentialRevision: 1,
+  return githubPilotRegistration({ connectionId: "github-pilot", installationId: 77,
     repositoryId: 42, repositoryFullName: "hiragram/dona", events: { issues: ["opened"] },
+    resolveBinding: async () => ({ account: "installation:77", revision: 1, credentialRevision: 1, generation: 1 }),
     resolveWebhookSecret: async () => Buffer.from(secretText) });
 }
 
@@ -32,6 +34,17 @@ describe("GitHub provider pilot", () => {
     for (const malformed of ["", "sha1=abc", "sha256=xyz", `sha256=${"a".repeat(62)}`]) {
       assert.throws(() => verifyGitHubSignature(payload, malformed, Buffer.from(secretText)));
     }
+  });
+
+  test("resolverのsecret Bufferを使用後に消去する", async () => {
+    const secret = Buffer.from(secretText);
+    const registered = githubPilotRegistration({ connectionId: "github-pilot", installationId: 77, repositoryId: 42,
+      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] },
+      resolveBinding: async () => ({ account: "installation:77", revision: 1, credentialRevision: 1, generation: 2 }),
+      resolveWebhookSecret: async () => secret });
+    await registered.authenticate({ body: payload, method: "POST", requestTarget: "/", receivedAt: "2026-09-07T00:00:00Z",
+      headers: [["X-GitHub-Delivery", delivery], ["X-GitHub-Event", "issues"], ["X-Hub-Signature-256", signature()]] });
+    assert.ok(secret.every(byte => byte === 0));
   });
 
   test("header、event/action、repository allowlistをstrictに検証する", async () => {
@@ -46,6 +59,11 @@ describe("GitHub provider pilot", () => {
     const wrongHeaders = good.map(([name, value]) => [name, name === "X-Hub-Signature-256" ? signature(wrong) : value] as const);
     const wrongVerified = await registration().authenticate({ ...base, body: wrong, headers: wrongHeaders });
     assert.throws(() => registration().normalize({ ...base, body: wrong, headers: wrongHeaders }, wrongVerified));
+    const realistic = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77, node_id: "I_1" },
+      repository: { id: 42, full_name: "hiragram/dona", private: true }, issue: { updated_at: "2026-09-07T00:00:00Z", id: 52, title: "fixture" } }));
+    const realisticHeaders = good.map(([name, value]) => [name, name === "X-Hub-Signature-256" ? signature(realistic) : value] as const);
+    const realisticVerified = await registration().authenticate({ ...base, body: realistic, headers: realisticHeaders });
+    assert.doesNotThrow(() => registration().normalize({ ...base, body: realistic, headers: realisticHeaders }, realisticVerified));
   });
 
   test("実HTTPで署名検証後のcommitだけを202でACKしduplicate/conflictを分離する", async () => {
@@ -69,7 +87,7 @@ describe("GitHub provider pilot", () => {
       assert.equal((await send(payload)).status, 202);
       const duplicates = await Promise.all(Array.from({ length: 8 }, () => send(payload)));
       assert.deepEqual(duplicates.map(result => result.status), Array(8).fill(202));
-      const changed = Buffer.from(payload.toString().replace('"id":77', '"id":78'));
+      const changed = Buffer.from(payload.toString().replace("2026-09-07T00:00:00Z", "2026-09-07T00:00:01Z"));
       assert.equal((await send(changed)).status, 409);
       assert.equal(database.list().length, 1);
       assert.equal(database.list()[0]?.source, "github");
@@ -84,5 +102,31 @@ describe("GitHub provider pilot", () => {
     assert.deepEqual(await client.get("/issues/52"), { id: 52 });
     assert.equal(calls[0]?.init?.method, "GET");
     await assert.rejects(client.get("/../other/repo"));
+    await assert.rejects(client.get("/%2e%2e/%2e%2e/installation/repositories"));
+  });
+
+  test("serve起動用registryへconfigとcurrent subscription generationを接続する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const secretPath = `${root}/github-webhook-secret`;
+    await fs.writeFile(secretPath, secretText, { mode: 0o600 });
+    config.githubPilot = { connectionId: "github-pilot", installationId: 77, repositoryId: 42,
+      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath };
+    const database = new DispatcherDatabase(config.databasePath);
+    database.connections.register({ id: "github-pilot", provider: "github", account: "installation:77",
+      allowlist: [{ resource: "42", events: ["issues.opened"] }], credentialRef: "cred_github_pilot", credentialRevision: 1,
+      capability: { kind: "manual", cursor: false } });
+    database.connections.attachManual("github-pilot", 1, "42", "hook:2", null);
+    database.connections.observe("github-pilot", 1, "42", 1, { providerId: "hook:2", expiresAt: null, verified: true, cutoverConfirmed: false });
+    database.connections.revise("github-pilot", 1, { id: "github-pilot", provider: "github", account: "installation:77",
+      allowlist: [{ resource: "42", events: ["issues.opened"] }], credentialRef: "cred_github_pilot", credentialRevision: 2,
+      capability: { kind: "manual", cursor: false } });
+    database.connections.attachManual("github-pilot", 2, "42", "hook:3", null);
+    database.connections.observe("github-pilot", 2, "42", 2, { providerId: "hook:3", expiresAt: null, verified: true, cutoverConfirmed: true });
+    const registered = serviceExternalIngressRegistry(config, database).get("github")?.registration;
+    assert.ok(registered);
+    const verified = await registered.authenticate({ body: payload, method: "POST", requestTarget: "/", receivedAt: "2026-09-07T00:00:00Z",
+      headers: [["X-GitHub-Delivery", delivery], ["X-GitHub-Event", "issues"], ["X-Hub-Signature-256", signature()]] });
+    assert.equal(verified.connection?.generation, 2);
+    database.close();
   });
 });

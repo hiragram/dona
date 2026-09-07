@@ -522,6 +522,7 @@ export class DispatcherApi {
       method: "POST",
       requestTarget: request.url!,
       receivedAt,
+      receivedAtMonotonic: monotonicNow,
     });
 
     let result;

@@ -12,24 +12,23 @@ import {
 const deliveryPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const eventPattern = /^[a-z][a-z0-9_]{0,63}$/;
 
-const repositorySchema = z.strictObject({ id: z.number().int().positive(), full_name: z.string().min(3).max(255) });
-const installationSchema = z.strictObject({ id: z.number().int().positive() });
+const repositorySchema = z.object({ id: z.number().int().positive(), full_name: z.string().min(3).max(255) }).passthrough();
+const installationSchema = z.object({ id: z.number().int().positive() }).passthrough();
 const payloadSchema = z.object({
   action: z.string().min(1).max(64),
   installation: installationSchema,
   repository: repositorySchema,
-  issue: z.strictObject({ updated_at: z.string().datetime({ offset: true }) }),
+  issue: z.object({ updated_at: z.string().datetime({ offset: true }) }).passthrough(),
 }).passthrough();
 
 export interface GitHubPilotConfig {
   readonly connectionId: string;
-  readonly account: string;
-  readonly connectionRevision: number;
-  readonly credentialRevision: number;
+  readonly installationId: number;
   readonly repositoryId: number;
   readonly repositoryFullName: string;
   readonly events: Readonly<Record<string, readonly string[]>>;
-  readonly resolveWebhookSecret: () => Promise<Buffer>;
+  readonly resolveBinding: () => Promise<{ account: string; revision: number; credentialRevision: number; generation: number }>;
+  readonly resolveWebhookSecret: (credentialRevision: number) => Promise<Buffer>;
 }
 
 type GitHubPrincipal = {
@@ -64,7 +63,8 @@ function principal(verified: VerifiedIngressPrincipal): GitHubPrincipal {
 }
 
 export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEventSourceRegistration {
-  if (!Number.isSafeInteger(config.repositoryId) || config.repositoryId <= 0 || config.repositoryFullName.length < 3) {
+  if (!Number.isSafeInteger(config.installationId) || config.installationId <= 0 ||
+      !Number.isSafeInteger(config.repositoryId) || config.repositoryId <= 0 || config.repositoryFullName.length < 3) {
     throw new Error("GitHub pilot repository allowlist is invalid");
   }
   return {
@@ -79,7 +79,8 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
       if (!deliveryPattern.test(deliveryId) || !eventPattern.test(event) || !(event in config.events)) {
         throw new ExternalIngressAuthenticationError();
       }
-      const secret = Buffer.from(await config.resolveWebhookSecret());
+      const binding = await config.resolveBinding();
+      const secret = await config.resolveWebhookSecret(binding.credentialRevision);
       try {
         if (secret.length < 32) throw new ExternalIngressAuthenticationError();
         verifyGitHubSignature(request.body, signature, secret);
@@ -90,13 +91,13 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
         connectionId: config.connectionId,
         resourceId: String(config.repositoryId),
         connection: {
-          account: config.account,
-          revision: config.connectionRevision,
-          credentialRevision: config.credentialRevision,
+          account: binding.account,
+          revision: binding.revision,
+          credentialRevision: binding.credentialRevision,
           resource: String(config.repositoryId),
-          generation: 1,
+          generation: binding.generation,
         },
-        principal: { deliveryId, event, secretRevision: config.credentialRevision },
+        principal: { deliveryId, event, secretRevision: binding.credentialRevision },
       };
     },
     normalize(request, verified) {
@@ -104,7 +105,7 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
       let raw: unknown;
       try { raw = JSON.parse(request.body.toString("utf8")); } catch { throw new ExternalIngressValidationError(); }
       const payload = payloadSchema.safeParse(raw);
-      if (!payload.success || payload.data.repository.id !== config.repositoryId ||
+      if (!payload.success || payload.data.installation.id !== config.installationId || payload.data.repository.id !== config.repositoryId ||
           payload.data.repository.full_name !== config.repositoryFullName ||
           !config.events[identity.event]?.includes(payload.data.action)) {
         throw new ExternalIngressValidationError();
@@ -144,7 +145,11 @@ export class GitHubReadOnlyInstallationClient {
   }
 
   async get(path: string): Promise<unknown> {
-    if (!/^\/[A-Za-z0-9_./?=&%-]*$/.test(path) || path.includes("..")) throw new Error("GitHub API path is invalid");
+    let decoded: string;
+    try { decoded = decodeURIComponent(path); } catch { throw new Error("GitHub API path is invalid"); }
+    if (!/^\/[A-Za-z0-9_./?=&%-]*$/.test(path) || decoded.includes("..") || decoded.includes("\\")) {
+      throw new Error("GitHub API path is invalid");
+    }
     const token = await this.tokens.token();
     const response = await this.fetchImpl(`https://api.github.com/repos/${this.repositoryFullName}${path}`, {
       method: "GET",
