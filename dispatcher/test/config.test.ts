@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
+import os from "node:os";
 import { describe, test } from "node:test";
 
 import {
   jobResourceDefaults,
   jobResourceHardLimits,
+  expandHome,
   loadConfig,
 } from "../src/config.js";
 
 describe("job resource config", () => {
+  test("expands documented home-relative paths consistently", () => {
+    assert.equal(expandHome("~/Library/Application Support/Dona/release-manifest.json"),
+      `${os.homedir()}/Library/Application Support/Dona/release-manifest.json`);
+  });
   test("loads safe defaults and allows the scheduler to apply the smaller concurrency limit", () => {
     const defaults = loadConfig({});
     assert.equal(defaults.jobsPerEventMax, jobResourceDefaults.jobsPerEventMax);

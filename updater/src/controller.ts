@@ -19,6 +19,7 @@ import type {
 import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
+const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 interface TerminalObservation {
   status: "succeeded" | "rolled_back";
   activeSha: string;
@@ -85,6 +86,14 @@ export class UpdateController {
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
     if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
+    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
+      if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
+      controlPlane = await this.runtime.schemaMigrationCapability();
+      if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
+        throw new Error("stable_updater_exact_target_schema_migration_capability_required");
+      }
+    }
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,
@@ -98,7 +107,10 @@ export class UpdateController {
       request_id: result.row.request_id,
       duplicate: result.duplicate,
       plan: result.plan,
-      preflight: { storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable },
+      preflight: {
+        storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
+        ...(controlPlane ? { schema_migration_control_plane_sha: controlPlane.build_sha } : {}),
+      },
     };
   }
 
@@ -405,6 +417,8 @@ export class UpdateController {
     }
     if (row.state === "quiescing") {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
+      const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
+      const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
       const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
@@ -424,17 +438,30 @@ export class UpdateController {
         );
         return;
       }
-      // Quiesce is keyed by the stable request ID and is idempotent. Re-observe it
-      // after every controller restart in case either ingress service also restarted.
-      const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+      // Reboot can restart a previously stopped launchd service. Re-observe each
+      // service independently: live services must drain again, while an unavailable
+      // UDS is accepted as stopped only when this request has durable stop evidence.
+      const slackHealth = await this.runtime.slackHealth();
       this.assertLease(row);
-      if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-        throw new Error("slack_adapter_drain_incomplete");
+      if (slackHealth.live) {
+        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+          throw new Error("slack_adapter_drain_incomplete");
+        }
+      } else if (persistedSlackStop?.phase !== "observed") {
+        throw new Error("slack_adapter_current_state_unverified");
       }
-      const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+      const dispatcherHealth = await this.runtime.dispatcherHealth();
       this.assertLease(row);
-      if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-        throw new Error("dispatcher_drain_incomplete");
+      if (dispatcherHealth.live) {
+        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+          throw new Error("dispatcher_drain_incomplete");
+        }
+      } else if (persistedDispatcherStop?.phase !== "observed") {
+        throw new Error("dispatcher_current_state_unverified");
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();
@@ -498,6 +525,28 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
       ))) return;
+      const previousManifest = await this.releases.readCurrentManifest();
+      const previousCompatibility = previousManifest.compatibility;
+      if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
+        if (previousManifest.sha !== schemaV3BridgeSha || previousManifest.sha !== row.current_sha) {
+          this.needsReview(row, "schema_activation_bridge_identity_unverified");
+          return;
+        }
+        const controlPlane = await this.runtime.schemaMigrationCapability();
+        this.assertLease(row);
+        if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
+          this.needsReview(row, "stable_updater_schema_migration_capability_unverified");
+          return;
+        }
+        const migration = await this.runtime.migrateAppSchema(
+          row.request_id, row.target_sha, previousCompatibility, targetCompatibility,
+        );
+        this.assertLease(row);
+        if (migration.timed_out || migration.output_truncated || migration.exit_code !== 0) {
+          this.needsReview(row, "app_schema_migration_unverified");
+          return;
+        }
+      }
       row = this.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced", {}, this.clock.now());
     }
     if (row.state === "activating") {
@@ -933,6 +982,10 @@ export class UpdateController {
       this.needsReview(row, "rollback_main_agent_stop_rejected");
       return undefined;
     }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
+      return undefined;
+    }
     if (existing) {
       const observed = await this.runtime.mainAgentStatus(targetRelease);
       this.assertLease(row);
@@ -1093,6 +1146,10 @@ export class UpdateController {
     }
     if (existing?.phase === "rejected") {
       this.needsReview(row, `${kind}_rejected`, `The persisted ${kind} operation was definitively rejected`);
+      return false;
+    }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
       return false;
     }
     if (existing) {

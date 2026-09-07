@@ -43,7 +43,7 @@ export const jobResourceHardLimits = {
   jobConcurrencyPerEvent: 32,
 } as const;
 
-function expandHome(value: string): string {
+export function expandHome(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
   return path.resolve(value);

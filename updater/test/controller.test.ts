@@ -40,6 +40,32 @@ test("requires a v2/v3 compatibility bridge before a schema-v3 writing release",
   assert.equal(releaseCompatibilityMatches(schemaV3, bridge), true);
 });
 
+test("refuses schema-v3 planning without an exact stable updater migration capability receipt", async () => {
+  const f = await fixture();
+  const bridgeCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const activationCompatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.runtime.schemaMigrationReady = false;
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = "3".repeat(40);
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  assert.equal(f.database.list().length, 0);
+  f.database.close();
+});
+
 class FakeGit implements GitPort {
   targetCompatibility: Compatibility = {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
@@ -99,6 +125,13 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
+  schemaMigrationReady = true;
+  schemaMigrationBuildSha = targetSha;
+  async schemaMigrationCapability() {
+    this.calls.push("schemaMigrationCapability");
+    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null };
+  }
+  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
@@ -427,6 +460,9 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
 
     assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.equal(f.runtime.calls.filter((call) => call === "migrateAppSchema").length, 1);
+    assert.ok(f.runtime.calls.indexOf("stopDispatcher") < f.runtime.calls.indexOf("migrateAppSchema"));
+    assert.ok(f.runtime.calls.indexOf("migrateAppSchema") < f.runtime.calls.indexOf(`startMainAgent:${targetSha}`));
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });

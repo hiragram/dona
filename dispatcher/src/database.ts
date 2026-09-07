@@ -4,7 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
 
-import { jobResourceDefaults, jobResourceHardLimits } from "./config.js";
+import { expandHome, jobResourceDefaults, jobResourceHardLimits } from "./config.js";
 import type {
   CreateJobRequest,
   CreateJobResult,
@@ -81,10 +81,19 @@ export class JobCreationError extends Error {
   }
 }
 
+function configuredSchemaWrite(): 2 | 3 {
+  const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return 3;
+  const manifest = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as { compatibility?: { app_schema_write?: unknown } };
+  const write = manifest.compatibility?.app_schema_write;
+  if (write !== 2 && write !== 3) throw new Error("Release manifest app_schema_write is invalid");
+  return write;
+}
+
 export const dispatcherSchemaCompatibility = {
   read_min: 2,
   read_max: 3,
-  write: 3,
+  get write(): 2 | 3 { return configuredSchemaWrite(); },
 } as const;
 
 export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled";
@@ -117,6 +126,36 @@ function ensureJobsRunnableFairIndex(db: Database.Database): void {
     db.exec(jobsRunnableFairIndexSql);
   })();
 }
+
+function ensureV2BridgeSchema(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+  if (!columns.some(({ name }) => name === "job_key")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN job_key TEXT NOT NULL DEFAULT 'legacy-default'");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_groups (
+      source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
+      sealed_at             TEXT,
+      notification_mode     TEXT NOT NULL CHECK (notification_mode IN ('grouped', 'legacy')),
+      attention_event_id    TEXT REFERENCES events(event_id),
+      all_terminal_event_id TEXT REFERENCES events(event_id),
+      created_at            TEXT NOT NULL,
+      updated_at            TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS job_groups_transition_idx
+      ON job_groups(notification_mode, sealed_at, updated_at);
+    CREATE INDEX IF NOT EXISTS jobs_event_idx ON jobs(source_event_id, created_at);
+    INSERT OR IGNORE INTO job_groups (
+      source_event_id, sealed_at, notification_mode, attention_event_id,
+      all_terminal_event_id, created_at, updated_at
+    )
+    SELECT jobs.source_event_id, NULL, 'legacy', NULL, NULL, MIN(jobs.created_at), MAX(jobs.updated_at)
+    FROM jobs GROUP BY jobs.source_event_id;
+  `);
+  ensureJobsRunnableFairIndex(db);
+  ensureJobsWorkspaceJobIndex(db);
+  ensureJobsStatusJobIndex(db);
+}
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id);
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_workspace_job_idx ON jobs(workspace_id,job_id)
@@ -131,6 +170,7 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
 export function migrateDispatcherDatabase(
   db: Database.Database,
   migrationHook: DispatcherMigrationHook = () => {},
+  outerTransaction = false,
 ): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > dispatcherSchemaCompatibility.read_max) {
@@ -203,7 +243,8 @@ export function migrateDispatcherDatabase(
     CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
     PRAGMA user_version = 2;
   `);
-  if (version < 3) db.transaction(() => {
+  const migrateV3 = () => {
+    const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -245,7 +286,7 @@ export function migrateDispatcherDatabase(
         last_error_code, last_error_message, created_at, updated_at
       )
       SELECT
-        job_id, source_event_id, 'legacy-default', source, workspace_id, channel_id, thread_ts, actor_id,
+        job_id, source_event_id, ${jobsHasKey ? "job_key" : "'legacy-default'"}, source, workspace_id, channel_id, thread_ts, actor_id,
         objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
         herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
         completed_at, result_json, completion_event_id, steer_event_id, steer_state,
@@ -265,6 +306,7 @@ export function migrateDispatcherDatabase(
     migrationHook("indexes_recreated");
 
     db.exec(`
+      DROP TABLE IF EXISTS job_groups;
       CREATE TABLE job_groups (
         source_event_id       TEXT PRIMARY KEY REFERENCES events(event_id),
         sealed_at             TEXT,
@@ -302,10 +344,15 @@ export function migrateDispatcherDatabase(
     `);
     migrationHook("groups_backfilled");
     db.pragma(`user_version = ${dispatcherSchemaCompatibility.write}`);
-  })();
-  ensureJobsRunnableFairIndex(db);
-  ensureJobsWorkspaceJobIndex(db);
-  ensureJobsStatusJobIndex(db);
+  };
+  const currentVersion = db.pragma("user_version", { simple: true }) as number;
+  if (dispatcherSchemaCompatibility.write >= 3 && currentVersion < 3) outerTransaction ? migrateV3() : db.transaction(migrateV3)();
+  if (dispatcherSchemaCompatibility.write === 2 && currentVersion === 2) ensureV2BridgeSchema(db);
+  if ((db.pragma("user_version", { simple: true }) as number) >= 3) {
+    ensureJobsRunnableFairIndex(db);
+    ensureJobsWorkspaceJobIndex(db);
+    ensureJobsStatusJobIndex(db);
+  }
 }
 
 export class DispatcherDatabase {
@@ -542,6 +589,9 @@ export class DispatcherDatabase {
       const admittedJobs = this.db.prepare(`
         SELECT objective, workspace_json FROM jobs WHERE source_event_id = ?
       `).all(parsedRequest.source_event_id) as Array<Pick<JobRow, "objective" | "workspace_json">>;
+      if (dispatcherSchemaCompatibility.write === 2 && admittedJobs.length > 0) {
+        throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
+      }
       if (admittedJobs.length >= this.jobAdmissionLimits.jobsPerEventMax) {
         throw new JobCreationError(
           "job_group_limit_exceeded",
