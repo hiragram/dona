@@ -415,6 +415,20 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
   ],completed_at:due},resultPath,new Date(due));
   assert.equal(dispatcher.get(eventId)?.last_error_code,"incomplete_delivery_after_post");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  for(const invalidAction of [
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:"evt_other",authorized:true},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"invalid",reply_broadcast:false},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000006",reply_broadcast:false,error:{code:"failed"}},
+  ]) {
+    raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
+    dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+      {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+      {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+      {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+      invalidAction,
+    ],completed_at:due},resultPath,new Date(due));
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  }
 });
 
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
@@ -437,6 +451,8 @@ test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   assert.equal(dispatcher.authorizeJobNotification(eventId,new Date("2026-09-05T00:01:01Z"),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:"2026-09-05T00:01:01Z",nonce:"new"}).authorized,true);
   raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(eventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
+  assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
+  raw.prepare("UPDATE job_completion_results SET notification_state='failed',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
   assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
 });
 
