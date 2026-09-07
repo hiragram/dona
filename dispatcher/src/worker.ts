@@ -13,6 +13,7 @@ import type { EventRow } from "./types.js";
 export interface EventStateFetcher {
   fetch(row: Readonly<EventRow>, signal: AbortSignal): Promise<unknown>;
   quarantine?(row: Readonly<EventRow>): Promise<void>;
+  degrade?(row: Readonly<EventRow>): Promise<void>;
 }
 
 class WakeSignal {
@@ -183,6 +184,15 @@ export class DispatcherWorker {
     if (metadata.requires_fetch && this.stateFetcher) {
       try {
         const result = await this.stateFetcher.fetch(row, this.abortController.signal) as { outcome?: string; retryAfter?: number };
+        if (result.outcome === "credential_unavailable") {
+          const updated = this.database.recordSafePromptFailure(row.event_id, "provider_credential_unavailable",
+            "Provider integration credential was unavailable", this.config.maxAttempts);
+          try { await this.stateFetcher.degrade?.(row); }
+          catch (error) { this.logger.warn("Provider connection degrade was deferred", { event_id: row.event_id,
+            error_code: "provider_degrade_deferred", error_message: error instanceof Error ? error.message : String(error) }); }
+          this.logTransition(dispatching, updated, started);
+          return;
+        }
         if (result.outcome === "permission_lost") {
           const updated = this.database.recordSafePromptFailure(row.event_id, "provider_fetch_permission_lost",
             "Provider access was revoked", this.config.maxAttempts);

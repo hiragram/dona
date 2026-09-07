@@ -151,7 +151,9 @@ export async function runService(
       !["page", "database", "data_source"].includes(String(subject.entity_type))) return { outcome: "degraded" };
     const connection = database.connections.get(config.notionPilot!.connectionId);
     const secretStore = new PrivateFileSecretStore(config.notionPilot!.secretStoreRoot);
-    const token = await secretStore.read(connection.credentialRef, connection.credentialRevision);
+    let token: Buffer;
+    try { token = await secretStore.read(connection.credentialRef, connection.credentialRevision); }
+    catch { return { outcome: "credential_unavailable" }; }
     try {
       const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
       const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
@@ -177,7 +179,12 @@ export async function runService(
               }
               return { status: response.status, ...(retryAfter === undefined ? {} : { retryAfter }) };
             }
-            return { status: response.status, value: await response.json() as Record<string, unknown> };
+            try { return { status: response.status, value: await response.json() as Record<string, unknown> }; }
+            catch (error) {
+              if (signal.aborted) throw error;
+              if (fetchSignal.aborted && allowPartial) return { status: 200, value: { results: [], has_more: false, content_truncated: true } };
+              throw error;
+            }
           }
         };
         const resource = await request(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`);
@@ -261,6 +268,12 @@ export async function runService(
       candidate.resource === subject.entity_id && candidate.revision === connection.revision && candidate.verifiedAt !== null).at(-1);
     if (subscription) database.connections.quarantine(connection.id, connection.revision,
       subscription.resource, subscription.generation, subscription.verificationEpoch);
+  }, async degrade(row) {
+    if (row.source !== "notion") return;
+    const subject = JSON.parse(row.subject_json) as Record<string, unknown>;
+    if (subject.connection_id !== config.notionPilot!.connectionId) return;
+    const connection = database.connections.get(config.notionPilot!.connectionId);
+    database.connections.degrade(connection.id, connection.revision);
   } } : undefined);
   const jobSupervisor = new JobSupervisor(
     database,

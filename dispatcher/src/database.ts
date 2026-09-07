@@ -979,6 +979,7 @@ export class DispatcherDatabase {
       .prepare(`
         UPDATE events SET
           status = CASE WHEN last_error_code='provider_fetching' THEN 'retryable_failed' ELSE 'needs_review' END,
+          attempt_count = CASE WHEN last_error_code='provider_fetching' THEN MAX(0,attempt_count-1) ELSE attempt_count END,
           available_at = CASE WHEN last_error_code='provider_fetching' THEN ? ELSE available_at END,
           last_error_code = CASE WHEN last_error_code='provider_fetching' THEN 'provider_fetch_interrupted' ELSE 'stale_dispatching' END,
           last_error_message = CASE WHEN last_error_code='provider_fetching'

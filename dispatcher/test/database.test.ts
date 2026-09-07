@@ -137,6 +137,7 @@ describe("DispatcherDatabase", () => {
     database.beginDispatch(event.event_id, `${config.resultsDir}/${event.event_id}.json`, new Date(), true);
     assert.equal(database.recoverStaleDispatching(), 1);
     assert.equal(database.get(event.event_id)?.status, "retryable_failed");
+    assert.equal(database.get(event.event_id)?.attempt_count, 0);
     assert.equal(database.get(event.event_id)?.last_error_code, "provider_fetch_interrupted");
     database.close();
   });

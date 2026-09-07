@@ -207,7 +207,7 @@ export class ProviderRegistrationRegistry {
         WHERE digest=? AND state!='consumed' AND expires_at>? AND (state='pending' OR claim_until<=?)`)
         .run(claimId, claimUntil, digest(token), now, now).changes;
       if (changed !== 1) throw new ConnectionError("operation_pending");
-      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.delivery.connectionId);
+      this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
       return { claim: { claimId, binding: actual, claimUntil } };
     }).immediate();
     if (result.error) throw result.error;
