@@ -43,7 +43,8 @@ describe("Notion ingress", () => {
     const secrets = path.join(root, "secrets"); fs.mkdirSync(secrets, { mode: 0o700 });
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
       DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
-        verificationCredentialRef: "cred_notion_verify", secretStoreRoot: secrets }) });
+        verificationCredentialRef: "cred_notion_verify", secretStoreRoot: secrets,
+        trustedProxy: { perSourceRateAndConcurrencyLimit: true } }) });
     let database = new DispatcherDatabase(config.databasePath);
     database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
       allowlist: [{ resource: "page_1", events: ["page.content_updated"] }], credentialRef: "cred_integration",
@@ -98,7 +99,8 @@ describe("Notion ingress", () => {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
       DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
-        verificationCredentialRef: "cred_shared", secretStoreRoot: root }) });
+        verificationCredentialRef: "cred_shared", secretStoreRoot: root,
+        trustedProxy: { perSourceRateAndConcurrencyLimit: true } }) });
     const database = new DispatcherDatabase(config.databasePath);
     t.after(() => database.close());
     database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
@@ -111,7 +113,8 @@ describe("Notion ingress", () => {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
       DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
-        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root,
+        trustedProxy: { perSourceRateAndConcurrencyLimit: true } }) });
     const database = new DispatcherDatabase(config.databasePath);
     t.after(() => database.close());
     database.connections.register({ id: "notion_test", provider: "github", account: "ws_1",
@@ -124,7 +127,8 @@ describe("Notion ingress", () => {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
       DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
-        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root,
+        trustedProxy: { perSourceRateAndConcurrencyLimit: true } }) });
     const database = new DispatcherDatabase(config.databasePath); t.after(() => database.close());
     database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
       allowlist: [{ resource: "page_1", events: ["page.content_updated"] }], credentialRef: "cred_integration",
@@ -136,7 +140,8 @@ describe("Notion ingress", () => {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
       DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
-        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root,
+        trustedProxy: { perSourceRateAndConcurrencyLimit: true } }) });
     const database = new DispatcherDatabase(config.databasePath); t.after(() => database.close());
     database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
       allowlist: ["page_1", "page_2"].map(resource => ({ resource, events: ["page.content_updated"] })),

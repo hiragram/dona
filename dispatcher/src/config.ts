@@ -6,6 +6,7 @@ import path from "node:path";
 export interface DispatcherConfig {
   notionPilot?: {
     connectionId: string; integrationId: string; verificationCredentialRef: string; secretStoreRoot: string;
+    trustedProxy: { perSourceRateAndConcurrencyLimit: true };
   };
   githubPilot?: {
     connectionId: string; installationId: number; repositoryId: number; repositoryFullName: string;
@@ -96,9 +97,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     if (typeof parsed.connectionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.connectionId) ||
       typeof parsed.integrationId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(parsed.integrationId) ||
       typeof parsed.verificationCredentialRef !== "string" || !/^cred_[A-Za-z0-9_-]{1,100}$/.test(parsed.verificationCredentialRef) ||
-      typeof parsed.secretStoreRoot !== "string" || parsed.secretStoreRoot.trim() === "") throw new Error("DONA_NOTION_PILOT_CONFIG is invalid");
+      typeof parsed.secretStoreRoot !== "string" || parsed.secretStoreRoot.trim() === "" || !parsed.trustedProxy ||
+      typeof parsed.trustedProxy !== "object" ||
+      (parsed.trustedProxy as Record<string, unknown>).perSourceRateAndConcurrencyLimit !== true)
+      throw new Error("DONA_NOTION_PILOT_CONFIG is invalid");
     return { connectionId: parsed.connectionId, integrationId: parsed.integrationId,
-      verificationCredentialRef: parsed.verificationCredentialRef, secretStoreRoot: expandHome(parsed.secretStoreRoot) };
+      verificationCredentialRef: parsed.verificationCredentialRef, secretStoreRoot: expandHome(parsed.secretStoreRoot),
+      trustedProxy: { perSourceRateAndConcurrencyLimit: true as const } };
   })();
   const queuePolicy = queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}"));
   if (notionPilot && queuePolicy.sources.notion === undefined) {

@@ -161,6 +161,25 @@ const NOTION_FIELDS = new Set(["id", "object", "type", "url", "created_time", "l
   "in_trash", "parent", "properties", "property_items", "title", "description", "children", "results", "content_truncated"]);
 
 function preview(value: unknown, maxBytes: number): { text: string; truncated: boolean } {
+  if (Array.isArray(value) && Buffer.byteLength(JSON.stringify(value)) > maxBytes) {
+    const selected: unknown[] = [];
+    for (let offset = 0; offset < value.length; offset += 1) {
+      const index = offset % 2 === 0 ? offset / 2 : value.length - 1 - Math.floor(offset / 2);
+      const candidate = [...selected, value[index]];
+      if (Buffer.byteLength(JSON.stringify(candidate)) > maxBytes) break;
+      selected.push(value[index]);
+    }
+    return { text: JSON.stringify(selected), truncated: true };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) && Buffer.byteLength(JSON.stringify(value)) > maxBytes) {
+    const entries = Object.entries(value as Record<string, unknown>), selected: Record<string, unknown> = {};
+    for (let offset = 0; offset < entries.length; offset += 1) {
+      const index = offset % 2 === 0 ? offset / 2 : entries.length - 1 - Math.floor(offset / 2);
+      const [key, item] = entries[index]!; selected[key] = item;
+      if (Buffer.byteLength(JSON.stringify(selected)) > maxBytes) delete selected[key];
+    }
+    return { text: JSON.stringify(selected), truncated: true };
+  }
   const encoded = JSON.stringify(value);
   if (Buffer.byteLength(encoded) <= maxBytes) return { text: encoded, truncated: false };
   let low = 0, high = encoded.length;
