@@ -716,6 +716,7 @@ export class DispatcherDatabase {
       payload: {
         job_id: job.job_id,
         job_status: job.status,
+        owner_kind: binding.owner.kind,
         workspace: JSON.parse(job.workspace_json) as Record<string, unknown>,
         ...(result ? { result: binding.owner.kind==="schedule"
           ? {schema_version:result.schema_version,job_id:result.job_id,status:result.status,
@@ -1034,7 +1035,7 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], ambiguous?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
-      this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       if(delivery.runId)this.scheduler.markWorkNotificationNeedsReview(delivery.runId,new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,ambiguous?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();

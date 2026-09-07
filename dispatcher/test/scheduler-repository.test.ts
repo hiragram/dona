@@ -242,6 +242,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
   const completionEventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const completionEvent=dispatcher.get(completionEventId)!; assert.equal(completionEvent.source,"dona_job");
+  assert.equal((JSON.parse(completionEvent.payload_json) as {owner_kind:string}).owner_kind,"schedule");
   assert.deepEqual(JSON.parse(completionEvent.reply_target_json!),input.target);
   assert.equal(repo.get("notify_work")?.state,"active");
   assert.equal(repo.claim(due),undefined);
@@ -470,6 +471,19 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const payload=JSON.parse(dispatcher.get(eventId)!.payload_json) as {error_message:string};
   assert.equal(payload.error_message,"実行エラーの詳細は安全上省略されました"); assert.doesNotMatch(payload.error_message,/xoxb/);
+});
+
+test("委任前current access失敗はscheduleをneeds_reviewへ固定する", () => {
+  const {repo,dispatcher,filename}=setup(); const objective="access確認対象";
+  repo.create("access_denied",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("access_denied",1,due,later,due,actor).run;
+  const resultPath=path.join(path.dirname(filename),`${run.event_id}.json`);
+  dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  dispatcher.saveFailedResult(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"failed",
+    summary:"current accessを確認できませんでした",actions:[],completed_at:due},resultPath);
+  assert.equal(dispatcher.get(run.event_id!)?.status,"dead_letter");
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  assert.equal(repo.get("access_denied")?.state,"needs_review");
 });
 
 test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにする", () => {
