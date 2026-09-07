@@ -15,6 +15,14 @@ import { tempPolicy } from "./helpers.js";
 const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
+const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.sh", import.meta.url));
+
+test("developer installer atomically creates and shares the access receipt key",async()=>{
+  const source=await fs.readFile(developerInstaller,"utf8");
+  assert.match(source,/openssl rand -hex 32/);
+  assert.match(source,/mv "\$DISPATCHER_TOKEN_PATH\.tmp" "\$DISPATCHER_TOKEN_PATH"/);
+  assert.equal(source.match(/<key>DONA_UPDATE_INTERNAL_TOKEN_PATH<\/key>/g)?.length,2);
+});
 
 async function run(mode: string, ...values: string[]): Promise<void> {
   await execute(process.execPath, [preflight, mode, ...values]);

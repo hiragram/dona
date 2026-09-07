@@ -381,12 +381,12 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     dispatcher.nextAvailable(new Date(mode==="deadline"||mode==="authorized_deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
     if(mode==="waiting") dispatcher.nextWaiting();
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
-    assert.equal(dispatcher.get(eventId)?.status,"completed");
-    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
+    assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"?"needs_review":"completed");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"?"needs_review":"none");
     if(mode==="authorized_deadline") {
-      assert.equal(repo.get(`notify_${mode}`)?.state,"active");
+      assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:16:01Z"},path.join(path.dirname(filename),`${eventId}.json`));
-      assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+      assert.equal(dispatcher.get(eventId)?.last_error_code,"notification_delivery_ambiguous");
     }
     if(mode==="waiting") {
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:01:31Z"},path.join(path.dirname(filename),`${eventId}.json`));

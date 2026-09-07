@@ -893,15 +893,15 @@ export class DispatcherDatabase {
   private suppressUnauthorizedScheduledNotifications(at: Date): void {
     const timestamp=at.toISOString();
     this.db.transaction(()=>{
-      const rows=this.db.prepare(`SELECT e.event_id,c.notification_state,c.notification_authorization_phase FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
+      const rows=this.db.prepare(`SELECT e.event_id,e.status,c.notification_state,c.notification_authorization_phase FROM events e JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.source='dona_job' AND e.status IN ('queued','retryable_failed','dispatching','waiting_agent') AND json_extract(c.owner_json,'$.kind')='schedule'
           AND (julianday(c.materialized_at,'+900 seconds')<julianday(?) OR s.state NOT IN ('active','needs_review')
             OR s.revision!=json_extract(c.owner_json,'$.revision') OR julianday(r.expires_at)<=julianday(?))`)
-        .all(timestamp,timestamp) as Array<{event_id:string;notification_state:string;notification_authorization_phase:string}>;
+        .all(timestamp,timestamp) as Array<{event_id:string;status:string;notification_state:string;notification_authorization_phase:string}>;
       for(const row of rows) {
-        if(row.notification_state==="needs_review"&&row.notification_authorization_phase==="write") {
+        if(["dispatching","waiting_agent"].includes(row.status)||(row.notification_state==="needs_review"&&row.notification_authorization_phase==="write")) {
           this.db.prepare("UPDATE events SET status='needs_review',updated_at=?,last_error_code='notification_delivery_ambiguous',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(timestamp,row.event_id);
           this.setNotificationState(row.event_id,"needs_review",at);
           continue;

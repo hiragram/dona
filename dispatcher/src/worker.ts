@@ -142,6 +142,7 @@ export class DispatcherWorker {
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {
       await fs.access(resultPath);
+      if(this.database.get(row.event_id)?.status!==row.status) return;
       const dispatching = this.database.beginDispatch(row.event_id, resultPath);
       if(dispatching.status==="completed") return;
       this.database.markNeedsReview(
@@ -152,6 +153,7 @@ export class DispatcherWorker {
       this.logCurrentTransition(dispatching, started);
       return;
     } catch (error) {
+      if(this.database.get(row.event_id)?.status!==row.status) return;
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         const updated = this.database.recordPreDispatchFailure(
           row.event_id,
