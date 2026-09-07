@@ -207,10 +207,12 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.ok(raw.prepare("SELECT 1 FROM job_completion_results WHERE job_id=? AND job_status='needs_review'").get(job.job_id));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get("review_work")?.state, "needs_review");
   assert.throws(() => repo.reconcileWorkRun(run.run_id, "failed", actor, due), /admin_required/);
-  repo.reconcileWorkRun(run.run_id, "failed", { ...actor, role: "admin" }, due);
+  dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
   assert.equal(repo.getRun(run.run_id)?.status, "failed");
   assert.ok((repo.auditHistory("review_work") as Array<{ operation: string }>).some(row => row.operation === "reconcile_work_failed"));
-  assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "needs_review");
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
+  assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "failed");
+  repo.update("review_work",1,{...input,action:"work.read_only",target:{kind:"none"},content:objective,authorization_id:"renewed",authorization_revision:2},"2026-09-08T00:01:00Z",actor,due);
 });
 
 test("delegated needs_review eventのResultをcontent deadlineで削除する", () => {
@@ -265,7 +267,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",ambiguous:true,reply_broadcast:false},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_OTHER",thread_ts:"1.000001",message_ts:"2.000000",reply_broadcast:false},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002",reply_broadcast:false},
   ],completed_at:due},notificationPath);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");

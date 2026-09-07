@@ -584,9 +584,18 @@ export class DispatcherDatabase {
   }
 
   reconcileScheduledRun(runId:string,outcome:"failed"|"cancelled",at=new Date()):unknown {
-    const row=this.db.prepare("SELECT s.tenant_id FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?").get(runId) as {tenant_id:string}|undefined;
+    const row=this.db.prepare("SELECT s.tenant_id,r.job_id FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?").get(runId) as {tenant_id:string;job_id:string|null}|undefined;
     if(!row) throw new Error(`Run ${runId} was not found`);
-    return this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+    return this.db.transaction(()=>{
+      const reconciledAt=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+      const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
+      if(row.job_id) {
+        this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status='needs_review'")
+          .run(outcome,reconciledAt,reconciledAt,row.job_id);
+        this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
+      }
+      return result;
+    }).immediate();
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date()): void {
@@ -1033,11 +1042,12 @@ export class DispatcherDatabase {
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
     const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
-    const ambiguousPost=actions.some(({value})=>typeof value.tool==="string"&&value.tool.endsWith(".post_message")&&value.ambiguous===true);
+    const posts=actions.filter(({value})=>typeof value.tool==="string"&&value.tool.endsWith(".post_message"));
+    const ambiguousPost=posts.some(({value})=>value.ambiguous===true);
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
-    return {delivered:!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&actions.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
