@@ -19,6 +19,9 @@ export interface Cursor { revision: number; version: number; checkpoint: string 
 export interface CursorBatch {
   binding: DeliveryBinding; expected: Cursor; checkpoint: string; complete: boolean;
   events: readonly { providerEventId: string; envelope: EventEnvelope }[];
+  membership?: readonly string[];
+  membershipChanges?: { add: readonly string[]; remove: readonly string[] };
+  continuation?: boolean;
 }
 export class ConnectionRegistry {
   constructor(private readonly db: Database.Database, readonly clock: Clock = systemClock) {}
@@ -331,6 +334,19 @@ export class ConnectionRegistry {
     return this.db.prepare("SELECT revision,version,checkpoint FROM connection_cursors WHERE connection_id=? AND resource=?").get(id, resource) as Cursor | undefined ??
       { revision: c.revision, version: 0, checkpoint: null };
   }
+  membership(id: string, resource: string): string[] {
+    return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? ORDER BY member")
+      .all(id,resource) as {member:string}[]).map(({member})=>member);
+  }
+  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[]; history: string[] } {
+    return this.db.transaction(() => {
+      this.assertPolling(binding);
+      return { cursor: this.cursor(binding.connectionId,binding.resource),
+        membership: this.membership(binding.connectionId,binding.resource),
+        history: (this.db.prepare("SELECT token FROM connection_cursor_history WHERE connection_id=? AND resource=?")
+          .all(binding.connectionId,binding.resource) as {token:string}[]).map(({token})=>token) };
+    }).immediate();
+  }
   assertPolling(binding: DeliveryBinding): void {
     this.db.transaction(() => {
       if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
@@ -357,6 +373,13 @@ export class ConnectionRegistry {
   }
   commitBatch(batch: CursorBatch, enqueue: (envelope: EventEnvelope) => EnqueueResult): EnqueueResult[] {
     if (!batch.complete || typeof batch.checkpoint !== "string" || batch.checkpoint.length > 16_384) throw new ConnectionError("incomplete_batch");
+    if (batch.membership !== undefined && (new Set(batch.membership).size !== batch.membership.length ||
+      batch.membership.some((member)=>!identifier.safeParse(member).success))) throw new ConnectionError("invalid_input");
+    if (batch.membershipChanges !== undefined) {
+      const {add,remove}=batch.membershipChanges;
+      if(new Set(add).size!==add.length||new Set(remove).size!==remove.length||add.some((member)=>!identifier.safeParse(member).success)||
+        remove.some((member)=>!identifier.safeParse(member).success)||add.some((member)=>remove.includes(member))) throw new ConnectionError("invalid_input");
+    }
     return this.db.transaction(() => {
       const b = batch.binding; const c = this.current(b.connectionId, b.revision, b.resource);
       if (!c.capability.cursor) throw new ConnectionError("capability_mismatch");
@@ -373,9 +396,30 @@ export class ConnectionRegistry {
         if (result.outcome === "duplicate_conflict") throw new ConnectionError("duplicate_conflict");
         return result;
       });
+      if(batch.continuation===true){
+        const history=this.db.prepare(`SELECT COUNT(*) count,COALESCE(SUM(length(token)),0) bytes
+          FROM connection_cursor_history WHERE connection_id=? AND resource=?`).get(c.id,b.resource) as {count:number;bytes:number};
+        const exists=!!this.db.prepare("SELECT 1 FROM connection_cursor_history WHERE connection_id=? AND resource=? AND token=?")
+          .get(c.id,b.resource,batch.checkpoint);
+        if(!exists&&(history.count>=1000||history.bytes+batch.checkpoint.length>16_777_216))throw new ConnectionError("operation_pending");
+      }
       this.db.prepare(`INSERT INTO connection_cursors VALUES(?,?,?,?,?) ON CONFLICT(connection_id,resource)
         DO UPDATE SET revision=excluded.revision,version=excluded.version,checkpoint=excluded.checkpoint`)
         .run(c.id, b.resource, c.revision, cursor.version + 1, batch.checkpoint);
+      if (batch.membership !== undefined) {
+        this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=?").run(c.id,b.resource);
+        const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?)");
+        for(const member of batch.membership) insert.run(c.id,b.resource,member);
+      }
+      if(batch.membershipChanges!==undefined){
+        const remove=this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND member=?");
+        for(const member of batch.membershipChanges.remove)remove.run(c.id,b.resource,member);
+        const add=this.db.prepare("INSERT OR IGNORE INTO connection_resource_memberships VALUES(?,?,?)");
+        for(const member of batch.membershipChanges.add)add.run(c.id,b.resource,member);
+      }
+      if (batch.continuation !== true)
+        this.db.prepare("DELETE FROM connection_cursor_history WHERE connection_id=? AND resource=?").run(c.id,b.resource);
+      this.db.prepare("INSERT OR IGNORE INTO connection_cursor_history VALUES(?,?,?)").run(c.id,b.resource,batch.checkpoint);
       this.audit(c, "checkpoint_committed", now); return results;
     }).immediate();
   }
