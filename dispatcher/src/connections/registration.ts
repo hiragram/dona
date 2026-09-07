@@ -85,11 +85,14 @@ export class ProviderRegistrationRegistry {
       } catch (error) {
         if (identifier.safeParse(input.provider).success && identifier.safeParse(input.providerId).success &&
           (input.connectionId === undefined || connectionIdentifier.safeParse(input.connectionId).success) &&
+          (input.account === undefined || identifier.safeParse(input.account).success) &&
           (input.resource === undefined || identifier.safeParse(input.resource).success))
           this.db.prepare(`UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id IN (
             SELECT c.id FROM connections c JOIN connection_subscriptions s ON s.connection_id=c.id
-            WHERE c.provider=? AND s.provider_id=? AND (? IS NULL OR c.id=?) AND (? IS NULL OR s.resource=?))`)
+            WHERE c.provider=? AND s.provider_id=? AND (? IS NULL OR c.id=?)
+              AND (? IS NULL OR json_extract(c.config_json,'$.account')=?) AND (? IS NULL OR s.resource=?))`)
             .run(now, input.provider, input.providerId, input.connectionId ?? null, input.connectionId ?? null,
+              input.account ?? null, input.account ?? null,
               input.resource ?? null, input.resource ?? null);
         return { error };
       }

@@ -288,6 +288,21 @@ test("accountで除外したconnectionのclockは対象bindingへ影響しない
     account: "workspace:one" }).delivery.connectionId, "pilot");
 });
 
+test("resolve失敗時のclock更新は指定accountだけに限定する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); activate(db);
+  const other = { ...config, id: "other", account: "workspace:two", credentialRef: "cred_other" };
+  db.connections.register(other); db.connections.attachManual("other", 1, "page:one", "subscription:one", null);
+  db.connections.observe("other", 1, "page:one", 1,
+    { providerId: "subscription:one", expiresAt: null, verified: true, cutoverConfirmed: false });
+  const raw = new Database(file); t.after(() => raw.close());
+  const before = raw.prepare("SELECT id,last_clock FROM connections ORDER BY id").all();
+  clock.value += 100;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one",
+    account: "workspace:missing" }), /not_authorized/);
+  const clocks = raw.prepare("SELECT id,last_clock FROM connections ORDER BY id").all() as Array<{ id: string; last_clock: number }>;
+  assert.deepEqual(clocks, before);
+});
+
 test("clock rewind時はverification attemptをfail closedにする", (t) => {
   const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,
