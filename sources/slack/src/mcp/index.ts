@@ -2,6 +2,8 @@
 import "dotenv/config";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createHmac, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 
 import { loadRuntimeConfig } from "../config.js";
 import { MacOSKeychainStore } from "../keychain.js";
@@ -20,7 +22,11 @@ async function main(): Promise<void> {
     new MacOSKeychainStore(),
     logger,
   );
-  const server = createSlackMcpServer(registry, logger);
+  const key=(await fs.readFile(config.accessReceiptKeyPath,"utf8")).trim();
+  const server = createSlackMcpServer(registry, logger, input=>{
+    const payload=Buffer.from(JSON.stringify({...input,issued_at:new Date().toISOString(),nonce:randomUUID()})).toString("base64url");
+    return `${payload}.${createHmac("sha256",key).update(payload).digest("base64url")}`;
+  });
   await server.connect(new StdioServerTransport());
   logger.info("Dona Slack MCP server started", { transport: "stdio" });
 

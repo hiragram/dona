@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -295,8 +295,15 @@ export class DispatcherApi {
       const scheduledAccess=/^\/v1\/scheduled-jobs\/([^/]+)\/access$/.exec(url.pathname);
       if(request.method==="POST"&&scheduledAccess) {
         const body=await this.readJson(request) as Record<string,unknown>;
-        try { sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(decodeURIComponent(scheduledAccess[1]!),{
-          workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??""),authorized:body.authorized===true})}); }
+        try {
+          const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
+          if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+          const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+          if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+          const decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+          const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
+          sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??"")})});
+        }
         catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
         return;
       }

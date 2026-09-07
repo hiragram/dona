@@ -3,6 +3,7 @@ export type SlackLogLevel = "debug" | "info" | "warn" | "error";
 export interface SlackRuntimeConfig {
   workspaces: string[];
   logLevel: SlackLogLevel;
+  accessReceiptKeyPath: string;
 }
 
 const logLevels = new Set<SlackLogLevel>(["debug", "info", "warn", "error"]);
@@ -46,8 +47,12 @@ function parseLogLevel(value: string | undefined): SlackLogLevel {
 }
 
 export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): SlackRuntimeConfig {
+  const base = path.join(os.homedir(),"Library","Application Support","Dona");
   return {
     workspaces: parseWorkspaces(env.SLACK_WORKSPACES),
     logLevel: parseLogLevel(env.SLACK_LOG_LEVEL),
+    accessReceiptKeyPath: env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base,"update-control","dispatcher.token"),
   };
 }
+import os from "node:os";
+import path from "node:path";

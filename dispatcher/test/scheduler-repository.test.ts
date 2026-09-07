@@ -338,9 +338,9 @@ test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費
   const run=repo.materialize("access_receipt",1,due,later,due,actor).run;
   dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
   assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/current access receipt/);
-  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",authorized:true},new Date(due)),/receipt_mismatch/);
-  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},new Date(due)).authorized,true);
-  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},new Date(due)),/already_recorded/);
+  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",issued_at:due,nonce:"n1"},new Date(due)),/receipt_mismatch/);
+  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date(due)).authorized,true);
+  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n3"},new Date(due)),/already_recorded/);
   const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
   assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).duplicate,true);
 });

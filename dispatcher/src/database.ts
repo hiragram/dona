@@ -847,14 +847,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  recordScheduleJobAccess(eventId:string,receipt:{workspace_id:string;channel_id:string;user_id:string;authorized:boolean},at=new Date()):Record<string,unknown> {
-    if(!receipt.authorized) throw new Error("schedule_access_not_authorized");
+  recordScheduleJobAccess(eventId:string,receipt:{workspace_id:string;channel_id:string;user_id:string;issued_at:string;nonce:string},at=new Date()):Record<string,unknown> {
     return this.db.transaction(()=>{
       const event=this.getRequired(eventId),binding=readEventJobBinding(this.db,eventId);
       const payload=JSON.parse(event.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
       const target=payload.work?.authorization_target;
       if(event.source!=="dona_schedule"||event.status!=="waiting_agent"||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
-        receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null) throw new Error("schedule_access_receipt_mismatch");
+        receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000) throw new Error("schedule_access_receipt_mismatch");
       const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(at.toISOString(),eventId).changes;
       if(changed!==1) throw new Error("schedule_access_receipt_already_recorded");
       return {authorized:true,event_id:eventId,checked_at:at.toISOString()};

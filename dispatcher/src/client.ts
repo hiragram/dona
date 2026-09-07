@@ -21,8 +21,8 @@ export class DispatcherApiClient {
   authorizeJobNotification(eventId:string):Promise<Record<string,unknown>> {
     return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,{});
   }
-  recordScheduleJobAccess(eventId:string,input:unknown):Promise<Record<string,unknown>> {
-    return this.request("POST",`/v1/scheduled-jobs/${encodeURIComponent(eventId)}/access`,input);
+  recordScheduleJobAccess(eventId:string,receipt:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/scheduled-jobs/${encodeURIComponent(eventId)}/access`,{receipt});
   }
 
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {
