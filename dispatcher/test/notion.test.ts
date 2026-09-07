@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { describe, test } from "node:test";
 import { createNotionRegistration, fetchLatestNotionState } from "../src/notion.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { DispatcherDatabase } from "../src/database.js";
+import { serviceExternalIngressRegistry } from "../src/service.js";
+import { loadConfig } from "../src/config.js";
 
 const receivedAt = "2026-09-07T00:00:00.000Z";
 const verificationAttempt = "attempt_01M1WK_NOTION";
@@ -31,6 +37,45 @@ function setup() {
 }
 
 describe("Notion ingress", () => {
+  test("serve registryはdurable attemptとsecretをrestart後も再利用してactive bindingを解決する", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const secrets = path.join(root, "secrets"); fs.mkdirSync(secrets, { mode: 0o700 });
+    const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
+      DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
+        verificationCredentialRef: "cred_notion_verify", secretStoreRoot: secrets }) });
+    let database = new DispatcherDatabase(config.databasePath);
+    database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
+      allowlist: [{ resource: "page_1", events: ["page.content_updated"] }], credentialRef: "cred_integration",
+      credentialRevision: 1, capability: { kind: "manual", cursor: false } });
+    database.connections.attachManual("notion_test", 1, "page_1", "sub_1", null);
+    database.connections.observe("notion_test", 1, "page_1", 1,
+      { providerId: "sub_1", expiresAt: null, verified: false, cutoverConfirmed: false });
+    const attempt = database.providerRegistration.issue({ provider: "notion", providerId: "sub_1",
+      connectionId: "notion_test", account: "ws_1", resource: "page_1" }, 60_000);
+    const verification = Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" }));
+    const registration = serviceExternalIngressRegistry(config, database).get("notion")!.registration;
+    await registration.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
+      requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
+    assert.equal(database.connections.get("notion_test").state, "active");
+    database.close();
+
+    database = new DispatcherDatabase(config.databasePath);
+    t.after(() => database.close());
+    const restarted = serviceExternalIngressRegistry(config, database).get("notion")!.registration;
+    const replay = await restarted.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
+      requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
+    assert.equal(replay.connection?.resource, "page_1");
+    const signature = createHmac("sha256", "secret-verification-token").update(body).digest("hex");
+    const event = await restarted.authenticate(request(body, signature));
+    assert.equal(event.connection?.generation, 1);
+  });
+
+  test("Notion起動configはpartial・不正識別子をfail closedにする", () => {
+    assert.throws(() => loadConfig({ DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test" }) }), /invalid/);
+    assert.throws(() => loadConfig({ DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "../notion", integrationId: "int_1",
+      verificationCredentialRef: "cred_verify", secretStoreRoot: "/tmp/secrets" }) }), /invalid/);
+  });
   test("verification token is stored but omitted from the normalized event", async () => {
     const { registration, secret } = setup();
     const raw = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));

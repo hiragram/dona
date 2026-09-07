@@ -29,6 +29,12 @@ type AttemptRow = {
   claim_id: string | null; claim_until: number | null;
 };
 
+export interface VerificationAttemptSnapshot {
+  binding: VerificationBinding;
+  createdAt: number;
+  state: "pending" | "claimed" | "consumed";
+}
+
 export class ProviderRegistrationRegistry {
   constructor(private readonly db: Database.Database, private readonly clock: Clock = systemClock) {}
 
@@ -106,6 +112,17 @@ export class ProviderRegistrationRegistry {
     }).immediate();
     if (result.error) throw result.error;
     return result.binding!;
+  }
+
+  inspectAttempt(token: string): VerificationAttemptSnapshot {
+    if (!validToken(token)) throw new ConnectionError("invalid_input");
+    const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as
+      (AttemptRow & { created_at: number }) | undefined;
+    if (!row || !["pending", "claimed", "consumed"].includes(row.state)) throw new ConnectionError("not_authorized");
+    const binding: VerificationBinding = { provider: row.provider, providerId: row.provider_id,
+      verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: row.account,
+        revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
+    return { binding, createdAt: row.created_at, state: row.state as VerificationAttemptSnapshot["state"] };
   }
 
   issue(input: Readonly<{ provider: string; providerId: string; connectionId: string; account: string; resource: string }>, ttlMs: number): string {

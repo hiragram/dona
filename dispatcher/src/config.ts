@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 
 export interface DispatcherConfig {
+  notionPilot?: {
+    connectionId: string; integrationId: string; verificationCredentialRef: string; secretStoreRoot: string;
+  };
   githubPilot?: {
     connectionId: string; installationId: number; repositoryId: number; repositoryFullName: string;
     events: Readonly<Record<string, readonly string[]>>; webhookSecretPath: string;
@@ -88,8 +91,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
       events, webhookSecretPath: expandHome(parsed.webhookSecretPath),
       trustedProxy: { githubMetaIpAllowlist: true as const, perSourceRateAndConcurrencyLimit: true as const } };
   })();
+  const notionPilot = env.DONA_NOTION_PILOT_CONFIG === undefined ? undefined : (() => {
+    const parsed = JSON.parse(env.DONA_NOTION_PILOT_CONFIG) as Record<string, unknown>;
+    if (typeof parsed.connectionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.connectionId) ||
+      typeof parsed.integrationId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(parsed.integrationId) ||
+      typeof parsed.verificationCredentialRef !== "string" || !/^cred_[A-Za-z0-9_-]{1,100}$/.test(parsed.verificationCredentialRef) ||
+      typeof parsed.secretStoreRoot !== "string" || parsed.secretStoreRoot.trim() === "") throw new Error("DONA_NOTION_PILOT_CONFIG is invalid");
+    return { connectionId: parsed.connectionId, integrationId: parsed.integrationId,
+      verificationCredentialRef: parsed.verificationCredentialRef, secretStoreRoot: expandHome(parsed.secretStoreRoot) };
+  })();
   return {
     ...(githubPilot === undefined ? {} : { githubPilot }),
+    ...(notionPilot === undefined ? {} : { notionPilot }),
     queuePolicy: queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}")),
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),

@@ -2,8 +2,11 @@ import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
-import { ExternalIngressRegistry } from "./ingress.js";
+import { ExternalIngressRegistry, type ExternalEventSourceRegistration } from "./ingress.js";
 import { githubPilotRegistration } from "./providers/github.js";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { createNotionRegistration } from "./notion.js";
+import { PrivateFileSecretStore } from "./connections/secret-store.js";
 import { readPrivateBuffer } from "./private-token.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
@@ -43,17 +46,66 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
       return secret;
     },
   })] : [];
+  if (config.notionPilot) {
+    const pilot = config.notionPilot;
+    const secrets = new PrivateFileSecretStore(pilot.secretStoreRoot);
+    registrations.push(createNotionRegistration({ connectionId: pilot.connectionId,
+      verificationSecretRef: pilot.verificationCredentialRef,
+      secrets: { async get() {
+        const connection = database.connections.get(pilot.connectionId);
+        return secrets.read(pilot.verificationCredentialRef, connection.credentialRevision);
+      } },
+      verification: { async claim(input) {
+        const snapshot = database.providerRegistration.inspectAttempt(input.attemptId);
+        const expected = snapshot.binding;
+        if (expected.provider !== "notion" || expected.delivery.connectionId !== pilot.connectionId) return undefined;
+        const activate = () => database.connections.observe(expected.delivery.connectionId, expected.delivery.revision,
+          expected.delivery.resource, expected.delivery.generation,
+          { providerId: expected.providerId, expiresAt: null, verified: true, cutoverConfirmed: false },
+          undefined, expected.verificationEpoch);
+        const eventId = `verification:${createHash("sha256").update(input.attemptId).digest("hex")}`;
+        if (snapshot.state === "consumed") {
+          const stored = await secrets.read(pilot.verificationCredentialRef, expected.delivery.credentialRevision);
+          const supplied = Buffer.from(input.token);
+          const matches = stored.length === supplied.length && timingSafeEqual(stored, supplied);
+          stored.fill(0); supplied.fill(0);
+          if (matches) activate();
+          return matches ? { binding: expected.delivery, providerEventId: eventId,
+            occurredAt: new Date(snapshot.createdAt).toISOString() } : undefined;
+        }
+        const claim = database.providerRegistration.claim(input.attemptId, expected, 30_000);
+        try { await secrets.write(pilot.verificationCredentialRef, expected.delivery.credentialRevision, input.token); }
+        catch {
+          const reconciled = await secrets.reconcile(pilot.verificationCredentialRef,
+            expected.delivery.credentialRevision, input.token).catch(() => false);
+          if (!reconciled) throw new Error("Notion verification secret is unavailable");
+        }
+        const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId);
+        activate();
+        return { binding: consumed.delivery, providerEventId: eventId, occurredAt: new Date(snapshot.createdAt).toISOString() };
+      } },
+      bindings: { async resolve(input) {
+        if (input.integrationId !== pilot.integrationId) return undefined;
+        const resolved = database.providerRegistration.resolve({ provider: "notion", providerId: input.subscriptionId,
+          connectionId: pilot.connectionId, account: input.workspaceId, resource: input.resourceId });
+        const connection = database.connections.get(pilot.connectionId);
+        const allowed = connection.allowlist.find(candidate => candidate.resource === input.resourceId)?.events.includes(input.eventType);
+        return allowed ? resolved.delivery : undefined;
+      } } }));
+  }
   return new ExternalIngressRegistry(registrations);
 }
 
 export async function runService(
   config: DispatcherConfig,
   externalIngressRegistry?: ExternalIngressRegistry,
+  additionalRegistrations: readonly ExternalEventSourceRegistration[] = [],
 ): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   externalIngressRegistry ??= serviceExternalIngressRegistry(config, database);
+  for (const registration of additionalRegistrations) externalIngressRegistry.register(registration);
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,

@@ -7,7 +7,6 @@ import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
-import { ExternalIngressRegistry } from "./ingress.js";
 import { figmaIngressFromEnv } from "./providers/figma.js";
 
 function usage(): never {
@@ -40,10 +39,8 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const args = process.argv.slice(2);
   if (args.length === 0 || args[0] === "serve") {
-    const registry = new ExternalIngressRegistry();
     const figma = figmaIngressFromEnv(process.env);
-    if (figma) registry.register(figma);
-    await runService(config, registry);
+    await runService(config, undefined, figma ? [figma] : []);
     return;
   }
   if (args[0] === "connection") {
