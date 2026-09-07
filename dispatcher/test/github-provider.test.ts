@@ -80,13 +80,14 @@ describe("GitHub provider pilot", () => {
     const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger, undefined, undefined, undefined,
       new ExternalIngressRegistry([registration()]));
     await api.start();
-    const send = (body: Buffer, deliveryId = delivery) => new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+    const send = (body: Buffer, deliveryId = delivery, validSignature = true) => new Promise<{ status: number; body: unknown }>((resolve, reject) => {
       const request = http.request({ socketPath: config.socketPath, path: "/v1/ingress/github", method: "POST",
-        headers: { "x-github-delivery": deliveryId, "x-github-event": "issues", "x-hub-signature-256": signature(Buffer.from(body)), "content-length": body.length } }, response => {
+        headers: { "x-github-delivery": deliveryId, "x-github-event": "issues", "x-hub-signature-256": validSignature ? signature(Buffer.from(body)) : `sha256=${"0".repeat(64)}`, "content-length": body.length } }, response => {
         const chunks: Buffer[] = []; response.on("data", chunk => chunks.push(chunk)); response.on("end", () => resolve({ status: response.statusCode!, body: JSON.parse(Buffer.concat(chunks).toString()) }));
       }); request.on("error", reject); request.end(body);
     });
     try {
+      for (let index = 0; index < 101; index += 1) assert.equal((await send(payload, delivery, false)).status, 401);
       assert.equal((await send(payload)).status, 202);
       const duplicates = await Promise.all(Array.from({ length: 8 }, () => send(payload)));
       assert.deepEqual(duplicates.map(result => result.status), Array(8).fill(202));

@@ -1,4 +1,4 @@
-# GitHub App webhook pilot runbook
+# GitHub App webhook pilot 運用手順
 
 Issue #52 の pilot は、所有を確認した単一 repository と `issues.opened` のように明示した event/action だけを受け付ける。共通 ingress の endpoint は `POST /v1/ingress/github` で、public proxy は request body を変更せず Unix socket へ渡す。
 
@@ -18,7 +18,7 @@ Issue #52 の pilot は、所有を確認した単一 repository と `issues.ope
 - response loss や socket 切断の後に redelivery API を自動実行しない。GitHub delivery UI の delivery ID と Dispatcher の source `github` の receipt を read-only で照合し、人間が再配送の要否を決める。
 - installation API の追加 fetch は `GitHubReadOnlyInstallationClient` を使い、固定した repository の `GET` のみに限定する。403/404/429/5xx と token expiry は delivery 未受信として扱わず、write や自動 retry に切り替えない。
 
-## Live smoke（手動 gate）
+## 実環境での動作確認（手動 gate）
 
 1. test GitHub App の permissions と対象 repository が上記の最小集合であることを GitHub App settings で再確認する。
 2. 隔離した HTTPS proxy と Dispatcher を起動し、許可した event を 1 件発生させる。
