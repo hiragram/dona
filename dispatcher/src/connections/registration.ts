@@ -32,8 +32,14 @@ type AttemptRow = {
 export class ProviderRegistrationRegistry {
   constructor(private readonly db: Database.Database, private readonly clock: Clock = systemClock) {}
 
+  private now(): number {
+    const now = this.clock.now();
+    if (!Number.isSafeInteger(now)) throw new ConnectionError("clock_skew");
+    return now;
+  }
+
   private binding(input: Readonly<{ provider: string; providerId: string; connectionId?: string; account?: string; resource?: string }>, activeOnly: boolean,
-    now = this.clock.now()): VerificationBinding {
+    now = this.now()): VerificationBinding {
     if (!identifier.safeParse(input.providerId).success || !identifier.safeParse(input.provider).success ||
       (input.connectionId !== undefined && !connectionIdentifier.safeParse(input.connectionId).success) ||
       (input.account !== undefined && !identifier.safeParse(input.account).success) ||
@@ -70,7 +76,7 @@ export class ProviderRegistrationRegistry {
 
   resolve(input: Readonly<{ provider: string; providerId: string; connectionId?: string; account?: string; resource?: string }>): VerificationBinding {
     const result = this.db.transaction((): { binding?: VerificationBinding; error?: unknown } => {
-      const now = this.clock.now();
+      const now = this.now();
       try {
         const binding = this.binding(input, true, now);
         this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.delivery.connectionId);
@@ -94,7 +100,7 @@ export class ProviderRegistrationRegistry {
   issue(input: Readonly<{ provider: string; providerId: string; connectionId: string; account: string; resource: string }>, ttlMs: number): string {
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 30 * 60_000) throw new ConnectionError("invalid_input");
     const result = this.db.transaction((): { token?: string; error?: unknown } => {
-      const now = this.clock.now();
+      const now = this.now();
       let binding: VerificationBinding;
       try { binding = this.binding(input, false, now); }
       catch (error) {
@@ -127,7 +133,7 @@ export class ProviderRegistrationRegistry {
       !Number.isSafeInteger(expected.verificationEpoch) || expected.verificationEpoch < 0 || !deliverySchema.safeParse(expected.delivery).success)
       throw new ConnectionError("invalid_input");
     const result = this.db.transaction((): { claim?: VerificationClaim; error?: unknown } => {
-      const now = this.clock.now();
+      const now = this.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
       if (!row || row.state === "consumed") throw new ConnectionError("not_authorized");
       if (row.expires_at <= now) {
@@ -172,10 +178,13 @@ export class ProviderRegistrationRegistry {
     if (!validToken(token) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(claimId))
       throw new ConnectionError("invalid_input");
     const result = this.db.transaction((): { binding?: VerificationBinding; error?: unknown } => {
-      const now = this.clock.now();
+      const now = this.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
-      if (!row || row.state !== "claimed" || row.claim_id !== claimId)
-        throw new ConnectionError("not_authorized");
+      if (!row) throw new ConnectionError("not_authorized");
+      if (row.state !== "claimed" || row.claim_id !== claimId) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
+        return { error: new ConnectionError("not_authorized") };
+      }
       if (row.claim_until! <= now || row.expires_at <= now) {
         this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
         return { error: new ConnectionError("not_authorized") };

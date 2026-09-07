@@ -123,6 +123,15 @@ test("secret readはFIFOをblocking open前に拒否する", async (t) => {
   await assert.rejects(store.read("cred_fifo", 1), /not_authorized/);
 });
 
+test("read-only rootではpending directoryを作らずcredentialを読む", async (t) => {
+  const { secrets, store } = fixture(t);
+  fs.writeFileSync(path.join(secrets, "cred_readonly.1.secret"), Buffer.alloc(32, 5), { mode: 0o600 });
+  fs.chmodSync(secrets, 0o500);
+  assert.equal((await store.read("cred_readonly", 1)).length, 32);
+  assert.equal(fs.existsSync(path.join(secrets, ".pending")), false);
+  fs.chmodSync(secrets, 0o700);
+});
+
 test("publish前crashの古いtemporary secretだけをboundedに回収する", async (t) => {
   const { secrets, store } = fixture(t);
   await store.write("cred_seed", 1, Buffer.alloc(32, 9));
@@ -289,6 +298,25 @@ test("consumeのcurrent binding失敗時刻もcommitする", (t) => {
   raw.prepare("UPDATE connection_subscriptions SET state='stopped'").run(); clock.value += 100;
   assert.throws(() => db.providerRegistration.consume(token, claim.claimId), /not_authorized/);
   assert.equal((raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock, clock.value);
+});
+
+test("claim前consume失敗の観測時刻もcommitする", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
+    connectionId: binding.delivery.connectionId, account: binding.delivery.account, resource: binding.delivery.resource }, 5_000);
+  clock.value += 100;
+  assert.throws(() => db.providerRegistration.consume(token, "00000000-0000-4000-8000-000000000000"), /not_authorized/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /clock_skew/);
+});
+
+test("invalid clockは永続化前にclock_skewで拒否する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); activate(db);
+  const raw = new Database(file); t.after(() => raw.close());
+  const before = (raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock;
+  clock.value = Number.NaN;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
+  assert.equal((raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock, before);
 });
 
 test("verification tokenとclaim IDはhash・query前に固定形式で拒否する", (t) => {

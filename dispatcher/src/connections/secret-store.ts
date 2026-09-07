@@ -15,12 +15,6 @@ export class PrivateFileSecretStore {
     const stats = await fs.lstat(this.root);
     if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0)
       throw new ConnectionError("not_authorized");
-    await fs.mkdir(this.pending, { mode: 0o700 }).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    });
-    const pending = await fs.lstat(this.pending);
-    if (!pending.isDirectory() || pending.isSymbolicLink() || pending.uid !== process.getuid?.() || (pending.mode & 0o077) !== 0)
-      throw new ConnectionError("not_authorized");
   }
 
   private file(reference: string, revision: number): string {
@@ -30,6 +24,12 @@ export class PrivateFileSecretStore {
 
   private async pendingDirectory(reference: string, revision: number): Promise<string> {
     this.file(reference, revision);
+    await fs.mkdir(this.pending, { mode: 0o700 }).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    });
+    const pending = await fs.lstat(this.pending);
+    if (!pending.isDirectory() || pending.isSymbolicLink() || pending.uid !== process.getuid?.() || (pending.mode & 0o077) !== 0)
+      throw new ConnectionError("not_authorized");
     const directory = path.join(this.pending, `${reference}.${revision}`);
     await fs.mkdir(directory, { mode: 0o700 }).catch((error) => {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
