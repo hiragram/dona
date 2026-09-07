@@ -212,9 +212,11 @@ export async function drainDriveChanges(
       throw new ConnectionError("operation_pending");
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
       .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId :
-        change.driveId === undefined || members.has(change.fileId) || allowlist.fileIds.has(change.fileId));
+        change.driveId === undefined || members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
+        allowlist.folderIds.has(change.fileId));
     if (fileChanges.some((change)=>allowlist.folderIds.has(change.fileId)&&
-      (change.removed===true||change.file?.trashed===true))) throw new ConnectionError("operation_pending");
+      (change.removed===true||change.file?.trashed===true||(feed.kind==="user"&&change.driveId!==undefined))))
+      throw new ConnectionError("operation_pending");
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
     const touchedMembers = new Map<string,boolean>();
     for (const change of fileChanges) {
@@ -252,7 +254,8 @@ export async function drainDriveChanges(
       return { done: true, checkpoint: parsed.data.nextPageToken, events, membershipChanges, continuation:true };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
-    if(seenPageTokens.has(parsed.data.newStartPageToken)) throw new ConnectionError("incomplete_batch");
+    if(seenPageTokens.has(parsed.data.newStartPageToken)&&
+      !(parsed.data.newStartPageToken===pageToken&&parsed.data.changes.length===0)) throw new ConnectionError("incomplete_batch");
     final = true;
     committedCheckpoint = parsed.data.newStartPageToken;
     return { done: true, checkpoint: parsed.data.newStartPageToken, events, membershipChanges };

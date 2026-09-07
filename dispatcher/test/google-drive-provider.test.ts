@@ -137,6 +137,21 @@ test("allowlisted folder自身の削除はcursor commit前にreconciliationへ�
   assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
 });
 
+test("allowlisted folder自身のshared drive移動もreconciliationへ隔離する",async(t)=>{
+  const db=fixture(t);
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"folder-1",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"folder-1"}}],newStartPageToken:"next"})},
+    {fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()}),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
+});
+
+test("変更のない空pageでは現在tokenと同じnewStartPageTokenを許容する",async(t)=>{
+  const db=fixture(t);
+  await drainDriveChanges(db,binding,{list:async()=>({changes:[],newStartPageToken:"start-token"})},
+    {fileIds:new Set(),folderIds:new Set(),driveIds:new Set()});
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
+});
+
 test("folder/drive経路で初観測したTrash fileもreconciliationへ隔離する",async(t)=>{
   for(const [allowlist,feed,change] of [
     [{fileIds:new Set<string>(),folderIds:new Set(["folder-1"]),driveIds:new Set<string>()},{kind:"user"} as const,
