@@ -25,6 +25,7 @@ import { eventOwnerSchema, executionPolicySchema, insertBinding, legacySlackBind
 import type { EventBinding, ExecutionPolicy, ProviderOwner } from "./event-routing.js";
 
 import { ConnectionRegistry, type CursorBatch } from "./connections/registry.js";
+import { ProviderRegistrationRegistry } from "./connections/registration.js";
 import { migrateConnections, connectionDispatchPredicate, connectionDispatchPredicateFor } from "./connections/schema.js";
 import { ConnectionError, type Clock, type DeliveryBinding } from "./connections/domain.js";
 
@@ -64,6 +65,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
 
   readonly connections: ConnectionRegistry;
+  readonly providerRegistration: ProviderRegistrationRegistry;
   private claimsClosed = false;
   readonly queuePolicy: QueuePolicy;
 
@@ -87,6 +89,7 @@ export class DispatcherDatabase {
       }).immediate();
     } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
+    this.providerRegistration = new ProviderRegistrationRegistry(this.db, clock ?? legacyClock);
   }
 
   private migrate(): void {
