@@ -85,14 +85,14 @@ test("明示file allowlistでもuser feedからshared driveへの離脱を優先
   assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
 });
 
-test("prior membershipなしの明示file離脱とTrash移動をtombstone化する",async(t)=>{
-  const db=fixture(t); let round=0; const client={list:async()=>({changes:[++round===1?
-    {fileId:"moving",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving"}}:
-    {fileId:"trashed",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"trashed",trashed:true}}],newStartPageToken:`next-${round}`})};
-  const allowlist={fileIds:new Set(["moving","trashed"]),folderIds:new Set<string>(),driveIds:new Set<string>()};
-  await drainDriveChanges(db,binding,client,allowlist); await drainDriveChanges(db,binding,client,allowlist);
-  assert.equal(db.list().length,2);
-  for(const row of db.list()) assert.deepEqual(JSON.parse(row.payload_json),{removed:true,drive_id:null,file:null});
+test("prior membershipなしの明示file離脱をtombstone化しTrash snapshotはreconciliationへ隔離する",async(t)=>{
+  const db=fixture(t); const allowlist={fileIds:new Set(["moving","trashed"]),folderIds:new Set<string>(),driveIds:new Set<string>()};
+  await drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"moving",driveId:"drive-2",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving"}}],newStartPageToken:"next-1"})},allowlist);
+  assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"trashed",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"trashed",trashed:true}}],newStartPageToken:"next-2"})},allowlist),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"next-1");
 });
 
 test("pages上限を事前検証しallowlisted drive removalはreconciliationへ隔離する",async(t)=>{
@@ -125,6 +125,16 @@ test("drain全体の循環page tokenをcommit前に拒否する",async(t)=>{
     pageToken==="start-token"?{changes:[],nextPageToken:"page-2"}:{changes:[],nextPageToken:"start-token"}};
   await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),/incomplete_batch/);
   assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),/incomplete_batch/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
+});
+
+test("allowlisted folder自身の削除はcursor commit前にreconciliationへ隔離する",async(t)=>{
+  const db=fixture(t);
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"folder-1",removed:true,changeType:"file",time:"2026-09-07T00:00:00Z"}],newStartPageToken:"next"})},
+    {fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()}),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"start-token");
 });
 
 function fixture(t: { after(fn: () => void): void }) {

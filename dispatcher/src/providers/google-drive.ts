@@ -175,7 +175,7 @@ export async function drainDriveChanges(
   const snapshot = database.connections.pollingSnapshot(binding);
   let expected = snapshot.cursor;
   const members = new Set([...snapshot.membership,...(allowlist.priorFileIds ?? [])]);
-  const seenPageTokens = new Set<string>();
+  const seenPageTokens = new Set(snapshot.history);
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
     if (remaining <= 0) throw new ConnectionError("incomplete_batch");
@@ -187,7 +187,6 @@ export async function drainDriveChanges(
     await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
     if (pageToken === null) throw new ConnectionError("cursor_conflict");
-    if (seenPageTokens.has(pageToken)) throw new ConnectionError("incomplete_batch");
     seenPageTokens.add(pageToken);
     let raw: unknown;
     try {
@@ -214,13 +213,17 @@ export async function drainDriveChanges(
     const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
       .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId :
         change.driveId === undefined || members.has(change.fileId) || allowlist.fileIds.has(change.fileId));
+    if (fileChanges.some((change)=>allowlist.folderIds.has(change.fileId)&&
+      (change.removed===true||change.file?.trashed===true))) throw new ConnectionError("operation_pending");
+    if (fileChanges.some((change)=>change.file?.trashed===true&&
+      (members.has(change.fileId)||allowlist.fileIds.has(change.fileId)))) throw new ConnectionError("operation_pending");
     const events: {providerEventId:string;envelope:EventEnvelope}[] = [];
     for (const change of fileChanges) {
       const trackedBefore = members.has(change.fileId) || allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId));
       const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && trackedBefore;
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
-      const providerRemoved = change.removed === true || change.file?.trashed === true;
+      const providerRemoved = change.removed === true;
       const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         folderAllowed);
@@ -228,7 +231,7 @@ export async function drainDriveChanges(
       if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
-      if (folderAllowed && !change.removed) members.add(change.fileId); else members.delete(change.fileId);
+      if (folderAllowed && !providerRemoved) members.add(change.fileId); else members.delete(change.fileId);
     }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
@@ -238,7 +241,7 @@ export async function drainDriveChanges(
       if (seenPageTokens.has(parsed.data.nextPageToken)) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
       committedCheckpoint = parsed.data.nextPageToken;
-      return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort() };
+      return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort(), continuation:true };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
     final = true;

@@ -8,6 +8,10 @@ export function migrateConnections(db: Database.Database): void {
       connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, member TEXT NOT NULL,
       PRIMARY KEY(connection_id,resource,member)
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS connection_cursor_history (
+      connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, token TEXT NOT NULL,
+      PRIMARY KEY(connection_id,resource,token)
+    )`);
     const row = db.prepare("SELECT version FROM connection_schema WHERE singleton=1").get() as { version: number } | undefined;
     if (row && row.version !== 1) throw new Error("Unsupported connection schema");
     if (row) return;

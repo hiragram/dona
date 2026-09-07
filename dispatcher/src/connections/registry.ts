@@ -20,6 +20,7 @@ export interface CursorBatch {
   binding: DeliveryBinding; expected: Cursor; checkpoint: string; complete: boolean;
   events: readonly { providerEventId: string; envelope: EventEnvelope }[];
   membership?: readonly string[];
+  continuation?: boolean;
 }
 export class ConnectionRegistry {
   constructor(private readonly db: Database.Database, readonly clock: Clock = systemClock) {}
@@ -336,11 +337,13 @@ export class ConnectionRegistry {
     return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? ORDER BY member")
       .all(id,resource) as {member:string}[]).map(({member})=>member);
   }
-  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[] } {
+  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[]; history: string[] } {
     return this.db.transaction(() => {
       this.assertPolling(binding);
       return { cursor: this.cursor(binding.connectionId,binding.resource),
-        membership: this.membership(binding.connectionId,binding.resource) };
+        membership: this.membership(binding.connectionId,binding.resource),
+        history: (this.db.prepare("SELECT token FROM connection_cursor_history WHERE connection_id=? AND resource=?")
+          .all(binding.connectionId,binding.resource) as {token:string}[]).map(({token})=>token) };
     }).immediate();
   }
   assertPolling(binding: DeliveryBinding): void {
@@ -395,6 +398,9 @@ export class ConnectionRegistry {
         const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?)");
         for(const member of batch.membership) insert.run(c.id,b.resource,member);
       }
+      if (batch.continuation !== true)
+        this.db.prepare("DELETE FROM connection_cursor_history WHERE connection_id=? AND resource=?").run(c.id,b.resource);
+      this.db.prepare("INSERT OR IGNORE INTO connection_cursor_history VALUES(?,?,?)").run(c.id,b.resource,batch.checkpoint);
       this.audit(c, "checkpoint_committed", now); return results;
     }).immediate();
   }

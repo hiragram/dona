@@ -6,6 +6,7 @@ import type { Cursor, CursorBatch } from "./registry.js";
 export type CursorPage = {
   events: CursorBatch["events"];
   membership?: CursorBatch["membership"];
+  continuation?: boolean;
 } & ({ done: false; nextPage: string } | { done: true; checkpoint: string });
 
 // page token は一時変数だけ。最終 page の取得・検証成功まで永続checkpointを触らない。
@@ -50,7 +51,8 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
     catch { throw new ConnectionError("incomplete_batch"); }
     if(result.done===true) {
       database.commitConnectionBatch({binding,expected,checkpoint:result.checkpoint,complete:true,events,
-        ...(result.membership === undefined ? {} : {membership:result.membership})}); return;
+        ...(result.membership === undefined ? {} : {membership:result.membership}),
+        ...(result.continuation === undefined ? {} : {continuation:result.continuation})}); return;
     }
     if(result.done!==false||typeof result.nextPage!=="string"||result.nextPage.length>16_384||seen.has(result.nextPage)) throw new ConnectionError("incomplete_batch");
     seen.add(result.nextPage);page=result.nextPage;
