@@ -123,7 +123,13 @@ describe("GitHub provider pilot", () => {
     for (const candidate of [
       { connectionId: "", installationId: 77, repositoryId: 42, repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: "/tmp/secret" },
       { connectionId: "github-pilot", installationId: 77, repositoryId: 42, repositoryFullName: "abc", events: { issues: ["opened"] }, webhookSecretPath: "/tmp/secret" },
-    ]) assert.throws(() => loadConfig({ DONA_GITHUB_PILOT_CONFIG: JSON.stringify(candidate) }));
+    ]) assert.throws(() => loadConfig({ DONA_GITHUB_PILOT_CONFIG: JSON.stringify({ ...candidate,
+      trustedProxy: { githubMetaIpAllowlist: true, perSourceRateAndConcurrencyLimit: true } }) }));
+    const otherwiseValid = { connectionId: "github-pilot", installationId: 77, repositoryId: 42, repositoryFullName: "hiragram/dona",
+      events: { issues: ["opened"] }, webhookSecretPath: "/tmp/secret" };
+    assert.throws(() => loadConfig({ DONA_GITHUB_PILOT_CONFIG: JSON.stringify(otherwiseValid) }), /invalid/);
+    assert.throws(() => loadConfig({ DONA_GITHUB_PILOT_CONFIG: JSON.stringify({ ...otherwiseValid,
+      trustedProxy: { githubMetaIpAllowlist: true, perSourceRateAndConcurrencyLimit: false } }) }), /invalid/);
     const { root } = await tempConfig(); roots.push(root);
     const target = `${root}/target`; const link = `${root}/link`;
     await fs.writeFile(target, secretText, { mode: 0o600 }); await fs.symlink(target, link);
@@ -135,7 +141,8 @@ describe("GitHub provider pilot", () => {
     const secretPath = `${root}/github-webhook-secret`;
     await fs.writeFile(secretPath, secretText, { mode: 0o600 });
     config.githubPilot = { connectionId: "github-pilot", installationId: 77, repositoryId: 42,
-      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath };
+      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath,
+      trustedProxy: { githubMetaIpAllowlist: true, perSourceRateAndConcurrencyLimit: true } };
     const database = new DispatcherDatabase(config.databasePath);
     database.connections.register({ id: "github-pilot", provider: "github", account: "installation:77",
       allowlist: [{ resource: "42", events: ["issues.opened"] }], credentialRef: "cred_github_pilot", credentialRevision: 1,
@@ -159,7 +166,8 @@ describe("GitHub provider pilot", () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const secretPath = `${root}/github-webhook-secret`; await fs.writeFile(secretPath, secretText, { mode: 0o600 });
     config.githubPilot = { connectionId: "github-pilot", installationId: 77, repositoryId: 42,
-      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath };
+      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath,
+      trustedProxy: { githubMetaIpAllowlist: true, perSourceRateAndConcurrencyLimit: true } };
     const database = new DispatcherDatabase(config.databasePath);
     database.connections.register({ id: "github-pilot", provider: "github", account: "installation:88",
       allowlist: [{ resource: "42", events: ["issues.opened"] }], credentialRef: "cred_github_pilot", credentialRevision: 1,

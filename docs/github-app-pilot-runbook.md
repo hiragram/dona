@@ -9,7 +9,7 @@ Issue #52 の pilot は、所有を確認した単一 repository と `issues.ope
 - Webhook events は実装時に connection allowlist へ登録した event/action だけを選ぶ。
 - webhook secret、App private key、installation token は Keychain 等の secret store に置く。DB、設定ファイル、log、Event Envelope、Result には値を保存せず、`credentialRef` と revision だけを保存する。
 
-起動時は `DONA_GITHUB_PILOT_CONFIG` に `connectionId`、`installationId`、repository numeric ID、`owner/name`、event/action allowlist、owner-only mode の `webhookSecretPath` を JSON で設定する。`dona-dispatcher serve` は DB から current connection revision / credential revision / active subscription generation を解決して `ExternalIngressRegistry` へ登録する。registration は受信開始から 9.5 秒の単一 deadline 内で raw bytes の署名検証後にだけ JSON を解析し、installation/repository identity と allowlist が一致した場合だけ durable enqueue する。
+起動時は `DONA_GITHUB_PILOT_CONFIG` に `connectionId`、`installationId`、repository numeric ID、`owner/name`、event/action allowlist、owner-only mode の `webhookSecretPath` を JSON で設定する。公開 proxy は GitHub `/meta` の `hooks` IP allowlist を定期照合し、送信元別の rate limit と in-flight concurrency limit を必ず適用する。設定の `trustedProxy.githubMetaIpAllowlist` と `trustedProxy.perSourceRateAndConcurrencyLimit` がともに `true` でなければ Dispatcher は pilot を起動しない。`dona-dispatcher serve` は DB から current connection revision / credential revision / active subscription generation を解決して `ExternalIngressRegistry` へ登録する。registration は受信開始から 9.5 秒の単一 deadline 内で raw bytes の署名検証後にだけ JSON を解析し、installation/repository identity と allowlist が一致した場合だけ durable enqueue する。
 
 ## ACK と障害境界
 

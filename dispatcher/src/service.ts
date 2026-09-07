@@ -18,7 +18,11 @@ import {
 
 export function serviceExternalIngressRegistry(config: DispatcherConfig, database: DispatcherDatabase): ExternalIngressRegistry {
   const registrations = config.githubPilot ? [githubPilotRegistration({
-    ...config.githubPilot,
+    connectionId: config.githubPilot.connectionId,
+    installationId: config.githubPilot.installationId,
+    repositoryId: config.githubPilot.repositoryId,
+    repositoryFullName: config.githubPilot.repositoryFullName,
+    events: config.githubPilot.events,
     async resolveBinding() {
       const connection = database.connections.get(config.githubPilot!.connectionId);
       if (connection.provider !== "github" || connection.state !== "active" ||
