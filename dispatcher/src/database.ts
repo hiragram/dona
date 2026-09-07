@@ -306,7 +306,10 @@ export class DispatcherDatabase {
           payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
         };
       }
-      if(binding.owner.kind==="schedule"&&["dispatching","waiting_agent"].includes(sourceEvent.status)) {
+      if(binding.owner.kind==="schedule") {
+        if(!["dispatching","waiting_agent"].includes(sourceEvent.status)) {
+          throw new Error("Scheduled work event is not dispatching");
+        }
         const payload=JSON.parse(sourceEvent.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
         const target=payload.work?.authorization_target;
         if(typeof target?.workspace_id!=="string"||typeof target.channel_id!=="string") throw new Error("Scheduled work authorization target is missing");
@@ -421,14 +424,14 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown','agent_wait_observation_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','agent_wait_observation_unknown'))
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
 
   listAmbiguousScheduledJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown')
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','invalid_result_agent_stop_unknown','agent_wait_observation_unknown')
         AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
   }
 
@@ -455,7 +458,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown','agent_wait_observation_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','agent_wait_observation_unknown'))
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -464,7 +467,7 @@ export class DispatcherDatabase {
       SELECT * FROM jobs
       WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
         AND completion_event_id IS NULL
-        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=jobs.job_id AND c.job_status=jobs.status)
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=jobs.job_id AND (c.job_status=jobs.status OR c.work_state=jobs.status))
       ORDER BY updated_at LIMIT ?
     `).all(limit) as JobRow[];
   }
@@ -677,7 +680,19 @@ export class DispatcherDatabase {
     if (!["queued", "retryable_failed", "preparing", "dispatching", "running", "blocked", "needs_review"].includes(row.status)) {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
-    this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+    this.db.transaction(()=>{
+      if(row.completion_event_id) {
+        const prior=this.db.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?")
+          .get(row.completion_event_id) as {notification_state:string;notification_authorization_phase:string}|undefined;
+        if(prior?.notification_state==="pending"&&prior.notification_authorization_phase==="none") {
+          const changed=this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')")
+            .run(nowUtc(),nowUtc(),row.completion_event_id).changes;
+          if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
+          this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(row.completion_event_id);
+        } else if(prior&&prior.notification_state!=="none") throw new Error("prior_notification_requires_reconciliation");
+      }
+      this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+    }).immediate();
     return this.getJobRequired(jobId);
   }
 
@@ -1037,7 +1052,7 @@ export class DispatcherDatabase {
   }
 
   private notificationDelivered(eventId:string,result:ResultEnvelope):{delivered:boolean;runId?:string} {
-    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string}|undefined;
+    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
@@ -1047,7 +1062,8 @@ export class DispatcherDatabase {
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
-    return {delivered:posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    const withinDeadline=Date.parse(result.completed_at)<=Date.parse(completion.materialized_at)+900_000;
+    return {delivered:withinDeadline&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
