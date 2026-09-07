@@ -98,6 +98,8 @@ export interface DriveAllowlist {
   readonly driveIds: ReadonlySet<string>;
   /** 永続projectionから得た、以前allowlist内だったfile。離脱/権限喪失tombstoneに使う。 */
   readonly priorFileIds?: ReadonlySet<string>;
+  /** bounded reconciliationで確認済みのsubfolder。子孫喪失controlの隔離に使う。 */
+  readonly priorFolderIds?: ReadonlySet<string>;
 }
 
 export type DriveFeed = { readonly kind: "user" } | { readonly kind: "drive"; readonly driveId: string };
@@ -174,7 +176,7 @@ export async function drainDriveChanges(
   const snapshot = database.connections.pollingSnapshot(binding);
   let expected = snapshot.cursor;
   const members = new Set([...snapshot.membership,...(allowlist.priorFileIds ?? [])]);
-  const folderMembers = new Set(snapshot.folders);
+  const folderMembers = new Set([...snapshot.folders,...(allowlist.priorFolderIds??[])]);
   const seenPageTokens = new Set(snapshot.history);
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
@@ -232,6 +234,9 @@ export async function drainDriveChanges(
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
+      if(isTrackedFolder&&!folderAllowed)throw new ConnectionError("operation_pending");
+      const joiningFolder=change.file?.mimeType==="application/vnd.google-apps.folder"&&folderAllowed&&!isTrackedFolder;
+      if(joiningFolder)throw new ConnectionError("operation_pending");
       const alternativelyAllowed=allowlist.fileIds.has(change.fileId)||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId));
       if(members.has(change.fileId)&&!folderAllowed&&!alternativelyAllowed&&!providerRemoved&&!leftUserFeed)

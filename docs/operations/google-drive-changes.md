@@ -14,7 +14,7 @@
 
 `changes.watch`のexpirationは作成時に明示し、7日以下に制限する。expiry windowへ入ったらunique channel ID/tokenで新generationを1件だけ作る。create response lossはoperation receipt/lookupで照合し、blind createしない。old/new overlap中はcanonical change identityでduplicateを収束させ、新generationの検証後だけ旧channelをstop候補にする。stop response lossもread-only照合へ送り、blind stopしない。
 
-periodic reconciliationはprovider cursor lifecycleのwakeとして実行し、scheduler scheduleを正本にしない。healthではsecretなしにconnection state、cursor version/age、channel expiry、last delivery/reconcile、renew operation stateを確認する。
+periodic reconciliationはprovider cursor lifecycleのwakeとして実行し、scheduler scheduleを正本にしない。現行のhealth/inspectionではsecretなしにconnection state、resource別cursor revision/version、channel expiry、last delivery/reconcile、renew operation stateを確認する。cursor ageは永続・公開していないため、同じresourceのcursor versionを時刻を記録して複数回観測し、停止の補助証拠にする。ageを直接確認できるとは扱わない。
 
 ## live smoke（別途明示承認が必要）
 
