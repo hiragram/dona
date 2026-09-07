@@ -81,7 +81,7 @@ const driveOtherChangeSchema = z.object({
 const driveChangeSchema = z.union([driveFileChangeSchema, driveOtherChangeSchema]);
 
 const drivePageSchema = z.object({
-  changes: z.array(driveChangeSchema).max(10_000),
+  changes: z.array(driveChangeSchema).max(10_000).default([]),
   nextPageToken: z.string().min(1).max(16_384).optional(),
   newStartPageToken: z.string().min(1).max(16_384).optional(),
 }).passthrough();
@@ -126,13 +126,6 @@ function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): strin
       parents: [...(change.file.parents ?? [])].sort(), trashed: change.file.trashed ?? false,
     } };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
-}
-
-function allowed(change: z.infer<typeof driveFileChangeSchema>, allowlist: DriveAllowlist): boolean {
-  return allowlist.fileIds.has(change.fileId) ||
-    (allowlist.priorFileIds?.has(change.fileId) ?? false) ||
-    (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
-    (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
 }
 
 function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>, tombstone: boolean): EventEnvelope {
@@ -201,7 +194,7 @@ export async function drainDriveChanges(
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
       const tombstone = !currentlyAllowed && members.has(change.fileId);
-      if (!currentlyAllowed && !tombstone && !allowed(change, allowlist)) continue;
+      if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: canonicalChangeId(change), envelope: envelope(binding, change, tombstone) });
       if (currentlyAllowed && !change.removed) members.add(change.fileId); else members.delete(change.fileId);
     }

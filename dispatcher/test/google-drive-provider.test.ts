@@ -36,6 +36,21 @@ test("同じdrain内のfolder加入後の離脱をtombstone化する", async (t)
   assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
 });
 
+test("tombstone後のfolder外changeで静的prior membershipを再適用しない", async (t) => {
+  const db=fixture(t); const client={list:async()=>({changes:[
+    {fileId:"leaving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"leaving",parents:["outside"]}},
+    {fileId:"leaving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"leaving",parents:["outside"],name:"private"}},
+  ],newStartPageToken:"next"})};
+  await drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["leaving"])});
+  assert.equal(db.list().length,1); assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
+});
+
+test("changes省略の正常な空pageでもnewStartPageTokenをcommitする", async (t) => {
+  const db=fixture(t); await drainDriveChanges(db,binding,{list:async()=>({kind:"drive#changeList",newStartPageToken:"empty-next"})},
+    {fileIds:new Set(),folderIds:new Set(),driveIds:new Set()});
+  assert.equal(db.list().length,0); assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"empty-next");
+});
+
 test("shared drive routing IDと全drive allowlistを分離して個別fileだけ許可する", async (t) => {
   const db=fixture(t); const client={list:async()=>({changes:[
     {fileId:"allowed",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"allowed"}},
