@@ -10,7 +10,8 @@ workspace、integration、resource、event typeのallowlistを解決する。Dis
 
 eventは変更内容ではなくlatest-state fetchのsignalとして扱う。同一entityのeventは`latest` modeで
 coalesceし、payloadのtimestampを永続snapshotの順序根拠にしない。read clientは必要最小fieldだけを取得し、
-404を`deleted`、401/403を`permission_lost`、429を`rate_limited`、その他の失敗を`degraded`として記録する。
+404を削除・共有解除の曖昧性を保つ`not_found_or_inaccessible`、401/403を`permission_lost`、429を
+`rate_limited`、通信例外とその他の失敗を`degraded`として記録する。
 subscription設定変更後にevent typeが自動追加されるとは仮定せず、allowlist revisionを更新して再検証する。
 provider resourceへのwriteと、曖昧なsubscription writeのblind retryは行わない。
 

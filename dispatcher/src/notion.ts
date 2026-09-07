@@ -10,21 +10,29 @@ import {
 } from "./ingress.js";
 
 const id = z.string().min(1).max(255).regex(/^[A-Za-z0-9_-]+$/);
-const eventSchema = z.strictObject({
+const eventSchema = z.object({
   id,
   timestamp: z.string().datetime({ offset: true }),
   workspace_id: id,
   subscription_id: id,
   integration_id: id,
   type: z.string().min(1).max(128).regex(/^[a-z0-9_.]+$/),
-  entity: z.strictObject({ id, type: z.enum(["page", "database", "data_source"]) }),
+  entity: z.object({ id, type: z.enum(["page", "database", "data_source"]) }),
   attempt_number: z.number().int().min(1).max(8),
 });
-const verificationSchema = z.strictObject({ verification_token: z.string().min(16).max(1024) });
+const verificationSchema = z.object({ verification_token: z.string().min(16).max(1024) });
 
 export interface NotionSecretStore {
   get(reference: string): Promise<Buffer | undefined>;
-  put(reference: string, value: Buffer): Promise<void>;
+}
+export interface NotionVerificationClaim {
+  binding: DeliveryBinding;
+  providerEventId: string;
+  occurredAt: string;
+}
+export interface NotionVerificationStore {
+  // pending registration attemptだけを原子的にconsumeし、secretを未設定の場合だけ保存する。
+  claim(input: Readonly<{ connectionId: string; secretRef: string; token: Buffer }>): Promise<NotionVerificationClaim | undefined>;
 }
 export interface NotionBindingResolver {
   resolve(input: Readonly<{ connectionId: string; subscriptionId: string; integrationId: string;
@@ -34,6 +42,7 @@ export interface NotionRegistrationOptions {
   connectionId: string;
   verificationSecretRef: string;
   secrets: NotionSecretStore;
+  verification: NotionVerificationStore;
   bindings: NotionBindingResolver;
 }
 
@@ -60,8 +69,11 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       const verification = verificationSchema.safeParse(candidate);
       if (verification.success) {
         if (header(request, "x-notion-signature") !== undefined) throw new ExternalIngressAuthenticationError();
-        await options.secrets.put(options.verificationSecretRef, Buffer.from(verification.data.verification_token));
-        return { connectionId: options.connectionId, principal: { kind: "verification" } };
+        const claim = await options.verification.claim({ connectionId: options.connectionId,
+          secretRef: options.verificationSecretRef, token: Buffer.from(verification.data.verification_token) });
+        if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
+        return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,
+          principal: { kind: "verification", provider_event_id: claim.providerEventId, occurred_at: claim.occurredAt } };
       }
       const parsed = eventSchema.safeParse(candidate);
       if (!parsed.success) throw new ExternalIngressAuthenticationError();
@@ -83,8 +95,8 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
     },
     normalize(request, verified) {
       if (verified.principal.kind === "verification") {
-        return { providerEventId: `verification:${options.connectionId}`, type: "notion.verification",
-          occurredAt: request.receivedAt, subject: { connection_id: options.connectionId },
+        return { providerEventId: String(verified.principal.provider_event_id), type: "notion.verification",
+          occurredAt: String(verified.principal.occurred_at), subject: { connection_id: options.connectionId },
           payload: { verified: true }, replyTarget: null } satisfies NormalizedExternalEvent;
       }
       const parsed = eventSchema.parse(json(request.body));
@@ -92,7 +104,8 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
         subject: { connection_id: options.connectionId, workspace_id: parsed.workspace_id,
           subscription_id: parsed.subscription_id, integration_id: parsed.integration_id,
           entity_id: parsed.entity.id, entity_type: parsed.entity.type },
-        payload: { attempt_number: parsed.attempt_number }, replyTarget: null } satisfies NormalizedExternalEvent;
+        // attempt_numberは同じevent IDの配送ごとに変わるため、durable event fingerprintへ含めない。
+        payload: {}, replyTarget: null } satisfies NormalizedExternalEvent;
     },
     parseNormalized(input) { return input as NormalizedExternalEvent; },
     queueSignal(event) {
@@ -105,15 +118,16 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
   };
 }
 
-export type NotionFetchOutcome = "fetched" | "deleted" | "permission_lost" | "rate_limited" | "degraded";
+export type NotionFetchOutcome = "fetched" | "not_found_or_inaccessible" | "permission_lost" | "rate_limited" | "degraded";
 export interface NotionReadClient {
   fetch(resourceId: string): Promise<{ status: number; retryAfter?: number; value?: Readonly<Record<string, unknown>> }>;
 }
 export async function fetchLatestNotionState(client: NotionReadClient, resourceId: string): Promise<{
   outcome: NotionFetchOutcome; retryAfter?: number; value?: Readonly<Record<string, unknown>> }> {
-  const response = await client.fetch(resourceId);
+  let response: Awaited<ReturnType<NotionReadClient["fetch"]>>;
+  try { response = await client.fetch(resourceId); } catch { return { outcome: "degraded" }; }
   if (response.status === 200 && response.value) return { outcome: "fetched", value: response.value };
-  if (response.status === 404) return { outcome: "deleted" };
+  if (response.status === 404) return { outcome: "not_found_or_inaccessible" };
   if (response.status === 401 || response.status === 403) return { outcome: "permission_lost" };
   if (response.status === 429) return { outcome: "rate_limited", ...(response.retryAfter === undefined ? {} : { retryAfter: response.retryAfter }) };
   return { outcome: "degraded" };
