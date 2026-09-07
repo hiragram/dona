@@ -156,7 +156,7 @@ export async function runService(
       const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
       const fetchSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       return fetchLatestNotionState({ async fetch(resourceId) {
-        const request = async (url: string) => {
+        const request = async (url: string, allowPartial = false) => {
           for (let attempt = 0; ; attempt += 1) {
             let response: Response;
             try { response = await fetch(url, {
@@ -164,7 +164,7 @@ export async function runService(
               headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } }); }
             catch (error) {
               if (signal.aborted) throw error;
-              if (fetchSignal.aborted) return { status: 200, value: { results: [], has_more: false, content_truncated: true } };
+              if (fetchSignal.aborted && allowPartial) return { status: 200, value: { results: [], has_more: false, content_truncated: true } };
               throw error;
             }
             const retry = response.headers.get("retry-after");
@@ -194,7 +194,7 @@ export async function runService(
             const url = new URL(`https://api.notion.com/v1/blocks/${encodeURIComponent(parentId)}/children`);
             url.searchParams.set("page_size", "100");
             if (cursor) url.searchParams.set("start_cursor", cursor);
-            const page = await request(url.toString());
+            const page = await request(url.toString(), true);
             if (page.status === 404 && depth > 0) { truncated = true; return []; }
             if (page.status !== 200 || !page.value) return { failure: page };
             if (page.value.content_truncated === true) truncated = true;
@@ -235,7 +235,7 @@ export async function runService(
               const url = new URL(`https://api.notion.com/v1/pages/${encodeURIComponent(resourceId)}/properties/${propertyPathId}`);
               url.searchParams.set("page_size", "100");
               if (cursor) url.searchParams.set("start_cursor", cursor);
-              const page = await request(url.toString());
+              const page = await request(url.toString(), true);
               if (page.status === 404) { truncated = true; break; }
               if (page.status !== 200 || !page.value) return page;
               if (page.value.content_truncated === true) truncated = true;

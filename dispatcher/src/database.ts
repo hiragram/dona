@@ -1077,6 +1077,18 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  recordInterruptedProviderFetch(eventId: string, at = new Date()): EventRow {
+    return this.db.transaction(() => {
+      const row = this.get(eventId);
+      if (!row || row.status !== "dispatching" || row.last_error_code !== "provider_fetching")
+        throw new Error(`Event ${eventId} is not in provider fetch phase`);
+      this.db.prepare(`UPDATE events SET status='retryable_failed',attempt_count=MAX(0,attempt_count-1),
+        available_at=?,last_error_code='provider_fetch_interrupted',last_error_message='Dispatcher stopped before prompt submission',updated_at=?
+        WHERE event_id=?`).run(at.toISOString(), at.toISOString(), eventId);
+      return this.get(eventId)!;
+    }).immediate();
+  }
+
   recordWaitingError(eventId: string, code: string, message: string, at = new Date()): void {
     this.db
       .prepare(`
