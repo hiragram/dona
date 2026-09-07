@@ -11,6 +11,7 @@ import {
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
+import type { SlackReminderConnector } from "./reminder-connector.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -56,6 +57,7 @@ export interface AdapterHealthState {
   connectionStates(): Record<string, string>;
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
+  trackOperation?<T>(operation: Promise<T>): Promise<T>;
 }
 
 export class SlackHealthServer {
@@ -70,6 +72,7 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
+    private readonly reminders?: Pick<SlackReminderConnector, "deliver">,
   ) {}
 
   async start(): Promise<void> {
@@ -115,6 +118,12 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (method === "POST" && (pathname === "/v1/internal/slack-reminders/preflight" || pathname === "/v1/internal/slack-reminders")) {
+      const operation = this.handleReminder(request, response, pathname.endsWith("/preflight"));
+      if (this.adapter.trackOperation) await this.adapter.trackOperation(operation);
+      else await operation;
+      return;
+    }
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
       if (!this.updateNotifications || !this.updateInternalTokenPath) {
         send(response, 503, {
@@ -230,10 +239,36 @@ export class SlackHealthServer {
       this.quiesceOperationId = input.operation_id;
       await this.adapter.quiesce();
       const status = this.adapter.drainStatus();
-      send(response, status.drained ? 200 : 409, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
+      send(response, status.drained ? 200 : 202, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
+  }
+
+  private async handleReminder(request: IncomingMessage, response: ServerResponse, preflightOnly: boolean): Promise<void> {
+    if (!this.reminders || !this.updateInternalTokenPath) {
+      send(response, 503, { schema_version: 1, error: { code: "connector_unavailable", message: "Reminder connector is not configured" } });
+      return;
+    }
+    if (!(await this.authorized(request))) {
+      send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
+      return;
+    }
+    if (this.adapter.isStopping()) {
+      send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+      return;
+    }
+    try {
+      const input = await this.readJson(request);
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+        return;
+      }
+      const result = await this.reminders.deliver(input, preflightOnly);
+      send(response, 200, { schema_version: 1, ...result });
+    } catch {
+      send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
+    }
   }
 
   private async authorized(request: IncomingMessage): Promise<boolean> {

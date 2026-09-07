@@ -1100,6 +1100,81 @@ test("outbox送信直前の期限判定は保存済みschedule時刻を使用す
   assert.equal(repo.getRun(first.run_id)?.reason, "misfire");
 });
 
+test("connector revocationは旧authorizationの通常resumeを拒否する", () => {
+  const { repo, raw } = setup();
+  repo.create("revoked_resume", input, due, actor, now);
+  repo.materialize("revoked_resume", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due, null, 0, "owner_not_authorized");
+  assert.equal(repo.get("revoked_resume")?.state, "paused");
+  const audit = raw.prepare("SELECT before_json, after_json FROM schedule_audit WHERE schedule_id = ? AND operation = 'outbox_revoked'").get("revoked_resume") as { before_json: string; after_json: string };
+  assert.equal(JSON.parse(audit.before_json).state, "active");
+  assert.equal(JSON.parse(audit.after_json).state, "paused");
+  assert.equal(JSON.parse(audit.after_json).decision_code, "owner_not_authorized");
+  assert.throws(() => repo.transition("revoked_resume", 1, "resume", actor, later), /authorization_expired/);
+});
+
+test("reminder outbox kindをimmutable revision actionと照合する", () => {
+  const { repo, raw } = setup();
+  repo.create("action_tamper", input, due, actor, now);
+  repo.materialize("action_tamper", 1, due, later, due, actor);
+  const outbox = raw.prepare("SELECT outbox_id FROM connector_outbox").get() as { outbox_id: string };
+  raw.prepare("UPDATE schedule_revisions SET action = 'work.read_only' WHERE schedule_id = 'action_tamper'").run();
+  assert.equal(repo.reminderConstraints(outbox.outbox_id), undefined);
+});
+
+test("認可照会中のpause複製も遅着revocationでresume不能にする", () => {
+  const { repo } = setup();
+  repo.create("revoked_after_pause", input, due, actor, now);
+  repo.materialize("revoked_after_pause", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("revoked_after_pause", 1, "pause", actor, later);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", later);
+  assert.equal(repo.get("revoked_after_pause")?.state, "paused");
+  assert.throws(() => repo.transition("revoked_after_pause", 2, "resume", actor, afterLater), /authorization_expired/);
+});
+
+test("認可照会不能はretry上限後にscheduleをpauseする", () => {
+  const { repo } = setup();
+  repo.create("auth_unavailable", input, due, actor, now);
+  repo.materialize("auth_unavailable", 1, due, later, due, actor);
+  for (const attemptAt of [due, "2026-09-05T00:01:01Z", "2026-09-05T00:01:06Z"]) {
+    const claim = repo.claim(attemptAt)!;
+    repo.requestStarted(claim.outbox_id, claim.claim_token!, attemptAt);
+    repo.finishWrite(claim.outbox_id, claim.claim_token!, "authorization_unavailable", attemptAt, null, 1);
+  }
+  assert.equal(repo.get("auth_unavailable")?.state, "paused");
+  assert.throws(() => repo.transition("auth_unavailable", 1, "resume", actor, later), /authorization_expired/);
+});
+
+test("認可照会retryがmisfire graceを越える場合は即時pauseする", () => {
+  const { repo } = setup();
+  repo.create("auth_retry_after_grace", input, due, actor, now);
+  repo.materialize("auth_retry_after_grace", 1, due, later, due, actor);
+  const nearGrace = "2026-09-05T00:15:59Z";
+  const claim = repo.claim(nearGrace)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, nearGrace);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "authorization_unavailable", nearGrace, null, 10);
+  assert.equal(repo.get("auth_retry_after_grace")?.state, "paused");
+  assert.equal(repo.getOutbox(claim.outbox_id, nearGrace)?.status, "failed");
+});
+
+test("connector待機中のpauseは遅着misfireより優先される", () => {
+  const { repo } = setup();
+  repo.create("paused_misfire", input, due, actor, now);
+  const run = repo.materialize("paused_misfire", 1, due, later, due, actor).run;
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("paused_misfire", 1, "pause", actor, later);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "misfire", later);
+  assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+  assert.equal(repo.getRun(run.run_id)?.reason, "cancelled");
+  assert.equal(repo.getOutbox(claim.outbox_id, later)?.status, "cancelled");
+  assert.ok((repo.auditHistory("paused_misfire") as { operation: string }[]).some(row => row.operation === "outbox_cancelled"));
+});
+
 test("時計後退中のrequestStartedはclaim時刻とaudit時刻を巻き戻さない", () => {
   const { repo, raw } = setup();
   repo.create("request_clock", input, due, actor, now);
@@ -1215,6 +1290,63 @@ test("schedule遷移はclaimed outboxのlease時刻より前へ戻らない", ()
     .get() as { terminal_at: string; content_delete_at: string };
   assert.equal(outbox.terminal_at, "2026-09-05T00:02:00Z");
   assert.equal(outbox.content_delete_at, "2026-09-12T00:02:00Z");
+});
+
+test("claim leaseの未来時刻では有効なauthorizationを早期失効させない", () => {
+  const { repo } = setup();
+  repo.create("transition_before_expiry", { ...input, expires_at: "2026-09-05T00:02:00Z" }, due, actor, now);
+  repo.materialize("transition_before_expiry", 1, due, later, due, actor);
+  repo.claim(due);
+  const paused = repo.transition("transition_before_expiry", 1, "pause", actor, "2026-09-05T00:01:30Z");
+  assert.equal(paused.state, "paused");
+  assert.equal(paused.updated_at, "2026-09-05T00:02:00Z");
+});
+
+test("配送完了時もlease由来のschedule時刻ではauthorizationを早期失効させない", () => {
+  const { repo } = setup();
+  repo.create("finish_before_expiry", { ...input, expires_at: "2026-09-05T00:02:00Z" }, due, actor, now);
+  repo.materialize("finish_before_expiry", 1, due, later, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.transition("finish_before_expiry", 1, "pause", actor, "2026-09-05T00:01:30Z");
+  assert.equal(repo.finishWrite(claim.outbox_id, claim.claim_token!, "sent", "2026-09-05T00:01:40Z", "receipt").status, "sent");
+  assert.equal(repo.get("finish_before_expiry")?.state, "paused");
+});
+
+test("配送完了時のmisfire判定はlease由来の保存時刻で早めない", () => {
+  const { repo, raw } = setup();
+  repo.create("finish_before_misfire", input, due, actor, now);
+  repo.materialize("finish_before_misfire", 1, due, later, due, actor);
+  const actual = "2026-09-05T00:12:40Z";
+  const claim = repo.claim(actual, 240)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, actual);
+  raw.prepare("UPDATE schedules SET updated_at = ? WHERE schedule_id = ?").run("2026-09-05T00:16:40Z", "finish_before_misfire");
+  const retried = repo.finishWrite(claim.outbox_id, claim.claim_token!, "not_accepted", actual);
+  assert.equal(retried.status, "pending");
+  assert.equal(retried.available_at, "2026-09-05T00:12:41Z");
+});
+
+test("one-shotの認可失敗はpausedをcompletedで上書きしない", () => {
+  const { dispatcher } = setup();
+  const repo = dispatcher.scheduler.withCodecs({ recurrence: text => text, policy: text => text });
+  const once = { ...input, recurrence_json: `{"at":"${due}","kind":"once","version":1}\n`, timezone: null, tzdb_version: null };
+  repo.create("once_revoked", once, due, actor, now);
+  repo.materialize("once_revoked", 1, due, null, due, actor);
+  const claim = repo.claim(due)!;
+  repo.requestStarted(claim.outbox_id, claim.claim_token!, due);
+  repo.finishWrite(claim.outbox_id, claim.claim_token!, "revoked", due, null, 0, "owner_not_authorized");
+  assert.equal(repo.get("once_revoked")?.state, "paused");
+});
+
+test("起動時のclaim解放はupdated_atを巻き戻さない", () => {
+  const { repo, raw } = setup();
+  repo.create("recover_claim_clock", input, due, actor, now);
+  repo.materialize("recover_claim_clock", 1, due, later, due, actor);
+  const claimAt = "2026-09-05T00:10:00Z";
+  const claim = repo.claim(claimAt)!;
+  repo.recover("2026-09-05T00:05:00Z", true);
+  const row = raw.prepare("SELECT status, updated_at FROM connector_outbox WHERE outbox_id = ?").get(claim.outbox_id) as { status: string; updated_at: string };
+  assert.deepEqual(row, { status: "pending", updated_at: claimAt });
 });
 
 test("work結果通知の曖昧性とreconcileは完了済みrunを上書きしない", () => {

@@ -7,6 +7,7 @@ import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { SystemClock } from "./scheduler/clock.js";
 import { SchedulerService } from "./scheduler/service.js";
+import { ReminderPublisher, SlackAdapterReminderClient } from "./scheduler/reminder-publisher.js";
 import { DispatcherWorker } from "./worker.js";
 import { UpdaterClient } from "./updater-client.js";
 import {
@@ -34,6 +35,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     createLogger("dispatcher_scheduler"),
     { pollMilliseconds: Math.min(config.queuePollMs, 60_000) },
   );
+  const reminderPublisher = new ReminderPublisher(database.scheduler, new SlackAdapterReminderClient(config),
+    new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   const jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config),
@@ -58,6 +61,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     {
       async quiesce() {
         await scheduler.stop();
+        await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
@@ -70,15 +74,20 @@ export async function runService(config: DispatcherConfig): Promise<void> {
 
   try {
     await api.start();
+    // Clear stale/expired outbox fences before due materialization decides overlap for a newer occurrence.
+    database.scheduler.recover(new SystemClock().now(), true);
     worker.start();
     scheduler.start();
+    reminderPublisher.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();
+    if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
+    await api.stop();
     database.close();
     updateNotificationDatabase.close();
     throw error;
@@ -94,6 +103,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         api.beginShutdown();
         await api.stop();
         await scheduler.stop();
+        await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();
