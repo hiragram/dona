@@ -637,7 +637,7 @@ export class DispatcherDatabase {
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
         last_error_message: result.status === "failed" ? result.summary : null,
       });
-      if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,completedAt);
+      if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,at);
     }).immediate();
   }
 
@@ -732,7 +732,7 @@ export class DispatcherDatabase {
     const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
     const workState=job.status==="completed"?"completed":job.status==="needs_review"?"needs_review":"failed";
     const notificationState=binding.destination.kind==="none"?"none":"pending";
-    const completedAt=job.completed_at??job.updated_at;
+    const completedAt=binding.owner.kind==="schedule"?at.toISOString():job.completed_at??job.updated_at;
     this.db.prepare(`INSERT OR IGNORE INTO job_completion_results
       (job_id,job_status,source_event_id,owner_json,destination_json,work_state,notification_state,materialized_at,content_delete_at)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(job.job_id,job.status,job.source_event_id,stableStringify(binding.owner),
@@ -1090,7 +1090,7 @@ export class DispatcherDatabase {
     const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
     const processing=actions.find(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing");
     const terminalStatus=["blocked","needs_review"].includes(completion.job_status)?"suspended":"active";
-    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&typeof value.error!=="string");
+    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
     return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 

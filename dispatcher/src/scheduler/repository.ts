@@ -345,7 +345,7 @@ export class SchedulerRepository {
         EXISTS (SELECT 1 FROM jobs j WHERE j.job_id=r.job_id AND j.status='needs_review') OR
         EXISTS (SELECT 1 FROM connector_outbox o WHERE o.run_id = r.run_id AND o.status = 'needs_review') OR
         EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
-          AND c.notification_state IN ('pending','needs_review'))) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
+          AND c.notification_state IN ('pending','failed','needs_review'))) LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       this.validateRevision(input, before.owner_id, before.tenant_id, updateAt);
       const sourceEventId = input.authorization_id.replace(/:\d+$/, "");
       const reusedAuthorization = this.db.prepare(`SELECT 1 FROM schedule_revisions

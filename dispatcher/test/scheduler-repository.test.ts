@@ -205,11 +205,12 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   const other=dispatcher.enqueue(eventEnvelope("other-owner")).row;
   assert.throws(()=>dispatcher.beginJobSteer(created.row.job_id,other.event_id),/does not belong/);
   dispatcher.beginJobPreparation(created.row.job_id,new Date(due)); dispatcher.beginJobDispatch(created.row.job_id,new Date(due)); dispatcher.markJobRunning(created.row.job_id,new Date(due));
-  dispatcher.saveJobResult(created.row.job_id,{schema_version:1,job_id:created.row.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"結果"},completed_at:"2026-09-05T00:02:00Z"},created.row.result_path,new Date("2026-09-05T00:02:00Z"));
+  dispatcher.saveJobResult(created.row.job_id,{schema_version:1,job_id:created.row.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"結果"},completed_at:"2026-09-05T00:02:00Z"},created.row.result_path,new Date("2026-09-05T00:10:00Z"));
   assert.equal(dispatcher.enqueueJobNotification(created.row.job_id,new Date("2026-09-05T00:02:00Z")).row.event_id,event.event_id);
   assert.equal(repo.getRun(run.run_id)?.status,"completed");
   const completion=raw.prepare("SELECT work_state,notification_state,notification_event_id FROM job_completion_results").get() as Record<string,unknown>;
   assert.deepEqual(completion,{work_state:"completed",notification_state:"none",notification_event_id:null});
+  assert.equal((raw.prepare("SELECT materialized_at FROM job_completion_results").get() as {materialized_at:string}).materialized_at,"2026-09-05T00:10:00.000Z");
 });
 
 test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを監査する", () => {
@@ -395,6 +396,17 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000003",reply_broadcast:false},
     {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",success:false},
+  ],completed_at:due},resultPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?").run(eventId);
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000005",reply_broadcast:false},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active",error:{code:"unavailable",message:"failed"}},
   ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
@@ -1017,6 +1029,16 @@ test("needs_reviewの未解決fenceを再承認で迂回できずadmin reconcile
   assert.ok(!("content" in result)); assert.ok(!("target_json" in result)); assert.equal(repo.get("s1")?.state, "needs_review");
   repo.update("s1", 1, renewed, later, actor, due);
   assert.equal(repo.materialize("s1", 2, later, afterLater, later, actor).run.status, "materialized");
+});
+
+test("failedのwork通知を残したschedule更新を拒否する", () => {
+  const { repo, raw, dispatcher } = setup(); repo.create("failed_notice_update", {...input,action:"work.read_only",content:"通知失敗"}, due, actor, now);
+  const run=repo.materialize("failed_notice_update",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:"通知失敗",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  raw.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE job_id=?").run(job.job_id);
+  assert.throws(()=>repo.update("failed_notice_update",1,{...input,authorization_id:"failed_notice_auth",authorization_revision:2},later,actor,due),/reconcile_required/);
 });
 
 test("公開run遷移はreminderのstartedとcompletedを拒否しoutboxを保持", () => {
