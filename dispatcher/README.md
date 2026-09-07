@@ -56,6 +56,8 @@ SLACK_HEALTH_SOCKET_PATH=~/Library/Application Support/Dona/run/slack-adapter.so
 DONA_RELEASE_MANIFEST_PATH=~/Library/Application Support/Dona/runtime/current/release-manifest.json
 ```
 
+Figma Webhooks V2の1-file pilotを有効にする場合だけ、`FIGMA_CONNECTION_ID`、`FIGMA_WEBHOOK_ID`、`FIGMA_FILE_KEY`、`FIGMA_ALLOWED_EVENTS`、`FIGMA_WEBHOOK_PASSCODE`をsecret storeから環境へ渡します。passcodeはpayload照合だけに使い、DB・Event Envelope・logへ保存しません。公開endpointはTLS、rate limit、request body上限を持つlocal reverse proxyから`POST /v1/ingress/figma`へ接続します。
+
 Dispatcherはshellを介さず、次の形のargvでHerdr 0.8.2を呼びます。
 
 ```text

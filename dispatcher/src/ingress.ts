@@ -115,6 +115,7 @@ export interface ExternalEventSourceRegistration {
     verified: VerifiedIngressPrincipal,
   ): Promise<unknown> | unknown;
   parseNormalized(input: unknown): NormalizedExternalEvent;
+  controlAcknowledgement?(event: NormalizedExternalEvent): ExternalIngressAcknowledgement | undefined;
   queueSignal?(event: NormalizedExternalEvent, verified: VerifiedIngressPrincipal): QueueAdmissionContext["coalesce"];
   buildAcknowledgement(receipt: PersistReceipt): ExternalIngressAcknowledgement;
 }
@@ -390,6 +391,22 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
+    const controlAcknowledgement = registration.controlAcknowledgement?.(normalized);
+    if (controlAcknowledgement !== undefined) {
+      return {
+        receipt: {
+          schemaVersion: 1,
+          eventId: "control",
+          sequence: 0,
+          source,
+          externalEventId: envelope.external_event_id,
+          outcome: "duplicate_same",
+          committedAt: request.receivedAt,
+          ackAllowed: true,
+        },
+        acknowledgement: validateAcknowledgement(controlAcknowledgement),
+      };
+    }
     if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
     const signal = registration.queueSignal?.(normalized, verified);
     const result = persist(envelope, {
