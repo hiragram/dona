@@ -41,18 +41,7 @@ export interface SchemaRollout {
   phase: string;
   database_schema: number;
   multi_job_enabled: boolean;
-  capabilities?: string[];
-  previous_release_sha?: string;
-  previous_release_contract?: string;
-  required_control_plane_capability?: string;
-  migration?: {
-    from_schema: number;
-    to_schema: number;
-    requires_quiesce: boolean;
-    requires_drain: boolean;
-    backup: string;
-    restore_open_test: boolean;
-  };
+  capabilities: string[];
 }
 
 export interface ReplyTarget {

@@ -52,7 +52,6 @@ export class DispatcherWorker {
     private readonly herdr: HerdrClient,
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
-    private readonly wakeJobSupervisor: () => void = () => {},
   ) {}
 
   isRunning(): boolean {
@@ -64,7 +63,6 @@ export class DispatcherWorker {
     const recovered = this.database.recoverStaleDispatching();
     if (recovered > 0) {
       this.logger.warn("Recovered stale dispatching events as needs_review", { count: recovered });
-      this.wakeJobSupervisor();
     }
     this.running = true;
     this.loopPromise = this.loop()
@@ -106,13 +104,11 @@ export class DispatcherWorker {
         if (waiting) {
           handled = true;
           await this.resumeWaiting(waiting);
-          this.wakeJobSupervisor();
         } else {
           const queued = this.database.nextAvailable();
           if (queued) {
             handled = true;
             await this.dispatch(queued);
-            this.wakeJobSupervisor();
           }
         }
       }
