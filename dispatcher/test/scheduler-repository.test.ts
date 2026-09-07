@@ -334,7 +334,11 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
     assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"?"needs_review":"completed");
     assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"?"needs_review":"none");
-    if(mode==="authorized_deadline") assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
+    if(mode==="authorized_deadline") {
+      assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
+      dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:16:01Z"},path.join(path.dirname(filename),`${eventId}.json`));
+      assert.equal(dispatcher.get(eventId)?.status,"needs_review");
+    }
     if(mode==="waiting") {
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:01:31Z"},path.join(path.dirname(filename),`${eventId}.json`));
       assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
@@ -484,6 +488,20 @@ test("scheduled job取消前に未送信の旧completion通知をsupersedeする
   dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
   assert.equal(dispatcher.get(notification.event_id)?.last_error_code,"job_result_superseded");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(notification.event_id) as {notification_state:string}).notification_state,"none");
+});
+
+test("取消応答不明jobの終了観測はstarted runを隔離してから決着する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="取消曖昧";
+  repo.create("cancel_unknown",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("cancel_unknown",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
+  dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答不明");
+  assert.equal(repo.getRun(run.run_id)?.status,"started");
+  dispatcher.settleAmbiguousCancellation(job.job_id,"停止確認済み",new Date(due));
+  assert.equal(repo.getRun(run.run_id)?.status,"cancelled");
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"cancelled");
 });
 
 test("schedule eventのdelegation前terminal failureをrunへ原子的に反映する", () => {

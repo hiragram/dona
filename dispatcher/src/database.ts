@@ -446,7 +446,9 @@ export class DispatcherDatabase {
         this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
-      this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",{tenant_id:binding.owner.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      const reconciledAt=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+      this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,jobId,reconciledAt,job.source_event_id);
+      this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",{tenant_id:binding.owner.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       this.updateJob(jobId,["needs_review"],"cancelled",{completed_at:at.toISOString(),last_error_code:"cancelled",last_error_message:reason});
     }).immediate();
   }
@@ -1071,6 +1073,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
+      if(event.status==="needs_review"&&event.source==="dona_job") return;
       if(event.source==="dona_schedule") {
         const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
         if(!run?.job_id||run.status==="materialized") {
@@ -1097,6 +1100,7 @@ export class DispatcherDatabase {
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
+      if(event.status==="needs_review"&&event.source==="dona_job") return;
       const delivery=this.notificationDelivered(eventId,result);
       if(delivery.delivered) {
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
