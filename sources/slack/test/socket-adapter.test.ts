@@ -18,8 +18,8 @@ const config: SlackAdapterConfig = {
   socketModeEnabled: true,
   logLevel: "info",
   buildSha: "development",
-  appSchemaWrite: 2,
-  appSchemaReadMax: 2,
+  appSchemaWrite: 3,
+  appSchemaReadMax: 3,
 };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
