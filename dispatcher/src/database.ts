@@ -412,14 +412,14 @@ export class DispatcherDatabase {
     const deadline = new Date(at.getTime() - 3_600_000).toISOString();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE j.status IN ('running','blocked','needs_review') AND COALESCE(j.prompt_accepted_at,j.dispatch_started_at)<=?
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown','agent_wait_observation_unknown'))
         AND json_extract(b.owner_json,'$.kind')='schedule'
       ORDER BY COALESCE(j.prompt_accepted_at,j.dispatch_started_at),j.job_id`).all(deadline) as JobRow[];
   }
 
   listAmbiguousScheduledJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance')
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown')
         AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
   }
 
@@ -434,7 +434,7 @@ export class DispatcherDatabase {
       WHERE json_extract(b.owner_json,'$.kind')='schedule'
         AND (s.state IN ('cancelled','expired') OR julianday(r.expires_at)<=julianday(?))
         AND j.status IN ('queued','retryable_failed','preparing','dispatching','running','blocked','needs_review')
-        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown'))
+        AND (j.status!='needs_review' OR j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','invalid_result','invalid_result_agent_stop_unknown','agent_wait_observation_unknown'))
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
@@ -1097,6 +1097,28 @@ export class DispatcherDatabase {
       `)
       .run(stableStringify(result), at.toISOString(), at.toISOString(), eventId);
     this.setNotificationState(eventId,"accepted",at);
+    return this.getRequired(eventId);
+  }
+
+  reconcileScheduledNotification(eventId:string,receipt:{workspace_id:string;channel_id:string;message_ts:string;thread_ts?:string},at=new Date()):EventRow {
+    const row=this.getRequired(eventId);
+    const completion=this.db.prepare(`SELECT destination_json,notification_state FROM job_completion_results
+      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {destination_json:string;notification_state:string}|undefined;
+    if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
+    const destination=JSON.parse(completion.destination_json) as {kind?:string;target?:{kind?:string;workspace_id?:string;channel_id?:string;thread_ts?:string}};
+    const target=destination.kind==="slack"?destination.target:undefined;
+    if(!target||receipt.workspace_id!==target.workspace_id||receipt.channel_id!==target.channel_id||
+      !/^\d{1,20}\.\d{6}$/.test(receipt.message_ts)||(target.kind==="thread"?receipt.thread_ts!==target.thread_ts:receipt.thread_ts!==undefined)) {
+      throw new Error("scheduled_notification_receipt_mismatch");
+    }
+    const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator reconciled a verified scheduled notification receipt",
+      actions:[{tool:"operator.reconcile_job_notification",workspace_id:receipt.workspace_id,channel_id:receipt.channel_id,message_ts:receipt.message_ts,...(receipt.thread_ts?{thread_ts:receipt.thread_ts}:{})}],
+      memory_candidates:[],completed_at:at.toISOString()};
+    this.db.transaction(()=>{
+      this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE event_id=?`)
+        .run(stableStringify(result),at.toISOString(),at.toISOString(),eventId);
+      this.setNotificationState(eventId,"accepted",at);
+    }).immediate();
     return this.getRequired(eventId);
   }
 

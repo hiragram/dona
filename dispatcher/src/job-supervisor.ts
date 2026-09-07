@@ -382,7 +382,7 @@ export class JobSupervisor {
       }
       this.database.markJobNeedsReview(
         row.job_id,
-        waited.errorCode ?? "agent_wait_failed",
+        row.source === "dona_schedule" ? "agent_wait_observation_unknown" : waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
       return;

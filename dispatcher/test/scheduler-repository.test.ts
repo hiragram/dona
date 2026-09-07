@@ -266,6 +266,10 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002",reply_broadcast:false},
   ],completed_at:due},notificationPath);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  assert.throws(()=>dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_OTHER",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due)),/scheduled_notification_receipt_mismatch/);
+  dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   assert.throws(()=>dispatcher.manualComplete(completionEventId,new Date(due)),/scheduled_notification_receipt_required/);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   fs.mkdirSync(path.dirname(job.result_path),{recursive:true}); fs.writeFileSync(job.result_path,"sensitive result");
@@ -324,12 +328,14 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   const authorization=dispatcher.enqueue(eventEnvelope("legacy-work-authorization")).row;
   repo.create("legacy_work", { ...input, authorization_id:`${authorization.event_id}:1`,action: "work.read_only", target: { kind: "none" }, content: objective }, due, {...actor,source_event_id:authorization.event_id}, now);
   const run = repo.materialize("legacy_work", 1, due, later, due, actor).run;
+  raw.prepare("UPDATE events SET status='completed',completed_at=?,result_json='{}' WHERE event_id=?").run(due,run.event_id);
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
   raw.prepare("DELETE FROM job_routing_schema").run();
   migrateJobRouting(raw);
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
   assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" },authorization_target:{workspace_id:"T_TEST",channel_id:"C_TEST"} });
+  assert.equal(dispatcher.get(run.event_id!)?.status,"queued");
   assert.equal(dispatcher.listOwnerJobs(run.event_id!).length, 0);
   raw.prepare("UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]') WHERE event_id=?").run(run.event_id);
   migrateJobRouting(raw);
@@ -366,7 +372,7 @@ test("scheduled objectiveは承認済み文字列をtrimせず委任し空白だ
 });
 
 test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", () => {
-  const { repo, dispatcher } = setup(); const objective = "deadline調査";
+  const { repo, dispatcher,raw } = setup(); const objective = "deadline調査";
   repo.create("deadline", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
   const run = repo.materialize("deadline", 1, due, later, due, actor).run;
   const job = dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
@@ -376,6 +382,9 @@ test("scheduled jobの3600秒deadlineを永続開始時刻から抽出する", (
   dispatcher.markJobBlocked(job.job_id,"入力待ち");
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
   dispatcher.markJobNeedsReview(job.job_id,"ambiguous_prompt_acceptance","確認待ち");
+  assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
+  raw.prepare("UPDATE jobs SET last_error_code='agent_wait_observation_unknown' WHERE job_id=?").run(job.job_id);
+  assert.equal(dispatcher.listAmbiguousScheduledJobs()[0]?.job_id,job.job_id);
   assert.equal(dispatcher.listOverdueScheduledJobs(new Date("2026-09-05T01:01:00Z"))[0]?.job_id,job.job_id);
   assert.equal(dispatcher.beginJobCancellation(job.job_id,job.source_event_id).status,"cancelling");
 });
@@ -390,6 +399,8 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation()[0]?.job_id,job.job_id);
   dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
   dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答が不明");
+  raw.prepare("UPDATE jobs SET last_error_code='agent_wait_observation_unknown' WHERE job_id=?").run(job.job_id);
+  assert.equal(dispatcher.listScheduledJobsRequiringCancellation().some(row=>row.job_id===job.job_id),true);
   raw.prepare("UPDATE jobs SET last_error_code='ambiguous_cancel_acceptance' WHERE job_id=?").run(job.job_id);
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(repo.get("cancel_job")?.state,"cancelled");
