@@ -149,6 +149,16 @@ describe("Notion ingress", () => {
     await assert.rejects(registration.authenticate(request(body, signature)));
     assert.ok(secret.every(byte => byte === 0));
   });
+  test("署名header欠落・不正hexでも取得済みsecret bufferを消去する", async () => {
+    for (const signature of [undefined, "not-hex"]) {
+      const secret = Buffer.from("secret-verification-token");
+      const registration = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
+        secrets: { async get() { return secret; } }, verification: { async claim() { return undefined; } },
+        bindings: { async resolve() { return undefined; } } });
+      await assert.rejects(registration.authenticate(request(body, signature)));
+      assert.ok(secret.every(byte => byte === 0));
+    }
+  });
   test("authenticates exact raw bytes and strictly normalizes an allowlisted event", async () => {
     const { registration } = setup();
     const verification = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));

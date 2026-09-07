@@ -89,8 +89,7 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
             expected.delivery.credentialRevision, input.token).catch(() => false);
           if (!reconciled) throw new Error("Notion verification secret is unavailable");
         }
-        const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId);
-        activate();
+        const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId, activate);
         return { binding: consumed.delivery, providerEventId: eventId, occurredAt: new Date(snapshot.createdAt).toISOString() };
       } },
       bindings: { async resolve(input) {

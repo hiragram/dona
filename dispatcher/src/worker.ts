@@ -173,9 +173,9 @@ export class DispatcherWorker {
     }
 
     if (this.stopping || this.quiescing) return;
-    const dispatching = this.tryClaim(row.event_id, resultPath);
-    if (!dispatching) return;
     const metadata = this.database.queueDispatchMetadata(row.event_id);
+    const dispatching = this.tryClaim(row.event_id, resultPath, metadata.requires_fetch && this.stateFetcher !== undefined);
+    if (!dispatching) return;
     let fetched = "", fetchedSuccessfully = false;
     if (metadata.requires_fetch && this.stateFetcher) {
       try {
@@ -219,6 +219,7 @@ export class DispatcherWorker {
       this.logTransition(dispatching, updated, started);
       return;
     }
+    if (metadata.requires_fetch && this.stateFetcher) this.database.markPromptSubmissionStarted(row.event_id);
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
@@ -258,9 +259,9 @@ export class DispatcherWorker {
     await this.resumeWaiting(waiting);
   }
 
-  private tryClaim(eventId: string, resultPath: string): EventRow | undefined {
+  private tryClaim(eventId: string, resultPath: string, providerFetching = false): EventRow | undefined {
     try {
-      return this.database.beginDispatch(eventId, resultPath);
+      return this.database.beginDispatch(eventId, resultPath, new Date(), providerFetching);
     } catch (error) {
       if (error instanceof QueueClaimUnavailableError) return undefined;
       throw error;

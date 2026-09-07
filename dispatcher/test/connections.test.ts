@@ -535,6 +535,13 @@ test("in-flight eventがあるconnectionのrevision更新を拒否する",async(
   assert.throws(()=>db.connections.revise("pilot",1,{...config,credentialRevision:2}),/operation_pending/);
 });
 
+test("provider fetchを含むdispatching中はconnection disableを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.disable("pilot",1),/operation_pending/);
+  assert.notEqual(db.connections.get("pilot").state,"disabled");
+});
+
 test("手動retry可能なeventがあるconnectionのrevision更新を拒否する",async(t)=>{
   const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   const accepted=db.enqueueExternal(event(),binding());db.manualDeadLetter(accepted.row.event_id,new Date(clock.now()));

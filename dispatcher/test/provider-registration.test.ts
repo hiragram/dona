@@ -364,6 +364,15 @@ test("期限切れconsumed attemptをinspect replayで再認可しない", (t) =
   assert.throws(() => db.providerRegistration.inspectAttempt(token), /not_authorized/);
 });
 
+test("activation失敗時はattempt consumeも同じtransactionでrollbackする", (t) => {
+  const { db } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
+    connectionId: binding.delivery.connectionId, account: binding.delivery.account, resource: binding.delivery.resource }, 1_000);
+  const claim = db.providerRegistration.claim(token, binding, 100);
+  assert.throws(() => db.providerRegistration.consume(token, claim.claimId, () => { throw new Error("activation failed"); }), /activation failed/);
+  assert.deepEqual(db.providerRegistration.consume(token, claim.claimId), binding);
+});
+
 test("issueとclaimのbinding失敗時刻もcommitしclock rewindを拒否する", (t) => {
   const { db, file, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,

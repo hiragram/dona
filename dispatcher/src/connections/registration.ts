@@ -206,7 +206,7 @@ export class ProviderRegistrationRegistry {
     return result.claim!;
   }
 
-  consume(token: string, claimId: string): VerificationBinding {
+  consume(token: string, claimId: string, onConsume?: (binding: VerificationBinding) => void): VerificationBinding {
     if (!validToken(token) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(claimId))
       throw new ConnectionError("invalid_input");
     const result = this.db.transaction((): { binding?: VerificationBinding; error?: unknown } => {
@@ -238,6 +238,7 @@ export class ProviderRegistrationRegistry {
       const changed = this.db.prepare(`UPDATE verification_attempts SET state='consumed',consumed_at=?
         WHERE digest=? AND state='claimed' AND claim_id=?`).run(now, digest(token), claimId).changes;
       if (changed !== 1) throw new ConnectionError("not_authorized");
+      onConsume?.(actual);
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.delivery.connectionId);
       return { binding: actual };
     }).immediate();

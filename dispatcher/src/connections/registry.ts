@@ -100,6 +100,10 @@ export class ConnectionRegistry {
       const c = this.get(id);
       if (c.revision !== revision) throw new ConnectionError("revision_conflict");
       if (c.state === "disabled") return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND status='dispatching' LIMIT 1`).get(id, revision)) {
+        throw new ConnectionError("operation_pending");
+      }
       const now = this.tick(id, true);
       const superseded = this.completeUndispatched(id, revision, now, "Connection disabled before dispatch", "connection_disabled");
       this.db.prepare("UPDATE connections SET state='disabled' WHERE id=?").run(id);

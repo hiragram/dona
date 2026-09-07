@@ -104,9 +104,10 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       catch { throw new ExternalIngressUnavailableError(); }
       const secret = Buffer.isBuffer(resolvedSecret) ? resolvedSecret : resolvedSecret?.secret;
       const credentialRevision = Buffer.isBuffer(resolvedSecret) ? undefined : resolvedSecret?.credentialRevision;
-      const supplied = signatureBytes(header(request, "x-notion-signature") ?? "");
-      if (!secret || !supplied) throw new ExternalIngressAuthenticationError();
+      if (!secret) throw new ExternalIngressAuthenticationError();
       try {
+        const supplied = signatureBytes(header(request, "x-notion-signature") ?? "");
+        if (!supplied) throw new ExternalIngressAuthenticationError();
         const expected = createHmac("sha256", secret).update(request.body).digest();
         if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new ExternalIngressAuthenticationError();
       } finally { secret.fill(0); }

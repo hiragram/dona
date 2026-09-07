@@ -978,16 +978,18 @@ export class DispatcherDatabase {
     return this.db
       .prepare(`
         UPDATE events SET
-          status = 'needs_review',
-          last_error_code = 'stale_dispatching',
-          last_error_message = 'Dispatcher restarted while prompt acceptance was unknown',
+          status = CASE WHEN last_error_code='provider_fetching' THEN 'retryable_failed' ELSE 'needs_review' END,
+          available_at = CASE WHEN last_error_code='provider_fetching' THEN ? ELSE available_at END,
+          last_error_code = CASE WHEN last_error_code='provider_fetching' THEN 'provider_fetch_interrupted' ELSE 'stale_dispatching' END,
+          last_error_message = CASE WHEN last_error_code='provider_fetching'
+            THEN 'Dispatcher restarted before prompt submission' ELSE 'Dispatcher restarted while prompt acceptance was unknown' END,
           updated_at = ?
         WHERE status = 'dispatching'
       `)
-      .run(at.toISOString()).changes;
+      .run(at.toISOString(), at.toISOString()).changes;
   }
 
-  beginDispatch(eventId: string, resultPath: string, at = new Date()): EventRow {
+  beginDispatch(eventId: string, resultPath: string, at = new Date(), providerFetching = false): EventRow {
     return this.db.transaction(() => {
     if (this.claimsClosed || this.nextAvailable(at)?.event_id !== eventId) throw new QueueClaimUnavailableError();
     const timestamp = at.toISOString();
@@ -996,10 +998,10 @@ export class DispatcherDatabase {
         UPDATE events SET
           status = 'dispatching', attempt_count = attempt_count + 1,
           dispatch_started_at = ?, prompt_accepted_at = NULL,
-          result_path = ?, last_error_code = NULL, last_error_message = NULL, updated_at = ?
+          result_path = ?, last_error_code = ?, last_error_message = NULL, updated_at = ?
         WHERE event_id = ? AND status IN ('queued', 'retryable_failed') AND ${connectionDispatchPredicate}
       `)
-      .run(timestamp, resultPath, timestamp, eventId, at.getTime(), at.getTime()).changes;
+      .run(timestamp, resultPath, providerFetching ? 'provider_fetching' : null, timestamp, eventId, at.getTime(), at.getTime()).changes;
     if (changed !== 1) throw new EventNotDispatchableError(eventId);
     const slots = Object.entries(this.queuePolicy.weights).flatMap(([c,w])=>Array<string>(w).fill(c));
     const lane = this.db.prepare("SELECT l.lane,l.class FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=?").get(eventId) as {lane:string;class:string};
@@ -1010,6 +1012,12 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE queue_lanes SET last_selected=? WHERE lane=?").run(step,lane.lane);
     return this.get(eventId)!;
     }).immediate();
+  }
+
+  markPromptSubmissionStarted(eventId: string, at = new Date()): void {
+    const changed = this.db.prepare(`UPDATE events SET last_error_code=NULL,updated_at=?
+      WHERE event_id=? AND status='dispatching' AND last_error_code='provider_fetching'`).run(at.toISOString(), eventId).changes;
+    if (changed !== 1) throw new Error(`Event ${eventId} is not in provider fetch phase`);
   }
 
   markWaiting(eventId: string, at = new Date()): void {
