@@ -357,6 +357,20 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("treats idle as a terminal observation after cancelling an invalid Result agent", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-idle");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){gets+=1;return ok("idle");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
+    assert.equal(gets,1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stopped");
+    database.close();
+  });
+
   test("preserves a worker-reported failure and emits a job_failed notification", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

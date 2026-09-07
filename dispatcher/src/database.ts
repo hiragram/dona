@@ -306,14 +306,14 @@ export class DispatcherDatabase {
           payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
         };
       }
-      if(binding.owner.kind==="schedule") {
+      if(binding.owner.kind==="schedule"&&["dispatching","waiting_agent"].includes(sourceEvent.status)) {
         const payload=JSON.parse(sourceEvent.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
-        if(payload.work?.authorization_target) {
-          const earliest=new Date(at.getTime()-120_000).toISOString();
-          const consumed=this.db.prepare(`UPDATE events SET schedule_access_consumed_at=? WHERE event_id=? AND schedule_access_checked_at>=?
-            AND schedule_access_checked_at<=? AND schedule_access_consumed_at IS NULL`).run(at.toISOString(),sourceEvent.event_id,earliest,at.toISOString()).changes;
-          if(consumed!==1) throw new Error("Scheduled work current access receipt is missing or expired");
-        }
+        const target=payload.work?.authorization_target;
+        if(typeof target?.workspace_id!=="string"||typeof target.channel_id!=="string") throw new Error("Scheduled work authorization target is missing");
+        const earliest=new Date(at.getTime()-120_000).toISOString();
+        const consumed=this.db.prepare(`UPDATE events SET schedule_access_consumed_at=? WHERE event_id=? AND schedule_access_checked_at>=?
+          AND schedule_access_checked_at<=? AND schedule_access_consumed_at IS NULL`).run(at.toISOString(),sourceEvent.event_id,earliest,at.toISOString()).changes;
+        if(consumed!==1) throw new Error("Scheduled work current access receipt is missing or expired");
       }
 
       const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, request.objective);
@@ -866,8 +866,9 @@ export class DispatcherDatabase {
       const event=this.getRequired(eventId),binding=readEventJobBinding(this.db,eventId);
       const payload=JSON.parse(event.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
       const target=payload.work?.authorization_target;
-      if(event.source!=="dona_schedule"||event.status!=="waiting_agent"||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
+      if(event.source!=="dona_schedule"||!["dispatching","waiting_agent"].includes(event.status)||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
         receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000) throw new Error("schedule_access_receipt_mismatch");
+      if(event.status==="dispatching") this.markWaiting(eventId,at);
       const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(receipt.issued_at,eventId).changes;
       if(changed!==1) throw new Error("schedule_access_receipt_already_recorded");
       return {authorized:true,event_id:eventId,checked_at:at.toISOString()};

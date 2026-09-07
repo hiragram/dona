@@ -336,14 +336,25 @@ test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費
   const authorization=dispatcher.enqueue(eventEnvelope("access-receipt-authorization")).row;
   repo.create("access_receipt",{...input,authorization_id:`${authorization.event_id}:1`,action:"work.read_only",target:{kind:"none"},content:objective},due,{...actor,source_event_id:authorization.event_id},now);
   const run=repo.materialize("access_receipt",1,due,later,due,actor).run;
-  dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due));
   assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/current access receipt/);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",issued_at:due,nonce:"n1"},new Date(due)),/receipt_mismatch/);
   assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date("2026-09-05T00:02:59Z")).authorized,true);
+  assert.equal(dispatcher.get(run.event_id!)?.status,"waiting_agent");
   assert.equal((raw.prepare("SELECT schedule_access_checked_at FROM events WHERE event_id=?").get(run.event_id) as {schedule_access_checked_at:string}).schedule_access_checked_at,due);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n3"},new Date(due)),/already_recorded/);
   const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z"));
   assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z")).duplicate,true);
+});
+
+test("authorization targetを復元できないscheduled workは委任を拒否する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="target欠落調査";
+  repo.create("missing_access_target",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);
+  const run=repo.materialize("missing_access_target",1,due,later,due,actor).run;
+  raw.prepare("UPDATE events SET payload_json=json_remove(payload_json,'$.work.authorization_target') WHERE event_id=?").run(run.event_id);
+  dispatcher.beginDispatch(run.event_id!,"/tmp/missing-target-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/authorization target is missing/);
+  assert.equal(dispatcher.listJobs().length,0);
 });
 
 test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {
@@ -790,6 +801,10 @@ test("旧revisionのwork通知失敗は現行scheduleをneeds_reviewへ遷移さ
   startWork(repo, dispatcher, raw, oldRun, due);
   repo.transition("old_work_notification", 1, "pause", actor, due);
   repo.update("old_work_notification", 2, { ...input, action: "work.read_only", authorization_id: "new_auth", authorization_revision: 3 }, later, actor, due);
+  const oldJobId=repo.getRun(oldRun.run_id)!.job_id!;
+  repo.markWorkRunNeedsReview(oldRun.run_id,oldJobId,later,oldRun.event_id!);
+  assert.equal(repo.getRun(oldRun.run_id)?.status,"needs_review");
+  assert.equal(repo.get("old_work_notification")?.state,"active");
   repo.markWorkNotificationNeedsReview(oldRun.run_id, later);
   assert.equal(repo.get("old_work_notification")?.state,"active");
   assert.equal(repo.get("old_work_notification")?.revision,3);

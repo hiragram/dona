@@ -576,9 +576,11 @@ export class SchedulerRepository {
       const before = this.get(run.schedule_id)!;
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
       this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
-      this.suppress(run.schedule_id, at, "cancelled");
-      this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id);
-      this.retireRevisions(run.schedule_id, at);
+      if(run.revision===before.revision) {
+        this.suppress(run.schedule_id, at, "cancelled");
+        this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND revision=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id,run.revision);
+        this.retireRevisions(run.schedule_id, at);
+      }
       this.audit(before, this.get(run.schedule_id)!, "work_result_needs_review",
         {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:sourceEventId}, at, undefined, this.getRun(runId)!);
       return this.getRun(runId)!;
