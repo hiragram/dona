@@ -240,7 +240,7 @@ test("additive migrationはlegacy user_version/event/jobを保ちrollbackとFK�
   initial.close();
   const raw=new Database(file); t.after(()=>raw.close());
   // 旧 schema の table/rows を保ったまま component table を外した fixture。
-  raw.exec("DROP TABLE connection_audit; DROP TABLE connection_event_bindings; DROP TABLE connection_cursors; DROP TABLE connection_operations; DROP TABLE connection_subscriptions; DROP TABLE connections; DROP TABLE connection_schema");
+  raw.exec("DROP TABLE verification_attempts; DROP TABLE connection_audit; DROP TABLE connection_event_bindings; DROP TABLE connection_cursors; DROP TABLE connection_operations; DROP TABLE connection_subscriptions; DROP TABLE connections; DROP TABLE connection_schema");
   const legacySchema=raw.prepare("SELECT sql FROM sqlite_master WHERE name IN ('events','jobs') ORDER BY name").all();
   const version=raw.pragma("user_version",{simple:true});
   const events=raw.prepare("SELECT * FROM events").all(), jobs=raw.prepare("SELECT * FROM jobs").all();
