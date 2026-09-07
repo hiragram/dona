@@ -93,6 +93,18 @@ test("同一revisionの並行publishは既存targetを置換しない", async (t
   assert.ok(stored.equals(first) || stored.equals(second));
 });
 
+test("link後crashで残った同一inodeのtemporary fileをreconcileが回収する", async (t) => {
+  const { secrets, store } = fixture(t), secret = Buffer.alloc(32, 4);
+  await store.write("cred_crash", 1, secret);
+  const target = path.join(secrets, "cred_crash.1.secret");
+  const temporary = path.join(secrets, ".cred_crash.1.0123456789abcdef01234567.tmp");
+  fs.linkSync(target, temporary);
+  assert.equal(fs.statSync(target).nlink, 2);
+  assert.equal(await store.reconcile("cred_crash", 1, secret), true);
+  assert.equal(fs.existsSync(temporary), false);
+  assert.equal(fs.statSync(target).nlink, 1);
+});
+
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
   const { db } = fixture(t); db.connections.register(config); const binding = activate(db);
   assert.deepEqual(binding, { connectionId: "pilot", provider: "notion", account: "workspace:one", revision: 1,
@@ -168,6 +180,27 @@ test("clock rewind時はverification attemptをfail closedにする", (t) => {
   const token2 = db.providerRegistration.issue(identity, 5_000);
   clock.value--;
   assert.throws(() => db.providerRegistration.claim(token2, binding, 1_000), /clock_skew/);
+});
+
+test("transactionは単一clock値をbinding検査・期限判定・保存に使う", (t) => {
+  const { file, db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.connectionId,
+    account: binding.account, resource: binding.resource };
+  const original = clock.value; let calls = 0;
+  clock.now = () => calls++ === 0 ? original : original - 1;
+  db.providerRegistration.issue(identity, 5_000);
+  const raw = new Database(file); t.after(() => raw.close());
+  assert.equal((raw.prepare("SELECT last_clock FROM connections WHERE id='pilot'").get() as { last_clock: number }).last_clock, original);
+  assert.equal(calls, 1);
+});
+
+test("commit済みrotationの再試行はsecret一致を照合して受理する", async (t) => {
+  const { db, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
+  await service.register(config, Buffer.alloc(32, 1));
+  const rotated = { ...config, credentialRevision: 2 };
+  assert.equal((await service.rotate("pilot", 1, rotated, Buffer.alloc(32, 2))).revision, 2);
+  assert.equal((await service.rotate("pilot", 1, rotated, Buffer.alloc(32, 2))).revision, 2);
+  await assert.rejects(service.rotate("pilot", 1, rotated, Buffer.alloc(32, 3)), /revision_conflict/);
 });
 
 test("attempt発行時のretentionは期限切れrowをboundedに削除する", (t) => {

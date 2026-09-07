@@ -61,6 +61,17 @@ export class PrivateFileSecretStore {
   async reconcile(reference: string, revision: number, expected: Uint8Array): Promise<boolean> {
     if (!(expected instanceof Uint8Array) || expected.byteLength < 16 || expected.byteLength > 65_536)
       throw new ConnectionError("invalid_input");
+    await this.checkedRoot();
+    const target = this.file(reference, revision), targetStats = await fs.lstat(target);
+    const temporaryPattern = new RegExp(`^\\.${reference}\\.${revision}\\.[a-f0-9]{24}\\.tmp$`);
+    if (targetStats.isFile() && !targetStats.isSymbolicLink() && targetStats.uid === process.getuid?.() && (targetStats.mode & 0o077) === 0) {
+      for (const entry of await fs.readdir(this.root)) {
+        if (!temporaryPattern.test(entry)) continue;
+        const temporary = path.join(this.root, entry), stats = await fs.lstat(temporary);
+        if (stats.isFile() && !stats.isSymbolicLink() && stats.uid === targetStats.uid && stats.dev === targetStats.dev && stats.ino === targetStats.ino)
+          await fs.unlink(temporary);
+      }
+    }
     const stored = await this.read(reference, revision);
     const candidate = Buffer.from(expected);
     const matches = stored.length === candidate.length && timingSafeEqual(stored, candidate);

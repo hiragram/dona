@@ -37,6 +37,11 @@ export class ProviderRegistrationService {
 
   async rotate(id: string, expectedRevision: number, config: ConnectionConfig, secret: Uint8Array): Promise<Connection> {
     const current = this.connections.get(id);
+    const alreadyAccepted = this.accepted(id, config, expectedRevision + 1);
+    if (alreadyAccepted) {
+      await this.writeReconciled(config, secret);
+      return alreadyAccepted;
+    }
     if (config.credentialRevision <= current.credentialRevision) throw new ConnectionError("revision_conflict");
     await this.writeReconciled(config, secret);
     try { return this.connections.revise(id, expectedRevision, config); }

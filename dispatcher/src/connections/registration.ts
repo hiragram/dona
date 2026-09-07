@@ -28,9 +28,9 @@ type AttemptRow = {
 export class ProviderRegistrationRegistry {
   constructor(private readonly db: Database.Database, private readonly clock: Clock = systemClock) {}
 
-  private binding(input: Readonly<{ provider: string; providerId: string; connectionId?: string; account?: string; resource?: string }>, activeOnly: boolean): VerificationBinding {
+  private binding(input: Readonly<{ provider: string; providerId: string; connectionId?: string; account?: string; resource?: string }>, activeOnly: boolean,
+    now = this.clock.now()): VerificationBinding {
     if (!identifier.safeParse(input.providerId).success || !identifier.safeParse(input.provider).success) throw new ConnectionError("invalid_input");
-    const now = this.clock.now();
     if (!Number.isSafeInteger(now)) throw new ConnectionError("clock_skew");
     if (input.connectionId) {
       const clock = this.db.prepare("SELECT last_clock FROM connections WHERE id=?").get(input.connectionId) as { last_clock: number } | undefined;
@@ -66,7 +66,7 @@ export class ProviderRegistrationRegistry {
   issue(input: Readonly<{ provider: string; providerId: string; connectionId: string; account: string; resource: string }>, ttlMs: number): string {
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 30 * 60_000) throw new ConnectionError("invalid_input");
     return this.db.transaction(() => {
-      const binding = this.binding(input, false), now = this.clock.now();
+      const now = this.clock.now(), binding = this.binding(input, false, now);
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.connectionId);
       // 1回のmaintenanceが長時間lockを保持しないよう削除数をboundedにする。
       this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
@@ -92,7 +92,7 @@ export class ProviderRegistrationRegistry {
         generation: row.generation, providerId: row.provider_id };
       if (!sameBinding(actual, expected)) throw new ConnectionError("not_authorized");
       const current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.connectionId,
-        account: actual.account, resource: actual.resource }, false);
+        account: actual.account, resource: actual.resource }, false, now);
       if (current.revision !== actual.revision || current.credentialRevision !== actual.credentialRevision || current.generation !== actual.generation)
         throw new ConnectionError("not_authorized");
       if (row.state === "claimed" && row.claim_until! > now) throw new ConnectionError("operation_pending");
@@ -116,7 +116,7 @@ export class ProviderRegistrationRegistry {
         revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource,
         generation: row.generation, providerId: row.provider_id };
       const current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.connectionId,
-        account: actual.account, resource: actual.resource }, false);
+        account: actual.account, resource: actual.resource }, false, now);
       if (!sameBinding(current, actual)) throw new ConnectionError("not_authorized");
       const changed = this.db.prepare(`UPDATE verification_attempts SET state='consumed',consumed_at=?
         WHERE digest=? AND state='claimed' AND claim_id=?`).run(now, digest(token), claimId).changes;
