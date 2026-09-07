@@ -209,16 +209,7 @@ export class JobSupervisor {
   private async loop(): Promise<void> {
     while (!this.stopping) {
       for(const job of this.database.listAmbiguousScheduledJobs()) {
-        if(await this.tryComplete(job,false)) continue;
-        if(job.last_error_code==="invalid_result_agent_stop_unknown") {
-          const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
-          if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
-            (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
-            if(await this.tryComplete(job,false)) continue;
-            this.database.recordInvalidResultAgentStopped(job.job_id);
-          }
-          continue;
-        }
+        if(await this.reconcileAmbiguousScheduledJob(job)) continue;
         if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;
         const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
         if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
@@ -251,6 +242,17 @@ export class JobSupervisor {
       for (const row of rows.slice(0, availableSlots)) this.launch(row);
       await this.wakeSignal.wait(this.config.queuePollMs);
     }
+  }
+
+  private async reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean> {
+    if(job.last_error_code!=="invalid_result_agent_stop_unknown") return this.tryComplete(job,false);
+    const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+    if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+      (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
+      if(await this.tryComplete(job,false)) return true;
+      this.database.recordInvalidResultAgentStopped(job.job_id);
+    }
+    return true;
   }
 
   private async stopInvalidResultAgent(job:JobRow):Promise<void> {

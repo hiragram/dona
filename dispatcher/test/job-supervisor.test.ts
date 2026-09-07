@@ -371,6 +371,29 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("preserves an unknown invalid Result stop fence before rereading the Result", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-unknown");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    database.recordInvalidResultAgentStopFailure(job.job_id,"cancel acceptance unknown");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path, "not-json");
+    let gets=0;
+    let cancels=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){gets+=1;return ok("working");},
+      async cancel(){cancels+=1;return ok("idle");},
+    }),config,logger,()=>undefined);
+    await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
+      .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
+    assert.equal(gets,1);
+    assert.equal(cancels,0);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stop_unknown");
+    database.close();
+  });
+
   test("preserves a worker-reported failure and emits a job_failed notification", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
