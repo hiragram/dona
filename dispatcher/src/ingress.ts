@@ -63,6 +63,7 @@ export interface RawIngressRequest {
   readonly method: "POST";
   readonly requestTarget: string;
   readonly receivedAt: string;
+  readonly receivedAtMonotonic?: number;
 }
 
 export interface VerifiedIngressPrincipal {
@@ -342,7 +343,7 @@ export class ExternalIngressProcessor {
     request: RawIngressRequest,
     persist: (envelope: EventEnvelope, context: IngressPersistenceContext) => EnqueueResult,
   ): Promise<ExternalIngressResult> {
-    const processingDeadline = performance.now() + registration.processingTimeoutMs;
+    const processingDeadline = (request.receivedAtMonotonic ?? performance.now()) + registration.processingTimeoutMs;
     let verified: VerifiedIngressPrincipal;
     let verifiedBinding: DeliveryBinding | undefined;
     try {
@@ -404,6 +405,7 @@ export class ExternalIngressProcessor {
       ...(owner ? { owner } : {}),
       ...(verified.purpose === "verification" ? { verification: true as const } : {}),
     });
+    remainingProcessingTime(processingDeadline);
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

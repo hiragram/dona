@@ -3,6 +3,8 @@ import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
 import { ExternalIngressRegistry } from "./ingress.js";
+import { githubPilotRegistration } from "./providers/github.js";
+import { readPrivateBuffer } from "./private-token.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
@@ -14,13 +16,44 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 
+export function serviceExternalIngressRegistry(config: DispatcherConfig, database: DispatcherDatabase): ExternalIngressRegistry {
+  const registrations = config.githubPilot ? [githubPilotRegistration({
+    connectionId: config.githubPilot.connectionId,
+    installationId: config.githubPilot.installationId,
+    repositoryId: config.githubPilot.repositoryId,
+    repositoryFullName: config.githubPilot.repositoryFullName,
+    events: config.githubPilot.events,
+    async resolveBinding() {
+      const connection = database.connections.get(config.githubPilot!.connectionId);
+      if (connection.provider !== "github" || connection.state !== "active" ||
+        connection.account !== `installation:${config.githubPilot!.installationId}`) throw new Error("GitHub connection is not active");
+      const resource = String(config.githubPilot!.repositoryId);
+      const subscription = database.connections.subscriptions(connection.id).filter(candidate =>
+        candidate.resource === resource && candidate.revision === connection.revision && candidate.verifiedAt !== null &&
+        ["active", "expiring", "stop_candidate"].includes(candidate.state)).at(-1);
+      if (!subscription) throw new Error("GitHub subscription is not active");
+      return { account: connection.account, revision: connection.revision,
+        credentialRevision: connection.credentialRevision, generation: subscription.generation };
+    },
+    async resolveWebhookSecret(credentialRevision) {
+      const connection = database.connections.get(config.githubPilot!.connectionId);
+      if (connection.credentialRevision !== credentialRevision) throw new Error("GitHub credential revision changed");
+      const secret = await readPrivateBuffer(config.githubPilot!.webhookSecretPath);
+      if (!secret) throw new Error("GitHub webhook secret is unavailable");
+      return secret;
+    },
+  })] : [];
+  return new ExternalIngressRegistry(registrations);
+}
+
 export async function runService(
   config: DispatcherConfig,
-  externalIngressRegistry = new ExternalIngressRegistry(),
+  externalIngressRegistry?: ExternalIngressRegistry,
 ): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
+  externalIngressRegistry ??= serviceExternalIngressRegistry(config, database);
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,

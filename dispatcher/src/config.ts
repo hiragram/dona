@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 
 export interface DispatcherConfig {
+  githubPilot?: {
+    connectionId: string; installationId: number; repositoryId: number; repositoryFullName: string;
+    events: Readonly<Record<string, readonly string[]>>; webhookSecretPath: string;
+    trustedProxy: { githubMetaIpAllowlist: true; perSourceRateAndConcurrencyLimit: true };
+  };
   queuePolicy?: QueuePolicy;
   socketPath: string;
   databasePath: string;
@@ -63,7 +68,28 @@ function buildSha(env: NodeJS.ProcessEnv): string {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConfig {
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
+  const githubPilot = env.DONA_GITHUB_PILOT_CONFIG === undefined ? undefined : (() => {
+    const parsed = JSON.parse(env.DONA_GITHUB_PILOT_CONFIG) as Record<string, unknown>;
+    if (typeof parsed.connectionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.connectionId) || !Number.isSafeInteger(parsed.installationId) ||
+      !Number.isSafeInteger(parsed.repositoryId) || typeof parsed.repositoryFullName !== "string" ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(parsed.repositoryFullName) || parsed.repositoryFullName.split("/").some(part => part === "." || part === "..") ||
+      typeof parsed.webhookSecretPath !== "string" || !parsed.events || typeof parsed.events !== "object" || Array.isArray(parsed.events) ||
+      !parsed.trustedProxy || typeof parsed.trustedProxy !== "object" ||
+      (parsed.trustedProxy as Record<string, unknown>).githubMetaIpAllowlist !== true ||
+      (parsed.trustedProxy as Record<string, unknown>).perSourceRateAndConcurrencyLimit !== true) {
+      throw new Error("DONA_GITHUB_PILOT_CONFIG is invalid");
+    }
+    const events = Object.fromEntries(Object.entries(parsed.events).map(([event, actions]) => {
+      if (!Array.isArray(actions) || actions.some(action => typeof action !== "string")) throw new Error("DONA_GITHUB_PILOT_CONFIG is invalid");
+      return [event, actions as string[]];
+    }));
+    return { connectionId: parsed.connectionId, installationId: parsed.installationId as number,
+      repositoryId: parsed.repositoryId as number, repositoryFullName: parsed.repositoryFullName,
+      events, webhookSecretPath: expandHome(parsed.webhookSecretPath),
+      trustedProxy: { githubMetaIpAllowlist: true as const, perSourceRateAndConcurrencyLimit: true as const } };
+  })();
   return {
+    ...(githubPilot === undefined ? {} : { githubPilot }),
     queuePolicy: queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}")),
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),
