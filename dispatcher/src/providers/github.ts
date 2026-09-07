@@ -18,7 +18,7 @@ const payloadSchema = z.object({
   action: z.string().min(1).max(64),
   installation: installationSchema,
   repository: repositorySchema,
-  issue: z.object({ updated_at: z.string().datetime({ offset: true }) }).passthrough(),
+  issue: z.object({ id: z.number().int().positive(), number: z.number().int().positive(), updated_at: z.string().datetime({ offset: true }) }).passthrough(),
 }).passthrough();
 
 export interface GitHubPilotConfig {
@@ -120,8 +120,9 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
           installation_id: payload.data.installation.id,
           repository_id: payload.data.repository.id,
           repository_full_name: payload.data.repository.full_name,
+          issue_id: payload.data.issue.id,
         },
-        payload: { action: payload.data.action },
+        payload: { action: payload.data.action, issue_number: payload.data.issue.number },
         replyTarget: null,
         trace: { github_delivery_id: identity.deliveryId },
       };
@@ -159,7 +160,10 @@ export class GitHubReadOnlyInstallationClient {
       headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "x-github-api-version": "2022-11-28" },
       redirect: "error",
     });
-    if (!response.ok) throw new Error(`GitHub read failed (${response.status})`);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`GitHub read failed (${response.status})`);
+    }
     return response.json();
   }
 }

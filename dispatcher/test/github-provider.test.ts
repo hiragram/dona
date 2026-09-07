@@ -10,6 +10,8 @@ import { DispatcherApi } from "../src/api.js";
 import { ExternalIngressRegistry } from "../src/ingress.js";
 import { GitHubReadOnlyInstallationClient, githubPilotRegistration, verifyGitHubSignature } from "../src/providers/github.js";
 import { serviceExternalIngressRegistry } from "../src/service.js";
+import { loadConfig } from "../src/config.js";
+import { readPrivateBuffer } from "../src/private-token.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))); });
@@ -17,7 +19,7 @@ const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 const jobs = { isRunning: () => true, wake() {}, async steer() { throw new Error("unused"); }, async cancel() { throw new Error("unused"); } };
 const delivery = "01234567-89ab-4def-8123-0123456789ab";
 const secretText = "a-secure-webhook-secret-with-32-bytes";
-const payload = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77 }, repository: { id: 42, full_name: "hiragram/dona" }, issue: { updated_at: "2026-09-07T00:00:00Z" } }));
+const payload = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77 }, repository: { id: 42, full_name: "hiragram/dona" }, issue: { id: 5200, number: 52, updated_at: "2026-09-07T00:00:00Z" } }));
 const signature = (body = payload) => `sha256=${createHmac("sha256", secretText).update(body).digest("hex")}`;
 
 function registration() {
@@ -52,15 +54,16 @@ describe("GitHub provider pilot", () => {
     const good = [["X-GitHub-Delivery", delivery], ["X-GitHub-Event", "issues"], ["X-Hub-Signature-256", signature()]] as const;
     const verified = await registration().authenticate({ ...base, headers: good });
     const normalized = registration().normalize({ ...base, headers: good }, verified);
-    assert.deepEqual((normalized as { payload: unknown }).payload, { action: "opened" });
+    assert.deepEqual((normalized as { payload: unknown }).payload, { action: "opened", issue_number: 52 });
+    assert.equal((normalized as { subject: { issue_id: number } }).subject.issue_id, 5200);
     await assert.rejects(registration().authenticate({ ...base, headers: [...good, ["x-github-event", "issues"]] }));
     await assert.rejects(registration().authenticate({ ...base, headers: good.map(([name, value]) => [name, name === "X-GitHub-Event" ? "push" : value]) }));
-    const wrong = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77 }, repository: { id: 43, full_name: "other/repo" }, issue: { updated_at: "2026-09-07T00:00:00Z" } }));
+    const wrong = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77 }, repository: { id: 43, full_name: "other/repo" }, issue: { id: 5200, number: 52, updated_at: "2026-09-07T00:00:00Z" } }));
     const wrongHeaders = good.map(([name, value]) => [name, name === "X-Hub-Signature-256" ? signature(wrong) : value] as const);
     const wrongVerified = await registration().authenticate({ ...base, body: wrong, headers: wrongHeaders });
     assert.throws(() => registration().normalize({ ...base, body: wrong, headers: wrongHeaders }, wrongVerified));
     const realistic = Buffer.from(JSON.stringify({ action: "opened", installation: { id: 77, node_id: "I_1" },
-      repository: { id: 42, full_name: "hiragram/dona", private: true }, issue: { updated_at: "2026-09-07T00:00:00Z", id: 52, title: "fixture" } }));
+      repository: { id: 42, full_name: "hiragram/dona", private: true }, issue: { updated_at: "2026-09-07T00:00:00Z", id: 5200, number: 52, title: "fixture" } }));
     const realisticHeaders = good.map(([name, value]) => [name, name === "X-Hub-Signature-256" ? signature(realistic) : value] as const);
     const realisticVerified = await registration().authenticate({ ...base, body: realistic, headers: realisticHeaders });
     assert.doesNotThrow(() => registration().normalize({ ...base, body: realistic, headers: realisticHeaders }, realisticVerified));
@@ -108,6 +111,22 @@ describe("GitHub provider pilot", () => {
       repositoryFullName: "hiragram/dona", events: { pull_request: ["opened"] },
       resolveBinding: async () => ({ account: "installation:77", revision: 1, credentialRevision: 1, generation: 1 }),
       resolveWebhookSecret: async () => Buffer.from(secretText) }));
+    let cancelled = false;
+    const failing = new GitHubReadOnlyInstallationClient("hiragram/dona", { token: async () => "test-token" }, async () =>
+      new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 429 }));
+    await assert.rejects(failing.get("/issues/52"), /429/);
+    assert.equal(cancelled, true);
+  });
+
+  test("無効な起動configとsymlink secretを起動前に拒否する", async () => {
+    for (const candidate of [
+      { connectionId: "", installationId: 77, repositoryId: 42, repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: "/tmp/secret" },
+      { connectionId: "github-pilot", installationId: 77, repositoryId: 42, repositoryFullName: "abc", events: { issues: ["opened"] }, webhookSecretPath: "/tmp/secret" },
+    ]) assert.throws(() => loadConfig({ DONA_GITHUB_PILOT_CONFIG: JSON.stringify(candidate) }));
+    const { root } = await tempConfig(); roots.push(root);
+    const target = `${root}/target`; const link = `${root}/link`;
+    await fs.writeFile(target, secretText, { mode: 0o600 }); await fs.symlink(target, link);
+    assert.equal(await readPrivateBuffer(link), undefined);
   });
 
   test("serve起動用registryへconfigとcurrent subscription generationを接続する", async () => {

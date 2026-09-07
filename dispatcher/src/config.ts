@@ -69,8 +69,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
   const githubPilot = env.DONA_GITHUB_PILOT_CONFIG === undefined ? undefined : (() => {
     const parsed = JSON.parse(env.DONA_GITHUB_PILOT_CONFIG) as Record<string, unknown>;
-    if (typeof parsed.connectionId !== "string" || !Number.isSafeInteger(parsed.installationId) ||
+    if (typeof parsed.connectionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.connectionId) || !Number.isSafeInteger(parsed.installationId) ||
       !Number.isSafeInteger(parsed.repositoryId) || typeof parsed.repositoryFullName !== "string" ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(parsed.repositoryFullName) || parsed.repositoryFullName.split("/").some(part => part === "." || part === "..") ||
       typeof parsed.webhookSecretPath !== "string" || !parsed.events || typeof parsed.events !== "object" || Array.isArray(parsed.events)) {
       throw new Error("DONA_GITHUB_PILOT_CONFIG is invalid");
     }
