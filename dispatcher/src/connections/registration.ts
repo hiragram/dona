@@ -1,19 +1,20 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { ConnectionError, connectionIdentifier, identifier, systemClock, type Clock, type ConnectionConfig, type DeliveryBinding } from "./domain.js";
+import { ConnectionError, connectionIdentifier, deliverySchema, identifier, systemClock, type Clock, type ConnectionConfig, type DeliveryBinding } from "./domain.js";
 
 const digest = (token: string): string => createHash("sha256").update(token, "utf8").digest("hex");
 const validToken = (token: unknown): token is string => typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token);
 const sameBinding = (left: VerificationBinding, right: VerificationBinding): boolean =>
-  left.connectionId === right.connectionId && left.provider === right.provider && left.account === right.account &&
-  left.revision === right.revision && left.credentialRevision === right.credentialRevision &&
-  left.resource === right.resource && left.generation === right.generation && left.providerId === right.providerId &&
+  left.delivery.connectionId === right.delivery.connectionId && left.provider === right.provider && left.delivery.account === right.delivery.account &&
+  left.delivery.revision === right.delivery.revision && left.delivery.credentialRevision === right.delivery.credentialRevision &&
+  left.delivery.resource === right.delivery.resource && left.delivery.generation === right.delivery.generation && left.providerId === right.providerId &&
   left.verificationEpoch === right.verificationEpoch;
 
-export interface VerificationBinding extends DeliveryBinding {
+export interface VerificationBinding {
   provider: string;
   providerId: string;
   verificationEpoch: number;
+  delivery: DeliveryBinding;
 }
 
 export interface VerificationClaim {
@@ -58,9 +59,9 @@ export class ProviderRegistrationRegistry {
     const matches = rows.flatMap((row) => {
       const config = JSON.parse(row.config_json) as ConnectionConfig;
       return input.account !== undefined && config.account !== input.account ? [] : [{
-        connectionId: row.connection_id, provider: row.provider, account: config.account, revision: row.revision,
-        credentialRevision: config.credentialRevision, resource: row.resource, generation: row.generation, providerId: row.provider_id,
-        verificationEpoch: row.verification_epoch,
+        provider: row.provider, providerId: row.provider_id, verificationEpoch: row.verification_epoch,
+        delivery: { connectionId: row.connection_id, account: config.account, revision: row.revision,
+          credentialRevision: config.credentialRevision, resource: row.resource, generation: row.generation },
       }];
     });
     if (matches.length !== 1) throw new ConnectionError(matches.length === 0 ? "not_authorized" : "invalid_transition");
@@ -72,7 +73,7 @@ export class ProviderRegistrationRegistry {
       const now = this.clock.now();
       try {
         const binding = this.binding(input, true, now);
-        this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.connectionId);
+        this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.delivery.connectionId);
         return { binding };
       } catch (error) {
         if (identifier.safeParse(input.provider).success && identifier.safeParse(input.providerId).success &&
@@ -101,7 +102,7 @@ export class ProviderRegistrationRegistry {
           this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=? AND provider=?").run(now, input.connectionId, input.provider);
         return { error };
       }
-      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.connectionId);
+      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.delivery.connectionId);
       // 1回のmaintenanceが長時間lockを保持しないよう削除数をboundedにする。
       this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
         WHERE state='consumed' ORDER BY expires_at LIMIT 100)`).run();
@@ -110,8 +111,9 @@ export class ProviderRegistrationRegistry {
       const token = randomBytes(32).toString("base64url");
       this.db.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,
         resource,generation,provider_id,verification_epoch,expires_at,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?)`)
-        .run(digest(token), binding.connectionId, binding.provider, binding.account, binding.revision,
-          binding.credentialRevision, binding.resource, binding.generation, binding.providerId, binding.verificationEpoch, now + ttlMs, now);
+        .run(digest(token), binding.delivery.connectionId, binding.provider, binding.delivery.account, binding.delivery.revision,
+          binding.delivery.credentialRevision, binding.delivery.resource, binding.delivery.generation,
+          binding.providerId, binding.verificationEpoch, now + ttlMs, now);
       return { token };
     }).immediate();
     if (result.error) throw result.error;
@@ -121,6 +123,9 @@ export class ProviderRegistrationRegistry {
   claim(token: string, expected: VerificationBinding, leaseMs: number): VerificationClaim {
     if (!validToken(token) || !Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000)
       throw new ConnectionError("invalid_input");
+    if (!expected || !identifier.safeParse(expected.provider).success || !identifier.safeParse(expected.providerId).success ||
+      !Number.isSafeInteger(expected.verificationEpoch) || expected.verificationEpoch < 0 || !deliverySchema.safeParse(expected.delivery).success)
+      throw new ConnectionError("invalid_input");
     const result = this.db.transaction((): { claim?: VerificationClaim; error?: unknown } => {
       const now = this.clock.now();
       const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as AttemptRow | undefined;
@@ -129,20 +134,26 @@ export class ProviderRegistrationRegistry {
         this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
         return { error: new ConnectionError("not_authorized") };
       }
-      const actual: VerificationBinding = { connectionId: row.connection_id, provider: row.provider, account: row.account,
-        revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource,
-        generation: row.generation, providerId: row.provider_id, verificationEpoch: row.verification_epoch };
-      if (!sameBinding(actual, expected)) throw new ConnectionError("not_authorized");
+      const actual: VerificationBinding = { provider: row.provider, providerId: row.provider_id, verificationEpoch: row.verification_epoch,
+        delivery: { connectionId: row.connection_id, account: row.account, revision: row.revision,
+          credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
+      if (!sameBinding(actual, expected)) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
+        return { error: new ConnectionError("not_authorized") };
+      }
       let current: VerificationBinding;
-      try { current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.connectionId,
-        account: actual.account, resource: actual.resource }, false, now); }
+      try { current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.delivery.connectionId,
+        account: actual.delivery.account, resource: actual.delivery.resource }, false, now); }
       catch (error) {
-        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.connectionId);
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
         return { error };
       }
-      if (!sameBinding(current, actual)) throw new ConnectionError("not_authorized");
+      if (!sameBinding(current, actual)) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
+        return { error: new ConnectionError("not_authorized") };
+      }
       if (row.state === "claimed" && row.claim_until! > now) {
-        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.connectionId);
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
         return { error: new ConnectionError("operation_pending") };
       }
       const claimId = randomUUID(), claimUntil = Math.min(row.expires_at, now + leaseMs);
@@ -150,7 +161,7 @@ export class ProviderRegistrationRegistry {
         WHERE digest=? AND state!='consumed' AND expires_at>? AND (state='pending' OR claim_until<=?)`)
         .run(claimId, claimUntil, digest(token), now, now).changes;
       if (changed !== 1) throw new ConnectionError("operation_pending");
-      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.connectionId);
+      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.delivery.connectionId);
       return { claim: { claimId, binding: actual, claimUntil } };
     }).immediate();
     if (result.error) throw result.error;
@@ -169,21 +180,24 @@ export class ProviderRegistrationRegistry {
         this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
         return { error: new ConnectionError("not_authorized") };
       }
-      const actual: VerificationBinding = { connectionId: row.connection_id, provider: row.provider, account: row.account,
-        revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource,
-        generation: row.generation, providerId: row.provider_id, verificationEpoch: row.verification_epoch };
+      const actual: VerificationBinding = { provider: row.provider, providerId: row.provider_id, verificationEpoch: row.verification_epoch,
+        delivery: { connectionId: row.connection_id, account: row.account, revision: row.revision,
+          credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
       let current: VerificationBinding;
-      try { current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.connectionId,
-        account: actual.account, resource: actual.resource }, false, now); }
+      try { current = this.binding({ provider: actual.provider, providerId: actual.providerId, connectionId: actual.delivery.connectionId,
+        account: actual.delivery.account, resource: actual.delivery.resource }, false, now); }
       catch (error) {
-        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.connectionId);
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
         return { error };
       }
-      if (!sameBinding(current, actual)) throw new ConnectionError("not_authorized");
+      if (!sameBinding(current, actual)) {
+        this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, actual.delivery.connectionId);
+        return { error: new ConnectionError("not_authorized") };
+      }
       const changed = this.db.prepare(`UPDATE verification_attempts SET state='consumed',consumed_at=?
         WHERE digest=? AND state='claimed' AND claim_id=?`).run(now, digest(token), claimId).changes;
       if (changed !== 1) throw new ConnectionError("not_authorized");
-      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.connectionId);
+      this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, actual.delivery.connectionId);
       return { binding: actual };
     }).immediate();
     if (result.error) throw result.error;

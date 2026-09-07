@@ -143,7 +143,9 @@ export class PrivateFileSecretStore {
 
   async read(reference: string, revision: number): Promise<Buffer> {
     await this.checkedRoot();
-    const handle = await fs.open(this.file(reference, revision), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const target = this.file(reference, revision), before = await fs.lstat(target);
+    if (!before.isFile() || before.isSymbolicLink()) throw new ConnectionError("not_authorized");
+    const handle = await fs.open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const stats = await handle.stat();
       if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() || (stats.mode & 0o077) !== 0 ||
