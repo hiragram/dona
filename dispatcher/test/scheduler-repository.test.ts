@@ -285,7 +285,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
 });
 
 test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite前に抑止する", () => {
-  for(const mode of ["deadline","retry","cancel","waiting"] as const) {
+  for(const mode of ["deadline","authorized_deadline","retry","cancel","waiting"] as const) {
     const {repo,dispatcher,raw,filename}=setup(); const objective=`${mode}通知`;
     repo.create(`notify_${mode}`,{...input,action:"work.read_only",content:objective},due,actor,now);
     const run=repo.materialize(`notify_${mode}`,1,due,later,due,actor).run;
@@ -293,6 +293,10 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
     dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
     dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
     const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+    if(mode==="authorized_deadline") {
+      dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
+      dispatcher.authorizeJobNotification(eventId,new Date(due));
+    }
     if(mode==="waiting") {
       dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
       dispatcher.markWaiting(eventId,new Date(due));
@@ -302,11 +306,12 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
       dispatcher.recordPreDispatchFailure(eventId,"temporary","retry",3,new Date(due));
       assert.notEqual(dispatcher.get(eventId)?.available_at,due);
     }
-    dispatcher.nextAvailable(new Date(mode==="deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
+    dispatcher.nextAvailable(new Date(mode==="deadline"||mode==="authorized_deadline"?"2026-09-05T00:16:01Z":"2026-09-05T00:01:31Z"));
     if(mode==="waiting") dispatcher.nextWaiting();
     if(mode==="retry") dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
-    assert.equal(dispatcher.get(eventId)?.status,"completed");
-    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
+    assert.equal(dispatcher.get(eventId)?.status,mode==="authorized_deadline"?"needs_review":"completed");
+    assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,mode==="authorized_deadline"?"needs_review":"none");
+    if(mode==="authorized_deadline") assert.equal(repo.get(`notify_${mode}`)?.state,"needs_review");
     if(mode==="waiting") {
       dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",completed_at:"2026-09-05T00:01:31Z"},path.join(path.dirname(filename),`${eventId}.json`));
       assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
@@ -494,6 +499,14 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const payload=JSON.parse(dispatcher.get(eventId)!.payload_json) as {error_message:string};
   assert.equal(payload.error_message,"実行エラーの詳細は安全上省略されました"); assert.doesNotMatch(payload.error_message,/xoxb/);
+  repo.create("long_failed_message",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const longRun=repo.materialize("long_failed_message",1,due,later,due,actor).run;
+  const longJob=dispatcher.createJob({source_event_id:longRun.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(longJob.job_id,new Date(due)); dispatcher.beginJobDispatch(longJob.job_id,new Date(due)); dispatcher.markJobRunning(longJob.job_id,new Date(due));
+  dispatcher.markJobNeedsReview(longJob.job_id,"runtime_failed","あ".repeat(3000)); dispatcher.enqueueJobNotification(longJob.job_id,new Date(due));
+  const longEventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(longJob.job_id) as {notification_event_id:string}).notification_event_id;
+  const longPayload=JSON.parse(dispatcher.get(longEventId)!.payload_json) as {error_message:string};
+  assert.equal(Array.from(longPayload.error_message).length,2000); assert.match(longPayload.error_message,/…$/);
 });
 
 test("委任前current access失敗はscheduleをneeds_reviewへ固定する", () => {

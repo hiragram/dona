@@ -214,6 +214,7 @@ export class JobSupervisor {
         const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
         if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
           (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
+          if(await this.tryComplete(job,false)) continue;
           this.database.settleAmbiguousCancellation(job.job_id,"Agent termination was confirmed after ambiguous cancellation");
         }
       }

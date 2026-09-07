@@ -578,7 +578,7 @@ export class DispatcherDatabase {
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const job=this.getJobRequired(jobId);
-    const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted"].includes(job.last_error_code??"")||
+    const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown"].includes(job.last_error_code??"")||
       (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
     if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
       throw new Error("completed_at_precedes_prompt_dispatch");
@@ -743,7 +743,7 @@ export class DispatcherDatabase {
 
   private safeNotificationError(message:string,scheduled:boolean):string {
     if(!scheduled) return message;
-    try { validateWorkResultContent(message); return message; }
+    try { return projectWorkResultContent(message); }
     catch { return "実行エラーの詳細は安全上省略されました"; }
   }
 
@@ -803,6 +803,7 @@ export class DispatcherDatabase {
       for(const row of rows) {
         if(row.notification_state==="needs_review") {
           this.db.prepare("UPDATE events SET status='needs_review',updated_at=?,last_error_code='notification_delivery_ambiguous',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(timestamp,row.event_id);
+          this.setNotificationState(row.event_id,"needs_review",at);
           continue;
         }
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',
