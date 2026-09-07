@@ -27,34 +27,33 @@ test("push headerは空body・channel/token/resourceを束縛し、syncと非連
   assert.throws(() => verifyDrivePush(Buffer.alloc(0), headers("update"), [channel]), /not_authorized/);
 });
 
-test("同じdrain内のfolder加入後の離脱をtombstone化する", async (t) => {
+test("同じdrain内のfolder加入後のparent snapshot変化をreconciliationへ隔離する", async (t) => {
   const db=fixture(t); let page=0;
   const client={list:async()=> ++page===1 ? {changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving",parents:["folder-1"]}}],nextPageToken:"page-2"} :
     {changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"moving",parents:["outside"],name:"private"}}],newStartPageToken:"next"}};
-  await drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()});
-  assert.equal(db.list().length,2);
-  assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()}),/operation_pending/);
+  assert.equal(db.list().length,1);
 });
 
-test("page continuationとmembershipを同時commitし再起動後の離脱を保持する", async (t) => {
+test("page continuationとmembershipを同時commitし再起動後のparent変化を隔離する", async (t) => {
   const db=fixture(t);
   const first={list:async()=>({changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"moving",parents:["folder-1"]}}],nextPageToken:"page-2"})};
   await assert.rejects(drainDriveChanges(db,binding,first,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()},
     {kind:"user"},{pages:1,events:10,bytes:10000,timeoutMs:1000}),/incomplete_batch/);
   assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),["moving"]);
   const second={list:async()=>({changes:[{fileId:"moving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"moving",parents:["outside"]}}],newStartPageToken:"next"})};
-  await drainDriveChanges(db,binding,second,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()});
-  assert.deepEqual(JSON.parse(db.list()[1]!.payload_json),{removed:true,drive_id:null,file:null});
-  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),[]);
+  await assert.rejects(drainDriveChanges(db,binding,second,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set()}),/operation_pending/);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
+  assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),["moving"]);
 });
 
-test("tombstone後のfolder外changeで静的prior membershipを再適用しない", async (t) => {
+test("静的prior membershipのfolder外snapshotをreconciliationへ隔離する", async (t) => {
   const db=fixture(t); const client={list:async()=>({changes:[
     {fileId:"leaving",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"leaving",parents:["outside"]}},
     {fileId:"leaving",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"leaving",parents:["outside"],name:"private"}},
   ],newStartPageToken:"next"})};
-  await drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["leaving"])});
-  assert.equal(db.list().length,1); assert.deepEqual(JSON.parse(db.list()[0]!.payload_json),{removed:true,drive_id:null,file:null});
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["leaving"])}),/operation_pending/);
+  assert.equal(db.list().length,0);
 });
 
 test("changes省略の正常な空pageでもnewStartPageTokenをcommitする", async (t) => {
@@ -230,19 +229,18 @@ test("shared drive allowlistと同時poll cursor競合をfail closedにする", 
   assert.ok(calls.every((call) => (call as {driveId?:string}).driveId === "drive-1"));
 });
 
-test("以前のfolder memberは離脱・権限喪失時もtombstoneとして配送する", async (t) => {
+test("以前のfolder memberのremoved changeはtombstoneとして配送する", async (t) => {
   const db = fixture(t); const client = { list: async () => ({ changes: [
-    { fileId: "moved", changeType: "file", time: "2026-09-07T00:00:00Z", file: { id: "moved", parents: ["other"] } },
     { fileId: "lost", removed: true, changeType: "file", time: "2026-09-07T00:00:01Z" },
   ], newStartPageToken: "next" }) };
-  await drainDriveChanges(db, binding, client, { fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["moved","lost"]) });
-  assert.equal(db.list().length, 2);
+  await drainDriveChanges(db, binding, client, { fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["lost"]) });
+  assert.equal(db.list().length, 1);
   for (const row of db.list()) assert.deepEqual(JSON.parse(row.payload_json), { removed:true,drive_id:null,file:null });
 });
 
 test("quota系403はretryable、可変snapshotはdedupし明示fileのfeed離脱はtombstone化する", async (t) => {
   const db = fixture(t); let round = 0;
-  const retry = { list: async () => { throw { status:403, errors:[{reason:"userRateLimitExceeded"}] }; } };
+  const retry = { list: async () => { throw { status:403, errors:[{reason:"dailyLimitExceeded"}] }; } };
   await assert.rejects(drainDriveChanges(db,binding,retry,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
     (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "incomplete_batch");
   const client = { list: async () => { round++; return { changes: [
@@ -272,16 +270,16 @@ test("複数pageでevent/byte/time上限を共有しdurable continuationで停�
 });
 
 test("credential失効とcursor期限切れをretryable page失敗から分離する", async (t) => {
-  for (const [status, code] of [[401,"credential_unavailable"],[403,"credential_unavailable"],[410,"cursor_conflict"],[429,"incomplete_batch"]] as const) {
-    const db = fixture(t); const client = { list: async () => { throw { status }; } };
+  for (const [status, code,reason] of [[401,"credential_unavailable",undefined],[403,"credential_unavailable","insufficientPermissions"],[410,"cursor_conflict",undefined],[429,"incomplete_batch",undefined]] as const) {
+    const db = fixture(t); const client = { list: async () => { throw { status,errors:reason?[{reason}]:[] }; } };
     await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
       (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === code);
   }
   const db=fixture(t); const circular:{status:number;response?:unknown}={status:410}; circular.response={data:{error:{errors:[{reason:"pageTokenExpired"}]}},request:circular};
   await assert.rejects(drainDriveChanges(db,binding,{list:async()=>{throw circular;}},{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
     (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="cursor_conflict");
-  for (const [status, code] of [[401,"credential_unavailable"],[403,"credential_unavailable"],[410,"cursor_conflict"]] as const) {
-    const responseDb=fixture(t); const client={list:async()=>{throw {response:{status,data:{error:{errors:[]}}}};}};
+  for (const [status, code,reason] of [[401,"credential_unavailable",undefined],[403,"credential_unavailable","insufficientPermissions"],[410,"cursor_conflict",undefined]] as const) {
+    const responseDb=fixture(t); const client={list:async()=>{throw {response:{status,data:{error:{errors:reason?[{reason}]:[]}}}};}};
     await assert.rejects(drainDriveChanges(responseDb,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
       (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code===code);
   }

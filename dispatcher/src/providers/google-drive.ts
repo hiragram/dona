@@ -198,9 +198,9 @@ export async function drainDriveChanges(
       const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;response?:unknown} : {};
       const response = typeof candidate.response === "object" && candidate.response !== null ? candidate.response as {status?:unknown} : undefined;
       const status = candidate.status ?? response?.status;
-      const quota403 = status === 403 && errorReasons(error).some((reason) =>
-        ["rateLimitExceeded","userRateLimitExceeded","sharingRateLimitExceeded"].includes(reason));
-      if (oauthErrorCode(error) === "invalid_grant" || status === 401 || (status === 403 && !quota403))
+      const authorization403 = status === 403 && errorReasons(error).some((reason) =>
+        ["authError","insufficientPermissions","forbidden"].includes(reason));
+      if (oauthErrorCode(error) === "invalid_grant" || status === 401 || authorization403)
         throw new ConnectionError("credential_unavailable");
       if (status === 410) throw new ConnectionError("cursor_conflict");
       throw new ConnectionError("incomplete_batch");
@@ -227,11 +227,13 @@ export async function drainDriveChanges(
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
+      if(members.has(change.fileId)&&!folderAllowed&&change.removed!==true&&!leftUserFeed)
+        throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
       const currentlyAllowed = !providerRemoved && !leftUserFeed && (allowlist.fileIds.has(change.fileId) ||
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
         folderAllowed);
-      const tombstone = !currentlyAllowed && (trackedBefore || folderAllowed);
+      const tombstone = !currentlyAllowed && (providerRemoved || leftUserFeed) && (trackedBefore || folderAllowed);
       if (!currentlyAllowed && !tombstone) continue;
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
