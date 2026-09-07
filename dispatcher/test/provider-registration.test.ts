@@ -112,10 +112,19 @@ test("secret readは保存fileのsizeを読込前に拒否する", async (t) => 
   await assert.rejects(store.read("cred_large", 1), /not_authorized/);
 });
 
+test("publish前crashの古いtemporary secretだけをboundedに回収する", async (t) => {
+  const { secrets, store } = fixture(t);
+  const stale = path.join(secrets, ".cred_stale.1.0123456789abcdef01234567.tmp");
+  fs.writeFileSync(stale, Buffer.alloc(32, 1), { mode: 0o600 });
+  const old = new Date(Date.now() - 10 * 60_000); fs.utimesSync(stale, old, old);
+  await store.write("cred_stale", 1, Buffer.alloc(32, 2));
+  assert.deepEqual(fs.readdirSync(secrets), ["cred_stale.1.secret"]);
+});
+
 test("resolverはcurrent active bindingだけを返しcross-workspace/provider/revision tamperを拒否する", async (t) => {
   const { db } = fixture(t); db.connections.register(config); const binding = activate(db);
   assert.deepEqual(binding, { connectionId: "pilot", provider: "notion", account: "workspace:one", revision: 1,
-    credentialRevision: 1, resource: "page:one", generation: 1, providerId: "subscription:one" });
+    credentialRevision: 1, resource: "page:one", generation: 1, providerId: "subscription:one", verificationEpoch: 0 });
   for (const input of [
     { provider: "figma", providerId: "subscription:one", connectionId: "pilot" },
     { provider: "notion", providerId: "subscription:one", connectionId: "pilot", account: "workspace:two" },
@@ -136,6 +145,23 @@ test("resolver成功時刻をhigh-waterとして保存する", (t) => {
   db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" });
   clock.value--;
   assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
+});
+
+test("期限切れresolverの失敗時刻もhigh-waterとして保存する", (t) => {
+  const { db, file, clock } = fixture(t); db.connections.register(config); activate(db);
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connection_subscriptions SET expires_at=? WHERE connection_id='pilot'").run(clock.value + 100);
+  clock.value += 100;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /not_authorized/);
+  clock.value--;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
+});
+
+test("active resolverは検証済みstop_candidateを配信可能として解決する", (t) => {
+  const { db, file } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const raw = new Database(file); t.after(() => raw.close());
+  raw.prepare("UPDATE connection_subscriptions SET state='stop_candidate' WHERE connection_id='pilot'").run();
+  assert.deepEqual(db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), binding);
 });
 
 test("verification attemptはdigestのみ永続化しexpiry/replay/restart/tamperを拒否する", (t) => {
@@ -163,7 +189,7 @@ test("verification pending bindingでもattemptを発行・consumeでき、activ
     account: "workspace:one", resource: "page:one" };
   assert.throws(() => db.providerRegistration.resolve(identity), /not_authorized/);
   const token = db.providerRegistration.issue(identity, 5_000);
-  const expected = { ...identity, revision: 1, credentialRevision: 1, generation: 1 };
+  const expected = { ...identity, revision: 1, credentialRevision: 1, generation: 1, verificationEpoch: 0 };
   const claim = db.providerRegistration.claim(token, expected, 1_000);
   assert.deepEqual(db.providerRegistration.consume(token, claim.claimId), expected);
 });
@@ -186,6 +212,14 @@ test("claim後のrevision変更はconsumeをfail closedにする", (t) => {
   const token = db.providerRegistration.issue(identity, 5_000), claim = db.providerRegistration.claim(token, binding, 1_000);
   db.connections.revise("pilot", 1, { ...config, credentialRevision: 2 });
   assert.throws(() => db.providerRegistration.consume(token, claim.claimId), /not_authorized/);
+});
+
+test("verification epoch更新後は旧attemptのclaimを拒否する", (t) => {
+  const { db } = fixture(t); db.connections.register(config); const binding = activate(db);
+  const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
+    connectionId: binding.connectionId, account: binding.account, resource: binding.resource }, 5_000);
+  db.connections.beginVerification("pilot", 1, "page:one", 1);
+  assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /not_authorized/);
 });
 
 test("clock rewind時はverification attemptをfail closedにする", (t) => {

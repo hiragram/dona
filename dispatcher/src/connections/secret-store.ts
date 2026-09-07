@@ -20,9 +20,27 @@ export class PrivateFileSecretStore {
     return path.join(this.root, `${reference}.${revision}.secret`);
   }
 
+  private async cleanupStale(reference: string, revision: number): Promise<void> {
+    const pattern = new RegExp(`^\\.${reference}\\.${revision}\\.[a-f0-9]{24}\\.tmp$`);
+    let removed = false, inspected = 0;
+    for (const entry of await fs.readdir(this.root)) {
+      if (!pattern.test(entry) || inspected++ >= 100) continue;
+      const temporary = path.join(this.root, entry), stats = await fs.lstat(temporary);
+      if (stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1 && stats.uid === process.getuid?.() &&
+        (stats.mode & 0o077) === 0 && stats.mtimeMs <= Date.now() - 5 * 60_000) {
+        await fs.unlink(temporary); removed = true;
+      }
+    }
+    if (removed) {
+      const directory = await fs.open(this.root, constants.O_RDONLY);
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+  }
+
   async write(reference: string, revision: number, secret: Uint8Array): Promise<{ created: true }> {
     if (!(secret instanceof Uint8Array) || secret.byteLength < 16 || secret.byteLength > 65_536) throw new ConnectionError("invalid_input");
     await this.checkedRoot();
+    await this.cleanupStale(reference, revision);
     const target = this.file(reference, revision);
     try {
       const existing = await fs.lstat(target);

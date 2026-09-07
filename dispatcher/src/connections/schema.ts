@@ -12,7 +12,7 @@ export function migrateConnections(db: Database.Database): void {
           digest TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id),
           provider TEXT NOT NULL, account TEXT NOT NULL, revision INTEGER NOT NULL,
           credential_revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
-          provider_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
+          provider_id TEXT NOT NULL, verification_epoch INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL,
           state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed')),
           claim_id TEXT, claim_until INTEGER, created_at INTEGER NOT NULL, consumed_at INTEGER,
           CHECK((state='pending' AND claim_id IS NULL AND claim_until IS NULL AND consumed_at IS NULL)
@@ -22,6 +22,9 @@ export function migrateConnections(db: Database.Database): void {
         CREATE INDEX IF NOT EXISTS verification_attempt_expiry_idx ON verification_attempts(state,expires_at);
         CREATE INDEX IF NOT EXISTS verification_attempt_expires_at_idx ON verification_attempts(expires_at);
       `);
+      const columns = db.prepare("PRAGMA table_info(verification_attempts)").all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "verification_epoch"))
+        db.exec("ALTER TABLE verification_attempts ADD COLUMN verification_epoch INTEGER NOT NULL DEFAULT 0");
       return;
     }
     db.exec(`
@@ -70,7 +73,7 @@ export function migrateConnections(db: Database.Database): void {
         digest TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id),
         provider TEXT NOT NULL, account TEXT NOT NULL, revision INTEGER NOT NULL,
         credential_revision INTEGER NOT NULL, resource TEXT NOT NULL, generation INTEGER NOT NULL,
-        provider_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        provider_id TEXT NOT NULL, verification_epoch INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed')),
         claim_id TEXT, claim_until INTEGER, created_at INTEGER NOT NULL, consumed_at INTEGER,
         CHECK((state='pending' AND claim_id IS NULL AND claim_until IS NULL AND consumed_at IS NULL)
