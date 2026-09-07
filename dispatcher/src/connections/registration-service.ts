@@ -17,7 +17,12 @@ export class ProviderRegistrationService {
   }
 
   private async reconcileAdopted(config: ConnectionConfig, secret: Uint8Array): Promise<void> {
-    const accepted = await this.secrets.reconcile(config.credentialRef, config.credentialRevision, secret).catch(() => false);
+    let accepted: boolean;
+    try { accepted = await this.secrets.reconcile(config.credentialRef, config.credentialRevision, secret); }
+    catch (error) {
+      if (error instanceof ConnectionError && error.code === "invalid_input") throw error;
+      accepted = false;
+    }
     if (!accepted) throw new ConnectionError("credential_unavailable");
   }
 
@@ -51,6 +56,8 @@ export class ProviderRegistrationService {
       throw new ConnectionError("invalid_input");
     const parsed = parseConfig(config);
     const current = this.connections.get(id);
+    if (parsed.id !== id || parsed.provider !== current.provider || parsed.account !== current.account)
+      throw new ConnectionError("invalid_input");
     const alreadyAccepted = this.accepted(id, parsed, expectedRevision + 1);
     if (alreadyAccepted) {
       await this.reconcileAdopted(parsed, secret);

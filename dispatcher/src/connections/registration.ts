@@ -52,12 +52,13 @@ export class ProviderRegistrationRegistry {
     const rows = this.db.prepare(`SELECT c.id connection_id,c.provider,c.config_json,c.revision,c.last_clock,
       s.resource,s.generation,s.revision subscription_revision,s.provider_id,s.verification_epoch,s.expires_at
       FROM connections c JOIN connection_subscriptions s ON s.connection_id=c.id
-      WHERE c.provider=? AND s.provider_id=? AND c.state!='disabled' AND s.revision=c.revision
+      WHERE c.provider=? AND s.provider_id=? AND c.state!='disabled' AND (?=0 OR s.revision=c.revision)
         AND ((?=1 AND c.state='active' AND s.verified_at IS NOT NULL AND s.state IN ('active','expiring','stop_candidate'))
           OR (?=0 AND s.state IN ('verification_pending','active','expiring')))
         AND (s.expires_at IS NULL OR s.expires_at>?)
         AND (? IS NULL OR c.id=?) AND (? IS NULL OR s.resource=?)`)
-      .all(input.provider, input.providerId, activeOnly ? 1 : 0, activeOnly ? 1 : 0, now, input.connectionId ?? null, input.connectionId ?? null,
+      .all(input.provider, input.providerId, activeOnly ? 1 : 0, activeOnly ? 1 : 0, activeOnly ? 1 : 0, now,
+        input.connectionId ?? null, input.connectionId ?? null,
         input.resource ?? null, input.resource ?? null) as Array<{ connection_id: string; provider: string; config_json: string;
           revision: number; last_clock: number; resource: string; generation: number; subscription_revision: number; provider_id: string;
           verification_epoch: number; expires_at: number | null }>;

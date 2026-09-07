@@ -258,6 +258,17 @@ test("verification epoch更新後は旧attemptのclaimを拒否する", (t) => {
   assert.throws(() => db.providerRegistration.claim(token, binding, 1_000), /not_authorized/);
 });
 
+test("revision更新後の既存generationをcurrent revisionで再verificationできる", (t) => {
+  const { db } = fixture(t); db.connections.register(config); const old = activate(db);
+  db.connections.revise("pilot", 1, { ...config, credentialRevision: 2 });
+  db.connections.beginVerification("pilot", 2, old.delivery.resource, old.delivery.generation);
+  const identity = { provider: old.provider, providerId: old.providerId, connectionId: old.delivery.connectionId,
+    account: old.delivery.account, resource: old.delivery.resource };
+  const expected = { ...old, verificationEpoch: 1, delivery: { ...old.delivery, revision: 2, credentialRevision: 2 } };
+  const token = db.providerRegistration.issue(identity, 5_000), claim = db.providerRegistration.claim(token, expected, 1_000);
+  assert.deepEqual(db.providerRegistration.consume(token, claim.claimId), expected);
+});
+
 test("clock rewind時はverification attemptをfail closedにする", (t) => {
   const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const identity = { provider: binding.provider, providerId: binding.providerId, connectionId: binding.delivery.connectionId,
@@ -365,6 +376,20 @@ test("採用済みrevisionの欠損secretはretryで再作成しない", async (
   fs.unlinkSync(path.join(secrets, "cred_pilot.1.secret"));
   await assert.rejects(service.register(config, Buffer.alloc(32, 2)), /credential_unavailable/);
   assert.equal(fs.existsSync(path.join(secrets, "cred_pilot.1.secret")), false);
+});
+
+test("採用済みretryでもsecret入力検証errorを保持する", async (t) => {
+  const { db, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
+  await service.register(config, Buffer.alloc(32, 1));
+  await assert.rejects(service.register(config, Buffer.alloc(8, 1)), /invalid_input/);
+});
+
+test("rotation identity不一致はsecret publish前に拒否する", async (t) => {
+  const { db, secrets, store } = fixture(t), service = new ProviderRegistrationService(db.connections, store);
+  await service.register(config, Buffer.alloc(32, 1));
+  await assert.rejects(service.rotate("pilot", 1, { ...config, id: "other", credentialRef: "cred_other", credentialRevision: 2 },
+    Buffer.alloc(32, 2)), /invalid_input/);
+  assert.equal(fs.existsSync(path.join(secrets, "cred_other.2.secret")), false);
 });
 
 test("operation_pending観測時刻をcommitしclock rewindを拒否する", (t) => {
