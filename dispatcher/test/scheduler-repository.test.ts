@@ -216,13 +216,14 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
 test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを監査する", () => {
   const { repo, dispatcher, raw } = setup();
   const objective = "曖昧なread-only作業";
-  repo.create("review_work", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
+  repo.create("review_work", { ...input, action: "work.read_only", content: objective }, due, actor, now);
   const run = repo.materialize("review_work", 1, due, later, due, actor).run;
   const job = createScheduledJob(dispatcher, raw, { source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id, new Date(due)); dispatcher.beginJobDispatch(job.job_id, new Date(due)); dispatcher.markJobRunning(job.job_id, new Date(due));
   dispatcher.markJobNeedsReview(job.job_id, "ambiguous_job_result", "結果の受理が不明");
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
+  const oldNotification=dispatcher.getJob(job.job_id)!.completion_event_id!;
   assert.ok(raw.prepare("SELECT 1 FROM job_completion_results WHERE job_id=? AND job_status='needs_review'").get(job.job_id));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get("review_work")?.state, "needs_review");
   raw.prepare("UPDATE jobs SET status='blocked' WHERE job_id=?").run(job.job_id);
@@ -232,8 +233,10 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.ok((repo.auditHistory("review_work") as Array<{ operation: string }>).some(row => row.operation === "reconcile_work_failed"));
   assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
   assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "failed");
-  assert.equal(dispatcher.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),false);
-  repo.update("review_work",1,{...input,action:"work.read_only",target:{kind:"none"},content:objective,authorization_id:"renewed",authorization_revision:2},"2026-09-08T00:01:00Z",actor,due);
+  assert.equal(dispatcher.get(oldNotification)?.last_error_code,"job_result_superseded");
+  assert.equal(dispatcher.getJob(job.job_id)?.completion_event_id,null);
+  assert.equal(dispatcher.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),true);
+  repo.update("review_work",1,{...input,action:"work.read_only",content:objective,authorization_id:"renewed",authorization_revision:2},"2026-09-08T00:01:00Z",actor,due);
 });
 
 test("delegated needs_review eventのResultをcontent deadlineで削除する", () => {
@@ -423,6 +426,7 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"invalid",reply_broadcast:false},
     {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000006",reply_broadcast:false,error:{code:"failed"}},
     {tool:"dona_slack.set_agent_session_status",workspace:"other",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:false},
   ]) {
     raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
     dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
@@ -581,6 +585,7 @@ test("job作成前のin-flight scheduled eventをschedule取消で抑止する",
     repo.transition(scheduleId,1,"cancel",actor,"2026-09-05T00:01:01Z");
     assert.equal(dispatcher.get(run.event_id!)?.status,"completed");
     assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");
+    assert.equal(dispatcher.beginDispatch(run.event_id!,`/tmp/${run.event_id}.json`,new Date("2026-09-05T00:01:01Z")).last_error_code,"schedule_suppressed");
     dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:"2026-09-05T00:01:01Z"},`/tmp/${run.event_id}.json`,new Date("2026-09-05T00:01:01Z"));
     assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");
   }

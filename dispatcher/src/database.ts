@@ -490,7 +490,7 @@ export class DispatcherDatabase {
       SELECT * FROM jobs
       WHERE status IN ('blocked', 'completed', 'failed', 'cancelled', 'needs_review')
         AND completion_event_id IS NULL
-        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=jobs.job_id AND (c.job_status=jobs.status OR c.work_state=jobs.status))
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=jobs.job_id AND c.job_status=jobs.status)
       ORDER BY updated_at LIMIT ?
     `).all(limit) as JobRow[];
   }
@@ -614,6 +614,18 @@ export class DispatcherDatabase {
     if(!row) throw new Error(`Run ${runId} was not found`);
     return this.db.transaction(()=>{
       const reconciledAt=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
+      if(row.job_id) {
+        const job=this.getJobRequired(row.job_id);
+        if(job.completion_event_id) {
+          const completion=this.db.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string;notification_authorization_phase:string}|undefined;
+          if(completion?.notification_state==="pending"&&completion.notification_authorization_phase==="none") {
+            const changed=this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(reconciledAt,reconciledAt,job.completion_event_id).changes;
+            if(changed!==1) throw new Error("prior_notification_requires_reconciliation");
+            this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
+          } else if(completion&&! ["none","accepted"].includes(completion.notification_state)) throw new Error("prior_notification_requires_reconciliation");
+          this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(row.job_id);
+        }
+      }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
         this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')")
@@ -1009,7 +1021,7 @@ export class DispatcherDatabase {
       .run(timestamp, resultPath, timestamp, eventId).changes;
     if (changed !== 1) {
       const current=this.get(eventId);
-      if(current?.status==="completed"&&current.last_error_code==="schedule_notification_suppressed") return current;
+      if(current?.status==="completed"&&["schedule_suppressed","schedule_notification_suppressed"].includes(current.last_error_code??"")) return current;
       throw new Error(`Event ${eventId} is no longer dispatchable`);
     }
     return this.get(eventId)!;
@@ -1106,7 +1118,8 @@ export class DispatcherDatabase {
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
     const allowedActions=actions.every(({value})=>{
       if(value.tool==="dona_dispatcher.authorize_job_notification") return value.event_id===eventId;
-      if(["dona_slack.check_user_channel_access","dona_slack.post_message"].includes(String(value.tool))) return true;
+      if(value.tool==="dona_slack.check_user_channel_access") return value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id;
+      if(value.tool==="dona_slack.post_message") return true;
       return value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.channel_id===target?.channel_id&&
         (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:["processing","active"]).includes(String(value.status));
@@ -1188,7 +1201,10 @@ export class DispatcherDatabase {
     const undelegatedRun=row.source==="dona_schedule"?this.db.prepare("SELECT status,job_id FROM schedule_runs WHERE event_id=?").get(eventId) as {status:string;job_id:string|null}|undefined:undefined;
     if(undelegatedRun?.job_id===null&&undelegatedRun.status!=="materialized") throw new Error("schedule_event_retry_requires_reconciliation");
     const resultBackupPath=row.result_path?`${row.result_path}.retry-backup`:null;
-    if(resultBackupPath&&fs.existsSync(resultBackupPath)) throw new Error("retry_result_backup_exists");
+    if(resultBackupPath&&fs.existsSync(resultBackupPath)) {
+      if(fs.existsSync(row.result_path!)) throw new Error("retry_result_backup_exists");
+      fs.renameSync(resultBackupPath,row.result_path!);
+    }
     if(row.result_path&&fs.existsSync(row.result_path)) {
       fs.renameSync(row.result_path,resultBackupPath!);
     }

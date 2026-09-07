@@ -73,6 +73,6 @@ const policy = {
   retain_successful: 2,
   required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
   require_verified_signature: false,
-  compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+  compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: false },
 };
 fs.writeFileSync(path.join(destination, "policy.json"), `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 });

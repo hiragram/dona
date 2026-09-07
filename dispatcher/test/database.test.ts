@@ -71,6 +71,7 @@ describe("DispatcherDatabase", () => {
     await fs.mkdir(config.resultsDir,{recursive:true});
     await fs.writeFile(`${config.resultsDir}/${event.event_id}.json`,"old result");
     assert.throws(() => database.manualRetry(event.event_id, false), /--force/);
+    await fs.rename(`${config.resultsDir}/${event.event_id}.json`,`${config.resultsDir}/${event.event_id}.json.retry-backup`);
     assert.equal(database.manualRetry(event.event_id, true).status, "queued");
     await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json`));
     await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json.retry-backup`));
