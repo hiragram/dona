@@ -22,11 +22,13 @@ async function main(): Promise<void> {
     new MacOSKeychainStore(),
     logger,
   );
-  const key=(await fs.readFile(config.accessReceiptKeyPath,"utf8")).trim();
-  const server = createSlackMcpServer(registry, logger, input=>{
+  let key:string|undefined;
+  try { key=(await fs.readFile(config.accessReceiptKeyPath,"utf8")).trim()||undefined; }
+  catch(error) { logger.warn("Slack access receipt signing is unavailable",{error_message:error instanceof Error?error.message:String(error)}); }
+  const server = createSlackMcpServer(registry, logger, key?input=>{
     const payload=Buffer.from(JSON.stringify({...input,issued_at:new Date().toISOString(),nonce:randomUUID()})).toString("base64url");
     return `${payload}.${createHmac("sha256",key).update(payload).digest("base64url")}`;
-  });
+  }:undefined);
   await server.connect(new StdioServerTransport());
   logger.info("Dona Slack MCP server started", { transport: "stdio" });
 

@@ -100,7 +100,7 @@ export class JobSupervisor {
       let exited=false;
       while(Date.now()<deadline) {
         const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
-        if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {exited=true;break;}
+        if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {exited=true;break;}
         if(!observed.ok) throw new Error(`Legacy agent ${job.agent_name} exit could not be observed`);
         await new Promise(resolve=>setTimeout(resolve,100));
       }
