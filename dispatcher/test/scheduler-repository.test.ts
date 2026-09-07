@@ -332,17 +332,18 @@ test("job開始時の認可拒否はjobだけを戻してrun終端を確定す�
 });
 
 test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費する", () => {
-  const {repo,dispatcher}=setup(),objective="access receipt付き調査";
+  const {repo,dispatcher,raw}=setup(),objective="access receipt付き調査";
   const authorization=dispatcher.enqueue(eventEnvelope("access-receipt-authorization")).row;
   repo.create("access_receipt",{...input,authorization_id:`${authorization.event_id}:1`,action:"work.read_only",target:{kind:"none"},content:objective},due,{...actor,source_event_id:authorization.event_id},now);
   const run=repo.materialize("access_receipt",1,due,later,due,actor).run;
   dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
   assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/current access receipt/);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",issued_at:due,nonce:"n1"},new Date(due)),/receipt_mismatch/);
-  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date(due)).authorized,true);
+  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n2"},new Date("2026-09-05T00:02:59Z")).authorized,true);
+  assert.equal((raw.prepare("SELECT schedule_access_checked_at FROM events WHERE event_id=?").get(run.event_id) as {schedule_access_checked_at:string}).schedule_access_checked_at,due);
   assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"n3"},new Date(due)),/already_recorded/);
-  const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
-  assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).duplicate,true);
+  const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z"));
+  assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date("2026-09-05T00:03:00Z")).duplicate,true);
 });
 
 test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {
@@ -516,6 +517,7 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const payload=JSON.parse(dispatcher.get(eventId)!.payload_json) as {error_message:string};
   assert.equal(payload.error_message,"実行エラーの詳細は安全上省略されました"); assert.doesNotMatch(payload.error_message,/xoxb/);
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
   repo.create("long_failed_message",{...input,action:"work.read_only",content:objective},due,actor,now);
   const longRun=repo.materialize("long_failed_message",1,due,later,due,actor).run;
   const longJob=dispatcher.createJob({source_event_id:longRun.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
@@ -524,6 +526,7 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   const longEventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(longJob.job_id) as {notification_event_id:string}).notification_event_id;
   const longPayload=JSON.parse(dispatcher.get(longEventId)!.payload_json) as {error_message:string};
   assert.equal(Array.from(longPayload.error_message).length,2000); assert.match(longPayload.error_message,/…$/);
+  assert.equal(Array.from(dispatcher.getJob(longJob.job_id)!.last_error_message!).length,2000);
 });
 
 test("委任前current access失敗はscheduleをneeds_reviewへ固定する", () => {

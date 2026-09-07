@@ -7,7 +7,7 @@ required = false
 enabled_tools = ["list_workspaces", "list_channels", "get_channel", "check_user_channel_access", "list_users", "get_user", "get_thread", "get_reactions", "get_file", "set_agent_session_status", "post_message", "add_reaction"]
 default_tools_approval_mode = "writes"
 startup_timeout_sec = 20
-tool_timeout_sec = 60
+tool_timeout_sec = 120
 
 [mcp_servers.dona_dispatcher]
 command = "node"

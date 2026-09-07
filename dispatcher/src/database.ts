@@ -854,7 +854,7 @@ export class DispatcherDatabase {
       const target=payload.work?.authorization_target;
       if(event.source!=="dona_schedule"||event.status!=="waiting_agent"||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
         receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000) throw new Error("schedule_access_receipt_mismatch");
-      const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(at.toISOString(),eventId).changes;
+      const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(receipt.issued_at,eventId).changes;
       if(changed!==1) throw new Error("schedule_access_receipt_already_recorded");
       return {authorized:true,event_id:eventId,checked_at:at.toISOString()};
     }).immediate();
@@ -1175,8 +1175,10 @@ export class DispatcherDatabase {
     values: Record<string, string | null>,
   ): void {
     const timestamp = nowUtc();
-    const assignments = [...Object.keys(values).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
-    const params = [...Object.values(values), to, timestamp, jobId, ...from];
+    const binding=readEventJobBinding(this.db,this.getJobRequired(jobId).source_event_id),persisted={...values};
+    if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true);
+    const assignments = [...Object.keys(persisted).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
+    const params = [...Object.values(persisted), to, timestamp, jobId, ...from];
     const placeholders = from.map(() => "?").join(", ");
     const changed = this.db.prepare(
       `UPDATE jobs SET ${assignments.join(", ")} WHERE job_id = ? AND status IN (${placeholders})`,

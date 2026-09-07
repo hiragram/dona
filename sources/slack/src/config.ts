@@ -9,6 +9,12 @@ export interface SlackRuntimeConfig {
 const logLevels = new Set<SlackLogLevel>(["debug", "info", "warn", "error"]);
 const workspacePattern = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
+function expandPath(value:string):string {
+  if(value==="~") return os.homedir();
+  if(value.startsWith("~/")) return path.join(os.homedir(),value.slice(2));
+  return path.resolve(value);
+}
+
 function parseWorkspaces(value: string | undefined): string[] {
   const workspaces = value
     ?.split(",")
@@ -51,7 +57,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): SlackRu
   return {
     workspaces: parseWorkspaces(env.SLACK_WORKSPACES),
     logLevel: parseLogLevel(env.SLACK_LOG_LEVEL),
-    accessReceiptKeyPath: env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base,"update-control","dispatcher.token"),
+    accessReceiptKeyPath: expandPath(env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base,"update-control","dispatcher.token")),
   };
 }
 import os from "node:os";

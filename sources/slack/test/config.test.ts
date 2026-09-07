@@ -20,9 +20,11 @@ describe("loadRuntimeConfig", () => {
     const config = loadRuntimeConfig({
       SLACK_WORKSPACES: "company",
       SLACK_LOG_LEVEL: "DEBUG",
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: "~/receipt.key",
     });
 
     assert.equal(config.logLevel, "debug");
+    assert.equal(config.accessReceiptKeyPath,path.join(os.homedir(),"receipt.key"));
   });
 
   it("rejects a missing workspace list", () => {

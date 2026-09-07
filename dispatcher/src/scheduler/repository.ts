@@ -1012,7 +1012,8 @@ export class SchedulerRepository {
           AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=jobs.job_id AND newer.content_delete_at>?)`).run(now,now);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
-          AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'`).run(now);
+          AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=events.event_id AND newer.content_delete_at>?)`).run(now,now);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE source='dona_schedule' AND EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=events.event_id
           AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=events.event_id
