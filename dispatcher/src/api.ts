@@ -16,6 +16,7 @@ import {
   ExternalIngressProcessor,
   ExternalIngressRegistry,
   ExternalIngressTimeoutError,
+  ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   type PreparedExternalIngressAcknowledgement,
   type RawIngressRequest,
@@ -439,6 +440,8 @@ export class DispatcherApi {
         }
       } else if (error instanceof ExternalIngressAuthenticationError) {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
+      } else if (error instanceof ExternalIngressUnavailableError) {
+        sendJson(response, 503, errorBody("ingress_dependency_unavailable", "Provider ingress dependency is temporarily unavailable"));
       } else if (error instanceof ExternalIngressValidationError) {
         sendJson(response, 400, errorBody("invalid_provider_event", "Provider event is invalid"));
       } else if (error instanceof ExternalIngressAcknowledgementError) {
@@ -545,6 +548,7 @@ export class DispatcherApi {
         error instanceof ExternalIngressAuthenticationError ||
         error instanceof ExternalIngressValidationError ||
         error instanceof ExternalIngressTimeoutError ||
+        error instanceof ExternalIngressUnavailableError ||
         error instanceof ExternalIngressAcknowledgementError
       ) {
         throw error;

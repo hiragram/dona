@@ -158,7 +158,10 @@ test("verification deliveryはpending subscriptionを通常event allowlistから
     occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { verified: true },
     reply_target: null };
   assert.throws(() => db.enqueueExternal(envelope, verifyBinding), /not_authorized/);
-  assert.equal(db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true).outcome, "created");
+  const result = db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true);
+  assert.equal(result.outcome, "created");
+  assert.equal(db.get(result.row.event_id)?.status, "completed");
+  assert.equal(db.nextAvailable(), undefined);
 });
 
 test("allowlistとcredential revisionを同時bindingし変更時はfail closed", async (t) => {

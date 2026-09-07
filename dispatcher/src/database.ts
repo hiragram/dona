@@ -261,7 +261,12 @@ export class DispatcherDatabase {
       return this.enqueueProvider(envelope, owner, at, queueContext);
     }
     try {
-      return this.connections.delivery(binding, envelope, () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
+      return this.db.transaction(() => {
+        const result = this.connections.delivery(binding, envelope,
+          () => this.enqueueProvider(envelope, owner, at, queueContext), verification);
+        if (verification && result.row.status !== "completed") this.manualComplete(result.row.event_id, at);
+        return result;
+      }).immediate();
     } catch (error) {
       if (error instanceof QueueAdmissionError) this.queueMetric(error.code);
       throw error;

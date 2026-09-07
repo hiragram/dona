@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { DeliveryBinding } from "./connections/domain.js";
 import {
   ExternalIngressAuthenticationError,
+  ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   type ExternalEventSourceRegistration,
   type NormalizedExternalEvent,
@@ -69,8 +70,10 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       const verification = verificationSchema.safeParse(candidate);
       if (verification.success) {
         if (header(request, "x-notion-signature") !== undefined) throw new ExternalIngressAuthenticationError();
-        const claim = await options.verification.claim({ connectionId: options.connectionId,
-          secretRef: options.verificationSecretRef, token: Buffer.from(verification.data.verification_token) });
+        let claim: NotionVerificationClaim | undefined;
+        try { claim = await options.verification.claim({ connectionId: options.connectionId,
+          secretRef: options.verificationSecretRef, token: Buffer.from(verification.data.verification_token) }); }
+        catch { throw new ExternalIngressUnavailableError(); }
         if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
         return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,
           purpose: "verification",

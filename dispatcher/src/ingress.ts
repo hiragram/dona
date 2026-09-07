@@ -32,6 +32,9 @@ export class ExternalIngressAuthenticationError extends Error {
     this.name = "ExternalIngressAuthenticationError";
   }
 }
+export class ExternalIngressUnavailableError extends Error {
+  constructor() { super("Provider ingress dependency is unavailable"); this.name = "ExternalIngressUnavailableError"; }
+}
 
 export class ExternalIngressValidationError extends Error {
   constructor() {
@@ -354,7 +357,7 @@ export class ExternalIngressProcessor {
       });
       remainingProcessingTime(processingDeadline);
     } catch (error) {
-      if (error instanceof ExternalIngressTimeoutError) throw error;
+      if (error instanceof ExternalIngressTimeoutError || error instanceof ExternalIngressUnavailableError) throw error;
       throw new ExternalIngressAuthenticationError();
     }
 

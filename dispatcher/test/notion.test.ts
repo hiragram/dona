@@ -39,6 +39,14 @@ describe("Notion ingress", () => {
     await assert.rejects(registration.authenticate(request(Buffer.from(JSON.stringify({
       verification_token: "different-verification-token" })))));
   });
+  test("keeps verification dependency failures retryable", async () => {
+    const { registration } = setup();
+    registration.authenticate = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
+      secrets: { async get() { return undefined; } }, verification: { async claim() { throw new Error("busy"); } },
+      bindings: { async resolve() { return undefined; } } }).authenticate;
+    await assert.rejects(registration.authenticate(request(Buffer.from(JSON.stringify({
+      verification_token: "secret-verification-token" })))), /temporarily unavailable|dependency is unavailable/i);
+  });
   test("authenticates exact raw bytes and strictly normalizes an allowlisted event", async () => {
     const { registration } = setup();
     const verification = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));
