@@ -22,6 +22,7 @@ const eventSchema = z.object({
   attempt_number: z.number().int().min(1).max(8),
 });
 const verificationSchema = z.object({ verification_token: z.string().min(16).max(1024) });
+const verificationAttemptSchema = z.string().min(16).max(255).regex(/^[A-Za-z0-9_-]+$/);
 
 export interface NotionSecretStore {
   get(reference: string): Promise<Buffer | undefined>;
@@ -32,8 +33,9 @@ export interface NotionVerificationClaim {
   occurredAt: string;
 }
 export interface NotionVerificationStore {
-  // pending registration attemptだけを原子的にconsumeし、secretを未設定の場合だけ保存する。
-  claim(input: Readonly<{ connectionId: string; secretRef: string; token: Buffer }>): Promise<NotionVerificationClaim | undefined>;
+  // 推測不能なpending attemptだけを原子的にconsumeする。ACK loss時は同じattempt/tokenのreceiptを返せる。
+  claim(input: Readonly<{ connectionId: string; secretRef: string; attemptId: string;
+    token: Buffer }>): Promise<NotionVerificationClaim | undefined>;
 }
 export interface NotionBindingResolver {
   resolve(input: Readonly<{ connectionId: string; subscriptionId: string; integrationId: string;
@@ -58,6 +60,14 @@ function signatureBytes(value: string): Buffer | undefined {
   const hex = value.startsWith("sha256=") ? value.slice(7) : value;
   return /^[a-f0-9]{64}$/i.test(hex) ? Buffer.from(hex, "hex") : undefined;
 }
+function verificationAttempt(requestTarget: string): string | undefined {
+  let target: URL;
+  try { target = new URL(requestTarget, "http://localhost"); } catch { return undefined; }
+  const attempts = target.searchParams.getAll("verification_attempt");
+  if (attempts.length !== 1 || [...target.searchParams.keys()].some((key) => key !== "verification_attempt")) return undefined;
+  const parsed = verificationAttemptSchema.safeParse(attempts[0]);
+  return parsed.success ? parsed.data : undefined;
+}
 
 export function createNotionRegistration(options: NotionRegistrationOptions): ExternalEventSourceRegistration {
   return {
@@ -70,9 +80,12 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
       const verification = verificationSchema.safeParse(candidate);
       if (verification.success) {
         if (header(request, "x-notion-signature") !== undefined) throw new ExternalIngressAuthenticationError();
+        const attemptId = verificationAttempt(request.requestTarget);
+        if (!attemptId) throw new ExternalIngressAuthenticationError();
         let claim: NotionVerificationClaim | undefined;
         try { claim = await options.verification.claim({ connectionId: options.connectionId,
-          secretRef: options.verificationSecretRef, token: Buffer.from(verification.data.verification_token) }); }
+          secretRef: options.verificationSecretRef, attemptId,
+          token: Buffer.from(verification.data.verification_token) }); }
         catch { throw new ExternalIngressUnavailableError(); }
         if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
         return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,

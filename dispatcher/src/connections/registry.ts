@@ -310,7 +310,7 @@ export class ConnectionRegistry {
       const replacement = stopping ? this.subscriptions(c.id).filter((candidate) => candidate.resource === binding.resource &&
         candidate.generation > binding.generation && candidate.revision === c.revision && candidate.verifiedAt !== null &&
         ["active","expiring"].includes(candidate.state) && (candidate.expiresAt === null || candidate.expiresAt > now)).at(-1) : undefined;
-      const deliverableState = verification ? s.state === "verification_pending" :
+      const deliverableState = verification ? ["verification_pending", "active"].includes(s.state) :
         ["active","expiring","stop_candidate"].includes(s.state) || (s.state==="renewal_unknown"&&!!replacement);
       if (s.revision !== c.revision || (!verification && s.verifiedAt === null) || !deliverableState ||
         (s.expiresAt !== null && s.expiresAt <= now)) throw new ConnectionError("not_authorized");

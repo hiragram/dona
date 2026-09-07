@@ -169,6 +169,12 @@ test("verification deliveryはpending subscriptionを通常event allowlist・que
     const bucket = raw.prepare("SELECT tokens FROM queue_sources WHERE source=?").get(source) as { tokens: number };
     assert.equal(bucket.tokens, db.queuePolicy.defaults.burst);
   } finally { raw.close(); }
+  db.connections.observe("verify", 1, "folder1", 1,
+    { providerId: "subscription1", expiresAt: null, verified: true, cutoverConfirmed: false });
+  assert.equal(db.connections.get("verify").state, "active");
+  const replay = db.enqueueExternal(envelope, verifyBinding, undefined, new Date(), undefined, true);
+  assert.equal(replay.outcome, "duplicate_same");
+  assert.equal(replay.row.event_id, result.row.event_id);
   assert.equal(db.nextAvailable(), undefined);
 });
 

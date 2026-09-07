@@ -4,18 +4,21 @@ import { describe, test } from "node:test";
 import { createNotionRegistration, fetchLatestNotionState } from "../src/notion.js";
 
 const receivedAt = "2026-09-07T00:00:00.000Z";
+const verificationAttempt = "attempt_01M1WK_NOTION";
 const body = Buffer.from(JSON.stringify({ id: "evt_1", timestamp: receivedAt, workspace_id: "ws_1",
   subscription_id: "sub_1", integration_id: "int_1", type: "page.content_updated",
   entity: { id: "page_1", type: "page" }, attempt_number: 8 }));
 function request(payload: Buffer, signature?: string) { return { body: payload,
   headers: signature ? [["x-notion-signature", signature] as const] : [], method: "POST" as const,
-  requestTarget: "/v1/ingress/notion", receivedAt }; }
+  requestTarget: payload.includes(Buffer.from("verification_token"))
+    ? `/v1/ingress/notion?verification_attempt=${verificationAttempt}` : "/v1/ingress/notion", receivedAt }; }
 function setup() {
   let secret: Buffer | undefined;
   let pending = true;
   const registration = createNotionRegistration({ connectionId: "notion_test", verificationSecretRef: "cred_notion_verify",
     secrets: { async get() { return secret; } },
     verification: { async claim(input) {
+      if (input.attemptId !== verificationAttempt) return undefined;
       if (!pending && !secret?.equals(input.token)) return undefined;
       pending = false; secret ??= Buffer.from(input.token);
       return { binding: { connectionId: "notion_test", account: "ws_1", revision: 1, credentialRevision: 1,
@@ -36,6 +39,10 @@ describe("Notion ingress", () => {
     assert.equal(secret()?.toString(), "secret-verification-token");
     assert.equal(JSON.stringify(normalized).includes("secret-verification-token"), false);
     assert.equal(principal.connection?.resource, "page_1");
+    const unbound = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));
+    await assert.rejects(registration.authenticate({ ...unbound, requestTarget: "/v1/ingress/notion" }));
+    await assert.rejects(registration.authenticate({ ...unbound,
+      requestTarget: "/v1/ingress/notion?verification_attempt=wrong_attempt_value" }));
     await assert.rejects(registration.authenticate(request(Buffer.from(JSON.stringify({
       verification_token: "different-verification-token" })))));
   });
