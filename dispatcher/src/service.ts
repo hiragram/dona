@@ -21,7 +21,8 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
     ...config.githubPilot,
     async resolveBinding() {
       const connection = database.connections.get(config.githubPilot!.connectionId);
-      if (connection.provider !== "github" || connection.state !== "active") throw new Error("GitHub connection is not active");
+      if (connection.provider !== "github" || connection.state !== "active" ||
+        connection.account !== `installation:${config.githubPilot!.installationId}`) throw new Error("GitHub connection is not active");
       const resource = String(config.githubPilot!.repositoryId);
       const subscription = database.connections.subscriptions(connection.id).filter(candidate =>
         candidate.resource === resource && candidate.revision === connection.revision && candidate.verifiedAt !== null &&

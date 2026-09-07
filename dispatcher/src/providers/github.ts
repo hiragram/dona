@@ -63,8 +63,10 @@ function principal(verified: VerifiedIngressPrincipal): GitHubPrincipal {
 }
 
 export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEventSourceRegistration {
+  const configuredEvents = Object.keys(config.events);
   if (!Number.isSafeInteger(config.installationId) || config.installationId <= 0 ||
-      !Number.isSafeInteger(config.repositoryId) || config.repositoryId <= 0 || config.repositoryFullName.length < 3) {
+      !Number.isSafeInteger(config.repositoryId) || config.repositoryId <= 0 || config.repositoryFullName.length < 3 ||
+      configuredEvents.length !== 1 || configuredEvents[0] !== "issues" || !config.events.issues?.length) {
     throw new Error("GitHub pilot repository allowlist is invalid");
   }
   return {
@@ -139,7 +141,8 @@ export class GitHubReadOnlyInstallationClient {
     private readonly tokens: GitHubInstallationTokenProvider,
     private readonly fetchImpl: typeof fetch = fetch,
   ) {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repositoryFullName)) {
+    const segments = repositoryFullName.split("/");
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repositoryFullName) || segments.some(segment => segment === "." || segment === "..")) {
       throw new Error("GitHub repository allowlist is invalid");
     }
   }

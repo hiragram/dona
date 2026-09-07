@@ -103,6 +103,11 @@ describe("GitHub provider pilot", () => {
     assert.equal(calls[0]?.init?.method, "GET");
     await assert.rejects(client.get("/../other/repo"));
     await assert.rejects(client.get("/%2e%2e/%2e%2e/installation/repositories"));
+    assert.throws(() => new GitHubReadOnlyInstallationClient("../installation", { token: async () => "test-token" }));
+    assert.throws(() => githubPilotRegistration({ connectionId: "github-pilot", installationId: 77, repositoryId: 42,
+      repositoryFullName: "hiragram/dona", events: { pull_request: ["opened"] },
+      resolveBinding: async () => ({ account: "installation:77", revision: 1, credentialRevision: 1, generation: 1 }),
+      resolveWebhookSecret: async () => Buffer.from(secretText) }));
   });
 
   test("serve起動用registryへconfigとcurrent subscription generationを接続する", async () => {
@@ -127,6 +132,23 @@ describe("GitHub provider pilot", () => {
     const verified = await registered.authenticate({ body: payload, method: "POST", requestTarget: "/", receivedAt: "2026-09-07T00:00:00Z",
       headers: [["X-GitHub-Delivery", delivery], ["X-GitHub-Event", "issues"], ["X-Hub-Signature-256", signature()]] });
     assert.equal(verified.connection?.generation, 2);
+    database.close();
+  });
+
+  test("connection accountが設定したinstallationと異なる場合は起動bindingを拒否する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const secretPath = `${root}/github-webhook-secret`; await fs.writeFile(secretPath, secretText, { mode: 0o600 });
+    config.githubPilot = { connectionId: "github-pilot", installationId: 77, repositoryId: 42,
+      repositoryFullName: "hiragram/dona", events: { issues: ["opened"] }, webhookSecretPath: secretPath };
+    const database = new DispatcherDatabase(config.databasePath);
+    database.connections.register({ id: "github-pilot", provider: "github", account: "installation:88",
+      allowlist: [{ resource: "42", events: ["issues.opened"] }], credentialRef: "cred_github_pilot", credentialRevision: 1,
+      capability: { kind: "manual", cursor: false } });
+    database.connections.attachManual("github-pilot", 1, "42", "hook:1", null);
+    database.connections.observe("github-pilot", 1, "42", 1, { providerId: "hook:1", expiresAt: null, verified: true, cutoverConfirmed: false });
+    const registered = serviceExternalIngressRegistry(config, database).get("github")!.registration;
+    await assert.rejects(registered.authenticate({ body: payload, method: "POST", requestTarget: "/", receivedAt: "2026-09-07T00:00:00Z",
+      headers: [["X-GitHub-Delivery", delivery], ["X-GitHub-Event", "issues"], ["X-Hub-Signature-256", signature()]] }));
     database.close();
   });
 });
