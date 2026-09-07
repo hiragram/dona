@@ -608,6 +608,9 @@ export class DispatcherDatabase {
     if (binding?.owner.kind === "schedule") {
       validateWorkResultEnvelope(stableStringify(result));
       validateWorkResultContent(renderJobResult(result as unknown as Record<string,unknown>));
+      const hasWriteAction=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+        typeof (action as Record<string,unknown>).tool==="string"&&/(?:post|send|create|update|delete|edit|write|cancel|steer|apply|merge|close|react)/i.test(String((action as Record<string,unknown>).tool)));
+      if(hasWriteAction) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
     const completedAt = new Date(result.completed_at);
@@ -790,6 +793,7 @@ export class DispatcherDatabase {
 
   private safeNotificationError(message:string,scheduled:boolean):string {
     if(!scheduled) return message;
+    if(/\/(?:Users|home|var|tmp|private)\//.test(message)) return "実行エラーの詳細は安全上省略されました";
     try { return projectWorkResultContent(message); }
     catch { return "実行エラーの詳細は安全上省略されました"; }
   }
@@ -1053,7 +1057,7 @@ export class DispatcherDatabase {
       .run(code, message, at.toISOString(), eventId);
   }
 
-  private notificationDelivered(eventId:string,result:ResultEnvelope):{delivered:boolean;runId?:string} {
+  private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date):{delivered:boolean;runId?:string} {
     const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
@@ -1064,12 +1068,12 @@ export class DispatcherDatabase {
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.access_receipt_verified===true&&value.event_id===eventId);
-    const withinDeadline=Date.parse(result.completed_at)<=Date.parse(completion.materialized_at)+900_000;
+    const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     return {delivered:withinDeadline&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&posts.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
-  saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
-    if(Date.parse(result.completed_at)>Date.now()) throw new Error("completed_at_is_in_the_future");
+  saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
+    if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
@@ -1088,20 +1092,20 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
-      const delivery=this.notificationDelivered(eventId,result);
+      const delivery=this.notificationDelivered(eventId,result,acceptedAt);
       if(delivery.runId) {
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
   }
 
-  saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string): void {
-    if(Date.parse(result.completed_at)>Date.now()) throw new Error("completed_at_is_in_the_future");
+  saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
+    if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&event.last_error_code==="schedule_notification_suppressed") return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
-      const delivery=this.notificationDelivered(eventId,result);
+      const delivery=this.notificationDelivered(eventId,result,acceptedAt);
       if(delivery.delivered) {
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
         this.setNotificationState(eventId,"accepted",new Date(result.completed_at));return;
@@ -1136,7 +1140,8 @@ export class DispatcherDatabase {
           UPDATE events SET status = 'queued', attempt_count = 0, available_at = ?,
             dispatch_started_at = NULL, prompt_accepted_at = NULL, completed_at = NULL,
             result_json = NULL, result_path = NULL, last_error_code = NULL,
-            last_error_message = NULL, updated_at = ? WHERE event_id = ?
+            last_error_message = NULL, schedule_access_checked_at = NULL,
+            schedule_access_consumed_at = NULL, updated_at = ? WHERE event_id = ?
         `).run(at.toISOString(), at.toISOString(), eventId);
         this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
       }).immediate();
@@ -1201,13 +1206,15 @@ export class DispatcherDatabase {
 
   manualDeadLetter(eventId: string, at = new Date()): EventRow {
     this.getRequired(eventId);
-    this.db
-      .prepare(`
+    this.db.transaction(()=>{
+      this.db.prepare(`
         UPDATE events SET status = 'dead_letter', last_error_code = 'operator_dead_letter',
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
-    this.setNotificationState(eventId,"failed",at);
+      this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      this.setNotificationState(eventId,"failed",at);
+    }).immediate();
     return this.getRequired(eventId);
   }
 
