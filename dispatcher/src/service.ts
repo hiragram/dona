@@ -50,8 +50,12 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
   if (config.notionPilot) {
     const pilot = config.notionPilot;
     const notionConnection = database.connections.get(pilot.connectionId);
+    if (notionConnection.provider !== "notion") throw new Error("Notion pilot connection must use the notion provider");
     if (notionConnection.credentialRef === pilot.verificationCredentialRef) {
       throw new Error("Notion verification credential reference must be separate from the integration credential");
+    }
+    if (database.connections.subscriptions(pilot.connectionId).length > 1) {
+      throw new Error("Notion pilot supports exactly one webhook subscription per connection");
     }
     const secrets = new PrivateFileSecretStore(pilot.secretStoreRoot);
     registrations.push(createNotionRegistration({ connectionId: pilot.connectionId,
@@ -127,7 +131,7 @@ export async function runService(
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
   const worker = new DispatcherWorker(database, herdr, config, workerLogger, config.notionPilot ? { async fetch(row, signal) {
-    if (row.source !== "notion") return { outcome: "degraded" };
+    if (row.source !== "notion") return { outcome: "not_configured" };
     const subject = JSON.parse(row.subject_json) as Record<string, unknown>;
     if (subject.connection_id !== config.notionPilot!.connectionId || typeof subject.entity_id !== "string" ||
       !["page", "database", "data_source"].includes(String(subject.entity_type))) return { outcome: "degraded" };

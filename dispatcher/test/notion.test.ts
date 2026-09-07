@@ -89,6 +89,19 @@ describe("Notion ingress", () => {
       credentialRef: "cred_shared", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
     assert.throws(() => serviceExternalIngressRegistry(config, database), /must be separate/);
   });
+  test("Notion pilotはprovider不一致と複数subscriptionを起動時に拒否する", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-topology-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
+      DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+    const database = new DispatcherDatabase(config.databasePath);
+    t.after(() => database.close());
+    database.connections.register({ id: "notion_test", provider: "github", account: "ws_1",
+      allowlist: [{ resource: "page_1", events: ["page.content_updated"] }],
+      credentialRef: "cred_integration", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
+    assert.throws(() => serviceExternalIngressRegistry(config, database), /notion provider/);
+  });
   test("verification token is stored but omitted from the normalized event", async () => {
     const { registration, secret } = setup();
     const raw = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));
