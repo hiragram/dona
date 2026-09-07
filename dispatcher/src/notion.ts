@@ -166,7 +166,7 @@ function preview(value: unknown, maxBytes: number): { text: string; truncated: b
     for (let offset = 0; offset < value.length; offset += 1) {
       const index = offset % 2 === 0 ? offset / 2 : value.length - 1 - Math.floor(offset / 2);
       const candidate = [...selected, value[index]];
-      if (Buffer.byteLength(JSON.stringify(candidate)) > maxBytes) break;
+      if (Buffer.byteLength(JSON.stringify(candidate)) > maxBytes) continue;
       selected.push(value[index]);
     }
     return { text: JSON.stringify(selected), truncated: true };
