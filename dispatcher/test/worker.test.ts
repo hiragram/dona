@@ -281,6 +281,31 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 
+  test("latest-state fetcher不在時はrequires_fetch signalをagentへ送らない", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await fs.mkdir(config.resultsDir, { recursive: true });
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue({ ...eventEnvelope("provider-without-fetcher"), source: externalEventSource("fake") }, new Date(), {
+      connectionId: "provider-connection",
+      coalesce: { resourceKey: "resource", signalKey: "changed", requiresFetch: true },
+    }).row;
+    let prompts = 0;
+    const herdr: HerdrClient = {
+      async get() { return ok("idle"); },
+      async prompt() { prompts += 1; return ok("working"); },
+      async wait() { throw new Error("must not wait"); },
+    };
+    const worker = new DispatcherWorker(database, herdr, config, logger);
+    worker.start();
+    await waitFor(() => database.get(event.event_id)?.status === "needs_review");
+    await worker.stop();
+    assert.equal(prompts, 0);
+    assert.equal(database.get(event.event_id)?.last_error_code, "provider_fetcher_unavailable");
+    assert.equal(database.queueDispatchMetadata(event.event_id).requires_fetch, true);
+    database.close();
+  });
+
   test("publishes result paths only inside the configured results directory", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

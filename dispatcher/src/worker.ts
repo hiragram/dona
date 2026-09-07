@@ -180,6 +180,12 @@ export class DispatcherWorker {
     const metadata = this.database.queueDispatchMetadata(row.event_id);
     const dispatching = this.tryClaim(row.event_id, resultPath, metadata.requires_fetch && this.stateFetcher !== undefined);
     if (!dispatching) return;
+    if (metadata.requires_fetch && !this.stateFetcher) {
+      this.database.markNeedsReview(row.event_id, "provider_fetcher_unavailable",
+        "Provider latest-state fetcher is not configured; the signal was not submitted");
+      this.logCurrentTransition(dispatching, started);
+      return;
+    }
     let fetched = "", fetchedSuccessfully = false;
     if (metadata.requires_fetch && this.stateFetcher) {
       try {
