@@ -385,6 +385,9 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(repo.get("cancel_job")?.state,"cancelled");
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation().some(row=>row.job_id===job.job_id),false);
+  assert.equal(dispatcher.listAmbiguousScheduledJobs().some(row=>row.job_id===job.job_id),true);
+  dispatcher.settleAmbiguousCancellation(job.job_id,"停止確認済み",new Date(due));
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"cancelled");
   assert.equal(raw.prepare("SELECT 1 FROM connector_outbox WHERE run_id=?").get(run.run_id),undefined);
 
   repo.create("expiry_job", { ...input, action:"work.read_only",target:{kind:"none"},content:objective,

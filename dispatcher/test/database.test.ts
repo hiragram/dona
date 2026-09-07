@@ -68,8 +68,11 @@ describe("DispatcherDatabase", () => {
     const event = database.enqueue(eventEnvelope("Ev-1")).row;
     database.beginDispatch(event.event_id, `${config.resultsDir}/${event.event_id}.json`);
     database.markNeedsReview(event.event_id, "prompt_timeout", "unknown acceptance");
+    await fs.mkdir(config.resultsDir,{recursive:true});
+    await fs.writeFile(`${config.resultsDir}/${event.event_id}.json`,"old result");
     assert.throws(() => database.manualRetry(event.event_id, false), /--force/);
     assert.equal(database.manualRetry(event.event_id, true).status, "queued");
+    await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json`));
     database.close();
   });
 

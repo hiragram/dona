@@ -419,8 +419,12 @@ export class DispatcherDatabase {
 
   listAmbiguousScheduledJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted')
+      WHERE j.status='needs_review' AND j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown')
         AND json_extract(b.owner_json,'$.kind')='schedule' ORDER BY j.updated_at,j.job_id`).all() as JobRow[];
+  }
+
+  settleAmbiguousCancellation(jobId:string,reason:string,at=new Date()):void {
+    this.updateJob(jobId,["needs_review"],"cancelled",{completed_at:at.toISOString(),last_error_code:"cancelled",last_error_message:reason});
   }
 
   listScheduledJobsRequiringCancellation(at = new Date()): JobRow[] {
@@ -1049,6 +1053,7 @@ export class DispatcherDatabase {
     if (!["blocked", "needs_review", "dead_letter", "retryable_failed"].includes(row.status)) {
       throw new Error(`Event in status ${row.status} cannot be retried`);
     }
+    if(row.result_path) fs.rmSync(row.result_path,{force:true});
     this.db.transaction(()=>{
       this.db.prepare(`
         UPDATE events SET status = 'queued', attempt_count = 0, available_at = ?,

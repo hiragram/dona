@@ -203,7 +203,15 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      for(const job of this.database.listAmbiguousScheduledJobs()) await this.tryComplete(job,false);
+      for(const job of this.database.listAmbiguousScheduledJobs()) {
+        if(await this.tryComplete(job,false)) continue;
+        if(!["cancel_acceptance_unknown","cancel_exit_unknown"].includes(job.last_error_code??"")) continue;
+        const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+        if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+          (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
+          this.database.settleAmbiguousCancellation(job.job_id,"Agent termination was confirmed after ambiguous cancellation");
+        }
+      }
       for (const job of this.database.listScheduledJobsRequiringCancellation()) {
         await this.tryComplete(job,false);
         const current=this.database.getJob(job.job_id);
