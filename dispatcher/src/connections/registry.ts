@@ -147,6 +147,9 @@ export class ConnectionRegistry {
   beginVerification(id: string, revision: number, resource: string, generation: number): Subscription {
     return this.db.transaction(() => {
       this.assertVerifiable(id, revision, resource, generation);
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND resource=? AND generation=? AND status='dispatching' LIMIT 1`)
+        .get(id, revision, resource, generation)) throw new ConnectionError("operation_pending");
       const now = this.tick(id);
       this.db.prepare(`UPDATE connection_subscriptions SET state='verification_pending',verified_at=NULL,
         verification_epoch=verification_epoch+1,last_reconcile_at=?,error=NULL

@@ -63,14 +63,15 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
       throw new Error("Notion pilot supports exactly one webhook provider ID per connection");
     }
     const secrets = new PrivateFileSecretStore(pilot.secretStoreRoot);
-    const verificationRevision = (epoch: number) => epoch + 1;
+    const verificationReference = (binding: { delivery: { revision: number; generation: number }; verificationEpoch: number }) =>
+      `cred_notion_${createHash("sha256").update(`${pilot.verificationCredentialRef}\0${binding.delivery.revision}\0${binding.delivery.generation}\0${binding.verificationEpoch}`).digest("hex")}`;
     registrations.push(createNotionRegistration({ connectionId: pilot.connectionId,
       verificationSecretRef: pilot.verificationCredentialRef,
       secrets: { async get(_reference, event) {
         const connection = database.connections.get(pilot.connectionId);
         const binding = database.providerRegistration.resolve({ provider: "notion", providerId: event.subscriptionId,
           connectionId: pilot.connectionId, account: event.workspaceId, resource: event.resourceId });
-        return { secret: await secrets.read(pilot.verificationCredentialRef, verificationRevision(binding.verificationEpoch)),
+        return { secret: await secrets.read(verificationReference(binding), 1),
           credentialRevision: connection.credentialRevision };
       } },
       verification: { async claim(input) {
@@ -83,7 +84,7 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
           undefined, expected.verificationEpoch);
         const eventId = `verification:${createHash("sha256").update(input.attemptId).digest("hex")}`;
         if (snapshot.state === "consumed") {
-          const stored = await secrets.read(pilot.verificationCredentialRef, verificationRevision(expected.verificationEpoch));
+          const stored = await secrets.read(verificationReference(expected), 1);
           const supplied = Buffer.from(input.token);
           const matches = stored.length === supplied.length && timingSafeEqual(stored, supplied);
           stored.fill(0); supplied.fill(0);
@@ -91,10 +92,9 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
             occurredAt: new Date(snapshot.createdAt).toISOString() } : undefined;
         }
         const claim = database.providerRegistration.claim(input.attemptId, expected, 30_000);
-        try { await secrets.write(pilot.verificationCredentialRef, verificationRevision(expected.verificationEpoch), input.token); }
+        try { await secrets.write(verificationReference(expected), 1, input.token); }
         catch {
-          const reconciled = await secrets.reconcile(pilot.verificationCredentialRef,
-            verificationRevision(expected.verificationEpoch), input.token).catch(() => false);
+          const reconciled = await secrets.reconcile(verificationReference(expected), 1, input.token).catch(() => false);
           if (!reconciled) throw new Error("Notion verification secret is unavailable");
         }
         const consumed = database.providerRegistration.consume(input.attemptId, claim.claimId, activate);
@@ -201,7 +201,7 @@ export async function runService(
         };
         const children = await readChildren(resourceId, 0);
         if (!Array.isArray(children)) return children.failure;
-        const propertyItems: Record<string, unknown[]> = {};
+        const propertyItems: Record<string, unknown> = {};
         const properties = resource.value?.properties;
         if (properties && typeof properties === "object") {
           for (const property of Object.values(properties as Record<string, unknown>)) {
@@ -212,6 +212,7 @@ export async function runService(
             try { propertyPathId = encodeURIComponent(decodeURIComponent(propertyId)); }
             catch { propertyPathId = encodeURIComponent(propertyId); }
             const items: unknown[] = [];
+            let propertyItem: unknown;
             let cursor: string | undefined;
             do {
               if (requests >= 100) { truncated = true; break; }
@@ -222,12 +223,13 @@ export async function runService(
               const page = await request(url.toString());
               if (page.status === 404) { truncated = true; break; }
               if (page.status !== 200 || !page.value) return page;
+              if (page.value.property_item !== undefined) propertyItem = page.value.property_item;
               if (Array.isArray(page.value.results)) items.push(...page.value.results);
               else items.push(page.value);
               cursor = page.value.has_more === true && typeof page.value.next_cursor === "string"
                 ? page.value.next_cursor : undefined;
             } while (cursor);
-            propertyItems[propertyId] = items;
+            propertyItems[propertyId] = propertyItem === undefined ? items : { results: items, property_item: propertyItem };
           }
         }
         return { ...resource, value: { ...resource.value, children, property_items: propertyItems,
