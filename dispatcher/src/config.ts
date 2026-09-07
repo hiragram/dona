@@ -100,10 +100,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     return { connectionId: parsed.connectionId, integrationId: parsed.integrationId,
       verificationCredentialRef: parsed.verificationCredentialRef, secretStoreRoot: expandHome(parsed.secretStoreRoot) };
   })();
+  const queuePolicy = queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}"));
+  if (notionPilot && queuePolicy.sources.notion === undefined) {
+    queuePolicy.sources.notion = { ...queuePolicy.defaults, coalescing: true };
+  }
   return {
     ...(githubPilot === undefined ? {} : { githubPilot }),
     ...(notionPilot === undefined ? {} : { notionPilot }),
-    queuePolicy: queuePolicySchema.parse(JSON.parse(env.DONA_QUEUE_POLICY ?? "{}")),
+    queuePolicy,
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),
     resultsDir: expandHome(env.DONA_RESULTS_DIR ?? path.join(base, "results")),

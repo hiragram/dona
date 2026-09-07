@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { DeliveryBinding } from "./connections/domain.js";
+import { ConnectionError } from "./connections/domain.js";
 import {
   ExternalIngressAuthenticationError,
   ExternalIngressUnavailableError,
@@ -86,7 +87,11 @@ export function createNotionRegistration(options: NotionRegistrationOptions): Ex
         try { claim = await options.verification.claim({ connectionId: options.connectionId,
           secretRef: options.verificationSecretRef, attemptId,
           token: Buffer.from(verification.data.verification_token) }); }
-        catch { throw new ExternalIngressUnavailableError(); }
+        catch (error) {
+          if (error instanceof ConnectionError && ["invalid_input", "not_authorized", "disabled", "revision_conflict"].includes(error.code))
+            throw new ExternalIngressAuthenticationError();
+          throw new ExternalIngressUnavailableError();
+        }
         if (!claim || claim.binding.connectionId !== options.connectionId) throw new ExternalIngressAuthenticationError();
         return { connectionId: options.connectionId, connection: claim.binding, resourceId: claim.binding.resource,
           purpose: "verification",

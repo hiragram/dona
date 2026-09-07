@@ -118,7 +118,7 @@ export async function runService(
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger, config.notionPilot ? { async fetch(row) {
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger, config.notionPilot ? { async fetch(row, signal) {
     if (row.source !== "notion") return { outcome: "degraded" };
     const subject = JSON.parse(row.subject_json) as Record<string, unknown>;
     if (subject.connection_id !== config.notionPilot!.connectionId || typeof subject.entity_id !== "string" ||
@@ -130,7 +130,8 @@ export async function runService(
       const kind = subject.entity_type === "page" ? "pages" : subject.entity_type === "database" ? "databases" : "data_sources";
       return fetchLatestNotionState({ async fetch(resourceId) {
         const response = await fetch(`https://api.notion.com/v1/${kind}/${encodeURIComponent(resourceId)}`, {
-          method: "GET", headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
+          method: "GET", signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+          headers: { authorization: `Bearer ${token.toString("utf8")}`, "notion-version": "2025-09-03" } });
         const retry = response.headers.get("retry-after");
         return { status: response.status, ...(retry === null ? {} : { retryAfter: Number(retry) }),
           ...(response.ok ? { value: await response.json() as Record<string, unknown> } : {}) };

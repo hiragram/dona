@@ -1052,12 +1052,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  recordSafePromptFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date()): EventRow {
+  recordSafePromptFailure(eventId: string, code: string, message: string, maxAttempts: number, at = new Date(), minimumDelayMs = 0): EventRow {
     return this.db.transaction(() => {
       const row = this.get(eventId);
       if (!row || row.status !== "dispatching") throw new Error(`Event ${eventId} is not dispatching`);
       const status: EventStatus = row.attempt_count >= maxAttempts ? "dead_letter" : "retryable_failed";
-      const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(row.attempt_count, at);
+      const normalRetryAt = retryAt(row.attempt_count, at);
+      const availableAt = status === "dead_letter" ? at.toISOString() : new Date(Math.max(Date.parse(normalRetryAt), at.getTime() + minimumDelayMs)).toISOString();
       this.db
         .prepare(`
           UPDATE events SET status = ?, available_at = ?, last_error_code = ?,
