@@ -281,6 +281,17 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
   assert.equal(repo.get("notify_work")?.state,"completed");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
+  raw.prepare("UPDATE job_completion_results SET job_status='needs_review',notification_state='needs_review' WHERE job_id=?").run(job.job_id);
+  dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
+  ],completed_at:due},notificationPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  raw.prepare("UPDATE job_completion_results SET job_status='completed' WHERE job_id=?").run(job.job_id);
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
@@ -394,6 +405,22 @@ test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   raw.prepare("UPDATE events SET status='needs_review' WHERE event_id=?").run(eventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
   assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
+});
+
+test("preflight中にblockedとなった通知をschedule取消で抑止する", () => {
+  const {repo,dispatcher,raw,filename}=setup(); const objective="通知取消";
+  repo.create("notify_preflight_cancel",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_preflight_cancel",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
+  dispatcher.authorizeJobNotification(eventId,new Date(due));
+  dispatcher.markBlocked(eventId,"承認待ち",["dispatching","waiting_agent"]);
+  repo.transition("notify_preflight_cancel",1,"cancel",actor,"2026-09-05T00:01:01Z");
+  assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}).notification_state,"none");
 });
 
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
@@ -644,6 +671,9 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
   raw.prepare("UPDATE jobs SET status='running',last_error_message=NULL WHERE job_id=?").run(job.job_id);
   dispatcher.markJobNeedsReview(job.job_id,"runtime_failed","EACCES: /Users/example/.dona/workspaces/private");
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
+  raw.prepare("UPDATE jobs SET status='running',workspace_path='/workspace/jobs/arbitrary',last_error_message=NULL WHERE job_id=?").run(job.job_id);
+  dispatcher.markJobNeedsReview(job.job_id,"runtime_failed","EACCES: /workspace/jobs/arbitrary/result");
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
   repo.create("long_failed_message",{...input,action:"work.read_only",content:objective},due,actor,now);
   const longRun=repo.materialize("long_failed_message",1,due,later,due,actor).run;

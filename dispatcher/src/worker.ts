@@ -180,7 +180,7 @@ export class DispatcherWorker {
     }
     if (!prompted.ok) {
       if (prompted.errorCode === "agent_blocked") {
-        this.database.markBlocked(row.event_id, commandMessage(prompted), ["dispatching"]);
+        this.database.markBlocked(row.event_id, commandMessage(prompted), ["dispatching","waiting_agent"]);
       } else if (["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
         const updated = this.database.recordSafePromptFailure(
           row.event_id,

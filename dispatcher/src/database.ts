@@ -783,7 +783,7 @@ export class DispatcherDatabase {
               summary:projectWorkResultContent(renderJobResult(result)),completed_at:result.completed_at}
           : result } : {}),
         ...(job.last_error_code ? { error_code: job.last_error_code } : {}),
-        ...(job.last_error_message ? { error_message: this.safeNotificationError(job.last_error_message,binding.owner.kind==="schedule") } : {}),
+        ...(job.last_error_message ? { error_message: this.safeNotificationError(job.last_error_message,binding.owner.kind==="schedule",job) } : {}),
       },
           reply_target: binding.destination.kind==="slack"?binding.destination.target:binding.destination,
       trace: { job_id: job.job_id, source_event_id: job.source_event_id },
@@ -796,9 +796,9 @@ export class DispatcherDatabase {
     return enqueued;
   }
 
-  private safeNotificationError(message:string,scheduled:boolean):string {
+  private safeNotificationError(message:string,scheduled:boolean,job?:JobRow):string {
     if(!scheduled) return message;
-    if(/\/(?:Users|home|var|tmp|private)\//.test(message)) return "実行エラーの詳細は安全上省略されました";
+    if(/\/(?:Users|home|var|tmp|private)\//.test(message)||job&&(message.includes(job.workspace_path)||message.includes(path.dirname(job.result_path)))) return "実行エラーの詳細は安全上省略されました";
     try { return projectWorkResultContent(message); }
     catch { return "実行エラーの詳細は安全上省略されました"; }
   }
@@ -1067,7 +1067,7 @@ export class DispatcherDatabase {
   }
 
   private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date):{delivered:boolean;runId?:string} {
-    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
+    const completion=this.db.prepare("SELECT job_status,owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
@@ -1080,7 +1080,8 @@ export class DispatcherDatabase {
     const allowedActions=actions.every(({value})=>{
       if(["dona_dispatcher.authorize_job_notification","dona_slack.check_user_channel_access","dona_slack.post_message"].includes(String(value.tool))) return true;
       return value.tool==="dona_slack.set_agent_session_status"&&value.channel_id===target?.channel_id&&
-        (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&["processing","active"].includes(String(value.status));
+        (target?.kind==="thread"?value.thread_ts===target.thread_ts:value.thread_ts===undefined)&&
+        (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:["processing","active"]).includes(String(value.status));
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
@@ -1259,7 +1260,8 @@ export class DispatcherDatabase {
   ): void {
     const timestamp = nowUtc();
     const binding=readEventJobBinding(this.db,this.getJobRequired(jobId).source_event_id),persisted={...values};
-    if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true);
+    const job=this.getJobRequired(jobId);
+    if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true,job);
     const assignments = [...Object.keys(persisted).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
     const params = [...Object.values(persisted), to, timestamp, jobId, ...from];
     const placeholders = from.map(() => "?").join(", ");

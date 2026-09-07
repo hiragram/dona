@@ -367,7 +367,7 @@ export class SchedulerRepository {
     return this.db.transaction(() => {
       const before = this.checked(scheduleId, expectedRevision, actor, operation === "resume");
       if(this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-        WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_event_id IS NOT NULL LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
+        WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase='write' AND c.notification_event_id IS NOT NULL LIMIT 1`).get(scheduleId)) throw new Error("reconcile_required");
       if ((operation === "pause" && before.state !== "active") || (operation === "resume" && before.state !== "paused") ||
           (operation === "cancel" && ["cancelled", "completed"].includes(before.state))) throw new Error("invalid_transition");
       const old = this.revision(before);
@@ -380,6 +380,15 @@ export class SchedulerRepository {
         ...runs.flatMap(row => [row.created_at, row.started_at ?? row.created_at, row.terminal_at ?? row.created_at]),
         ...outboxes.flatMap(row => [row.created_at, row.updated_at, row.request_started_at ?? row.created_at,
           row.terminal_at ?? row.created_at, row.lease_until ?? row.created_at])].sort().at(-1)!;
+      if(operation!=="resume") {
+        this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',last_error_message=NULL
+          WHERE event_id IN (SELECT c.notification_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+            WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase IN ('none','preflight'))
+          AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`).run(transitionAt,transitionAt,scheduleId);
+        this.db.prepare(`UPDATE job_completion_results SET notification_state='none' WHERE rowid IN
+          (SELECT c.rowid FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+            WHERE r.schedule_id=? AND c.notification_state='needs_review' AND c.notification_authorization_phase IN ('none','preflight'))`).run(scheduleId);
+      }
       // A claim lease is a future fencing deadline, not the wall clock at which this operation occurs.
       // Keep transitionAt monotonic for persisted timestamps, but evaluate authorization lifetime at now.
       if (operation === "resume" && (old.terminal_at !== null || old.expires_at <= now || old.content === null || (old.content_delete_at !== null && old.content_delete_at <= now))) throw new Error("authorization_expired");
