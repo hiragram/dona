@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import type { DispatcherDatabase } from "../database.js";
 import { ConnectionError, type DeliveryBinding } from "../connections/domain.js";
@@ -101,8 +102,12 @@ export interface DriveAllowlist {
 export type DriveFeed = { readonly kind: "user" } | { readonly kind: "drive"; readonly driveId: string };
 
 function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): string {
-  // zodのstrict parse後の固定field順を署名し、同時刻の異なるchangeを衝突させない。
-  return createHash("sha256").update(JSON.stringify(change)).digest("hex");
+  const canonical = { fileId: change.fileId, removed: change.removed ?? false, changeType: change.changeType,
+    time: change.time, driveId: change.driveId ?? null, file: change.file === undefined ? null : {
+      id: change.file.id, name: change.file.name ?? null, mimeType: change.file.mimeType ?? null,
+      parents: [...(change.file.parents ?? [])].sort(), trashed: change.file.trashed ?? false,
+    } };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 function allowed(change: z.infer<typeof driveFileChangeSchema>, allowlist: DriveAllowlist): boolean {
@@ -112,7 +117,7 @@ function allowed(change: z.infer<typeof driveFileChangeSchema>, allowlist: Drive
     (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
 }
 
-function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>): EventEnvelope {
+function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>, tombstone: boolean): EventEnvelope {
   const providerEventId = canonicalChangeId(change);
   return {
     schema_version: 1,
@@ -121,9 +126,8 @@ function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChan
     type: "changed",
     occurred_at: new Date(change.time).toISOString(),
     subject: { account: binding.account, resource: binding.resource, file_id: change.fileId },
-    payload: {
-      removed: change.removed ?? false,
-      drive_id: change.driveId ?? null,
+    payload: tombstone ? { removed: true, drive_id: null, file: null } : {
+      removed: change.removed ?? false, drive_id: change.driveId ?? null,
       file: change.file === undefined ? null : {
         id: change.file.id, name: change.file.name ?? null, mime_type: change.file.mimeType ?? null,
         parent_ids: change.file.parents ?? [], trashed: change.file.trashed ?? false,
@@ -143,7 +147,14 @@ export async function drainDriveChanges(
 ): Promise<void> {
   if (feed.kind === "drive" && !allowlist.driveIds.has(feed.driveId)) throw new ConnectionError("not_authorized");
   const bounded = limits ?? { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 };
+  const deadline = performance.now() + bounded.timeoutMs;
+  let totalEvents = 0, totalBytes = 0;
   for (let batch = 0; batch < bounded.pages; batch++) {
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining <= 0) throw new ConnectionError("incomplete_batch");
+    const remainingEvents = bounded.events - totalEvents;
+    const remainingBytes = (bounded.bytes ?? 16_777_216) - totalBytes;
+    if (remainingEvents <= 0 || remainingBytes <= 0) throw new ConnectionError("incomplete_batch");
     let final = false;
     await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
@@ -154,17 +165,28 @@ export async function drainDriveChanges(
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
         fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
-      const status = typeof error === "object" && error !== null && "status" in error ? (error as {status?:unknown}).status : undefined;
-      if (status === 401 || status === 403) throw new ConnectionError("credential_unavailable");
+      const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;reason?:unknown;errors?:unknown;response?:unknown} : {};
+      const status = candidate.status;
+      const serialized = JSON.stringify({ reason:candidate.reason, errors:candidate.errors, response:candidate.response });
+      const quota403 = status === 403 && /(?:rateLimitExceeded|userRateLimitExceeded|sharingRateLimitExceeded)/.test(serialized);
+      if (status === 401 || (status === 403 && !quota403)) throw new ConnectionError("credential_unavailable");
       if (status === 410) throw new ConnectionError("cursor_conflict");
       throw new ConnectionError("incomplete_batch");
     }
     const parsed = drivePageSchema.safeParse(raw);
     if (!parsed.success) throw new ConnectionError("incomplete_batch");
-    const events = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
-      .filter((change) => allowed(change, allowlist)).map((change) => ({
-      providerEventId: canonicalChangeId(change), envelope: envelope(binding, change),
-    }));
+    const fileChanges = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
+      .filter((change) => feed.kind === "drive" ? change.driveId === feed.driveId : change.driveId === undefined);
+    const events = fileChanges.filter((change) => allowed(change, allowlist)).map((change) => {
+      const currentlyAllowed = allowlist.fileIds.has(change.fileId) ||
+        (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
+        (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
+      const tombstone = !currentlyAllowed && (allowlist.priorFileIds?.has(change.fileId) ?? false);
+      return { providerEventId: canonicalChangeId(change), envelope: envelope(binding, change, tombstone) };
+    });
+    totalEvents += events.length;
+    totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
+    if (totalEvents > bounded.events || totalBytes > (bounded.bytes ?? 16_777_216)) throw new ConnectionError("incomplete_batch");
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
@@ -173,7 +195,7 @@ export async function drainDriveChanges(
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
     final = true;
     return { done: true, checkpoint: parsed.data.newStartPageToken, events };
-    }, { ...bounded, pages: 1 });
+    }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining });
     if (final) return;
   }
   // cursorは最後にcommitしたcontinuationを保持するため、次回はそこから安全に再開できる。

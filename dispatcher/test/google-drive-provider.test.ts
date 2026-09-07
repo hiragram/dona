@@ -92,6 +92,30 @@ test("以前のfolder memberは離脱・権限喪失時もtombstoneとして配�
   ], newStartPageToken: "next" }) };
   await drainDriveChanges(db, binding, client, { fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["moved","lost"]) });
   assert.equal(db.list().length, 2);
+  for (const row of db.list()) assert.deepEqual(JSON.parse(row.payload_json), { removed:true,drive_id:null,file:null });
+});
+
+test("quota系403はretryable、未知fieldはdedup IDへ影響せずuser feedはshared-drive changeを除外する", async (t) => {
+  const db = fixture(t); let round = 0;
+  const retry = { list: async () => { throw { status:403, errors:[{reason:"userRateLimitExceeded"}] }; } };
+  await assert.rejects(drainDriveChanges(db,binding,retry,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
+    (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "incomplete_batch");
+  const client = { list: async () => { round++; return { changes: [
+    { fileId:"same",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"same"},unknown:round },
+    ...(round === 2 ? [{ fileId:"shared",driveId:"drive-1",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"shared"} }] : []),
+  ],...(round === 1 ? {nextPageToken:"page-2"} : {newStartPageToken:"next"}) }; } };
+  const allowlist={fileIds:new Set(["same","shared"]),folderIds:new Set<string>(),driveIds:new Set(["drive-1"])};
+  await drainDriveChanges(db,binding,client,allowlist);
+  assert.equal(db.list().length,1);
+});
+
+test("複数pageでevent/byte/time上限を共有しdurable continuationで停止する", async (t) => {
+  const db=fixture(t); let page=0;
+  const client={list:async()=>({changes:[{fileId:`file-${++page}`,changeType:"file",time:`2026-09-07T00:00:0${page}Z`,file:{id:`file-${page}`}}],nextPageToken:`page-${page+1}`})};
+  await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(["file-1","file-2"]),folderIds:new Set(),driveIds:new Set()},
+    {kind:"user"},{pages:10,events:1,bytes:10000,timeoutMs:1000}),/incomplete_batch/);
+  assert.equal(page,1); assert.equal(db.list().length,1);
+  assert.equal(db.connections.cursor(channel.connectionId,channel.resource).checkpoint,"page-2");
 });
 
 test("credential失効とcursor期限切れをretryable page失敗から分離する", async (t) => {
