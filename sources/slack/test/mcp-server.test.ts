@@ -38,6 +38,8 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }> = [];
   readonly sessionStatuses: Array<{
     channelId: string;
@@ -130,6 +132,8 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult> {
     this.posts.push(input);
     return { channelId: input.channelId, messageTs: "2.3", ...(input.threadTs ? { threadTs: input.threadTs } : {}) };
@@ -243,6 +247,8 @@ describe("Dona Slack MCP server", () => {
           channel_id: "C123",
           text: "hello",
           thread_ts: "1.2",
+          mrkdwn: false,
+          parse: "none",
         },
       });
       assert.equal(result.isError, undefined);
@@ -252,6 +258,8 @@ describe("Dona Slack MCP server", () => {
           text: "hello",
           threadTs: "1.2",
           replyBroadcast: false,
+          mrkdwn: false,
+          parse: "none",
         },
       ]);
       assert.deepEqual(result.structuredContent, {
@@ -260,6 +268,8 @@ describe("Dona Slack MCP server", () => {
         message_ts: "2.3",
         thread_ts: "1.2",
         reply_broadcast: false,
+        mrkdwn: false,
+        parse: "none",
       });
 
       const fileResult = await client.callTool({

@@ -259,16 +259,27 @@ export class JobSupervisor {
   private async stopInvalidResultAgent(job:JobRow):Promise<void> {
     const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
     if(!stopped.ok&&! ["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));return;}
-    if(!stopped.ok) {this.database.recordInvalidResultAgentStopped(job.job_id);return;}
+    if(!stopped.ok) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
     const deadline=Date.now()+this.config.jobCommandTimeoutMs;
     while(Date.now()<deadline) {
       const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
-      if(observed.ok&&["idle","done"].includes(observed.agentStatus??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);return;}
-      if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);return;}
+      if(observed.ok&&["idle","done"].includes(observed.agentStatus??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
+      if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
       if(!observed.ok) break;
       await new Promise(resolve=>setTimeout(resolve,100));
     }
     this.database.recordInvalidResultAgentStopFailure(job.job_id,"Agent exit was not observed after invalid Result");
+  }
+
+  private async tryRecoverStoppedInvalidResult(jobId:string):Promise<void> {
+    const stopped=this.database.getJob(jobId);
+    if(stopped?.last_error_code!=="invalid_result_agent_stopped") return;
+    try {
+      const result=await readJobResultEnvelope(stopped.result_path,stopped.job_id);
+      this.database.saveJobResult(stopped.job_id,result,stopped.result_path);
+    } catch {
+      // The invalid/missing Result remains fenced for operator review after the worker is stopped.
+    }
   }
 
   private publishNotifications(): void {

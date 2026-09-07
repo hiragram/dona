@@ -490,13 +490,15 @@ export function createSlackMcpServer(
       inputSchema: {
         workspace: workspaceSchema,
         channel_id: channelSchema,
-        text: z.string().min(1).max(12_000).describe("Slack mrkdwn message body"),
+        text: z.string().min(1).max(12_000).describe("Slack message body"),
         thread_ts: timestampSchema.optional(),
         reply_broadcast: z.boolean().default(false),
+        mrkdwn: z.boolean().optional(),
+        parse: z.literal("none").optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace, channel_id, text, thread_ts, reply_broadcast }) => {
+    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse }) => {
       try {
         const connection = registry.get(workspace);
         const result = await connection.client.postMessage({
@@ -504,6 +506,8 @@ export function createSlackMcpServer(
           text,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
           replyBroadcast: reply_broadcast,
+          ...(mrkdwn!==undefined?{mrkdwn}:{}),
+          ...(parse?{parse}:{}),
         });
         logger.info("Slack MCP posted message", {
           tool: "post_message",
@@ -518,6 +522,8 @@ export function createSlackMcpServer(
           channel_id: result.channelId,
           message_ts: result.messageTs,
           reply_broadcast,
+          ...(mrkdwn!==undefined?{mrkdwn}:{}),
+          ...(parse?{parse}:{}),
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
       } catch (error) {

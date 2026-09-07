@@ -428,6 +428,20 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("recovers a valid Result written while an invalid Result agent stops normally", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-invalid-result-stop-valid");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
+    await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+    await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return ok("idle");}}),config,logger,()=>undefined);
+    await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
+    assert.equal(database.getJob(job.job_id)?.status,"completed");
+    database.close();
+  });
+
   test("preserves a worker-reported failure and emits a job_failed notification", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
