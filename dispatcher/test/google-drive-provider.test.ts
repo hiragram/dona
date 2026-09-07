@@ -52,16 +52,15 @@ test("multi-pageを全取得してallowlist後にだけnormalizeし、最終toke
   } : { changes: [{ fileId: "gone", removed: true, changeType: "file", time: "2026-09-07T00:00:02Z" }], newStartPageToken: "next-start" }; } };
   await drainDriveChanges(db, binding, client, { fileIds: new Set(["gone"]), folderIds: new Set(["folder-1"]), driveIds: new Set() });
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls, [
-    { pageToken: "start-token", supportsAllDrives: true, includeItemsFromAllDrives: true },
-    { pageToken: "page-2", supportsAllDrives: true, includeItemsFromAllDrives: true },
-  ]);
+  assert.equal((calls[0] as {pageToken:string}).pageToken, "start-token");
+  assert.equal((calls[1] as {pageToken:string}).pageToken, "page-2");
+  assert.match((calls[0] as {fields:string}).fields, /newStartPageToken/);
   assert.equal(db.list().length, 2);
   assert.equal(db.connections.cursor(channel.connectionId, channel.resource).checkpoint, "next-start");
   assert.equal(JSON.parse(db.list()[1]!.payload_json).removed, true);
 });
 
-test("page 2失敗ではeventとcheckpointを一切commitせず、再実行で一意に収束する", async (t) => {
+test("page 2失敗ではdurable continuationから再開して一意に収束する", async (t) => {
   const db = fixture(t); let fail = true;
   const first = { changes: [{ fileId: "file-1", changeType: "file", time: "2026-09-07T00:00:00Z", file: { id: "file-1" } }], nextPageToken: "page-2" };
   const client = { list: async ({pageToken}: {pageToken:string}) => {
@@ -71,16 +70,34 @@ test("page 2失敗ではeventとcheckpointを一切commitせず、再実行で�
   } };
   const allowlist = { fileIds: new Set(["file-1"]), folderIds: new Set<string>(), driveIds: new Set<string>() };
   await assert.rejects(drainDriveChanges(db, binding, client, allowlist), /incomplete_batch/);
-  assert.equal(db.list().length, 0); assert.equal(db.connections.cursor(channel.connectionId, channel.resource).checkpoint, "start-token");
+  assert.equal(db.list().length, 1); assert.equal(db.connections.cursor(channel.connectionId, channel.resource).checkpoint, "page-2");
   fail = false; await drainDriveChanges(db, binding, client, allowlist);
   assert.equal(db.list().length, 1); assert.equal(db.connections.cursor(channel.connectionId, channel.resource).checkpoint, "next-start");
 });
 
 test("shared drive allowlistと同時poll cursor競合をfail closedにする", async (t) => {
   const db = fixture(t);
-  const client = { list: async () => ({ changes: [{ fileId: "shared-file", driveId: "drive-1", changeType: "file", time: "2026-09-07T00:00:00Z", file: { id: "shared-file" } }], newStartPageToken: "next" }) };
+  const calls: unknown[] = []; const client = { list: async (input: unknown) => { calls.push(input); return { kind: "drive#changeList", changes: [{ changeType: "drive", driveId: "drive-1" }, { fileId: "shared-file", driveId: "drive-1", changeType: "file", time: "2026-09-07T00:00:00Z", file: { id: "shared-file", extra: true } }], newStartPageToken: "next" }; } };
   const allowlist = { fileIds: new Set<string>(), folderIds: new Set<string>(), driveIds: new Set(["drive-1"]) };
-  const results = await Promise.allSettled([drainDriveChanges(db, binding, client, allowlist), drainDriveChanges(db, binding, client, allowlist)]);
+  const results = await Promise.allSettled([drainDriveChanges(db, binding, client, allowlist, {kind:"drive",driveId:"drive-1"}), drainDriveChanges(db, binding, client, allowlist, {kind:"drive",driveId:"drive-1"})]);
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(db.list().length, 1);
+  assert.ok(calls.every((call) => (call as {driveId?:string}).driveId === "drive-1"));
+});
+
+test("以前のfolder memberは離脱・権限喪失時もtombstoneとして配送する", async (t) => {
+  const db = fixture(t); const client = { list: async () => ({ changes: [
+    { fileId: "moved", changeType: "file", time: "2026-09-07T00:00:00Z", file: { id: "moved", parents: ["other"] } },
+    { fileId: "lost", removed: true, changeType: "file", time: "2026-09-07T00:00:01Z" },
+  ], newStartPageToken: "next" }) };
+  await drainDriveChanges(db, binding, client, { fileIds:new Set(),folderIds:new Set(["folder-1"]),driveIds:new Set(),priorFileIds:new Set(["moved","lost"]) });
+  assert.equal(db.list().length, 2);
+});
+
+test("credential失効とcursor期限切れをretryable page失敗から分離する", async (t) => {
+  for (const [status, code] of [[401,"credential_unavailable"],[403,"credential_unavailable"],[410,"cursor_conflict"],[429,"incomplete_batch"]] as const) {
+    const db = fixture(t); const client = { list: async () => { throw { status }; } };
+    await assert.rejects(drainDriveChanges(db,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
+      (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === code);
+  }
 });

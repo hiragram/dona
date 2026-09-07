@@ -58,7 +58,7 @@ export function verifyDrivePush(
   throw new ConnectionError("not_authorized");
 }
 
-const driveChangeSchema = z.strictObject({
+const driveFileChangeSchema = z.object({
   fileId: z.string().min(1).max(256),
   removed: z.boolean().optional(),
   changeType: z.literal("file"),
@@ -70,37 +70,49 @@ const driveChangeSchema = z.strictObject({
     mimeType: z.string().max(256).optional(),
     parents: z.array(z.string().min(1).max(256)).max(100).optional(),
     trashed: z.boolean().optional(),
-  }).optional(),
-});
+  }).passthrough().optional(),
+}).passthrough();
 
-const drivePageSchema = z.strictObject({
+const driveOtherChangeSchema = z.object({
+  changeType: z.string().min(1).max(64).refine((value) => value !== "file"),
+}).passthrough();
+
+const driveChangeSchema = z.union([driveFileChangeSchema, driveOtherChangeSchema]);
+
+const drivePageSchema = z.object({
   changes: z.array(driveChangeSchema).max(10_000),
   nextPageToken: z.string().min(1).max(16_384).optional(),
   newStartPageToken: z.string().min(1).max(16_384).optional(),
-});
+}).passthrough();
 
 export interface DriveChangesClient {
-  list(input: Readonly<{ pageToken: string; supportsAllDrives: true; includeItemsFromAllDrives: true }>): Promise<unknown>;
+  list(input: Readonly<{ pageToken: string; supportsAllDrives: true; includeItemsFromAllDrives: true;
+    driveId?: string; fields: string }>): Promise<unknown>;
 }
 
 export interface DriveAllowlist {
   readonly fileIds: ReadonlySet<string>;
   readonly folderIds: ReadonlySet<string>;
   readonly driveIds: ReadonlySet<string>;
+  /** 永続projectionから得た、以前allowlist内だったfile。離脱/権限喪失tombstoneに使う。 */
+  readonly priorFileIds?: ReadonlySet<string>;
 }
 
-function canonicalChangeId(change: z.infer<typeof driveChangeSchema>): string {
+export type DriveFeed = { readonly kind: "user" } | { readonly kind: "drive"; readonly driveId: string };
+
+function canonicalChangeId(change: z.infer<typeof driveFileChangeSchema>): string {
   // zodのstrict parse後の固定field順を署名し、同時刻の異なるchangeを衝突させない。
   return createHash("sha256").update(JSON.stringify(change)).digest("hex");
 }
 
-function allowed(change: z.infer<typeof driveChangeSchema>, allowlist: DriveAllowlist): boolean {
+function allowed(change: z.infer<typeof driveFileChangeSchema>, allowlist: DriveAllowlist): boolean {
   return allowlist.fileIds.has(change.fileId) ||
+    (allowlist.priorFileIds?.has(change.fileId) ?? false) ||
     (change.driveId !== undefined && allowlist.driveIds.has(change.driveId)) ||
     (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent));
 }
 
-function envelope(binding: DeliveryBinding, change: z.infer<typeof driveChangeSchema>): EventEnvelope {
+function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChangeSchema>): EventEnvelope {
   const providerEventId = canonicalChangeId(change);
   return {
     schema_version: 1,
@@ -126,29 +138,46 @@ export async function drainDriveChanges(
   binding: DeliveryBinding,
   client: DriveChangesClient,
   allowlist: DriveAllowlist,
+  feed: DriveFeed = { kind: "user" },
   limits?: { pages: number; events: number; timeoutMs: number; bytes?: number },
 ): Promise<void> {
-  await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
+  if (feed.kind === "drive" && !allowlist.driveIds.has(feed.driveId)) throw new ConnectionError("not_authorized");
+  const bounded = limits ?? { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 };
+  for (let batch = 0; batch < bounded.pages; batch++) {
+    let final = false;
+    await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
     if (pageToken === null) throw new ConnectionError("cursor_conflict");
     let raw: unknown;
     try {
-      raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true });
-    } catch {
+      raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true,
+        ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
+        fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
+    } catch (error) {
+      const status = typeof error === "object" && error !== null && "status" in error ? (error as {status?:unknown}).status : undefined;
+      if (status === 401 || status === 403) throw new ConnectionError("credential_unavailable");
+      if (status === 410) throw new ConnectionError("cursor_conflict");
       throw new ConnectionError("incomplete_batch");
     }
     const parsed = drivePageSchema.safeParse(raw);
     if (!parsed.success) throw new ConnectionError("incomplete_batch");
-    const events = parsed.data.changes.filter((change) => allowed(change, allowlist)).map((change) => ({
+    const events = parsed.data.changes.filter((change): change is z.infer<typeof driveFileChangeSchema> => change.changeType === "file")
+      .filter((change) => allowed(change, allowlist)).map((change) => ({
       providerEventId: canonicalChangeId(change), envelope: envelope(binding, change),
     }));
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
-      return { done: false, nextPage: parsed.data.nextPageToken, events };
+      // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
+      return { done: true, checkpoint: parsed.data.nextPageToken, events };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
+    final = true;
     return { done: true, checkpoint: parsed.data.newStartPageToken, events };
-  }, limits);
+    }, { ...bounded, pages: 1 });
+    if (final) return;
+  }
+  // cursorは最後にcommitしたcontinuationを保持するため、次回はそこから安全に再開できる。
+  throw new ConnectionError("incomplete_batch");
 }
 
 /** getStartPageTokenの結果も空batchとして原子的に保存し、未設定cursorへのblind jumpを分離する。 */

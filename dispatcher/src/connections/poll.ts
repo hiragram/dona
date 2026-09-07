@@ -30,7 +30,11 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
       result=await Promise.race([fetchPage(expected.checkpoint,page),new Promise<never>((_,reject)=>{
         timer=setTimeout(()=>reject(new ConnectionError("incomplete_batch")),remaining);
       })]);
-    } catch {throw new ConnectionError("incomplete_batch");}
+    } catch (error) {
+      // providerが恒久的なcursor/credential失敗を分類した場合は、retryable batch失敗へ潰さない。
+      if (error instanceof ConnectionError && error.code !== "incomplete_batch") throw error;
+      throw new ConnectionError("incomplete_batch");
+    }
     finally {if(timer)clearTimeout(timer);}
     if(!Array.isArray(result.events)||events.length+result.events.length>limits.events) throw new ConnectionError("incomplete_batch");
     try { events.push(...result.events.map(event=>{

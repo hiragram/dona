@@ -7,7 +7,7 @@
 - OAuth scopeは`https://www.googleapis.com/auth/drive.metadata.readonly`を基本とし、content取得が必要な別要件なしに`drive` scopeへ広げない。
 - `X-Goog-Channel-ID`、`X-Goog-Channel-Token`、`X-Goog-Resource-ID`を保存済みgenerationへ照合する。token、credential、page tokenはlog、Result、healthへ出さない。
 - push bodyは空である。`sync`はwatch handshakeのcontrol notificationとして扱い、business eventを作らない。message numberは増加するが連番とは仮定せず、gapだけで通知欠落と判定しない。
-- notification後とperiodic reconciliationの両方で保存済みpage tokenから`changes.list`を全page drainする。全eventと`newStartPageToken`を同じDB transactionでcommitし、partial pageや429/5xxではcursorを進めない。
+- notification後とperiodic reconciliationの両方で保存済みpage tokenから`changes.list`をdrainする。各pageのeventとcontinuation tokenを同じDB transactionでcommitし、最終pageでは`newStartPageToken`へ進む。page取得前の失敗ではcursorを進めず、上限超過やrestartは最後のdurable continuationから再開する。
 - cursor無効・期限切れでは現在tokenへblind jumpしない。connectionをdegraded/needs-reviewとして隔離し、allowlistを用いたbounded reconciliationを人間が判断する。
 
 ## watch・renew・reconcile
