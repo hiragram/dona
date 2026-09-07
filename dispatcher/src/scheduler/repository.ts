@@ -698,7 +698,7 @@ export class SchedulerRepository {
       (r.status IN ('materialized','started','needs_review') OR EXISTS (SELECT 1 FROM connector_outbox o
         WHERE o.run_id = r.run_id AND o.status IN ('pending','claimed','request_started','needs_review')) OR EXISTS
         (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
-          AND c.notification_state IN ('pending','needs_review'))) LIMIT 1`).get(scheduleId);
+          AND c.notification_state IN ('pending','failed','needs_review'))) LIMIT 1`).get(scheduleId);
     if (unsettled) return;
     const runTerminal = (this.db.prepare("SELECT MAX(terminal_at) AS value FROM schedule_runs WHERE schedule_id = ?").get(scheduleId) as { value: string | null }).value;
     const completedAt = [now, before.created_at, before.updated_at, before.terminal_at ?? before.created_at,
