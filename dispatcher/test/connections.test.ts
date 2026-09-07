@@ -556,6 +556,13 @@ test("provider fetchを含むdispatching中は再verification開始を拒否す�
   assert.notEqual(db.connections.subscriptions("pilot")[0]!.verifiedAt,null);
 });
 
+test("provider fetchを含むdispatching中はconnection degradeを拒否する",async(t)=>{
+  const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
+  const accepted=db.enqueueExternal(event(),binding());db.beginDispatch(accepted.row.event_id,"fixture",new Date(clock.now()),true);
+  assert.throws(()=>db.connections.degrade("pilot",1),/operation_pending/);
+  assert.equal(db.connections.get("pilot").state,"active");
+});
+
 test("手動retry可能なeventがあるconnectionのrevision更新を拒否する",async(t)=>{
   const {db,lifecycle,clock}=fixture(t);await lifecycle.createOrRenew("pilot","folder1");
   const accepted=db.enqueueExternal(event(),binding());db.manualDeadLetter(accepted.row.event_id,new Date(clock.now()));

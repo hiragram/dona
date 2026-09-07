@@ -115,6 +115,10 @@ export class ConnectionRegistry {
     this.db.transaction(() => {
       const c = this.get(id);
       if (c.revision !== revision || c.state === "disabled") return;
+      if (this.db.prepare(`SELECT 1 FROM events JOIN connection_event_bindings USING(event_id)
+        WHERE connection_id=? AND revision=? AND status='dispatching' LIMIT 1`).get(id, revision)) {
+        throw new ConnectionError("operation_pending");
+      }
       const now = this.tick(id);
       this.db.prepare("UPDATE connections SET state='degraded' WHERE id=?").run(id);
       this.audit(c, "credential_unavailable", now);
