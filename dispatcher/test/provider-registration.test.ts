@@ -49,28 +49,39 @@ test("secret-storeはowner-only atomic fileだけを公開しsymlink/hard-link/p
   await assert.rejects(store.read("cred_safe", 1), /not_authorized/);
 });
 
-test("registration失敗は新secretをrollbackし、rotation失敗でも旧revisionを維持する", async (t) => {
+test("registration競合は既存secretを保ち、rotation失敗は旧revisionをactiveに保つ", async (t) => {
   const { db, store, secrets } = fixture(t); const service = new ProviderRegistrationService(db.connections, store);
   await service.register(config, Buffer.alloc(32, 1));
   assert.equal(db.connections.get("pilot").credentialRevision, 1);
   await assert.rejects(service.rotate("pilot", 99, { ...config, credentialRevision: 2 }, Buffer.alloc(32, 2)), /revision_conflict/);
   assert.equal(db.connections.get("pilot").credentialRevision, 1);
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret"]);
+  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret", "cred_pilot.2.secret"]);
   assert.equal((await service.register({ ...config, id: "pilot" }, Buffer.alloc(32, 1))).revision, 1);
   await assert.rejects(service.register({ ...config, allowlist: [{ resource: "page:one", events: ["deleted"] }] }, Buffer.alloc(32, 1)), /revision_conflict/);
   assert.equal((await store.read("cred_pilot", 1)).length, 32);
-  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret"]);
+  assert.deepEqual(fs.readdirSync(secrets), ["cred_pilot.1.secret", "cred_pilot.2.secret"]);
 });
 
-test("secret publish後の応答喪失は内容をread-backして二重writeなしで継続する", async (t) => {
+test("durability未確認ではDB commitせず、次の明示reconcileでdirectory fsync後に継続する", async (t) => {
   const { db, store } = fixture(t); let writes = 0;
   const ambiguous = Object.create(store) as PrivateFileSecretStore;
   ambiguous.write = async (reference, revision, secret) => {
-    writes++; await store.write(reference, revision, secret); throw new Error("ambiguous_write");
+    writes++; await store.write(reference, revision, secret); throw new Error("durability_unconfirmed");
   };
   const service = new ProviderRegistrationService(db.connections, ambiguous);
-  assert.equal((await service.register(config, Buffer.alloc(32, 7))).revision, 1);
+  await assert.rejects(service.register(config, Buffer.alloc(32, 7)), /durability_unconfirmed/);
+  assert.throws(() => db.connections.get("pilot"), /not_found/);
+  const resumed = new ProviderRegistrationService(db.connections, store);
+  assert.equal((await resumed.register(config, Buffer.alloc(32, 7))).revision, 1);
   assert.equal(writes, 1);
+});
+
+test("invalid secret lengthは既存fileとの一致でも成功へ昇格しない", async (t) => {
+  const { db, secrets, store } = fixture(t);
+  fs.writeFileSync(path.join(secrets, "cred_pilot.1.secret"), Buffer.alloc(8, 1), { mode: 0o600 });
+  const service = new ProviderRegistrationService(db.connections, store);
+  await assert.rejects(service.register(config, Buffer.alloc(8, 1)), /invalid_input/);
+  assert.throws(() => db.connections.get("pilot"), /not_found/);
 });
 
 test("同一revisionの並行publishは既存targetを置換しない", async (t) => {
@@ -93,6 +104,11 @@ test("resolverはcurrent active bindingだけを返しcross-workspace/provider/r
   ]) assert.throws(() => db.providerRegistration.resolve(input), /not_authorized/);
   db.connections.revise("pilot", 1, { ...config, credentialRevision: 2 });
   assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one", connectionId: "pilot" }), /not_authorized/);
+});
+
+test("connectionId省略resolverも永続clockの後退を拒否する", (t) => {
+  const { db, clock } = fixture(t); db.connections.register(config); activate(db); clock.value--;
+  assert.throws(() => db.providerRegistration.resolve({ provider: "notion", providerId: "subscription:one" }), /clock_skew/);
 });
 
 test("verification attemptはdigestのみ永続化しexpiry/replay/restart/tamperを拒否する", (t) => {
@@ -189,7 +205,7 @@ test("別processの同時claimは1件だけ成功する", async (t) => {
   assert.equal(results.filter((result) => result.code === "operation_pending").length, 1);
 });
 
-test("connection schema v1からv2へadditive migrationし既存rowとuser_versionを維持する", (t) => {
+test("connection schemaへrollback-compatibleなadditive migrationを行い既存rowとuser_versionを維持する", (t) => {
   const { file, db } = fixture(t); db.connections.register(config); db.close();
   const raw = new Database(file); t.after(() => raw.close());
   raw.exec("DROP TABLE verification_attempts; UPDATE connection_schema SET version=1");

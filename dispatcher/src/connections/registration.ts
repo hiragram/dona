@@ -46,7 +46,8 @@ export class ProviderRegistrationRegistry {
         AND (? IS NULL OR c.id=?) AND (? IS NULL OR s.resource=?)`)
       .all(input.provider, input.providerId, activeOnly ? 1 : 0, activeOnly ? 1 : 0, now, input.connectionId ?? null, input.connectionId ?? null,
         input.resource ?? null, input.resource ?? null) as Array<{ connection_id: string; provider: string; config_json: string;
-          revision: number; resource: string; generation: number; subscription_revision: number; provider_id: string; expires_at: number | null }>;
+          revision: number; last_clock: number; resource: string; generation: number; subscription_revision: number; provider_id: string; expires_at: number | null }>;
+    if (rows.some((row) => now < row.last_clock)) throw new ConnectionError("clock_skew");
     const matches = rows.flatMap((row) => {
       const config = JSON.parse(row.config_json) as ConnectionConfig;
       return input.account !== undefined && config.account !== input.account ? [] : [{

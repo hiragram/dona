@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { ConnectionError } from "./domain.js";
 
 const credentialReference = /^cred_[A-Za-z0-9_-]{1,100}$/;
@@ -52,14 +52,23 @@ export class PrivateFileSecretStore {
     } catch (error) {
       await handle?.close().catch(() => undefined);
       await fs.unlink(temporary).catch(() => undefined);
-      // publish後のfsync/validation応答喪失は、この呼出しがlinkを作った事実から一意に照合する。
-      if (published) {
-        const stats = await fs.lstat(target).catch(() => undefined);
-        if (stats?.isFile() && !stats.isSymbolicLink() && stats.nlink === 1 && stats.uid === process.getuid?.() && (stats.mode & 0o077) === 0)
-          return { created: true };
-      }
+      if (published) throw new ConnectionError("durability_unconfirmed");
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ConnectionError("revision_conflict");
       throw error;
     }
+  }
+
+  async reconcile(reference: string, revision: number, expected: Uint8Array): Promise<boolean> {
+    if (!(expected instanceof Uint8Array) || expected.byteLength < 16 || expected.byteLength > 65_536)
+      throw new ConnectionError("invalid_input");
+    const stored = await this.read(reference, revision);
+    const candidate = Buffer.from(expected);
+    const matches = stored.length === candidate.length && timingSafeEqual(stored, candidate);
+    stored.fill(0); candidate.fill(0);
+    if (!matches) return false;
+    const directory = await fs.open(this.root, constants.O_RDONLY);
+    try { await directory.sync(); } finally { await directory.close(); }
+    return true;
   }
 
   async read(reference: string, revision: number): Promise<Buffer> {
@@ -73,12 +82,4 @@ export class PrivateFileSecretStore {
     } finally { await handle.close(); }
   }
 
-  async discard(reference: string, revision: number): Promise<void> {
-    await this.checkedRoot();
-    const target = this.file(reference, revision);
-    const stats = await fs.lstat(target);
-    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.uid !== process.getuid?.())
-      throw new ConnectionError("not_authorized");
-    await fs.unlink(target);
-  }
 }
