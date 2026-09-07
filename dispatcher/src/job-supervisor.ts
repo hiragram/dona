@@ -208,7 +208,7 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      for(const job of this.database.listAmbiguousScheduledJobs()) {
+      for(const job of this.database.listAmbiguousScheduledJobs()) try {
         if(await this.reconcileAmbiguousScheduledJob(job)) continue;
         if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;
         const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
@@ -217,6 +217,8 @@ export class JobSupervisor {
           if(await this.tryComplete(job,false)) continue;
           this.database.settleAmbiguousCancellation(job.job_id,"Agent termination was confirmed after ambiguous cancellation");
         }
+      } catch(error) {
+        this.logger.warn("Scheduled job reconciliation requires review",{job_id:job.job_id,error_message:error instanceof Error?error.message:String(error)});
       }
       for (const job of this.database.listScheduledJobsRequiringCancellation()) {
         await this.tryComplete(job,false);

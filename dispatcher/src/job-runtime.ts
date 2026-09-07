@@ -52,6 +52,17 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   return args;
 }
 
+export function parseScheduledMcpInventory(value:unknown):string[] {
+  if(!Array.isArray(value)) throw new Error("Scheduled Codex MCP inventory was invalid");
+  return value.map(item=>{
+    if(item===null||typeof item!=="object"||Array.isArray(item)||!Object.hasOwn(item,"name")||typeof (item as {name?:unknown}).name!=="string"||!(item as {name:string}).name)
+      throw new Error("Scheduled Codex MCP identity was invalid");
+    const name=(item as {name:string}).name;
+    if(!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Scheduled Codex MCP identity was invalid");
+    return name;
+  });
+}
+
 function parseJson(value: string): unknown {
   try {
     return JSON.parse(value);
@@ -220,9 +231,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
       if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
       const inventory=parseJson(listed.stdout);
-      if(!Array.isArray(inventory)) throw new Error("Scheduled Codex MCP inventory was invalid");
-      disabledMcpServers=inventory.map(item=>findValue(item,["name"])).map(String);
-      if(disabledMcpServers.some(name=>!/^[A-Za-z0-9_-]+$/.test(name))) throw new Error("Scheduled Codex MCP identity was invalid");
+      disabledMcpServers=parseScheduledMcpInventory(inventory);
     }
 
     let started: HerdrCommandResult | undefined;

@@ -501,4 +501,22 @@ describe("JobSupervisor", () => {
     assert.equal(cancelCount, 1);
     database.close();
   });
+
+  test("keeps the supervisor loop alive when one cancellation needs notification reconciliation", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-reconcile-warning");
+    markRunning(database,job.job_id);
+    database.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答不明");
+    let listed=false,warned=false;
+    (database as unknown as {listAmbiguousScheduledJobs():JobRow[]}).listAmbiguousScheduledJobs=()=>listed?[]:(listed=true,[database.getJob(job.job_id)!]);
+    (database as unknown as {settleAmbiguousCancellation():void}).settleAmbiguousCancellation=()=>{throw new Error("prior_notification_requires_reconciliation");};
+    const testLogger:Logger={debug(){},info(){},warn(message){if(message==="Scheduled job reconciliation requires review") warned=true;},error(){}};
+    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return ok("idle");}}),config,testLogger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>warned);
+    assert.equal(supervisor.isRunning(),true);
+    await supervisor.stop();
+    database.close();
+  });
 });

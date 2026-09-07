@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
-import { codexAgentArguments, HerdrJobAgentRuntime } from "../src/job-runtime.js";
+import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory } from "../src/job-runtime.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -14,6 +14,12 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("rejects missing or malformed scheduled MCP identities", () => {
+    assert.deepEqual(parseScheduledMcpInventory([{name:"slack"},{name:"github_1"}]),["slack","github_1"]);
+    for(const inventory of [[{}],[{name:undefined}],[{name:""}],[{name:"bad.name"}],null])
+      assert.throws(()=>parseScheduledMcpInventory(inventory),/MCP (?:inventory|identity) was invalid/);
+  });
+
   test("trusts only the Dispatcher-selected GitHub repository and worktree for the invocation", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
