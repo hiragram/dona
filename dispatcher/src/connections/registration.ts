@@ -119,6 +119,7 @@ export class ProviderRegistrationRegistry {
     const row = this.db.prepare("SELECT * FROM verification_attempts WHERE digest=?").get(digest(token)) as
       (AttemptRow & { created_at: number }) | undefined;
     if (!row || !["pending", "claimed", "consumed"].includes(row.state)) throw new ConnectionError("not_authorized");
+    if (this.now() > row.expires_at) throw new ConnectionError("not_authorized");
     const binding: VerificationBinding = { provider: row.provider, providerId: row.provider_id,
       verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: row.account,
         revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };

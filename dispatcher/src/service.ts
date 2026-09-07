@@ -194,12 +194,15 @@ export async function runService(
             if (requests >= 100) { truncated = true; break; }
             if (!property || typeof property !== "object" || typeof (property as Record<string, unknown>).id !== "string") continue;
             const propertyId = String((property as Record<string, unknown>).id);
+            let propertyPathId: string;
+            try { propertyPathId = encodeURIComponent(decodeURIComponent(propertyId)); }
+            catch { propertyPathId = encodeURIComponent(propertyId); }
             const items: unknown[] = [];
             let cursor: string | undefined;
             do {
               if (requests >= 100) { truncated = true; break; }
               requests += 1;
-              const url = new URL(`https://api.notion.com/v1/pages/${encodeURIComponent(resourceId)}/properties/${encodeURIComponent(propertyId)}`);
+              const url = new URL(`https://api.notion.com/v1/pages/${encodeURIComponent(resourceId)}/properties/${propertyPathId}`);
               url.searchParams.set("page_size", "100");
               if (cursor) url.searchParams.set("start_cursor", cursor);
               const page = await request(url.toString());
