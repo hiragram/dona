@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { ConnectionError, connectionIdentifier, deliverySchema, identifier, systemClock, type Clock, type ConnectionConfig, type DeliveryBinding } from "./domain.js";
 
 const digest = (token: string): string => createHash("sha256").update(token, "utf8").digest("hex");
+const CONSUMED_VERIFICATION_REPLAY_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const validToken = (token: unknown): token is string => typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token);
 const sameBinding = (left: VerificationBinding, right: VerificationBinding): boolean =>
   left.delivery.connectionId === right.delivery.connectionId && left.provider === right.provider && left.delivery.account === right.delivery.account &&
@@ -27,6 +28,7 @@ type AttemptRow = {
   connection_id: string; provider: string; account: string; revision: number; credential_revision: number;
   resource: string; generation: number; provider_id: string; verification_epoch: number; expires_at: number; state: string;
   claim_id: string | null; claim_until: number | null;
+  consumed_at: number | null;
 };
 
 export interface VerificationAttemptSnapshot {
@@ -124,7 +126,10 @@ export class ProviderRegistrationRegistry {
       const clock = this.db.prepare("SELECT last_clock FROM connections WHERE id=?").get(row.connection_id) as { last_clock: number } | undefined;
       if (!clock || now < clock.last_clock) throw new ConnectionError("clock_skew");
       this.db.prepare("UPDATE connections SET last_clock=MAX(last_clock,?) WHERE id=?").run(now, row.connection_id);
-      if (now > row.expires_at) return { error: new ConnectionError("not_authorized") };
+      const replayExpiresAt = row.state === "consumed" && row.consumed_at !== null
+        ? row.consumed_at + CONSUMED_VERIFICATION_REPLAY_RETENTION_MS
+        : row.expires_at;
+      if (now > replayExpiresAt) return { error: new ConnectionError("not_authorized") };
       const binding: VerificationBinding = { provider: row.provider, providerId: row.provider_id,
         verificationEpoch: row.verification_epoch, delivery: { connectionId: row.connection_id, account: row.account,
           revision: row.revision, credentialRevision: row.credential_revision, resource: row.resource, generation: row.generation } };
@@ -149,7 +154,9 @@ export class ProviderRegistrationRegistry {
       this.db.prepare("UPDATE connections SET last_clock=? WHERE id=?").run(now, binding.delivery.connectionId);
       // 1回のmaintenanceが長時間lockを保持しないよう削除数をboundedにする。
       this.db.prepare(`DELETE FROM verification_attempts WHERE rowid IN (SELECT rowid FROM verification_attempts
-        WHERE expires_at<=? ORDER BY expires_at LIMIT 100)`).run(now);
+        WHERE (state!='consumed' AND expires_at<=?) OR (state='consumed' AND consumed_at<=?)
+        ORDER BY CASE WHEN state='consumed' THEN consumed_at ELSE expires_at END LIMIT 100)`)
+        .run(now, now - CONSUMED_VERIFICATION_REPLAY_RETENTION_MS);
       const token = randomBytes(32).toString("base64url");
       this.db.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,
         resource,generation,provider_id,verification_epoch,expires_at,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?)`)

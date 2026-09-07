@@ -264,6 +264,11 @@ describe("Notion ingress", () => {
     const emptyContainers = normalizeNotionFetchValue({ children: Array.from({ length: 100_000 }, () => ({})) });
     assert.ok(Buffer.byteLength(JSON.stringify(emptyContainers)) <= 48 * 1024);
     assert.equal(emptyContainers.children_truncated, true);
+    const ordered = normalizeNotionFetchValue({ children: Array.from({ length: 20 }, (_, index) => ({ index, text: "x".repeat(1_000) })) });
+    const selected = JSON.parse(ordered.children_json as string) as Array<{ index: number }>;
+    assert.ok(selected.some((entry) => entry.index === 0));
+    assert.ok(selected.some((entry) => entry.index === 19));
+    assert.deepEqual(selected.map((entry) => entry.index), selected.map((entry) => entry.index).slice().sort((left, right) => left - right));
     const oversizedScalar = normalizeNotionFetchValue({ title: "x".repeat(100_000),
       description: "y".repeat(100_000), properties: {} });
     assert.ok(Buffer.byteLength(JSON.stringify(oversizedScalar)) <= 48 * 1024);

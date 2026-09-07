@@ -162,14 +162,15 @@ const NOTION_FIELDS = new Set(["id", "object", "type", "url", "created_time", "l
 
 function preview(value: unknown, maxBytes: number): { text: string; truncated: boolean } {
   if (Array.isArray(value) && Buffer.byteLength(JSON.stringify(value)) > maxBytes) {
-    const selected: unknown[] = [];
+    const selected: Array<{ index: number; value: unknown }> = [];
     for (let offset = 0; offset < value.length; offset += 1) {
       const index = offset % 2 === 0 ? offset / 2 : value.length - 1 - Math.floor(offset / 2);
-      const candidate = [...selected, value[index]];
-      if (Buffer.byteLength(JSON.stringify(candidate)) > maxBytes) continue;
-      selected.push(value[index]);
+      const candidate = [...selected, { index, value: value[index] }];
+      if (Buffer.byteLength(JSON.stringify(candidate.map((entry) => entry.value))) > maxBytes) continue;
+      selected.push({ index, value: value[index] });
     }
-    return { text: JSON.stringify(selected), truncated: true };
+    selected.sort((left, right) => left.index - right.index);
+    return { text: JSON.stringify(selected.map((entry) => entry.value)), truncated: true };
   }
   if (value && typeof value === "object" && !Array.isArray(value) && Buffer.byteLength(JSON.stringify(value)) > maxBytes) {
     const entries = Object.entries(value as Record<string, unknown>), selected: Record<string, unknown> = {};

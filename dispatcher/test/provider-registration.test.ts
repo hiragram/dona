@@ -354,13 +354,15 @@ test("consumed replayの観測時刻をcommitし別tokenの復活を防ぐ", (t)
   assert.throws(() => db.providerRegistration.claim(pending, binding, 100), /clock_skew/);
 });
 
-test("期限切れconsumed attemptをinspect replayで再認可しない", (t) => {
+test("consumed attemptはpending TTL後も7日間だけreceipt replayに使える", (t) => {
   const { db, clock } = fixture(t); db.connections.register(config); const binding = activate(db);
   const token = db.providerRegistration.issue({ provider: binding.provider, providerId: binding.providerId,
     connectionId: binding.delivery.connectionId, account: binding.delivery.account, resource: binding.delivery.resource }, 1_000);
   const claim = db.providerRegistration.claim(token, binding, 100);
   db.providerRegistration.consume(token, claim.claimId);
   clock.value += 1_001;
+  assert.equal(db.providerRegistration.inspectAttempt(token).state, "consumed");
+  clock.value += 7 * 24 * 60 * 60_000;
   assert.throws(() => db.providerRegistration.inspectAttempt(token), /not_authorized/);
   clock.value -= 1;
   assert.throws(() => db.providerRegistration.inspectAttempt(token), /clock_skew/);
@@ -506,12 +508,12 @@ test("attempt発行時のretentionは期限切れrowをboundedに削除する", 
   raw.prepare(`INSERT INTO verification_attempts(digest,connection_id,provider,account,revision,credential_revision,resource,generation,
     provider_id,expires_at,state,claim_id,claim_until,created_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,?,'consumed','claim',?,?,?)`)
     .run("f".repeat(64), "pilot", "notion", "workspace:one", 1, 1, "page:one", 1, "subscription:one",
-      clock.value + 5_000, clock.value + 1_000, clock.value - 2, clock.value - 1);
+      clock.value - 1, clock.value + 1_000, clock.value - 2, clock.value - 1);
   db.providerRegistration.issue(identity, 5_000);
   assert.equal((raw.prepare("SELECT count(*) n FROM verification_attempts").get() as { n: number }).n, 3);
   assert.equal((raw.prepare("SELECT state FROM verification_attempts WHERE digest=?").get("f".repeat(64)) as { state: string }).state, "consumed");
-  assert.match(JSON.stringify(raw.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM verification_attempts WHERE expires_at<=? ORDER BY expires_at LIMIT 100").all(clock.value)),
-    /verification_attempt_expires_at_idx/);
+  assert.match(JSON.stringify(raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='verification_attempt_consumed_at_idx'").get()),
+    /verification_attempt_consumed_at_idx/);
 });
 
 test("registration retryもstrict config validationを迂回しない", async (t) => {
