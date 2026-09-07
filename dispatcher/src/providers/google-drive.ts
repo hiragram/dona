@@ -167,7 +167,9 @@ export async function drainDriveChanges(
     throw new ConnectionError("invalid_input");
   const deadline = performance.now() + bounded.timeoutMs;
   let totalEvents = 0, totalBytes = 0;
-  const members = new Set([...database.connections.membership(binding.connectionId,binding.resource),...(allowlist.priorFileIds ?? [])]);
+  const snapshot = database.connections.pollingSnapshot(binding);
+  let expected = snapshot.cursor;
+  const members = new Set([...snapshot.membership,...(allowlist.priorFileIds ?? [])]);
   const seenPageTokens = new Set<string>();
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
@@ -176,6 +178,7 @@ export async function drainDriveChanges(
     const remainingBytes = (bounded.bytes ?? 16_777_216) - totalBytes;
     if (remainingEvents <= 0 || remainingBytes <= 0) throw new ConnectionError("incomplete_batch");
     let final = false;
+    let committedCheckpoint: string | undefined;
     await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
     if (pageToken === null) throw new ConnectionError("cursor_conflict");
@@ -187,8 +190,9 @@ export async function drainDriveChanges(
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
         fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
-      const candidate = typeof error === "object" && error !== null ? error as {status?:unknown} : {};
-      const status = candidate.status;
+      const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;response?:unknown} : {};
+      const response = typeof candidate.response === "object" && candidate.response !== null ? candidate.response as {status?:unknown} : undefined;
+      const status = candidate.status ?? response?.status;
       const quota403 = status === 403 && errorReasons(error).some((reason) =>
         ["rateLimitExceeded","userRateLimitExceeded","sharingRateLimitExceeded"].includes(reason));
       if (status === 401 || (status === 403 && !quota403)) throw new ConnectionError("credential_unavailable");
@@ -222,12 +226,17 @@ export async function drainDriveChanges(
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
       if (seenPageTokens.has(parsed.data.nextPageToken)) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
+      committedCheckpoint = parsed.data.nextPageToken;
       return { done: true, checkpoint: parsed.data.nextPageToken, events, membership:[...members].sort() };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
     final = true;
+    committedCheckpoint = parsed.data.newStartPageToken;
     return { done: true, checkpoint: parsed.data.newStartPageToken, events, membership:[...members].sort() };
-    }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining });
+    }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining }, expected);
+    if (committedCheckpoint === undefined) throw new ConnectionError("incomplete_batch");
+    expected = { revision: expected.revision, version: expected.version + 1,
+      checkpoint: committedCheckpoint };
     if (final) return;
   }
   // cursorは最後にcommitしたcontinuationを保持するため、次回はそこから安全に再開できる。

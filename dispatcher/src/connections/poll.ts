@@ -1,7 +1,7 @@
 import type { DispatcherDatabase } from "../database.js";
 import { validateNormalizedExternalEvent } from "../ingress.js";
 import { ConnectionError, type DeliveryBinding } from "./domain.js";
-import type { CursorBatch } from "./registry.js";
+import type { Cursor, CursorBatch } from "./registry.js";
 
 export type CursorPage = {
   events: CursorBatch["events"];
@@ -11,11 +11,12 @@ export type CursorPage = {
 // page token は一時変数だけ。最終 page の取得・検証成功まで永続checkpointを触らない。
 export async function pollConnectionBatch(database: DispatcherDatabase, binding: DeliveryBinding,
   fetchPage: (checkpoint: string | null, page: string | null) => Promise<CursorPage>,
-  limits: {pages:number;events:number;timeoutMs:number;bytes?:number} = { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 }): Promise<void> {
+  limits: {pages:number;events:number;timeoutMs:number;bytes?:number} = { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 },
+  initialExpected?: Cursor): Promise<void> {
   const byteLimit=limits.bytes??16_777_216;
   if (![limits.pages,limits.events,limits.timeoutMs,byteLimit].every((n)=>Number.isSafeInteger(n)&&n>0) || limits.timeoutMs>60_000) throw new ConnectionError("invalid_input");
   database.connections.assertPolling(binding);
-  const expected=database.connections.cursor(binding.connectionId,binding.resource);
+  const expected=initialExpected ?? database.connections.cursor(binding.connectionId,binding.resource);
   if (expected.revision !== binding.revision) throw new ConnectionError("cursor_conflict");
   const events: {providerEventId:string;envelope:CursorBatch["events"][number]["envelope"]}[]=[];
   let encodedBytes=0;

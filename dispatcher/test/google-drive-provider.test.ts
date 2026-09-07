@@ -217,4 +217,9 @@ test("credential失効とcursor期限切れをretryable page失敗から分離�
   const db=fixture(t); const circular:{status:number;response?:unknown}={status:410}; circular.response={data:{error:{errors:[{reason:"pageTokenExpired"}]}},request:circular};
   await assert.rejects(drainDriveChanges(db,binding,{list:async()=>{throw circular;}},{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
     (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="cursor_conflict");
+  for (const [status, code] of [[401,"credential_unavailable"],[403,"credential_unavailable"],[410,"cursor_conflict"]] as const) {
+    const responseDb=fixture(t); const client={list:async()=>{throw {response:{status,data:{error:{errors:[]}}}};}};
+    await assert.rejects(drainDriveChanges(responseDb,binding,client,{fileIds:new Set(),folderIds:new Set(),driveIds:new Set()}),
+      (error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code===code);
+  }
 });

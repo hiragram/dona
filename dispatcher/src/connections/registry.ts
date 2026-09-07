@@ -336,6 +336,13 @@ export class ConnectionRegistry {
     return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? ORDER BY member")
       .all(id,resource) as {member:string}[]).map(({member})=>member);
   }
+  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[] } {
+    return this.db.transaction(() => {
+      this.assertPolling(binding);
+      return { cursor: this.cursor(binding.connectionId,binding.resource),
+        membership: this.membership(binding.connectionId,binding.resource) };
+    }).immediate();
+  }
   assertPolling(binding: DeliveryBinding): void {
     this.db.transaction(() => {
       if (!deliverySchema.safeParse(binding).success) throw new ConnectionError("not_authorized");
