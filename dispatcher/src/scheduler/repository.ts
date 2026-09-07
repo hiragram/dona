@@ -620,6 +620,15 @@ export class SchedulerRepository {
     if(changed===1)this.retireRevisions(run.schedule_id,now);
     this.audit(schedule,this.get(run.schedule_id)!,"work_notification_needs_review",{tenant_id:schedule.tenant_id,actor_id:"dispatcher",role:"admin",source_event_id:null},now,undefined,run);
   }
+  reconcileWorkNotificationNotSent(runId:string,now:string):void {
+    const run=this.getRun(runId);if(!run)return;const schedule=this.get(run.schedule_id)!;
+    if(run.revision!==schedule.revision||!["completed","failed","cancelled"].includes(run.status))return;
+    const changed=this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes;
+    if(changed===1) {
+      this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);
+      this.audit(schedule,this.get(run.schedule_id)!,"work_notification_not_sent_reconciled",{tenant_id:schedule.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},now,undefined,run);
+    }
+  }
 
   settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string): void {
     utc(now); id(eventId);

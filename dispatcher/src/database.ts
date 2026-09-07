@@ -1293,6 +1293,22 @@ export class DispatcherDatabase {
     return this.getRequired(eventId);
   }
 
+  reconcileScheduledNotificationNotSent(eventId:string,at=new Date()):EventRow {
+    this.getRequired(eventId);
+    const completion=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id,notification_state FROM job_completion_results
+      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {run_id:string;notification_state:string}|undefined;
+    if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
+    const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator confirmed the scheduled notification was not sent",
+      actions:[{tool:"operator.reconcile_job_notification",outcome:"not_sent"}],memory_candidates:[],completed_at:at.toISOString()};
+    this.db.transaction(()=>{
+      this.db.prepare("UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code='notification_confirmed_not_sent',last_error_message=NULL,updated_at=? WHERE event_id=?")
+        .run(stableStringify(result),at.toISOString(),at.toISOString(),eventId);
+      this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=?").run(eventId);
+      this.scheduler.reconcileWorkNotificationNotSent(completion.run_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+    }).immediate();
+    return this.getRequired(eventId);
+  }
+
   manualDeadLetter(eventId: string, at = new Date()): EventRow {
     const row=this.getRequired(eventId);
     const notification=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}|undefined;

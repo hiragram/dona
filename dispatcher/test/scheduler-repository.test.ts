@@ -334,6 +334,9 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   assert.throws(()=>dispatcher.manualComplete(completionEventId,new Date(due)),/scheduled_notification_receipt_required/);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  dispatcher.reconcileScheduledNotificationNotSent(completionEventId,new Date(due));
+  assert.equal(dispatcher.get(completionEventId)?.last_error_code,"notification_confirmed_not_sent");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET job_status='failed',notification_state='needs_review' WHERE notification_event_id=?").run(completionEventId);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[

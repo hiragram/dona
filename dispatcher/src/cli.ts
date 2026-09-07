@@ -14,6 +14,7 @@ function usage(): never {
   dona-dispatcher event retry <event_id> [--force]
   dona-dispatcher event complete <event_id>
   dona-dispatcher event reconcile-notification <event_id> <workspace_id> <channel_id> <message_ts> [thread_ts]
+  dona-dispatcher event reconcile-notification <event_id> not_sent
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
   dona-dispatcher job show <job_id>
@@ -86,6 +87,7 @@ async function main(): Promise<void> {
       return;
     }
     if(command==="reconcile-notification") {
+      if(args[3]==="not_sent") {console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventIdAt(args,2)),null,2));return;}
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6];
       console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})}),null,2));
       return;

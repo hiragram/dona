@@ -287,6 +287,7 @@ export class DispatcherApi {
       }
       const notificationAuthorization=/^\/v1\/job-notifications\/([^/]+)\/authorize$/.exec(url.pathname);
       if(request.method==="POST"&&notificationAuthorization) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting notification authorization while quiescing");
         const body=await this.readJson(request) as Record<string,unknown>;
         try {
           let decoded:Record<string,unknown>|undefined;
@@ -305,6 +306,7 @@ export class DispatcherApi {
       }
       const scheduledAccess=/^\/v1\/scheduled-jobs\/([^/]+)\/access$/.exec(url.pathname);
       if(request.method==="POST"&&scheduledAccess) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting scheduled access writes while quiescing");
         const body=await this.readJson(request) as Record<string,unknown>;
         try {
           const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
