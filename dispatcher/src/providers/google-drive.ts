@@ -67,6 +67,7 @@ const driveFileChangeSchema = z.object({
   driveId: z.string().min(1).max(256).optional(),
   file: z.strictObject({
     id: z.string().min(1).max(256),
+    mimeType: z.string().optional(),
     parents: z.array(z.string().min(1).max(256)).max(100).optional(),
     trashed: z.boolean().optional(),
   }).passthrough().optional(),
@@ -173,6 +174,7 @@ export async function drainDriveChanges(
   const snapshot = database.connections.pollingSnapshot(binding);
   let expected = snapshot.cursor;
   const members = new Set([...snapshot.membership,...(allowlist.priorFileIds ?? [])]);
+  const folderMembers = new Set(snapshot.folders);
   const seenPageTokens = new Set(snapshot.history);
   for (let batch = 0; batch < bounded.pages; batch++) {
     const remaining = Math.floor(deadline - performance.now());
@@ -191,7 +193,7 @@ export async function drainDriveChanges(
       raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true,
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
         pageSize: Math.min(1000, remainingEvents), signal,
-        fields: "changes(fileId,removed,changeType,time,driveId,file(id,parents,trashed)),nextPageToken,newStartPageToken" });
+        fields: "changes(fileId,removed,changeType,time,driveId,file(id,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
       const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;response?:unknown} : {};
       const response = typeof candidate.response === "object" && candidate.response !== null ? candidate.response as {status?:unknown} : undefined;
@@ -224,6 +226,9 @@ export async function drainDriveChanges(
         (change.driveId !== undefined && allowlist.driveIds.has(change.driveId));
       const leftUserFeed = feed.kind === "user" && change.driveId !== undefined && trackedBefore;
       const folderAllowed = (change.file?.parents ?? []).some((parent) => allowlist.folderIds.has(parent)||members.has(parent));
+      const isTrackedFolder=folderMembers.has(change.fileId);
+      if(isTrackedFolder&&(change.removed===true||change.file?.trashed===true||leftUserFeed))
+        throw new ConnectionError("operation_pending");
       if(change.file?.trashed===true&&(trackedBefore||folderAllowed||
         (change.driveId!==undefined&&allowlist.driveIds.has(change.driveId)))) throw new ConnectionError("operation_pending");
       const providerRemoved = change.removed === true;
@@ -239,29 +244,38 @@ export async function drainDriveChanges(
       events.push({ providerEventId: resourceChangeId(binding, change), envelope: envelope(binding, change, tombstone) });
       // 離脱検知が必要なfolder projectionだけを追跡する。file/drive allowlistは静的判定できる。
       if (folderAllowed && !providerRemoved&&!leftUserFeed) members.add(change.fileId); else members.delete(change.fileId);
+      if(change.file?.mimeType==="application/vnd.google-apps.folder"&&folderAllowed&&!providerRemoved&&!leftUserFeed)
+        folderMembers.add(change.fileId);
+      else if(providerRemoved||leftUserFeed)folderMembers.delete(change.fileId);
     }
     totalEvents += events.length;
     totalBytes += events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0);
     if (totalEvents > bounded.events || totalBytes > (bounded.bytes ?? 16_777_216)) throw new ConnectionError("incomplete_batch");
     const membershipChanges={add:[] as string[],remove:[] as string[]};
+    const folderMembershipChanges={add:[] as string[],remove:[] as string[]};
     for(const [member,wasMember] of touchedMembers){
       const isMember=members.has(member);
       if(!wasMember&&isMember)membershipChanges.add.push(member);
       if(wasMember&&!isMember)membershipChanges.remove.push(member);
+    }
+    for(const member of touchedMembers.keys()){
+      const wasFolder=snapshot.folders.includes(member),isFolder=folderMembers.has(member);
+      if(!wasFolder&&isFolder)folderMembershipChanges.add.push(member);
+      if(wasFolder&&!isFolder)folderMembershipChanges.remove.push(member);
     }
     if (parsed.data.nextPageToken !== undefined) {
       if (parsed.data.newStartPageToken !== undefined) throw new ConnectionError("incomplete_batch");
       if (seenPageTokens.has(parsed.data.nextPageToken)) throw new ConnectionError("incomplete_batch");
       // continuation tokenまでのchangeを先にdurable commitし、上限超過/restartでも前進可能にする。
       committedCheckpoint = parsed.data.nextPageToken;
-      return { done: true, checkpoint: parsed.data.nextPageToken, events, membershipChanges, continuation:true };
+      return { done: true, checkpoint: parsed.data.nextPageToken, events, membershipChanges, folderMembershipChanges, continuation:true };
     }
     if (parsed.data.newStartPageToken === undefined) throw new ConnectionError("incomplete_batch");
     if(seenPageTokens.has(parsed.data.newStartPageToken)&&
       !(parsed.data.newStartPageToken===pageToken&&parsed.data.changes.length===0)) throw new ConnectionError("incomplete_batch");
     final = true;
     committedCheckpoint = parsed.data.newStartPageToken;
-    return { done: true, checkpoint: parsed.data.newStartPageToken, events, membershipChanges };
+    return { done: true, checkpoint: parsed.data.newStartPageToken, events, membershipChanges, folderMembershipChanges };
     }, { ...bounded, pages: 1, events: remainingEvents, bytes: remainingBytes, timeoutMs: remaining }, expected);
     if (committedCheckpoint === undefined) throw new ConnectionError("incomplete_batch");
     expected = { revision: expected.revision, version: expected.version + 1,

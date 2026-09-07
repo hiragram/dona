@@ -5,8 +5,12 @@ export function migrateConnections(db: Database.Database): void {
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS connection_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)`);
     db.exec(`CREATE TABLE IF NOT EXISTS connection_resource_memberships (
-      connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, member TEXT NOT NULL,
-      PRIMARY KEY(connection_id,resource,member)
+      connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, revision INTEGER NOT NULL, member TEXT NOT NULL,
+      PRIMARY KEY(connection_id,resource,revision,member)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS connection_resource_folders (
+      connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, revision INTEGER NOT NULL, member TEXT NOT NULL,
+      PRIMARY KEY(connection_id,resource,revision,member)
     )`);
     db.exec(`CREATE TABLE IF NOT EXISTS connection_cursor_history (
       connection_id TEXT NOT NULL REFERENCES connections(id), resource TEXT NOT NULL, token TEXT NOT NULL,

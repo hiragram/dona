@@ -21,6 +21,7 @@ export interface CursorBatch {
   events: readonly { providerEventId: string; envelope: EventEnvelope }[];
   membership?: readonly string[];
   membershipChanges?: { add: readonly string[]; remove: readonly string[] };
+  folderMembershipChanges?: { add: readonly string[]; remove: readonly string[] };
   continuation?: boolean;
 }
 export class ConnectionRegistry {
@@ -335,14 +336,17 @@ export class ConnectionRegistry {
       { revision: c.revision, version: 0, checkpoint: null };
   }
   membership(id: string, resource: string): string[] {
-    return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? ORDER BY member")
-      .all(id,resource) as {member:string}[]).map(({member})=>member);
+    const revision=this.get(id).revision;
+    return (this.db.prepare("SELECT member FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND revision=? ORDER BY member")
+      .all(id,resource,revision) as {member:string}[]).map(({member})=>member);
   }
-  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[]; history: string[] } {
+  pollingSnapshot(binding: DeliveryBinding): { cursor: Cursor; membership: string[]; folders: string[]; history: string[] } {
     return this.db.transaction(() => {
       this.assertPolling(binding);
       return { cursor: this.cursor(binding.connectionId,binding.resource),
         membership: this.membership(binding.connectionId,binding.resource),
+        folders: (this.db.prepare("SELECT member FROM connection_resource_folders WHERE connection_id=? AND resource=? AND revision=?")
+          .all(binding.connectionId,binding.resource,binding.revision) as {member:string}[]).map(({member})=>member),
         history: (this.db.prepare("SELECT token FROM connection_cursor_history WHERE connection_id=? AND resource=?")
           .all(binding.connectionId,binding.resource) as {token:string}[]).map(({token})=>token) };
     }).immediate();
@@ -380,6 +384,9 @@ export class ConnectionRegistry {
       if(new Set(add).size!==add.length||new Set(remove).size!==remove.length||add.some((member)=>!identifier.safeParse(member).success)||
         remove.some((member)=>!identifier.safeParse(member).success)||add.some((member)=>remove.includes(member))) throw new ConnectionError("invalid_input");
     }
+    if(batch.folderMembershipChanges!==undefined){const {add,remove}=batch.folderMembershipChanges;
+      if(new Set(add).size!==add.length||new Set(remove).size!==remove.length||add.some((member)=>!identifier.safeParse(member).success)||
+        remove.some((member)=>!identifier.safeParse(member).success)||add.some((member)=>remove.includes(member)))throw new ConnectionError("invalid_input");}
     return this.db.transaction(() => {
       const b = batch.binding; const c = this.current(b.connectionId, b.revision, b.resource);
       if (!c.capability.cursor) throw new ConnectionError("capability_mismatch");
@@ -407,15 +414,21 @@ export class ConnectionRegistry {
         DO UPDATE SET revision=excluded.revision,version=excluded.version,checkpoint=excluded.checkpoint`)
         .run(c.id, b.resource, c.revision, cursor.version + 1, batch.checkpoint);
       if (batch.membership !== undefined) {
-        this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=?").run(c.id,b.resource);
-        const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?)");
-        for(const member of batch.membership) insert.run(c.id,b.resource,member);
+        this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND revision=?").run(c.id,b.resource,c.revision);
+        const insert=this.db.prepare("INSERT INTO connection_resource_memberships VALUES(?,?,?,?)");
+        for(const member of batch.membership) insert.run(c.id,b.resource,c.revision,member);
       }
       if(batch.membershipChanges!==undefined){
-        const remove=this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND member=?");
-        for(const member of batch.membershipChanges.remove)remove.run(c.id,b.resource,member);
-        const add=this.db.prepare("INSERT OR IGNORE INTO connection_resource_memberships VALUES(?,?,?)");
-        for(const member of batch.membershipChanges.add)add.run(c.id,b.resource,member);
+        const remove=this.db.prepare("DELETE FROM connection_resource_memberships WHERE connection_id=? AND resource=? AND revision=? AND member=?");
+        for(const member of batch.membershipChanges.remove)remove.run(c.id,b.resource,c.revision,member);
+        const add=this.db.prepare("INSERT OR IGNORE INTO connection_resource_memberships VALUES(?,?,?,?)");
+        for(const member of batch.membershipChanges.add)add.run(c.id,b.resource,c.revision,member);
+      }
+      if(batch.folderMembershipChanges!==undefined){
+        const remove=this.db.prepare("DELETE FROM connection_resource_folders WHERE connection_id=? AND resource=? AND revision=? AND member=?");
+        for(const member of batch.folderMembershipChanges.remove)remove.run(c.id,b.resource,c.revision,member);
+        const add=this.db.prepare("INSERT OR IGNORE INTO connection_resource_folders VALUES(?,?,?,?)");
+        for(const member of batch.folderMembershipChanges.add)add.run(c.id,b.resource,c.revision,member);
       }
       if (batch.continuation !== true)
         this.db.prepare("DELETE FROM connection_cursor_history WHERE connection_id=? AND resource=?").run(c.id,b.resource);

@@ -67,11 +67,13 @@ test("folder外へ移動しても明示file許可があれば通常配送してm
 test("追跡済みsubfolder直下の新規fileをsubtree memberとして取り込む",async(t)=>{
   const db=fixture(t); const allowlist={fileIds:new Set<string>(),folderIds:new Set(["folder-1"]),driveIds:new Set<string>()};
   await drainDriveChanges(db,binding,{list:async()=>({changes:[
-    {fileId:"subfolder",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"subfolder",parents:["folder-1"]}}],newStartPageToken:"next-1"})},allowlist);
+    {fileId:"subfolder",changeType:"file",time:"2026-09-07T00:00:00Z",file:{id:"subfolder",mimeType:"application/vnd.google-apps.folder",parents:["folder-1"]}}],newStartPageToken:"next-1"})},allowlist);
   await drainDriveChanges(db,binding,{list:async()=>({changes:[
     {fileId:"child",changeType:"file",time:"2026-09-07T00:00:01Z",file:{id:"child",parents:["subfolder"]}}],newStartPageToken:"next-2"})},allowlist);
   assert.equal(db.list().length,2);
   assert.deepEqual(db.connections.membership(channel.connectionId,channel.resource),["child","subfolder"]);
+  await assert.rejects(drainDriveChanges(db,binding,{list:async()=>({changes:[
+    {fileId:"subfolder",removed:true,changeType:"file",time:"2026-09-07T00:00:02Z"}],newStartPageToken:"next-3"})},allowlist),/operation_pending/);
 });
 
 test("changes省略の正常な空pageでもnewStartPageTokenをcommitする", async (t) => {
