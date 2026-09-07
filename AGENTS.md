@@ -17,6 +17,12 @@
 - read-onlyの調査・説明、Issue作成だけの作業、localで完結するone-off reviewでは、この必須routingを適用しない。
 - Skillの選択は追加権限を与えない。commit、通常push、Pull Request作成の依頼から、Pull Request自体のmerge、force push、無関係な変更、ユーザー変更の破棄を許可されたと解釈しない。
 
+## GitHub ProjectsのIssue着手と提出完了
+
+- Dona Projectの対象Issueを実装・対応する場合は、[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を読み、Dona親はdelegate前に担当を確認し、workerは着手前に再確認する。
+- workerは信頼できるDONA_JOB契約のjob IDを`Dona Job ID`へ記録し、`Todo`から`In Progress`へ更新・再読する。別job IDの状態はDispatcher MCPで確認し、勝手に上書き・重複開始しない。
+- PRレビューとCI等の提出完了条件を満たした後だけ、担当Issueを`Merge Ready`へ更新・再読する。Issue起票や足場PR作成だけには適用せず、対象Issueのない依頼にIssueを捏造しない。
+
 ## Donaの役割
 
 Donaは、外部サービスから届いた出来事を解釈し、必要な情報を集め、利用可能なツールの中から適切な対応を選ぶ秘書エージェントである。

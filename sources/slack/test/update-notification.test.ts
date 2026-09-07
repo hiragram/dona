@@ -29,6 +29,7 @@ const request: UpdateNotificationRequest = {
   notification_id: "update:upd_01m1es03xy5cf8d9pm5cwx4srv:terminal:2",
   request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv",
   terminal_fence: 2,
+  terminal_status: "succeeded",
   workspace_id: "T123",
   channel_id: "C123",
   thread_ts: "1756722030.123456",
@@ -119,6 +120,21 @@ describe("SlackUpdateNotificationReporter", () => {
       () => parseUpdateNotificationRequest({ ...request, text: "x".repeat(3_001) }),
       /notification is invalid/,
     );
+    const cancelled = {
+      ...request,
+      notification_id: `update:${request.request_id}:terminal:0`,
+      terminal_fence: 0,
+      terminal_status: "cancelled" as const,
+      desired_session_status: "active" as const,
+    };
+    assert.deepEqual(parseUpdateNotificationRequest(cancelled), cancelled);
+    assert.throws(
+      () => parseUpdateNotificationRequest({ ...cancelled, terminal_status: "failed" }),
+      /unclaimed cancellation/,
+    );
+    const missingStatus = { ...cancelled } as Record<string, unknown>;
+    delete missingStatus.terminal_status;
+    assert.throws(() => parseUpdateNotificationRequest(missingStatus), /unclaimed cancellation/);
   });
 
   test("reconciles an ambiguous partial delivery by identity block without posting twice", async () => {

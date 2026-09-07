@@ -19,6 +19,7 @@ import type {
   MainAgentStopResult,
   MainAgentStatus,
   OutboxRow,
+  SchemaRollout,
 } from "./types.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
@@ -48,6 +49,7 @@ export class RealGit implements GitPort {
     target_reachable: boolean;
     ci_trusted: boolean;
     target_compatibility: Compatibility;
+    target_rollout: SchemaRollout;
   }> {
     fullSha(currentSha, "current_sha");
     await fs.mkdir(this.policy.control_root, { recursive: true, mode: 0o700 });
@@ -77,6 +79,7 @@ export class RealGit implements GitPort {
       target_reachable: ancestry.exit_code === 0,
       ci_trusted: await this.verifyTrust(targetSha),
       target_compatibility: await this.readCompatibility(targetSha),
+      target_rollout: await this.readSchemaRollout(targetSha),
     };
   }
 
@@ -160,6 +163,29 @@ export class RealGit implements GitPort {
       "--git-dir", this.cachePath, "show", `${targetSha}:config/release-compatibility.json`,
     ]));
     return parseCompatibilityMetadata(JSON.parse(body));
+  }
+
+  private async readSchemaRollout(targetSha: string): Promise<SchemaRollout> {
+    const raw = requireSuccess("git show schema rollout", await this.git([
+      "--git-dir", this.cachePath, "show", `${targetSha}:config/schema-rollout.json`,
+    ]));
+    const value = JSON.parse(raw) as Partial<SchemaRollout>;
+    const commonValid = value.schema_version === 1 && typeof value.phase === "string" &&
+      Number.isInteger(value.database_schema) && typeof value.multi_job_enabled === "boolean";
+    const bootstrapValid = Array.isArray(value.capabilities) &&
+      value.capabilities.every((entry) => typeof entry === "string");
+    const migration = value.migration;
+    const activationValid = value.phase === "activation" &&
+      typeof value.previous_release_sha === "string" && /^[0-9a-f]{40}$/.test(value.previous_release_sha) &&
+      typeof value.previous_release_contract === "string" &&
+      typeof value.required_control_plane_capability === "string" && migration !== undefined &&
+      Number.isInteger(migration.from_schema) && Number.isInteger(migration.to_schema) &&
+      typeof migration.requires_quiesce === "boolean" && typeof migration.requires_drain === "boolean" &&
+      typeof migration.backup === "string" && typeof migration.restore_open_test === "boolean";
+    if (!commonValid || (!bootstrapValid && !activationValid)) {
+      throw new Error("target_schema_rollout_is_invalid");
+    }
+    return value as SchemaRollout;
   }
 }
 

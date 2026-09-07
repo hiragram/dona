@@ -53,6 +53,7 @@ async function main(): Promise<void> {
     config.updateInternalTokenPath,
     new SlackJobProgressReporter(registry, (progressId, deliveryToken) => dispatcher.resolveJobProgress(progressId, deliveryToken)),
     config.appSchemaWrite,
+    config.appSchemaReadMax,
   );
   await health.start();
   try {

@@ -19,6 +19,7 @@ const config: SlackAdapterConfig = {
   logLevel: "info",
   buildSha: "development",
   appSchemaWrite: 3,
+  appSchemaReadMax: 3,
 };
 const logger: SlackLogger = { debug() {}, info() {}, warn() {}, error() {} };
 

@@ -70,7 +70,25 @@ const updateEventEnvelopeSchema = z
   .strict()
   .refine((value) => value.subject.request_id === value.payload.request_id, "request_id mismatch")
   .refine((value) => value.external_event_id.startsWith(`update:${value.payload.request_id}:terminal:`), "external_event_id mismatch")
-  .refine((value) => value.type === `update_${value.payload.update_status}`, "type/status mismatch");
+  .refine((value) => value.type === `update_${value.payload.update_status}`, "type/status mismatch")
+  .superRefine((value, context) => {
+    const fence = Number(/:terminal:(\d+)$/.exec(value.external_event_id)?.[1]);
+    if (!Number.isSafeInteger(fence)) {
+      context.addIssue({ code: "custom", message: "terminal fence is invalid", path: ["external_event_id"] });
+      return;
+    }
+    if (fence === 0 && (
+      value.payload.update_status !== "cancelled" ||
+      value.payload.active_sha !== null ||
+      value.payload.error?.code !== "cancelled_by_operator"
+    )) {
+      context.addIssue({
+        code: "custom",
+        message: "terminal fence 0 is reserved for an unclaimed operator cancellation",
+        path: ["external_event_id"],
+      });
+    }
+  });
 
 const resultEnvelopeSchema = z
   .object({

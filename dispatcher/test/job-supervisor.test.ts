@@ -986,6 +986,298 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
+  test("stalled promptは再送せず同一agentのsequence進行から監視へ移る", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobPromptReconcileMs = 100;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-progress");
+    let prompts = 0;
+    let gets = 0;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() {
+        prompts += 1;
+        return failed("agent_prompt_stalled");
+      },
+      async get() {
+        gets += 1;
+        if (gets === 1) assert.equal(database.getJob(job.job_id)?.status, "preparing");
+        return {
+          ...ok(gets === 1 ? "idle" : "working"),
+          agentIdentity: '["w1","p1","agent"]',
+          stateChangeSeq: gets === 1 ? 10 : 11,
+        };
+      },
+      async wait() {
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return ok("done");
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => ["completed", "needs_review"].includes(database.getJob(job.job_id)?.status ?? ""));
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(updated.status, "completed", `${updated.last_error_code}: ${updated.last_error_message}`);
+    assert.equal(prompts, 1);
+    assert.equal(gets, 2);
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
+  test("stalled promptのidentity差し替えは再送せずneeds_reviewにする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root); config.jobPromptReconcileMs = 100;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-swap");
+    let prompts = 0;
+    let gets = 0;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompts += 1; return failed("agent_prompt_stalled"); },
+      async get() {
+        gets += 1;
+        return { ...ok("idle"), agentIdentity: gets === 1 ? "old" : "new", stateChangeSeq: gets };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    await supervisor.stop();
+    assert.equal(prompts, 1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "prompt_agent_identity_changed");
+    assert.equal(database.getJob(job.job_id)?.prompt_accepted_at, null);
+    database.close();
+  });
+
+  test("stalled prompt後の同一agentのblocked進行を受理済みとして保持する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-blocked");
+    let prompted = false;
+    const identity = '["w1","p1","agent","session-1"]';
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        return {
+          ...ok(prompted ? "blocked" : "idle"),
+          agentIdentity: identity,
+          stateChangeSeq: prompted ? 2 : 1,
+        };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "blocked");
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.ok(updated.prompt_accepted_at);
+    assert.equal(updated.last_error_code, "agent_blocked");
+    database.close();
+  });
+
+  test("stalled prompt後のidentity差し替え直前に完成したResultを優先する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-swap-result");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "old", stateChangeSeq: 1 };
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return { ...ok("idle"), agentIdentity: "new", stateChangeSeq: 2 };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await supervisor.stop();
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
+  test("stalled prompt後にResultが先行した場合はagentを待たず回収する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobPromptReconcileMs = 100;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-result-first");
+    let promptCount = 0;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() {
+        promptCount += 1;
+        return { ...failed("agent_prompt_stalled"), agentIdentity: "agent", stateChangeSeq: 1 };
+      },
+      async get() {
+        if (promptCount === 0) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => ["completed", "needs_review"].includes(database.getJob(job.job_id)?.status ?? ""));
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(updated.status, "completed", `${updated.last_error_code}: ${updated.last_error_message}`);
+    assert.equal(promptCount, 1);
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
+  test("stalled prompt後にidentityまたはsequenceの証明がなければneeds_reviewにする", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobPromptReconcileMs = 20;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-unchanged");
+    let promptCount = 0;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() {
+        promptCount += 1;
+        return { ...failed("agent_prompt_stalled"), agentIdentity: "agent", stateChangeSeq: 1 };
+      },
+      async get() {
+        return promptCount === 0
+          ? { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }
+          : { ...ok("working"), stateChangeSeq: 2 };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(promptCount, 1);
+    assert.equal(updated.last_error_code, "prompt_acceptance_unproven");
+    assert.equal(updated.prompt_accepted_at, null);
+    database.close();
+  });
+
+  test("stalled prompt後のagent消失またはread timeoutはneeds_reviewにする", async () => {
+    for (const [errorCode, timedOut, expected] of [
+      ["agent_not_found", false, "agent_not_found"],
+      ["timeout", true, "prompt_reconcile_timeout"],
+    ] as const) {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const database = new DispatcherDatabase(config.databasePath);
+      const job = createScratchJob(database, config, `Ev-stalled-${errorCode}`);
+      let prompted = false;
+      let reconcileTimeoutMs: number | undefined;
+      const runtime = fakeRuntime({
+        async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+        async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+        async get(_agentName, _signal, timeoutMs) {
+          if (prompted) reconcileTimeoutMs = timeoutMs;
+          return prompted
+            ? failed(errorCode, timedOut)
+            : { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        },
+      });
+      const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+      supervisor.start();
+      await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+      await supervisor.stop();
+      assert.equal(database.getJob(job.job_id)?.last_error_code, expected);
+      assert.equal(database.getJob(job.job_id)?.prompt_accepted_at, null);
+      assert.ok(reconcileTimeoutMs !== undefined && reconcileTimeoutMs <= config.jobPromptReconcileMs);
+      database.close();
+    }
+  });
+
+  test("stalled prompt後のread失敗直前に完成したResultを回収する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-result-at-timeout");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() {
+        await fs.mkdir(config.jobResultsDir, { recursive: true });
+        return { herdrWorkspaceId: "w1", herdrPaneId: "p1" };
+      },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get() {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        await fs.writeFile(job.result_path, JSON.stringify({
+          schema_version: 1,
+          job_id: job.job_id,
+          status: "completed",
+          summary: "完了",
+          completed_at: new Date().toISOString(),
+        }));
+        return failed("timeout", true);
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "completed");
+    await supervisor.stop();
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
+    database.close();
+  });
+
+  test("stalled promptの再照合中断をdispatchingに残さない", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-stop");
+    let prompted = false;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get(_agentName, signal) {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        if (signal?.aborted) return { ...failed("aborted"), aborted: true };
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return { ...failed("aborted"), aborted: true };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "dispatching");
+    await supervisor.stop();
+    const updated = database.getJob(job.job_id)!;
+    assert.equal(updated.status, "needs_review");
+    assert.equal(updated.last_error_code, "prompt_interrupted");
+    database.close();
+  });
+
   test("requires review when a terminal worker does not publish a result", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

@@ -66,6 +66,19 @@ describe("event validation", () => {
     assert.throws(() => parseEventEnvelope(envelope), /source/);
     assert.equal(parseInternalUpdateEventEnvelope(envelope).source, "dona_update");
     assert.throws(() => parseInternalUpdateEventEnvelope({ ...envelope, type: "update_succeeded" }), /type\/status mismatch/);
+    const cancelled = structuredClone(envelope);
+    cancelled.external_event_id = "update:upd_01m1es03xy5cf8d9pm5cwx4srv:terminal:0";
+    cancelled.type = "update_cancelled";
+    cancelled.payload.update_status = "cancelled";
+    cancelled.payload.error = { code: "cancelled_by_operator", message: "operator cancelled" };
+    assert.equal(parseInternalUpdateEventEnvelope(cancelled).type, "update_cancelled");
+    for (const invalid of [
+      { ...structuredClone(cancelled), type: "update_failed", payload: { ...cancelled.payload, update_status: "failed" } },
+      { ...structuredClone(cancelled), payload: { ...cancelled.payload, active_sha: "1".repeat(40) } },
+      { ...structuredClone(cancelled), payload: { ...cancelled.payload, error: { code: "other", message: null } } },
+    ]) {
+      assert.throws(() => parseInternalUpdateEventEnvelope(invalid), /unclaimed operator cancellation/);
+    }
   });
 });
 

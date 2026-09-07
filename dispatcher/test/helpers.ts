@@ -29,6 +29,7 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       jobConcurrencyPerEvent: 2,
       jobAgentStartTimeoutMs: 100,
       jobCommandTimeoutMs: 100,
+      jobPromptReconcileMs: 100,
       ghPath: "gh",
       gitPath: "git",
       updaterSocketPath: path.join(root, "update-control", "updater.sock"),

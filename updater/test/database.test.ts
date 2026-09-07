@@ -17,6 +17,32 @@ const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", cha
 const compatibility = { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true };
 
 describe("UpdateDatabase", () => {
+  test("emits a fence-zero terminal event when an awaiting plan is cancelled before claim", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const db = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true,
+    }, new Date("2026-09-02T00:00:00.000Z"));
+    const cancelled = db.requestCancellation(
+      created.row.request_id,
+      approvalEventId,
+      replyTarget,
+      "operator cancelled",
+      new Date("2026-09-02T00:00:01.000Z"),
+    );
+    const outbox = db.outboxFor(cancelled.request_id)!;
+    const envelope = JSON.parse(outbox.payload_json) as Record<string, any>;
+    assert.equal(cancelled.fence, 0);
+    assert.equal(outbox.external_event_id, `update:${cancelled.request_id}:terminal:0`);
+    assert.equal(envelope.type, "update_cancelled");
+    assert.equal(envelope.payload.update_status, "cancelled");
+    assert.equal(envelope.payload.active_sha, null);
+    assert.equal(envelope.payload.error.code, "cancelled_by_operator");
+    db.close();
+  });
+
   test("atomically migrates the released schema 1 database through schema 3", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

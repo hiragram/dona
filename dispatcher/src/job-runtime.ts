@@ -15,7 +15,7 @@ export interface PreparedJobRuntime {
 export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
@@ -83,14 +83,38 @@ function findAgentStatus(input: unknown): AgentStatus | undefined {
   return undefined;
 }
 
+function findAgentSessionId(input: unknown): string | undefined {
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const session = record.agent_session;
+  if (session !== null && typeof session === "object") {
+    const sessionRecord = session as Record<string, unknown>;
+    if (sessionRecord.kind === "id" && typeof sessionRecord.value === "string") return sessionRecord.value;
+  }
+  for (const value of Object.values(record)) {
+    const nested = findAgentSessionId(value);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
 function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentStatus">): HerdrCommandResult {
   const parsed = parseJson(base.ok ? base.stdout : base.stderr || base.stdout);
   const error = findValue(parsed, ["error_code", "code"]);
   const agentStatus = findAgentStatus(parsed);
+  const workspaceId = findValue(parsed, ["workspace_id"]);
+  const paneId = findValue(parsed, ["pane_id"]);
+  const agentName = findValue(parsed, ["agent_name", "name"]);
+  const agentSessionId = findAgentSessionId(parsed);
+  const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...base,
     ...(typeof error === "string" ? { errorCode: error } : {}),
     ...(agentStatus ? { agentStatus } : {}),
+    ...(agentSessionId === undefined ? {} : {
+      agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null, agentSessionId]),
+    }),
+    ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
 }
 
@@ -99,6 +123,7 @@ function runProcess(
   args: string[],
   timeoutMs: number,
   signal?: AbortSignal,
+  settleBeforeClose = false,
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -114,16 +139,22 @@ function runProcess(
       signal?.removeEventListener("abort", abort);
       resolve(resultFromProcess(base));
     };
-    const kill = (): void => {
-      if (!child.killed) child.kill("SIGTERM");
+    const terminate = (): void => {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      forceKill.unref();
     };
     const abort = (): void => {
       aborted = true;
-      kill();
+      terminate();
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      kill();
+      terminate();
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     }, timeoutMs);
     timer.unref();
     signal?.addEventListener("abort", abort, { once: true });
@@ -238,9 +269,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
-
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", agentName], this.config.jobCommandTimeoutMs, signal);
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal, true);
   }
 
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -269,12 +299,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
   }
 
-  private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  private herdr(
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+    settleBeforeClose = false,
+  ): Promise<HerdrCommandResult> {
     return runProcess(
       this.config.herdrPath,
       ["--session", this.config.herdrSession, ...args],
       timeoutMs,
       signal,
+      settleBeforeClose,
     );
   }
 

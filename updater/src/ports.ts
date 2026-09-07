@@ -11,6 +11,7 @@ import type {
   CompletionDeliveryResult,
   CompletionLookupResult,
   ReleaseManifest,
+  SchemaRollout,
   UpdateRow,
 } from "./types.js";
 
@@ -25,6 +26,7 @@ export interface GitPort {
     target_reachable: boolean;
     ci_trusted: boolean;
     target_compatibility: Compatibility;
+    target_rollout: SchemaRollout;
   }>;
   stage(targetSha: string, destination: string): Promise<void>;
   verifyStaged(destination: string, targetSha: string): Promise<void>;

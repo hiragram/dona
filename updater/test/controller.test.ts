@@ -16,6 +16,7 @@ import type {
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
+  SchemaRollout,
 } from "../src/types.js";
 import { currentSha, installPointers, logger, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
@@ -71,6 +72,23 @@ class FakeGit implements GitPort {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
     app_schema_write: 2, rollback_safe: true,
   };
+  targetRollout: SchemaRollout = {
+    schema_version: 1,
+    phase: "activation",
+    database_schema: 3,
+    multi_job_enabled: true,
+    previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
+    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+    migration: {
+      from_schema: 2,
+      to_schema: 3,
+      requires_quiesce: true,
+      requires_drain: true,
+      backup: "sqlite_online_backup",
+      restore_open_test: true,
+    },
+  };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
     return {
@@ -79,6 +97,7 @@ class FakeGit implements GitPort {
       target_reachable: this.reachable,
       ci_trusted: true,
       target_compatibility: this.targetCompatibility,
+      target_rollout: this.targetRollout,
     };
   }
   async stage(target: string, destination: string) {
@@ -827,6 +846,7 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: false,
       target_compatibility: policy.compatibility,
+      target_rollout: untrustedGit.targetRollout,
     });
     const untrusted = new UpdateController(database, policy, untrustedGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(untrusted.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /ci_trust_gate/);
@@ -837,6 +857,7 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: true,
       target_compatibility: { ...policy.compatibility, protocol: 2 },
+      target_rollout: incompatibleGit.targetRollout,
     });
     const incompatible = new UpdateController(database, policy, incompatibleGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(incompatible.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /approved_policy/);

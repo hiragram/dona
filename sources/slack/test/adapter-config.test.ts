@@ -27,11 +27,12 @@ describe("loadAdapterConfig", () => {
       const manifestPath = path.join(root, "release-manifest.json");
       await fs.writeFile(manifestPath, JSON.stringify({
         sha: "2".repeat(40),
-        compatibility: { app_schema_write: 2 },
+        compatibility: { app_schema_read_max: 3, app_schema_write: 2 },
       }));
       const config = loadAdapterConfig({ SLACK_WORKSPACES: "company", DONA_RELEASE_MANIFEST_PATH: manifestPath });
       assert.equal(config.buildSha, "2".repeat(40));
       assert.equal(config.appSchemaWrite, 2);
+      assert.equal(config.appSchemaReadMax, 3);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
