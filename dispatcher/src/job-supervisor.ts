@@ -90,7 +90,11 @@ export class JobSupervisor {
   private async stopLegacySharedGrantAgents():Promise<void> {
     for(const job of this.database.listLegacySharedGrantJobs()) {
       const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
-      if(!stopped.ok&&["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {this.database.markLegacySharedGrantAgentStopped(job.job_id);continue;}
+      if(!stopped.ok&&["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {
+        this.database.markLegacySharedGrantAgentStopped(job.job_id);
+        await this.tryComplete(this.database.getJob(job.job_id)!,false);
+        continue;
+      }
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
       const deadline=Date.now()+this.config.jobCommandTimeoutMs;
       let exited=false;
@@ -102,6 +106,7 @@ export class JobSupervisor {
       }
       if(!exited) throw new Error(`Legacy agent ${job.agent_name} exit was not observed`);
       this.database.markLegacySharedGrantAgentStopped(job.job_id);
+      await this.tryComplete(this.database.getJob(job.job_id)!,false);
     }
   }
 

@@ -578,7 +578,8 @@ export class DispatcherDatabase {
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const job=this.getJobRequired(jobId);
-    const recoverAmbiguous=job.status==="needs_review"&&["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted"].includes(job.last_error_code??"");
+    const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted"].includes(job.last_error_code??"")||
+      (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
     if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
       throw new Error("completed_at_precedes_prompt_dispatch");
     this.db.transaction(()=>{

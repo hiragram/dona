@@ -219,8 +219,12 @@ describe("DispatcherDatabase", () => {
     assert.equal(isolated.status,"needs_review"); assert.equal(isolated.last_error_code,"legacy_agent_sandbox_unknown");
     assert.equal(reopened.getJob(running.job_id)?.last_error_code,"legacy_agent_sandbox_unknown");
     assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),false);
+    const recoveredResult={schema_version:1 as const,job_id:running.job_id,status:"completed" as const,summary:"回収済み",completed_at:new Date().toISOString()};
+    assert.throws(()=>reopened.saveJobResult(running.job_id,recoveredResult,`${config.jobResultsDir}/${running.job_id}.json`),/Invalid status transition/);
     reopened.markLegacySharedGrantAgentStopped(running.job_id);
     assert.equal(reopened.isLegacySharedGrantAgentStopped(running.job_id),true);
+    reopened.saveJobResult(running.job_id,recoveredResult,`${config.jobResultsDir}/${running.job_id}.json`);
+    assert.equal(reopened.getJob(running.job_id)?.status,"completed");
     reopened.close();
   });
 });
