@@ -594,7 +594,8 @@ export class SchedulerRepository {
   }
   markWorkNotificationNeedsReview(runId:string,now:string):void {
     const run=this.getRun(runId);if(!run)return;const schedule=this.get(run.schedule_id)!;
-    const changed=this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=? AND state='active'").run(now,run.schedule_id).changes;
+    if(run.revision!==schedule.revision)return;
+    const changed=this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=? AND revision=? AND state='active'").run(now,run.schedule_id,run.revision).changes;
     if(changed===1)this.retireRevisions(run.schedule_id,now);
     this.audit(schedule,this.get(run.schedule_id)!,"work_notification_needs_review",{tenant_id:schedule.tenant_id,actor_id:"dispatcher",role:"admin",source_event_id:null},now,undefined,run);
   }

@@ -73,6 +73,27 @@ describe("DispatcherDatabase", () => {
     assert.throws(() => database.manualRetry(event.event_id, false), /--force/);
     assert.equal(database.manualRetry(event.event_id, true).status, "queued");
     await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json`));
+    await assert.rejects(fs.access(`${config.resultsDir}/${event.event_id}.json.retry-backup`));
+    database.close();
+  });
+
+  test("restores the Result when a manual retry transaction fails", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-retry-rollback")).row;
+    const resultPath = `${config.resultsDir}/${event.event_id}.json`;
+    database.beginDispatch(event.event_id, resultPath);
+    database.markNeedsReview(event.event_id, "prompt_timeout", "unknown acceptance");
+    await fs.mkdir(config.resultsDir,{recursive:true});
+    await fs.writeFile(resultPath,"old result");
+    const trigger = new Database(config.databasePath);
+    trigger.exec("CREATE TRIGGER reject_manual_retry BEFORE UPDATE ON events WHEN OLD.external_event_id = 'Ev-retry-rollback' BEGIN SELECT RAISE(ABORT, 'retry rejected'); END;");
+    trigger.close();
+    assert.throws(() => database.manualRetry(event.event_id, true), /retry rejected/);
+    assert.equal(await fs.readFile(resultPath,"utf8"),"old result");
+    await assert.rejects(fs.access(`${resultPath}.retry-backup`));
+    assert.equal(database.get(event.event_id)?.status,"needs_review");
     database.close();
   });
 

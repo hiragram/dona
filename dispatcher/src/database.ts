@@ -1094,16 +1094,26 @@ export class DispatcherDatabase {
     if (!["blocked", "needs_review", "dead_letter", "retryable_failed"].includes(row.status)) {
       throw new Error(`Event in status ${row.status} cannot be retried`);
     }
-    if(row.result_path) fs.rmSync(row.result_path,{force:true});
-    this.db.transaction(()=>{
-      this.db.prepare(`
-        UPDATE events SET status = 'queued', attempt_count = 0, available_at = ?,
-          dispatch_started_at = NULL, prompt_accepted_at = NULL, completed_at = NULL,
-          result_json = NULL, result_path = NULL, last_error_code = NULL,
-          last_error_message = NULL, updated_at = ? WHERE event_id = ?
-      `).run(at.toISOString(), at.toISOString(), eventId);
-      this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
-    }).immediate();
+    const resultBackupPath=row.result_path?`${row.result_path}.retry-backup`:null;
+    if(resultBackupPath&&fs.existsSync(resultBackupPath)) throw new Error("retry_result_backup_exists");
+    if(row.result_path&&fs.existsSync(row.result_path)) {
+      fs.renameSync(row.result_path,resultBackupPath!);
+    }
+    try {
+      this.db.transaction(()=>{
+        this.db.prepare(`
+          UPDATE events SET status = 'queued', attempt_count = 0, available_at = ?,
+            dispatch_started_at = NULL, prompt_accepted_at = NULL, completed_at = NULL,
+            result_json = NULL, result_path = NULL, last_error_code = NULL,
+            last_error_message = NULL, updated_at = ? WHERE event_id = ?
+        `).run(at.toISOString(), at.toISOString(), eventId);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
+      }).immediate();
+    } catch(error) {
+      if(row.result_path&&resultBackupPath&&fs.existsSync(resultBackupPath)&&!fs.existsSync(row.result_path)) fs.renameSync(resultBackupPath,row.result_path);
+      throw error;
+    }
+    if(resultBackupPath) fs.rmSync(resultBackupPath,{force:true});
     return this.getRequired(eventId);
   }
 

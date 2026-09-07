@@ -783,6 +783,19 @@ test("旧requestのreceiptは新revisionへ更新後も旧snapshot/hashに帰属
 
 });
 
+test("旧revisionのwork通知失敗は現行scheduleをneeds_reviewへ遷移させない", () => {
+  const { repo, raw, dispatcher } = setup();
+  repo.create("old_work_notification", { ...input, action: "work.read_only" }, due, actor, now);
+  const oldRun = repo.materialize("old_work_notification", 1, due, later, due, actor).run;
+  startWork(repo, dispatcher, raw, oldRun, due);
+  repo.transition("old_work_notification", 1, "pause", actor, due);
+  repo.update("old_work_notification", 2, { ...input, action: "work.read_only", authorization_id: "new_auth", authorization_revision: 3 }, later, actor, due);
+  repo.markWorkNotificationNeedsReview(oldRun.run_id, later);
+  assert.equal(repo.get("old_work_notification")?.state,"active");
+  assert.equal(repo.get("old_work_notification")?.revision,3);
+  assert.equal((repo.auditHistory("old_work_notification") as Array<{operation:string}>).filter(row=>row.operation==="work_notification_needs_review").length,0);
+});
+
 test("needs_reviewの未解決fenceを再承認で迂回できずadmin reconcile後だけ更新可能", () => {
   const { repo } = setup(); repo.create("s1", input, due, actor, now);
   repo.materialize("s1", 1, due, later, due, actor);
