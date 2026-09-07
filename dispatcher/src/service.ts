@@ -52,6 +52,9 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
     const pilot = config.notionPilot;
     const notionConnection = database.connections.get(pilot.connectionId);
     if (notionConnection.provider !== "notion") throw new Error("Notion pilot connection must use the notion provider");
+    if (notionConnection.capability.kind !== "manual" || notionConnection.capability.cursor) {
+      throw new Error("Notion pilot requires a manual non-cursor connection capability");
+    }
     if (notionConnection.allowlist.length !== 1) throw new Error("Notion pilot supports exactly one resource per connection");
     if (notionConnection.credentialRef === pilot.verificationCredentialRef) {
       throw new Error("Notion verification credential reference must be separate from the integration credential");

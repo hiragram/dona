@@ -186,7 +186,13 @@ export class DispatcherWorker {
         if (result.outcome === "permission_lost") {
           const updated = this.database.recordSafePromptFailure(row.event_id, "provider_fetch_permission_lost",
             "Provider access was revoked", this.config.maxAttempts);
-          await this.stateFetcher.quarantine?.(row);
+          try { await this.stateFetcher.quarantine?.(row); }
+          catch (error) {
+            this.logger.warn("Provider binding quarantine was deferred", {
+              event_id: row.event_id, error_code: "provider_quarantine_deferred",
+              error_message: error instanceof Error ? error.message : String(error),
+            });
+          }
           this.logTransition(dispatching, updated, started);
           return;
         }

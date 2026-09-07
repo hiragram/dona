@@ -117,6 +117,18 @@ describe("Notion ingress", () => {
       credentialRef: "cred_integration", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
     assert.throws(() => serviceExternalIngressRegistry(config, database), /notion provider/);
   });
+  test("Notion pilotはmanaged capabilityを起動時に拒否する", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-capability-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
+      DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
+        verificationCredentialRef: "cred_verify", secretStoreRoot: root }) });
+    const database = new DispatcherDatabase(config.databasePath); t.after(() => database.close());
+    database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
+      allowlist: [{ resource: "page_1", events: ["page.content_updated"] }], credentialRef: "cred_integration",
+      credentialRevision: 1, capability: { kind: "managed", cursor: false, renewal: "none" } });
+    assert.throws(() => serviceExternalIngressRegistry(config, database), /manual non-cursor/);
+  });
   test("pilot scope外の複数resource bindingを起動時に拒否する", (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-resources-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
