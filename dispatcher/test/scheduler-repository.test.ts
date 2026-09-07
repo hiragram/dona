@@ -429,6 +429,16 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
     ],completed_at:due},resultPath,new Date(due));
     assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   }
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000007",reply_broadcast:false},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
+    {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+  ],completed_at:due},resultPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
 });
 
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
@@ -515,15 +525,18 @@ test("authorization targetを復元できないscheduled workは委任を拒否�
 });
 
 test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {
-  const { repo, dispatcher, raw } = setup(); const objective = "旧eventの調査";
+  const { repo, dispatcher, raw, filename } = setup(); const objective = "旧eventの調査";
   const authorization=dispatcher.enqueue(eventEnvelope("legacy-work-authorization")).row;
   repo.create("legacy_work", { ...input, authorization_id:`${authorization.event_id}:1`,action: "work.read_only", target: { kind: "none" }, content: objective }, due, {...actor,source_event_id:authorization.event_id}, now);
   const run = repo.materialize("legacy_work", 1, due, later, due, actor).run;
-  raw.prepare("UPDATE events SET status='completed',completed_at=?,result_json='{}' WHERE event_id=?").run(due,run.event_id);
+  const legacyResult=path.join(path.dirname(filename),`${run.event_id}.json`); fs.writeFileSync(legacyResult,"old result");
+  raw.prepare("UPDATE events SET status='completed',completed_at=?,result_json='{}',result_path=? WHERE event_id=?").run(due,legacyResult,run.event_id);
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
   raw.prepare("DELETE FROM job_routing_schema").run();
-  migrateJobRouting(raw);
+  const reopened=new DispatcherDatabase(filename); reopened.close();
+  assert.equal(fs.existsSync(legacyResult),false);
+  assert.equal(fs.readFileSync(`${legacyResult}.routing-migration-backup`,"utf8"),"old result");
   const payload = JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{objective:string;scope:string}};
   assert.deepEqual(payload.work, { objective, scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" },authorization_target:{workspace_id:"T_TEST",channel_id:"C_TEST"} });
   assert.equal(dispatcher.get(run.event_id!)?.status,"queued");
@@ -1055,6 +1068,9 @@ test("failedのwork通知を残したschedule更新を拒否する", () => {
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   raw.prepare("UPDATE job_completion_results SET notification_state='failed' WHERE job_id=?").run(job.job_id);
   assert.throws(()=>repo.update("failed_notice_update",1,{...input,authorization_id:"failed_notice_auth",authorization_revision:2},later,actor,due),/reconcile_required/);
+  repo.purge("2026-10-06T00:00:00Z");
+  assert.ok(repo.getRun(run.run_id));
+  assert.match((raw.prepare("SELECT owner_json FROM job_completion_results WHERE job_id=?").get(job.job_id) as {owner_json:string}).owner_json,new RegExp(run.run_id));
 });
 
 test("公開run遷移はreminderのstartedとcompletedを拒否しoutboxを保持", () => {

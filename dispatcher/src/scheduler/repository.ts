@@ -1041,17 +1041,17 @@ export class SchedulerRepository {
       const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
       this.db.prepare(`DELETE FROM job_owner_bindings WHERE job_id IN
         (SELECT c.job_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline);
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','failed','needs_review'))`).run(metadataDeadline);
       this.db.prepare(`DELETE FROM event_job_bindings WHERE event_id IN
         (SELECT c.source_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline);
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','failed','needs_review'))`).run(metadataDeadline);
       this.db.prepare(`UPDATE events SET subject_json='{}',payload_json='{}',reply_target_json=NULL WHERE event_id IN
         (SELECT c.source_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review') UNION SELECT c.notification_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(metadataDeadline,metadataDeadline);
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','failed','needs_review') UNION SELECT c.notification_event_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','failed','needs_review'))`).run(metadataDeadline,metadataDeadline);
       this.db.prepare(`UPDATE job_completion_results SET owner_json=?,destination_json='{"kind":"none"}' WHERE rowid IN
         (SELECT c.rowid FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
-          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','needs_review'))`).run(deletedOwner,metadataDeadline);
+          WHERE r.terminal_at<=? AND c.notification_state NOT IN ('pending','failed','needs_review'))`).run(deletedOwner,metadataDeadline);
       this.db.prepare("DELETE FROM schedule_audit WHERE created_at <= ?").run(add(now, -7776000));
       this.db.prepare("DELETE FROM schedule_access_receipt_nonces WHERE consumed_at <= ?").run(add(now,-86400));
       // Unresolved fences and references survive metadata retention. No deletion can resurrect a wake:
@@ -1059,7 +1059,7 @@ export class SchedulerRepository {
       this.db.prepare(`DELETE FROM schedule_runs WHERE terminal_at <= ? AND NOT EXISTS
         (SELECT 1 FROM connector_outbox o WHERE o.run_id = schedule_runs.run_id AND (o.terminal_at IS NULL OR o.terminal_at > ?))
         AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id
-          AND c.notification_state IN ('pending','needs_review'))`)
+          AND c.notification_state IN ('pending','failed','needs_review'))`)
         .run(add(now, -2592000), add(now, -2592000));
       this.db.prepare(`DELETE FROM schedules WHERE terminal_at <= ? AND NOT EXISTS
         (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedules.schedule_id)`).run(add(now, -2592000));

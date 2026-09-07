@@ -59,7 +59,25 @@ export class DispatcherDatabase {
     try {
       this.migrate();
       migrateScheduler(this.db);
-      migrateJobRouting(this.db);
+      const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
+      const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
+      const eventColumns=new Set((this.db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
+      const legacyScheduleResults=!routingMarker&&["source","status","result_path"].every(column=>eventColumns.has(column))?(this.db.prepare(`SELECT e.result_path FROM events e JOIN schedule_runs r ON r.event_id=e.event_id
+        JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+        WHERE e.source='dona_schedule' AND e.status='completed' AND e.result_path IS NOT NULL AND v.action='work.read_only'
+          AND r.status='materialized' AND r.job_id IS NULL AND NOT EXISTS (SELECT 1 FROM jobs WHERE source_event_id=e.event_id)`).all() as Array<{result_path:string}>):[];
+      const movedResults:Array<{from:string;to:string}>=[];
+      try {
+        for(const row of legacyScheduleResults) if(fs.existsSync(row.result_path)) {
+          const backup=`${row.result_path}.routing-migration-backup`;
+          if(fs.existsSync(backup)) throw new Error("routing_migration_result_backup_exists");
+          fs.renameSync(row.result_path,backup); movedResults.push({from:row.result_path,to:backup});
+        }
+        migrateJobRouting(this.db);
+      } catch(error) {
+        for(const moved of movedResults.reverse()) if(fs.existsSync(moved.to)&&!fs.existsSync(moved.from)) fs.renameSync(moved.to,moved.from);
+        throw error;
+      }
       this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,stopped_at TEXT)");
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
@@ -1089,9 +1107,9 @@ export class DispatcherDatabase {
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
     const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
-    const processing=actions.find(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing");
+    const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatus=["blocked","needs_review"].includes(completion.job_status)?"suspended":"active";
-    const sessionSettled=!processing||actions.some(({index,value})=>index>(validPost?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
+    const sessionSettled=!processing||actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing.index)&&value.tool==="dona_slack.set_agent_session_status"&&value.status===terminalStatus&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
     return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&sessionSettled&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
