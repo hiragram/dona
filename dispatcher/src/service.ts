@@ -49,6 +49,10 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
   })] : [];
   if (config.notionPilot) {
     const pilot = config.notionPilot;
+    const notionConnection = database.connections.get(pilot.connectionId);
+    if (notionConnection.credentialRef === pilot.verificationCredentialRef) {
+      throw new Error("Notion verification credential reference must be separate from the integration credential");
+    }
     const secrets = new PrivateFileSecretStore(pilot.secretStoreRoot);
     registrations.push(createNotionRegistration({ connectionId: pilot.connectionId,
       verificationSecretRef: pilot.verificationCredentialRef,
@@ -179,7 +183,33 @@ export async function runService(
         };
         const children = await readChildren(resourceId, 0);
         if (!Array.isArray(children)) return children.failure;
-        return { ...resource, value: { ...resource.value, children, content_truncated: truncated } };
+        const propertyItems: Record<string, unknown[]> = {};
+        const properties = resource.value?.properties;
+        if (properties && typeof properties === "object") {
+          for (const property of Object.values(properties as Record<string, unknown>)) {
+            if (requests >= 100) { truncated = true; break; }
+            if (!property || typeof property !== "object" || typeof (property as Record<string, unknown>).id !== "string") continue;
+            const propertyId = String((property as Record<string, unknown>).id);
+            const items: unknown[] = [];
+            let cursor: string | undefined;
+            do {
+              if (requests >= 100) { truncated = true; break; }
+              requests += 1;
+              const url = new URL(`https://api.notion.com/v1/pages/${encodeURIComponent(resourceId)}/properties/${encodeURIComponent(propertyId)}`);
+              url.searchParams.set("page_size", "100");
+              if (cursor) url.searchParams.set("start_cursor", cursor);
+              const page = await request(url.toString());
+              if (page.status !== 200 || !page.value) return page;
+              if (Array.isArray(page.value.results)) items.push(...page.value.results);
+              else items.push(page.value);
+              cursor = page.value.has_more === true && typeof page.value.next_cursor === "string"
+                ? page.value.next_cursor : undefined;
+            } while (cursor);
+            propertyItems[propertyId] = items;
+          }
+        }
+        return { ...resource, value: { ...resource.value, children, property_items: propertyItems,
+          content_truncated: truncated } };
       } }, subject.entity_id);
     } finally { token.fill(0); }
   } } : undefined);

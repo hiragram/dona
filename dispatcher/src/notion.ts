@@ -153,7 +153,7 @@ export interface NotionReadClient {
 }
 const NOTION_FETCH_MAX_BYTES = 48 * 1024;
 const NOTION_FIELDS = new Set(["id", "object", "type", "url", "created_time", "last_edited_time", "archived",
-  "in_trash", "parent", "properties", "title", "description", "children", "results", "content_truncated"]);
+  "in_trash", "parent", "properties", "property_items", "title", "description", "children", "results", "content_truncated"]);
 
 function preview(value: unknown, maxBytes: number): { text: string; truncated: boolean } {
   const encoded = JSON.stringify(value);
@@ -170,24 +170,15 @@ function preview(value: unknown, maxBytes: number): { text: string; truncated: b
 export function normalizeNotionFetchValue(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
   const normalized: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    if (NOTION_FIELDS.has(key) && !["properties", "children", "results"].includes(key)) normalized[key] = item;
+    if (!NOTION_FIELDS.has(key)) continue;
+    if (["boolean", "number"].includes(typeof item) || item === null) normalized[key] = item;
+    else {
+      const result = preview(item, 6 * 1024);
+      normalized[`${key}_json`] = result.text;
+      if (result.truncated) normalized[`${key}_truncated`] = true;
+    }
   }
-  for (const key of ["properties", "children", "results"] as const) {
-    if (!(key in value)) continue;
-    const result = preview(value[key], 20 * 1024);
-    normalized[`${key}_json`] = result.text;
-    if (result.truncated) normalized[`${key}_truncated`] = true;
-  }
-  while (Buffer.byteLength(JSON.stringify(normalized)) > NOTION_FETCH_MAX_BYTES) {
-    const candidates = ["children_json", "properties_json", "results_json"]
-      .filter(key => typeof normalized[key] === "string")
-      .sort((a, b) => String(normalized[b]).length - String(normalized[a]).length);
-    if (candidates.length === 0) return { truncated: true };
-    const key = candidates[0]!;
-    normalized[key] = String(normalized[key]).slice(0, Math.max(0, String(normalized[key]).length - 256));
-    normalized[`${key.replace("_json", "")}_truncated`] = true;
-  }
-  return normalized;
+  return Buffer.byteLength(JSON.stringify(normalized)) <= NOTION_FETCH_MAX_BYTES ? normalized : { truncated: true };
 }
 export async function fetchLatestNotionState(client: NotionReadClient, resourceId: string): Promise<{
   outcome: NotionFetchOutcome; retryAfter?: number; value?: Readonly<Record<string, unknown>> }> {

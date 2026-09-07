@@ -204,10 +204,19 @@ export class DispatcherWorker {
         return;
       }
     }
+    const compactMetadata = { schema_version: metadata.schema_version, requires_fetch: metadata.requires_fetch,
+      delivery_count: metadata.delivery_count, deliveries: metadata.deliveries.slice(-100),
+      deliveries_truncated: metadata.deliveries.length > 100 };
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row)) + fetched +
-      (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(metadata)}\n${fetchedSuccessfully
+      (metadata.requires_fetch ? `\nqueue_metadata: ${JSON.stringify(compactMetadata)}\n${fetchedSuccessfully
         ? "このsignalは処理時点のresourceをfetch済みです。deliveryの集約をfetch完了とみなさず、PROVIDER_FETCHを評価してください。"
         : "このsignalは処理時点のresourceをfetchする必要があります。deliveryの集約をfetch完了とみなさないでください。"}` : "");
+    if (Buffer.byteLength(prompt) > 128 * 1024) {
+      const updated = this.database.recordSafePromptFailure(row.event_id, "prompt_too_large",
+        "Completed provider prompt exceeded the byte limit", this.config.maxAttempts);
+      this.logTransition(dispatching, updated, started);
+      return;
+    }
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(

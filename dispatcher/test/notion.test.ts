@@ -76,6 +76,19 @@ describe("Notion ingress", () => {
     assert.throws(() => loadConfig({ DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "../notion", integrationId: "int_1",
       verificationCredentialRef: "cred_verify", secretStoreRoot: "/tmp/secrets" }) }), /invalid/);
   });
+  test("verification credential refとintegration credential refの衝突を起動時に拒否する", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-notion-conflict-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const config = loadConfig({ DONA_DATABASE_PATH: path.join(root, "dispatcher.sqlite"),
+      DONA_NOTION_PILOT_CONFIG: JSON.stringify({ connectionId: "notion_test", integrationId: "int_1",
+        verificationCredentialRef: "cred_shared", secretStoreRoot: root }) });
+    const database = new DispatcherDatabase(config.databasePath);
+    t.after(() => database.close());
+    database.connections.register({ id: "notion_test", provider: "notion", account: "ws_1",
+      allowlist: [{ resource: "page_1", events: ["page.content_updated"] }],
+      credentialRef: "cred_shared", credentialRevision: 1, capability: { kind: "manual", cursor: false } });
+    assert.throws(() => serviceExternalIngressRegistry(config, database), /must be separate/);
+  });
   test("verification token is stored but omitted from the normalized event", async () => {
     const { registration, secret } = setup();
     const raw = request(Buffer.from(JSON.stringify({ verification_token: "secret-verification-token" })));
@@ -177,5 +190,8 @@ describe("Notion ingress", () => {
     const emptyContainers = normalizeNotionFetchValue({ children: Array.from({ length: 100_000 }, () => ({})) });
     assert.ok(Buffer.byteLength(JSON.stringify(emptyContainers)) <= 48 * 1024);
     assert.equal(emptyContainers.children_truncated, true);
+    const oversizedScalar = normalizeNotionFetchValue({ title: "x".repeat(100_000),
+      description: "y".repeat(100_000), properties: {} });
+    assert.ok(Buffer.byteLength(JSON.stringify(oversizedScalar)) <= 48 * 1024);
   });
 });
