@@ -79,7 +79,6 @@ export function serviceExternalIngressRegistry(config: DispatcherConfig, databas
           const supplied = Buffer.from(input.token);
           const matches = stored.length === supplied.length && timingSafeEqual(stored, supplied);
           stored.fill(0); supplied.fill(0);
-          if (matches) activate();
           return matches ? { binding: expected.delivery, providerEventId: eventId,
             occurredAt: new Date(snapshot.createdAt).toISOString() } : undefined;
         }
@@ -206,6 +205,7 @@ export async function runService(
               url.searchParams.set("page_size", "100");
               if (cursor) url.searchParams.set("start_cursor", cursor);
               const page = await request(url.toString());
+              if (page.status === 404) { truncated = true; break; }
               if (page.status !== 200 || !page.value) return page;
               if (Array.isArray(page.value.results)) items.push(...page.value.results);
               else items.push(page.value);

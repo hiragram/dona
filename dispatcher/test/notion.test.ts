@@ -69,6 +69,10 @@ describe("Notion ingress", () => {
     const signature = createHmac("sha256", "secret-verification-token").update(body).digest("hex");
     const event = await restarted.authenticate(request(body, signature));
     assert.equal(event.connection?.generation, 1);
+    database.connections.quarantine("notion_test", 1, "page_1", 1);
+    await restarted.authenticate({ body: verification, headers: [], method: "POST", receivedAt,
+      requestTarget: `/v1/ingress/notion?verification_attempt=${attempt}` });
+    assert.equal(database.connections.subscriptions("notion_test")[0]!.verifiedAt, null);
   });
 
   test("Notion起動configはpartial・不正識別子をfail closedにする", () => {
