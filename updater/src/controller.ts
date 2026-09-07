@@ -25,8 +25,7 @@ interface TerminalObservation {
 }
 
 function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
-  return previous.rollback_safe && target.rollback_safe &&
-    previous.protocol === target.protocol && previous.config === target.config &&
+  return previous.protocol === target.protocol && previous.config === target.config &&
     previous.app_schema_write >= target.app_schema_read_min && previous.app_schema_write <= target.app_schema_read_max &&
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
 }
@@ -80,8 +79,8 @@ export class UpdateController {
       built_at: this.clock.now().toISOString(),
       compatibility: git.target_compatibility,
     };
-    const rollbackCompatible = compatible(current.compatibility, targetManifest.compatibility);
-    if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (!compatible(current.compatibility, targetManifest.compatibility)) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    const rollbackCompatible = current.compatibility.rollback_safe && targetManifest.compatibility.rollback_safe;
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,
