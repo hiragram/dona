@@ -9,6 +9,7 @@ DISPATCHER_DIR="$REPO_DIR/dispatcher"
 SLACK_DIR="$REPO_DIR/sources/slack"
 NODE_PATH=$(command -v node)
 HERDR_PATH=$(command -v herdr)
+CODEX_PATH=$(command -v codex)
 GH_PATH=$(command -v gh)
 GIT_PATH=$(command -v git)
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -40,6 +41,7 @@ DISPATCHER_XML=$(escape_xml "$DISPATCHER_DIR")
 SLACK_XML=$(escape_xml "$SLACK_DIR")
 LOG_XML=$(escape_xml "$LOG_DIR")
 HERDR_XML=$(escape_xml "$HERDR_PATH")
+CODEX_XML=$(escape_xml "$CODEX_PATH")
 GH_XML=$(escape_xml "$GH_PATH")
 GIT_XML=$(escape_xml "$GIT_PATH")
 
@@ -59,6 +61,7 @@ cat > "$DISPATCHER_PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>DONA_HERDR_PATH</key><string>$HERDR_XML</string>
+    <key>DONA_CODEX_PATH</key><string>$CODEX_XML</string>
     <key>DONA_GH_PATH</key><string>$GH_XML</string>
     <key>DONA_GIT_PATH</key><string>$GIT_XML</string>
   </dict>

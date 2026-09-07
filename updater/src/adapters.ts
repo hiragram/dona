@@ -595,6 +595,7 @@ export class RealRuntime implements RuntimePort {
       DONA_UPDATER_SOCKET_PATH: path.join(this.policy.control_root, "updater.sock"),
       DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
       DONA_HERDR_PATH: this.policy.executables.herdr,
+      DONA_CODEX_PATH: this.policy.executables.codex,
       DONA_GH_PATH: this.policy.executables.gh,
       DONA_GIT_PATH: this.policy.executables.git,
     })}`;

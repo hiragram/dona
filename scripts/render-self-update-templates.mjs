@@ -28,6 +28,7 @@ const values = {
   GH: command("gh"),
   GIT: command("git", "/usr/bin/git"),
   HERDR: command("herdr"),
+  CODEX: command("codex"),
   CONTROL_ROOT: path.join(base, "update-control"),
   RUNTIME_ROOT: path.join(base, "runtime"),
   CONFIG_ROOT: path.join(base, "config"),
@@ -61,7 +62,7 @@ const policy = {
   main_agent: { session: "dona", name: "dona-main", minimum_herdr_version: "0.8.2" },
   launchd: { dispatcher_label: "dev.dona.dispatcher", slack_label: "dev.dona.slack-adapter" },
   executables: {
-    git: values.GIT, npm: values.NPM, node: values.NODE, launchctl: "/bin/launchctl", gh: values.GH, herdr: values.HERDR,
+    git: values.GIT, npm: values.NPM, node: values.NODE, launchctl: "/bin/launchctl", gh: values.GH, herdr: values.HERDR, codex: values.CODEX,
   },
   timeouts: {
     command_ms: 900000, health_ms: 30000, drain_ms: 30000, agent_drain_ms: 900000,
