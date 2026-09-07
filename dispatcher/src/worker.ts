@@ -284,7 +284,7 @@ export class DispatcherWorker {
     } catch (error) {
       if (error instanceof ResultNotFoundError && !terminalAgentState) return false;
       const current = this.database.get(row.event_id);
-      if (current?.status === "completed" && ["schedule_notification_suppressed","job_result_superseded"].includes(current.last_error_code??"")) return true;
+      if (current?.status === "completed" && ["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(current.last_error_code??"")) return true;
       this.database.markNeedsReview(
         row.event_id,
         error instanceof ResultNotFoundError ? "result_missing" : "invalid_result",

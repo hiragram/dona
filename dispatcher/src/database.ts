@@ -1124,7 +1124,7 @@ export class DispatcherDatabase {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
-      if(event.status==="completed"&&["schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
+      if(event.status==="completed"&&["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
       if(event.source==="dona_schedule") {
         const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
@@ -1151,7 +1151,7 @@ export class DispatcherDatabase {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
-      if(event.status==="completed"&&["schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
+      if(event.status==="completed"&&["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
       const delivery=this.notificationDelivered(eventId,result,acceptedAt);
       if(delivery.delivered) {

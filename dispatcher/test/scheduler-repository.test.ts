@@ -486,6 +486,22 @@ test("preflight中にblockedとなった通知をschedule取消で抑止する",
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {notification_state:string}).notification_state,"none");
 });
 
+test("pending認可前の通知をschedule pauseで抑止する", () => {
+  const {repo,dispatcher,raw,filename}=setup(),objective="認可前通知";
+  repo.create("notify_pending_pause",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_pending_pause",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
+  repo.transition("notify_pending_pause",1,"pause",actor,"2026-09-05T00:01:01Z");
+  assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"none");
+  dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"後着",completed_at:"2026-09-05T00:01:01Z"},resultPath,new Date("2026-09-05T00:01:01Z"));
+  assert.equal(dispatcher.get(eventId)?.last_error_code,"schedule_notification_suppressed");
+});
+
 test("job開始時の認可拒否はjobだけを戻してrun終端を確定する", () => {
   const { repo, dispatcher, raw } = setup(); const objective = "開始境界の調査";
   repo.create("start_fence", { ...input, action: "work.read_only", target: { kind: "none" }, content: objective }, due, actor, now);
@@ -564,6 +580,8 @@ test("job作成前のin-flight scheduled eventをschedule取消で抑止する",
     if(waiting) dispatcher.markWaiting(run.event_id!,new Date(due));
     repo.transition(scheduleId,1,"cancel",actor,"2026-09-05T00:01:01Z");
     assert.equal(dispatcher.get(run.event_id!)?.status,"completed");
+    assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");
+    dispatcher.saveCompleted(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"completed",completed_at:"2026-09-05T00:01:01Z"},`/tmp/${run.event_id}.json`,new Date("2026-09-05T00:01:01Z"));
     assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");
   }
 });
