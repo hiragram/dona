@@ -12,7 +12,7 @@ export type CursorPage = {
 
 // page token は一時変数だけ。最終 page の取得・検証成功まで永続checkpointを触らない。
 export async function pollConnectionBatch(database: DispatcherDatabase, binding: DeliveryBinding,
-  fetchPage: (checkpoint: string | null, page: string | null) => Promise<CursorPage>,
+  fetchPage: (checkpoint: string | null, page: string | null, signal: AbortSignal) => Promise<CursorPage>,
   limits: {pages:number;events:number;timeoutMs:number;bytes?:number} = { pages: 100, events: 10_000, timeoutMs: 30_000, bytes: 16_777_216 },
   initialExpected?: Cursor): Promise<void> {
   const byteLimit=limits.bytes??16_777_216;
@@ -28,11 +28,12 @@ export async function pollConnectionBatch(database: DispatcherDatabase, binding:
   for(let count=0;count<limits.pages;count++) {
     database.connections.assertPolling(binding);
     let result: CursorPage; let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller=new AbortController();
     try {
       const remaining=deadline-performance.now();
       if(remaining<=0) throw new ConnectionError("incomplete_batch");
-      result=await Promise.race([fetchPage(expected.checkpoint,page),new Promise<never>((_,reject)=>{
-        timer=setTimeout(()=>reject(new ConnectionError("incomplete_batch")),remaining);
+      result=await Promise.race([fetchPage(expected.checkpoint,page,controller.signal),new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>{controller.abort();reject(new ConnectionError("incomplete_batch"));},remaining);
       })]);
     } catch (error) {
       // providerが恒久的なcursor/credential失敗を分類した場合は、retryable batch失敗へ潰さない。

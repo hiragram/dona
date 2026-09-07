@@ -67,8 +67,6 @@ const driveFileChangeSchema = z.object({
   driveId: z.string().min(1).max(256).optional(),
   file: z.strictObject({
     id: z.string().min(1).max(256),
-    name: z.string().max(1024).optional(),
-    mimeType: z.string().max(256).optional(),
     parents: z.array(z.string().min(1).max(256)).max(100).optional(),
     trashed: z.boolean().optional(),
   }).passthrough().optional(),
@@ -90,7 +88,7 @@ const drivePageSchema = z.object({
 
 export interface DriveChangesClient {
   list(input: Readonly<{ pageToken: string; supportsAllDrives: true; includeItemsFromAllDrives: true;
-    driveId?: string; pageSize: number; fields: string }>): Promise<unknown>;
+    driveId?: string; pageSize: number; fields: string; signal: AbortSignal }>): Promise<unknown>;
 }
 
 export interface DriveAllowlist {
@@ -153,7 +151,7 @@ function envelope(binding: DeliveryBinding, change: z.infer<typeof driveFileChan
     payload: tombstone ? { removed: true, drive_id: null, file: null } : {
       removed: change.removed ?? false, drive_id: change.driveId ?? null,
       // changes.listのfile snapshotは再取得時に変わり得るため、Envelopeにはchange identityと同じ安定fieldだけを出す。
-      file: change.file === undefined ? null : { id: change.file.id },
+      file: { id: change.fileId },
     },
     reply_target: null,
   };
@@ -184,7 +182,7 @@ export async function drainDriveChanges(
     if (remainingEvents <= 0 || remainingBytes <= 0) throw new ConnectionError("incomplete_batch");
     let final = false;
     let committedCheckpoint: string | undefined;
-    await pollConnectionBatch(database, binding, async (checkpoint, page): Promise<CursorPage> => {
+    await pollConnectionBatch(database, binding, async (checkpoint, page, signal): Promise<CursorPage> => {
     const pageToken = page ?? checkpoint;
     if (pageToken === null) throw new ConnectionError("cursor_conflict");
     seenPageTokens.add(pageToken);
@@ -192,8 +190,8 @@ export async function drainDriveChanges(
     try {
       raw = await client.list({ pageToken, supportsAllDrives: true, includeItemsFromAllDrives: true,
         ...(feed.kind === "drive" ? { driveId: feed.driveId } : {}),
-        pageSize: Math.min(1000, remainingEvents),
-        fields: "changes(fileId,removed,changeType,time,driveId,file(id,name,mimeType,parents,trashed)),nextPageToken,newStartPageToken" });
+        pageSize: Math.min(1000, remainingEvents), signal,
+        fields: "changes(fileId,removed,changeType,time,driveId,file(id,parents,trashed)),nextPageToken,newStartPageToken" });
     } catch (error) {
       const candidate = typeof error === "object" && error !== null ? error as {status?:unknown;response?:unknown} : {};
       const response = typeof candidate.response === "object" && candidate.response !== null ? candidate.response as {status?:unknown} : undefined;
