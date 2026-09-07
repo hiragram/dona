@@ -8,6 +8,7 @@ export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
   authorizeJobNotification?(eventId:string):Promise<Record<string,unknown>>;
+  recordScheduleJobAccess?(eventId:string,input:unknown):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
@@ -160,6 +161,16 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   },async({event_id})=>{
     try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id)); }
     catch(error){return failure(error,logger,"authorize_job_notification");}
+  });
+
+  server.registerTool("record_schedule_job_access", {
+    title:"Record scheduled job access receipt",
+    description:"check_user_channel_access成功直後に、その完全一致receiptを一度だけ永続化します。成功後は直ちにdelegate_jobを呼びます。",
+    inputSchema:{event_id:eventId,workspace_id:z.string().min(1).max(160),channel_id:z.string().min(1).max(160),user_id:z.string().min(1).max(160),authorized:z.literal(true)},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+  },async({event_id,...input})=>{
+    try { if(!client.recordScheduleJobAccess) throw new Error("Schedule access recording is unavailable"); return success(await client.recordScheduleJobAccess(event_id,input)); }
+    catch(error){return failure(error,logger,"record_schedule_job_access");}
   });
 
   server.registerTool("steer_job", {

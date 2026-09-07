@@ -250,6 +250,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   dispatcher.beginDispatch(completionEventId,notificationPath,new Date(due)); dispatcher.markWaiting(completionEventId,new Date(due));
   assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due)).authorized,true);
   assert.equal(dispatcher.authorizeJobNotification(completionEventId,new Date(due)).authorized,true);
+  assert.throws(()=>dispatcher.authorizeJobNotification(completionEventId,new Date(due)),/schedule_notification_not_authorized/);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
@@ -328,6 +329,20 @@ test("job開始時の認可拒否はjobだけを戻してrun終端を確定す�
   raw.prepare("UPDATE schedules SET state='paused' WHERE schedule_id='start_fence'").run();
   assert.throws(() => dispatcher.createJob({ source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)), /no longer authorized/);
   assert.equal(dispatcher.listJobs().length, 0); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+});
+
+test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費する", () => {
+  const {repo,dispatcher}=setup(),objective="access receipt付き調査";
+  const authorization=dispatcher.enqueue(eventEnvelope("access-receipt-authorization")).row;
+  repo.create("access_receipt",{...input,authorization_id:`${authorization.event_id}:1`,action:"work.read_only",target:{kind:"none"},content:objective},due,{...actor,source_event_id:authorization.event_id},now);
+  const run=repo.materialize("access_receipt",1,due,later,due,actor).run;
+  dispatcher.beginDispatch(run.event_id!,"/tmp/access-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),/current access receipt/);
+  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_OTHER",user_id:"U_TEST",authorized:true},new Date(due)),/receipt_mismatch/);
+  assert.equal(dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},new Date(due)).authorized,true);
+  assert.throws(()=>dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},new Date(due)),/already_recorded/);
+  const created=dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
+  assert.equal(created.duplicate,false); assert.equal(dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).duplicate,true);
 });
 
 test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", () => {

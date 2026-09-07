@@ -23,7 +23,7 @@ export function migrateJobRouting(db: Database.Database): void {
     db.exec(`CREATE TABLE IF NOT EXISTS job_routing_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS event_job_bindings(event_id TEXT PRIMARY KEY REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT NOT NULL REFERENCES event_job_bindings(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS job_completion_results(job_id TEXT NOT NULL,job_status TEXT NOT NULL,source_event_id TEXT NOT NULL REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL,work_state TEXT NOT NULL,notification_state TEXT NOT NULL CHECK(notification_state IN ('none','pending','accepted','failed','needs_review')),notification_event_id TEXT REFERENCES events(event_id),materialized_at TEXT NOT NULL,content_delete_at TEXT NOT NULL,result_file_deleted_at TEXT,PRIMARY KEY(job_id,job_status));
+      CREATE TABLE IF NOT EXISTS job_completion_results(job_id TEXT NOT NULL,job_status TEXT NOT NULL,source_event_id TEXT NOT NULL REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL,work_state TEXT NOT NULL,notification_state TEXT NOT NULL CHECK(notification_state IN ('none','pending','accepted','failed','needs_review')),notification_authorization_phase TEXT NOT NULL DEFAULT 'none' CHECK(notification_authorization_phase IN ('none','preflight','write')),notification_event_id TEXT REFERENCES events(event_id),materialized_at TEXT NOT NULL,content_delete_at TEXT NOT NULL,result_file_deleted_at TEXT,PRIMARY KEY(job_id,job_status));
       CREATE INDEX IF NOT EXISTS job_owner_lookup_idx ON job_owner_bindings(owner_json);
       CREATE UNIQUE INDEX IF NOT EXISTS schedule_job_owner_idx ON event_job_bindings(json_extract(owner_json,'$.run_id')) WHERE json_extract(owner_json,'$.kind')='schedule';
       CREATE TRIGGER IF NOT EXISTS event_job_binding_immutable BEFORE UPDATE ON event_job_bindings BEGIN SELECT RAISE(ABORT,'event_job_binding_immutable'); END;
@@ -44,6 +44,7 @@ export function migrateJobRouting(db: Database.Database): void {
     if (marker && marker.version !== 1) throw new Error("Unsupported job routing schema");
     const completionColumns=new Set((db.prepare("PRAGMA table_info(job_completion_results)").all() as Array<{name:string}>).map(row=>row.name));
     if(!completionColumns.has("result_file_deleted_at")) db.exec("ALTER TABLE job_completion_results ADD COLUMN result_file_deleted_at TEXT");
+    if(!completionColumns.has("notification_authorization_phase")) db.exec("ALTER TABLE job_completion_results ADD COLUMN notification_authorization_phase TEXT NOT NULL DEFAULT 'none' CHECK(notification_authorization_phase IN ('none','preflight','write'))");
     const outboxColumns=new Set((db.prepare("PRAGMA table_info(connector_outbox)").all() as Array<{name:string}>).map(row=>row.name));
     if(!outboxColumns.has("completion_job_status")) db.exec("ALTER TABLE connector_outbox ADD COLUMN completion_job_status TEXT");
     db.exec("DROP TRIGGER IF EXISTS job_completion_outbox_insert; DROP TRIGGER IF EXISTS job_completion_outbox_update;");
@@ -60,6 +61,8 @@ export function migrateJobRouting(db: Database.Database): void {
         WHERE job_id=(SELECT job_id FROM schedule_runs WHERE run_id=NEW.run_id) AND job_status=NEW.completion_job_status;
       END;`);
     const eventColumns=new Set((db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
+    if(!eventColumns.has("schedule_access_checked_at")) db.exec("ALTER TABLE events ADD COLUMN schedule_access_checked_at TEXT");
+    if(!eventColumns.has("schedule_access_consumed_at")) db.exec("ALTER TABLE events ADD COLUMN schedule_access_consumed_at TEXT");
     if(!marker&&eventColumns.has("source")&&eventColumns.has("reply_target_json")) for (const row of db.prepare("SELECT * FROM events WHERE source='slack'").all() as EventRow[]) {
       const binding=legacySlackBinding(row); if(binding) insertEventJobBinding(db,row.event_id,binding);
     }

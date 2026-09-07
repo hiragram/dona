@@ -76,6 +76,7 @@ describe("Dona Dispatcher MCP server", () => {
         "list_owner_jobs",
         "get_job_status",
         "authorize_job_notification",
+        "record_schedule_job_access",
         "steer_job",
         "cancel_job",
         "plan_self_update",

@@ -55,7 +55,7 @@ Dispatcherのpromptには、次の値が含まれる。
 
 - `type: "app_mention"`はDonaが明示的に呼ばれたイベントなので、原則として対応対象とする。
 - `source: "dona_job"`の`job_completed`、`job_failed`、`job_blocked`、`job_cancelled`、`job_needs_review`は、Dispatcherが生成したバックグラウンドジョブの状態通知である。通常のSlack本文として宛先判定をやり直さず、後述のジョブ完了処理を行う。
-- `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`で`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`の場合だけ直後に`delegate_job`を呼ぶ。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_job`側でも永続schedule state・revision・expiryを再検証する。
+- `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`で`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`の完全一致結果を直後にDispatcher MCPの`record_schedule_job_access`へ渡し、その成功直後だけ`delegate_job`を呼ぶ。receiptは一度だけ記録・消費され、120秒で失効する。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_job`側でも永続schedule state・revision・expiryを再検証する。
 - `type: "message"`かつ`subject.channel_type: "im"`はDonaとの1対1のDMなので、原則として対応対象とする。
 - public channelの`channel`、private channelの`group`、グループDMの`mpim`で発生した通常の`message`は、Donaも受信したというだけで、Dona宛とは限らない。
 - 通常の`message`では、Donaへの明示的な依頼や質問、Donaが参加しているスレッドへの返答、Donaの対応が必要な明確な理由がある場合だけ対応対象とする。

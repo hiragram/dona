@@ -292,6 +292,14 @@ export class DispatcherApi {
         catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
         return;
       }
+      const scheduledAccess=/^\/v1\/scheduled-jobs\/([^/]+)\/access$/.exec(url.pathname);
+      if(request.method==="POST"&&scheduledAccess) {
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try { sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(decodeURIComponent(scheduledAccess[1]!),{
+          workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??""),authorized:body.authorized===true})}); }
+        catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
+        return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;

@@ -306,6 +306,15 @@ export class DispatcherDatabase {
           payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
         };
       }
+      if(binding.owner.kind==="schedule") {
+        const payload=JSON.parse(sourceEvent.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
+        if(payload.work?.authorization_target) {
+          const earliest=new Date(at.getTime()-120_000).toISOString();
+          const consumed=this.db.prepare(`UPDATE events SET schedule_access_consumed_at=? WHERE event_id=? AND schedule_access_checked_at>=?
+            AND schedule_access_checked_at<=? AND schedule_access_consumed_at IS NULL`).run(at.toISOString(),sourceEvent.event_id,earliest,at.toISOString()).changes;
+          if(consumed!==1) throw new Error("Scheduled work current access receipt is missing or expired");
+        }
+      }
 
       const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, request.objective);
       const workspacePath = request.workspace.kind === "scratch"
@@ -818,21 +827,37 @@ export class DispatcherDatabase {
     this.suppressUnauthorizedScheduledNotifications(at);
     return this.db.transaction(()=>{
       const timestamp=at.toISOString();
-      const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json FROM events e
+      const row=this.db.prepare(`SELECT e.status,c.owner_json,c.destination_json,c.notification_authorization_phase FROM events e
         JOIN job_completion_results c ON c.notification_event_id=e.event_id
         JOIN schedules s ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
         JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=json_extract(c.owner_json,'$.revision')
         WHERE e.event_id=? AND e.source='dona_job' AND e.status IN ('dispatching','waiting_agent')
-          AND c.notification_state IN ('pending','needs_review') AND json_extract(c.owner_json,'$.kind')='schedule'
+          AND ((c.notification_state='pending' AND c.notification_authorization_phase='none') OR
+            (c.notification_state='needs_review' AND c.notification_authorization_phase='preflight')) AND json_extract(c.owner_json,'$.kind')='schedule'
           AND julianday(c.materialized_at,'+900 seconds')>=julianday(?) AND s.state IN ('active','needs_review')
           AND s.revision=json_extract(c.owner_json,'$.revision') AND julianday(r.expires_at)>julianday(?)`).get(eventId,timestamp,timestamp) as
-        {status:string;owner_json:string;destination_json:string}|undefined;
+        {status:string;owner_json:string;destination_json:string;notification_authorization_phase:string}|undefined;
       if(!row) throw new Error("schedule_notification_not_authorized");
       if(row.status==="dispatching") this.markWaiting(eventId,at);
-      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=? AND notification_state='pending'").run(eventId);
+      const nextPhase=row.notification_authorization_phase==="none"?"preflight":"write";
+      this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase=? WHERE notification_event_id=?").run(nextPhase,eventId);
       const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number};
       return {authorized:true,event_id:eventId,owner_id:owner.owner_id,schedule_id:owner.schedule_id,revision:owner.revision,
         destination:JSON.parse(row.destination_json) as Record<string,unknown>};
+    }).immediate();
+  }
+
+  recordScheduleJobAccess(eventId:string,receipt:{workspace_id:string;channel_id:string;user_id:string;authorized:boolean},at=new Date()):Record<string,unknown> {
+    if(!receipt.authorized) throw new Error("schedule_access_not_authorized");
+    return this.db.transaction(()=>{
+      const event=this.getRequired(eventId),binding=readEventJobBinding(this.db,eventId);
+      const payload=JSON.parse(event.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
+      const target=payload.work?.authorization_target;
+      if(event.source!=="dona_schedule"||event.status!=="waiting_agent"||binding?.owner.kind!=="schedule"||receipt.user_id!==binding.owner.owner_id||
+        receipt.workspace_id!==target?.workspace_id||receipt.channel_id!==target.channel_id||event.schedule_access_consumed_at!==null) throw new Error("schedule_access_receipt_mismatch");
+      const changed=this.db.prepare("UPDATE events SET schedule_access_checked_at=? WHERE event_id=? AND schedule_access_checked_at IS NULL").run(at.toISOString(),eventId).changes;
+      if(changed!==1) throw new Error("schedule_access_receipt_already_recorded");
+      return {authorized:true,event_id:eventId,checked_at:at.toISOString()};
     }).immediate();
   }
 
@@ -989,7 +1014,7 @@ export class DispatcherDatabase {
   }
 
   private notificationDelivered(eventId:string,result:ResultEnvelope):{delivered:boolean;runId?:string} {
-    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string}|undefined;
+    const completion=this.db.prepare("SELECT owner_json,destination_json,notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string}|undefined;
     if(!completion)return {delivered:false};
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
@@ -998,7 +1023,7 @@ export class DispatcherDatabase {
     const authorized=actions.find(({value})=>value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
     const access=actions.find(({index,value})=>index>(authorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.check_user_channel_access"&&value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id);
     const reauthorized=actions.find(({index,value})=>index>(access?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_dispatcher.authorize_job_notification"&&value.authorized===true&&value.event_id===eventId);
-    return {delivered:!ambiguousPost&&completion.notification_state==="needs_review"&&actions.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&actions.some(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined)),...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string): void {
@@ -1064,7 +1089,7 @@ export class DispatcherDatabase {
           result_json = NULL, result_path = NULL, last_error_code = NULL,
           last_error_message = NULL, updated_at = ? WHERE event_id = ?
       `).run(at.toISOString(), at.toISOString(), eventId);
-      this.db.prepare("UPDATE job_completion_results SET notification_state='pending' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
+      this.db.prepare("UPDATE job_completion_results SET notification_state='pending',notification_authorization_phase='none' WHERE notification_event_id=? AND notification_state='failed'").run(eventId);
     }).immediate();
     return this.getRequired(eventId);
   }
