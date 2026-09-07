@@ -70,6 +70,21 @@ describe("DispatcherWorker", () => {
     await worker.stop(); database.close();
   });
 
+  test("does not retry when the event advances while prompt acceptance becomes unavailable",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-prompt-advanced")).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){await gate;return failed("agent_not_running");},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="dispatching");
+    database.markWaiting(event.event_id); release();
+    await waitFor(()=>database.get(event.event_id)?.status==="needs_review");
+    assert.equal(database.get(event.event_id)?.last_error_code,"prompt_acceptance_unknown");
+    assert.equal(worker.isRunning(),true);
+    await worker.stop(); database.close();
+  });
+
   for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
     const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;

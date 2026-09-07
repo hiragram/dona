@@ -185,6 +185,15 @@ export class DispatcherWorker {
       if (prompted.errorCode === "agent_blocked") {
         this.database.markBlocked(row.event_id, commandMessage(prompted), ["dispatching","waiting_agent"]);
       } else if (["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
+        if(afterPrompt.status==="waiting_agent") {
+          this.database.markNeedsReview(
+            row.event_id,
+            "prompt_acceptance_unknown",
+            "Agent became unavailable after the event advanced during prompt submission",
+          );
+          this.logCurrentTransition(dispatching, started);
+          return;
+        }
         const updated = this.database.recordSafePromptFailure(
           row.event_id,
           prompted.errorCode ?? "agent_not_found",
