@@ -104,7 +104,16 @@ export interface UpdatePlan {
   previous_sha: string | null;
   compatibility: Compatibility;
   rollback_compatible: boolean;
+  compatibility_transition: CompatibilityTransition | null;
   created_at: string;
+}
+
+export interface CompatibilityTransition {
+  from_sha: string;
+  from: Compatibility;
+  to: Compatibility;
+  previous_release_contract: string;
+  required_control_plane_capability: string;
 }
 
 export interface UpdateRow {
@@ -119,6 +128,7 @@ export interface UpdateRow {
   plan_hash: string;
   policy_version: string;
   compatibility_json: string;
+  transition_json?: string | null;
   rollback_compatible: number;
   approval_id: string | null;
   approval_event_id: string | null;

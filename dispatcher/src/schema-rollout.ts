@@ -20,7 +20,7 @@ export interface MigrationReceipt {
   backup: { opened: true; integrity_check: "ok"; foreign_key_violations: 0 };
   migrated: { integrity_check: "ok"; foreign_key_violations: 0; user_version: 3 };
   preservation: Record<string, { before: number; after: number; before_digest: string; after_digest: string }>;
-  rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: boolean };
+  rollback: { target_schema: 3; previous_release_can_read: boolean; backup_restore_opened: boolean };
   completed_at: string;
 }
 
@@ -102,8 +102,8 @@ export function assertSchemaActivationSafe(
   actualSchema: number,
 ): void {
   if (actualSchema !== 2) throw new Error("schema_activation_requires_v2_database");
-  if (previous.app_schema_read_min > 2 || previous.app_schema_read_max < 3 || previous.app_schema_write !== 2) {
-    throw new Error("previous_release_is_not_v2_v3_compatibility_bridge");
+  if (previous.app_schema_read_min > 2 || previous.app_schema_read_max < 2 || previous.app_schema_write !== 2) {
+    throw new Error("previous_release_cannot_supply_schema_v2_source");
   }
   if (target.app_schema_read_min > 2 || target.app_schema_read_max < 3 || target.app_schema_write !== 3) {
     throw new Error("target_release_is_not_v3_activation_release");
@@ -180,7 +180,11 @@ export async function migrateV2ToV3WithBackup(input: {
       backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
       migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
       preservation,
-      rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
+      rollback: {
+        target_schema: 3,
+        previous_release_can_read: input.previous.app_schema_read_min <= 3 && input.previous.app_schema_read_max >= 3,
+        backup_restore_opened: true,
+      },
       completed_at: input.completedAt ?? new Date().toISOString(),
     };
   } finally {

@@ -21,7 +21,7 @@ const bridge = { app_schema_read_min: 2, app_schema_read_max: 3, app_schema_writ
 const activation = { ...bridge, app_schema_write: 3 };
 
 test("unsafe schema activation combinations are rejected before a write", () => {
-  assert.throws(() => assertSchemaActivationSafe({ ...bridge, app_schema_read_max: 2 }, activation, 2), /compatibility_bridge/);
+  assert.throws(() => assertSchemaActivationSafe({ ...bridge, app_schema_read_min: 3 }, activation, 2), /schema_v2_source/);
   assert.throws(() => assertSchemaActivationSafe(bridge, { ...activation, app_schema_write: 2 }, 2), /activation_release/);
   assert.throws(() => assertSchemaActivationSafe({ ...bridge, rollback_safe: false }, activation, 2), /safe_rollback/);
   assert.throws(() => assertSchemaActivationSafe(bridge, activation, 3), /requires_v2/);
@@ -145,6 +145,40 @@ test("migration refuses to run before drain and never overwrites a backup", asyn
     databasePath: "/not/opened", backupPath: "/not/written", previous: bridge, target: activation,
     quiesced: false, drained: true,
   }), /quiesced_drained/);
+});
+
+test("v2-only source receipt requires backup restore instead of claiming direct rollback readability", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-v2-source-"));
+  roots.push(root);
+  const databasePath = path.join(root, "dispatcher.sqlite3");
+  const backupPath = path.join(root, "dispatcher.v2.sqlite3");
+  const db = new Database(databasePath);
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+  const receipt = await migrateV2ToV3WithBackup({
+    databasePath, backupPath,
+    previous: { ...bridge, app_schema_read_max: 2 }, target: activation,
+    quiesced: true, drained: true,
+  });
+  assert.equal(receipt.rollback.previous_release_can_read, false);
+  assert.equal(receipt.rollback.backup_restore_opened, true);
+
+  const receiptPath = path.join(root, "migration-receipt.json");
+  await publishMigrationReceipt(receiptPath, receipt);
+  await fs.copyFile(backupPath, databasePath);
+  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    databasePath, backupPath, receiptPath,
+    JSON.stringify({ ...bridge, app_schema_read_max: 2 }), JSON.stringify(activation),
+  ]);
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const exit = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  assert.equal(exit, 0, stderr);
+  const retried = new Database(databasePath, { readonly: true });
+  assert.equal(retried.pragma("user_version", { simple: true }), 3);
+  retried.close();
 });
 
 test("receipt publication is not blocked by a stale legacy temporary file", async () => {

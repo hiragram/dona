@@ -8,6 +8,7 @@ import { redactText } from "./redaction.js";
 import type {
   ApplyRequest,
   CommandResult,
+  CompatibilityTransition,
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
@@ -21,14 +22,16 @@ import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
 const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
+const productionV2SourceSha = "7dbaab72e3387f94f6c8a2289a685b90b100d083";
+const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_v1";
 const schemaV3ActivationRollout: SchemaRollout = {
   schema_version: 1,
   phase: "activation",
   database_schema: 3,
   multi_job_enabled: true,
-  previous_release_sha: schemaV3BridgeSha,
-  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  previous_release_sha: productionV2SourceSha,
+  previous_release_contract: "release-compatibility.production-v2.json",
+  required_control_plane_capability: schemaMigrationCapability,
   migration: {
     from_schema: 2,
     to_schema: 3,
@@ -62,9 +65,25 @@ function mainAgentMatches(agent: MainAgentObservation): boolean {
     agent.interactive_ready && agent.matches_release && agent.status !== null && agent.status !== "unknown";
 }
 
-function rolloutMatchesTargetCompatibility(rollout: SchemaRollout, compatibility: ReleaseManifest["compatibility"]): boolean {
+function rolloutMatchesTargetCompatibility(
+  rollout: SchemaRollout,
+  compatibility: ReleaseManifest["compatibility"],
+  transition?: UpdatePolicy["compatibility_transitions"][number],
+): boolean {
   if (compatibility.app_schema_write === 3) {
-    return canonicalJson(rollout) === canonicalJson(schemaV3ActivationRollout);
+    const expected = transition ? {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: transition.from_sha,
+      previous_release_contract: transition.previous_release_contract,
+      required_control_plane_capability: transition.required_control_plane_capability,
+    } : schemaV3ActivationRollout;
+    const legacyExpected = {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: schemaV3BridgeSha,
+      previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    };
+    return canonicalJson(rollout) === canonicalJson(expected) ||
+      (!transition && canonicalJson(rollout) === canonicalJson(legacyExpected));
   }
   return rollout.database_schema === 2 && !rollout.multi_job_enabled && rollout.phase !== "activation" &&
     Array.isArray(rollout.capabilities) && rollout.migration === undefined &&
@@ -97,10 +116,16 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
+    const transition = this.policy.compatibility_transitions.find((candidate) =>
+      candidate.from_sha === current.sha &&
+      canonicalJson(candidate.from) === canonicalJson(current.compatibility) &&
+      canonicalJson(candidate.to) === canonicalJson(git.target_compatibility) &&
+      candidate.required_control_plane_capability === git.target_rollout.required_control_plane_capability
+    );
+    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility) && !transition) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
-    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility)) {
+    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility, transition)) {
       throw new Error("target_schema_rollout_does_not_match_target_compatibility");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
@@ -116,11 +141,15 @@ export class UpdateController {
       compatibility: git.target_compatibility,
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
-    if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3 &&
+      !transition && current.sha !== schemaV3BridgeSha) {
+      throw new Error("schema_activation_bridge_identity_unverified");
+    }
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
-    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
-      if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
-      controlPlane = await this.runtime.schemaMigrationCapability();
+    if (transition || (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3)) {
+      const capability = transition?.required_control_plane_capability ?? schemaMigrationCapability;
+      controlPlane = await this.runtime.schemaMigrationCapability(capability);
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
@@ -132,6 +161,7 @@ export class UpdateController {
       policy_version: this.policy.policy_version,
       compatibility: targetManifest.compatibility,
       rollback_compatible: rollbackCompatible,
+      ...(transition ? { compatibility_transition: transition } : {}),
     }, this.clock.now());
     return {
       schema_version: 1,
@@ -140,7 +170,10 @@ export class UpdateController {
       plan: result.plan,
       preflight: {
         storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
-        ...(controlPlane ? { schema_migration_control_plane_sha: controlPlane.build_sha } : {}),
+        ...(controlPlane ? {
+          control_plane_capability: transition?.required_control_plane_capability ?? git.target_rollout.required_control_plane_capability,
+          schema_migration_control_plane_sha: controlPlane.build_sha,
+        } : {}),
       },
     };
   }
@@ -389,8 +422,16 @@ export class UpdateController {
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
     const targetCompatibility = JSON.parse(initial.compatibility_json) as ReleaseManifest["compatibility"];
+    const persistedTransition = initial.transition_json
+      ? JSON.parse(initial.transition_json) as CompatibilityTransition
+      : undefined;
     let mainAgentPaneId = this.database.runtimeOperation(row.request_id, "stop_main_agent")?.target_ref;
     this.assertLease(row);
+    if (persistedTransition && !this.policy.compatibility_transitions.some((candidate) =>
+      canonicalJson(candidate) === canonicalJson(persistedTransition))) {
+      this.needsReview(row, "approved_transition_no_longer_matches_policy");
+      return;
+    }
     if (row.state === "rolling_back") {
       await this.resumeRollback(row);
       return;
@@ -560,11 +601,19 @@ export class UpdateController {
       const previousManifest = await this.releases.readCurrentManifest();
       const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
-        if (previousManifest.sha !== schemaV3BridgeSha || previousManifest.sha !== row.current_sha) {
+        const approvedTransition = persistedTransition?.from_sha === previousManifest.sha &&
+          previousManifest.sha === row.current_sha &&
+          canonicalJson(persistedTransition.from) === canonicalJson(previousCompatibility) &&
+          canonicalJson(persistedTransition.to) === canonicalJson(targetCompatibility)
+          ? persistedTransition
+          : undefined;
+        const legacyExactBridge = previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
+        if (!approvedTransition && !legacyExactBridge) {
           this.needsReview(row, "schema_activation_bridge_identity_unverified");
           return;
         }
-        const controlPlane = await this.runtime.schemaMigrationCapability();
+        const capability = approvedTransition?.required_control_plane_capability ?? schemaMigrationCapability;
+        const controlPlane = await this.runtime.schemaMigrationCapability(capability);
         this.assertLease(row);
         if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
           await this.restoreQuiescedServices(row, "stable_updater_schema_migration_capability_unverified");

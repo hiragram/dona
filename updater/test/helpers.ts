@@ -55,6 +55,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
         app_schema_write: 2,
         rollback_safe: true,
       },
+      compatibility_transitions: [],
     },
   };
 }

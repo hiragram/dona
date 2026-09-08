@@ -38,6 +38,8 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
 
+schema境界を越えるtargetは、policyの`compatibility_transitions`へsource/target compatibilityと必要なcontrol-plane capabilityを完全一致で列挙します。旧形式policyは空のtransition集合として扱うため、従来どおり単一`compatibility`と一致するtarget以外をfail closedします。repository上のtransition追加だけではproduction policyやstable updaterは変化しません。guarded control-plane installを別途承認・実施してexact updater SHAとpolicyを確認した後に、新しいplanを生成します。これは`apply_self_update`、DB migration、pointer切替、service操作の承認を兼ねません。
+
 ## Reconcile
 
 crash、sleep/reboot、launchctl/HTTP response喪失後は同じcommandを繰り返しません。
@@ -88,7 +90,7 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 ## app DB schema v2→v3 rollout
 
-schema rolloutは通常の単発self-updateへ混ぜない。先行bridgeはcommit `61bc86f71726ce1f44fc3500e524203626cf869a`で、primary `config/release-compatibility.json`が`app_schema_write: 2`、`config/schema-rollout.json`が`multi_job_enabled: false`を宣言し、Dispatcher自身もrelease manifestのwrite versionが2ならv2をexpandしてlegacy single-jobを維持し、key付きmulti-jobを拒否する実在release sourceである。このexact SHAを通常のrelease build/CIで検証してから配布し、previous/targetの双方が`app_schema_read_min: 2`、`app_schema_read_max: 3`を公開したことをhealthで確認した後だけ、activation releaseへ進む。activation releaseは`app_schema_write: 3`とし、このbridgeだけをv3-compatible rollback targetにできる。
+schema rolloutは通常の単発self-updateへ混ぜない。production source `7dbaab72e3387f94f6c8a2289a685b90b100d083`は`config/release-compatibility.production-v2.json`どおりschema 2だけをread/writeするため、schema-v3 targetへの通常rollback互換性はない。`config/update-compatibility-transitions.json`へsource SHA、source/target compatibility、previous release contract、必要なcontrol-plane capabilityをexactに固定し、plannerとactivation直前の双方で同じtransitionを検証する。移行失敗時はv2 pointer rollbackを推測せず、Online Backup receiptと停止下restore境界へ従う。
 
 schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
 
@@ -98,7 +100,7 @@ migration/activation planは次の順序を崩さない。
 2. SQLite Online Backup APIで別fileへbackupする。WAL稼働中の`.sqlite3`単体copyは禁止する。
 3. backupをread-only openし、`user_version = 2`、`integrity_check = ok`、`foreign_key_check` 0件、row/Result/completion count一致を確認する。
 4. 単一transactionでv2→v3 migrationを実行し、同じ検査と保存件数、`user_version = 3`をreceiptへ記録する。
-5. previous releaseがv3をread可能であることを再確認してからmulti-job gateを有効化する。条件不一致、応答不明、既存backup path、検査失敗はactivation前に拒否し、writeをblind retryしない。
+5. previous releaseがv3をread可能ならpointer rollback可能性を確認してからmulti-job gateを有効化する。productionのv2-only transitionではpointer rollbackを行わず、検証済みOnline Backupを停止下でv2としてrestore-openできることをrollback条件とする。条件不一致、応答不明、未検証の既存backup path、検査失敗はactivation前に拒否し、writeをblind retryしない。
 
 `migrateV2ToV3WithBackup`は上記3〜4の機械的境界であり、pathをreceiptへ含めない。rollback rehearsalは、migration済みv3をcompatibility releaseが開けることと、Online Backupをv2としてrestore-openできることの両方を確認する。v2しかreadできないreleaseへpointer rollbackしてはならない。v3-compatible releaseへ戻せない場合だけservice停止下で検証済みbackupをrestoreする。
 

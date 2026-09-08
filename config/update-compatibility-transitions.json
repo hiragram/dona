@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "transitions": [
+    {
+      "from_sha": "7dbaab72e3387f94f6c8a2289a685b90b100d083",
+      "from": {
+        "protocol": 1,
+        "config": 1,
+        "app_schema_read_min": 2,
+        "app_schema_read_max": 2,
+        "app_schema_write": 2,
+        "rollback_safe": true
+      },
+      "to": {
+        "protocol": 1,
+        "config": 1,
+        "app_schema_read_min": 2,
+        "app_schema_read_max": 3,
+        "app_schema_write": 3,
+        "rollback_safe": true
+      },
+      "previous_release_contract": "release-compatibility.production-v2.json",
+      "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1"
+    }
+  ]
+}

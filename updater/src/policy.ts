@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { Compatibility } from "./types.js";
+import type { Compatibility, CompatibilityTransition } from "./types.js";
 import { fullSha, ValidationError } from "./validation.js";
 
 export interface UpdatePolicy {
@@ -51,6 +51,7 @@ export interface UpdatePolicy {
   required_checks: string[];
   require_verified_signature: boolean;
   compatibility: Compatibility;
+  compatibility_transitions: CompatibilityTransition[];
 }
 
 function absolute(value: unknown, name: string): string {
@@ -96,12 +97,15 @@ function compatibility(input: unknown): Compatibility {
 
 export function parsePolicy(input: unknown): UpdatePolicy {
   const value = record(input, "policy");
-  exact(value, [
+  const policyKeys = [
     "schema_version", "policy_version", "repository", "canonical_remote", "default_branch",
     "control_root", "config_root", "release_root", "current_pointer", "previous_pointer", "dispatcher_socket",
     "slack_socket", "dispatcher_internal_token_file", "main_agent", "launchd", "executables", "timeouts",
     "output_limit_bytes", "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
-  ], "policy");
+  ];
+  const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions"].includes(key));
+  const missing = policyKeys.filter((key) => !(key in value));
+  if (extras.length || missing.length) throw new ValidationError("policy fields do not match schema");
   if (value.schema_version !== 1 || value.repository !== "hiragram/dona" || value.default_branch !== "main") {
     throw new ValidationError("policy repository/default branch/schema are not supported");
   }
@@ -154,6 +158,39 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     throw new ValidationError("required_checks must contain all fixed Dona CI check names");
   }
   if (typeof value.require_verified_signature !== "boolean") throw new ValidationError("require_verified_signature must be boolean");
+  const transitions = value.compatibility_transitions === undefined ? [] : value.compatibility_transitions;
+  if (!Array.isArray(transitions)) throw new ValidationError("compatibility_transitions must be an array");
+  const compatibilityTransitions = transitions.map((input, index) => {
+    const transition = record(input, `compatibility_transitions[${index}]`);
+    exact(transition, ["from_sha", "from", "to", "previous_release_contract", "required_control_plane_capability"], `compatibility_transitions[${index}]`);
+    if (typeof transition.required_control_plane_capability !== "string" ||
+      !/^[a-z][a-z0-9_]{0,127}$/.test(transition.required_control_plane_capability)) {
+      throw new ValidationError(`compatibility_transitions[${index}] capability is invalid`);
+    }
+    if (typeof transition.previous_release_contract !== "string" ||
+      !/^release-compatibility\.[a-z0-9.-]+\.json$/.test(transition.previous_release_contract)) {
+      throw new ValidationError(`compatibility_transitions[${index}] previous release contract is invalid`);
+    }
+    const parsed = {
+      from_sha: fullSha(transition.from_sha),
+      from: compatibility(transition.from),
+      to: compatibility(transition.to),
+      previous_release_contract: transition.previous_release_contract,
+      required_control_plane_capability: transition.required_control_plane_capability,
+    };
+    if (parsed.from.protocol !== parsed.to.protocol || parsed.from.config !== parsed.to.config ||
+      parsed.from.app_schema_write !== 2 || parsed.to.app_schema_write !== 3 ||
+      parsed.from.app_schema_read_min > 2 || parsed.from.app_schema_read_max < 2 ||
+      parsed.to.app_schema_read_min > 2 || parsed.to.app_schema_read_max < 3 ||
+      !parsed.from.rollback_safe || !parsed.to.rollback_safe ||
+      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_v1") {
+      throw new ValidationError(`compatibility_transitions[${index}] is not a supported v2 to v3 migration`);
+    }
+    return parsed;
+  });
+  const transitionKeys = compatibilityTransitions.map(({ from_sha, from, to }) =>
+    JSON.stringify({ from_sha, from, to }));
+  if (new Set(transitionKeys).size !== transitionKeys.length) throw new ValidationError("compatibility_transitions contains duplicates");
   return {
     schema_version: 1,
     policy_version: value.policy_version,
@@ -194,6 +231,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     required_checks: [...requiredChecks] as string[],
     require_verified_signature: value.require_verified_signature,
     compatibility: compatibility(value.compatibility),
+    compatibility_transitions: compatibilityTransitions,
   };
 }
 

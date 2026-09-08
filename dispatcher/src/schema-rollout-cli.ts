@@ -18,6 +18,8 @@ import {
 async function main(): Promise<void> {
   const [databasePath, backupPath, receiptPath, previousJson, targetJson] = process.argv.slice(2);
   if (!databasePath || !backupPath || !receiptPath || !previousJson || !targetJson) throw new Error("schema_rollout_arguments_invalid");
+  const previous = JSON.parse(previousJson) as SchemaCompatibility;
+  const target = JSON.parse(targetJson) as SchemaCompatibility;
   await fs.mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(backupPath), 0o700);
   let reuseVerifiedBackup = false;
@@ -39,6 +41,7 @@ async function main(): Promise<void> {
     return;
   } catch (error) {
     if ((error as Error).message !== "schema_rollout_receipt_state_mismatch" &&
+      (error as Error).message !== "database_schema_2_does_not_match_3" &&
       (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   try {
@@ -78,7 +81,11 @@ async function main(): Promise<void> {
           before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
           after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
         }])),
-        rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
+        rollback: {
+          target_schema: 3,
+          previous_release_can_read: previous.app_schema_read_min <= 3 && previous.app_schema_read_max >= 3,
+          backup_restore_opened: true,
+        },
         completed_at: new Date().toISOString(),
       };
       await publishMigrationReceipt(receiptPath, recovered);
@@ -95,8 +102,8 @@ async function main(): Promise<void> {
   const receipt = await migrateV2ToV3WithBackup({
     databasePath,
     backupPath,
-    previous: JSON.parse(previousJson) as SchemaCompatibility,
-    target: JSON.parse(targetJson) as SchemaCompatibility,
+    previous,
+    target,
     quiesced: true,
     drained: true,
     reuseVerifiedBackup,

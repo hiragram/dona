@@ -96,6 +96,63 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   f.database.close();
 });
 
+test("plans an explicitly approved compatibility transition from the installed production contract", async () => {
+  const f = await fixture();
+  const sourceCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const targetCompatibility: Compatibility = {
+    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3,
+  };
+  f.policy.compatibility = sourceCompatibility;
+  f.policy.compatibility_transitions = [{
+    from_sha: currentSha,
+    from: sourceCompatibility,
+    to: targetCompatibility,
+    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  }];
+  f.git.targetCompatibility = targetCompatibility;
+  f.git.targetRollout = { ...activationRollout, previous_release_sha: currentSha };
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = targetSha;
+
+  const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+  assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, false);
+  assert.deepEqual(
+    (result.plan as { compatibility_transition: unknown }).compatibility_transition,
+    f.policy.compatibility_transitions[0],
+  );
+  const preflight = result.preflight as Record<string, unknown>;
+  assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
+  assert.equal(preflight.schema_migration_control_plane_sha, targetSha);
+  f.database.close();
+});
+
+test("does not require the v2 to v3 migration capability for a rollback-compatible write v3 to v2 plan", async () => {
+  const f = await fixture();
+  const targetCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const currentCompatibility: Compatibility = { ...targetCompatibility, app_schema_write: 3 };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: currentCompatibility })}\n`);
+  f.policy.compatibility = targetCompatibility;
+  f.git.targetCompatibility = targetCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1, phase: "compatibility", database_schema: 2,
+    multi_job_enabled: false, capabilities: ["schema_v3_read"],
+  };
+  f.runtime.schemaMigrationReady = false;
+
+  const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+  assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, true);
+  assert.equal("control_plane_capability" in (result.preflight as Record<string, unknown>), false);
+  f.database.close();
+});
+
 test("validates the post-activation rollout contract on schema-v3 to schema-v3 plans", async () => {
   const f = await fixture();
   const activationCompatibility: Compatibility = {
@@ -191,9 +248,12 @@ class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
   schemaMigrationReady = true;
   schemaMigrationBuildSha = targetSha;
-  async schemaMigrationCapability() {
+  async schemaMigrationCapability(capability: string) {
     this.calls.push("schemaMigrationCapability");
-    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null };
+    return {
+      ready: this.schemaMigrationReady && capability === "dispatcher_v2_to_v3_online_backup_v1",
+      build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null,
+    };
   }
   async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;
