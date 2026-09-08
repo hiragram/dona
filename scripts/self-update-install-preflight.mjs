@@ -136,6 +136,17 @@ export async function waitForUpdaterSha(socketPath, expectedSha, timeoutMs, expe
   throw new Error(`updater ${expectedSha} was not observed ready`);
 }
 
+export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
+  if(!/^[0-9a-f]{40}$/.test(expectedSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-dispatcher-sha arguments are invalid");
+  const deadline=Date.now()+timeoutMs;
+  do {
+    try { const health=await udsJson(socketPath,"/health/version",Math.min(2_000,timeoutMs)); if(health.status==="ready"&&health.service==="dispatcher"&&health.build_sha===expectedSha)return; }
+    catch { /* launchd activation and UDS publication are observed until the bounded deadline. */ }
+    await new Promise(resolve=>setTimeout(resolve,100));
+  } while(Date.now()<deadline);
+  throw new Error(`dispatcher ${expectedSha} was not observed ready`);
+}
+
 async function releaseTreeDigest(root) {
   const rootStats = await fs.lstat(root);
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error("release comparison root is invalid");
@@ -202,7 +213,7 @@ async function main() {
   const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
     console.error(
-      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-dispatcher-sha <socket> <sha> <timeout-ms> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
     );
     return 2;
   }
@@ -249,6 +260,10 @@ async function main() {
       console.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+  if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]) {
+    try { await waitForDispatcherSha(value,secondValue,Number(process.argv[5])); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "validate-existing-release" && secondValue && process.argv[5]) {
     try {

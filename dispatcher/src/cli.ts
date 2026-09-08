@@ -89,15 +89,16 @@ async function main(): Promise<void> {
     }
     if(command==="reconcile-notification") {
       if(args[3]==="not_sent") {
-        const eventId=eventIdAt(args,2),settlement=database.notificationSessionSettlementRequest(eventId);
+        const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId),settlement=database.notificationSessionSettlementRequest(eventId);
         if(settlement)await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement);
-        console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId),null,2));return;
+        console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,new Date(),claim),null,2));return;
       }
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6];
+      const claim=database.claimNotificationReconciliation(eventId);
       const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
       if(!verification) throw new Error("scheduled_notification_verification_unavailable");
       const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);
-      console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})}),null,2));
+      console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})},new Date(),claim),null,2));
       return;
     }
     if (command === "dead-letter") {

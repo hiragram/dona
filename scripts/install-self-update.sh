@@ -337,7 +337,8 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  if bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA" 30000 && \
+    bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"

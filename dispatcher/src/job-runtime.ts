@@ -255,7 +255,11 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (started.ok || started.errorCode !== "agent_pane_busy" || Date.now() >= deadline || signal?.aborted) break;
       await delay(200, signal);
     } while (true);
-    if (!started?.ok) throw commandError("Herdr agent start failed", started!);
+    if (!started?.ok) {
+      await this.herdr(["workspace","close",String(workspaceId)],this.config.jobCommandTimeoutMs+5_000).catch(()=>undefined);
+      if(workspace.kind==="scratch")await fs.rm(row.workspace_path,{recursive:true,force:true});
+      throw commandError("Herdr agent start failed", started!);
+    }
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 

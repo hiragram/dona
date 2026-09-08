@@ -53,7 +53,7 @@ function renderJobResult(result: Record<string, unknown> | null): string {
 
 function containsHostAbsolutePath(value:string):boolean {
   const withoutUrls=value.replace(/\bfile:\/\//gi,"").replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
-  return /(?:^|[^A-Za-z0-9._~-])\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
+  return /(?:^|[^A-Za-z0-9._~-])\/(?:Users|home|root|etc|var|private|tmp|opt|usr|Library|System|Applications|Volumes|dev|bin|sbin)(?:\/|\b)/.test(withoutUrls);
 }
 
 export class DispatcherDatabase {
@@ -1173,6 +1173,18 @@ export class DispatcherDatabase {
     return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:String(target.thread_ts??""),desired_session_status:["blocked","needs_review"].includes(completion.job_status)?"suspended":"active"};
   }
 
+  claimNotificationReconciliation(eventId:string):string {
+    const token=ulid().toLowerCase();
+    const changed=this.db.prepare(`UPDATE events SET last_error_code='operator_notification_reconcile_claimed',last_error_message=? WHERE event_id=?
+      AND COALESCE(last_error_code,'')!='operator_notification_reconcile_claimed' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=events.event_id AND c.notification_state IN ('failed','needs_review'))`).run(token,eventId).changes;
+    if(changed!==1)throw new Error("scheduled_notification_not_reconcilable");
+    return token;
+  }
+  private assertNotificationReconciliationClaim(eventId:string,token?:string):void {
+    const row=this.getRequired(eventId);
+    if(row.last_error_code==="operator_notification_reconcile_claimed"&&row.last_error_message!==token)throw new Error("scheduled_notification_reconcile_claim_conflict");
+  }
+
   private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date,evidence?:JobNotificationEvidence):{delivered:boolean;runId?:string} {
     const completion=this.db.prepare("SELECT job_status,owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
@@ -1201,7 +1213,7 @@ export class DispatcherDatabase {
     const receiptValid=evidence?.event_id===eventId&&evidence.workspace_id===target?.workspace_id&&evidence.channel_id===target?.channel_id&&evidence.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&
       evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&Number.isFinite(postedAt);
     const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
-    const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
+    const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)-5_000&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
     return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
@@ -1340,8 +1352,9 @@ export class DispatcherDatabase {
     return this.getRequired(eventId);
   }
 
-  reconcileScheduledNotification(eventId:string,receipt:{workspace_id:string;channel_id:string;message_ts:string;thread_ts?:string},at=new Date()):EventRow {
+  reconcileScheduledNotification(eventId:string,receipt:{workspace_id:string;channel_id:string;message_ts:string;thread_ts?:string},at=new Date(),claimToken?:string):EventRow {
     return this.db.transaction(()=>{
+      this.assertNotificationReconciliationClaim(eventId,claimToken);
       this.getRequired(eventId);
       const completion=this.db.prepare(`SELECT destination_json,notification_state FROM job_completion_results
         WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {destination_json:string;notification_state:string}|undefined;
@@ -1359,8 +1372,9 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  reconcileScheduledNotificationNotSent(eventId:string,at=new Date()):EventRow {
+  reconcileScheduledNotificationNotSent(eventId:string,at=new Date(),claimToken?:string):EventRow {
     return this.db.transaction(()=>{
+      this.assertNotificationReconciliationClaim(eventId,claimToken);
       this.getRequired(eventId);
       const completion=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id,notification_state FROM job_completion_results
         WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {run_id:string;notification_state:string}|undefined;
