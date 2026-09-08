@@ -426,6 +426,50 @@ test("Dona result通知を固定900秒期限・retry後・schedule取消でwrite
   }
 });
 
+test("blocked通知を期限で解放しone-shot scheduleをdrainする", () => {
+  for(const phase of ["none","write"] as const) {
+    const {repo,dispatcher,raw,filename}=setup(),scheduleId=`blocked_notice_${phase}`,objective="blocked通知";
+    repo.create(scheduleId,{...input,action:"work.read_only",content:objective},due,actor,now);
+    const run=repo.materialize(scheduleId,1,due,later,due,actor).run;
+    const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+    dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+    dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+    const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+    dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
+    if(phase==="write") raw.prepare("UPDATE job_completion_results SET notification_authorization_phase='write' WHERE job_id=?").run(job.job_id);
+    dispatcher.markBlocked(eventId,"入力待ち",undefined,new Date(due));
+    assert.equal(dispatcher.get(eventId)?.status,"blocked");
+    assert.equal(dispatcher.hasBlockedEvent(new Date("2026-09-05T00:16:01Z")),false);
+    assert.equal(dispatcher.get(eventId)?.status,phase==="write"?"needs_review":"completed");
+  }
+
+  const {repo,dispatcher,raw}=setup(),objective="one-shot完了";
+  repo.create("once_notice",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("once_notice",1,due,later,due,actor).run;
+  raw.prepare("UPDATE schedule_revisions SET recurrence_json=? WHERE schedule_id='once_notice'").run('{"at":"2026-09-05T00:01:00Z","kind":"once","version":1}');
+  raw.prepare("UPDATE schedules SET next_due=NULL WHERE schedule_id='once_notice'").run();
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  dispatcher.nextAvailable(new Date("2026-09-05T00:16:01Z"));
+  assert.equal(repo.get("once_notice")?.state,"completed");
+});
+
+test("retention後も通知reconcile claimをresumeできる", () => {
+  const {repo,dispatcher,raw,filename}=setup(),objective="claim保持";
+  repo.create("claim_retention",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("claim_retention",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.markJobNeedsReview(job.job_id,"ambiguous_job_result","確認待ち"); dispatcher.enqueueJobNotification(job.job_id,new Date(due));
+  const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  dispatcher.beginDispatch(eventId,path.join(path.dirname(filename),`${eventId}.json`),new Date(due));
+  dispatcher.markBlocked(eventId,"確認待ち",undefined,new Date(due));
+  const token=dispatcher.claimNotificationReconciliation(eventId);
+  repo.purge("2026-09-12T00:01:01Z");
+  assert.equal(dispatcher.claimNotificationReconciliation(eventId,true),token);
+});
+
 test("二段目認可から120秒を越えた通知Resultをacceptedにしない", () => {
   const {repo,dispatcher,raw,filename}=setup(); const objective="通知直前認可";
   repo.create("notify_write_expiry",{...input,action:"work.read_only",content:objective},due,actor,now);

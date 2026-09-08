@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { DispatcherApi } from "../src/api.js";
+import { DispatcherApi, scheduleAccessConfirmationTimeout } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
 import { UpdaterClientError } from "../src/updater-client.js";
@@ -58,6 +58,12 @@ function request(
 }
 
 describe("DispatcherApi", () => {
+  test("bounds live access confirmation by the signed receipt lifetime", () => {
+    const issuedAt="2026-09-08T00:00:00.000Z",issued=Date.parse(issuedAt);
+    assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued),119_000);
+    assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued+118_500),500);
+    assert.throws(()=>scheduleAccessConfirmationTimeout(issuedAt,issued+119_000),/receipt_expired/);
+  });
   test("persists before returning 202 and returns the same event for duplicates", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

@@ -30,6 +30,11 @@ async function confirmScheduleAccess(socketPath:string,internalToken:string,inpu
     const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
   });request.setTimeout(timeoutMs,()=>request.destroy(new Error("schedule_access_confirmation_timeout")));request.once("error",reject);request.end(encoded);});
 }
+export function scheduleAccessConfirmationTimeout(issuedAt:string,now=Date.now()):number {
+  const remaining=Date.parse(issuedAt)+120_000-now-1_000;
+  if(!Number.isFinite(remaining)||remaining<=0) throw new Error("schedule_access_receipt_expired");
+  return Math.min(140_000,remaining);
+}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -306,7 +311,7 @@ export class DispatcherApi {
             const eventId=decodeURIComponent(notificationAuthorization[1]!); if(claimed.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
             const issuedAt=String(claimed.issued_at??""),nonce=String(claimed.nonce??"");
             if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
-            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},140_000);
+            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
             decoded={...confirmed,issued_at:issuedAt,nonce};
           }
           sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??""),channel_kind:String(decoded.channel_kind??""),channel_user_id:decoded.channel_user_id===null?null:String(decoded.channel_user_id??"")}:undefined)});
@@ -327,7 +332,7 @@ export class DispatcherApi {
           const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
           const issuedAt=String(decoded.issued_at??""),nonce=String(decoded.nonce??"");
           if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
-          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},140_000);
+          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
           sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(confirmed.workspace_id??""),channel_id:String(confirmed.channel_id??""),user_id:String(confirmed.user_id??""),issued_at:issuedAt,nonce})});
         }
         catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }

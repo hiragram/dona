@@ -749,7 +749,7 @@ export class SchedulerRepository {
   private runCanSend(row: Outbox, run: Run): boolean {
     return row.kind === "slack.reminder.post" ? ["materialized", "started"].includes(run.status) : ["completed", "failed", "needs_review"].includes(run.status);
   }
-  private completeIfDrained(scheduleId: string, now: string): void {
+  completeIfDrained(scheduleId: string, now: string): void {
     const before = this.get(scheduleId)!;
     if (!["active", "paused", "expired", "needs_review"].includes(before.state) || before.next_due !== null || before.high_watermark === null ||
         (JSON.parse(this.revision(before).recurrence_json) as { kind: string }).kind !== "once") return;
@@ -1081,7 +1081,8 @@ export class SchedulerRepository {
         WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
           WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
           WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
-      this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,last_error_message=NULL
+      this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,
+        last_error_message=CASE WHEN last_error_code='operator_notification_reconcile_claimed' THEN last_error_message ELSE NULL END
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
           WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
       const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
