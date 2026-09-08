@@ -6,7 +6,8 @@ import type { JobNotificationEvidence,JobNotificationVerificationRequest } from 
 export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settleSession?(input:JobSessionSettlementRequest):Promise<Record<string,unknown>>; }
 export interface JobSessionSettlementRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended";}
 
-const deliveryConfirmationTimeoutMs=120_000;
+// Adapter側のbounded pagination（135秒）と最後のSlack call/session更新（各最大15秒）より長くする。
+const deliveryConfirmationTimeoutMs=180_000;
 
 async function token(path:string):Promise<string> {
   const stat=await fs.lstat(path);

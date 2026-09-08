@@ -242,6 +242,20 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   repo.update("review_work",1,{...input,action:"work.read_only",content:objective,authorization_id:"renewed",authorization_revision:2},"2026-09-08T00:01:00Z",actor,due);
 });
 
+test("workspace cleanup失敗のscheduled jobを再cleanup対象に保持する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="cleanup再試行";
+  repo.create("cleanup_retry",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);
+  const run=repo.materialize("cleanup_retry",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.setJobRuntime(job.job_id,"workspace-cleanup","pane-cleanup");
+  dispatcher.markJobNeedsReview(job.job_id,"workspace_cleanup_failed","workspace close failed");
+  dispatcher.enqueueJobNotification(job.job_id,new Date(due));
+  assert.equal(dispatcher.listTerminalScheduledJobsNeedingCleanup().some(row=>row.job_id===job.job_id),true);
+  dispatcher.markJobRuntimeCleaned(job.job_id);
+  assert.equal(dispatcher.getJob(job.job_id)?.herdr_workspace_id,null);
+});
+
 test("delegated needs_review eventのResultをcontent deadlineで削除する", () => {
   const {repo,dispatcher,raw,filename}=setup(); const objective="隔離Result";
   repo.create("review_retention",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);
@@ -763,12 +777,13 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
 });
 
 test("job作成前のin-flight scheduled eventをschedule取消で抑止する", () => {
-  for(const waiting of [false,true]) {
-    const {repo,dispatcher}=setup(),scheduleId=`inflight_${waiting}`;
+  for(const eventStatus of ["dispatching","waiting_agent","blocked"] as const) {
+    const {repo,dispatcher,raw}=setup(),scheduleId=`inflight_${eventStatus}`;
     repo.create(scheduleId,{...input,action:"work.read_only",content:"取消対象"},due,actor,now);
     const run=repo.materialize(scheduleId,1,due,later,due,actor).run;
     dispatcher.beginDispatch(run.event_id!,`/tmp/${run.event_id}.json`,new Date(due));
-    if(waiting) dispatcher.markWaiting(run.event_id!,new Date(due));
+    if(eventStatus==="waiting_agent") dispatcher.markWaiting(run.event_id!,new Date(due));
+    if(eventStatus==="blocked") raw.prepare("UPDATE events SET status='blocked' WHERE event_id=?").run(run.event_id);
     repo.transition(scheduleId,1,"cancel",actor,"2026-09-05T00:01:01Z");
     assert.equal(dispatcher.get(run.event_id!)?.status,"completed");
     assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"schedule_suppressed");

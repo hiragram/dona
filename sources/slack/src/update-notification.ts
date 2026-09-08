@@ -238,9 +238,10 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
     try { connection=this.registry.getByTeamId(input.workspace_id); }
     catch { throw new Error("unknown_workspace"); }
     if(!connection.botId&&!connection.botUserId) throw new Error("slack_bot_identity_unavailable");
-    const rootTs=input.thread_ts??input.message_ts;
+    const rootTs=input.thread_ts??input.message_ts,scanDeadline=Date.now()+135_000;
     let cursor:string|undefined,found:SlackThreadMessage|undefined; const seen=new Set<string>();
     do {
+      if(Date.now()>=scanDeadline) throw new Error("job_delivery_confirmation_deadline_exceeded");
       const page=await connection.client.getThread(input.channel_id,rootTs,200,cursor);
       for(const message of page.messages.filter(item=>item.ts===input.message_ts)) {
         if(found) throw new Error("duplicate_delivery_message");
@@ -249,6 +250,7 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       if(page.hasMore&&!page.nextCursor) throw new Error("slack_thread_pagination_incomplete");
       cursor=page.nextCursor; if(cursor&&seen.has(cursor)) throw new Error("slack_thread_pagination_repeated"); if(cursor)seen.add(cursor);
     } while(cursor);
+    if(Date.now()>=scanDeadline) throw new Error("job_delivery_confirmation_deadline_exceeded");
     const identity=`dona-job-${createHash("sha256").update(input.event_id).digest("hex").slice(0,32)}`;
     if(!found||!authoredByReporter(found,connection.botId,connection.botUserId)||createHash("sha256").update(found.text).digest("hex")!==input.body_sha256||found.threadTs!==(input.thread_ts??undefined)||found.subtype==="thread_broadcast"||!found.blockIds.includes(identity)) throw new Error("job_delivery_not_confirmed");
     let sessionStatus:"active"|"suspended"|null=null;

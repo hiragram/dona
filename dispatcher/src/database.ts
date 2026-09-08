@@ -509,14 +509,14 @@ export class DispatcherDatabase {
 
   listTerminalScheduledJobsNeedingCleanup(limit = 100): JobRow[] {
     return this.db.prepare(`SELECT DISTINCT j.* FROM jobs j JOIN job_completion_results c USING(job_id)
-      WHERE j.status IN ('completed','failed','cancelled') AND j.herdr_workspace_id IS NOT NULL
+      WHERE (j.status IN ('completed','failed','cancelled') OR (j.status='needs_review' AND j.last_error_code='workspace_cleanup_failed')) AND j.herdr_workspace_id IS NOT NULL
         AND json_extract(c.owner_json,'$.kind')='schedule' AND json_extract(j.workspace_json,'$.kind')='scratch'
       ORDER BY j.completed_at,j.job_id LIMIT ?`).all(limit) as JobRow[];
   }
 
   markJobRuntimeCleaned(jobId: string): void {
     this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
-      WHERE job_id=? AND status IN ('completed','failed','cancelled')`).run(nowUtc(),jobId);
+      WHERE job_id=? AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId);
   }
 
   listJobsNeedingNotification(limit = 100): JobRow[] {
