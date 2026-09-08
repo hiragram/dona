@@ -104,6 +104,8 @@ migration/activation planは次の順序を崩さない。
 
 `migrateV2ToV3WithBackup`は上記3〜4の機械的境界であり、pathをreceiptへ含めない。rollback rehearsalは、migration済みv3をcompatibility releaseが開けることと、Online Backupをv2としてrestore-openできることの両方を確認する。v2しかreadできないreleaseへpointer rollbackしてはならない。v3-compatible releaseへ戻せない場合だけservice停止下で検証済みbackupをrestoreする。
 
+初回migrationではbackupとreceiptが未作成であることを`lstat`で確認してからOnline Backupへ進む。再開時はregular fileとして存在するbackup/receiptだけを検査し、backup-onlyならlive DBとbackupがともに健全なschema v2で内容が一致する場合だけ再利用する。permission、I/O、symlink、corruption、未知のSQLite open errorを「未作成」へ降格しない。
+
 legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplicate` response、group metadataを持たない既存`dona_job` eventを維持する。CIのfixture/integration成功はlive Slack smokeではない。isolated threadでの2 success・1 attention、Agent Session遷移、集約返信を実Dona経路の両側で照合するまでProjectを`Merge Ready`にしない。
 
 ## Retention

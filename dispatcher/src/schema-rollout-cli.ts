@@ -15,6 +15,17 @@ import {
   type SchemaCompatibility,
 } from "./schema-rollout.js";
 
+async function optionalRegularFile(filePath: string, label: string): Promise<boolean> {
+  try {
+    const stats = await fs.lstat(filePath);
+    if (!stats.isFile() || stats.isSymbolicLink()) throw new Error(`${label}_is_not_a_regular_file`);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function main(): Promise<void> {
   const [databasePath, backupPath, receiptPath, previousJson, targetJson] = process.argv.slice(2);
   if (!databasePath || !backupPath || !receiptPath || !previousJson || !targetJson) throw new Error("schema_rollout_arguments_invalid");
@@ -23,7 +34,7 @@ async function main(): Promise<void> {
   await fs.mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(backupPath), 0o700);
   let reuseVerifiedBackup = false;
-  try {
+  if (await optionalRegularFile(receiptPath, "schema_rollout_receipt")) try {
     const existing = JSON.parse(await fs.readFile(receiptPath, "utf8")) as MigrationReceipt;
     if (existing.schema_version !== 1 || existing.from_schema !== 2 || existing.to_schema !== 3 ||
       existing.rollback?.backup_restore_opened !== true) throw new Error("schema_rollout_receipt_invalid");
@@ -41,10 +52,9 @@ async function main(): Promise<void> {
     return;
   } catch (error) {
     if ((error as Error).message !== "schema_rollout_receipt_state_mismatch" &&
-      (error as Error).message !== "database_schema_2_does_not_match_3" &&
-      (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      (error as Error).message !== "database_schema_2_does_not_match_3") throw error;
   }
-  try {
+  if (await optionalRegularFile(backupPath, "schema_rollout_backup")) {
     const migrated = new Database(databasePath, { readonly: true, fileMustExist: true });
     const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
     try {
@@ -59,45 +69,43 @@ async function main(): Promise<void> {
           JSON.stringify(contentSnapshot(backup)) !== JSON.stringify(contentSnapshot(migrated))) {
           throw new Error("schema_backup_content_mismatch");
         }
-        throw new Error("schema_rollout_backup_ready_for_migration");
+        reuseVerifiedBackup = true;
+      } else {
+        verifyDatabase(migrated, 3);
+        verifyDatabase(backup, 2);
+        const before = countSnapshot(backup);
+        const after = countSnapshot(migrated);
+        const beforeDigests = contentSnapshot(backup);
+        const afterDigests = contentSnapshot(migrated);
+        const backupStillMatches = JSON.stringify(before) === JSON.stringify(after) &&
+          JSON.stringify(beforeDigests) === JSON.stringify(afterDigests);
+        if (!backupStillMatches) throw new Error("schema_backup_content_mismatch");
+        const recovered: MigrationReceipt = {
+          schema_version: 1,
+          from_schema: 2,
+          to_schema: 3,
+          backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
+          migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
+          preservation: Object.fromEntries(Object.keys(before).map((name) => [name, {
+            before: before[name]!, after: after[name]!,
+            before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+            after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+          }])),
+          rollback: {
+            target_schema: 3,
+            previous_release_can_read: previous.app_schema_read_min <= 3 && previous.app_schema_read_max >= 3,
+            backup_restore_opened: true,
+          },
+          completed_at: new Date().toISOString(),
+        };
+        await publishMigrationReceipt(receiptPath, recovered);
+        process.stdout.write(`${JSON.stringify(recovered)}\n`);
+        return;
       }
-      verifyDatabase(migrated, 3);
-      verifyDatabase(backup, 2);
-      const before = countSnapshot(backup);
-      const after = countSnapshot(migrated);
-      const beforeDigests = contentSnapshot(backup);
-      const afterDigests = contentSnapshot(migrated);
-      const backupStillMatches = JSON.stringify(before) === JSON.stringify(after) &&
-        JSON.stringify(beforeDigests) === JSON.stringify(afterDigests);
-      if (!backupStillMatches) throw new Error("schema_backup_content_mismatch");
-      const recovered: MigrationReceipt = {
-        schema_version: 1,
-        from_schema: 2,
-        to_schema: 3,
-        backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
-        migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
-        preservation: Object.fromEntries(Object.keys(before).map((name) => [name, {
-          before: before[name]!, after: after[name]!,
-          before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
-          after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
-        }])),
-        rollback: {
-          target_schema: 3,
-          previous_release_can_read: previous.app_schema_read_min <= 3 && previous.app_schema_read_max >= 3,
-          backup_restore_opened: true,
-        },
-        completed_at: new Date().toISOString(),
-      };
-      await publishMigrationReceipt(receiptPath, recovered);
-      process.stdout.write(`${JSON.stringify(recovered)}\n`);
-      return;
     } finally {
       migrated.close();
       backup.close();
     }
-  } catch (error) {
-    if ((error as Error).message === "schema_rollout_backup_ready_for_migration") reuseVerifiedBackup = true;
-    else if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const receipt = await migrateV2ToV3WithBackup({
     databasePath,
