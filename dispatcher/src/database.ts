@@ -697,7 +697,7 @@ export class DispatcherDatabase {
         this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
       }
-      if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(completedAt.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
         result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
         last_error_code: result.status === "failed" ? "agent_reported_failure" : null,

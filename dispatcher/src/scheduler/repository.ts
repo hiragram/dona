@@ -623,6 +623,10 @@ export class SchedulerRepository {
     const schedule=this.get(run.schedule_id);
     if(!schedule||schedule.revision!==run.revision)return;
     const revision=this.revision(schedule);
+    if(revision.expires_at<=now) {
+      this.expireSchedule(schedule,{tenant_id:schedule.tenant_id,actor_id:"dispatcher",role:"admin",source_event_id:sourceEventId},now);
+      return;
+    }
     const contentAvailable=revision.content!==null&&(revision.content_delete_at===null||revision.content_delete_at>now);
     const activated=contentAvailable?this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes:0;
     if(activated===1) this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);

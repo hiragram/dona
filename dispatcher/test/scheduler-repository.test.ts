@@ -571,6 +571,20 @@ test("遅着work Result回収は削除済みcontentのscheduleを再有効化し
     .get(run.schedule_id,run.revision) as {content_delete_at:string}).content_delete_at,due);
 });
 
+test("遅着work Result回収は回収時点で期限切れのscheduleを再有効化しない", () => {
+  const {repo,dispatcher,raw}=setup();
+  repo.create("recover_expired_revision",{...input,action:"work.read_only",expires_at:"2026-09-05T00:03:00Z"},due,actor,now);
+  const run=repo.materialize("recover_expired_revision",1,due,later,due,actor).run;
+  startWork(repo,dispatcher,raw,run,due);
+  const jobId=repo.getRun(run.run_id)!.job_id!;
+  repo.markWorkRunNeedsReview(run.run_id,jobId,due,run.event_id!);
+  repo.recoverWorkRunForResult(run.run_id,jobId,run.event_id!,"2026-09-05T00:04:00Z");
+  assert.equal(repo.getRun(run.run_id)?.status,"started");
+  assert.equal(repo.get("recover_expired_revision")?.state,"expired");
+  assert.notEqual((raw.prepare("SELECT terminal_at FROM schedule_revisions WHERE schedule_id=? AND revision=?")
+    .get(run.schedule_id,run.revision) as {terminal_at:string|null}).terminal_at,null);
+});
+
 test("通知reconciliation時に期限切れrevisionをexpiredへ終端する", () => {
   const {repo,dispatcher,raw}=setup();
   repo.create("reconcile_expired",{...input,action:"work.read_only",expires_at:"2026-09-06T00:02:00Z"},due,actor,now);

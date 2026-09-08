@@ -5,6 +5,8 @@ import type { JobNotificationEvidence,JobNotificationVerificationRequest } from 
 
 export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>; }
 
+const deliveryConfirmationTimeoutMs=120_000;
+
 async function token(path:string):Promise<string> {
   const stat=await fs.lstat(path);
   if(!stat.isFile()||stat.isSymbolicLink()||stat.uid!==process.getuid?.()||(stat.mode&0o077)!==0) throw new Error("job_delivery_internal_token_unavailable");
@@ -25,7 +27,7 @@ export class SlackAdapterJobNotificationVerifier implements JobNotificationVerif
           resolve(body as unknown as JobNotificationEvidence);
         } catch(error){reject(error);}});
       });
-      request.setTimeout(this.config.jobCommandTimeoutMs,()=>request.destroy(new Error("job_delivery_confirmation_timeout")));
+      request.setTimeout(deliveryConfirmationTimeoutMs,()=>request.destroy(new Error("job_delivery_confirmation_timeout")));
       request.once("error",reject); request.end(encoded);
     });
   }
