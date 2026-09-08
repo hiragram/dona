@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 
@@ -86,7 +87,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
     rollback: { ...receipt.rollback, backup_restore_opened: false },
   }));
   const legacyReceiptChild = spawn(path.resolve("node_modules/.bin/tsx"), [
-    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath,
     backupPath,
     legacyReceiptPath,
@@ -124,7 +125,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
 
   const recoveryReceiptPath = path.join(root, "recovered-receipt.json");
   const child = spawn(path.resolve("node_modules/.bin/tsx"), [
-    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath,
     backupPath,
     recoveryReceiptPath,
@@ -167,7 +168,7 @@ test("v2-only source receipt requires backup restore instead of claiming direct 
   await publishMigrationReceipt(receiptPath, receipt);
   await fs.copyFile(backupPath, databasePath);
   const child = spawn(path.resolve("node_modules/.bin/tsx"), [
-    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath, backupPath, receiptPath,
     JSON.stringify({ ...bridge, app_schema_read_max: 2 }), JSON.stringify(activation),
   ]);
