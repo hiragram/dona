@@ -98,6 +98,7 @@ export class UpdateController {
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
     const transition = this.policy.compatibility_transitions.find((candidate) =>
+      candidate.from_sha === current.sha &&
       canonicalJson(candidate.from) === canonicalJson(current.compatibility) &&
       canonicalJson(candidate.to) === canonicalJson(git.target_compatibility) &&
       candidate.required_control_plane_capability === git.target_rollout.required_control_plane_capability
@@ -567,7 +568,14 @@ export class UpdateController {
       const previousManifest = await this.releases.readCurrentManifest();
       const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
-        if (previousManifest.sha !== schemaV3BridgeSha || previousManifest.sha !== row.current_sha) {
+        const approvedTransition = this.policy.compatibility_transitions.find((candidate) =>
+          candidate.from_sha === previousManifest.sha && previousManifest.sha === row.current_sha &&
+          canonicalJson(candidate.from) === canonicalJson(previousCompatibility) &&
+          canonicalJson(candidate.to) === canonicalJson(targetCompatibility)
+        );
+        const legacyExactBridge = this.policy.compatibility_transitions.length === 0 &&
+          previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
+        if (!approvedTransition && !legacyExactBridge) {
           this.needsReview(row, "schema_activation_bridge_identity_unverified");
           return;
         }

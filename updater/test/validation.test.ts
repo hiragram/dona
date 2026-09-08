@@ -58,6 +58,7 @@ describe("fixed self-update surface", () => {
       assert.throws(() => parsePolicy({ ...policy, executables: { ...policy.executables, herdr: "herdr" } }), /absolute/);
       assert.deepEqual(parsePolicy(policy).compatibility_transitions, []);
       const transition = {
+        from_sha: "1".repeat(40),
         from: policy.compatibility,
         to: { ...policy.compatibility, app_schema_read_max: 3, app_schema_write: 3 },
         required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",

@@ -2,6 +2,7 @@
   "schema_version": 1,
   "transitions": [
     {
+      "from_sha": "7dbaab72e3387f94f6c8a2289a685b90b100d083",
       "from": {
         "protocol": 1,
         "config": 1,

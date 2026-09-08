@@ -107,6 +107,7 @@ test("plans an explicitly approved compatibility transition from the installed p
   };
   f.policy.compatibility = sourceCompatibility;
   f.policy.compatibility_transitions = [{
+    from_sha: currentSha,
     from: sourceCompatibility,
     to: targetCompatibility,
     required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
