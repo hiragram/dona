@@ -85,6 +85,17 @@ describe("DispatcherWorker", () => {
     await worker.stop(); database.close();
   });
 
+  test("keeps an existing review fence when Result reading fails",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-result-review-race")).row;
+    const resultPath=path.join(config.resultsDir,`${event.event_id}.json`);
+    database.beginDispatch(event.event_id,resultPath); database.markWaiting(event.event_id); database.markNeedsReview(event.event_id,"notification_delivery_ambiguous","schedule changed");
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},config,logger);
+    const completed=await (worker as unknown as {tryComplete(row:typeof event,terminal:boolean):Promise<boolean>}).tryComplete({...event,status:"waiting_agent",result_path:resultPath},true);
+    assert.equal(completed,true); assert.equal(database.get(event.event_id)?.last_error_code,"notification_delivery_ambiguous");
+    database.close();
+  });
+
   for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
     const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;

@@ -652,7 +652,7 @@ export class DispatcherDatabase {
       validateWorkResultEnvelope(stableStringify(result));
       const rendered=renderJobResult(result as unknown as Record<string,unknown>);
       validateWorkResultContent(rendered);
-      if(rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+      if(/\/(?:Users|home|var|tmp|private)\//.test(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
       if((result.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
@@ -913,7 +913,7 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  authorizeJobNotification(eventId:string,at=new Date(),receipt?:{workspace_id:string;channel_id:string;user_id:string;issued_at:string;nonce:string}):Record<string,unknown> {
+  authorizeJobNotification(eventId:string,at=new Date(),receipt?:{workspace_id:string;channel_id:string;user_id:string;issued_at:string;nonce:string;channel_kind?:string;channel_user_id?:string|null}):Record<string,unknown> {
     this.suppressUnauthorizedScheduledNotifications(at);
     return this.db.transaction(()=>{
       const timestamp=at.toISOString();
@@ -928,9 +928,10 @@ export class DispatcherDatabase {
           AND s.revision=json_extract(c.owner_json,'$.revision') AND julianday(r.expires_at)>julianday(?)`).get(eventId,timestamp,timestamp) as
         {status:string;owner_json:string;destination_json:string;notification_authorization_phase:string;notification_preflight_authorized_at:string|null}|undefined;
       if(!row) throw new Error("schedule_notification_not_authorized");
-      const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number},destination=JSON.parse(row.destination_json) as {kind?:string;target?:{workspace_id?:string;channel_id?:string}};
+      const owner=JSON.parse(row.owner_json) as {owner_id:string;schedule_id:string;revision:number},destination=JSON.parse(row.destination_json) as {kind?:string;target?:{kind?:string;workspace_id?:string;channel_id?:string}};
       if(row.notification_authorization_phase==="none"&&receipt) throw new Error("schedule_notification_receipt_unexpected");
       if(row.notification_authorization_phase==="preflight"&&(!receipt||destination.kind!=="slack"||receipt.workspace_id!==destination.target?.workspace_id||receipt.channel_id!==destination.target.channel_id||receipt.user_id!==owner.owner_id||row.notification_preflight_authorized_at===null||Date.parse(receipt.issued_at)<Date.parse(row.notification_preflight_authorized_at)||Math.abs(at.getTime()-Date.parse(receipt.issued_at))>120_000)) throw new Error("schedule_notification_access_receipt_invalid");
+      if(row.notification_authorization_phase==="preflight"&&destination.target?.kind==="owner_dm"&&(receipt?.channel_kind!=="im"||receipt.channel_user_id!==owner.owner_id)) throw new Error("schedule_notification_access_receipt_invalid");
       if(row.notification_authorization_phase==="preflight"&&this.db.prepare("INSERT OR IGNORE INTO schedule_access_receipt_nonces(nonce,event_id,consumed_at) VALUES(?,?,?)").run(receipt!.nonce,eventId,timestamp).changes!==1)
         throw new Error("schedule_notification_access_receipt_already_consumed");
       if(row.status==="dispatching") this.markWaiting(eventId,at);
@@ -1136,7 +1137,7 @@ export class DispatcherDatabase {
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
-    const validPost=posts.find(({index,value})=>index>(reauthorized?.index??Number.MAX_SAFE_INTEGER)&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
+    const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
       const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatuses=["blocked","needs_review"].includes(completion.job_status)?["suspended"]:completion.job_status==="failed"?["active","suspended"]:["active"];
     const sessionSettled=actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing?.index??-1)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&terminalStatuses.includes(String(value.status))&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));

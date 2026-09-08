@@ -299,7 +299,7 @@ export class DispatcherApi {
             decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
             if(decoded.event_id!==decodeURIComponent(notificationAuthorization[1]!)) throw new Error("schedule_access_receipt_mismatch");
           }
-          sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??"")}:undefined)});
+          sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??""),channel_kind:String(decoded.channel_kind??""),channel_user_id:decoded.channel_user_id===null?null:String(decoded.channel_user_id??"")}:undefined)});
         }
         catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
         return;

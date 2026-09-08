@@ -445,6 +445,16 @@ test("二段目認可から120秒を越えた通知Resultをacceptedにしない
   ],completed_at:due},resultPath,new Date(due));
   assert.equal(dispatcher.get(eventId)?.last_error_code,"incomplete_delivery_after_post");
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
+  raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(eventId);
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"processing"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000010",reply_broadcast:false,mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
+  ],completed_at:due},resultPath,new Date(due));
+  assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
   for(const invalidAction of [
     {tool:"dona_dispatcher.authorize_job_notification",event_id:"evt_other",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:false},
@@ -486,7 +496,8 @@ test("threadを持たないwork通知はsession actionなしで配送を終端�
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
   dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
   dispatcher.authorizeJobNotification(eventId,new Date(due));
-  dispatcher.authorizeJobNotification(eventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"dm"});
+  assert.throws(()=>dispatcher.authorizeJobNotification(eventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"wrong-dm",channel_kind:"other",channel_user_id:null}),/access_receipt_invalid/);
+  dispatcher.authorizeJobNotification(eventId,new Date(due),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:due,nonce:"dm",channel_kind:"im",channel_user_id:"U_TEST"});
   dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
@@ -959,6 +970,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.post_message"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.set_agent_session_status"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"path",output:{format:"markdown",text:`${job.workspace_path}/private/result`},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"/Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);

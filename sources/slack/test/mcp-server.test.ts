@@ -171,7 +171,7 @@ describe("Dona Slack MCP server", () => {
       logger,
       () => fake,
     );
-    const server = createSlackMcpServer(registry, logger);
+    const server = createSlackMcpServer(registry, logger,input=>JSON.stringify(input));
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -199,8 +199,9 @@ describe("Dona Slack MCP server", () => {
         listed.tools.find(({ name }) => name === "get_thread")?.annotations?.readOnlyHint,
         true,
       );
-      const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1"}});
-      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true});
+      const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1",event_id:"evt_test"}});
+      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null,
+        access_receipt:JSON.stringify({event_id:"evt_test",workspace_id:"T123",channel_id:"C123",user_id:"U1",channel_kind:"other",channel_user_id:null})});
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
