@@ -17,6 +17,8 @@ import type {
   SlackUserPage,
 } from "../src/slack-api.js";
 import {
+  parseJobDeliveryConfirmationRequest,
+  parseJobSessionSettlementRequest,
   parseUpdateNotificationRequest,
   SlackUpdateNotificationReporter,
   type UpdateNotificationRequest,
@@ -113,6 +115,16 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(result.posted_at,"2026-09-02T23:11:40.987Z"); assert.equal(result.reply_broadcast,false); assert.equal(result.session_status,"active");
     client.messages[0]!.subtype="thread_broadcast";
     await assert.rejects(reporter.confirmJobDelivery({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,message_ts:"1788390700.987654",text:"完了",desired_session_status:"active"}),/not_confirmed/);
+  });
+  test("job deliveryはuppercase event IDと2000 code pointの本文を受理する",()=>{
+    const text="😀".repeat(2000);
+    assert.equal(parseJobDeliveryConfirmationRequest({schema_version:1,event_id:"evt_01M1ZFEWBJX8V0844YRRKQWZC7",workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,message_ts:"1788390700.987654",text,desired_session_status:null}).text,text);
+  });
+  test("投稿なしreconcile用のAgent Sessionを終端化する",async()=>{
+    const {client,reporter}=await reporterFixture();
+    const input=parseJobSessionSettlementRequest({schema_version:1,event_id:"evt_01M1ZFEWBJX8V0844YRRKQWZC7",workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,desired_session_status:"active"});
+    assert.equal((await reporter.settleJobSession(input)).session_status,"active");
+    assert.equal(client.statusCount,1);
   });
   test("schedule accessをadapterのlive membershipへ固定する",async()=>{
     const {reporter}=await reporterFixture();

@@ -9,6 +9,7 @@ import type { SlackLogger } from "./logger.js";
 import {
   parseUpdateNotificationRequest,
   parseJobDeliveryConfirmationRequest,
+  parseJobSessionSettlementRequest,
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
@@ -181,6 +182,19 @@ export class SlackHealthServer {
       } catch(error) {
         this.logger.error("Slack job delivery confirmation failed",{error_code:"job_delivery_not_confirmed",error_message:error instanceof Error?error.message:String(error)});
         send(response,409,{schema_version:1,error:{code:"job_delivery_not_confirmed",message:"Slack delivery could not be confirmed"}});
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/job-session-settlements") {
+      if(!this.updateNotifications?.settleJobSession||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Session settlement is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobSessionSettlementRequest(await this.readJson(request));
+        const result=await this.updateNotifications.settleJobSession(input);
+        send(response,200,result);
+      } catch(error) {
+        this.logger.error("Slack job session settlement failed",{error_code:"job_session_not_settled",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_session_not_settled",message:"Slack Agent Session could not be settled"}});
       }
       return;
     }

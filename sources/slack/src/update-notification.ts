@@ -31,6 +31,7 @@ export interface UpdateNotificationResult {
 export interface UpdateNotificationPort {
   deliver(input: UpdateNotificationRequest): Promise<UpdateNotificationResult>;
   confirmJobDelivery?(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult>;
+  settleJobSession?(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult>;
   confirmScheduleAccess?(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult>;
 }
 export interface ScheduleAccessConfirmationRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;user_id:string;}
@@ -38,15 +39,23 @@ export interface ScheduleAccessConfirmationResult extends ScheduleAccessConfirma
 
 export interface JobDeliveryConfirmationRequest { schema_version:1; event_id:string; workspace_id:string; channel_id:string; thread_ts:string|null; message_ts:string; text:string; desired_session_status:"active"|"suspended"|null; }
 export interface JobDeliveryConfirmationResult extends Omit<JobDeliveryConfirmationRequest,"schema_version"|"text"|"desired_session_status"> { body_sha256:string; posted_at:string; reply_broadcast:false; session_status:"active"|"suspended"|null; }
+export interface JobSessionSettlementRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended";}
+export interface JobSessionSettlementResult extends JobSessionSettlementRequest {session_status:"active"|"suspended";}
 
 export function parseJobDeliveryConfirmationRequest(input:unknown):JobDeliveryConfirmationRequest {
   const value=exactObject(input),keys=["schema_version","event_id","workspace_id","channel_id","thread_ts","message_ts","text","desired_session_status"];
   if(Object.keys(value).some(key=>!keys.includes(key))||keys.some(key=>!(key in value))) throw new Error("job delivery confirmation fields do not match schema");
-  if(value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||
+  if(value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/i.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||
     typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||(value.thread_ts!==null&&(typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)))||typeof value.message_ts!=="string"||!timestampPattern.test(value.message_ts)||
-    typeof value.text!=="string"||value.text.length<1||value.text.length>3000||(value.desired_session_status!==null&&value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job delivery confirmation is invalid");
+    typeof value.text!=="string"||[...value.text].length<1||[...value.text].length>3000||(value.desired_session_status!==null&&value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job delivery confirmation is invalid");
   if(value.thread_ts===null&&value.desired_session_status!==null) throw new Error("job delivery confirmation session target is invalid");
   return value as unknown as JobDeliveryConfirmationRequest;
+}
+
+export function parseJobSessionSettlementRequest(input:unknown):JobSessionSettlementRequest {
+  const value=exactObject(input),keys=["schema_version","event_id","workspace_id","channel_id","thread_ts","desired_session_status"];
+  if(Object.keys(value).some(key=>!keys.includes(key))||keys.some(key=>!(key in value))||value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/i.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)||(value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job session settlement is invalid");
+  return value as unknown as JobSessionSettlementRequest;
 }
 
 export class UpdateNotificationPermanentError extends Error {
@@ -258,5 +267,12 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
     const user=await connection.client.getUser(input.user_id),channel=await connection.client.getChannel(input.channel_id);
     if(!connection.client.hasChannelMember||user.isDeleted||channel.isArchived||!await connection.client.hasChannelMember(input.channel_id,input.user_id)) throw new Error("schedule_access_not_confirmed");
     return {...input,workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
+  }
+
+  async settleJobSession(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult> {
+    let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
+    const session=await connection.client.setAgentSessionStatus({channelId:input.channel_id,threadTs:input.thread_ts,status:input.desired_session_status});
+    if(session.status!==input.desired_session_status||session.agentStatus!==input.desired_session_status) throw new Error("job_session_not_settled");
+    return {...input,workspace_id:connection.teamId,session_status:input.desired_session_status};
   }
 }

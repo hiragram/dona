@@ -1159,6 +1159,14 @@ export class DispatcherDatabase {
       desired_session_status:target.kind==="thread"?(["blocked","needs_review"].includes(completion.job_status)?"suspended":completion.job_status==="failed"?((result.actions??[]).some(action=>action&&typeof action==="object"&&!Array.isArray(action)&&(action as Record<string,unknown>).status==="suspended")?"suspended":"active"):"active"):null};
   }
 
+  notificationSessionSettlementRequest(eventId:string):{schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended"}|undefined {
+    const completion=this.db.prepare("SELECT job_status,destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;destination_json:string}|undefined;
+    if(!completion)return undefined;
+    const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
+    if(target?.kind!=="thread")return undefined;
+    return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:String(target.thread_ts??""),desired_session_status:["blocked","needs_review"].includes(completion.job_status)?"suspended":"active"};
+  }
+
   private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date,evidence?:JobNotificationEvidence):{delivered:boolean;runId?:string} {
     const completion=this.db.prepare("SELECT job_status,owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
