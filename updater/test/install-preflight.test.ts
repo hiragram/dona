@@ -117,6 +117,17 @@ test("control-plane upgrade preflight requires exact updater health and only ter
   }
 });
 
+test("control-plane upgradeはDispatcherのquiesceとdrain完了を要求する", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-dispatcher-drain-")),socketPath=path.join(root,"dispatcher.sock");
+  let polls=0;
+  const server=http.createServer((request,response)=>{
+    const body=request.url==="/v1/admin/quiesce"?{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:false,in_flight:1,unsafe_states:["event.dispatching"]}:{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:++polls>1,in_flight:polls>1?0:1,unsafe_states:polls>1?[]:["event.dispatching"]};
+    response.writeHead(request.url==="/v1/admin/quiesce"?202:200,{"content-type":"application/json"});response.end(JSON.stringify(body));
+  });
+  try { await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);}); await run("quiesce-dispatcher",socketPath,"2".repeat(40)); assert.ok(polls>1); }
+  finally { await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); await fs.rm(root,{recursive:true,force:true}); }
+});
+
 test("macOS keeps a hardened staged updater renamable by reopening only its root", {
   skip: process.platform !== "darwin",
 }, async () => {

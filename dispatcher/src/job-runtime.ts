@@ -218,6 +218,14 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       }
     }
 
+    let disabledMcpServers:string[]=[];
+    if(row.source==="dona_schedule") {
+      const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
+      if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
+      const inventory=parseJson(listed.stdout);
+      disabledMcpServers=parseScheduledMcpInventory(inventory);
+    }
+
     const created = workspace.kind === "scratch"
       ? await this.createScratchWorkspace(row, signal)
       : await this.createGitHubWorktree(row, workspace.repository, workspace.base_ref, signal);
@@ -226,14 +234,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const paneId = findValue(parsed, ["pane_id"]);
     if (!created.ok || workspaceId === undefined || paneId === undefined) {
       throw commandError("Herdr workspace creation failed", created);
-    }
-
-    let disabledMcpServers:string[]=[];
-    if(row.source==="dona_schedule") {
-      const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
-      if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
-      const inventory=parseJson(listed.stdout);
-      disabledMcpServers=parseScheduledMcpInventory(inventory);
     }
 
     let started: HerdrCommandResult | undefined;

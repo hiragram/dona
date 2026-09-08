@@ -65,15 +65,16 @@ export async function cleanupInstallStaging(releaseRoot, stagingDir) {
   await fs.rm(stagingDir, { recursive: true, force: true });
 }
 
-function udsJson(socketPath, route, timeoutMs = 2_000) {
+function udsJson(socketPath, route, timeoutMs = 2_000, method="GET", body) {
   return new Promise((resolve, reject) => {
-    const request = http.request({ socketPath, path: route, method: "GET" }, (response) => {
+    const encoded=body===undefined?undefined:Buffer.from(JSON.stringify(body));
+    const request = http.request({ socketPath, path: route, method, headers:encoded?{"content-type":"application/json","content-length":String(encoded.length)}:undefined }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
       response.on("end", () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if (response.statusCode !== 200) throw new Error(`HTTP ${response.statusCode}`);
+          if (response.statusCode !== 200 && response.statusCode !== 202) throw new Error(`HTTP ${response.statusCode}`);
           resolve(body);
         } catch (error) {
           reject(error);
@@ -82,8 +83,20 @@ function udsJson(socketPath, route, timeoutMs = 2_000) {
     });
     request.setTimeout(timeoutMs, () => request.destroy(new Error("request timed out")));
     request.once("error", reject);
-    request.end();
+    request.end(encoded);
   });
+}
+
+export async function quiesceDispatcherForControlUpgrade(socketPath,targetSha,timeoutMs=30_000) {
+  if(!/^[0-9a-f]{40}$/.test(targetSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("dispatcher quiesce arguments are invalid");
+  const operationId="upd_01m1es03xy5cf8d9pm5cwx4srv";
+  let snapshot=await udsJson(socketPath,"/v1/admin/quiesce",2_000,"POST",{schema_version:1,protocol:1,operation_id:operationId,target_sha:targetSha});
+  const deadline=Date.now()+timeoutMs;
+  while(snapshot?.drained!==true&&Date.now()<deadline) {
+    await new Promise(resolve=>setTimeout(resolve,100));
+    snapshot=await udsJson(socketPath,"/v1/admin/drain-status",2_000);
+  }
+  if(snapshot?.service!=="dispatcher"||snapshot?.quiescing!==true||snapshot?.drained!==true||snapshot?.in_flight!==0||!Array.isArray(snapshot?.unsafe_states)||snapshot.unsafe_states.length!==0)throw new Error("dispatcher did not reach a safe drain barrier");
 }
 
 export async function assertControlUpgradeSafe(socketPath) {
@@ -189,7 +202,7 @@ async function main() {
   const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
     console.error(
-      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
     );
     return 2;
   }
@@ -218,6 +231,10 @@ async function main() {
       console.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+  if(mode==="quiesce-dispatcher"&&secondValue) {
+    try { await quiesceDispatcherForControlUpgrade(value,secondValue); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "wait-updater-sha" && secondValue && process.argv[5]) {
     try {

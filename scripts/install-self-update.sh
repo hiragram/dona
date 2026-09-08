@@ -318,6 +318,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
   fi
   CONTROL_SWAPPED=1
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
       print -u2 "Dispatcherの停止受理を確認できないため、plistを更新しません。"

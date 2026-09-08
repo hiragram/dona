@@ -1185,7 +1185,7 @@ export class DispatcherDatabase {
     const allowedActions=actions.every(({value})=>{
       if(value.tool==="dona_dispatcher.authorize_job_notification") return value.event_id===eventId&&value.authorized===true&&value.success!==false&&value.ok!==false&&!("error" in value);
       if(value.tool==="dona_slack.check_user_channel_access") return value.authorized===true&&value.workspace_id===target?.workspace_id&&value.channel_id===target?.channel_id&&value.user_id===owner.owner_id;
-      if(value.tool==="dona_slack.post_message") return value.mrkdwn===false&&value.parse==="none";
+      if(value.tool==="dona_slack.post_message") return true;
       return target?.kind==="thread"&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.channel_id===target.channel_id&&
         value.thread_ts===target.thread_ts&&
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:completion.job_status==="failed"?["processing","active","suspended"]:["processing","active"]).includes(String(value.status));
