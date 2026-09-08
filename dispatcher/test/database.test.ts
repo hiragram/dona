@@ -272,4 +272,24 @@ describe("DispatcherDatabase", () => {
     assert.equal(reopened.getJob(running.job_id)?.status,"completed");
     reopened.close();
   });
+
+  test("does not stop terminal jobs solely because they retain a legacy result path", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const jobs = ["completed","failed","cancelled"].map((status,index) => {
+      const source=database.enqueue(eventEnvelope(`Ev-job-legacy-terminal-${index}`)).row;
+      return {status,job:database.createJob({source_event_id:source.event_id,objective:"完了済み",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row};
+    });
+    database.close();
+    const raw = new Database(config.databasePath);
+    for(const {status,job} of jobs) {
+      raw.prepare("UPDATE jobs SET status=?,result_path=? WHERE job_id=?").run(status,`${config.jobResultsDir}/${job.job_id}.json`,job.job_id);
+      raw.prepare("INSERT INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(job.job_id);
+    }
+    raw.close();
+    const reopened = new DispatcherDatabase(config.databasePath);
+    assert.deepEqual(reopened.listLegacySharedGrantJobs(),[]);
+    for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
+    reopened.close();
+  });
 });
