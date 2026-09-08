@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase } from "../src/database.js";
-import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory } from "../src/job-runtime.js";
+import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory, PreparedWorkspaceCleanupError } from "../src/job-runtime.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -244,6 +244,32 @@ console.log(JSON.stringify({status:"ok"}));
     assert.equal(cleaned.ok,true,JSON.stringify(cleaned));
     assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"workspace","close","w7"]);
     await assert.rejects(fs.access(job.workspace_path),{code:"ENOENT"});
+    database.close();
+  });
+
+  test("agent start失敗後のworkspace close失敗はIDとscratch workspaceを保持する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const executable=path.join(root,"fake-herdr-start-cleanup-failure.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+const args=process.argv.slice(2);
+if(args[2]==="agent"&&args[3]==="get")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="create"){
+  console.log(JSON.stringify({status:"ok",result:{workspace:{workspace_id:"w9"},root_pane:{pane_id:"w9:p1"}}}));
+  process.exit(0);
+}
+if(args[2]==="agent"&&args[3]==="start")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="close")process.exit(1);
+process.exit(2);
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-start-cleanup-failure")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await assert.rejects(
+      new HerdrJobAgentRuntime({...config,herdrPath:executable}).prepare(job),
+      (error:unknown)=>error instanceof PreparedWorkspaceCleanupError&&error.herdrWorkspaceId==="w9"&&error.herdrPaneId==="w9:p1",
+    );
+    assert.equal((await fs.stat(job.workspace_path)).isDirectory(),true);
     database.close();
   });
 

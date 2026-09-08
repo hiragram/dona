@@ -1173,7 +1173,12 @@ export class DispatcherDatabase {
     return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:String(target.thread_ts??""),desired_session_status:["blocked","needs_review"].includes(completion.job_status)?"suspended":"active"};
   }
 
-  claimNotificationReconciliation(eventId:string):string {
+  claimNotificationReconciliation(eventId:string,resume=false):string {
+    const current=this.getRequired(eventId);
+    if(current.last_error_code==="operator_notification_reconcile_claimed") {
+      if(resume&&current.last_error_message)return current.last_error_message;
+      throw new Error("scheduled_notification_reconcile_requires_explicit_resume");
+    }
     const token=ulid().toLowerCase();
     const changed=this.db.prepare(`UPDATE events SET last_error_code='operator_notification_reconcile_claimed',last_error_message=? WHERE event_id=?
       AND COALESCE(last_error_code,'')!='operator_notification_reconcile_claimed' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=events.event_id AND c.notification_state IN ('failed','needs_review'))`).run(token,eventId).changes;

@@ -14,8 +14,8 @@ function usage(): never {
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
   dona-dispatcher event complete <event_id>
-  dona-dispatcher event reconcile-notification <event_id> <workspace_id> <channel_id> <message_ts> [thread_ts]
-  dona-dispatcher event reconcile-notification <event_id> not_sent
+  dona-dispatcher event reconcile-notification <event_id> <workspace_id> <channel_id> <message_ts> [thread_ts] [--resume]
+  dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
   dona-dispatcher job show <job_id>
@@ -89,12 +89,12 @@ async function main(): Promise<void> {
     }
     if(command==="reconcile-notification") {
       if(args[3]==="not_sent") {
-        const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId),settlement=database.notificationSessionSettlementRequest(eventId);
+        const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId,args.includes("--resume")),settlement=database.notificationSessionSettlementRequest(eventId);
         if(settlement)await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement);
         console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,new Date(),claim),null,2));return;
       }
-      const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6];
-      const claim=database.claimNotificationReconciliation(eventId);
+      const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6]==="--resume"?undefined:args[6];
+      const claim=database.claimNotificationReconciliation(eventId,args.includes("--resume"));
       const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
       if(!verification) throw new Error("scheduled_notification_verification_unavailable");
       const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);

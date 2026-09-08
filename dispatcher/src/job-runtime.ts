@@ -12,6 +12,10 @@ export interface PreparedJobRuntime {
   herdrPaneId: string;
 }
 
+export class PreparedWorkspaceCleanupError extends Error {
+  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
+}
+
 export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
@@ -256,7 +260,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       await delay(200, signal);
     } while (true);
     if (!started?.ok) {
-      await this.herdr(["workspace","close",String(workspaceId)],this.config.jobCommandTimeoutMs+5_000).catch(()=>undefined);
+      const closed=await this.herdr(["workspace","close",String(workspaceId)],this.config.jobCommandTimeoutMs+5_000).catch(()=>undefined);
+      if(!closed?.ok)throw new PreparedWorkspaceCleanupError("Herdr workspace cleanup failed after agent start failure",String(workspaceId),String(paneId));
       if(workspace.kind==="scratch")await fs.rm(row.workspace_path,{recursive:true,force:true});
       throw commandError("Herdr agent start failed", started!);
     }

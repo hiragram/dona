@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
-import type { JobAgentRuntime } from "./job-runtime.js";
+import { PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
 import { buildJobPrompt } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
@@ -358,6 +358,7 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
+      if(error instanceof PreparedWorkspaceCleanupError)this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
       if (this.stopping) return;
       if (this.database.getJob(row.job_id)?.status !== "preparing") return;
       const updated = this.database.recordJobPreparationFailure(
