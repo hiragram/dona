@@ -251,7 +251,6 @@ describe("Dona Slack MCP server", () => {
           thread_ts: "1.2",
           mrkdwn: false,
           parse: "none",
-          event_id: "evt_notification",
         },
       });
       assert.equal(result.isError, undefined);
@@ -270,7 +269,6 @@ describe("Dona Slack MCP server", () => {
         channel_id: "C123",
         message_ts: "2.3",
         body_sha256: createHash("sha256").update("hello").digest("hex"),
-        delivery_receipt: JSON.stringify({receipt_kind:"slack_delivery",event_id:"evt_notification",workspace_id:"T123",channel_id:"C123",thread_ts:"1.2",message_ts:"2.3",body_sha256:createHash("sha256").update("hello").digest("hex"),posted_at:"1970-01-01T00:00:02.000Z"}),
         thread_ts: "1.2",
         reply_broadcast: false,
         mrkdwn: false,

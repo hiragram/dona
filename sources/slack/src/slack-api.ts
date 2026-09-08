@@ -18,6 +18,7 @@ export interface SlackWorkspaceIdentity {
 
 export interface SlackThreadMessage {
   ts: string;
+  subtype?: string;
   threadTs?: string;
   userId?: string;
   botId?: string;
@@ -431,6 +432,7 @@ export class SlackWebApiClient implements SlackApiClient {
         return [
           {
             ts: message.ts,
+            ...((message as {subtype?:unknown}).subtype ? { subtype: String((message as {subtype?:unknown}).subtype) } : {}),
             ...(message.thread_ts ? { threadTs: message.thread_ts } : {}),
             ...(message.user ? { userId: message.user } : {}),
             ...(message.bot_id ? { botId: message.bot_id } : {}),

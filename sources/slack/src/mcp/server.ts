@@ -93,7 +93,7 @@ function failure(error: unknown, logger: SlackLogger, fields: Record<string, unk
 export function createSlackMcpServer(
   registry: SlackWorkspaceRegistry,
   logger: SlackLogger,
-  signReceipt?: (input:Record<string,unknown>)=>string,
+  signAccessReceipt?: (input:{event_id:string;workspace_id:string;channel_id:string;user_id:string;channel_kind:"im"|"other";channel_user_id:string|null})=>string,
 ): McpServer {
   const server = new McpServer(
     { name: "dona-slack", version: "0.1.0" },
@@ -218,7 +218,7 @@ export function createSlackMcpServer(
       const channel=await connection.client.getChannel(channel_id);
       const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
       const channel_kind=channel.isIm?"im" as const:"other" as const,channel_user_id=channel.isIm?channel.userId??null:null;
-      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id&&signReceipt?{access_receipt:signReceipt({event_id,workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id})}:{})});
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id&&signAccessReceipt?{access_receipt:signAccessReceipt({event_id,workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id})}:{})});
     } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
   });
 
@@ -497,11 +497,10 @@ export function createSlackMcpServer(
         reply_broadcast: z.boolean().default(false),
         mrkdwn: z.boolean().optional(),
         parse: z.literal("none").optional(),
-        event_id: z.string().min(1).max(128).optional().describe("scheduled notificationでは現在のDona event_idを指定し、署名済みdelivery_receiptを取得します"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
+    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse }) => {
       try {
         const connection = registry.get(workspace);
         const result = await connection.client.postMessage({
@@ -521,7 +520,6 @@ export function createSlackMcpServer(
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
         const body_sha256=createHash("sha256").update(text).digest("hex");
-        const posted_at=new Date(Number(result.messageTs.split(".")[0])*1000).toISOString();
         return success({
           workspace,
           channel_id: result.channelId,
@@ -531,7 +529,6 @@ export function createSlackMcpServer(
           ...(mrkdwn!==undefined?{mrkdwn}:{}),
           ...(parse?{parse}:{}),
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
-          ...(event_id&&signReceipt?{delivery_receipt:signReceipt({receipt_kind:"slack_delivery",event_id,workspace_id:connection.teamId,channel_id:result.channelId,thread_ts:result.threadTs??null,message_ts:result.messageTs,body_sha256,posted_at})}:{}),
         });
       } catch (error) {
         return failure(error, logger, {

@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -27,6 +27,13 @@ import { stableStringify } from "./validation.js";
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;text:string;desired_session_status:"active"|"suspended"|null; }
+export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;session_status:"active"|"suspended"|null; }
+function terminalStatusesFor(status:string):string[] { return ["blocked","needs_review"].includes(status)?["suspended"]:status==="failed"?["active","suspended"]:["active"]; }
+function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
+  return typeof payload.result?.summary==="string"?payload.result.summary:typeof payload.error_message==="string"?payload.error_message:
+    payload.job_status==="cancelled"?"ジョブは中止されました":payload.job_status==="blocked"?"ジョブは入力待ちです":"ジョブの確認が必要です";
+}
 
 function nowUtc(): string {
   return new Date().toISOString();
@@ -54,7 +61,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
 
-  constructor(databasePath: string, private readonly notificationReceiptKey?:string) {
+  constructor(databasePath: string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -1140,12 +1147,25 @@ export class DispatcherDatabase {
       .run(code, message, at.toISOString(), eventId);
   }
 
-  private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date):{delivered:boolean;runId?:string} {
+  notificationVerificationRequest(eventId:string,result:ResultEnvelope):JobNotificationVerificationRequest|undefined {
+    const completion=this.db.prepare("SELECT job_status,owner_json,destination_json FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string}|undefined;
+    if(!completion)return undefined;
+    const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string}; if(!owner.run_id)return undefined;
+    const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
+    const payload=JSON.parse(this.getRequired(eventId).payload_json) as {result?:{summary?:unknown};error_message?:unknown;job_status?:unknown};
+    const text=notificationText(payload);
+    const post=(result.actions??[]).find(action=>action&&typeof action==="object"&&!Array.isArray(action)&&(action as Record<string,unknown>).tool==="dona_slack.post_message") as Record<string,unknown>|undefined;
+    if(!target||!post||typeof post.message_ts!=="string")return undefined;
+    return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:target.kind==="thread"?String(target.thread_ts??""):null,message_ts:post.message_ts,text,
+      desired_session_status:target.kind==="thread"?(["blocked","needs_review"].includes(completion.job_status)?"suspended":completion.job_status==="failed"?((result.actions??[]).some(action=>action&&typeof action==="object"&&!Array.isArray(action)&&(action as Record<string,unknown>).status==="suspended")?"suspended":"active"):"active"):null};
+  }
+
+  private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date,evidence?:JobNotificationEvidence):{delivered:boolean;runId?:string} {
     const completion=this.db.prepare("SELECT job_status,owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
     const event=this.getRequired(eventId);
-    const payload=JSON.parse(event.payload_json) as {result?:{summary?:unknown}};
-    const expectedBody=typeof payload.result?.summary==="string"?payload.result.summary:"";
+    const payload=JSON.parse(event.payload_json) as {result?:{summary?:unknown};error_message?:unknown;job_status?:unknown};
+    const expectedBody=notificationText(payload);
     const expectedBodySha256=createHash("sha256").update(expectedBody).digest("hex");
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
@@ -1164,26 +1184,16 @@ export class DispatcherDatabase {
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:completion.job_status==="failed"?["processing","active","suspended"]:["processing","active"]).includes(String(value.status));
     });
     const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&value.body_sha256===expectedBodySha256&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
-    let postedAt=Number.NaN,receiptValid=false;
-    if(validPost&&this.notificationReceiptKey&&typeof validPost.value.delivery_receipt==="string") try {
-      const [encoded,signature,...extra]=validPost.value.delivery_receipt.split(".");
-      if(!encoded||!signature||extra.length) throw new Error("invalid_delivery_receipt");
-      const expected=createHmac("sha256",this.notificationReceiptKey).update(encoded).digest(),actual=Buffer.from(signature,"base64url");
-      if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_delivery_receipt");
-      const receipt=JSON.parse(Buffer.from(encoded,"base64url").toString("utf8")) as Record<string,unknown>;
-      postedAt=Date.parse(String(receipt.posted_at??""));
-      receiptValid=receipt.receipt_kind==="slack_delivery"&&receipt.event_id===eventId&&receipt.workspace_id===target?.workspace_id&&receipt.channel_id===target?.channel_id&&
-        receipt.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&receipt.message_ts===validPost.value.message_ts&&receipt.body_sha256===expectedBodySha256&&Number.isFinite(postedAt);
-    } catch { receiptValid=false; }
+    const postedAt=Date.parse(evidence?.posted_at??"");
+    const receiptValid=evidence?.event_id===eventId&&evidence.workspace_id===target?.workspace_id&&evidence.channel_id===target?.channel_id&&evidence.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&
+      evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&Number.isFinite(postedAt)&&
+      (target?.kind!=="thread"||terminalStatusesFor(completion.job_status).includes(String(evidence.session_status)));
     const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
-      const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
-    const terminalStatuses=["blocked","needs_review"].includes(completion.job_status)?["suspended"]:completion.job_status==="failed"?["active","suspended"]:["active"];
-    const sessionSettled=actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing?.index??-1)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&terminalStatuses.includes(String(value.status))&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
-    return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&(target?.kind!=="thread"||sessionSettled)&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
-  saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
+  saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date(),evidence?:JobNotificationEvidence): void {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
@@ -1203,20 +1213,20 @@ export class DispatcherDatabase {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
       });
-      const delivery=this.notificationDelivered(eventId,result,acceptedAt);
+      const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.runId) {
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
   }
 
-  saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {
+  saveFailedResult(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date(),evidence?:JobNotificationEvidence): void {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");
     this.db.transaction(()=>{
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
-      const delivery=this.notificationDelivered(eventId,result,acceptedAt);
+      const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.delivered) {
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
         this.setNotificationState(eventId,"accepted",new Date(result.completed_at));return;

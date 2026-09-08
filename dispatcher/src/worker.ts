@@ -8,6 +8,7 @@ import type { Logger } from "./logger.js";
 import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import type { EventRow } from "./types.js";
+import type { JobNotificationVerifier } from "./job-notification-verifier.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -52,6 +53,7 @@ export class DispatcherWorker {
     private readonly herdr: HerdrClient,
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
+    private readonly notificationVerifier?:JobNotificationVerifier,
   ) {}
 
   isRunning(): boolean {
@@ -288,8 +290,10 @@ export class DispatcherWorker {
   private async tryComplete(row: EventRow, terminalAgentState: boolean): Promise<boolean> {
     try {
       const result = await readResultEnvelope(row.result_path!, row.event_id);
-      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!);
-      else this.database.saveFailedResult(row.event_id, result, row.result_path!);
+      const verification=this.database.notificationVerificationRequest(row.event_id,result);
+      const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.verify(verification):undefined):undefined;
+      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
+      else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
       this.logCurrentTransition(row, Date.now());
       return true;
     } catch (error) {

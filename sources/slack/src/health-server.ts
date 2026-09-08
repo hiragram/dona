@@ -8,6 +8,7 @@ import type { DispatcherClient } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
 import {
   parseUpdateNotificationRequest,
+  parseJobDeliveryConfirmationRequest,
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
@@ -167,6 +168,19 @@ export class SlackHealthServer {
             message: invalid || permanent ? message : "Slack update notification could not be completed",
           },
         });
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/job-delivery-confirmations") {
+      if(!this.updateNotifications?.confirmJobDelivery||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Delivery confirmer is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobDeliveryConfirmationRequest(await this.readJson(request));
+        const result=await this.updateNotifications.confirmJobDelivery(input);
+        send(response,200,{schema_version:1,...result});
+      } catch(error) {
+        this.logger.error("Slack job delivery confirmation failed",{error_code:"job_delivery_not_confirmed",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_delivery_not_confirmed",message:"Slack delivery could not be confirmed"}});
       }
       return;
     }

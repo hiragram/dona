@@ -1,4 +1,5 @@
 import type { SlackAgentSessionStatus, SlackApiClient, SlackThreadMessage } from "./slack-api.js";
+import { createHash } from "node:crypto";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 const notificationIdPattern = /^update:upd_[0-9a-hjkmnp-tv-z]{26}:terminal:\d+$/;
@@ -29,6 +30,20 @@ export interface UpdateNotificationResult {
 
 export interface UpdateNotificationPort {
   deliver(input: UpdateNotificationRequest): Promise<UpdateNotificationResult>;
+  confirmJobDelivery?(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult>;
+}
+
+export interface JobDeliveryConfirmationRequest { schema_version:1; event_id:string; workspace_id:string; channel_id:string; thread_ts:string|null; message_ts:string; text:string; desired_session_status:"active"|"suspended"|null; }
+export interface JobDeliveryConfirmationResult extends Omit<JobDeliveryConfirmationRequest,"schema_version"|"text"|"desired_session_status"> { body_sha256:string; posted_at:string; reply_broadcast:false; session_status:"active"|"suspended"|null; }
+
+export function parseJobDeliveryConfirmationRequest(input:unknown):JobDeliveryConfirmationRequest {
+  const value=exactObject(input),keys=["schema_version","event_id","workspace_id","channel_id","thread_ts","message_ts","text","desired_session_status"];
+  if(Object.keys(value).some(key=>!keys.includes(key))||keys.some(key=>!(key in value))) throw new Error("job delivery confirmation fields do not match schema");
+  if(value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||
+    typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||(value.thread_ts!==null&&(typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)))||typeof value.message_ts!=="string"||!timestampPattern.test(value.message_ts)||
+    typeof value.text!=="string"||value.text.length<1||value.text.length>3000||(value.desired_session_status!==null&&value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job delivery confirmation is invalid");
+  if((value.thread_ts===null)!==(value.desired_session_status===null)) throw new Error("job delivery confirmation session target is invalid");
+  return value as unknown as JobDeliveryConfirmationRequest;
 }
 
 export class UpdateNotificationPermanentError extends Error {
@@ -204,5 +219,34 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       }
     }
     return result;
+  }
+
+  async confirmJobDelivery(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult> {
+    let connection;
+    try { connection=this.registry.getByTeamId(input.workspace_id); }
+    catch { throw new Error("unknown_workspace"); }
+    if(!connection.botId&&!connection.botUserId) throw new Error("slack_bot_identity_unavailable");
+    const rootTs=input.thread_ts??input.message_ts;
+    let cursor:string|undefined,found:SlackThreadMessage|undefined; const seen=new Set<string>();
+    do {
+      const page=await connection.client.getThread(input.channel_id,rootTs,200,cursor);
+      for(const message of page.messages.filter(item=>item.ts===input.message_ts)) {
+        if(found) throw new Error("duplicate_delivery_message");
+        found=message;
+      }
+      if(page.hasMore&&!page.nextCursor) throw new Error("slack_thread_pagination_incomplete");
+      cursor=page.nextCursor; if(cursor&&seen.has(cursor)) throw new Error("slack_thread_pagination_repeated"); if(cursor)seen.add(cursor);
+    } while(cursor);
+    if(!found||!authoredByReporter(found,connection.botId,connection.botUserId)||found.text!==input.text||found.threadTs!==(input.thread_ts??undefined)||found.subtype==="thread_broadcast") throw new Error("job_delivery_not_confirmed");
+    let sessionStatus:"active"|"suspended"|null=null;
+    if(input.thread_ts&&input.desired_session_status) {
+      const session=await connection.client.setAgentSessionStatus({channelId:input.channel_id,threadTs:input.thread_ts,status:input.desired_session_status});
+      if(session.status!==input.desired_session_status||session.agentStatus!==input.desired_session_status) throw new Error("job_delivery_session_not_settled");
+      sessionStatus=input.desired_session_status;
+    }
+    const seconds=Number(input.message_ts);
+    if(!Number.isFinite(seconds)) throw new Error("job_delivery_timestamp_invalid");
+    return {event_id:input.event_id,workspace_id:connection.teamId,channel_id:input.channel_id,thread_ts:input.thread_ts,message_ts:input.message_ts,
+      body_sha256:createHash("sha256").update(input.text).digest("hex"),posted_at:new Date(seconds*1000).toISOString(),reply_broadcast:false,session_status:sessionStatus};
   }
 }
