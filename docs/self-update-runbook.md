@@ -86,9 +86,23 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 ## Backupとschema
 
-bootstrap releaseはapp DB `user_version=2`とlegacy single-job write/result/completionを維持し、`multi_job_enabled=false`、read/write schema 2を固定する。bootstrapのplannerだけが、protocol/config・write schema・read min・rollback compatibilityを維持した次段のread max拡張を許可し、feature activationは拒否する。healthとrelease manifestのactual build SHA、read/write capabilityが一致しない場合はpointer切替前に拒否する。current→targetはfast-forwardでなければならず、timeoutやconnection lossはpointer、receipt、version healthをread-onlyで照合してblind retryしない。
+## app DB schema v2→v3 rollout
 
-schema v3 migration、multi-job activation、SQLite Online Backup/restore、live Slack fan-out smokeは後続activation releaseの責務である。activation targetは実稼働bridge SHAの子孫でなければならず、rollback先もv3をread可能なbridgeに限定する。WAL稼働中の`.sqlite3`単体copyは禁止する。CIやrehearsalはlive rollout成功の代替にしない。
+schema rolloutは通常の単発self-updateへ混ぜない。先行bridgeはcommit `61bc86f71726ce1f44fc3500e524203626cf869a`で、primary `config/release-compatibility.json`が`app_schema_write: 2`、`config/schema-rollout.json`が`multi_job_enabled: false`を宣言し、Dispatcher自身もrelease manifestのwrite versionが2ならv2をexpandしてlegacy single-jobを維持し、key付きmulti-jobを拒否する実在release sourceである。このexact SHAを通常のrelease build/CIで検証してから配布し、previous/targetの双方が`app_schema_read_min: 2`、`app_schema_read_max: 3`を公開したことをhealthで確認した後だけ、activation releaseへ進む。activation releaseは`app_schema_write: 3`とし、このbridgeだけをv3-compatible rollback targetにできる。
+
+schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
+
+migration/activation planは次の順序を崩さない。
+
+1. Slack ingress、Dispatcher、job controlをquiesceし、drain結果の`unsafe_states`が空であることを確認する。
+2. SQLite Online Backup APIで別fileへbackupする。WAL稼働中の`.sqlite3`単体copyは禁止する。
+3. backupをread-only openし、`user_version = 2`、`integrity_check = ok`、`foreign_key_check` 0件、row/Result/completion count一致を確認する。
+4. 単一transactionでv2→v3 migrationを実行し、同じ検査と保存件数、`user_version = 3`をreceiptへ記録する。
+5. previous releaseがv3をread可能であることを再確認してからmulti-job gateを有効化する。条件不一致、応答不明、既存backup path、検査失敗はactivation前に拒否し、writeをblind retryしない。
+
+`migrateV2ToV3WithBackup`は上記3〜4の機械的境界であり、pathをreceiptへ含めない。rollback rehearsalは、migration済みv3をcompatibility releaseが開けることと、Online Backupをv2としてrestore-openできることの両方を確認する。v2しかreadできないreleaseへpointer rollbackしてはならない。v3-compatible releaseへ戻せない場合だけservice停止下で検証済みbackupをrestoreする。
+
+legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplicate` response、group metadataを持たない既存`dona_job` eventを維持する。CIのfixture/integration成功はlive Slack smokeではない。isolated threadでの2 success・1 attention、Agent Session遷移、集約返信を実Dona経路の両側で照合するまでProjectを`Merge Ready`にしない。
 
 ## Retention
 

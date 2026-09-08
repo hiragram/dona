@@ -18,22 +18,21 @@ describe("loadAdapterConfig", () => {
       config.healthSocketPath,
       path.join(os.homedir(), "Library", "Application Support", "Dona", "run", "slack-adapter.sock"),
     );
-    assert.equal(config.appSchemaWrite, 2);
-    assert.equal(config.appSchemaReadMax, 2);
+    assert.equal(config.appSchemaWrite, 3);
   });
 
-  test("loads the schema write capability from the exact release manifest", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-bridge-"));
+  test("loads bridge schema write compatibility from the release manifest", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-slack-manifest-"));
     try {
       const manifestPath = path.join(root, "release-manifest.json");
       await fs.writeFile(manifestPath, JSON.stringify({
         sha: "2".repeat(40),
-        compatibility: { app_schema_read_max: 2, app_schema_write: 2 },
+        compatibility: { app_schema_read_max: 3, app_schema_write: 2 },
       }));
       const config = loadAdapterConfig({ SLACK_WORKSPACES: "company", DONA_RELEASE_MANIFEST_PATH: manifestPath });
       assert.equal(config.buildSha, "2".repeat(40));
       assert.equal(config.appSchemaWrite, 2);
-      assert.equal(config.appSchemaReadMax, 2);
+      assert.equal(config.appSchemaReadMax, 3);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

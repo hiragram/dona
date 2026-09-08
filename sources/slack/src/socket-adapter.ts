@@ -133,6 +133,13 @@ export class SlackSocketAdapter {
     return { quiescing: this.stopping, drained: this.stopping && unsafe.length === 0, in_flight: this.inFlight.size, unsafe_states: unsafe };
   }
 
+  trackExternal<T>(operation: Promise<T>): Promise<T> {
+    const drain = operation.then(() => undefined, () => undefined);
+    this.inFlight.add(drain);
+    void drain.finally(() => this.inFlight.delete(drain));
+    return operation;
+  }
+
   private bind(socket: WorkspaceSocket): void {
     const { workspace, client } = socket;
     for (const state of ["connecting", "connected", "reconnecting", "disconnecting", "disconnected"] as const) {

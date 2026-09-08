@@ -16,7 +16,10 @@ export interface DispatcherConfig {
   maxAttempts: number;
   jobsWorkspaceRoot: string;
   jobResultsDir: string;
+  jobsPerEventMax: number;
+  jobObjectiveTotalMaxBytes: number;
   jobConcurrency: number;
+  jobConcurrencyPerEvent: number;
   jobAgentStartTimeoutMs: number;
   jobCommandTimeoutMs: number;
   jobPromptReconcileMs: number;
@@ -25,11 +28,23 @@ export interface DispatcherConfig {
   updaterSocketPath: string;
   updateInternalTokenPath: string;
   updateNotificationDatabasePath: string;
+  jobProgressDatabasePath: string;
   slackAdapterSocketPath: string;
   buildSha: string;
 }
 
-function expandHome(value: string): string {
+export const jobResourceDefaults = {
+  jobsPerEventMax: 8,
+  jobObjectiveTotalMaxBytes: 400_000,
+  jobConcurrencyPerEvent: 2,
+} as const;
+
+export const jobResourceHardLimits = {
+  jobsPerEventMax: 32,
+  jobConcurrencyPerEvent: 32,
+} as const;
+
+export function expandHome(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
   return path.resolve(value);
@@ -41,6 +56,17 @@ function positiveInteger(value: string | undefined, fallback: number, name: stri
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error(`${name} must be a positive integer`);
   }
+  return parsed;
+}
+
+function boundedPositiveInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+  maximum: number,
+): number {
+  const parsed = positiveInteger(value, fallback, name);
+  if (parsed > maximum) throw new Error(`${name} must be at most ${maximum}`);
   return parsed;
 }
 
@@ -86,7 +112,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
       env.DONA_JOBS_WORKSPACE_ROOT ?? path.join(os.homedir(), ".dona", "workspaces"),
     ),
     jobResultsDir: expandHome(env.DONA_JOB_RESULTS_DIR ?? path.join(base, "job-results")),
+    jobsPerEventMax: boundedPositiveInteger(
+      env.DONA_JOBS_PER_EVENT_MAX,
+      jobResourceDefaults.jobsPerEventMax,
+      "DONA_JOBS_PER_EVENT_MAX",
+      jobResourceHardLimits.jobsPerEventMax,
+    ),
+    jobObjectiveTotalMaxBytes: positiveInteger(
+      env.DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES,
+      jobResourceDefaults.jobObjectiveTotalMaxBytes,
+      "DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES",
+    ),
     jobConcurrency: positiveInteger(env.DONA_JOB_CONCURRENCY, 4, "DONA_JOB_CONCURRENCY"),
+    jobConcurrencyPerEvent: boundedPositiveInteger(
+      env.DONA_JOB_CONCURRENCY_PER_EVENT,
+      jobResourceDefaults.jobConcurrencyPerEvent,
+      "DONA_JOB_CONCURRENCY_PER_EVENT",
+      jobResourceHardLimits.jobConcurrencyPerEvent,
+    ),
     jobAgentStartTimeoutMs: positiveInteger(
       env.DONA_JOB_AGENT_START_TIMEOUT_MS,
       30_000,
@@ -108,6 +151,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     updateNotificationDatabasePath: expandHome(
       env.DONA_UPDATE_NOTIFICATION_DATABASE_PATH ?? path.join(base, "update-notifications.sqlite3"),
+    ),
+    jobProgressDatabasePath: expandHome(
+      env.DONA_JOB_PROGRESS_DATABASE_PATH ?? path.join(base, "job-progress.sqlite3"),
     ),
     slackAdapterSocketPath: expandHome(
       env.SLACK_HEALTH_SOCKET_PATH ?? path.join(base, "run", "slack-adapter.sock"),

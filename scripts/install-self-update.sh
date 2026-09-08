@@ -309,6 +309,18 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
 
   if bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
+    CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
+    $NODE_PATH -e '
+const fs = require("node:fs");
+const [target, sha] = process.argv.slice(1);
+fs.writeFileSync(target, `${JSON.stringify({
+  schema_version: 1,
+  build_sha: sha,
+  schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  verified_at: new Date().toISOString(),
+})}\n`, { flag: "wx", mode: 0o600 });
+' "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"
+    /bin/mv "$CONTROL_RECEIPT_TMP" "$CONTROL_ROOT/control-plane-receipt.json"
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"
     print "次に通常updateをplan/applyして、DispatcherとSlack Adapterを同じreleaseへ切り替えてください。"

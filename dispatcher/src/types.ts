@@ -31,7 +31,7 @@ export const jobGroupNotificationModes = ["grouped", "legacy"] as const;
 
 export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
 
-export type JobGroupTransition = "attention" | "all_terminal";
+export type JobGroupTransition = "progress" | "attention" | "all_terminal";
 
 export interface EventEnvelope {
   schema_version: 1;
@@ -51,6 +51,12 @@ export type JobWorkspace =
 
 export interface CreateJobRequest {
   source_event_id: string;
+  job_key?: string;
+  objective: string;
+  workspace: JobWorkspace;
+}
+
+export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
 }
@@ -165,8 +171,48 @@ export interface JobGroupRow {
   updated_at: string;
 }
 
+export interface JobGroupSnapshot {
+  source_event_id: string;
+  total: number;
+  pending: number;
+  status_counts: Partial<Record<JobStatus, number>>;
+  jobs: Array<{
+    job_id: string;
+    job_key: string;
+    status: JobStatus;
+  }>;
+  transition: JobGroupTransition;
+}
+
 export interface CreateJobResult {
   row: JobRow;
+  outcome: "created" | "reused";
   duplicate: boolean;
-  payloadMismatch: boolean;
+}
+
+export interface EventJobProjection {
+  job_id: string;
+  job_key: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  last_error_code: string | null;
+  result_summary: string | null;
+}
+
+export type EventJobReconciliation = "not_found" | "matched" | "conflict" | "unverified_legacy";
+
+export const jobProgressPhases = [
+  "preparing", "implementing", "testing", "reviewing", "waiting_ci", "reconciling",
+] as const;
+export type JobProgressPhase = (typeof jobProgressPhases)[number];
+
+export interface JobProgressEnvelope {
+  schema_version: 1;
+  job_id: string;
+  sequence: number;
+  phase: JobProgressPhase;
+  safe_summary: string;
+  updated_at: string;
 }

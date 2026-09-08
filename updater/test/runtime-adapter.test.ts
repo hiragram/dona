@@ -199,6 +199,37 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   }
 });
 
+test("RealRuntime migrates only the owner-private Dispatcher database selected by dispatcher.env", async () => {
+  const { root, policy } = await tempPolicy();
+  const configuredDatabase = path.join(root, "custom", "dispatcher.sqlite3");
+  await fs.mkdir(path.dirname(configuredDatabase), { recursive: true });
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(configuredDatabase, "fixture", { mode: 0o600 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), `DONA_DATABASE_PATH=${configuredDatabase} # custom path\n`, { mode: 0o600 });
+  const recording = new RecordingRunner();
+  const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
+  await runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true });
+  assert.equal(recording.calls[0]?.args[1], configuredDatabase);
+  assert.equal(recording.calls[0]?.args[2], path.join(
+    policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "dispatcher-v2.sqlite3",
+  ));
+  assert.equal(recording.calls[0]?.args[3], path.join(
+    policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "migration-receipt.json",
+  ));
+  await fs.chmod(configuredDatabase, 0o644);
+  assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true }), /database_identity_invalid/);
+  await fs.chmod(configuredDatabase, 0o600);
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "DONA_DATABASE_PATH=relative/dispatcher.sqlite3\n", { mode: 0o600 });
+  assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
+    { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true }), /path_must_be_absolute/);
+  await removeTree(root);
+});
+
 test("RealRuntime restarts the exact idle dona-main pane from the immutable target release", async () => {
   const { root, policy } = await tempPolicy();
   const currentRelease = path.join(policy.release_root, "1".repeat(40));

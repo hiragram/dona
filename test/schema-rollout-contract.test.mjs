@@ -1,26 +1,41 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import test from "node:test";
 
 const rollout = JSON.parse(fs.readFileSync(new URL("../config/schema-rollout.json", import.meta.url)));
-const compatibility = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.json", import.meta.url)));
-const bridge = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.v2-v3-bridge.json", import.meta.url)));
+const target = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.json", import.meta.url)));
+const previous = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.v2-v3-bridge.json", import.meta.url)));
 
-test("bootstrap release stays on schema v2 while installing the widening planner", () => {
+test("schema activation names the exact buildable compatibility bridge", () => {
   assert.deepEqual(rollout, {
     schema_version: 1,
-    phase: "compatibility_bootstrap",
-    database_schema: 2,
-    multi_job_enabled: false,
-    capabilities: ["safe_read_max_widening_planner"],
+    phase: "activation",
+    database_schema: 3,
+    multi_job_enabled: true,
+    previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
+    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+    migration: {
+      from_schema: 2,
+      to_schema: 3,
+      requires_quiesce: true,
+      requires_drain: true,
+      backup: "sqlite_online_backup",
+      restore_open_test: true,
+    },
   });
-  assert.deepEqual(compatibility, {
-    schema_version: 1, protocol: 1, config: 1, app_schema_read_min: 2,
-    app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true,
-  });
-  assert.equal(bridge.app_schema_read_min, 2);
-  assert.equal(bridge.app_schema_read_max, 3);
-  assert.equal(bridge.app_schema_write, 2);
-  assert.equal(bridge.rollback_safe, true);
-  assert.equal(JSON.stringify(rollout).includes('"multi_job_enabled":true'), false);
+  assert.deepEqual(
+    [previous.app_schema_read_min, previous.app_schema_read_max, previous.app_schema_write, previous.rollback_safe],
+    [2, 3, 2, true],
+  );
+  assert.deepEqual(
+    [target.app_schema_read_min, target.app_schema_read_max, target.app_schema_write, target.rollback_safe],
+    [2, 3, 3, true],
+  );
+  const bridgeCompatibility = JSON.parse(execFileSync("git", ["show", `${rollout.previous_release_sha}:config/release-compatibility.json`], { encoding: "utf8" }));
+  assert.deepEqual(bridgeCompatibility, previous);
+  const bridgeDatabase = execFileSync("git", ["show", `${rollout.previous_release_sha}:dispatcher/src/database.ts`], { encoding: "utf8" });
+  assert.match(bridgeDatabase, /ensureV2BridgeSchema/);
+  assert.match(bridgeDatabase, /multi_job_feature_disabled_for_schema_v2_bridge/);
 });

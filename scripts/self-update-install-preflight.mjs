@@ -167,8 +167,8 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
   if (manifest?.schema_version !== 1 || manifest.sha !== expectedSha ||
     manifest.repository !== "hiragram/dona" || manifest.policy_version !== "2026-09-03.2" ||
     compatibility?.protocol !== 1 || compatibility?.config !== 1 ||
-    compatibility?.app_schema_read_min !== 2 || compatibility?.app_schema_read_max !== 2 ||
-    compatibility?.app_schema_write !== 2 || compatibility?.rollback_safe !== true) {
+    compatibility?.app_schema_read_min !== 2 || compatibility?.app_schema_read_max !== 3 ||
+    compatibility?.app_schema_write !== 3 || compatibility?.rollback_safe !== true) {
     throw new Error("existing release manifest does not match the control-plane contract");
   }
   const [existingDigest, stagedDigest] = await Promise.all([

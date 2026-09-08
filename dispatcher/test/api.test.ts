@@ -9,7 +9,7 @@ import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
 import { UpdaterClientError } from "../src/updater-client.js";
-import { stableStringify } from "../src/validation.js";
+import { canonicalJobPayloadSha256, parseCreateJobRequest, stableStringify } from "../src/validation.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
@@ -50,6 +50,27 @@ function request(
             body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
           }),
         );
+      },
+    );
+    req.once("error", reject);
+    req.end(encoded);
+  });
+}
+
+function requestAndDropResponseBody(socketPath: string, route: string, body: unknown): Promise<void> {
+  const encoded = Buffer.from(JSON.stringify(body));
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        socketPath,
+        method: "POST",
+        path: route,
+        headers: { "content-type": "application/json", "content-length": String(encoded.length) },
+      },
+      (response) => {
+        response.once("error", () => {});
+        response.destroy();
+        resolve();
       },
     );
     req.once("error", reject);
@@ -122,8 +143,11 @@ describe("DispatcherApi", () => {
       workspace: { kind: "github", repository: "owner/repo" },
     });
     assert.equal(created.status, 202);
+    assert.equal(created.body.outcome, "created");
+    assert.equal(created.body.duplicate, false);
     const job = created.body.job as Record<string, unknown>;
     assert.match(String(job.job_id), /^job_/);
+    assert.equal(job.job_key, "legacy-default");
     assert.equal(jobWakeCount, 1);
     const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}`);
     assert.equal(shown.status, 200);
@@ -135,6 +159,209 @@ describe("DispatcherApi", () => {
     );
     assert.equal(listed.status, 200);
     assert.equal((listed.body.jobs as unknown[]).length, 1);
+    const reconciled = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${accepted.body.event_id}/jobs?job_key=legacy-default`,
+    );
+    assert.equal(reconciled.status, 200);
+    assert.equal((reconciled.body.jobs as Array<Record<string, unknown>>)[0]?.job_id, job.job_id);
+    assert.equal(JSON.stringify(reconciled.body).includes(config.jobsWorkspaceRoot), false);
+    assert.equal(JSON.stringify(reconciled.body).includes("リポジトリを調査する"), false);
+    await api.stop();
+    database.close();
+  });
+
+  test("converges concurrent keyed creates and exposes stable conflict and closed-group errors", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    let jobWakeCount = 0;
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      { ...jobs, wake: () => void (jobWakeCount += 1) },
+      config,
+      logger,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-keyed-job-api"));
+    const sourceEventId = String(accepted.body.event_id);
+    const createBody = {
+      source_event_id: sourceEventId,
+      job_key: "report.daily",
+      objective: "  prepare report  ",
+      workspace: { kind: "scratch", ignored: true },
+      ignored: true,
+    };
+    const attempts = await Promise.all(
+      Array.from({ length: 5 }, () => request(config.socketPath, "POST", "/v1/jobs", createBody)),
+    );
+    assert.deepEqual(attempts.map(({ status }) => status).sort(), [200, 200, 200, 200, 202]);
+    assert.deepEqual(new Set(attempts.map(({ body }) => (body.job as Record<string, unknown>).job_id)).size, 1);
+    assert.deepEqual(new Set(attempts.map(({ body }) => body.outcome)), new Set(["created", "reused"]));
+    assert.equal(database.listEventJobs(sourceEventId).length, 1);
+    assert.equal(jobWakeCount, 5);
+
+    const conflict = await request(config.socketPath, "POST", "/v1/jobs", {
+      ...createBody,
+      objective: "different report",
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal((conflict.body.error as Record<string, unknown>).code, "job_idempotency_conflict");
+    assert.equal(database.listEventJobs(sourceEventId).length, 1);
+
+    const second = await request(config.socketPath, "POST", "/v1/jobs", {
+      ...createBody,
+      job_key: "report.secondary",
+      objective: "prepare another report",
+    });
+    assert.equal(second.status, 202);
+    assert.notEqual(
+      (second.body.job as Record<string, unknown>).job_id,
+      (attempts[0]!.body.job as Record<string, unknown>).job_id,
+    );
+    const allJobs = await request(config.socketPath, "GET", `/v1/events/${sourceEventId}/jobs`);
+    assert.equal((allJobs.body.jobs as unknown[]).length, 2);
+    const trimmedLookup = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=%20report.daily%20`,
+    );
+    assert.equal((trimmedLookup.body.jobs as Array<Record<string, unknown>>)[0]?.job_key, "report.daily");
+
+    database.sealJobGroup(sourceEventId);
+    const reusedAfterSeal = await request(config.socketPath, "POST", "/v1/jobs", {
+      source_event_id: sourceEventId,
+      job_key: "report.daily",
+      objective: "prepare report",
+      workspace: { kind: "scratch" },
+    });
+    assert.equal(reusedAfterSeal.status, 200);
+    assert.equal(reusedAfterSeal.body.outcome, "reused");
+    const closed = await request(config.socketPath, "POST", "/v1/jobs", {
+      ...createBody,
+      job_key: "report.after-seal",
+    });
+    assert.equal(closed.status, 409);
+    assert.equal((closed.body.error as Record<string, unknown>).code, "job_group_closed");
+    assert.equal((await request(config.socketPath, "POST", "/v1/jobs", {
+      ...createBody,
+      job_key: "legacy-default",
+    })).status, 400);
+    await api.stop();
+    database.close();
+  });
+
+  test("returns a stable quota error and logs only bounded resource fields", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.jobsPerEventMax = 1;
+    const database = new DispatcherDatabase(config.databasePath, {
+      jobsPerEventMax: config.jobsPerEventMax,
+      jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
+    });
+    const warnings: Array<Record<string, unknown>> = [];
+    const quotaLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(message, fields) {
+        if (message === "Job creation rejected by resource limit") warnings.push(fields ?? {});
+      },
+    };
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      jobs,
+      config,
+      quotaLogger,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-job-quota-api"));
+    const sourceEventId = String(accepted.body.event_id);
+    const requestBody = {
+      source_event_id: sourceEventId,
+      job_key: "private.key",
+      objective: "private objective",
+      workspace: { kind: "scratch" },
+    };
+    assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 202);
+    assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 200);
+    const rejected = await request(config.socketPath, "POST", "/v1/jobs", {
+      ...requestBody,
+      job_key: "private.second",
+    });
+
+    assert.equal(rejected.status, 409);
+    assert.equal((rejected.body.error as Record<string, unknown>).code, "job_group_limit_exceeded");
+    assert.deepEqual(warnings, [{
+      error_code: "job_group_limit_exceeded",
+      resource: "jobs_per_event",
+      current_value: 1,
+      attempted_value: 2,
+      limit_value: 1,
+    }]);
+    assert.equal(JSON.stringify(warnings).includes("private"), false);
+    assert.equal(database.listEventJobs(sourceEventId).length, 1);
+    await api.stop();
+    database.close();
+  });
+
+  test("recovers a committed job after the create response body is lost without resending the write", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    let jobWakeCount = 0;
+    const api = new DispatcherApi(
+      database,
+      { isRunning: () => true, wake() {} },
+      { ...jobs, wake: () => void (jobWakeCount += 1) },
+      config,
+      logger,
+    );
+    await api.start();
+    const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-lost-job-response"));
+    const sourceEventId = String(accepted.body.event_id);
+
+    const createBody = {
+      source_event_id: sourceEventId,
+      job_key: "response.lost",
+      objective: "recover through read-only lookup",
+      workspace: { kind: "scratch" },
+    };
+    await requestAndDropResponseBody(config.socketPath, "/v1/jobs", createBody);
+    const persisted = database.listEventJobs(sourceEventId, "response.lost");
+    assert.equal(persisted.length, 1);
+    assert.equal(jobWakeCount, 1);
+
+    const reconciled = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=response.lost&canonical_payload_sha256=${
+        canonicalJobPayloadSha256(parseCreateJobRequest(createBody))
+      }`,
+    );
+    assert.equal(reconciled.status, 200);
+    assert.equal(reconciled.body.reconciliation, "matched");
+    assert.equal((reconciled.body.jobs as Array<Record<string, unknown>>)[0]?.job_id, persisted[0]?.job_id);
+    const conflict = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=response.lost&canonical_payload_sha256=${"0".repeat(64)}`,
+    );
+    assert.equal(conflict.body.reconciliation, "conflict");
+    const notFound = await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?job_key=missing&canonical_payload_sha256=${"0".repeat(64)}`,
+    );
+    assert.equal(notFound.body.reconciliation, "not_found");
+    assert.equal((await request(
+      config.socketPath,
+      "GET",
+      `/v1/events/${sourceEventId}/jobs?canonical_payload_sha256=${"0".repeat(64)}`,
+    )).status, 400);
+    assert.equal(database.listEventJobs(sourceEventId).length, 1);
+    assert.equal(jobWakeCount, 1);
     await api.stop();
     database.close();
   });
@@ -260,7 +487,7 @@ describe("DispatcherApi", () => {
         app_schema_read_max: version.body.app_schema_read_max,
         app_schema_write: version.body.app_schema_write,
       },
-      { app_schema: 2, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2 },
+      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3 },
     );
     assert.equal(JSON.stringify(version.body).includes(config.databasePath), false);
     database.manualComplete(eventId);
