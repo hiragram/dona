@@ -21,14 +21,16 @@ import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
 const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
+const productionV2SourceSha = "7dbaab72e3387f94f6c8a2289a685b90b100d083";
+const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_v1";
 const schemaV3ActivationRollout: SchemaRollout = {
   schema_version: 1,
   phase: "activation",
   database_schema: 3,
   multi_job_enabled: true,
-  previous_release_sha: schemaV3BridgeSha,
-  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  previous_release_sha: productionV2SourceSha,
+  previous_release_contract: "release-compatibility.production-v2.json",
+  required_control_plane_capability: schemaMigrationCapability,
   migration: {
     from_schema: 2,
     to_schema: 3,
@@ -74,7 +76,13 @@ function rolloutMatchesTargetCompatibility(
       previous_release_contract: transition.previous_release_contract,
       required_control_plane_capability: transition.required_control_plane_capability,
     } : schemaV3ActivationRollout;
-    return canonicalJson(rollout) === canonicalJson(expected);
+    const legacyExpected = {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: schemaV3BridgeSha,
+      previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    };
+    return canonicalJson(rollout) === canonicalJson(expected) ||
+      (!transition && canonicalJson(rollout) === canonicalJson(legacyExpected));
   }
   return rollout.database_schema === 2 && !rollout.multi_job_enabled && rollout.phase !== "activation" &&
     Array.isArray(rollout.capabilities) && rollout.migration === undefined &&
@@ -135,7 +143,8 @@ export class UpdateController {
     if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
     if (transition || current.compatibility.app_schema_write !== targetManifest.compatibility.app_schema_write) {
-      controlPlane = await this.runtime.schemaMigrationCapability();
+      const capability = transition?.required_control_plane_capability ?? schemaMigrationCapability;
+      controlPlane = await this.runtime.schemaMigrationCapability(capability);
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
@@ -588,7 +597,8 @@ export class UpdateController {
           this.needsReview(row, "schema_activation_bridge_identity_unverified");
           return;
         }
-        const controlPlane = await this.runtime.schemaMigrationCapability();
+        const capability = approvedTransition?.required_control_plane_capability ?? schemaMigrationCapability;
+        const controlPlane = await this.runtime.schemaMigrationCapability(capability);
         this.assertLease(row);
         if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
           await this.restoreQuiescedServices(row, "stable_updater_schema_migration_capability_unverified");

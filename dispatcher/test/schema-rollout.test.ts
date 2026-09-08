@@ -21,7 +21,7 @@ const bridge = { app_schema_read_min: 2, app_schema_read_max: 3, app_schema_writ
 const activation = { ...bridge, app_schema_write: 3 };
 
 test("unsafe schema activation combinations are rejected before a write", () => {
-  assert.throws(() => assertSchemaActivationSafe({ ...bridge, app_schema_read_max: 2 }, activation, 2), /compatibility_bridge/);
+  assert.throws(() => assertSchemaActivationSafe({ ...bridge, app_schema_read_min: 3 }, activation, 2), /schema_v2_source/);
   assert.throws(() => assertSchemaActivationSafe(bridge, { ...activation, app_schema_write: 2 }, 2), /activation_release/);
   assert.throws(() => assertSchemaActivationSafe({ ...bridge, rollback_safe: false }, activation, 2), /safe_rollback/);
   assert.throws(() => assertSchemaActivationSafe(bridge, activation, 3), /requires_v2/);

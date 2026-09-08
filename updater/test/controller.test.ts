@@ -221,9 +221,12 @@ class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
   schemaMigrationReady = true;
   schemaMigrationBuildSha = targetSha;
-  async schemaMigrationCapability() {
+  async schemaMigrationCapability(capability: string) {
     this.calls.push("schemaMigrationCapability");
-    return { ready: this.schemaMigrationReady, build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null };
+    return {
+      ready: this.schemaMigrationReady && capability === "dispatcher_v2_to_v3_online_backup_v1",
+      build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null,
+    };
   }
   async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
   wrongTargetOnce = false;

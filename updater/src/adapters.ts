@@ -490,7 +490,7 @@ export class RealRuntime implements RuntimePort {
     return snapshot;
   }
 
-  async schemaMigrationCapability(): Promise<{ ready: boolean; build_sha: string | null }> {
+  async schemaMigrationCapability(capability: string): Promise<{ ready: boolean; build_sha: string | null }> {
     const buildSha = process.env.DONA_UPDATER_BUILD_SHA?.trim() ?? null;
     if (!buildSha || !/^[0-9a-f]{40}$/.test(buildSha)) return { ready: false, build_sha: null };
     try {
@@ -504,7 +504,7 @@ export class RealRuntime implements RuntimePort {
       this.dispatcherDatabasePath();
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
-          receipt.schema_migration_capability === "dispatcher_v2_to_v3_online_backup_v1",
+          receipt.schema_migration_capability === capability,
         build_sha: buildSha,
       };
     } catch {
