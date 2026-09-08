@@ -624,6 +624,31 @@ export class UpdateController {
         );
         this.assertLease(row);
         if (migration.timed_out || migration.output_truncated || migration.exit_code !== 0) {
+          // A non-zero exit without a timeout is a definitive command
+          // rejection, but the database outcome still needs direct proof.
+          // Restore the v2-only runtime only after verifying the live database
+          // is healthy and remains at the exact previous schema.
+          // Timeout/null-exit and truncated-success outcomes remain ambiguous:
+          // the database may already be v3, and restarting a v2-only runtime
+          // would be unsafe.
+          if (!migration.timed_out && migration.exit_code !== null && migration.exit_code !== 0) {
+            let schemaState: Awaited<ReturnType<RuntimePort["appSchemaState"]>> | undefined;
+            try {
+              schemaState = await this.runtime.appSchemaState();
+              this.assertLease(row);
+            } catch {
+              // Missing read-back is not evidence that the old runtime is safe.
+            }
+            if (schemaState?.user_version === previousCompatibility.app_schema_write &&
+              schemaState.integrity_ok && schemaState.foreign_key_violations === 0) {
+              await this.restoreQuiescedServices(row, "app_schema_migration_rejected");
+              return;
+            }
+            this.needsReview(row, "app_schema_migration_state_unverified", undefined, {
+              ...(schemaState ? { app_schema: schemaState } : {}),
+            });
+            return;
+          }
           this.needsReview(row, "app_schema_migration_unverified");
           return;
         }

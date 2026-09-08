@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { parse as parseDotenv } from "dotenv";
 
 import type { UpdatePolicy } from "./policy.js";
@@ -538,6 +539,26 @@ export class RealRuntime implements RuntimePort {
       outputLimitBytes: this.policy.output_limit_bytes,
       env: minimalEnvironment(),
     });
+  }
+
+  async appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }> {
+    const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
+    try {
+      database.pragma("foreign_keys = ON");
+      const userVersion = database.pragma("user_version", { simple: true });
+      const integrity = database.pragma("integrity_check") as Array<{ integrity_check: string }>;
+      const foreignKeys = database.pragma("foreign_key_check") as unknown[];
+      if (typeof userVersion !== "number" || !Number.isSafeInteger(userVersion)) {
+        throw new Error("dispatcher_database_schema_invalid");
+      }
+      return {
+        user_version: userVersion,
+        integrity_ok: integrity.length === 1 && integrity[0]?.integrity_check === "ok",
+        foreign_key_violations: foreignKeys.length,
+      };
+    } finally {
+      database.close();
+    }
   }
 
   private dispatcherDatabasePath(): string {
