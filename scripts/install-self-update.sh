@@ -318,6 +318,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
   fi
   CONTROL_SWAPPED=1
+  DISPATCHER_STOPPED=1
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
@@ -325,7 +326,6 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
       exit 1
     fi
   fi
-  DISPATCHER_STOPPED=1
   /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
   DISPATCHER_PLIST_SWAPPED=1
   if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then

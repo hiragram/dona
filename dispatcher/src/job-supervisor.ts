@@ -369,9 +369,9 @@ export class JobSupervisor {
       this.logTransition(preparing, updated);
       return;
     }
+    this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     if (this.stopping) return;
     if (this.database.getJob(row.job_id)?.status !== "preparing") return;
-    this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
     const dispatching = this.database.beginJobDispatch(row.job_id);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
     if (this.database.getJob(row.job_id)?.status !== "dispatching") return;

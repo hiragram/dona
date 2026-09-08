@@ -94,7 +94,7 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId),null,2));return;
       }
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6];
-      const verification=database.notificationVerificationRequest(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[{tool:"dona_slack.post_message",workspace:"operator",workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs,reply_broadcast:false}:{}),mrkdwn:false,parse:"none"}],completed_at:new Date().toISOString()});
+      const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
       if(!verification) throw new Error("scheduled_notification_verification_unavailable");
       const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);
       console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})}),null,2));

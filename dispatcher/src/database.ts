@@ -559,10 +559,9 @@ export class DispatcherDatabase {
   }
 
   setJobRuntime(jobId: string, herdrWorkspaceId: string, herdrPaneId: string): void {
-    this.updateJob(jobId, ["preparing"], "preparing", {
-      herdr_workspace_id: herdrWorkspaceId,
-      herdr_pane_id: herdrPaneId,
-    });
+    const changed=this.db.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=? AND status IN ('preparing','cancelling')")
+      .run(herdrWorkspaceId,herdrPaneId,jobId).changes;
+    if(changed!==1)throw new Error(`Job ${jobId} is no longer preparing or cancelling`);
   }
 
   beginJobDispatch(jobId: string, at = new Date()): JobRow {
@@ -1157,6 +1156,13 @@ export class DispatcherDatabase {
     if(!target||!post||typeof post.message_ts!=="string")return undefined;
     return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:target.kind==="thread"?String(target.thread_ts??""):null,message_ts:post.message_ts,text,
       desired_session_status:target.kind==="thread"?(["blocked","needs_review"].includes(completion.job_status)?"suspended":completion.job_status==="failed"?((result.actions??[]).some(action=>action&&typeof action==="object"&&!Array.isArray(action)&&(action as Record<string,unknown>).status==="suspended")?"suspended":"active"):"active"):null};
+  }
+
+  notificationReconciliationVerificationRequest(eventId:string,post:{workspace_id:string;channel_id:string;message_ts:string;thread_ts?:string}):JobNotificationVerificationRequest|undefined {
+    const stored=this.getRequired(eventId).result_json;
+    const prior:ResultEnvelope=stored?JSON.parse(stored) as ResultEnvelope:{schema_version:1,event_id:eventId,status:"completed",summary:"reconciliation",actions:[],completed_at:new Date().toISOString()};
+    const actions=(prior.actions??[]).filter(action=>!action||typeof action!=="object"||Array.isArray(action)||(action as Record<string,unknown>).tool!=="dona_slack.post_message");
+    return this.notificationVerificationRequest(eventId,{...prior,actions:[...actions,{tool:"dona_slack.post_message",workspace:"operator",workspace_id:post.workspace_id,channel_id:post.channel_id,message_ts:post.message_ts,...(post.thread_ts?{thread_ts:post.thread_ts,reply_broadcast:false}:{}),mrkdwn:false,parse:"none"}]});
   }
 
   notificationSessionSettlementRequest(eventId:string):{schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended"}|undefined {
