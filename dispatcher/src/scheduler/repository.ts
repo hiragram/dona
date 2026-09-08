@@ -631,14 +631,20 @@ export class SchedulerRepository {
     this.audit(schedule,this.get(run.schedule_id)!,"work_notification_needs_review",{tenant_id:schedule.tenant_id,actor_id:"dispatcher",role:"admin",source_event_id:null},now,undefined,run);
   }
   reconcileWorkNotificationNotSent(runId:string,now:string):void {
+    this.resumeAfterWorkNotification(runId,now,"work_notification_not_sent_reconciled");
+  }
+  private resumeAfterWorkNotification(runId:string,now:string,operation:string):void {
+    utc(now);id(runId);
     const run=this.getRun(runId);if(!run)return;const schedule=this.get(run.schedule_id)!;
     if(run.revision!==schedule.revision||!["completed","failed","cancelled"].includes(run.status))return;
-    const changed=this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes;
+    const revision=this.revision(schedule);
+    const contentAvailable=revision.content!==null&&(revision.content_delete_at===null||revision.content_delete_at>now);
+    const changed=contentAvailable?this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes:0;
     if(changed===1) {
       this.db.prepare("UPDATE schedule_revisions SET terminal_at=NULL,content_delete_at=NULL WHERE schedule_id=? AND revision=?").run(run.schedule_id,run.revision);
-      this.audit(schedule,this.get(run.schedule_id)!,"work_notification_not_sent_reconciled",{tenant_id:schedule.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},now,undefined,run);
-      this.completeIfDrained(run.schedule_id,now);
+      this.audit(schedule,this.get(run.schedule_id)!,operation,{tenant_id:schedule.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},now,undefined,run);
     }
+    this.completeIfDrained(run.schedule_id,now);
   }
 
   settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string): void {
@@ -751,9 +757,7 @@ export class SchedulerRepository {
     this.audit(before, this.get(scheduleId)!, "complete", { tenant_id: before.tenant_id, actor_id: "scheduler", role: "admin", source_event_id: null }, completedAt);
   }
   settleWorkNotification(runId: string, now: string): void {
-    utc(now); id(runId);
-    const run = this.getRun(runId);
-    if (run) this.completeIfDrained(run.schedule_id, now);
+    this.resumeAfterWorkNotification(runId,now,"work_notification_sent_reconciled");
   }
   private expireUnsent(row: Outbox, now: string, eligibilityAt?: string): boolean {
     if (row.status !== "pending" && row.status !== "claimed") return false;

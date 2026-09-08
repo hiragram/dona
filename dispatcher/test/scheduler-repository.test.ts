@@ -331,6 +331,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.throws(()=>dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_OTHER",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due)),/scheduled_notification_receipt_mismatch/);
   dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  assert.equal(repo.get("notify_work")?.state,"completed");
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   assert.throws(()=>dispatcher.manualComplete(completionEventId,new Date(due)),/scheduled_notification_receipt_required/);
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"needs_review");
@@ -507,6 +508,26 @@ test("not_sent reconciliationはdrained one-shotをcompletedへ進める", () =>
   raw.prepare("UPDATE job_completion_results SET notification_state='none' WHERE json_extract(owner_json,'$.run_id')=?").run(run.run_id);
   repo.reconcileWorkNotificationNotSent(run.run_id,due);
   assert.equal(repo.get("not_sent_once")?.state,"completed");
+
+  repo.create("not_sent_deleted",{...input,action:"work.read_only"},due,actor,now);
+  const deleted=repo.materialize("not_sent_deleted",1,due,later,due,actor).run;
+  startWork(repo,dispatcher,raw,deleted,due);
+  repo.setRunState(deleted.run_id,"started","completed",actor,due,null,"結果",null,true);
+  repo.markWorkNotificationNeedsReview(deleted.run_id,due);
+  raw.prepare("UPDATE job_completion_results SET notification_state='none' WHERE json_extract(owner_json,'$.run_id')=?").run(deleted.run_id);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,content_delete_at=? WHERE schedule_id=? AND revision=?").run(due,deleted.schedule_id,deleted.revision);
+  repo.reconcileWorkNotificationNotSent(deleted.run_id,"2026-09-05T00:02:00Z");
+  assert.equal(repo.get("not_sent_deleted")?.state,"needs_review");
+
+  repo.create("sent_recurring",{...input,action:"work.read_only"},due,actor,now);
+  const recurring=repo.materialize("sent_recurring",1,due,later,due,actor).run;
+  startWork(repo,dispatcher,raw,recurring,due);
+  repo.setRunState(recurring.run_id,"started","completed",actor,due,null,"結果",null,true);
+  repo.markWorkNotificationNeedsReview(recurring.run_id,due);
+  raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE json_extract(owner_json,'$.run_id')=?").run(recurring.run_id);
+  repo.settleWorkNotification(recurring.run_id,due);
+  assert.equal(repo.get("sent_recurring")?.state,"active");
+  assert.equal((raw.prepare("SELECT content FROM schedule_revisions WHERE schedule_id=? AND revision=?").get(recurring.schedule_id,recurring.revision) as {content:string|null}).content,"非公開のリマインダー本文");
 });
 
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
