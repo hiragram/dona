@@ -1467,7 +1467,11 @@ export class UpdateController {
     let mainAgent = initialMainAgent;
     let mainAgentVerified = mainAgentMatches(initialMainAgent);
     let servicesVerified = true;
-    if (pointer.current_sha === row.current_sha && !mainAgentVerified) {
+    let recoveryHealth: { dispatcher: HealthSnapshot; slack_adapter: HealthSnapshot } | undefined;
+    const retryableMainAgentObservation = initialMainAgent.exists &&
+      initialMainAgent.name === this.policy.main_agent.name && initialMainAgent.kind === "codex" &&
+      initialMainAgent.matches_release && initialMainAgent.pane_id !== null && initialMainAgent.session_id !== null;
+    if (pointer.current_sha === row.current_sha && !mainAgentVerified && retryableMainAgentObservation) {
       // Herdr can briefly report the just-finished dona-main turn as non-interactive.
       // Reuse its bounded idle wait before treating an otherwise restored runtime as ambiguous.
       const settled = await this.runtime.waitForMainAgentIdle();
@@ -1486,6 +1490,7 @@ export class UpdateController {
       ]);
       this.assertLease(row);
       pointer = currentPointer;
+      recoveryHealth = { dispatcher: dispatcherHealth, slack_adapter: slackHealth };
       servicesVerified = currentManifest !== null &&
         this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
         this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility);
@@ -1499,6 +1504,7 @@ export class UpdateController {
           cause_code: causeCode,
           pointer: { current_sha: pointer.current_sha, previous_sha: pointer.previous_sha },
           main_agent: this.mainAgentAuditObservation(mainAgent),
+          ...(recoveryHealth ? { services: recoveryHealth } : {}),
         },
       );
       return;

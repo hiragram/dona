@@ -809,7 +809,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack", "waitForMainAgentIdle",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack",
     ]);
     const audit = f.database.auditRows(row.request_id).at(-1)!;
     const details = JSON.parse(audit.details_json as string) as Record<string, unknown>;
@@ -894,6 +894,13 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.state, "needs_review");
     assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
     assert.equal(row.observed_active_sha, null);
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, unknown>;
+    const services = details.services as Record<string, Record<string, unknown>>;
+    assert.ok(services.dispatcher);
+    assert.ok(services.slack_adapter);
+    assert.equal(services.dispatcher.live, false);
+    assert.equal(services.slack_adapter.ready, true);
     f.database.close();
   });
 
