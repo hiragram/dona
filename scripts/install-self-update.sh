@@ -51,18 +51,6 @@ restore_control_plane() {
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     /bin/launchctl bootout "$DOMAIN/dev.dona.updater" >/dev/null 2>&1 || true
   fi
-  if [[ "$DISPATCHER_STOPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
-    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1 || true
-    if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
-      /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
-    fi
-    if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
-      print -u2 "旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
-      return 1
-    fi
-    DISPATCHER_PLIST_SWAPPED=0
-    DISPATCHER_STOPPED=0
-  fi
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     print -u2 "control-plane復旧前に新しいupdaterの停止を確認できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
@@ -97,6 +85,18 @@ restore_control_plane() {
       "$CONTROL_ROOT/updater.sock" "$OLD_UPDATER_SHA" 30000; then
     print -u2 "旧stable updaterの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
+  fi
+  if [[ "$DISPATCHER_STOPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
+    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1 || true
+    if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
+      /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
+    fi
+    if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
+      print -u2 "旧Updaterの復旧後に旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
+      return 1
+    fi
+    DISPATCHER_PLIST_SWAPPED=0
+    DISPATCHER_STOPPED=0
   fi
   return 0
 }
