@@ -18,7 +18,7 @@ import type {
   OutboxRow,
   SchemaRollout,
 } from "../src/types.js";
-import { currentSha, installPointers, logger, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -261,6 +261,9 @@ class FakeRuntime implements RuntimePort {
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
   mainObserveStatus: MainAgentObservation["status"] = "idle";
+  mainObserveStatuses: Array<MainAgentObservation["status"]> = [];
+  mainNonInteractiveOnObserveCall: number | undefined;
+  private mainObserveCallCount = 0;
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   previousMainStartUnknownOnce = false;
@@ -350,7 +353,12 @@ class FakeRuntime implements RuntimePort {
     return { outcome: "started" as const, observation: this.mainAgent(this.mainAgentSha, "idle", releasePath), error_code: null };
   }
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
-    return this.mainAgent(this.mainAgentSha, this.mainObserveStatus, releasePath);
+    this.mainObserveCallCount += 1;
+    const observation = this.mainAgent(this.mainAgentSha, this.mainObserveStatuses.shift() ?? this.mainObserveStatus, releasePath);
+    if (this.mainNonInteractiveOnObserveCall === this.mainObserveCallCount) {
+      return { ...observation, interactive_ready: false };
+    }
+    return observation;
   }
   async dispatcherHealth(): Promise<HealthSnapshot> {
     if (!this.dispatcherLive) return this.health("dispatcher", null, false, false);
@@ -796,7 +804,38 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack", "waitForMainAgentIdle",
+    ]);
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, unknown>;
+    assert.deepEqual(details.pointer, { current_sha: currentSha, previous_sha: olderSha });
+    assert.equal((details.main_agent as Record<string, unknown>).matches_release, false);
+    assert.equal("working_directory" in (details.main_agent as Record<string, unknown>), false);
+    f.database.close();
+  });
+
+  test("re-observes a transiently non-interactive current main agent before terminal recovery", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-transient-main-agent",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "main_agent_not_idle");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack", "waitForMainAgentIdle",
     ]);
     f.database.close();
   });

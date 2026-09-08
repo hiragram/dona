@@ -497,11 +497,11 @@ export class UpdateDatabase {
     })();
   }
 
-  terminal(requestId: string, fence: number, to: Extract<UpdateState, "succeeded" | "failed" | "rolled_back" | "needs_review" | "cancelled">, code: string, fields: MutationFields = {}, at = new Date()): UpdateRow {
+  terminal(requestId: string, fence: number, to: Extract<UpdateState, "succeeded" | "failed" | "rolled_back" | "needs_review" | "cancelled">, code: string, fields: MutationFields = {}, at = new Date(), details: Record<string, unknown> = {}): UpdateRow {
     return this.db.transaction(() => {
       const row = this.getRequired(requestId);
       if (row.fence !== fence) throw new Error("Terminal mutation rejected by stale fencing token");
-      return this.completeInternal(row, to, code, fields, at);
+      return this.completeInternal(row, to, code, fields, at, details);
     })();
   }
 
@@ -752,6 +752,7 @@ export class UpdateDatabase {
     code: string,
     fields: MutationFields,
     at: Date,
+    details: Record<string, unknown> = {},
   ): UpdateRow {
     const completed = this.transitionInternal(row, to, at, {
       ...fields,
@@ -768,7 +769,7 @@ export class UpdateDatabase {
         last_error_code: null,
         last_error_message: null,
       } : {}),
-    }, code, {});
+    }, code, details);
     this.db.prepare("UPDATE controller_state SET active_request_id = NULL, updated_at = ? WHERE singleton = 1 AND active_request_id = ?")
       .run(at.toISOString(), row.request_id);
     this.insertOutbox(completed, at);

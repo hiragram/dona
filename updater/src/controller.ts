@@ -1459,16 +1459,35 @@ export class UpdateController {
       causeCode,
       () => this.runtime.startSlack(),
     ))) return;
-    const [pointer, mainAgent] = await Promise.all([
+    const [pointer, initialMainAgent] = await Promise.all([
       this.releases.observe(),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha)),
     ]);
     this.assertLease(row);
-    if (pointer.current_sha !== row.current_sha || !mainAgentMatches(mainAgent)) {
+    let mainAgent = initialMainAgent;
+    let mainAgentVerified = mainAgentMatches(initialMainAgent);
+    if (pointer.current_sha === row.current_sha && !mainAgentVerified) {
+      // Herdr can briefly report the just-finished dona-main turn as non-interactive.
+      // Reuse its bounded idle wait before treating an otherwise restored runtime as ambiguous.
+      const settled = await this.runtime.waitForMainAgentIdle();
+      this.assertLease(row);
+      const observed = await this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha));
+      this.assertLease(row);
+      const sameSettledIdentity = settled.pane_id !== null && settled.session_id !== null &&
+        settled.pane_id === observed.pane_id && settled.session_id === observed.session_id;
+      mainAgent = observed;
+      mainAgentVerified = sameSettledIdentity && mainAgentMatches(observed);
+    }
+    if (pointer.current_sha !== row.current_sha || !mainAgentVerified) {
       this.needsReview(
         row,
         "quiesce_recovery_runtime_mismatch",
         `Update stopped before pointer mutation (${causeCode}), but the exact current pointer and main-agent runtime were not verified`,
+        {
+          cause_code: causeCode,
+          pointer: { current_sha: pointer.current_sha, previous_sha: pointer.previous_sha },
+          main_agent: this.mainAgentAuditObservation(mainAgent),
+        },
       );
       return;
     }
@@ -1593,11 +1612,26 @@ export class UpdateController {
     row: UpdateRow,
     code: string,
     message = "External command or runtime acceptance could not be proven; no blind retry was attempted",
+    details: Record<string, unknown> = {},
   ): void {
     this.database.terminal(row.request_id, row.fence, "needs_review", code, {
       last_error_code: code,
       last_error_message: message,
-    }, this.clock.now());
+    }, this.clock.now(), details);
+  }
+
+  private mainAgentAuditObservation(agent: MainAgentObservation): Record<string, unknown> {
+    return {
+      exists: agent.exists,
+      name: agent.name,
+      kind: agent.kind,
+      pane_id: agent.pane_id,
+      status: agent.status,
+      interactive_ready: agent.interactive_ready,
+      session_id: agent.session_id,
+      matches_release: agent.matches_release,
+      error_code: agent.error_code,
+    };
   }
 
   private assertLease(row: UpdateRow): void {
