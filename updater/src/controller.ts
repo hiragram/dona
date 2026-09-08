@@ -1468,6 +1468,7 @@ export class UpdateController {
     let mainAgentVerified = mainAgentMatches(initialMainAgent);
     let servicesVerified = true;
     let recoveryHealth: { dispatcher: HealthSnapshot; slack_adapter: HealthSnapshot } | undefined;
+    let settledMainAgent: MainAgentObservation | undefined;
     const retryableMainAgentObservation = initialMainAgent.exists &&
       initialMainAgent.name === this.policy.main_agent.name && initialMainAgent.kind === "codex" &&
       initialMainAgent.matches_release && initialMainAgent.pane_id !== null && initialMainAgent.session_id !== null;
@@ -1475,6 +1476,7 @@ export class UpdateController {
       // Herdr can briefly report the just-finished dona-main turn as non-interactive.
       // Reuse its bounded idle wait before treating an otherwise restored runtime as ambiguous.
       const settled = await this.runtime.waitForMainAgentIdle();
+      settledMainAgent = settled;
       this.assertLease(row);
       const observed = await this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha));
       this.assertLease(row);
@@ -1493,7 +1495,8 @@ export class UpdateController {
       recoveryHealth = { dispatcher: dispatcherHealth, slack_adapter: slackHealth };
       servicesVerified = currentManifest !== null &&
         this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
-        this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility);
+        this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility) &&
+        this.notificationReporterReady(dispatcherHealth, slackHealth);
     }
     if (pointer.current_sha !== row.current_sha || !servicesVerified || !mainAgentVerified) {
       this.needsReview(
@@ -1504,6 +1507,7 @@ export class UpdateController {
           cause_code: causeCode,
           pointer: { current_sha: pointer.current_sha, previous_sha: pointer.previous_sha },
           main_agent: this.mainAgentAuditObservation(mainAgent),
+          ...(settledMainAgent ? { settled_main_agent: this.mainAgentAuditObservation(settledMainAgent) } : {}),
           ...(recoveryHealth ? { services: recoveryHealth } : {}),
         },
       );

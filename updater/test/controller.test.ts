@@ -263,6 +263,7 @@ class FakeRuntime implements RuntimePort {
   mainObserveStatus: MainAgentObservation["status"] = "idle";
   mainObserveStatuses: Array<MainAgentObservation["status"]> = [];
   mainNonInteractiveOnObserveCall: number | undefined;
+  rotateMainAgentSessionOnObserveCall: number | undefined;
   private mainObserveCallCount = 0;
   afterMainWait: ((call: number) => Promise<void>) | undefined;
   private mainWaitCallCount = 0;
@@ -359,6 +360,7 @@ class FakeRuntime implements RuntimePort {
   }
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
     this.mainObserveCallCount += 1;
+    if (this.rotateMainAgentSessionOnObserveCall === this.mainObserveCallCount) this.mainAgentSessionGeneration += 1;
     const observation = this.mainAgent(this.mainAgentSha, this.mainObserveStatuses.shift() ?? this.mainObserveStatus, releasePath);
     if (this.mainNonInteractiveOnObserveCall === this.mainObserveCallCount) {
       return { ...observation, interactive_ready: false };
@@ -901,6 +903,55 @@ describe("UpdateController isolated end-to-end", () => {
     assert.ok(services.slack_adapter);
     assert.equal(services.dispatcher.live, false);
     assert.equal(services.slack_adapter.ready, true);
+    f.database.close();
+  });
+
+  test("audits both main-agent identities when the session changes after recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-session-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.rotateMainAgentSessionOnObserveCall = 3;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, Record<string, unknown>>;
+    assert.equal(details.settled_main_agent?.session_id, `session-${currentSha}`);
+    assert.equal(details.main_agent?.session_id, `session-${currentSha}-1`);
+    f.database.close();
+  });
+
+  test("requires notification protocol readiness after recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-notification-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call === 2) f.runtime.notificationProtocolReady = false;
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
     f.database.close();
   });
 
