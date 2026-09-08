@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const canonicalRemote = "https://github.com/hiragram/dona.git";
 
@@ -64,15 +65,16 @@ export async function cleanupInstallStaging(releaseRoot, stagingDir) {
   await fs.rm(stagingDir, { recursive: true, force: true });
 }
 
-function udsJson(socketPath, route, timeoutMs = 2_000) {
+function udsJson(socketPath, route, timeoutMs = 2_000, method="GET", body) {
   return new Promise((resolve, reject) => {
-    const request = http.request({ socketPath, path: route, method: "GET" }, (response) => {
+    const encoded=body===undefined?undefined:Buffer.from(JSON.stringify(body));
+    const request = http.request({ socketPath, path: route, method, headers:encoded?{"content-type":"application/json","content-length":String(encoded.length)}:undefined }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
       response.on("end", () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if (response.statusCode !== 200) throw new Error(`HTTP ${response.statusCode}`);
+          if (response.statusCode !== 200 && response.statusCode !== 202) throw new Error(`HTTP ${response.statusCode}`);
           resolve(body);
         } catch (error) {
           reject(error);
@@ -81,8 +83,20 @@ function udsJson(socketPath, route, timeoutMs = 2_000) {
     });
     request.setTimeout(timeoutMs, () => request.destroy(new Error("request timed out")));
     request.once("error", reject);
-    request.end();
+    request.end(encoded);
   });
+}
+
+export async function quiesceDispatcherForControlUpgrade(socketPath,targetSha,timeoutMs=30_000) {
+  if(!/^[0-9a-f]{40}$/.test(targetSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("dispatcher quiesce arguments are invalid");
+  const operationId="upd_01m1es03xy5cf8d9pm5cwx4srv";
+  let snapshot=await udsJson(socketPath,"/v1/admin/quiesce",2_000,"POST",{schema_version:1,protocol:1,operation_id:operationId,target_sha:targetSha});
+  const deadline=Date.now()+timeoutMs;
+  while(snapshot?.drained!==true&&Date.now()<deadline) {
+    await new Promise(resolve=>setTimeout(resolve,100));
+    snapshot=await udsJson(socketPath,"/v1/admin/drain-status",2_000);
+  }
+  if(snapshot?.service!=="dispatcher"||snapshot?.quiescing!==true||snapshot?.drained!==true||snapshot?.in_flight!==0||!Array.isArray(snapshot?.unsafe_states)||snapshot.unsafe_states.length!==0)throw new Error("dispatcher did not reach a safe drain barrier");
 }
 
 export async function assertControlUpgradeSafe(socketPath) {
@@ -120,6 +134,17 @@ export async function waitForUpdaterSha(socketPath, expectedSha, timeoutMs, expe
     await new Promise((resolve) => setTimeout(resolve, 100));
   } while (Date.now() < deadline);
   throw new Error(`updater ${expectedSha} was not observed ready`);
+}
+
+export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
+  if(!/^[0-9a-f]{40}$/.test(expectedSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-dispatcher-sha arguments are invalid");
+  const deadline=Date.now()+timeoutMs;
+  do {
+    try { const health=await udsJson(socketPath,"/health/version",Math.min(2_000,timeoutMs)); if(health.status==="ready"&&health.service==="dispatcher"&&health.build_sha===expectedSha)return; }
+    catch { /* launchd activation and UDS publication are observed until the bounded deadline. */ }
+    await new Promise(resolve=>setTimeout(resolve,100));
+  } while(Date.now()<deadline);
+  throw new Error(`dispatcher ${expectedSha} was not observed ready`);
 }
 
 async function releaseTreeDigest(root) {
@@ -163,13 +188,17 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
     throw new Error("existing release validation arguments are invalid");
   }
   const manifest = JSON.parse(await fs.readFile(path.join(existingRelease, "release-manifest.json"), "utf8"));
+  const stagedManifest = JSON.parse(await fs.readFile(path.join(stagedRelease, "release-manifest.json"), "utf8"));
   const compatibility = manifest?.compatibility;
   if (manifest?.schema_version !== 1 || manifest.sha !== expectedSha ||
     manifest.repository !== "hiragram/dona" || manifest.policy_version !== "2026-09-03.2" ||
     compatibility?.protocol !== 1 || compatibility?.config !== 1 ||
     compatibility?.app_schema_read_min !== 2 || compatibility?.app_schema_read_max !== 2 ||
-    compatibility?.app_schema_write !== 2 || compatibility?.rollback_safe !== true) {
+    compatibility?.app_schema_write !== 2 || typeof compatibility?.rollback_safe !== "boolean") {
     throw new Error("existing release manifest does not match the control-plane contract");
+  }
+  if (!isDeepStrictEqual(manifest.compatibility, stagedManifest?.compatibility)) {
+    throw new Error("existing release compatibility does not match the freshly verified staging manifest");
   }
   const [existingDigest, stagedDigest] = await Promise.all([
     releaseTreeDigest(existingRelease),
@@ -184,7 +213,7 @@ async function main() {
   const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
     console.error(
-      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-dispatcher-sha <socket> <sha> <timeout-ms> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
     );
     return 2;
   }
@@ -214,6 +243,10 @@ async function main() {
       return 1;
     }
   }
+  if(mode==="quiesce-dispatcher"&&secondValue) {
+    try { await quiesceDispatcherForControlUpgrade(value,secondValue); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
+  }
   if (mode === "wait-updater-sha" && secondValue && process.argv[5]) {
     try {
       await waitForUpdaterSha(
@@ -227,6 +260,10 @@ async function main() {
       console.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+  if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]) {
+    try { await waitForDispatcherSha(value,secondValue,Number(process.argv[5])); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "validate-existing-release" && secondValue && process.argv[5]) {
     try {

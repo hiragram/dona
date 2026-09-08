@@ -25,10 +25,15 @@ interface TerminalObservation {
 }
 
 function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
-  return previous.rollback_safe && target.rollback_safe &&
-    previous.protocol === target.protocol && previous.config === target.config &&
+  return previous.protocol === target.protocol && previous.config === target.config &&
     previous.app_schema_write >= target.app_schema_read_min && previous.app_schema_write <= target.app_schema_read_max &&
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
+}
+
+function policyCompatible(policy: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
+  const { rollback_safe: _policyRollback, ...approved } = policy;
+  const { rollback_safe: _targetRollback, ...candidate } = target;
+  return canonicalJson(approved) === canonicalJson(candidate);
 }
 
 function resultSucceeded(result: { exit_code: number | null; timed_out: boolean }): boolean {
@@ -65,7 +70,7 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
+    if (!policyCompatible(this.policy.compatibility, git.target_compatibility)) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
@@ -80,8 +85,8 @@ export class UpdateController {
       built_at: this.clock.now().toISOString(),
       compatibility: git.target_compatibility,
     };
-    const rollbackCompatible = compatible(current.compatibility, targetManifest.compatibility);
-    if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (!compatible(current.compatibility, targetManifest.compatibility)) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    const rollbackCompatible = current.compatibility.rollback_safe && targetManifest.compatibility.rollback_safe;
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,

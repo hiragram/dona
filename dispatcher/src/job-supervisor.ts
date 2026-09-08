@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
-import type { JobAgentRuntime } from "./job-runtime.js";
+import { PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
 import { buildJobPrompt } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
@@ -78,13 +78,39 @@ export class JobSupervisor {
       });
     }
     this.running = true;
-    this.loopPromise = this.loop().catch((error: unknown) => {
+    this.loopPromise = this.stopLegacySharedGrantAgents().then(()=>this.loop()).catch((error: unknown) => {
       this.logger.error("Job supervisor stopped unexpectedly", {
         error_code: "job_supervisor_crashed",
         error_message: error instanceof Error ? error.message : String(error),
       });
       throw error;
     });
+  }
+
+  private async stopLegacySharedGrantAgents():Promise<void> {
+    for(const job of this.database.listLegacySharedGrantJobs()) {
+      const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
+      if(!stopped.ok&&["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {
+        this.database.markLegacySharedGrantAgentStopped(job.job_id);
+        await this.tryComplete(this.database.getJob(job.job_id)!,false);
+        continue;
+      }
+      if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
+      if(!this.runtime.closeAgent) throw new Error(`Legacy agent ${job.agent_name} cannot be closed by this runtime`);
+      const closed=await this.runtime.closeAgent(job.agent_name,this.abortController.signal);
+      if(!closed.ok&&!['agent_not_found','agent_not_running'].includes(closed.errorCode??"")) throw new Error(`Legacy agent ${job.agent_name} could not be closed before isolated jobs start`);
+      const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+      let exited=false;
+      while(Date.now()<deadline) {
+        const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+        if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {exited=true;break;}
+        if(!observed.ok) throw new Error(`Legacy agent ${job.agent_name} exit could not be observed`);
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      if(!exited) throw new Error(`Legacy agent ${job.agent_name} exit was not observed`);
+      this.database.markLegacySharedGrantAgentStopped(job.job_id);
+      await this.tryComplete(this.database.getJob(job.job_id)!,false);
+    }
   }
 
   wake(): void {
@@ -144,16 +170,39 @@ export class JobSupervisor {
         this.wake();
         return { row: this.database.getJob(jobId)!, duplicate: false };
       }
+      if (["preparing", "dispatching"].includes(before.status)) await this.active.get(jobId);
+      if(before.last_error_code==="legacy_agent_sandbox_unknown"&&this.database.isLegacySharedGrantAgentStopped(jobId)) {
+        this.database.markJobCancelled(jobId,reason); this.wake();
+        return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
+      if(before.status==="preparing"&&!cancelled.timedOut&&["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
+        this.database.markJobCancelled(jobId,reason); this.wake();
+        return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
-          cancelled.errorCode ?? "cancel_acceptance_unknown",
+          "cancel_acceptance_unknown",
           commandMessage(cancelled),
         );
         this.wake();
         throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
+      const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+      let stopped=false;
+      while(Date.now()<deadline) {
+        const observed=await this.runtime.get(cancelling.agent_name,this.abortController.signal);
+        if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+          (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {stopped=true;break;}
+        if(!observed.ok) break;
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      if(!stopped) {
+        this.database.markJobNeedsReview(jobId,"cancel_exit_unknown","Agent exit was not observed after cancellation acceptance");
+        this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
+      }
+      if(await this.tryComplete(cancelling,false)) return {row:this.database.getJob(jobId)!,duplicate:false};
       this.database.markJobCancelled(jobId, reason);
       this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -162,6 +211,49 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
+      for(const job of this.database.listAmbiguousScheduledJobs()) try {
+        if(await this.reconcileAmbiguousScheduledJob(job)) continue;
+        if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;
+        const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+        if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+          (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
+          if(await this.tryComplete(job,false)) continue;
+          this.database.settleAmbiguousCancellation(job.job_id,"Agent termination was confirmed after ambiguous cancellation");
+        }
+      } catch(error) {
+        this.logger.warn("Scheduled job reconciliation requires review",{job_id:job.job_id,error_message:error instanceof Error?error.message:String(error)});
+      }
+      for (const job of this.database.listScheduledJobsRequiringCancellation()) {
+        await this.tryComplete(job,false);
+        const current=this.database.getJob(job.job_id);
+        if(["completed","failed"].includes(current?.status??"")) continue;
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {await this.stopInvalidResultAgent(job);continue;}
+        try { await this.cancel(job.job_id, job.source_event_id, "Schedule was cancelled or its authorization expired"); }
+        catch (error) { this.logger.warn("Scheduled job cancellation requires review", { job_id: job.job_id,
+          error_message: error instanceof Error ? error.message : String(error) }); }
+      }
+      for (const job of this.database.listOverdueScheduledJobs()) {
+        await this.tryComplete(job,false);
+        const current=this.database.getJob(job.job_id);
+        if(["completed","failed"].includes(current?.status??"")) continue;
+        if(current?.status==="needs_review"&&["invalid_result","invalid_result_agent_stop_unknown"].includes(current.last_error_code??"")) {await this.stopInvalidResultAgent(job);continue;}
+        try { await this.cancel(job.job_id, job.source_event_id, "Scheduled work exceeded its 3600 second execution deadline"); }
+        catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
+          error_message: error instanceof Error ? error.message : String(error) }); }
+      }
+      for (const job of this.database.listTerminalScheduledJobsNeedingCleanup()) {
+        try {
+          if (!this.runtime.cleanup) continue;
+          const cleaned = await this.runtime.cleanup(job, this.abortController.signal);
+          if (!cleaned.ok) throw new Error(commandMessage(cleaned));
+          this.database.markJobRuntimeCleaned(job.job_id);
+        } catch (error) {
+          this.logger.warn("Terminal scheduled job cleanup will be retried", {
+            job_id: job.job_id,
+            error_message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       this.publishNotifications();
       const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
       const rows = this.database.listRunnableJobs().filter((row) => !this.active.has(row.job_id));
@@ -170,10 +262,63 @@ export class JobSupervisor {
     }
   }
 
+  private async reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean> {
+    if(job.last_error_code==="invalid_result") {await this.stopInvalidResultAgent(job);return true;}
+    if(job.last_error_code!=="invalid_result_agent_stop_unknown") return this.tryComplete(job,false);
+    const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+    if((observed.ok&&["idle","done"].includes(observed.agentStatus??"")&&await this.closeAndConfirmInvalidResultAgent(job))||
+      (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
+      this.database.recordInvalidResultAgentStopped(job.job_id);
+      if(await this.tryComplete(job,false)) return true;
+    }
+    return true;
+  }
+
+  private async stopInvalidResultAgent(job:JobRow):Promise<void> {
+    const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
+    if(!stopped.ok&&! ["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {this.database.recordInvalidResultAgentStopFailure(job.job_id,commandMessage(stopped));return;}
+    if(!stopped.ok) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
+    const deadline=Date.now()+this.config.jobCommandTimeoutMs;
+    while(Date.now()<deadline) {
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
+      if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
+      if(!observed.ok) break;
+      if(["idle","done"].includes(observed.agentStatus??"")) {
+        if(await this.closeAndConfirmInvalidResultAgent(job)) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
+        break;
+      }
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    this.database.recordInvalidResultAgentStopFailure(job.job_id,"Agent exit was not observed after invalid Result");
+  }
+
+  private async closeAndConfirmInvalidResultAgent(job:JobRow):Promise<boolean> {
+    if(!this.runtime.closeAgent)return false;
+    const closed=await this.runtime.closeAgent(job.agent_name,this.abortController.signal);
+    if(!closed.ok&&! ["agent_not_found","agent_not_running"].includes(closed.errorCode??""))return false;
+    const absent=await this.runtime.get(job.agent_name,this.abortController.signal);
+    return !absent.ok&&["agent_not_found","agent_not_running"].includes(absent.errorCode??"");
+  }
+
+  private async tryRecoverStoppedInvalidResult(jobId:string):Promise<void> {
+    const stopped=this.database.getJob(jobId);
+    if(stopped?.last_error_code!=="invalid_result_agent_stopped") return;
+    try {
+      const result=await readJobResultEnvelope(stopped.result_path,stopped.job_id);
+      this.database.saveJobResult(stopped.job_id,result,stopped.result_path);
+    } catch {
+      // The invalid/missing Result remains fenced for operator review after the worker is stopped.
+    }
+  }
+
   private publishNotifications(): void {
     for (const job of this.database.listJobsNeedingNotification()) {
       try {
         const event = this.database.enqueueJobNotification(job.job_id);
+        if (event.row.source !== "dona_job") {
+          this.logger.info("Job completion persisted without a Dona notification event", { job_id: job.job_id, job_status: job.status });
+          continue;
+        }
         this.logger.info("Job notification event enqueued", {
           job_id: job.job_id,
           job_status: job.status,
@@ -224,7 +369,13 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
+      if(error instanceof PreparedWorkspaceCleanupError) {
+        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
+        this.database.markJobNeedsReview(row.job_id,"workspace_cleanup_failed",error.message);
+        return;
+      }
       if (this.stopping) return;
+      if (this.database.getJob(row.job_id)?.status !== "preparing") return;
       const updated = this.database.recordJobPreparationFailure(
         row.job_id,
         errorCode(error),
@@ -234,10 +385,12 @@ export class JobSupervisor {
       this.logTransition(preparing, updated);
       return;
     }
-    if (this.stopping) return;
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
+    if (this.stopping) return;
+    if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
     const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching), this.abortController.signal);
+    if (this.database.getJob(row.job_id)?.status !== "dispatching") return;
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
       return;
@@ -259,7 +412,9 @@ export class JobSupervisor {
       }
       this.database.markJobNeedsReview(
         row.job_id,
-        prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_acceptance_unknown"),
+        row.source === "dona_schedule"
+          ? "prompt_acceptance_unknown"
+          : prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_acceptance_unknown"),
         commandMessage(prompted),
       );
       return;
@@ -271,9 +426,11 @@ export class JobSupervisor {
   }
 
   private async monitor(row: JobRow): Promise<void> {
+    if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (await this.tryComplete(row, false)) return;
     const waited = await this.runtime.wait(row.agent_name, this.abortController.signal);
     if (waited.aborted || this.stopping) return;
+    if (this.database.getJob(row.job_id)?.status !== "running") return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
         this.logger.debug("Background job remains active", {
@@ -284,7 +441,7 @@ export class JobSupervisor {
       }
       this.database.markJobNeedsReview(
         row.job_id,
-        waited.errorCode ?? "agent_wait_failed",
+        row.source === "dona_schedule" ? "agent_wait_observation_unknown" : waited.errorCode ?? "agent_wait_failed",
         commandMessage(waited),
       );
       return;
@@ -306,6 +463,7 @@ export class JobSupervisor {
       return true;
     } catch (error) {
       if (error instanceof JobResultNotFoundError && !terminalAgentState) return false;
+      if (this.database.getJob(row.job_id)?.status === "cancelled") return true;
       this.database.markJobNeedsReview(
         row.job_id,
         error instanceof JobResultNotFoundError ? "result_missing" : "invalid_result",

@@ -98,6 +98,7 @@ export function migrateScheduler(db: Database.Database): void {
         attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt BETWEEN 0 AND 3), available_at TEXT NOT NULL,
         claim_token TEXT, lease_until TEXT, request_started_at TEXT, receipt_id TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, content_delete_at TEXT,
+        completion_job_status TEXT,
         UNIQUE(run_id, kind)
       );
       CREATE INDEX connector_outbox_claim_idx ON connector_outbox(status, available_at, outbox_id);

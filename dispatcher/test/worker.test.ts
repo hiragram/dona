@@ -41,6 +41,73 @@ function promptFields(prompt: string): { eventId: string; resultPath: string } {
 }
 
 describe("DispatcherWorker", () => {
+  for(const preflight of [failed("unavailable"),ok("blocked")]) test(`keeps running when ${preflight.ok?"blocked":"failed"} preflight arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const event=database.enqueue(eventEnvelope(`Ev-preflight-race-${preflight.ok?"blocked":"failed"}`)).row;
+    let release!:()=>void,started=false;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){started=true;await gate;return preflight;},async prompt(){throw new Error("must not prompt");},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>started);
+    database.manualComplete(event.event_id);
+    release();
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(worker.isRunning(),true);
+    assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
+  for(const prompted of [failed("agent_not_running"),failed("agent_blocked")]) test(`keeps running when ${prompted.errorCode} prompt result arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-prompt-race-${prompted.errorCode}`)).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){await gate;return prompted;},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="dispatching"); database.manualComplete(event.event_id); release();
+    await new Promise(resolve=>setTimeout(resolve,20)); assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
+  test("does not retry when the event advances while prompt acceptance becomes unavailable",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-prompt-advanced")).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){await gate;return failed("agent_not_running");},async wait(){throw new Error("must not wait");}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="dispatching");
+    database.markWaiting(event.event_id); release();
+    await waitFor(()=>database.get(event.event_id)?.status==="needs_review");
+    assert.equal(database.get(event.event_id)?.last_error_code,"prompt_acceptance_unknown");
+    assert.equal(worker.isRunning(),true);
+    await worker.stop(); database.close();
+  });
+
+  test("keeps an existing review fence when Result reading fails",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-result-review-race")).row;
+    const resultPath=path.join(config.resultsDir,`${event.event_id}.json`);
+    database.beginDispatch(event.event_id,resultPath); database.markWaiting(event.event_id); database.markNeedsReview(event.event_id,"notification_delivery_ambiguous","schedule changed");
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},config,logger);
+    const completed=await (worker as unknown as {tryComplete(row:typeof event,terminal:boolean):Promise<boolean>}).tryComplete({...event,status:"waiting_agent",result_path:resultPath},true);
+    assert.equal(completed,true); assert.equal(database.get(event.event_id)?.last_error_code,"notification_delivery_ambiguous");
+    database.close();
+  });
+
+  for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;
+    let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const herdr:HerdrClient={async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){await gate;return waited;}};
+    const worker=new DispatcherWorker(database,herdr,config,logger); worker.start();
+    await waitFor(()=>database.get(event.event_id)?.status==="waiting_agent"); database.manualComplete(event.event_id); release();
+    await new Promise(resolve=>setTimeout(resolve,20)); assert.equal(database.get(event.event_id)?.status,"completed");
+    await worker.stop(); database.close();
+  });
+
   test("prompts and completes events one at a time in sequence order", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

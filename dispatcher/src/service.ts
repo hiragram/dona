@@ -4,6 +4,7 @@ import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
+import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 import { createLogger } from "./logger.js";
 import { SystemClock } from "./scheduler/clock.js";
 import { SchedulerService } from "./scheduler/service.js";
@@ -27,7 +28,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger);
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config));
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),

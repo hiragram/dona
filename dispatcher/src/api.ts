@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -24,6 +24,17 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
+  const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
+  return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
+    const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
+  });request.setTimeout(timeoutMs,()=>request.destroy(new Error("schedule_access_confirmation_timeout")));request.once("error",reject);request.end(encoded);});
+}
+export function scheduleAccessConfirmationTimeout(issuedAt:string,now=Date.now()):number {
+  const remaining=Date.parse(issuedAt)+120_000-now-1_000;
+  if(!Number.isFinite(remaining)||remaining<=0) throw new Error("schedule_access_receipt_expired");
+  return Math.min(140_000,remaining);
+}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -121,7 +132,7 @@ export class DispatcherApi {
     private readonly updateNotifications?: ApiWorkerState,
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
-  ) { this.schedules = new ScheduleApiService(database, scheduleNow, wakeScheduler); }
+  ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
@@ -283,6 +294,48 @@ export class DispatcherApi {
       }
       if (url.pathname.startsWith("/v1/self-update/")) {
         await this.handleSelfUpdate(request, response, url);
+        return;
+      }
+      const notificationAuthorization=/^\/v1\/job-notifications\/([^/]+)\/authorize$/.exec(url.pathname);
+      if(request.method==="POST"&&notificationAuthorization) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting notification authorization while quiescing");
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try {
+          let decoded:Record<string,unknown>|undefined;
+          if(body.receipt!==undefined) {
+            const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt),[payload,signature,...extra]=receipt.split(".");
+            if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+            const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+            if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+            const claimed=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+            const eventId=decodeURIComponent(notificationAuthorization[1]!); if(claimed.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
+            const issuedAt=String(claimed.issued_at??""),nonce=String(claimed.nonce??"");
+            if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
+            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
+            decoded={...confirmed,issued_at:issuedAt,nonce};
+          }
+          sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??""),channel_kind:String(decoded.channel_kind??""),channel_user_id:decoded.channel_user_id===null?null:String(decoded.channel_user_id??"")}:undefined)});
+        }
+        catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
+        return;
+      }
+      const scheduledAccess=/^\/v1\/scheduled-jobs\/([^/]+)\/access$/.exec(url.pathname);
+      if(request.method==="POST"&&scheduledAccess) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting scheduled access writes while quiescing");
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try {
+          const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
+          if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+          const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+          if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+          const decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+          const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
+          const issuedAt=String(decoded.issued_at??""),nonce=String(decoded.nonce??"");
+          if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
+          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
+          sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(confirmed.workspace_id??""),channel_id:String(confirmed.channel_id??""),user_id:String(confirmed.user_id??""),issued_at:issuedAt,nonce})});
+        }
+        catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
         return;
       }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
@@ -521,6 +574,12 @@ export class DispatcherApi {
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(sourceEventId){
+        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId)});}
+        catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
+        return;
+      }
       const workspaceId = url.searchParams.get("workspace_id");
       const channelId = url.searchParams.get("channel_id");
       const threadTs = url.searchParams.get("thread_ts");

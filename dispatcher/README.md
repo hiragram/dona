@@ -41,6 +41,7 @@ Herdr連携の初期値は次のとおりです。
 HERDR_SESSION=dona
 DONA_AGENT_NAME=dona-main
 DONA_HERDR_PATH=herdr
+DONA_CODEX_PATH=codex
 DONA_AGENT_MISSING_GRACE_MS=5000
 DONA_JOBS_WORKSPACE_ROOT=~/.dona/workspaces
 DONA_JOB_RESULTS_DIR=~/Library/Application Support/Dona/job-results

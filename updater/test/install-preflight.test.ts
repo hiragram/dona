@@ -15,6 +15,14 @@ import { tempPolicy } from "./helpers.js";
 const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
+const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.sh", import.meta.url));
+
+test("developer installer atomically creates and shares the access receipt key",async()=>{
+  const source=await fs.readFile(developerInstaller,"utf8");
+  assert.match(source,/openssl rand -hex 32/);
+  assert.match(source,/mv "\$DISPATCHER_TOKEN_PATH\.tmp" "\$DISPATCHER_TOKEN_PATH"/);
+  assert.equal(source.match(/<key>DONA_UPDATE_INTERNAL_TOKEN_PATH<\/key>/g)?.length,2);
+});
 
 async function run(mode: string, ...values: string[]): Promise<void> {
   await execute(process.execPath, [preflight, mode, ...values]);
@@ -109,6 +117,17 @@ test("control-plane upgrade preflight requires exact updater health and only ter
   }
 });
 
+test("control-plane upgradeはDispatcherのquiesceとdrain完了を要求する", async () => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-dispatcher-drain-")),socketPath=path.join(root,"dispatcher.sock");
+  let polls=0;
+  const server=http.createServer((request,response)=>{
+    const body=request.url==="/v1/admin/quiesce"?{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:false,in_flight:1,unsafe_states:["event.dispatching"]}:{schema_version:1,protocol:1,service:"dispatcher",quiescing:true,drained:++polls>1,in_flight:polls>1?0:1,unsafe_states:polls>1?[]:["event.dispatching"]};
+    response.writeHead(request.url==="/v1/admin/quiesce"?202:200,{"content-type":"application/json"});response.end(JSON.stringify(body));
+  });
+  try { await new Promise<void>((resolve,reject)=>{server.once("error",reject);server.listen(socketPath,resolve);}); await run("quiesce-dispatcher",socketPath,"2".repeat(40)); assert.ok(polls>1); }
+  finally { await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); await fs.rm(root,{recursive:true,force:true}); }
+});
+
 test("macOS keeps a hardened staged updater renamable by reopening only its root", {
   skip: process.platform !== "darwin",
 }, async () => {
@@ -144,6 +163,12 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
   assert.match(source, /updater\.previous\.sqlite3/);
+  assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
+  assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
+  assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source,/DISPATCHER_STOPPED=1[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
+  assert.match(source,/if \[\[ "\$DISPATCHER_STOPPED" == "1"[\s\S]*launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
+  assert.match(source, /launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
@@ -201,6 +226,9 @@ test("an existing immutable release is reusable only with the exact control-plan
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await run("validate-existing-release", existingRelease, stagedRelease, sha);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, compatibility: { ...manifest.compatibility, rollback_safe: false } }));
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /compatibility does not match/);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "tampered\n");
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, sha),

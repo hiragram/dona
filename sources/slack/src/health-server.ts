@@ -8,6 +8,8 @@ import type { DispatcherClient } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
 import {
   parseUpdateNotificationRequest,
+  parseJobDeliveryConfirmationRequest,
+  parseJobSessionSettlementRequest,
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
@@ -168,6 +170,42 @@ export class SlackHealthServer {
           },
         });
       }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/job-delivery-confirmations") {
+      if(!this.updateNotifications?.confirmJobDelivery||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Delivery confirmer is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobDeliveryConfirmationRequest(await this.readJson(request));
+        const result=await this.updateNotifications.confirmJobDelivery(input);
+        send(response,200,{schema_version:1,...result});
+      } catch(error) {
+        this.logger.error("Slack job delivery confirmation failed",{error_code:"job_delivery_not_confirmed",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_delivery_not_confirmed",message:"Slack delivery could not be confirmed"}});
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/job-session-settlements") {
+      if(!this.updateNotifications?.settleJobSession||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Session settlement is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobSessionSettlementRequest(await this.readJson(request));
+        const result=await this.updateNotifications.settleJobSession(input);
+        send(response,200,result);
+      } catch(error) {
+        this.logger.error("Slack job session settlement failed",{error_code:"job_session_not_settled",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_session_not_settled",message:"Slack Agent Session could not be settled"}});
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/schedule-access-confirmations") {
+      if(!this.updateNotifications?.confirmScheduleAccess||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Access confirmer is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const body=await this.readJson(request) as Record<string,unknown>;
+        const input={schema_version:1 as const,event_id:String(body.event_id??""),workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??"")};
+        const result=await this.updateNotifications.confirmScheduleAccess(input); send(response,200,result);
+      } catch { send(response,409,{schema_version:1,error:{code:"schedule_access_not_confirmed",message:"Current Slack access could not be confirmed"}}); }
       return;
     }
     if (method === "GET" && pathname === "/health/live") {

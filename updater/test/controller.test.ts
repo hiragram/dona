@@ -698,6 +698,20 @@ describe("UpdateController isolated end-to-end", () => {
     database.close();
   });
 
+  test("plans an explicitly approved non-rollback release without enabling automatic rollback", async () => {
+    const {root,policy}=await tempPolicy(); roots.push(root);
+    await installPointers(policy);
+    const database=new UpdateDatabase(path.join(policy.control_root,"updater.sqlite3"));
+    const store=new ReleaseStore(policy),dispatcher=new FakeDispatcher(),runtime=new FakeRuntime(store,()=>currentSha,policy.release_root);
+    const git=new FakeGit();
+    git.refresh=async current=>({current_sha:current,target_sha:targetSha,target_reachable:true,ci_trusted:true,target_compatibility:{...policy.compatibility,rollback_safe:false}});
+    const controller=new UpdateController(database,policy,git,new FakeBuild(),store,runtime,dispatcher,logger);
+    const planned=await controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});
+    assert.equal((planned.plan as {rollback_compatible:boolean}).rollback_compatible,false);
+    assert.equal(database.get(planned.request_id as string)?.rollback_compatible,0);
+    database.close();
+  });
+
   test("reconciles target health after a controller crash without repeating restart commands", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

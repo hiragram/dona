@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createHash } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
@@ -92,6 +93,7 @@ function failure(error: unknown, logger: SlackLogger, fields: Record<string, unk
 export function createSlackMcpServer(
   registry: SlackWorkspaceRegistry,
   logger: SlackLogger,
+  signAccessReceipt?: (input:{event_id:string;workspace_id:string;channel_id:string;user_id:string;channel_kind:"im"|"other";channel_user_id:string|null})=>string,
 ): McpServer {
   const server = new McpServer(
     { name: "dona-slack", version: "0.1.0" },
@@ -202,6 +204,25 @@ export function createSlackMcpServer(
       }
     },
   );
+
+  server.registerTool("check_user_channel_access", {
+    title: "Check current Slack access",
+    description: "外部write直前に、指定userが現在もworkspaceに存在し対象channelのmemberであることを確認します。照会失敗は許可として扱いません。",
+    inputSchema: { workspace: workspaceSchema, channel_id: channelSchema, user_id: userSchema,event_id:z.string().min(1).max(128).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({workspace,channel_id,user_id,event_id}) => {
+    try {
+      const connection=registry.get(workspace);
+      if(!connection.client.hasChannelMember) throw new SlackApiError("access_check_unavailable","Current membership check is unavailable");
+      const user=await connection.client.getUser(user_id);
+      const channel=await connection.client.getChannel(channel_id);
+      const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
+      const channel_kind=channel.isIm?"im" as const:"other" as const,channel_user_id=channel.isIm?channel.userId??null:null;
+      const receiptInput={event_id:event_id??"",workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id};
+      if(authorized&&event_id&&!signAccessReceipt) throw new SlackApiError("access_receipt_signing_unavailable","Access receipt signing is unavailable");
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id?{access_receipt:signAccessReceipt!(receiptInput)}:{})});
+    } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
+  });
 
   server.registerTool(
     "list_users",
@@ -473,20 +494,28 @@ export function createSlackMcpServer(
       inputSchema: {
         workspace: workspaceSchema,
         channel_id: channelSchema,
-        text: z.string().min(1).max(12_000).describe("Slack mrkdwn message body"),
+        text: z.string().min(1).max(12_000).describe("Slack message body"),
         thread_ts: timestampSchema.optional(),
         reply_broadcast: z.boolean().default(false),
+        mrkdwn: z.boolean().optional(),
+        parse: z.literal("none").optional(),
+        event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("Dona job通知時のcurrent event ID"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace, channel_id, text, thread_ts, reply_broadcast }) => {
+    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
+        const effectiveMrkdwn=event_id?false:mrkdwn;
+        const effectiveParse=event_id?"none" as const:parse;
         const result = await connection.client.postMessage({
           channelId: channel_id,
           text,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
           replyBroadcast: reply_broadcast,
+          ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
+          ...(effectiveParse?{parse:effectiveParse}:{}),
+          ...(event_id?{identityBlockId:`dona-job-${createHash("sha256").update(event_id).digest("hex").slice(0,32)}`}:{}),
         });
         logger.info("Slack MCP posted message", {
           tool: "post_message",
@@ -496,10 +525,16 @@ export function createSlackMcpServer(
           message_ts: result.messageTs,
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
+        const body_sha256=createHash("sha256").update(text).digest("hex");
         return success({
           workspace,
           channel_id: result.channelId,
           message_ts: result.messageTs,
+          body_sha256,
+          reply_broadcast,
+          ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
+          ...(effectiveParse?{parse:effectiveParse}:{}),
+          ...(event_id?{event_id}:{}),
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
       } catch (error) {

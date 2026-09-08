@@ -34,6 +34,7 @@ export interface UpdatePolicy {
     launchctl: string;
     gh: string;
     herdr: string;
+    codex: string;
   };
   timeouts: {
     command_ms: number;
@@ -121,7 +122,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     throw new ValidationError("launchd labels are not allowed");
   }
   const executables = record(value.executables, "executables");
-  exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr"], "executables");
+  exact(executables, ["git", "npm", "node", "launchctl", "gh", "herdr", "codex"], "executables");
   const timeouts = record(value.timeouts, "timeouts");
   exact(timeouts, ["command_ms", "health_ms", "drain_ms", "agent_drain_ms", "agent_exit_ms", "agent_start_ms", "reconcile_ms", "lease_ms"], "timeouts");
   const controlRoot = absolute(value.control_root, "control_root");
@@ -146,6 +147,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     launchctl: absolute(executables.launchctl, "executables.launchctl"),
     gh: absolute(executables.gh, "executables.gh"),
     herdr: absolute(executables.herdr, "executables.herdr"),
+    codex: absolute(executables.codex, "executables.codex"),
   };
   const fixedChecks = ["Verify dispatcher", "Verify sources/slack", "Verify updater"];
   const requiredChecks = value.required_checks;

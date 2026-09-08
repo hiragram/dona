@@ -12,12 +12,18 @@ export interface PreparedJobRuntime {
   herdrPaneId: string;
 }
 
+export class PreparedWorkspaceCleanupError extends Error {
+  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
+}
+
 export interface JobAgentRuntime {
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
+  cleanup?(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
 function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
@@ -27,8 +33,14 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig): string[] {
-  const args = ["--add-dir", config.jobResultsDir];
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[]=[]): string[] {
+  const resultDirectory=path.dirname(row.result_path);
+  const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
+  if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
+  const args = row.source==="dona_schedule"
+    ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+        ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
+    : ["--add-dir", resultDirectory];
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {
@@ -44,6 +56,17 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig): stri
     .join(", ");
   args.push("-c", `projects = { ${projects} }`);
   return args;
+}
+
+export function parseScheduledMcpInventory(value:unknown):string[] {
+  if(!Array.isArray(value)) throw new Error("Scheduled Codex MCP inventory was invalid");
+  return value.map(item=>{
+    if(item===null||typeof item!=="object"||Array.isArray(item)||!Object.hasOwn(item,"name")||typeof (item as {name?:unknown}).name!=="string"||!(item as {name:string}).name)
+      throw new Error("Scheduled Codex MCP identity was invalid");
+    const name=(item as {name:string}).name;
+    if(!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Scheduled Codex MCP identity was invalid");
+    return name;
+  });
 }
 
 function parseJson(value: string): unknown {
@@ -185,8 +208,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
     await fs.mkdir(this.config.jobsWorkspaceRoot, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
-    await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
-    await fs.chmod(this.config.jobResultsDir, 0o700);
+    const resultDirectory=path.dirname(row.result_path);
+    await fs.mkdir(resultDirectory, { recursive: true, mode: 0o700 });
+    await fs.chmod(resultDirectory, 0o700);
 
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
@@ -196,6 +220,14 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (workspaceId !== undefined && paneId !== undefined) {
         return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
       }
+    }
+
+    let disabledMcpServers:string[]=[];
+    if(row.source==="dona_schedule") {
+      const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
+      if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
+      const inventory=parseJson(listed.stdout);
+      disabledMcpServers=parseScheduledMcpInventory(inventory);
     }
 
     const created = workspace.kind === "scratch"
@@ -219,7 +251,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config),
+          "--", ...codexAgentArguments(row, this.config,disabledMcpServers),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,
@@ -227,7 +259,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (started.ok || started.errorCode !== "agent_pane_busy" || Date.now() >= deadline || signal?.aborted) break;
       await delay(200, signal);
     } while (true);
-    if (!started?.ok) throw commandError("Herdr agent start failed", started!);
+    if (!started?.ok) {
+      const closed=await this.herdr(["workspace","close",String(workspaceId)],this.config.jobCommandTimeoutMs+5_000).catch(()=>undefined);
+      if(!closed?.ok)throw new PreparedWorkspaceCleanupError("Herdr workspace cleanup failed after agent start failure",String(workspaceId),String(paneId));
+      if(workspace.kind==="scratch")await fs.rm(row.workspace_path,{recursive:true,force:true});
+      throw commandError("Herdr agent start failed", started!);
+    }
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
@@ -259,6 +296,22 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  }
+
+  closeAgent(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult> {
+    return this.herdr(["agent","close",agentName],this.config.jobCommandTimeoutMs+5_000,signal);
+  }
+
+  async cleanup(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    const workspace = workspaceFromJob(row);
+    if (row.source !== "dona_schedule" || workspace.kind !== "scratch" || !row.herdr_workspace_id) {
+      throw new Error("Only terminal scheduled scratch jobs can be cleaned up");
+    }
+    assertScratchWorkspacePath(row, this.config);
+    const closed = await this.herdr(["workspace", "close", row.herdr_workspace_id], this.config.jobCommandTimeoutMs + 5_000, signal);
+    if (!closed.ok && !["workspace_not_found", "not_found"].includes(closed.errorCode ?? "")) return closed;
+    await fs.rm(row.workspace_path, { recursive: true, force: true });
+    return closed.ok ? closed : { ...closed, ok: true };
   }
 
   private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {

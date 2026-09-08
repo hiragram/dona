@@ -18,6 +18,13 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
+  authorizeJobNotification(eventId:string,receipt?:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/job-notifications/${encodeURIComponent(eventId)}/authorize`,receipt?{receipt}:{});
+  }
+  recordScheduleJobAccess(eventId:string,receipt:string):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/scheduled-jobs/${encodeURIComponent(eventId)}/access`,{receipt});
+  }
+
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>> {
     const query = new URLSearchParams({
       workspace_id: workspaceId,
@@ -25,6 +32,10 @@ export class DispatcherApiClient {
       thread_ts: threadTs,
     });
     return this.request("GET", `/v1/jobs?${query}`);
+  }
+
+  listOwnerJobs(sourceEventId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs?${new URLSearchParams({ source_event_id: sourceEventId })}`);
   }
 
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {

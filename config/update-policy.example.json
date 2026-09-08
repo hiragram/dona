@@ -27,7 +27,8 @@
     "node": "/opt/homebrew/bin/node",
     "launchctl": "/bin/launchctl",
     "gh": "/opt/homebrew/bin/gh",
-    "herdr": "/Users/USERNAME/.local/bin/herdr"
+    "herdr": "/Users/USERNAME/.local/bin/herdr",
+    "codex": "/opt/homebrew/bin/codex"
   },
   "timeouts": {
     "command_ms": 900000,
@@ -54,6 +55,6 @@
     "app_schema_read_min": 2,
     "app_schema_read_max": 2,
     "app_schema_write": 2,
-    "rollback_safe": true
+    "rollback_safe": false
   }
 }

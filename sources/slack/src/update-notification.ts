@@ -1,4 +1,5 @@
 import type { SlackAgentSessionStatus, SlackApiClient, SlackThreadMessage } from "./slack-api.js";
+import { createHash } from "node:crypto";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
 
 const notificationIdPattern = /^update:upd_[0-9a-hjkmnp-tv-z]{26}:terminal:\d+$/;
@@ -29,6 +30,32 @@ export interface UpdateNotificationResult {
 
 export interface UpdateNotificationPort {
   deliver(input: UpdateNotificationRequest): Promise<UpdateNotificationResult>;
+  confirmJobDelivery?(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult>;
+  settleJobSession?(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult>;
+  confirmScheduleAccess?(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult>;
+}
+export interface ScheduleAccessConfirmationRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;user_id:string;}
+export interface ScheduleAccessConfirmationResult extends ScheduleAccessConfirmationRequest {authorized:true;channel_kind:"im"|"other";channel_user_id:string|null;}
+
+export interface JobDeliveryConfirmationRequest { schema_version:1; event_id:string; workspace_id:string; channel_id:string; thread_ts:string|null; message_ts:string; body_sha256:string; desired_session_status:"active"|"suspended"|null; }
+export interface JobDeliveryConfirmationResult extends Omit<JobDeliveryConfirmationRequest,"schema_version"|"desired_session_status"> { posted_at:string; reply_broadcast:false; identity_block_verified:true; session_status:"active"|"suspended"|null; }
+export interface JobSessionSettlementRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended";}
+export interface JobSessionSettlementResult extends JobSessionSettlementRequest {session_status:"active"|"suspended";}
+
+export function parseJobDeliveryConfirmationRequest(input:unknown):JobDeliveryConfirmationRequest {
+  const value=exactObject(input),keys=["schema_version","event_id","workspace_id","channel_id","thread_ts","message_ts","body_sha256","desired_session_status"];
+  if(Object.keys(value).some(key=>!keys.includes(key))||keys.some(key=>!(key in value))) throw new Error("job delivery confirmation fields do not match schema");
+  if(value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/i.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||
+    typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||(value.thread_ts!==null&&(typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)))||typeof value.message_ts!=="string"||!timestampPattern.test(value.message_ts)||
+    typeof value.body_sha256!=="string"||!/^[0-9a-f]{64}$/.test(value.body_sha256)||(value.desired_session_status!==null&&value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job delivery confirmation is invalid");
+  if(value.thread_ts===null&&value.desired_session_status!==null) throw new Error("job delivery confirmation session target is invalid");
+  return value as unknown as JobDeliveryConfirmationRequest;
+}
+
+export function parseJobSessionSettlementRequest(input:unknown):JobSessionSettlementRequest {
+  const value=exactObject(input),keys=["schema_version","event_id","workspace_id","channel_id","thread_ts","desired_session_status"];
+  if(Object.keys(value).some(key=>!keys.includes(key))||keys.some(key=>!(key in value))||value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/i.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)||(value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job session settlement is invalid");
+  return value as unknown as JobSessionSettlementRequest;
 }
 
 export class UpdateNotificationPermanentError extends Error {
@@ -204,5 +231,51 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
       }
     }
     return result;
+  }
+
+  async confirmJobDelivery(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult> {
+    let connection;
+    try { connection=this.registry.getByTeamId(input.workspace_id); }
+    catch { throw new Error("unknown_workspace"); }
+    if(!connection.botId&&!connection.botUserId) throw new Error("slack_bot_identity_unavailable");
+    const rootTs=input.thread_ts??input.message_ts,scanDeadline=Date.now()+135_000;
+    let cursor:string|undefined,found:SlackThreadMessage|undefined; const seen=new Set<string>();
+    do {
+      if(Date.now()>=scanDeadline) throw new Error("job_delivery_confirmation_deadline_exceeded");
+      const page=await connection.client.getThread(input.channel_id,rootTs,200,cursor);
+      for(const message of page.messages.filter(item=>item.ts===input.message_ts)) {
+        if(found) throw new Error("duplicate_delivery_message");
+        found=message;
+      }
+      if(page.hasMore&&!page.nextCursor) throw new Error("slack_thread_pagination_incomplete");
+      cursor=page.nextCursor; if(cursor&&seen.has(cursor)) throw new Error("slack_thread_pagination_repeated"); if(cursor)seen.add(cursor);
+    } while(cursor);
+    if(Date.now()>=scanDeadline) throw new Error("job_delivery_confirmation_deadline_exceeded");
+    const identity=`dona-job-${createHash("sha256").update(input.event_id).digest("hex").slice(0,32)}`;
+    if(!found||!authoredByReporter(found,connection.botId,connection.botUserId)||createHash("sha256").update(found.text).digest("hex")!==input.body_sha256||found.threadTs!==(input.thread_ts??undefined)||found.subtype==="thread_broadcast"||!found.blockIds.includes(identity)) throw new Error("job_delivery_not_confirmed");
+    let sessionStatus:"active"|"suspended"|null=null;
+    if(input.thread_ts&&input.desired_session_status) {
+      const session=await connection.client.setAgentSessionStatus({channelId:input.channel_id,threadTs:input.thread_ts,status:input.desired_session_status});
+      if(session.status!==input.desired_session_status||session.agentStatus!==input.desired_session_status) throw new Error("job_delivery_session_not_settled");
+      sessionStatus=input.desired_session_status;
+    }
+    const seconds=Number(input.message_ts);
+    if(!Number.isFinite(seconds)) throw new Error("job_delivery_timestamp_invalid");
+    return {event_id:input.event_id,workspace_id:connection.teamId,channel_id:input.channel_id,thread_ts:input.thread_ts,message_ts:input.message_ts,
+      body_sha256:input.body_sha256,posted_at:new Date(seconds*1000).toISOString(),reply_broadcast:false,identity_block_verified:true,session_status:sessionStatus};
+  }
+
+  async confirmScheduleAccess(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult> {
+    let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
+    const user=await connection.client.getUser(input.user_id),channel=await connection.client.getChannel(input.channel_id);
+    if(!connection.client.hasChannelMember||user.isDeleted||channel.isArchived||!await connection.client.hasChannelMember(input.channel_id,input.user_id)) throw new Error("schedule_access_not_confirmed");
+    return {...input,workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
+  }
+
+  async settleJobSession(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult> {
+    let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
+    const session=await connection.client.setAgentSessionStatus({channelId:input.channel_id,threadTs:input.thread_ts,status:input.desired_session_status});
+    if(session.status!==input.desired_session_status||session.agentStatus!==input.desired_session_status) throw new Error("job_session_not_settled");
+    return {...input,workspace_id:connection.teamId,session_status:input.desired_session_status};
   }
 }

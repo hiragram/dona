@@ -14,6 +14,8 @@ LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$UID"
 CONTROL_UPGRADE_ACTIVE=0
 CONTROL_SWAPPED=0
+DISPATCHER_PLIST_SWAPPED=0
+DISPATCHER_STOPPED=0
 CONTROL_BACKUP_ROOT=""
 
 bootstrap_updater_reconciled() {
@@ -83,6 +85,24 @@ restore_control_plane() {
       "$CONTROL_ROOT/updater.sock" "$OLD_UPDATER_SHA" 30000; then
     print -u2 "旧stable updaterの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
+  fi
+  if [[ "$DISPATCHER_STOPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
+    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1 || true
+    if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
+      /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
+    fi
+    if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
+      print -u2 "旧Updaterの復旧後に旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
+      return 1
+    fi
+    if [[ -z "${ACTIVE_DISPATCHER_SHA:-}" ]] || \
+      ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+        "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000; then
+      print -u2 "旧Dispatcherの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
+      return 1
+    fi
+    DISPATCHER_PLIST_SWAPPED=0
+    DISPATCHER_STOPPED=0
   fi
   return 0
 }
@@ -264,7 +284,8 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   chmod 700 "$BACKUP_ROOT/updater.next"
   /bin/cp "$INSTALL_TMP/rendered/policy.json" "$BACKUP_ROOT/policy.next.json"
   /bin/cp "$INSTALL_TMP/rendered/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist"
-  chmod 600 "$BACKUP_ROOT/policy.next.json" "$BACKUP_ROOT/dev.dona.updater.next.plist"
+  /bin/cp "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"
+  chmod 600 "$BACKUP_ROOT/policy.next.json" "$BACKUP_ROOT/dev.dona.updater.next.plist" "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"
 
   CONTROL_UPGRADE_ACTIVE=1
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.updater"; then
@@ -288,6 +309,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
 
   /bin/cp "$CONTROL_ROOT/policy.json" "$BACKUP_ROOT/policy.previous.json"
   /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.previous.plist"
+  /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" "$BACKUP_ROOT/dev.dona.dispatcher.previous.plist"
   if [[ -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
     /usr/bin/sqlite3 "$CONTROL_ROOT/updater.sqlite3" "PRAGMA wal_checkpoint(TRUNCATE);"
     /bin/cp "$CONTROL_ROOT/updater.sqlite3" "$BACKUP_ROOT/updater.previous.sqlite3"
@@ -302,12 +324,32 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
   fi
   CONTROL_SWAPPED=1
+  DISPATCHER_STOPPED=1
+  ACTIVE_DISPATCHER_SHA=$(/usr/bin/basename "$(/usr/bin/readlink "$RUNTIME_ROOT/current")")
+  if [[ ! "$ACTIVE_DISPATCHER_SHA" =~ '^[0-9a-f]{40}$' ]]; then
+    print -u2 "active Dispatcher SHAをcurrent pointerから確定できません。"
+    exit 1
+  fi
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
+  if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
+    if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
+      print -u2 "Dispatcherの停止受理を確認できないため、plistを更新しません。"
+      exit 1
+    fi
+  fi
+  /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
+  DISPATCHER_PLIST_SWAPPED=1
+  if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
+    print -u2 "新しいDispatcher plistをlaunchdへ登録できないため、control-planeを復旧します。"
+    exit 1
+  fi
   /bin/mv "$CONTROL_ROOT/updater" "$BACKUP_ROOT/updater.previous"
   /bin/mv "$BACKUP_ROOT/updater.next" "$CONTROL_ROOT/updater"
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  if bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000 && \
+    bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"

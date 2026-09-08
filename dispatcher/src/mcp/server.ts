@@ -7,7 +7,10 @@ import type { Logger } from "../logger.js";
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   getJob(jobId: string): Promise<Record<string, unknown>>;
+  authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
+  recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
+  listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
@@ -127,6 +130,16 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     }
   });
 
+  server.registerTool("list_owner_jobs", {
+    title: "List owner jobs",
+    description: "現在eventと同じ永続ownerに属するjobを取得します。",
+    inputSchema: { source_event_id: eventId },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ source_event_id }) => {
+    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
+    catch(error){ return failure(error,logger,"list_owner_jobs"); }
+  });
+
   server.registerTool("get_job_status", {
     title: "Get background job status",
     description: "ジョブの状態、workspace path、結果、エラーを取得します。",
@@ -138,6 +151,26 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }
+  });
+
+  server.registerTool("authorize_job_notification", {
+    title:"Authorize scheduled job notification",
+    description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。",
+    inputSchema:{event_id:eventId,access_receipt:z.string().min(32).max(2_000).optional()},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({event_id,access_receipt})=>{
+    try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id,access_receipt)); }
+    catch(error){return failure(error,logger,"authorize_job_notification");}
+  });
+
+  server.registerTool("record_schedule_job_access", {
+    title:"Record scheduled job access receipt",
+    description:"check_user_channel_access成功直後に、その完全一致receiptを一度だけ永続化します。成功後は直ちにdelegate_jobを呼びます。",
+    inputSchema:{event_id:eventId,receipt:z.string().min(32).max(2_000)},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+  },async({event_id,receipt})=>{
+    try { if(!client.recordScheduleJobAccess) throw new Error("Schedule access recording is unavailable"); return success(await client.recordScheduleJobAccess(event_id,receipt)); }
+    catch(error){return failure(error,logger,"record_schedule_job_access");}
   });
 
   server.registerTool("steer_job", {

@@ -8,6 +8,7 @@ import type { Logger } from "./logger.js";
 import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import type { EventRow } from "./types.js";
+import type { JobNotificationVerifier } from "./job-notification-verifier.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -52,6 +53,7 @@ export class DispatcherWorker {
     private readonly herdr: HerdrClient,
     private readonly config: DispatcherConfig,
     private readonly logger: Logger,
+    private readonly notificationVerifier?:JobNotificationVerifier,
   ) {}
 
   isRunning(): boolean {
@@ -121,6 +123,8 @@ export class DispatcherWorker {
     const started = Date.now();
     const preflight = await this.herdr.get(this.abortController.signal);
     if (this.stopping || preflight.aborted) return;
+    const current=this.database.get(row.event_id);
+    if(current?.status!==row.status) return;
     if (!preflight.ok || !preflight.agentStatus) {
       const updated = this.database.recordPreDispatchFailure(
         row.event_id,
@@ -137,11 +141,12 @@ export class DispatcherWorker {
       return;
     }
     if (!["idle", "done"].includes(preflight.agentStatus)) return;
-
     const resultPath = path.join(this.config.resultsDir, `${row.event_id}.json`);
     try {
       await fs.access(resultPath);
+      if(this.database.get(row.event_id)?.status!==row.status) return;
       const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+      if(dispatching.status==="completed") return;
       this.database.markNeedsReview(
         row.event_id,
         "result_path_exists",
@@ -150,6 +155,7 @@ export class DispatcherWorker {
       this.logCurrentTransition(dispatching, started);
       return;
     } catch (error) {
+      if(this.database.get(row.event_id)?.status!==row.status) return;
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         const updated = this.database.recordPreDispatchFailure(
           row.event_id,
@@ -163,8 +169,11 @@ export class DispatcherWorker {
     }
 
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
+    if(dispatching.status==="completed") return;
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
+    const afterPrompt=this.database.get(row.event_id);
+    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) return;
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
         row.event_id,
@@ -176,8 +185,17 @@ export class DispatcherWorker {
     }
     if (!prompted.ok) {
       if (prompted.errorCode === "agent_blocked") {
-        this.database.markBlocked(row.event_id, commandMessage(prompted), ["dispatching"]);
+        this.database.markBlocked(row.event_id, commandMessage(prompted), ["dispatching","waiting_agent"]);
       } else if (["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
+        if(afterPrompt.status==="waiting_agent") {
+          this.database.markNeedsReview(
+            row.event_id,
+            "prompt_acceptance_unknown",
+            "Agent became unavailable after the event advanced during prompt submission",
+          );
+          this.logCurrentTransition(dispatching, started);
+          return;
+        }
         const updated = this.database.recordSafePromptFailure(
           row.event_id,
           prompted.errorCode ?? "agent_not_found",
@@ -197,7 +215,8 @@ export class DispatcherWorker {
       return;
     }
 
-    this.database.markWaiting(row.event_id);
+    if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
+    else if(afterPrompt?.status!=="waiting_agent") return;
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
@@ -213,6 +232,7 @@ export class DispatcherWorker {
     if (existing) return;
     const started = Date.now();
     const waited = await this.herdr.wait(this.abortController.signal);
+    if(this.database.get(row.event_id)?.status!=="waiting_agent") return;
     if (waited.aborted || this.stopping) return;
     if (!waited.ok) {
       const errorCode = waited.errorCode ?? (waited.timedOut ? "agent_wait_timeout" : "agent_wait_failed");
@@ -270,12 +290,17 @@ export class DispatcherWorker {
   private async tryComplete(row: EventRow, terminalAgentState: boolean): Promise<boolean> {
     try {
       const result = await readResultEnvelope(row.result_path!, row.event_id);
-      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!);
-      else this.database.saveFailedResult(row.event_id, result, row.result_path!);
+      const verification=this.database.notificationVerificationRequest(row.event_id,result);
+      const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.settle(verification):undefined):undefined;
+      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
+      else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
       this.logCurrentTransition(row, Date.now());
       return true;
     } catch (error) {
       if (error instanceof ResultNotFoundError && !terminalAgentState) return false;
+      const current = this.database.get(row.event_id);
+      if (current?.status === "completed" && ["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(current.last_error_code??"")) return true;
+      if(current?.status==="needs_review") return true;
       this.database.markNeedsReview(
         row.event_id,
         error instanceof ResultNotFoundError ? "result_missing" : "invalid_result",
