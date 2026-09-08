@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const canonicalRemote = "https://github.com/hiragram/dona.git";
 
@@ -163,6 +164,7 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
     throw new Error("existing release validation arguments are invalid");
   }
   const manifest = JSON.parse(await fs.readFile(path.join(existingRelease, "release-manifest.json"), "utf8"));
+  const stagedManifest = JSON.parse(await fs.readFile(path.join(stagedRelease, "release-manifest.json"), "utf8"));
   const compatibility = manifest?.compatibility;
   if (manifest?.schema_version !== 1 || manifest.sha !== expectedSha ||
     manifest.repository !== "hiragram/dona" || manifest.policy_version !== "2026-09-03.2" ||
@@ -170,6 +172,9 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
     compatibility?.app_schema_read_min !== 2 || compatibility?.app_schema_read_max !== 2 ||
     compatibility?.app_schema_write !== 2 || typeof compatibility?.rollback_safe !== "boolean") {
     throw new Error("existing release manifest does not match the control-plane contract");
+  }
+  if (!isDeepStrictEqual(manifest.compatibility, stagedManifest?.compatibility)) {
+    throw new Error("existing release compatibility does not match the freshly verified staging manifest");
   }
   const [existingDigest, stagedDigest] = await Promise.all([
     releaseTreeDigest(existingRelease),

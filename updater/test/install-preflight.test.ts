@@ -209,6 +209,9 @@ test("an existing immutable release is reusable only with the exact control-plan
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await run("validate-existing-release", existingRelease, stagedRelease, sha);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, compatibility: { ...manifest.compatibility, rollback_safe: false } }));
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /compatibility does not match/);
+    await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "tampered\n");
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, sha),

@@ -45,7 +45,8 @@ function renderJobResult(result: Record<string, unknown> | null): string {
 }
 
 function containsHostAbsolutePath(value:string):boolean {
-  return /(?:^|[\s"'`(])\/(?!\/)[^\s"'`<>)]+/m.test(value);
+  const withoutUrls=value.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
+  return /(?<!\/)\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
 }
 
 export class DispatcherDatabase {
@@ -1214,6 +1215,7 @@ export class DispatcherDatabase {
     const reportedPost=row.result_json!==null&&this.db.prepare(`SELECT 1 FROM json_each(?,'$.actions')
       WHERE json_extract(value,'$.tool') LIKE '%.post_message' LIMIT 1`).get(row.result_json)!==undefined;
     if(notification&&reportedPost) throw new Error("scheduled_notification_retry_requires_reconciliation");
+    if(notification&&row.result_path&&fs.existsSync(row.result_path)) throw new Error("scheduled_notification_retry_requires_reconciliation");
     if(notification&&!((notification.notification_state==="failed"&&["none","preflight"].includes(notification.notification_authorization_phase))||(notification.notification_state==="needs_review"&&["none","preflight"].includes(notification.notification_authorization_phase))))
       throw new Error("scheduled_notification_retry_requires_reconciliation");
     const undelegatedRun=row.source==="dona_schedule"?this.db.prepare("SELECT status,job_id FROM schedule_runs WHERE event_id=?").get(eventId) as {status:string;job_id:string|null}|undefined:undefined;
