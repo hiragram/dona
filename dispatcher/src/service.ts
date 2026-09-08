@@ -1,4 +1,5 @@
 import type { DispatcherConfig } from "./config.js";
+import fs from "node:fs";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
@@ -19,7 +20,9 @@ import {
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
-  const database = new DispatcherDatabase(config.databasePath);
+  let notificationReceiptKey:string|undefined;
+  try { notificationReceiptKey=fs.readFileSync(config.updateInternalTokenPath,"utf8").trim()||undefined; } catch { /* delivery verification fails closed until the shared key exists */ }
+  const database = new DispatcherDatabase(config.databasePath,notificationReceiptKey);
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -54,7 +54,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, private readonly notificationReceiptKey?:string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -1163,13 +1163,24 @@ export class DispatcherDatabase {
         value.thread_ts===target.thread_ts&&
         (["blocked","needs_review"].includes(completion.job_status)?["processing","suspended"]:completion.job_status==="failed"?["processing","active","suspended"]:["processing","active"]).includes(String(value.status));
     });
-    const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
-    const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
     const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&value.body_sha256===expectedBodySha256&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
+    let postedAt=Number.NaN,receiptValid=false;
+    if(validPost&&this.notificationReceiptKey&&typeof validPost.value.delivery_receipt==="string") try {
+      const [encoded,signature,...extra]=validPost.value.delivery_receipt.split(".");
+      if(!encoded||!signature||extra.length) throw new Error("invalid_delivery_receipt");
+      const expected=createHmac("sha256",this.notificationReceiptKey).update(encoded).digest(),actual=Buffer.from(signature,"base64url");
+      if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_delivery_receipt");
+      const receipt=JSON.parse(Buffer.from(encoded,"base64url").toString("utf8")) as Record<string,unknown>;
+      postedAt=Date.parse(String(receipt.posted_at??""));
+      receiptValid=receipt.receipt_kind==="slack_delivery"&&receipt.event_id===eventId&&receipt.workspace_id===target?.workspace_id&&receipt.channel_id===target?.channel_id&&
+        receipt.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&receipt.message_ts===validPost.value.message_ts&&receipt.body_sha256===expectedBodySha256&&Number.isFinite(postedAt);
+    } catch { receiptValid=false; }
+    const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
+    const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
       const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatuses=["blocked","needs_review"].includes(completion.job_status)?["suspended"]:completion.job_status==="failed"?["active","suspended"]:["active"];
     const sessionSettled=actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing?.index??-1)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&terminalStatuses.includes(String(value.status))&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));
-    return {delivered:withinDeadline&&withinWriteAuthorization&&allowedActions&&(target?.kind!=="thread"||sessionSettled)&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&(target?.kind!=="thread"||sessionSettled)&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date()): void {

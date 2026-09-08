@@ -96,6 +96,9 @@ export class JobSupervisor {
         continue;
       }
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
+      if(!this.runtime.closeAgent) throw new Error(`Legacy agent ${job.agent_name} cannot be closed by this runtime`);
+      const closed=await this.runtime.closeAgent(job.agent_name,this.abortController.signal);
+      if(!closed.ok&&!['agent_not_found','agent_not_running'].includes(closed.errorCode??"")) throw new Error(`Legacy agent ${job.agent_name} could not be closed before isolated jobs start`);
       const deadline=Date.now()+this.config.jobCommandTimeoutMs;
       let exited=false;
       while(Date.now()<deadline) {

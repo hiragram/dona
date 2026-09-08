@@ -246,4 +246,17 @@ console.log(JSON.stringify({status:"ok"}));
     await assert.rejects(fs.access(job.workspace_path),{code:"ENOENT"});
     database.close();
   });
+
+  test("legacy agent closeをagent identityへ固定する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const capturePath=path.join(root,"agent-close-argv.json"),executable=path.join(root,"fake-herdr-agent-close.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const result=await new HerdrJobAgentRuntime({...config,herdrPath:executable}).closeAgent("job_01m1legacyagent000000enhc");
+    assert.equal(result.ok,true);
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"agent","close","job_01m1legacyagent000000enhc"]);
+  });
 });

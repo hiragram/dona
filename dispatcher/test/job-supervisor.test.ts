@@ -520,4 +520,17 @@ describe("JobSupervisor", () => {
     await supervisor.stop();
     database.close();
   });
+
+  test("legacy shared-grant agentはctrl+c後にcloseしてから停止済みにする",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath),job=createScratchJob(database,config,"Ev-legacy-close");
+    let marked=false; const calls:string[]=[];
+    (database as unknown as {listLegacySharedGrantJobs():JobRow[]}).listLegacySharedGrantJobs=()=>[job];
+    (database as unknown as {markLegacySharedGrantAgentStopped(jobId:string):void}).markLegacySharedGrantAgentStopped=id=>{assert.equal(id,job.job_id);marked=true;};
+    const runtime=fakeRuntime({async cancel(){calls.push("cancel");return ok("idle");},async closeAgent(){calls.push("close");return ok("done");},async get(){calls.push("get");return failed("agent_not_found");}});
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    await (supervisor as unknown as {stopLegacySharedGrantAgents():Promise<void>}).stopLegacySharedGrantAgents();
+    assert.deepEqual(calls,["cancel","close","get"]); assert.equal(marked,true);
+    database.close();
+  });
 });

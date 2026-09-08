@@ -18,6 +18,7 @@ export interface JobAgentRuntime {
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
   cleanup?(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
@@ -286,6 +287,10 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  }
+
+  closeAgent(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult> {
+    return this.herdr(["agent","close",agentName],this.config.jobCommandTimeoutMs+5_000,signal);
   }
 
   async cleanup(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
