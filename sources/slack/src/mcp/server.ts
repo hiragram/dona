@@ -506,13 +506,15 @@ export function createSlackMcpServer(
     async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
+        const effectiveMrkdwn=event_id?false:mrkdwn;
+        const effectiveParse=event_id?"none" as const:parse;
         const result = await connection.client.postMessage({
           channelId: channel_id,
           text,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
           replyBroadcast: reply_broadcast,
-          ...(mrkdwn!==undefined?{mrkdwn}:{}),
-          ...(parse?{parse}:{}),
+          ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
+          ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{identityBlockId:`dona-job-${createHash("sha256").update(event_id).digest("hex").slice(0,32)}`}:{}),
         });
         logger.info("Slack MCP posted message", {
@@ -530,8 +532,8 @@ export function createSlackMcpServer(
           message_ts: result.messageTs,
           body_sha256,
           reply_broadcast,
-          ...(mrkdwn!==undefined?{mrkdwn}:{}),
-          ...(parse?{parse}:{}),
+          ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
+          ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{event_id}:{}),
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });

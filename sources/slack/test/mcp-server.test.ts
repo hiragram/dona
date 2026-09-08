@@ -275,6 +275,34 @@ describe("Dona Slack MCP server", () => {
         parse: "none",
       });
 
+      const scheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "scheduled",
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.deepEqual(fake.posts.at(-1), {
+        channelId: "C123",
+        text: "scheduled",
+        replyBroadcast: false,
+        mrkdwn: false,
+        parse: "none",
+        identityBlockId: `dona-job-${createHash("sha256").update("evt_01m1zfewbjx8v0844yrrkqwzc7").digest("hex").slice(0,32)}`,
+      });
+      assert.deepEqual(scheduledResult.structuredContent, {
+        workspace: "company",
+        channel_id: "C123",
+        message_ts: "2.3",
+        body_sha256: createHash("sha256").update("scheduled").digest("hex"),
+        reply_broadcast: false,
+        mrkdwn: false,
+        parse: "none",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      });
+
       const fileResult = await client.callTool({
         name: "get_file",
         arguments: { workspace: "company", file_id: "F123" },

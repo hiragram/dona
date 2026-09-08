@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { EventRow } from "./types.js";
 import { stableStringify } from "./validation.js";
@@ -18,13 +19,19 @@ export const destinationSchema = z.discriminatedUnion("kind", [
 ]);
 export type JobBinding = { owner: z.infer<typeof jobOwnerSchema>; destination: z.infer<typeof destinationSchema> };
 
+function notificationBody(payloadJson:string):string {
+  const payload=JSON.parse(payloadJson) as {result?:{summary?:unknown};error_message?:unknown;job_status?:unknown};
+  return typeof payload.result?.summary==="string"?payload.result.summary:typeof payload.error_message==="string"?payload.error_message:
+    payload.job_status==="cancelled"?"ジョブは中止されました":payload.job_status==="blocked"?"ジョブは入力待ちです":"ジョブの確認が必要です";
+}
+
 export function migrateJobRouting(db: Database.Database): void {
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS job_routing_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS event_job_bindings(event_id TEXT PRIMARY KEY REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_owner_bindings(job_id TEXT PRIMARY KEY,source_event_id TEXT NOT NULL REFERENCES event_job_bindings(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS schedule_access_receipt_nonces(nonce TEXT PRIMARY KEY,event_id TEXT NOT NULL REFERENCES events(event_id),consumed_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS job_completion_results(job_id TEXT NOT NULL,job_status TEXT NOT NULL,source_event_id TEXT NOT NULL REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL,work_state TEXT NOT NULL,notification_state TEXT NOT NULL CHECK(notification_state IN ('none','pending','accepted','failed','needs_review')),notification_authorization_phase TEXT NOT NULL DEFAULT 'none' CHECK(notification_authorization_phase IN ('none','preflight','write')),notification_preflight_authorized_at TEXT,notification_write_authorized_at TEXT,notification_event_id TEXT REFERENCES events(event_id),materialized_at TEXT NOT NULL,content_delete_at TEXT NOT NULL,result_file_deleted_at TEXT,PRIMARY KEY(job_id,job_status));
+      CREATE TABLE IF NOT EXISTS job_completion_results(job_id TEXT NOT NULL,job_status TEXT NOT NULL,source_event_id TEXT NOT NULL REFERENCES events(event_id),owner_json TEXT NOT NULL,destination_json TEXT NOT NULL,work_state TEXT NOT NULL,notification_state TEXT NOT NULL CHECK(notification_state IN ('none','pending','accepted','failed','needs_review')),notification_authorization_phase TEXT NOT NULL DEFAULT 'none' CHECK(notification_authorization_phase IN ('none','preflight','write')),notification_preflight_authorized_at TEXT,notification_write_authorized_at TEXT,notification_event_id TEXT REFERENCES events(event_id),notification_body_sha256 TEXT,materialized_at TEXT NOT NULL,content_delete_at TEXT NOT NULL,result_file_deleted_at TEXT,PRIMARY KEY(job_id,job_status));
       CREATE INDEX IF NOT EXISTS job_owner_lookup_idx ON job_owner_bindings(owner_json);
       CREATE UNIQUE INDEX IF NOT EXISTS schedule_job_owner_idx ON event_job_bindings(json_extract(owner_json,'$.run_id')) WHERE json_extract(owner_json,'$.kind')='schedule';
       CREATE TRIGGER IF NOT EXISTS event_job_binding_immutable BEFORE UPDATE ON event_job_bindings BEGIN SELECT RAISE(ABORT,'event_job_binding_immutable'); END;
@@ -49,6 +56,13 @@ export function migrateJobRouting(db: Database.Database): void {
     if(!completionColumns.has("notification_authorization_phase")) db.exec("ALTER TABLE job_completion_results ADD COLUMN notification_authorization_phase TEXT NOT NULL DEFAULT 'none' CHECK(notification_authorization_phase IN ('none','preflight','write'))");
     if(!completionColumns.has("notification_preflight_authorized_at")) db.exec("ALTER TABLE job_completion_results ADD COLUMN notification_preflight_authorized_at TEXT");
     if(!completionColumns.has("notification_write_authorized_at")) db.exec("ALTER TABLE job_completion_results ADD COLUMN notification_write_authorized_at TEXT");
+    if(!completionColumns.has("notification_body_sha256")) db.exec("ALTER TABLE job_completion_results ADD COLUMN notification_body_sha256 TEXT");
+    const routingEventColumns=new Set((db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
+    if(routingEventColumns.has("payload_json")) for(const row of db.prepare(`SELECT c.rowid,e.payload_json FROM job_completion_results c JOIN events e ON e.event_id=c.notification_event_id
+      WHERE c.notification_event_id IS NOT NULL AND c.notification_body_sha256 IS NULL`).all() as Array<{rowid:number;payload_json:string}>) {
+        db.prepare("UPDATE job_completion_results SET notification_body_sha256=? WHERE rowid=?")
+          .run(createHash("sha256").update(notificationBody(row.payload_json)).digest("hex"),row.rowid);
+      }
     const outboxColumns=new Set((db.prepare("PRAGMA table_info(connector_outbox)").all() as Array<{name:string}>).map(row=>row.name));
     if(!outboxColumns.has("completion_job_status")) db.exec("ALTER TABLE connector_outbox ADD COLUMN completion_job_status TEXT");
     db.exec("DROP TRIGGER IF EXISTS job_completion_outbox_insert; DROP TRIGGER IF EXISTS job_completion_outbox_update;");
