@@ -5,16 +5,16 @@ import test from "node:test";
 
 const rollout = JSON.parse(fs.readFileSync(new URL("../config/schema-rollout.json", import.meta.url)));
 const target = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.json", import.meta.url)));
-const previous = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.v2-v3-bridge.json", import.meta.url)));
+const previous = JSON.parse(fs.readFileSync(new URL("../config/release-compatibility.production-v2.json", import.meta.url)));
 
-test("schema activation names the exact buildable compatibility bridge", () => {
+test("schema activation names the exact installed production source", () => {
   assert.deepEqual(rollout, {
     schema_version: 1,
     phase: "activation",
     database_schema: 3,
     multi_job_enabled: true,
-    previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
-    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    previous_release_sha: "7dbaab72e3387f94f6c8a2289a685b90b100d083",
+    previous_release_contract: "release-compatibility.production-v2.json",
     required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
     migration: {
       from_schema: 2,
@@ -27,7 +27,7 @@ test("schema activation names the exact buildable compatibility bridge", () => {
   });
   assert.deepEqual(
     [previous.app_schema_read_min, previous.app_schema_read_max, previous.app_schema_write, previous.rollback_safe],
-    [2, 3, 2, true],
+    [2, 2, 2, true],
   );
   assert.deepEqual(
     [target.app_schema_read_min, target.app_schema_read_max, target.app_schema_write, target.rollback_safe],
@@ -37,5 +37,5 @@ test("schema activation names the exact buildable compatibility bridge", () => {
   assert.deepEqual(bridgeCompatibility, previous);
   const bridgeDatabase = execFileSync("git", ["show", `${rollout.previous_release_sha}:dispatcher/src/database.ts`], { encoding: "utf8" });
   assert.match(bridgeDatabase, /ensureV2BridgeSchema/);
-  assert.match(bridgeDatabase, /multi_job_feature_disabled_for_schema_v2_bridge/);
+  assert.match(bridgeDatabase, /dispatcherSchemaCompatibility\.write === 3 && version < 3/);
 });

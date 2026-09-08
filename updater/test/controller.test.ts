@@ -110,10 +110,11 @@ test("plans an explicitly approved compatibility transition from the installed p
     from_sha: currentSha,
     from: sourceCompatibility,
     to: targetCompatibility,
+    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
     required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
   }];
   f.git.targetCompatibility = targetCompatibility;
-  f.git.targetRollout = activationRollout;
+  f.git.targetRollout = { ...activationRollout, previous_release_sha: currentSha };
   f.runtime.schemaMigrationReady = true;
   f.runtime.schemaMigrationBuildSha = targetSha;
 

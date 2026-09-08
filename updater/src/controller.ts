@@ -62,9 +62,19 @@ function mainAgentMatches(agent: MainAgentObservation): boolean {
     agent.interactive_ready && agent.matches_release && agent.status !== null && agent.status !== "unknown";
 }
 
-function rolloutMatchesTargetCompatibility(rollout: SchemaRollout, compatibility: ReleaseManifest["compatibility"]): boolean {
+function rolloutMatchesTargetCompatibility(
+  rollout: SchemaRollout,
+  compatibility: ReleaseManifest["compatibility"],
+  transition?: UpdatePolicy["compatibility_transitions"][number],
+): boolean {
   if (compatibility.app_schema_write === 3) {
-    return canonicalJson(rollout) === canonicalJson(schemaV3ActivationRollout);
+    const expected = transition ? {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: transition.from_sha,
+      previous_release_contract: transition.previous_release_contract,
+      required_control_plane_capability: transition.required_control_plane_capability,
+    } : schemaV3ActivationRollout;
+    return canonicalJson(rollout) === canonicalJson(expected);
   }
   return rollout.database_schema === 2 && !rollout.multi_job_enabled && rollout.phase !== "activation" &&
     Array.isArray(rollout.capabilities) && rollout.migration === undefined &&
@@ -106,7 +116,7 @@ export class UpdateController {
     if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility) && !transition) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
-    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility)) {
+    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility, transition)) {
       throw new Error("target_schema_rollout_does_not_match_target_compatibility");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
@@ -573,8 +583,7 @@ export class UpdateController {
           canonicalJson(candidate.from) === canonicalJson(previousCompatibility) &&
           canonicalJson(candidate.to) === canonicalJson(targetCompatibility)
         );
-        const legacyExactBridge = this.policy.compatibility_transitions.length === 0 &&
-          previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
+        const legacyExactBridge = previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
         if (!approvedTransition && !legacyExactBridge) {
           this.needsReview(row, "schema_activation_bridge_identity_unverified");
           return;

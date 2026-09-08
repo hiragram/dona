@@ -75,6 +75,7 @@
         "app_schema_write": 3,
         "rollback_safe": true
       },
+      "previous_release_contract": "release-compatibility.production-v2.json",
       "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1"
     }
   ]

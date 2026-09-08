@@ -58,6 +58,7 @@ export interface CompatibilityTransition {
   from_sha: string;
   from: Compatibility;
   to: Compatibility;
+  previous_release_contract: string;
   required_control_plane_capability: string;
 }
 
@@ -169,15 +170,20 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (!Array.isArray(transitions)) throw new ValidationError("compatibility_transitions must be an array");
   const compatibilityTransitions = transitions.map((input, index) => {
     const transition = record(input, `compatibility_transitions[${index}]`);
-    exact(transition, ["from_sha", "from", "to", "required_control_plane_capability"], `compatibility_transitions[${index}]`);
+    exact(transition, ["from_sha", "from", "to", "previous_release_contract", "required_control_plane_capability"], `compatibility_transitions[${index}]`);
     if (typeof transition.required_control_plane_capability !== "string" ||
       !/^[a-z][a-z0-9_]{0,127}$/.test(transition.required_control_plane_capability)) {
       throw new ValidationError(`compatibility_transitions[${index}] capability is invalid`);
+    }
+    if (typeof transition.previous_release_contract !== "string" ||
+      !/^release-compatibility\.[a-z0-9.-]+\.json$/.test(transition.previous_release_contract)) {
+      throw new ValidationError(`compatibility_transitions[${index}] previous release contract is invalid`);
     }
     return {
       from_sha: fullSha(transition.from_sha),
       from: compatibility(transition.from),
       to: compatibility(transition.to),
+      previous_release_contract: transition.previous_release_contract,
       required_control_plane_capability: transition.required_control_plane_capability,
     };
   });
