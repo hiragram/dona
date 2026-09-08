@@ -63,6 +63,15 @@ test("CLI treats only absent backup and receipt files as a fresh migration", asy
   assert.equal(completed.exit, 0, completed.stderr);
   assert.deepEqual(JSON.parse(completed.stdout), JSON.parse(fresh.stdout));
 
+  const savedBackupPath = path.join(root, "saved-backup.sqlite3");
+  await fs.rename(backupPath, savedBackupPath);
+  await fs.symlink(savedBackupPath, backupPath);
+  const completedWithBackupLink = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.notEqual(completedWithBackupLink.exit, 0);
+  assert.match(completedWithBackupLink.stderr, /schema_rollout_backup_is_not_a_regular_file/);
+  await fs.unlink(backupPath);
+  await fs.rename(savedBackupPath, backupPath);
+
   await fs.copyFile(backupPath, databasePath);
   await fs.unlink(receiptPath);
   const backupOnly = await runRolloutCli(databasePath, backupPath, receiptPath);
