@@ -541,6 +541,22 @@ test("not_sent reconciliationはdrained one-shotをcompletedへ進める", () =>
   assert.equal((raw.prepare("SELECT content FROM schedule_revisions WHERE schedule_id=? AND revision=?").get(recurring.schedule_id,recurring.revision) as {content:string|null}).content,"非公開のリマインダー本文");
 });
 
+test("遅着work Result回収は削除済みcontentのscheduleを再有効化しない", () => {
+  const {repo,dispatcher,raw}=setup();
+  repo.create("recover_deleted_content",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("recover_deleted_content",1,due,later,due,actor).run;
+  startWork(repo,dispatcher,raw,run,due);
+  const jobId=repo.getRun(run.run_id)!.job_id!;
+  repo.markWorkRunNeedsReview(run.run_id,jobId,due,run.event_id!);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,content_delete_at=? WHERE schedule_id=? AND revision=?")
+    .run(due,run.schedule_id,run.revision);
+  repo.recoverWorkRunForResult(run.run_id,jobId,run.event_id!,"2026-09-05T00:02:00Z");
+  assert.equal(repo.getRun(run.run_id)?.status,"started");
+  assert.equal(repo.get("recover_deleted_content")?.state,"needs_review");
+  assert.equal((raw.prepare("SELECT content_delete_at FROM schedule_revisions WHERE schedule_id=? AND revision=?")
+    .get(run.schedule_id,run.revision) as {content_delete_at:string}).content_delete_at,due);
+});
+
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   const {repo,dispatcher,raw,filename}=setup(); const objective="通知retry";
   repo.create("notify_retry_phase",{...input,action:"work.read_only",content:objective},due,actor,now);
@@ -985,7 +1001,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
-  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"src/database.ts、A/B、2026/09/08"},completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`); dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
   assert.throws(()=>dispatcher.saveFailedResult(eventId,{schema_version:1,event_id:eventId,status:"failed",summary:"future",completed_at:new Date(Date.now()+60_000).toISOString()},resultPath),/completed_at_is_in_the_future/);

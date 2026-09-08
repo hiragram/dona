@@ -46,7 +46,7 @@ function renderJobResult(result: Record<string, unknown> | null): string {
 
 function containsHostAbsolutePath(value:string):boolean {
   const withoutUrls=value.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
-  return /(?<!\/)\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
+  return /(?:^|[\s"'`=:[({<])\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
 }
 
 export class DispatcherDatabase {
