@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
+import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 
 function usage(): never {
   console.error(`Usage:
@@ -89,6 +90,9 @@ async function main(): Promise<void> {
     if(command==="reconcile-notification") {
       if(args[3]==="not_sent") {console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventIdAt(args,2)),null,2));return;}
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6];
+      const verification=database.notificationVerificationRequest(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[{tool:"dona_slack.post_message",workspace:"operator",workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs,reply_broadcast:false}:{}),mrkdwn:false,parse:"none"}],completed_at:new Date().toISOString()});
+      if(!verification) throw new Error("scheduled_notification_verification_unavailable");
+      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);
       console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})}),null,2));
       return;
     }
