@@ -1083,7 +1083,7 @@ export class SchedulerRepository {
           WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
       this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,last_error_message=NULL
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
-          WHERE notification_event_id IS NOT NULL AND content_delete_at<=? AND notification_state NOT IN ('pending','failed','needs_review'))`).run(now);
+          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
       const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
       this.db.prepare(`DELETE FROM job_owner_bindings WHERE job_id IN
         (SELECT c.job_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')

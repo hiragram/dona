@@ -95,6 +95,12 @@ restore_control_plane() {
       print -u2 "旧Updaterの復旧後に旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
+    if [[ -z "${ACTIVE_DISPATCHER_SHA:-}" ]] || \
+      ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+        "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000; then
+      print -u2 "旧Dispatcherの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
+      return 1
+    fi
     DISPATCHER_PLIST_SWAPPED=0
     DISPATCHER_STOPPED=0
   fi

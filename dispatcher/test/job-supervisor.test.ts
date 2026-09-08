@@ -358,16 +358,16 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
-  test("treats idle as a terminal observation after cancelling an invalid Result agent", async () => {
+  test("invalid Result agentはidle後にcloseと不在確認を行う", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-invalid-result-stop-idle");
     markRunning(database,job.job_id);
     database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
     let gets=0;
-    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){gets+=1;return ok("idle");}}),config,logger,()=>undefined);
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
     await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
-    assert.equal(gets,1);
+    assert.equal(gets,2);
     assert.equal(database.getJob(job.job_id)?.last_error_code,"invalid_result_agent_stopped");
     database.close();
   });
@@ -404,7 +404,8 @@ describe("JobSupervisor", () => {
     database.recordInvalidResultAgentStopFailure(job.job_id,"cancel acceptance unknown");
     await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
-    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return ok("idle");}}),config,logger,()=>undefined);
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
     await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
       .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
     assert.equal(database.getJob(job.job_id)?.status,"completed");
@@ -417,10 +418,11 @@ describe("JobSupervisor", () => {
     const job = createScratchJob(database, config, "Ev-invalid-result-stop-now");
     markRunning(database,job.job_id);
     database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
-    let cancels=0;
+    let cancels=0,gets=0;
     const supervisor=new JobSupervisor(database,fakeRuntime({
       async cancel(){cancels+=1;return ok("idle");},
-      async get(){return ok("idle");},
+      async get(){return gets++===0?ok("idle"):failed("agent_not_found");},
+      async closeAgent(){return ok("done");},
     }),config,logger,()=>undefined);
     await (supervisor as unknown as {reconcileAmbiguousScheduledJob(job:JobRow):Promise<boolean>})
       .reconcileAmbiguousScheduledJob(database.getJob(job.job_id)!);
@@ -437,7 +439,8 @@ describe("JobSupervisor", () => {
     database.markJobNeedsReview(job.job_id,"invalid_result","invalid Result");
     await fs.mkdir(path.dirname(job.result_path), { recursive: true });
     await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
-    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return ok("idle");}}),config,logger,()=>undefined);
+    let gets=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({async cancel(){return ok("working");},async get(){return gets++===0?ok("idle"):failed("agent_not_found");},async closeAgent(){return ok("done");}}),config,logger,()=>undefined);
     await (supervisor as unknown as {stopInvalidResultAgent(job:JobRow):Promise<void>}).stopInvalidResultAgent(database.getJob(job.job_id)!);
     assert.equal(database.getJob(job.job_id)?.status,"completed");
     database.close();

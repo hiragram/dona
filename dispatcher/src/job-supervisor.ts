@@ -266,7 +266,7 @@ export class JobSupervisor {
     if(job.last_error_code==="invalid_result") {await this.stopInvalidResultAgent(job);return true;}
     if(job.last_error_code!=="invalid_result_agent_stop_unknown") return this.tryComplete(job,false);
     const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
-    if((observed.ok&&["idle","done"].includes(observed.agentStatus??""))||
+    if((observed.ok&&["idle","done"].includes(observed.agentStatus??"")&&await this.closeAndConfirmInvalidResultAgent(job))||
       (!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??""))) {
       this.database.recordInvalidResultAgentStopped(job.job_id);
       if(await this.tryComplete(job,false)) return true;
@@ -281,12 +281,23 @@ export class JobSupervisor {
     const deadline=Date.now()+this.config.jobCommandTimeoutMs;
     while(Date.now()<deadline) {
       const observed=await this.runtime.get(job.agent_name,this.abortController.signal);
-      if(observed.ok&&["idle","done"].includes(observed.agentStatus??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
       if(!observed.ok&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
       if(!observed.ok) break;
+      if(["idle","done"].includes(observed.agentStatus??"")) {
+        if(await this.closeAndConfirmInvalidResultAgent(job)) {this.database.recordInvalidResultAgentStopped(job.job_id);await this.tryRecoverStoppedInvalidResult(job.job_id);return;}
+        break;
+      }
       await new Promise(resolve=>setTimeout(resolve,100));
     }
     this.database.recordInvalidResultAgentStopFailure(job.job_id,"Agent exit was not observed after invalid Result");
+  }
+
+  private async closeAndConfirmInvalidResultAgent(job:JobRow):Promise<boolean> {
+    if(!this.runtime.closeAgent)return false;
+    const closed=await this.runtime.closeAgent(job.agent_name,this.abortController.signal);
+    if(!closed.ok&&! ["agent_not_found","agent_not_running"].includes(closed.errorCode??""))return false;
+    const absent=await this.runtime.get(job.agent_name,this.abortController.signal);
+    return !absent.ok&&["agent_not_found","agent_not_running"].includes(absent.errorCode??"");
   }
 
   private async tryRecoverStoppedInvalidResult(jobId:string):Promise<void> {
