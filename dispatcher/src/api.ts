@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -24,6 +24,12 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+async function confirmScheduleAccess(socketPath:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
+  const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
+  return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length)}},response=>{
+    const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
+  });request.setTimeout(timeoutMs,()=>request.destroy(new Error("schedule_access_confirmation_timeout")));request.once("error",reject);request.end(encoded);});
+}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -309,13 +315,11 @@ export class DispatcherApi {
         if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting scheduled access writes while quiescing");
         const body=await this.readJson(request) as Record<string,unknown>;
         try {
-          const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
-          if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
-          const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
-          if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
-          const decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+          const receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
+          const decoded=signature&&extra.length===0?JSON.parse(Buffer.from(payload!,"base64url").toString("utf8")) as Record<string,unknown>:JSON.parse(receipt) as Record<string,unknown>;
           const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
-          sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??"")})});
+          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},this.config.jobCommandTimeoutMs);
+          sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(confirmed.workspace_id??""),channel_id:String(confirmed.channel_id??""),user_id:String(confirmed.user_id??""),issued_at:new Date().toISOString(),nonce:randomUUID()})});
         }
         catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
         return;

@@ -15,6 +15,7 @@ DOMAIN="gui/$UID"
 CONTROL_UPGRADE_ACTIVE=0
 CONTROL_SWAPPED=0
 DISPATCHER_PLIST_SWAPPED=0
+DISPATCHER_STOPPED=0
 CONTROL_BACKUP_ROOT=""
 
 bootstrap_updater_reconciled() {
@@ -50,14 +51,17 @@ restore_control_plane() {
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     /bin/launchctl bootout "$DOMAIN/dev.dona.updater" >/dev/null 2>&1 || true
   fi
-  if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
+  if [[ "$DISPATCHER_STOPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
     /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1 || true
-    /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
+    if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
+      /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
+    fi
     if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
       print -u2 "旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
     DISPATCHER_PLIST_SWAPPED=0
+    DISPATCHER_STOPPED=0
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     print -u2 "control-plane復旧前に新しいupdaterの停止を確認できません。backup: $CONTROL_BACKUP_ROOT"
@@ -320,6 +324,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
       exit 1
     fi
   fi
+  DISPATCHER_STOPPED=1
   /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
   DISPATCHER_PLIST_SWAPPED=1
   if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then

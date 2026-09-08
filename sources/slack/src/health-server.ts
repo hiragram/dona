@@ -184,6 +184,15 @@ export class SlackHealthServer {
       }
       return;
     }
+    if(method==="POST"&&pathname==="/v1/internal/schedule-access-confirmations") {
+      if(!this.updateNotifications?.confirmScheduleAccess) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Access confirmer is not configured"}});return; }
+      try {
+        const body=await this.readJson(request) as Record<string,unknown>;
+        const input={schema_version:1 as const,event_id:String(body.event_id??""),workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??"")};
+        const result=await this.updateNotifications.confirmScheduleAccess(input); send(response,200,result);
+      } catch { send(response,409,{schema_version:1,error:{code:"schedule_access_not_confirmed",message:"Current Slack access could not be confirmed"}}); }
+      return;
+    }
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });
       return;

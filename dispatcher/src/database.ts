@@ -29,7 +29,6 @@ const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;text:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;session_status:"active"|"suspended"|null; }
-function terminalStatusesFor(status:string):string[] { return ["blocked","needs_review"].includes(status)?["suspended"]:status==="failed"?["active","suspended"]:["active"]; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
   return typeof payload.result?.summary==="string"?payload.result.summary:typeof payload.error_message==="string"?payload.error_message:
     payload.job_status==="cancelled"?"ジョブは中止されました":payload.job_status==="blocked"?"ジョブは入力待ちです":"ジョブの確認が必要です";
@@ -508,9 +507,9 @@ export class DispatcherDatabase {
   }
 
   listTerminalScheduledJobsNeedingCleanup(limit = 100): JobRow[] {
-    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
+    return this.db.prepare(`SELECT DISTINCT j.* FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE j.status IN ('completed','failed','cancelled') AND j.herdr_workspace_id IS NOT NULL
-        AND json_extract(b.owner_json,'$.kind')='schedule' AND json_extract(j.workspace_json,'$.kind')='scratch'
+        AND json_extract(c.owner_json,'$.kind')='schedule' AND json_extract(j.workspace_json,'$.kind')='scratch'
       ORDER BY j.completed_at,j.job_id LIMIT ?`).all(limit) as JobRow[];
   }
 
@@ -1186,12 +1185,14 @@ export class DispatcherDatabase {
     const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&value.body_sha256===expectedBodySha256&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
     const postedAt=Date.parse(evidence?.posted_at??"");
     const receiptValid=evidence?.event_id===eventId&&evidence.workspace_id===target?.workspace_id&&evidence.channel_id===target?.channel_id&&evidence.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&
-      evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&Number.isFinite(postedAt)&&
-      (target?.kind!=="thread"||terminalStatusesFor(completion.job_status).includes(String(evidence.session_status)));
+      evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&Number.isFinite(postedAt);
     const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
     return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
   }
+
+  isNotificationAccepted(eventId:string):boolean { return this.db.prepare("SELECT 1 FROM job_completion_results WHERE notification_event_id=? AND notification_state='accepted'").get(eventId)!==undefined; }
+  markNotificationSessionNeedsReview(eventId:string,at=new Date()):void { this.db.transaction(()=>this.setNotificationState(eventId,"needs_review",at))(); }
 
   saveCompleted(eventId: string, result: ResultEnvelope, resultPath: string, acceptedAt=new Date(),evidence?:JobNotificationEvidence): void {
     if(Date.parse(result.completed_at)>acceptedAt.getTime()) throw new Error("completed_at_is_in_the_future");

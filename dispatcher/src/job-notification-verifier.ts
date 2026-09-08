@@ -3,7 +3,7 @@ import http from "node:http";
 import type { DispatcherConfig } from "./config.js";
 import type { JobNotificationEvidence,JobNotificationVerificationRequest } from "./database.js";
 
-export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>; }
+export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>; }
 
 async function token(path:string):Promise<string> {
   const stat=await fs.lstat(path);
@@ -13,7 +13,9 @@ async function token(path:string):Promise<string> {
 
 export class SlackAdapterJobNotificationVerifier implements JobNotificationVerifier {
   constructor(private readonly config:DispatcherConfig) {}
-  async verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence> {
+  verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence> { return this.request({...input,desired_session_status:null}); }
+  settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence> { return this.request(input); }
+  private async request(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence> {
     const encoded=Buffer.from(JSON.stringify(input)),secret=await token(this.config.updateInternalTokenPath);
     return new Promise((resolve,reject)=>{
       const request=http.request({socketPath:this.config.slackAdapterSocketPath,path:"/v1/internal/job-delivery-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":secret}},response=>{

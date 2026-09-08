@@ -155,6 +155,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
   assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source,/DISPATCHER_STOPPED=1[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
+  assert.match(source,/if \[\[ "\$DISPATCHER_STOPPED" == "1"[\s\S]*launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
   assert.match(source, /launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);

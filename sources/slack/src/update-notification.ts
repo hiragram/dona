@@ -31,7 +31,10 @@ export interface UpdateNotificationResult {
 export interface UpdateNotificationPort {
   deliver(input: UpdateNotificationRequest): Promise<UpdateNotificationResult>;
   confirmJobDelivery?(input:JobDeliveryConfirmationRequest):Promise<JobDeliveryConfirmationResult>;
+  confirmScheduleAccess?(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult>;
 }
+export interface ScheduleAccessConfirmationRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;user_id:string;}
+export interface ScheduleAccessConfirmationResult extends ScheduleAccessConfirmationRequest {authorized:true;channel_kind:"im"|"other";channel_user_id:string|null;}
 
 export interface JobDeliveryConfirmationRequest { schema_version:1; event_id:string; workspace_id:string; channel_id:string; thread_ts:string|null; message_ts:string; text:string; desired_session_status:"active"|"suspended"|null; }
 export interface JobDeliveryConfirmationResult extends Omit<JobDeliveryConfirmationRequest,"schema_version"|"text"|"desired_session_status"> { body_sha256:string; posted_at:string; reply_broadcast:false; session_status:"active"|"suspended"|null; }
@@ -42,7 +45,7 @@ export function parseJobDeliveryConfirmationRequest(input:unknown):JobDeliveryCo
   if(value.schema_version!==1||typeof value.event_id!=="string"||!/^evt_[0-9a-hjkmnp-tv-z]{26}$/.test(value.event_id)||typeof value.workspace_id!=="string"||!idPattern.test(value.workspace_id)||
     typeof value.channel_id!=="string"||!idPattern.test(value.channel_id)||(value.thread_ts!==null&&(typeof value.thread_ts!=="string"||!timestampPattern.test(value.thread_ts)))||typeof value.message_ts!=="string"||!timestampPattern.test(value.message_ts)||
     typeof value.text!=="string"||value.text.length<1||value.text.length>3000||(value.desired_session_status!==null&&value.desired_session_status!=="active"&&value.desired_session_status!=="suspended")) throw new Error("job delivery confirmation is invalid");
-  if((value.thread_ts===null)!==(value.desired_session_status===null)) throw new Error("job delivery confirmation session target is invalid");
+  if(value.thread_ts===null&&value.desired_session_status!==null) throw new Error("job delivery confirmation session target is invalid");
   return value as unknown as JobDeliveryConfirmationRequest;
 }
 
@@ -248,5 +251,12 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
     if(!Number.isFinite(seconds)) throw new Error("job_delivery_timestamp_invalid");
     return {event_id:input.event_id,workspace_id:connection.teamId,channel_id:input.channel_id,thread_ts:input.thread_ts,message_ts:input.message_ts,
       body_sha256:createHash("sha256").update(input.text).digest("hex"),posted_at:new Date(seconds*1000).toISOString(),reply_broadcast:false,session_status:sessionStatus};
+  }
+
+  async confirmScheduleAccess(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult> {
+    let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
+    const user=await connection.client.getUser(input.user_id),channel=await connection.client.getChannel(input.channel_id);
+    if(!connection.client.hasChannelMember||user.isDeleted||channel.isArchived||!await connection.client.hasChannelMember(input.channel_id,input.user_id)) throw new Error("schedule_access_not_confirmed");
+    return {...input,workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
   }
 }

@@ -294,6 +294,8 @@ export class DispatcherWorker {
       const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.verify(verification):undefined):undefined;
       if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
       else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
+      if(verification?.desired_session_status&&this.database.isNotificationAccepted(row.event_id)) try { await this.notificationVerifier!.settle(verification); }
+      catch { this.database.markNotificationSessionNeedsReview(row.event_id); this.logCurrentTransition(row,Date.now()); return true; }
       this.logCurrentTransition(row, Date.now());
       return true;
     } catch (error) {

@@ -218,7 +218,8 @@ export function createSlackMcpServer(
       const channel=await connection.client.getChannel(channel_id);
       const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
       const channel_kind=channel.isIm?"im" as const:"other" as const,channel_user_id=channel.isIm?channel.userId??null:null;
-      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id&&signAccessReceipt?{access_receipt:signAccessReceipt({event_id,workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id})}:{})});
+      const receiptInput={event_id:event_id??"",workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id};
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id?{access_receipt:signAccessReceipt?signAccessReceipt(receiptInput):JSON.stringify(receiptInput)}:{})});
     } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
   });
 
