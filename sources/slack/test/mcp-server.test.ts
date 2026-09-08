@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -267,6 +268,7 @@ describe("Dona Slack MCP server", () => {
         workspace: "company",
         channel_id: "C123",
         message_ts: "2.3",
+        body_sha256: createHash("sha256").update("hello").digest("hex"),
         thread_ts: "1.2",
         reply_broadcast: false,
         mrkdwn: false,

@@ -238,6 +238,19 @@ export class JobSupervisor {
         catch (error) { this.logger.warn("Scheduled job deadline cancellation requires review", { job_id: job.job_id,
           error_message: error instanceof Error ? error.message : String(error) }); }
       }
+      for (const job of this.database.listTerminalScheduledJobsNeedingCleanup()) {
+        try {
+          if (!this.runtime.cleanup) continue;
+          const cleaned = await this.runtime.cleanup(job, this.abortController.signal);
+          if (!cleaned.ok) throw new Error(commandMessage(cleaned));
+          this.database.markJobRuntimeCleaned(job.job_id);
+        } catch (error) {
+          this.logger.warn("Terminal scheduled job cleanup will be retried", {
+            job_id: job.job_id,
+            error_message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       this.publishNotifications();
       const availableSlots = Math.max(0, this.config.jobConcurrency - this.active.size);
       const rows = this.database.listRunnableJobs().filter((row) => !this.active.has(row.job_id));

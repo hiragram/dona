@@ -270,6 +270,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   const completionEvent=dispatcher.get(completionEventId)!; assert.equal(completionEvent.source,"dona_job");
   assert.equal((JSON.parse(completionEvent.payload_json) as {owner_kind:string}).owner_kind,"schedule");
   assert.equal((JSON.parse(completionEvent.payload_json) as {notification_format:string}).notification_format,"plain_text");
+  const bodySha=createHash("sha256").update((JSON.parse(completionEvent.payload_json) as {result:{summary:string}}).result.summary).digest("hex");
   assert.deepEqual(JSON.parse(completionEvent.reply_target_json!),input.target);
   assert.equal(repo.get("notify_work")?.state,"active");
   assert.equal(repo.claim(due),undefined);
@@ -282,7 +283,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false,mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:"0".repeat(64),reply_broadcast:false,mrkdwn:false,parse:"none"},
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "needs_review");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
@@ -290,7 +291,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false,mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"active"},
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "accepted");
@@ -304,7 +305,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",reply_broadcast:false,mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
@@ -345,7 +346,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000009",reply_broadcast:false,mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000009",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
   ],completed_at:due},notificationPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
@@ -494,6 +495,7 @@ test("threadを持たないwork通知はsession actionなしで配送を終端�
   dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
+  const dmBodySha=createHash("sha256").update((JSON.parse(dispatcher.get(eventId)!.payload_json) as {result:{summary:string}}).result.summary).digest("hex");
   const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
   dispatcher.beginDispatch(eventId,resultPath,new Date(due)); dispatcher.markWaiting(eventId,new Date(due));
   dispatcher.authorizeJobNotification(eventId,new Date(due));
@@ -503,7 +505,7 @@ test("threadを持たないwork通知はsession actionなしで配送を終端�
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
-    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",message_ts:"2.000001",mrkdwn:false,parse:"none"},
+    {tool:"dona_slack.post_message",workspace:"test",channel_id:"C_TEST",message_ts:"2.000001",body_sha256:dmBodySha,mrkdwn:false,parse:"none"},
   ],completed_at:due},resultPath,new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
 });
@@ -1014,7 +1016,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"path=/etc/hosts と [/root/.ssh/config]"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"file URL",output:{format:"markdown",text:"file:///Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
-  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:"2026-09-05T01:01:01Z"},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"src/database.ts、A/B、2026/09/08"},completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
@@ -1026,6 +1028,16 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.equal(repo.get("result_fence")?.state,"needs_review");
   assert.ok(repo.get("result_fence")!.updated_at>=due);
   assert.equal((repo.auditHistory("result_fence") as Array<{operation:string}>).filter(row=>row.operation==="work_notification_needs_review").length,1);
+});
+
+test("期限内に公開されたscheduled Resultはrestart後の遅い回収でも受理する", () => {
+  const {repo,dispatcher,raw,filename}=setup(),objective="restart回収";
+  repo.create("restart_result",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("restart_result",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},path.dirname(filename),path.dirname(filename),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"期限内完了",actions:[],completed_at:"2026-09-05T00:30:00Z"},job.result_path,new Date("2026-09-05T02:00:00Z"));
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"completed");
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {

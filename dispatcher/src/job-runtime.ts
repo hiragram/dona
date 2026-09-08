@@ -18,6 +18,7 @@ export interface JobAgentRuntime {
   prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  cleanup?(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
 function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
@@ -285,6 +286,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  }
+
+  async cleanup(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    const workspace = workspaceFromJob(row);
+    if (row.source !== "dona_schedule" || workspace.kind !== "scratch" || !row.herdr_workspace_id) {
+      throw new Error("Only terminal scheduled scratch jobs can be cleaned up");
+    }
+    assertScratchWorkspacePath(row, this.config);
+    const closed = await this.herdr(["workspace", "close", row.herdr_workspace_id], this.config.jobCommandTimeoutMs + 5_000, signal);
+    if (!closed.ok && !["workspace_not_found", "not_found"].includes(closed.errorCode ?? "")) return closed;
+    await fs.rm(row.workspace_path, { recursive: true, force: true });
+    return closed.ok ? closed : { ...closed, ok: true };
   }
 
   private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {

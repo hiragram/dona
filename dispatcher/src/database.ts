@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -499,6 +500,18 @@ export class DispatcherDatabase {
       ORDER BY j.created_at,j.job_id`).all(at.toISOString()) as JobRow[];
   }
 
+  listTerminalScheduledJobsNeedingCleanup(limit = 100): JobRow[] {
+    return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE j.status IN ('completed','failed','cancelled') AND j.herdr_workspace_id IS NOT NULL
+        AND json_extract(b.owner_json,'$.kind')='schedule' AND json_extract(j.workspace_json,'$.kind')='scratch'
+      ORDER BY j.completed_at,j.job_id LIMIT ?`).all(limit) as JobRow[];
+  }
+
+  markJobRuntimeCleaned(jobId: string): void {
+    this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
+      WHERE job_id=? AND status IN ('completed','failed','cancelled')`).run(nowUtc(),jobId);
+  }
+
   listJobsNeedingNotification(limit = 100): JobRow[] {
     return this.db.prepare(`
       SELECT * FROM jobs
@@ -664,7 +677,7 @@ export class DispatcherDatabase {
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
-    if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
+    if(binding?.owner.kind==="schedule"&&acceptedDeadline&&completedAt.getTime()>Date.parse(acceptedDeadline)+3_600_000)
       throw new Error("scheduled_work_result_deadline_exceeded");
     const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
       (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
@@ -1130,6 +1143,10 @@ export class DispatcherDatabase {
   private notificationDelivered(eventId:string,result:ResultEnvelope,acceptedAt:Date):{delivered:boolean;runId?:string} {
     const completion=this.db.prepare("SELECT job_status,owner_json,destination_json,notification_state,notification_authorization_phase,notification_write_authorized_at,materialized_at FROM job_completion_results WHERE notification_event_id=?").get(eventId) as {job_status:string;owner_json:string;destination_json:string;notification_state:string;notification_authorization_phase:string;notification_write_authorized_at:string|null;materialized_at:string}|undefined;
     if(!completion)return {delivered:false};
+    const event=this.getRequired(eventId);
+    const payload=JSON.parse(event.payload_json) as {result?:{summary?:unknown}};
+    const expectedBody=typeof payload.result?.summary==="string"?payload.result.summary:"";
+    const expectedBodySha256=createHash("sha256").update(expectedBody).digest("hex");
     const destination=JSON.parse(completion.destination_json) as {kind?:unknown;target?:Record<string,unknown>},target=destination.kind==="slack"?destination.target:undefined;
     const owner=JSON.parse(completion.owner_json) as {owner_id?:unknown;run_id?:string};
     const actions=(result.actions??[]).flatMap((action,index)=>action&&typeof action==="object"&&!Array.isArray(action)?[{index,value:action as Record<string,unknown>}]:[]);
@@ -1148,7 +1165,7 @@ export class DispatcherDatabase {
     });
     const withinDeadline=acceptedAt.getTime()<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=completion.notification_write_authorized_at!==null&&acceptedAt.getTime()<=Date.parse(completion.notification_write_authorized_at)+120_000;
-    const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
+    const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&value.body_sha256===expectedBodySha256&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
       const processing=actions.filter(({value})=>value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&value.status==="processing"&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)).at(-1);
     const terminalStatuses=["blocked","needs_review"].includes(completion.job_status)?["suspended"]:completion.job_status==="failed"?["active","suspended"]:["active"];
     const sessionSettled=actions.some(({index,value})=>index>Math.max(validPost?.index??Number.MAX_SAFE_INTEGER,processing?.index??-1)&&value.tool==="dona_slack.set_agent_session_status"&&value.workspace===access?.value.workspace&&terminalStatuses.includes(String(value.status))&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value));

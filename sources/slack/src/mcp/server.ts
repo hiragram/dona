@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createHash } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
@@ -522,6 +523,7 @@ export function createSlackMcpServer(
           workspace,
           channel_id: result.channelId,
           message_ts: result.messageTs,
+          body_sha256: createHash("sha256").update(text).digest("hex"),
           reply_broadcast,
           ...(mrkdwn!==undefined?{mrkdwn}:{}),
           ...(parse?{parse}:{}),

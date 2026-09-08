@@ -60,6 +60,7 @@ function fakeRuntime(overrides: Partial<JobAgentRuntime>): JobAgentRuntime {
     async prompt() { throw new Error("must not prompt"); },
     async wait() { throw new Error("must not wait"); },
     async cancel() { throw new Error("must not cancel"); },
+    async cleanup() { throw new Error("must not cleanup"); },
     ...overrides,
   };
 }

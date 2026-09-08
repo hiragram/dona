@@ -223,4 +223,27 @@ process.exit(2);
     assert.match(job.agent_name, /enhc$/);
     database.close();
   });
+
+  test("terminal scheduled scratch workspaceをHerdr close後に削除する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const capturePath=path.join(root,"cleanup-argv.json");
+    const executable=path.join(root,"fake-herdr-cleanup.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-scheduled-cleanup")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await fs.mkdir(job.workspace_path,{recursive:true});
+    await fs.writeFile(path.join(job.workspace_path,"artifact"),"temporary");
+    const runtime=new HerdrJobAgentRuntime({...config,herdrPath:executable});
+    const cleaned=await runtime.cleanup!({...job,source:"dona_schedule",herdr_workspace_id:"w7"});
+    assert.equal(cleaned.ok,true,JSON.stringify(cleaned));
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"workspace","close","w7"]);
+    await assert.rejects(fs.access(job.workspace_path),{code:"ENOENT"});
+    database.close();
+  });
 });

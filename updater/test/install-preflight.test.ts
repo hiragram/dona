@@ -152,6 +152,10 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
   assert.match(source, /updater\.previous\.sqlite3/);
+  assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
+  assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
+  assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source, /launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
