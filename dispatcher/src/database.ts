@@ -44,6 +44,10 @@ function renderJobResult(result: Record<string, unknown> | null): string {
   return typeof output?.text === "string" && output.text.trim() ? `${summary}\n\n${output.text}` : summary;
 }
 
+function containsHostAbsolutePath(value:string):boolean {
+  return /(?:^|[\s"'`(])\/(?!\/)[^\s"'`<>)]+/m.test(value);
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
@@ -652,7 +656,7 @@ export class DispatcherDatabase {
       validateWorkResultEnvelope(stableStringify(result));
       const rendered=renderJobResult(result as unknown as Record<string,unknown>);
       validateWorkResultContent(rendered);
-      if(/(?:^|[\s"'`(])\/(?!\/)[^\s"'`<>)]+/m.test(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+      if(containsHostAbsolutePath(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
       if((result.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
@@ -841,7 +845,7 @@ export class DispatcherDatabase {
 
   private safeNotificationError(message:string,scheduled:boolean,job?:JobRow):string {
     if(!scheduled) return message;
-    if(/\/(?:Users|home|var|tmp|private)\//.test(message)||job&&(message.includes(job.workspace_path)||message.includes(path.dirname(job.result_path)))) return "実行エラーの詳細は安全上省略されました";
+    if(containsHostAbsolutePath(message)||job&&(message.includes(job.workspace_path)||message.includes(path.dirname(job.result_path)))) return "実行エラーの詳細は安全上省略されました";
     try { return projectWorkResultContent(message); }
     catch { return "実行エラーの詳細は安全上省略されました"; }
   }

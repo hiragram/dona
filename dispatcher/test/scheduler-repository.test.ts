@@ -935,6 +935,9 @@ test("scheduled runtime errorはDona通知へ保存する前に安全な固定�
   raw.prepare("UPDATE jobs SET status='running',last_error_message=NULL WHERE job_id=?").run(job.job_id);
   dispatcher.markJobNeedsReview(job.job_id,"runtime_failed","EACCES: /Users/example/.dona/workspaces/private");
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
+  raw.prepare("UPDATE jobs SET status='running',last_error_message=NULL WHERE job_id=?").run(job.job_id);
+  dispatcher.markJobNeedsReview(job.job_id,"runtime_failed","EACCES: /root/.ssh/config");
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
   raw.prepare("UPDATE jobs SET status='running',workspace_path='/workspace/jobs/arbitrary',last_error_message=NULL WHERE job_id=?").run(job.job_id);
   dispatcher.markJobNeedsReview(job.job_id,"runtime_failed","EACCES: /workspace/jobs/arbitrary/result");
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_message,"実行エラーの詳細は安全上省略されました");
