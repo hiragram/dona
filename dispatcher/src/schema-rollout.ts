@@ -20,7 +20,7 @@ export interface MigrationReceipt {
   backup: { opened: true; integrity_check: "ok"; foreign_key_violations: 0 };
   migrated: { integrity_check: "ok"; foreign_key_violations: 0; user_version: 3 };
   preservation: Record<string, { before: number; after: number; before_digest: string; after_digest: string }>;
-  rollback: { target_schema: 3; previous_release_can_read: true; backup_restore_opened: boolean };
+  rollback: { target_schema: 3; previous_release_can_read: boolean; backup_restore_opened: boolean };
   completed_at: string;
 }
 
@@ -180,7 +180,11 @@ export async function migrateV2ToV3WithBackup(input: {
       backup: { opened: true, integrity_check: "ok", foreign_key_violations: 0 },
       migrated: { integrity_check: "ok", foreign_key_violations: 0, user_version: 3 },
       preservation,
-      rollback: { target_schema: 3, previous_release_can_read: true, backup_restore_opened: true },
+      rollback: {
+        target_schema: 3,
+        previous_release_can_read: input.previous.app_schema_read_min <= 3 && input.previous.app_schema_read_max >= 3,
+        backup_restore_opened: true,
+      },
       completed_at: input.completedAt ?? new Date().toISOString(),
     };
   } finally {

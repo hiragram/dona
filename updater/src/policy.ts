@@ -187,7 +187,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       required_control_plane_capability: transition.required_control_plane_capability,
     };
   });
-  const transitionKeys = compatibilityTransitions.map((transition) => JSON.stringify(transition));
+  const transitionKeys = compatibilityTransitions.map(({ from_sha, from, to }) =>
+    JSON.stringify({ from_sha, from, to }));
   if (new Set(transitionKeys).size !== transitionKeys.length) throw new ValidationError("compatibility_transitions contains duplicates");
   return {
     schema_version: 1,

@@ -68,6 +68,10 @@ describe("fixed self-update surface", () => {
       assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);
       assert.throws(() => parsePolicy({
         ...policy,
+        compatibility_transitions: [transition, { ...transition, required_control_plane_capability: "other_capability" }],
+      }), /duplicates/);
+      assert.throws(() => parsePolicy({
+        ...policy,
         compatibility_transitions: [{ ...transition, required_control_plane_capability: "invalid-capability" }],
       }), /capability is invalid/);
     } finally {

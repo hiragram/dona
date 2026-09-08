@@ -141,6 +141,10 @@ export class UpdateController {
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
     if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3 &&
+      !transition && current.sha !== schemaV3BridgeSha) {
+      throw new Error("schema_activation_bridge_identity_unverified");
+    }
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
     if (transition || current.compatibility.app_schema_write !== targetManifest.compatibility.app_schema_write) {
       const capability = transition?.required_control_plane_capability ?? schemaMigrationCapability;

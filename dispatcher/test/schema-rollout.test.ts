@@ -147,6 +147,23 @@ test("migration refuses to run before drain and never overwrites a backup", asyn
   }), /quiesced_drained/);
 });
 
+test("v2-only source receipt requires backup restore instead of claiming direct rollback readability", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-v2-source-"));
+  roots.push(root);
+  const databasePath = path.join(root, "dispatcher.sqlite3");
+  const backupPath = path.join(root, "dispatcher.v2.sqlite3");
+  const db = new Database(databasePath);
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+  const receipt = await migrateV2ToV3WithBackup({
+    databasePath, backupPath,
+    previous: { ...bridge, app_schema_read_max: 2 }, target: activation,
+    quiesced: true, drained: true,
+  });
+  assert.equal(receipt.rollback.previous_release_can_read, false);
+  assert.equal(receipt.rollback.backup_restore_opened, true);
+});
+
 test("receipt publication is not blocked by a stale legacy temporary file", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-receipt-"));
   roots.push(root);
