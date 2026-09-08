@@ -45,7 +45,7 @@ function renderJobResult(result: Record<string, unknown> | null): string {
 }
 
 function containsHostAbsolutePath(value:string):boolean {
-  const withoutUrls=value.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
+  const withoutUrls=value.replace(/\bfile:\/\//gi,"").replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
   return /(?:^|[\s"'`=:[({<])\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
 }
 
@@ -732,6 +732,9 @@ export class DispatcherDatabase {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     const row = this.getJobRequired(jobId);
     if (row.status === "cancelled") return row;
+    if(row.status==="needs_review"&&["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(row.last_error_code??"")) {
+      throw new Error("cancellation_requires_reconciliation");
+    }
     if (!["queued", "retryable_failed", "preparing", "dispatching", "running", "blocked", "needs_review"].includes(row.status)) {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
@@ -851,13 +854,16 @@ export class DispatcherDatabase {
     catch { return "実行エラーの詳細は安全上省略されました"; }
   }
 
-  private setNotificationState(eventId:string,state:"none"|"accepted"|"failed"|"needs_review",at:Date):void {
+  private setNotificationState(eventId:string,state:"none"|"accepted"|"failed"|"needs_review",at:Date,expectedStates?:Array<"failed"|"needs_review">):void {
     const rows=this.db.prepare(`SELECT json_extract(c.owner_json,'$.run_id') AS run_id,c.materialized_at,r.created_at AS run_created_at,r.started_at,r.terminal_at,s.updated_at AS schedule_updated_at
       FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id') JOIN schedules s USING(schedule_id)
       WHERE c.notification_event_id=? AND json_extract(c.owner_json,'$.kind')='schedule'`).all(eventId) as Array<{run_id:string;materialized_at:string;run_created_at:string;started_at:string|null;terminal_at:string|null;schedule_updated_at:string}>;
     const requested=new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z");
     if(state==="failed"||state==="needs_review") for(const row of rows) this.scheduler.markWorkNotificationNeedsReview(row.run_id,[requested,row.materialized_at,row.run_created_at,row.started_at,row.terminal_at,row.schedule_updated_at].filter((value):value is string=>value!==null).sort().at(-1)!);
-    this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId);
+    const updated=expectedStates
+      ?this.db.prepare(`UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=? AND notification_state IN (${expectedStates.map(()=>"?").join(",")})`).run(state,eventId,...expectedStates).changes
+      :this.db.prepare("UPDATE job_completion_results SET notification_state=? WHERE notification_event_id=?").run(state,eventId).changes;
+    if(expectedStates&&updated!==1)throw new Error("scheduled_notification_not_reconcilable");
     if(state==="accepted") for(const row of rows) this.scheduler.settleWorkNotification(row.run_id,[requested,row.materialized_at,row.run_created_at,row.started_at,row.terminal_at,row.schedule_updated_at].filter((value):value is string=>value!==null).sort().at(-1)!);
   }
 
@@ -1282,41 +1288,38 @@ export class DispatcherDatabase {
   }
 
   reconcileScheduledNotification(eventId:string,receipt:{workspace_id:string;channel_id:string;message_ts:string;thread_ts?:string},at=new Date()):EventRow {
-    const row=this.getRequired(eventId);
-    const completion=this.db.prepare(`SELECT destination_json,notification_state FROM job_completion_results
-      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {destination_json:string;notification_state:string}|undefined;
-    if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
-    const destination=JSON.parse(completion.destination_json) as {kind?:string;target?:{kind?:string;workspace_id?:string;channel_id?:string;thread_ts?:string}};
-    const target=destination.kind==="slack"?destination.target:undefined;
-    if(!target||receipt.workspace_id!==target.workspace_id||receipt.channel_id!==target.channel_id||
-      !/^\d{1,20}\.\d{6}$/.test(receipt.message_ts)||(target.kind==="thread"?receipt.thread_ts!==target.thread_ts:receipt.thread_ts!==undefined)) {
-      throw new Error("scheduled_notification_receipt_mismatch");
-    }
-    const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator reconciled a verified scheduled notification receipt",
-      actions:[{tool:"operator.reconcile_job_notification",workspace_id:receipt.workspace_id,channel_id:receipt.channel_id,message_ts:receipt.message_ts,...(receipt.thread_ts?{thread_ts:receipt.thread_ts}:{})}],
-      memory_candidates:[],completed_at:at.toISOString()};
-    this.db.transaction(()=>{
+    return this.db.transaction(()=>{
+      this.getRequired(eventId);
+      const completion=this.db.prepare(`SELECT destination_json,notification_state FROM job_completion_results
+        WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {destination_json:string;notification_state:string}|undefined;
+      if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
+      const destination=JSON.parse(completion.destination_json) as {kind?:string;target?:{kind?:string;workspace_id?:string;channel_id?:string;thread_ts?:string}};
+      const target=destination.kind==="slack"?destination.target:undefined;
+      if(!target||receipt.workspace_id!==target.workspace_id||receipt.channel_id!==target.channel_id||
+        !/^\d{1,20}\.\d{6}$/.test(receipt.message_ts)||(target.kind==="thread"?receipt.thread_ts!==target.thread_ts:receipt.thread_ts!==undefined)) throw new Error("scheduled_notification_receipt_mismatch");
+      const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator reconciled a verified scheduled notification receipt",
+        actions:[{tool:"operator.reconcile_job_notification",workspace_id:receipt.workspace_id,channel_id:receipt.channel_id,message_ts:receipt.message_ts,...(receipt.thread_ts?{thread_ts:receipt.thread_ts}:{})}],memory_candidates:[],completed_at:at.toISOString()};
       this.db.prepare(`UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE event_id=?`)
         .run(stableStringify(result),at.toISOString(),at.toISOString(),eventId);
-      this.setNotificationState(eventId,"accepted",at);
+      this.setNotificationState(eventId,"accepted",at,["failed","needs_review"]);
+      return this.getRequired(eventId);
     }).immediate();
-    return this.getRequired(eventId);
   }
 
   reconcileScheduledNotificationNotSent(eventId:string,at=new Date()):EventRow {
-    this.getRequired(eventId);
-    const completion=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id,notification_state FROM job_completion_results
-      WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {run_id:string;notification_state:string}|undefined;
-    if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
-    const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator confirmed the scheduled notification was not sent",
-      actions:[{tool:"operator.reconcile_job_notification",outcome:"not_sent"}],memory_candidates:[],completed_at:at.toISOString()};
-    this.db.transaction(()=>{
+    return this.db.transaction(()=>{
+      this.getRequired(eventId);
+      const completion=this.db.prepare(`SELECT json_extract(owner_json,'$.run_id') AS run_id,notification_state FROM job_completion_results
+        WHERE notification_event_id=? AND json_extract(owner_json,'$.kind')='schedule'`).get(eventId) as {run_id:string;notification_state:string}|undefined;
+      if(!completion||!["failed","needs_review"].includes(completion.notification_state)) throw new Error("scheduled_notification_not_reconcilable");
+      const result:ResultEnvelope={schema_version:1,event_id:eventId,status:"completed",summary:"Operator confirmed the scheduled notification was not sent",
+        actions:[{tool:"operator.reconcile_job_notification",outcome:"not_sent"}],memory_candidates:[],completed_at:at.toISOString()};
       this.db.prepare("UPDATE events SET status='completed',result_json=?,completed_at=?,last_error_code='notification_confirmed_not_sent',last_error_message=NULL,updated_at=? WHERE event_id=?")
         .run(stableStringify(result),at.toISOString(),at.toISOString(),eventId);
-      this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=?").run(eventId);
+      this.setNotificationState(eventId,"none",at,["failed","needs_review"]);
       this.scheduler.reconcileWorkNotificationNotSent(completion.run_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
+      return this.getRequired(eventId);
     }).immediate();
-    return this.getRequired(eventId);
   }
 
   manualDeadLetter(eventId: string, at = new Date()): EventRow {

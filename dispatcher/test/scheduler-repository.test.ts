@@ -331,6 +331,7 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.throws(()=>dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_OTHER",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due)),/scheduled_notification_receipt_mismatch/);
   dispatcher.reconcileScheduledNotification(completionEventId,{workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000002"},new Date(due));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  assert.throws(()=>dispatcher.reconcileScheduledNotificationNotSent(completionEventId,new Date(due)),/scheduled_notification_not_reconcilable/);
   assert.equal(repo.get("notify_work")?.state,"completed");
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
   assert.throws(()=>dispatcher.manualComplete(completionEventId,new Date(due)),/scheduled_notification_receipt_required/);
@@ -555,6 +556,18 @@ test("遅着work Result回収は削除済みcontentのscheduleを再有効化し
   assert.equal(repo.get("recover_deleted_content")?.state,"needs_review");
   assert.equal((raw.prepare("SELECT content_delete_at FROM schedule_revisions WHERE schedule_id=? AND revision=?")
     .get(run.schedule_id,run.revision) as {content_delete_at:string}).content_delete_at,due);
+});
+
+test("通知reconciliation時に期限切れrevisionをexpiredへ終端する", () => {
+  const {repo,dispatcher,raw}=setup();
+  repo.create("reconcile_expired",{...input,action:"work.read_only",expires_at:"2026-09-06T00:02:00Z"},due,actor,now);
+  const run=repo.materialize("reconcile_expired",1,due,later,due,actor).run;
+  startWork(repo,dispatcher,raw,run,due);
+  repo.setRunState(run.run_id,"started","completed",actor,due,null,"結果",null,true);
+  repo.markWorkNotificationNeedsReview(run.run_id,due);
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE json_extract(owner_json,'$.run_id')=?").run(run.run_id);
+  repo.reconcileWorkNotificationNotSent(run.run_id,"2026-09-06T00:03:00Z");
+  assert.equal(repo.get("reconcile_expired")?.state,"expired");
 });
 
 test("外部write前の通知retryだけをpending preflightへ戻す", () => {
@@ -792,6 +805,7 @@ test("schedule cancelとexpiryは対応する実行jobをSupervisor取消対象�
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation()[0]?.job_id,job.job_id);
   dispatcher.beginJobCancellation(job.job_id,job.source_event_id);
   dispatcher.markJobNeedsReview(job.job_id,"cancel_acceptance_unknown","取消応答が不明");
+  assert.throws(()=>dispatcher.beginJobCancellation(job.job_id,job.source_event_id),/cancellation_requires_reconciliation/);
   raw.prepare("UPDATE jobs SET last_error_code='agent_wait_observation_unknown' WHERE job_id=?").run(job.job_id);
   assert.equal(dispatcher.listScheduledJobsRequiringCancellation().some(row=>row.job_id===job.job_id),true);
   raw.prepare("UPDATE jobs SET last_error_code='ambiguous_cancel_acceptance' WHERE job_id=?").run(job.job_id);
@@ -998,6 +1012,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"/Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"設定: /etc/hosts"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"path=/etc/hosts と [/root/.ssh/config]"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"file URL",output:{format:"markdown",text:"file:///Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);

@@ -642,6 +642,10 @@ export class SchedulerRepository {
     const run=this.getRun(runId);if(!run)return;const schedule=this.get(run.schedule_id)!;
     if(run.revision!==schedule.revision||!["completed","failed","cancelled"].includes(run.status))return;
     const revision=this.revision(schedule);
+    if(revision.expires_at<=now) {
+      this.expireSchedule(schedule,{tenant_id:schedule.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},now);
+      return;
+    }
     const contentAvailable=revision.content!==null&&(revision.content_delete_at===null||revision.content_delete_at>now);
     const changed=contentAvailable?this.db.prepare("UPDATE schedules SET state='active',terminal_at=NULL,updated_at=? WHERE schedule_id=? AND revision=? AND state='needs_review'").run(now,run.schedule_id,run.revision).changes:0;
     if(changed===1) {
