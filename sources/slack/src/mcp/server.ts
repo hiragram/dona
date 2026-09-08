@@ -499,10 +499,11 @@ export function createSlackMcpServer(
         reply_broadcast: z.boolean().default(false),
         mrkdwn: z.boolean().optional(),
         parse: z.literal("none").optional(),
+        event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("Dona job通知時のcurrent event ID"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse }) => {
+    async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
         const result = await connection.client.postMessage({
@@ -512,6 +513,7 @@ export function createSlackMcpServer(
           replyBroadcast: reply_broadcast,
           ...(mrkdwn!==undefined?{mrkdwn}:{}),
           ...(parse?{parse}:{}),
+          ...(event_id?{identityBlockId:`dona-job-${createHash("sha256").update(event_id).digest("hex").slice(0,32)}`}:{}),
         });
         logger.info("Slack MCP posted message", {
           tool: "post_message",
@@ -530,6 +532,7 @@ export function createSlackMcpServer(
           reply_broadcast,
           ...(mrkdwn!==undefined?{mrkdwn}:{}),
           ...(parse?{parse}:{}),
+          ...(event_id?{event_id}:{}),
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
       } catch (error) {

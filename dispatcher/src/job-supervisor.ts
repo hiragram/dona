@@ -358,7 +358,11 @@ export class JobSupervisor {
     try {
       prepared = await this.runtime.prepare(preparing, this.abortController.signal);
     } catch (error) {
-      if(error instanceof PreparedWorkspaceCleanupError)this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
+      if(error instanceof PreparedWorkspaceCleanupError) {
+        this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
+        this.database.markJobNeedsReview(row.job_id,"workspace_cleanup_failed",error.message);
+        return;
+      }
       if (this.stopping) return;
       if (this.database.getJob(row.job_id)?.status !== "preparing") return;
       const updated = this.database.recordJobPreparationFailure(

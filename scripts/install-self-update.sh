@@ -319,6 +319,11 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   fi
   CONTROL_SWAPPED=1
   DISPATCHER_STOPPED=1
+  ACTIVE_DISPATCHER_SHA=$(/usr/bin/basename "$(/usr/bin/readlink "$RUNTIME_ROOT/current")")
+  if [[ ! "$ACTIVE_DISPATCHER_SHA" =~ '^[0-9a-f]{40}$' ]]; then
+    print -u2 "active Dispatcher SHAをcurrent pointerから確定できません。"
+    exit 1
+  fi
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
@@ -337,7 +342,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA" 30000 && \
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000 && \
     bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_UPGRADE_ACTIVE=0

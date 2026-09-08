@@ -28,7 +28,7 @@ const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;text:string;desired_session_status:"active"|"suspended"|null; }
-export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;session_status:"active"|"suspended"|null; }
+export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
   return typeof payload.result?.summary==="string"?payload.result.summary:typeof payload.error_message==="string"?payload.error_message:
     payload.job_status==="cancelled"?"ジョブは中止されました":payload.job_status==="blocked"?"ジョブは入力待ちです":"ジョブの確認が必要です";
@@ -672,7 +672,9 @@ export class DispatcherDatabase {
     const job=this.getJobRequired(jobId);
     const binding = readEventJobBinding(this.db,job.source_event_id);
     if (binding?.owner.kind === "schedule") {
-      validateWorkResultEnvelope(stableStringify(result));
+      const serialized=stableStringify(result);
+      validateWorkResultEnvelope(serialized);
+      if(containsHostAbsolutePath(serialized)||serialized.includes(job.workspace_path)||serialized.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
       const rendered=renderJobResult(result as unknown as Record<string,unknown>);
       validateWorkResultContent(rendered);
       if(containsHostAbsolutePath(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
@@ -1216,7 +1218,7 @@ export class DispatcherDatabase {
     const validPost=posts.find(({index,value})=>index===(reauthorized?.index??Number.MAX_SAFE_INTEGER)+1&&value.tool==="dona_slack.post_message"&&value.body_sha256===expectedBodySha256&&typeof value.workspace==="string"&&value.workspace===access?.value.workspace&&typeof value.message_ts==="string"&&/^\d{1,20}\.\d{6}$/.test(value.message_ts)&&value.success!==false&&value.ok!==false&&value.ambiguous!==true&&!("error" in value)&&value.channel_id===target?.channel_id&&(target?.kind==="thread"?(value.thread_ts===target.thread_ts&&value.reply_broadcast===false):value.thread_ts===undefined));
     const postedAt=Date.parse(evidence?.posted_at??"");
     const receiptValid=evidence?.event_id===eventId&&evidence.workspace_id===target?.workspace_id&&evidence.channel_id===target?.channel_id&&evidence.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&
-      evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&Number.isFinite(postedAt);
+      evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&evidence.identity_block_verified===true&&Number.isFinite(postedAt);
     const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
     const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)-5_000&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
     return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};

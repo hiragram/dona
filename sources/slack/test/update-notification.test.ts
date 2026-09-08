@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 
 import type { KeychainStore } from "../src/keychain.js";
@@ -110,8 +111,9 @@ async function reporterFixture() {
 describe("SlackUpdateNotificationReporter", () => {
   test("job deliveryをremote本文・非broadcast・session終端へ固定する",async()=>{
     const {client,reporter}=await reporterFixture();
-    client.messages.push({ts:"1788390700.987654",threadTs:request.thread_ts,botId:"B_TEST",text:"完了",fileIds:[],blockIds:[],reactions:[]});
-    const result=await reporter.confirmJobDelivery({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,message_ts:"1788390700.987654",text:"完了",desired_session_status:"active"});
+    const eventId="evt_01m1zfewbjx8v0844yrrkqwzc7";
+    client.messages.push({ts:"1788390700.987654",threadTs:request.thread_ts,botId:"B_TEST",text:"完了",fileIds:[],blockIds:[`dona-job-${createHash("sha256").update(eventId).digest("hex").slice(0,32)}`],reactions:[]});
+    const result=await reporter.confirmJobDelivery({schema_version:1,event_id:eventId,workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,message_ts:"1788390700.987654",text:"完了",desired_session_status:"active"});
     assert.equal(result.posted_at,"2026-09-02T23:11:40.987Z"); assert.equal(result.reply_broadcast,false); assert.equal(result.session_status,"active");
     client.messages[0]!.subtype="thread_broadcast";
     await assert.rejects(reporter.confirmJobDelivery({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",thread_ts:request.thread_ts,message_ts:"1788390700.987654",text:"完了",desired_session_status:"active"}),/not_confirmed/);
