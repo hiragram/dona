@@ -120,6 +120,10 @@ test("plans an explicitly approved compatibility transition from the installed p
 
   const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
   assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, false);
+  assert.deepEqual(
+    (result.plan as { compatibility_transition: unknown }).compatibility_transition,
+    f.policy.compatibility_transitions[0],
+  );
   const preflight = result.preflight as Record<string, unknown>;
   assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
   assert.equal(preflight.schema_migration_control_plane_sha, targetSha);

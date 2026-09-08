@@ -8,6 +8,7 @@ import { assertTransition, isTerminal } from "./state-machine.js";
 import type {
   ApplyRequest,
   Compatibility,
+  CompatibilityTransition,
   OutboxRow,
   PlanRequest,
   UpdatePlan,
@@ -72,6 +73,7 @@ export interface PlanMaterial {
   policy_version: string;
   compatibility: Compatibility;
   rollback_compatible: boolean;
+  compatibility_transition?: CompatibilityTransition;
 }
 
 export interface MutationFields {
@@ -99,7 +101,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 3) throw new Error(`Updater database schema ${version} is newer than supported schema 3`);
+    if (version > 4) throw new Error(`Updater database schema ${version} is newer than supported schema 4`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -116,6 +118,7 @@ export class UpdateDatabase {
         plan_hash              TEXT NOT NULL,
         policy_version         TEXT NOT NULL,
         compatibility_json     TEXT NOT NULL,
+        transition_json        TEXT,
         rollback_compatible    INTEGER NOT NULL CHECK (rollback_compatible IN (0, 1)),
         approval_id            TEXT,
         approval_event_id      TEXT,
@@ -196,7 +199,7 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 3;
+      PRAGMA user_version = 4;
     `);
     if (version === 1) migrate(`
       ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
@@ -223,11 +226,17 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 3;
+      ALTER TABLE update_requests ADD COLUMN transition_json TEXT;
+      PRAGMA user_version = 4;
     `);
     if (version === 2) migrate(`
       ALTER TABLE update_outbox ADD COLUMN superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id);
-      PRAGMA user_version = 3;
+      ALTER TABLE update_requests ADD COLUMN transition_json TEXT;
+      PRAGMA user_version = 4;
+    `);
+    if (version === 3) migrate(`
+      ALTER TABLE update_requests ADD COLUMN transition_json TEXT;
+      PRAGMA user_version = 4;
     `);
   }
 
@@ -247,6 +256,7 @@ export class UpdateDatabase {
   createPlan(request: PlanRequest, material: PlanMaterial, at = new Date()): { row: UpdateRow; plan: UpdatePlan; duplicate: boolean } {
     const replyTargetJson = canonicalJson(request.reply_target);
     const compatibilityJson = canonicalJson(material.compatibility);
+    const transitionJson = material.compatibility_transition ? canonicalJson(material.compatibility_transition) : null;
     const createdAt = at.toISOString();
     return this.db.transaction(() => {
       const existing = this.db.prepare("SELECT * FROM update_requests WHERE source_event_id = ?")
@@ -254,7 +264,8 @@ export class UpdateDatabase {
       if (existing) {
         const mismatch = existing.reply_target_json !== replyTargetJson ||
           existing.current_sha !== material.current_sha || existing.target_sha !== material.target_sha ||
-          existing.policy_version !== material.policy_version || existing.compatibility_json !== compatibilityJson;
+          existing.policy_version !== material.policy_version || existing.compatibility_json !== compatibilityJson ||
+          existing.transition_json !== transitionJson;
         if (mismatch) throw new Error("A plan for this source event already exists with different material");
         return { row: existing, plan: this.planFromRow(existing), duplicate: true };
       }
@@ -279,17 +290,18 @@ export class UpdateDatabase {
         previous_sha: material.previous_sha,
         compatibility: material.compatibility,
         rollback_compatible: material.rollback_compatible,
+        compatibility_transition: material.compatibility_transition ?? null,
         created_at: createdAt,
       };
       const planHash = sha256(canonicalJson(canonicalPlan));
       this.db.prepare(`
         INSERT INTO update_requests (
           request_id, source_event_id, reply_target_json, state, current_sha, target_sha, previous_sha,
-          plan_id, plan_hash, policy_version, compatibility_json, rollback_compatible, created_at, updated_at
-        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          plan_id, plan_hash, policy_version, compatibility_json, transition_json, rollback_compatible, created_at, updated_at
+        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         requestId, request.source_event_id, replyTargetJson, material.current_sha, material.target_sha,
-        material.previous_sha, planId, planHash, material.policy_version, compatibilityJson,
+        material.previous_sha, planId, planHash, material.policy_version, compatibilityJson, transitionJson,
         material.rollback_compatible ? 1 : 0, createdAt, createdAt,
       );
       const row = this.getRequired(requestId);
@@ -817,6 +829,9 @@ export class UpdateDatabase {
       previous_sha: row.previous_sha,
       compatibility: JSON.parse(row.compatibility_json) as Compatibility,
       rollback_compatible: row.rollback_compatible === 1,
+      compatibility_transition: row.transition_json
+        ? JSON.parse(row.transition_json) as CompatibilityTransition
+        : null,
       created_at: row.created_at,
     };
   }

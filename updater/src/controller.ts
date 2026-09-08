@@ -8,6 +8,7 @@ import { redactText } from "./redaction.js";
 import type {
   ApplyRequest,
   CommandResult,
+  CompatibilityTransition,
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
@@ -160,6 +161,7 @@ export class UpdateController {
       policy_version: this.policy.policy_version,
       compatibility: targetManifest.compatibility,
       rollback_compatible: rollbackCompatible,
+      ...(transition ? { compatibility_transition: transition } : {}),
     }, this.clock.now());
     return {
       schema_version: 1,
@@ -420,8 +422,16 @@ export class UpdateController {
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
     const targetCompatibility = JSON.parse(initial.compatibility_json) as ReleaseManifest["compatibility"];
+    const persistedTransition = initial.transition_json
+      ? JSON.parse(initial.transition_json) as CompatibilityTransition
+      : undefined;
     let mainAgentPaneId = this.database.runtimeOperation(row.request_id, "stop_main_agent")?.target_ref;
     this.assertLease(row);
+    if (persistedTransition && !this.policy.compatibility_transitions.some((candidate) =>
+      canonicalJson(candidate) === canonicalJson(persistedTransition))) {
+      this.needsReview(row, "approved_transition_no_longer_matches_policy");
+      return;
+    }
     if (row.state === "rolling_back") {
       await this.resumeRollback(row);
       return;
@@ -591,11 +601,12 @@ export class UpdateController {
       const previousManifest = await this.releases.readCurrentManifest();
       const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
-        const approvedTransition = this.policy.compatibility_transitions.find((candidate) =>
-          candidate.from_sha === previousManifest.sha && previousManifest.sha === row.current_sha &&
-          canonicalJson(candidate.from) === canonicalJson(previousCompatibility) &&
-          canonicalJson(candidate.to) === canonicalJson(targetCompatibility)
-        );
+        const approvedTransition = persistedTransition?.from_sha === previousManifest.sha &&
+          previousManifest.sha === row.current_sha &&
+          canonicalJson(persistedTransition.from) === canonicalJson(previousCompatibility) &&
+          canonicalJson(persistedTransition.to) === canonicalJson(targetCompatibility)
+          ? persistedTransition
+          : undefined;
         const legacyExactBridge = previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
         if (!approvedTransition && !legacyExactBridge) {
           this.needsReview(row, "schema_activation_bridge_identity_unverified");

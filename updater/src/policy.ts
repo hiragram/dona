@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { Compatibility } from "./types.js";
+import type { Compatibility, CompatibilityTransition } from "./types.js";
 import { fullSha, ValidationError } from "./validation.js";
 
 export interface UpdatePolicy {
@@ -52,14 +52,6 @@ export interface UpdatePolicy {
   require_verified_signature: boolean;
   compatibility: Compatibility;
   compatibility_transitions: CompatibilityTransition[];
-}
-
-export interface CompatibilityTransition {
-  from_sha: string;
-  from: Compatibility;
-  to: Compatibility;
-  previous_release_contract: string;
-  required_control_plane_capability: string;
 }
 
 function absolute(value: unknown, name: string): string {
