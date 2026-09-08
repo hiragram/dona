@@ -652,7 +652,7 @@ export class DispatcherDatabase {
       validateWorkResultEnvelope(stableStringify(result));
       const rendered=renderJobResult(result as unknown as Record<string,unknown>);
       validateWorkResultContent(rendered);
-      if(/\/(?:Users|home|var|tmp|private)\//.test(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+      if(/(?:^|[\s"'`(])\/(?!\/)[^\s"'`<>)]+/m.test(rendered)||rendered.includes(job.workspace_path)||rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
       if((result.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
     }
     const status: JobStatus = result.status === "completed" ? "completed" : "failed";
@@ -1207,6 +1207,9 @@ export class DispatcherDatabase {
     }
     const notification=this.db.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?")
       .get(eventId) as {notification_state:string;notification_authorization_phase:string}|undefined;
+    const reportedPost=row.result_json!==null&&this.db.prepare(`SELECT 1 FROM json_each(?,'$.actions')
+      WHERE json_extract(value,'$.tool') LIKE '%.post_message' LIMIT 1`).get(row.result_json)!==undefined;
+    if(notification&&reportedPost) throw new Error("scheduled_notification_retry_requires_reconciliation");
     if(notification&&!((notification.notification_state==="failed"&&["none","preflight"].includes(notification.notification_authorization_phase))||(notification.notification_state==="needs_review"&&["none","preflight"].includes(notification.notification_authorization_phase))))
       throw new Error("scheduled_notification_retry_requires_reconciliation");
     const undelegatedRun=row.source==="dona_schedule"?this.db.prepare("SELECT status,job_id FROM schedule_runs WHERE event_id=?").get(eventId) as {status:string;job_id:string|null}|undefined:undefined;

@@ -564,6 +564,9 @@ test("外部write前の通知retryだけをpending preflightへ戻す", () => {
   assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
   raw.prepare("UPDATE job_completion_results SET notification_state='failed',notification_authorization_phase='write' WHERE notification_event_id=?").run(eventId);
   assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
+  raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='preflight' WHERE notification_event_id=?").run(eventId);
+  raw.prepare("UPDATE events SET result_json=? WHERE event_id=?").run(JSON.stringify({actions:[{tool:"dona_slack.post_message",message_ts:"2.000099"}]}),eventId);
+  assert.throws(()=>dispatcher.manualRetry(eventId,true,new Date(due)),/requires_reconciliation/);
 });
 
 test("preflight中にblockedとなった通知をschedule取消で抑止する", () => {
@@ -971,6 +974,7 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"write",actions:[{tool:"dona_slack.set_agent_session_status"}],completed_at:due},job.result_path,new Date(due)),/external_write_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"path",output:{format:"markdown",text:`${job.workspace_path}/private/result`},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"/Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"設定: /etc/hosts"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
