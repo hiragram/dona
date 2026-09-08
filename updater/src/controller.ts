@@ -146,7 +146,7 @@ export class UpdateController {
       throw new Error("schema_activation_bridge_identity_unverified");
     }
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
-    if (transition || current.compatibility.app_schema_write !== targetManifest.compatibility.app_schema_write) {
+    if (transition || (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3)) {
       const capability = transition?.required_control_plane_capability ?? schemaMigrationCapability;
       controlPlane = await this.runtime.schemaMigrationCapability(capability);
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
