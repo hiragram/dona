@@ -14,9 +14,10 @@ const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: fal
 
 class RecordingRunner {
   readonly calls: Array<{ executable: string; args: readonly string[]; options: RunOptions }> = [];
+  result: CommandResult = ok;
   async run(executable: string, args: readonly string[], options: RunOptions): Promise<CommandResult> {
     this.calls.push({ executable, args, options });
-    return ok;
+    return this.result;
   }
 }
 
@@ -222,11 +223,17 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
   assert.equal(recording.calls[0]?.args[3], path.join(
     policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "migration-receipt.json",
   ));
+  recording.result = {
+    ...ok,
+    stdout: '{"schema_version":1,"user_version":2,"integrity_ok":true,"foreign_key_violations":0}\n',
+  };
   assert.deepEqual(await runtime.appSchemaState(), {
     user_version: 2,
     integrity_ok: true,
     foreign_key_violations: 0,
   });
+  assert.equal(path.basename(recording.calls[1]!.args[0]!), "app-schema-inspect-cli.js");
+  assert.equal(recording.calls[1]!.args[1], configuredDatabase);
   await fs.chmod(configuredDatabase, 0o644);
   assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },

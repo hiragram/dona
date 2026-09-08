@@ -3,7 +3,7 @@ import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import Database from "better-sqlite3";
+import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 
 import type { UpdatePolicy } from "./policy.js";
@@ -542,23 +542,26 @@ export class RealRuntime implements RuntimePort {
   }
 
   async appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }> {
-    const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
-    try {
-      database.pragma("foreign_keys = ON");
-      const userVersion = database.pragma("user_version", { simple: true });
-      const integrity = database.pragma("integrity_check") as Array<{ integrity_check: string }>;
-      const foreignKeys = database.pragma("foreign_key_check") as unknown[];
-      if (typeof userVersion !== "number" || !Number.isSafeInteger(userVersion)) {
-        throw new Error("dispatcher_database_schema_invalid");
-      }
-      return {
-        user_version: userVersion,
-        integrity_ok: integrity.length === 1 && integrity[0]?.integrity_check === "ok",
-        foreign_key_violations: foreignKeys.length,
-      };
-    } finally {
-      database.close();
+    const result = await this.runner.run(this.policy.executables.node, [
+      fileURLToPath(new URL("./app-schema-inspect-cli.js", import.meta.url)),
+      this.dispatcherDatabasePath(),
+    ], {
+      timeoutMs: this.policy.timeouts.command_ms,
+      outputLimitBytes: this.policy.output_limit_bytes,
+      env: minimalEnvironment(),
+    });
+    if (result.output_truncated) throw new Error("app_schema_inspect_output_truncated");
+    const value = JSON.parse(requireSuccess("app schema inspection", result)) as Record<string, unknown>;
+    if (value.schema_version !== 1 || !Number.isSafeInteger(value.user_version) ||
+      typeof value.integrity_ok !== "boolean" || !Number.isSafeInteger(value.foreign_key_violations) ||
+      (value.foreign_key_violations as number) < 0) {
+      throw new Error("app_schema_inspect_result_invalid");
     }
+    return {
+      user_version: value.user_version as number,
+      integrity_ok: value.integrity_ok,
+      foreign_key_violations: value.foreign_key_violations as number,
+    };
   }
 
   private dispatcherDatabasePath(): string {
