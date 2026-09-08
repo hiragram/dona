@@ -334,7 +334,7 @@ export class SchedulerRepository {
     this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='schedule_notification_suppressed',last_error_message=NULL
       WHERE event_id IN (SELECT c.notification_event_id FROM job_completion_results c
         WHERE json_extract(c.owner_json,'$.schedule_id')=? AND c.notification_state='pending' AND c.notification_authorization_phase='none')
-        AND source='dona_job' AND status IN ('queued','retryable_failed')`).run(now,now,scheduleId);
+        AND source='dona_job' AND status IN ('queued','retryable_failed','blocked')`).run(now,now,scheduleId);
     this.db.prepare(`UPDATE job_completion_results SET notification_state='none' WHERE json_extract(owner_json,'$.schedule_id')=?
       AND notification_state='pending' AND notification_authorization_phase='none' AND notification_event_id IN
         (SELECT event_id FROM events WHERE status='completed' AND last_error_code='schedule_notification_suppressed')`).run(scheduleId);
