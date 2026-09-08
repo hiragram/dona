@@ -179,13 +179,22 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       !/^release-compatibility\.[a-z0-9.-]+\.json$/.test(transition.previous_release_contract)) {
       throw new ValidationError(`compatibility_transitions[${index}] previous release contract is invalid`);
     }
-    return {
+    const parsed = {
       from_sha: fullSha(transition.from_sha),
       from: compatibility(transition.from),
       to: compatibility(transition.to),
       previous_release_contract: transition.previous_release_contract,
       required_control_plane_capability: transition.required_control_plane_capability,
     };
+    if (parsed.from.protocol !== parsed.to.protocol || parsed.from.config !== parsed.to.config ||
+      parsed.from.app_schema_write !== 2 || parsed.to.app_schema_write !== 3 ||
+      parsed.from.app_schema_read_min > 2 || parsed.from.app_schema_read_max < 2 ||
+      parsed.to.app_schema_read_min > 2 || parsed.to.app_schema_read_max < 3 ||
+      !parsed.from.rollback_safe || !parsed.to.rollback_safe ||
+      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_v1") {
+      throw new ValidationError(`compatibility_transitions[${index}] is not a supported v2 to v3 migration`);
+    }
+    return parsed;
   });
   const transitionKeys = compatibilityTransitions.map(({ from_sha, from, to }) =>
     JSON.stringify({ from_sha, from, to }));

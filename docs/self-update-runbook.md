@@ -100,7 +100,7 @@ migration/activation planは次の順序を崩さない。
 2. SQLite Online Backup APIで別fileへbackupする。WAL稼働中の`.sqlite3`単体copyは禁止する。
 3. backupをread-only openし、`user_version = 2`、`integrity_check = ok`、`foreign_key_check` 0件、row/Result/completion count一致を確認する。
 4. 単一transactionでv2→v3 migrationを実行し、同じ検査と保存件数、`user_version = 3`をreceiptへ記録する。
-5. previous releaseがv3をread可能であることを再確認してからmulti-job gateを有効化する。条件不一致、応答不明、既存backup path、検査失敗はactivation前に拒否し、writeをblind retryしない。
+5. previous releaseがv3をread可能ならpointer rollback可能性を確認してからmulti-job gateを有効化する。productionのv2-only transitionではpointer rollbackを行わず、検証済みOnline Backupを停止下でv2としてrestore-openできることをrollback条件とする。条件不一致、応答不明、未検証の既存backup path、検査失敗はactivation前に拒否し、writeをblind retryしない。
 
 `migrateV2ToV3WithBackup`は上記3〜4の機械的境界であり、pathをreceiptへ含めない。rollback rehearsalは、migration済みv3をcompatibility releaseが開けることと、Online Backupをv2としてrestore-openできることの両方を確認する。v2しかreadできないreleaseへpointer rollbackしてはならない。v3-compatible releaseへ戻せない場合だけservice停止下で検証済みbackupをrestoreする。
 

@@ -68,12 +68,19 @@ describe("fixed self-update surface", () => {
       assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);
       assert.throws(() => parsePolicy({
         ...policy,
-        compatibility_transitions: [transition, { ...transition, required_control_plane_capability: "other_capability" }],
-      }), /duplicates/);
-      assert.throws(() => parsePolicy({
-        ...policy,
         compatibility_transitions: [{ ...transition, required_control_plane_capability: "invalid-capability" }],
       }), /capability is invalid/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{ ...transition, from: { ...transition.from, protocol: 2 } }],
+      }), /not a supported v2 to v3 migration/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{
+          ...transition,
+          from: { ...transition.from, app_schema_read_max: 3, app_schema_write: 3 },
+        }],
+      }), /not a supported v2 to v3 migration/);
     } finally {
       const fs = await import("node:fs/promises");
       await fs.rm(root, { recursive: true, force: true });

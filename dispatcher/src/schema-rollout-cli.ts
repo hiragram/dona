@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     return;
   } catch (error) {
     if ((error as Error).message !== "schema_rollout_receipt_state_mismatch" &&
+      (error as Error).message !== "database_schema_2_does_not_match_3" &&
       (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   try {

@@ -162,6 +162,23 @@ test("v2-only source receipt requires backup restore instead of claiming direct 
   });
   assert.equal(receipt.rollback.previous_release_can_read, false);
   assert.equal(receipt.rollback.backup_restore_opened, true);
+
+  const receiptPath = path.join(root, "migration-receipt.json");
+  await publishMigrationReceipt(receiptPath, receipt);
+  await fs.copyFile(backupPath, databasePath);
+  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+    new URL("../src/schema-rollout-cli.ts", import.meta.url).pathname,
+    databasePath, backupPath, receiptPath,
+    JSON.stringify({ ...bridge, app_schema_read_max: 2 }), JSON.stringify(activation),
+  ]);
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const exit = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  assert.equal(exit, 0, stderr);
+  const retried = new Database(databasePath, { readonly: true });
+  assert.equal(retried.pragma("user_version", { simple: true }), 3);
+  retried.close();
 });
 
 test("receipt publication is not blocked by a stale legacy temporary file", async () => {
