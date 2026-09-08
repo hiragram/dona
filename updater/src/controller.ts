@@ -1459,13 +1459,14 @@ export class UpdateController {
       causeCode,
       () => this.runtime.startSlack(),
     ))) return;
-    const [pointer, initialMainAgent] = await Promise.all([
+    let [pointer, initialMainAgent] = await Promise.all([
       this.releases.observe(),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha)),
     ]);
     this.assertLease(row);
     let mainAgent = initialMainAgent;
     let mainAgentVerified = mainAgentMatches(initialMainAgent);
+    let servicesVerified = true;
     if (pointer.current_sha === row.current_sha && !mainAgentVerified) {
       // Herdr can briefly report the just-finished dona-main turn as non-interactive.
       // Reuse its bounded idle wait before treating an otherwise restored runtime as ambiguous.
@@ -1477,8 +1478,19 @@ export class UpdateController {
         settled.pane_id === observed.pane_id && settled.session_id === observed.session_id;
       mainAgent = observed;
       mainAgentVerified = sameSettledIdentity && mainAgentMatches(observed);
+      const [currentPointer, dispatcherHealth, slackHealth, currentManifest] = await Promise.all([
+        this.releases.observe(),
+        this.runtime.dispatcherHealth(),
+        this.runtime.slackHealth(),
+        this.releases.releaseManifest(row.current_sha),
+      ]);
+      this.assertLease(row);
+      pointer = currentPointer;
+      servicesVerified = currentManifest !== null &&
+        this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
+        this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility);
     }
-    if (pointer.current_sha !== row.current_sha || !mainAgentVerified) {
+    if (pointer.current_sha !== row.current_sha || !servicesVerified || !mainAgentVerified) {
       this.needsReview(
         row,
         "quiesce_recovery_runtime_mismatch",

@@ -264,6 +264,8 @@ class FakeRuntime implements RuntimePort {
   mainObserveStatuses: Array<MainAgentObservation["status"]> = [];
   mainNonInteractiveOnObserveCall: number | undefined;
   private mainObserveCallCount = 0;
+  afterMainWait: ((call: number) => Promise<void>) | undefined;
+  private mainWaitCallCount = 0;
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   previousMainStartUnknownOnce = false;
@@ -287,6 +289,7 @@ class FakeRuntime implements RuntimePort {
     this.dispatcherLive = false;
     this.slackLive = false;
   }
+  simulateDispatcherStopped(): void { this.dispatcherLive = false; }
   setHealthCompatibility(sha: string, compatibility: Compatibility): void {
     this.healthCompatibility.set(sha, compatibility);
   }
@@ -311,6 +314,8 @@ class FakeRuntime implements RuntimePort {
   }
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
     this.calls.push("waitForMainAgentIdle");
+    this.mainWaitCallCount += 1;
+    await this.afterMainWait?.(this.mainWaitCallCount);
     return this.mainAgent(this.mainAgentSha, this.mainWaitStatus);
   }
   async stopMainAgent(expected: MainAgentObservation) {
@@ -837,6 +842,58 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls, [
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack", "waitForMainAgentIdle",
     ]);
+    f.database.close();
+  });
+
+  test("fails closed when the current pointer changes during recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-pointer-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call !== 2) return;
+      await fs.unlink(f.policy.current_pointer);
+      await fs.symlink(path.join(f.policy.release_root, targetSha), f.policy.current_pointer);
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
+    assert.equal(row.observed_active_sha, null);
+    f.database.close();
+  });
+
+  test("fails closed when current service health is lost during recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-health-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call === 2) f.runtime.simulateDispatcherStopped();
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
+    assert.equal(row.observed_active_sha, null);
     f.database.close();
   });
 
