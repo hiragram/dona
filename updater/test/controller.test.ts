@@ -248,6 +248,8 @@ class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
   schemaMigrationReady = true;
   schemaMigrationBuildSha = targetSha;
+  migrationResult: CommandResult = ok;
+  appSchemaStateResult = { user_version: 2, integrity_ok: true, foreign_key_violations: 0 };
   async schemaMigrationCapability(capability: string) {
     this.calls.push("schemaMigrationCapability");
     return {
@@ -255,7 +257,8 @@ class FakeRuntime implements RuntimePort {
       build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null,
     };
   }
-  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return ok; }
+  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return this.migrationResult; }
+  async appSchemaState() { this.calls.push("appSchemaState"); return this.appSchemaStateResult; }
   wrongTargetOnce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
@@ -650,6 +653,130 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls.slice(-3), [
       `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
+    f.database.close();
+  });
+
+  test("restores the exact current runtime after a definitively rejected schema migration", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-rejected",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: 1, stdout: "", stderr: "migration_rejected", timed_out: false, output_truncated: false,
+    };
+    f.runtime.rotateMainAgentSessionOnStart = true;
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "app_schema_migration_rejected");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-5), [
+      "migrateAppSchema", "appSchemaState", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("does not restart a v2 runtime when schema migration acceptance is unknown", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-timeout",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: null, stdout: "", stderr: "", timed_out: true, output_truncated: false,
+    };
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "app_schema_migration_unverified");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-1), ["migrateAppSchema"]);
+    f.database.close();
+  });
+
+  test("does not restart a v2-only runtime after rejection when the database is already schema v3", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-rejected-after-write",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: 1, stdout: "", stderr: "receipt_publication_failed", timed_out: false, output_truncated: false,
+    };
+    f.runtime.appSchemaStateResult = { user_version: 3, integrity_ok: true, foreign_key_violations: 0 };
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "app_schema_migration_state_unverified");
+    assert.deepEqual(f.runtime.calls.slice(-2), ["migrateAppSchema", "appSchemaState"]);
     f.database.close();
   });
 

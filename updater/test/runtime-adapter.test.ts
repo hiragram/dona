@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { test } from "node:test";
+import Database from "better-sqlite3";
 
 import { RealRuntime } from "../src/adapters.js";
 import { ProcessRunner, type RunOptions } from "../src/process.js";
@@ -13,9 +14,10 @@ const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: fal
 
 class RecordingRunner {
   readonly calls: Array<{ executable: string; args: readonly string[]; options: RunOptions }> = [];
+  result: CommandResult = ok;
   async run(executable: string, args: readonly string[], options: RunOptions): Promise<CommandResult> {
     this.calls.push({ executable, args, options });
-    return ok;
+    return this.result;
   }
 }
 
@@ -204,7 +206,10 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
   const configuredDatabase = path.join(root, "custom", "dispatcher.sqlite3");
   await fs.mkdir(path.dirname(configuredDatabase), { recursive: true });
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
-  await fs.writeFile(configuredDatabase, "fixture", { mode: 0o600 });
+  const database = new Database(configuredDatabase);
+  database.pragma("user_version = 2");
+  database.close();
+  await fs.chmod(configuredDatabase, 0o600);
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), `DONA_DATABASE_PATH=${configuredDatabase} # custom path\n`, { mode: 0o600 });
   const recording = new RecordingRunner();
   const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
@@ -218,6 +223,17 @@ test("RealRuntime migrates only the owner-private Dispatcher database selected b
   assert.equal(recording.calls[0]?.args[3], path.join(
     policy.control_root, "schema-backups", "dispatcher-v2-to-v3", "migration-receipt.json",
   ));
+  recording.result = {
+    ...ok,
+    stdout: '{"schema_version":1,"user_version":2,"integrity_ok":true,"foreign_key_violations":0}\n',
+  };
+  assert.deepEqual(await runtime.appSchemaState(), {
+    user_version: 2,
+    integrity_ok: true,
+    foreign_key_violations: 0,
+  });
+  assert.equal(path.basename(recording.calls[1]!.args[0]!), "app-schema-inspect-cli.js");
+  assert.equal(recording.calls[1]!.args[1], configuredDatabase);
   await fs.chmod(configuredDatabase, 0o644);
   assert.throws(() => runtime.migrateAppSchema("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha,
     { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true },
