@@ -294,7 +294,10 @@ export class DispatcherWorker {
       const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.verify(verification):undefined):undefined;
       if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
       else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
-      if(verification?.desired_session_status&&this.database.isNotificationAccepted(row.event_id)) try { await this.notificationVerifier!.settle(verification); }
+      if(verification?.desired_session_status&&this.database.isNotificationAccepted(row.event_id)) try {
+        if(!this.notificationVerifier?.settleSession)throw new Error("job_session_settlement_unavailable");
+        await this.notificationVerifier.settleSession({schema_version:1,event_id:verification.event_id,workspace_id:verification.workspace_id,channel_id:verification.channel_id,thread_ts:verification.thread_ts!,desired_session_status:verification.desired_session_status});
+      }
       catch { this.database.markNotificationSessionNeedsReview(row.event_id); this.logCurrentTransition(row,Date.now()); return true; }
       this.logCurrentTransition(row, Date.now());
       return true;

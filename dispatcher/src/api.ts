@@ -298,10 +298,13 @@ export class DispatcherApi {
         try {
           let decoded:Record<string,unknown>|undefined;
           if(body.receipt!==undefined) {
-            const receipt=String(body.receipt),[payload,signature,...extra]=receipt.split(".");
-            const claimed=signature&&extra.length===0?JSON.parse(Buffer.from(payload!,"base64url").toString("utf8")) as Record<string,unknown>:JSON.parse(receipt) as Record<string,unknown>;
+            const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt),[payload,signature,...extra]=receipt.split(".");
+            if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+            const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+            if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+            const claimed=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
             const eventId=decodeURIComponent(notificationAuthorization[1]!); if(claimed.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
-            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},95_000);
+            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},130_000);
             decoded={...confirmed,issued_at:new Date().toISOString(),nonce:randomUUID()};
           }
           sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??""),channel_kind:String(decoded.channel_kind??""),channel_user_id:decoded.channel_user_id===null?null:String(decoded.channel_user_id??"")}:undefined)});
@@ -314,10 +317,13 @@ export class DispatcherApi {
         if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting scheduled access writes while quiescing");
         const body=await this.readJson(request) as Record<string,unknown>;
         try {
-          const receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
-          const decoded=signature&&extra.length===0?JSON.parse(Buffer.from(payload!,"base64url").toString("utf8")) as Record<string,unknown>:JSON.parse(receipt) as Record<string,unknown>;
+          const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
+          if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+          const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+          if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+          const decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
           const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
-          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},95_000);
+          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},130_000);
           sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(confirmed.workspace_id??""),channel_id:String(confirmed.channel_id??""),user_id:String(confirmed.user_id??""),issued_at:new Date().toISOString(),nonce:randomUUID()})});
         }
         catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }

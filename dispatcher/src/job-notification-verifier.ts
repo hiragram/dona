@@ -3,7 +3,7 @@ import http from "node:http";
 import type { DispatcherConfig } from "./config.js";
 import type { JobNotificationEvidence,JobNotificationVerificationRequest } from "./database.js";
 
-export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>; }
+export interface JobNotificationVerifier { verify(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settle(input:JobNotificationVerificationRequest):Promise<JobNotificationEvidence>;settleSession?(input:JobSessionSettlementRequest):Promise<Record<string,unknown>>; }
 export interface JobSessionSettlementRequest {schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string;desired_session_status:"active"|"suspended";}
 
 const deliveryConfirmationTimeoutMs=120_000;

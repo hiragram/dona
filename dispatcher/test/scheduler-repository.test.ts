@@ -1039,9 +1039,11 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"/Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"設定: /etc/hosts"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"path=/etc/hosts と [/root/.ssh/config]"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"host path",output:{format:"markdown",text:"場所：/Users/alice/.ssh/config, path,/etc/hosts"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"file URL",output:{format:"markdown",text:"file:///Users/alice/.ssh/config"},actions:[],completed_at:due},job.result_path,new Date(due)),/local_path_reported/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"-----BEGIN OPENSSH PRIVATE KEY-----",actions:[],completed_at:due},job.result_path,new Date(due)),/content_requires_redaction/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"late",actions:[],completed_at:"2026-09-05T01:01:01Z"},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"backdated",actions:[],completed_at:due},job.result_path,new Date("2026-09-05T01:01:01Z")),/deadline_exceeded/);
   assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"past",completed_at:"2026-09-05T00:00:59Z"},job.result_path,new Date(due)),/completed_at_precedes_prompt_dispatch/);
   dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",output:{format:"markdown",text:"src/database.ts、A/B、2026/09/08"},completed_at:due},job.result_path,new Date(due));
   const eventId=(raw.prepare("SELECT notification_event_id FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_event_id:string}).notification_event_id;
@@ -1055,14 +1057,14 @@ test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにす
   assert.equal((repo.auditHistory("result_fence") as Array<{operation:string}>).filter(row=>row.operation==="work_notification_needs_review").length,1);
 });
 
-test("期限内に公開されたscheduled Resultはrestart後の遅い回収でも受理する", () => {
+test("自己申告completed_atが期限内でもDispatcherの遅い回収は拒否する", () => {
   const {repo,dispatcher,raw,filename}=setup(),objective="restart回収";
   repo.create("restart_result",{...input,action:"work.read_only",content:objective},due,actor,now);
   const run=repo.materialize("restart_result",1,due,later,due,actor).run;
   const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},path.dirname(filename),path.dirname(filename),new Date(due)).row;
   dispatcher.beginJobPreparation(job.job_id,new Date(due)); dispatcher.beginJobDispatch(job.job_id,new Date(due)); dispatcher.markJobRunning(job.job_id,new Date(due));
-  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"期限内完了",actions:[],completed_at:"2026-09-05T00:30:00Z"},job.result_path,new Date("2026-09-05T02:00:00Z"));
-  assert.equal(dispatcher.getJob(job.job_id)?.status,"completed");
+  assert.throws(()=>dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"期限内完了",actions:[],completed_at:"2026-09-05T00:30:00Z"},job.result_path,new Date("2026-09-05T02:00:00Z")),/deadline_exceeded/);
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"running");
 });
 
 test("claimは複数connection間で排他的、送信前lease切れは再claim、古いtokenは拒否", () => {

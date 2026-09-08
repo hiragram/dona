@@ -219,7 +219,8 @@ export function createSlackMcpServer(
       const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
       const channel_kind=channel.isIm?"im" as const:"other" as const,channel_user_id=channel.isIm?channel.userId??null:null;
       const receiptInput={event_id:event_id??"",workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id};
-      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id?{access_receipt:signAccessReceipt?signAccessReceipt(receiptInput):JSON.stringify(receiptInput)}:{})});
+      if(authorized&&event_id&&!signAccessReceipt) throw new SlackApiError("access_receipt_signing_unavailable","Access receipt signing is unavailable");
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id?{access_receipt:signAccessReceipt!(receiptInput)}:{})});
     } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
   });
 

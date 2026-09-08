@@ -53,7 +53,7 @@ function renderJobResult(result: Record<string, unknown> | null): string {
 
 function containsHostAbsolutePath(value:string):boolean {
   const withoutUrls=value.replace(/\bfile:\/\//gi,"").replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>]+/gi,"");
-  return /(?:^|[\s"'`=:[({<])\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
+  return /(?:^|[^A-Za-z0-9._~-])\/(?!\/)[^\s"'`<>)\]]+/.test(withoutUrls);
 }
 
 export class DispatcherDatabase {
@@ -683,7 +683,7 @@ export class DispatcherDatabase {
     const completedAt = new Date(result.completed_at);
     if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
     const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
-    if(binding?.owner.kind==="schedule"&&acceptedDeadline&&completedAt.getTime()>Date.parse(acceptedDeadline)+3_600_000)
+    if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
       throw new Error("scheduled_work_result_deadline_exceeded");
     const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
       (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
