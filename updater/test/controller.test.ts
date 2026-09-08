@@ -96,6 +96,34 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   f.database.close();
 });
 
+test("plans an explicitly approved compatibility transition from the installed production contract", async () => {
+  const f = await fixture();
+  const sourceCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const targetCompatibility: Compatibility = {
+    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3,
+  };
+  f.policy.compatibility = sourceCompatibility;
+  f.policy.compatibility_transitions = [{
+    from: sourceCompatibility,
+    to: targetCompatibility,
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  }];
+  f.git.targetCompatibility = targetCompatibility;
+  f.git.targetRollout = activationRollout;
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = targetSha;
+
+  const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+  assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, false);
+  const preflight = result.preflight as Record<string, unknown>;
+  assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
+  assert.equal(preflight.schema_migration_control_plane_sha, targetSha);
+  f.database.close();
+});
+
 test("validates the post-activation rollout contract on schema-v3 to schema-v3 plans", async () => {
   const f = await fixture();
   const activationCompatibility: Compatibility = {

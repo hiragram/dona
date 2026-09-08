@@ -22,8 +22,12 @@ describe("fixed self-update surface", () => {
     });
     const examplePolicy = JSON.parse(
       await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),
-    ) as { compatibility: unknown };
+    ) as { compatibility: unknown; compatibility_transitions: unknown };
     assert.deepEqual(examplePolicy.compatibility, metadata);
+    const transitionFile = JSON.parse(
+      await fs.readFile(new URL("../../config/update-compatibility-transitions.json", import.meta.url), "utf8"),
+    ) as { transitions: unknown };
+    assert.deepEqual(examplePolicy.compatibility_transitions, transitionFile.transitions);
   });
 
   test("does not accept repository, ref, path, command, npm flags, launchctl args, or environment", () => {
@@ -52,6 +56,18 @@ describe("fixed self-update surface", () => {
       assert.throws(() => parsePolicy({ ...policy, config_root: "/tmp/unrelated-config" }), /fixed base/);
       assert.throws(() => parsePolicy({ ...policy, main_agent: { ...policy.main_agent, session: "other" } }), /main_agent/);
       assert.throws(() => parsePolicy({ ...policy, executables: { ...policy.executables, herdr: "herdr" } }), /absolute/);
+      assert.deepEqual(parsePolicy(policy).compatibility_transitions, []);
+      const transition = {
+        from: policy.compatibility,
+        to: { ...policy.compatibility, app_schema_read_max: 3, app_schema_write: 3 },
+        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+      };
+      assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [transition] }).compatibility_transitions, [transition]);
+      assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{ ...transition, required_control_plane_capability: "invalid-capability" }],
+      }), /capability is invalid/);
     } finally {
       const fs = await import("node:fs/promises");
       await fs.rm(root, { recursive: true, force: true });

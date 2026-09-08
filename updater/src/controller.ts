@@ -97,7 +97,12 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility)) {
+    const transition = this.policy.compatibility_transitions.find((candidate) =>
+      canonicalJson(candidate.from) === canonicalJson(current.compatibility) &&
+      canonicalJson(candidate.to) === canonicalJson(git.target_compatibility) &&
+      candidate.required_control_plane_capability === git.target_rollout.required_control_plane_capability
+    );
+    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility) && !transition) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
     }
     if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility)) {
@@ -116,10 +121,9 @@ export class UpdateController {
       compatibility: git.target_compatibility,
     };
     const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
-    if (!rollbackCompatible) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
     let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
-    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3) {
-      if (current.sha !== schemaV3BridgeSha) throw new Error("schema_activation_requires_exact_bridge_release");
+    if (transition || current.compatibility.app_schema_write !== targetManifest.compatibility.app_schema_write) {
       controlPlane = await this.runtime.schemaMigrationCapability();
       if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
@@ -140,7 +144,10 @@ export class UpdateController {
       plan: result.plan,
       preflight: {
         storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
-        ...(controlPlane ? { schema_migration_control_plane_sha: controlPlane.build_sha } : {}),
+        ...(controlPlane ? {
+          control_plane_capability: transition?.required_control_plane_capability ?? git.target_rollout.required_control_plane_capability,
+          schema_migration_control_plane_sha: controlPlane.build_sha,
+        } : {}),
       },
     };
   }

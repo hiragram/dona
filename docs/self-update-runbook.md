@@ -38,6 +38,8 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
 
+schema境界を越えるtargetは、policyの`compatibility_transitions`へsource/target compatibilityと必要なcontrol-plane capabilityを完全一致で列挙します。旧形式policyは空のtransition集合として扱うため、従来どおり単一`compatibility`と一致するtarget以外をfail closedします。repository上のtransition追加だけではproduction policyやstable updaterは変化しません。guarded control-plane installを別途承認・実施してexact updater SHAとpolicyを確認した後に、新しいplanを生成します。これは`apply_self_update`、DB migration、pointer切替、service操作の承認を兼ねません。
+
 ## Reconcile
 
 crash、sleep/reboot、launchctl/HTTP response喪失後は同じcommandを繰り返しません。
