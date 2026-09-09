@@ -21,11 +21,87 @@ afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { re
 const bridge = { app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 2, rollback_safe: true };
 const activation = { ...bridge, app_schema_write: 3 };
 
+async function runRolloutCli(databasePath: string, backupPath: string, receiptPath: string) {
+  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+    fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
+    databasePath, backupPath, receiptPath, JSON.stringify(bridge), JSON.stringify(activation),
+  ]);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const exit = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  return { exit, stdout, stderr };
+}
+
 test("unsafe schema activation combinations are rejected before a write", () => {
   assert.throws(() => assertSchemaActivationSafe({ ...bridge, app_schema_read_min: 3 }, activation, 2), /schema_v2_source/);
   assert.throws(() => assertSchemaActivationSafe(bridge, { ...activation, app_schema_write: 2 }, 2), /activation_release/);
   assert.throws(() => assertSchemaActivationSafe({ ...bridge, rollback_safe: false }, activation, 2), /safe_rollback/);
   assert.throws(() => assertSchemaActivationSafe(bridge, activation, 3), /requires_v2/);
+});
+
+test("CLI treats only absent backup and receipt files as a fresh migration", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-cli-fresh-"));
+  roots.push(root);
+  const databasePath = path.join(root, "dispatcher.sqlite3");
+  const backupPath = path.join(root, "backup.sqlite3");
+  const receiptPath = path.join(root, "migration-receipt.json");
+  const db = new Database(databasePath);
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+
+  const fresh = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.equal(fresh.exit, 0, fresh.stderr);
+  assert.equal(JSON.parse(fresh.stdout).migrated.user_version, 3);
+  assert.equal((await fs.stat(backupPath)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(receiptPath)).mode & 0o777, 0o600);
+
+  const completed = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.equal(completed.exit, 0, completed.stderr);
+  assert.deepEqual(JSON.parse(completed.stdout), JSON.parse(fresh.stdout));
+
+  const savedBackupPath = path.join(root, "saved-backup.sqlite3");
+  await fs.rename(backupPath, savedBackupPath);
+  await fs.symlink(savedBackupPath, backupPath);
+  const completedWithBackupLink = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.notEqual(completedWithBackupLink.exit, 0);
+  assert.match(completedWithBackupLink.stderr, /schema_rollout_backup_is_not_a_regular_file/);
+  await fs.unlink(backupPath);
+  await fs.rename(savedBackupPath, backupPath);
+
+  await fs.copyFile(backupPath, databasePath);
+  await fs.unlink(receiptPath);
+  const backupOnly = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.equal(backupOnly.exit, 0, backupOnly.stderr);
+  assert.equal(JSON.parse(backupOnly.stdout).migrated.user_version, 3);
+});
+
+test("CLI rejects symlink backup and receipt paths instead of treating them as absent", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-schema-cli-link-"));
+  roots.push(root);
+  const databasePath = path.join(root, "dispatcher.sqlite3");
+  const db = new Database(databasePath);
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+  const target = path.join(root, "target");
+  await fs.writeFile(target, "not a database");
+
+  const backupPath = path.join(root, "backup.sqlite3");
+  await fs.symlink(target, backupPath);
+  const backupLink = await runRolloutCli(databasePath, backupPath, path.join(root, "missing-receipt.json"));
+  assert.notEqual(backupLink.exit, 0);
+  assert.match(backupLink.stderr, /schema_rollout_backup_is_not_a_regular_file/);
+
+  await fs.unlink(backupPath);
+  const receiptPath = path.join(root, "migration-receipt.json");
+  await fs.symlink(target, receiptPath);
+  const receiptLink = await runRolloutCli(databasePath, backupPath, receiptPath);
+  assert.notEqual(receiptLink.exit, 0);
+  assert.match(receiptLink.stderr, /schema_rollout_receipt_is_not_a_regular_file/);
+  await assert.rejects(fs.access(backupPath));
 });
 
 test("WAL v2 database is backed up, restored, migrated transactionally, and preserves results", async () => {
