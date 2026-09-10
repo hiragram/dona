@@ -507,6 +507,10 @@ export class DispatcherDatabase {
     for (const key of unresolvedConflictKeys) connectionKeys.add(key);
     for (const key of unresolvedRecoveryKeys) connectionKeys.add(key);
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
+    for (const row of projected) if (row.state!=="disabled" &&
+      activeUnmanagedConnections?.has(JSON.stringify([row.provider,"*"]))===true) {
+      connectionKeys.add(JSON.stringify([row.provider,row.id]));
+    }
     for (const key of activeUnmanagedConnections ?? []) {
       const [,connection] = JSON.parse(key) as [string,string];
       if (connection !== "*") connectionKeys.add(key);
