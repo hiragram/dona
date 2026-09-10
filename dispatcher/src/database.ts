@@ -102,7 +102,14 @@ export class DispatcherDatabase {
         latency_bucket TEXT NOT NULL,
         count INTEGER NOT NULL,
         last_observed_at TEXT NOT NULL,
+        last_observed_sequence INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(source, connection_id, outcome, latency_bucket)
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_sequence (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_write_probe (
+        id INTEGER PRIMARY KEY, payload BLOB NOT NULL
       );
       CREATE TABLE IF NOT EXISTS external_event_errors (
         source TEXT NOT NULL, connection_id TEXT NOT NULL, error_code TEXT NOT NULL,
@@ -124,6 +131,23 @@ export class DispatcherDatabase {
           last_error_at=MAX(last_error_at,excluded.last_error_at);
       END;
     `);
+    const sequence = this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").get();
+    if (sequence === undefined) this.db.prepare("INSERT INTO external_ingress_sequence(singleton,value) VALUES(1,0)").run();
+    const metricColumns = this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
+    if (!metricColumns.some((column) => column.name === "last_observed_sequence")) {
+      this.db.exec(`
+        ALTER TABLE external_ingress_metrics ADD COLUMN last_observed_sequence INTEGER NOT NULL DEFAULT 0;
+        WITH ranked AS (
+          SELECT rowid metric_rowid,row_number() OVER (ORDER BY last_observed_at,rowid) observation_sequence
+          FROM external_ingress_metrics WHERE last_observed_sequence=0
+        )
+        UPDATE external_ingress_metrics SET last_observed_sequence=(
+          SELECT observation_sequence FROM ranked WHERE metric_rowid=external_ingress_metrics.rowid
+        ) WHERE last_observed_sequence=0;
+        UPDATE external_ingress_sequence SET value=MAX(value,
+          coalesce((SELECT max(last_observed_sequence) FROM external_ingress_metrics),0)) WHERE singleton=1;
+      `);
+    }
   }
 
   recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): void {
@@ -135,10 +159,15 @@ export class DispatcherDatabase {
         ? connectionId : "";
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
-      this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at)
-        VALUES(?,?,?,?,1,?) ON CONFLICT(source,connection_id,outcome,latency_bucket)
-        DO UPDATE SET count=count+1,last_observed_at=MAX(last_observed_at,excluded.last_observed_at)`)
-        .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString());
+      this.db.transaction(() => {
+        const order = this.db.prepare("UPDATE external_ingress_sequence SET value=value+1 WHERE singleton=1 RETURNING value")
+          .get() as {value:number};
+        this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence)
+          VALUES(?,?,?,?,1,?,?) ON CONFLICT(source,connection_id,outcome,latency_bucket)
+          DO UPDATE SET count=count+1,last_observed_at=MAX(last_observed_at,excluded.last_observed_at),
+            last_observed_sequence=excluded.last_observed_sequence`)
+          .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value);
+      }).immediate();
     } catch {}
   }
 
@@ -149,8 +178,15 @@ export class DispatcherDatabase {
   private externalReleaseHealthSnapshot(at: Date) {
     const now = at.getTime();
     let writable = true;
-    try { this.db.prepare("UPDATE external_ingress_metrics SET count=count WHERE 0").run(); }
-    catch { writable = false; }
+    try {
+      this.db.exec("SAVEPOINT external_health_write_probe");
+      this.db.prepare("INSERT INTO external_write_probe(payload) VALUES(zeroblob(4096))").run();
+      this.db.exec("ROLLBACK TO external_health_write_probe; RELEASE external_health_write_probe");
+    }
+    catch {
+      writable = false;
+      try { this.db.exec("ROLLBACK TO external_health_write_probe; RELEASE external_health_write_probe"); } catch {}
+    }
     const connections = this.db.prepare(`SELECT c.id,c.provider,c.state,c.revision,
       (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
         WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('queued','retryable_failed')) queue_depth,
@@ -177,36 +213,48 @@ export class DispatcherDatabase {
       errors: this.db.prepare(`SELECT error_code,count,last_error_at FROM external_event_errors
         WHERE source=? AND connection_id=? ORDER BY error_code`).all(row.provider, row.id),
     }));
-    const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
+    const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence
       FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
         source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
+        last_observed_sequence: number;
       }>;
     const laneConnections = this.db.prepare(`SELECT DISTINCT source,connection_id FROM (
       SELECT source,connection connection_id FROM queue_lanes WHERE class='external' AND connection!='unverified_legacy'
     ) ORDER BY source,connection_id`).all() as Array<{source:string;connection_id:string}>;
-    const connectionKeys = new Set(storedIngress.filter((row) => row.connection_id !== "")
-      .map((row) => JSON.stringify([row.source,row.connection_id])));
+    const ingressByConnection = new Map<string, typeof storedIngress>();
+    for (const row of storedIngress) {
+      if (row.connection_id === "") continue;
+      const key = JSON.stringify([row.source,row.connection_id]);
+      const rows = ingressByConnection.get(key) ?? [];
+      rows.push(row);
+      ingressByConnection.set(key, rows);
+    }
+    const connectionKeys = new Set(ingressByConnection.keys());
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
+    const projectedByConnection = new Map(projected.map((row) => [JSON.stringify([row.provider,row.id]),row]));
     const ingressConnections = [...connectionKeys].sort().map((key) => {
         const [source,connectionId] = JSON.parse(key) as [string,string];
-        const rows = storedIngress.filter((row) => row.source === source && row.connection_id === connectionId);
-        const success = rows.filter((row) => ["created","duplicate_same"].includes(row.outcome))
-          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
-        const control = rows.filter((row) => row.outcome === "control_acknowledged")
-          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
-        const failure = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome))
-          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
+        const rows = ingressByConnection.get(key) ?? [];
+        const latest = (predicate: (outcome:string) => boolean) => rows.filter((row) => predicate(row.outcome))
+          .sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
+        const successRow = latest((outcome) => ["created","duplicate_same"].includes(outcome));
+        const controlRow = latest((outcome) => outcome === "control_acknowledged");
+        const failureRow = latest((outcome) => !["created","duplicate_same","control_acknowledged"].includes(outcome));
+        const success = successRow?.last_observed_at ?? null;
+        const control = controlRow?.last_observed_at ?? null;
+        const failure = failureRow?.last_observed_at ?? null;
         const terminal = this.db.prepare(`SELECT
           sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
           FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
           WHERE l.source=? AND l.connection=?`).get(source,connectionId) as {blocked:number|null;dead_letter:number|null};
         const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
-        const state = projected.find((row) => row.provider === source && row.id === connectionId)?.state ?? "unmanaged";
+        const state = projectedByConnection.get(key)?.state ?? "unmanaged";
         return { source, connection_id: connectionId, state,
-          ready: state === "disabled" || ((failure === null || (success !== null && success > failure)) && blocked === 0 && deadLetter === 0),
+          ready: state === "disabled" || ((failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure, blocked, dead_letter: deadLetter };
       });
-    const ingress = storedIngress.map((row) => ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
+    const ingress = storedIngress.map(({last_observed_sequence: _sequence, ...row}) =>
+      ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
     return {
       schema_version: 1,
       observed_at: at.toISOString(),

@@ -99,6 +99,10 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
   health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ingress_connections[0]!.ready,true);
+  clock.value-=10_000;
+  db.recordExternalIngress("figma","figma-pilot","invalid_event",50,new Date(clock.now()));
+  health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ingress_connections[0]!.ready,false);
   const figmaSource=externalEventSource("figma");
   const queued=db.enqueue({schema_version:1,source:figmaSource,external_event_id:scopedExternalEventId(figmaSource,"figma-pilot","event-1"),
     type:"figma.file_update",occurred_at:new Date(clock.now()).toISOString(),subject:{file_key:"fixture"},payload:{},reply_target:null},
@@ -107,6 +111,15 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ingress_connections[0]!.blocked,1);
   assert.equal(health.ingress_connections[0]!.ready,false);
+});
+
+test("release healthのwritable probeは実書込みをrollbackする", (t) => {
+  const {db,file} = fixture(t);
+  const health = db.externalReleaseHealth();
+  assert.equal(health.writable,true);
+  const raw = new Database(file);
+  assert.equal((raw.prepare("SELECT count(*) count FROM external_write_probe").get() as {count:number}).count,0);
+  raw.close();
 });
 
 test("release healthはblockedと復旧済みerror履歴をrelease停止条件にする", async (t) => {

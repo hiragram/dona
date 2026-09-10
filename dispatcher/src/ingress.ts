@@ -442,7 +442,8 @@ export class ExternalIngressProcessor {
           ...(verified.verificationCommit ? { verificationCommit: verified.verificationCommit } : {}) } : {}),
       });
     } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId); }
-    remainingProcessingTime(processingDeadline);
+    try { remainingProcessingTime(processingDeadline); }
+    catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

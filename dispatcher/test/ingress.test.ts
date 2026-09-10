@@ -10,15 +10,18 @@ import { z } from "zod";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import {
+  authenticatedConnectionId,
   externalEventSource,
   ExternalIngressRegistry,
   ExternalIngressProcessor,
+  ExternalIngressTimeoutError,
   scopedExternalEventId,
   type ExternalEventSourceRegistration,
   type RawIngressRequest,
 } from "../src/ingress.js";
 import type { Logger } from "../src/logger.js";
 import { envelopeFromRow } from "../src/prompt.js";
+import type { EnqueueResult } from "../src/types.js";
 import { tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -450,6 +453,24 @@ describe("external ingress contract", () => {
 
     await api.stop();
     database.close();
+  });
+
+  test("persist後のprocessing timeoutも認証済みconnectionへ帰属する", async () => {
+    const definition = registration();
+    const limited = { ...definition, processingTimeoutMs: 1 };
+    const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([limited]));
+    const body = fakeBody();
+    const requestValue: RawIngressRequest = { body, headers: Object.entries(signedHeaders(body)), method: "POST", requestTarget: "/fake",
+      receivedAt: new Date().toISOString(), receivedAtMonotonic: performance.now() };
+    await assert.rejects(processor.process(externalEventSource("fake"), limited, requestValue, () => {
+      const until = performance.now()+5;
+      while (performance.now()<until) { /* fixture: synchronous durable write */ }
+      return { row: { event_id:"evt_fixture", sequence:1, source:"fake", external_event_id:"external-fixture",
+        schema_version:1, event_type:"fake.changed", occurred_at:new Date().toISOString(), subject_json:"{}", payload_json:"{}",
+        reply_target_json:null, trace_json:null, payload_hash:"fixture", status:"queued", attempts:0, available_at:new Date().toISOString(),
+        last_error:null, last_error_code:null, processing_started_at:null, created_at:new Date().toISOString(), updated_at:new Date().toISOString() },
+        outcome:"created" as const, duplicate:false, payloadMismatch:false } as unknown as EnqueueResult;
+    }), (error: unknown) => error instanceof ExternalIngressTimeoutError && authenticatedConnectionId(error)==="connection-a");
   });
 
   test("enforces raw body and processing time limits without acknowledging or persisting", async () => {
