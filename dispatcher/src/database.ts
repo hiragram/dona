@@ -220,16 +220,16 @@ export class DispatcherDatabase {
       const latchedOutcomes=this.failedObservationLatches.get(latchKey);
       if (outcome === "created") {
         if (latchedOutcomes !== undefined) {
-          for (const latched of [...latchedOutcomes]) if (latched !== "control_acknowledgement_unavailable") latchedOutcomes.delete(latched);
+          for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable"].includes(latched)) latchedOutcomes.delete(latched);
           if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
         }
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
-        for (const recovered of ["created","acknowledgement_unavailable","post_persist_timeout",
+        for (const recovered of ["created","duplicate_same","acknowledgement_unavailable","post_persist_timeout",
           "acknowledgement_unavailable_after_created","post_persist_created_timeout",
           "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"]) latchedOutcomes.delete(recovered);
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
-        latchedOutcomes.delete("control_acknowledgement_unavailable");
+        latchedOutcomes.delete("control_acknowledged"); latchedOutcomes.delete("control_acknowledgement_unavailable");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
       if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,"",0]));
@@ -398,7 +398,8 @@ export class DispatcherDatabase {
           return recoverySequence > failure.last_observed_sequence;
         });
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
-          activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true;
+          (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
+            rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>

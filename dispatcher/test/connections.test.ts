@@ -219,6 +219,17 @@ test("control ACK failureは後続control成功だけで回復する", (t) => {
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("成功outcomeの観測latchは同じ成功の再観測で解除する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["figma","figma-pilot"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("duplicate起点のpost-persist timeoutはdata path成功に昇格しない", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
   db.recordExternalIngress("figma","figma-pilot","post_persist_duplicate_timeout",50,new Date(clock.now()));
@@ -285,6 +296,16 @@ test("wildcard registrationは架空行なしで現processのsource成功を要�
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("custom","custom-1","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("wildcard registrationは履歴connectionを個別の再稼働対象にしない", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  db.recordExternalIngress("custom","old", "created",50,new Date(clock.now())); db.close();
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  const active=new Set([JSON.stringify(["custom","*"])]);
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.state,"retired");
+  restarted.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
