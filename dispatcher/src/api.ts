@@ -518,9 +518,9 @@ export class DispatcherApi {
     // 未認証 request が認証済み delivery の source quota を消費しないよう、共有 bucket はここに置かない。
     // raw body の size/time limit 後、認証済み connection 単位の durable queue admission が rate を制限する。
     const monotonicNow = performance.now();
-    const observe = (connectionId: string | undefined, outcome: string): boolean => {
+    const observe = (connectionId: string | undefined, outcome: string, connectionRevision?: number): boolean => {
       const latency = performance.now() - startedAt;
-      return this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency);
+      return this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency, undefined, connectionRevision);
     };
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
@@ -591,7 +591,7 @@ export class DispatcherApi {
     const { receipt } = result;
     const observedOutcome = receipt.control === true ? "control_acknowledged" :
       receipt.verification === true ? `verification_${receipt.outcome}` : receipt.outcome;
-    if (!observe(receipt.connectionId, observedOutcome)) {
+    if (!observe(receipt.connectionId, observedOutcome, receipt.connectionRevision)) {
       throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),receipt.connectionId);
     }
     if (receipt.outcome === "duplicate_conflict") {

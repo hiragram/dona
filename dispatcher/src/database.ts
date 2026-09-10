@@ -169,7 +169,7 @@ export class DispatcherDatabase {
     }
   }
 
-  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): boolean {
+  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date(), authenticatedRevision?: number): boolean {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
     const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
     const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
@@ -182,7 +182,7 @@ export class DispatcherDatabase {
       busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
       this.db.pragma("busy_timeout=0");
       this.db.transaction(() => {
-        const revision = boundedConnection === "" ? 0 : (this.db.prepare(
+        const revision = boundedConnection === "" ? 0 : authenticatedRevision ?? (this.db.prepare(
           "SELECT revision FROM connections WHERE provider=? AND id=?",
         ).get(safeSource,boundedConnection) as {revision:number}|undefined)?.revision ?? 0;
         const order = this.db.prepare("UPDATE external_ingress_sequence SET value=value+1 WHERE singleton=1 RETURNING value")
@@ -208,8 +208,11 @@ export class DispatcherDatabase {
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
-    if (this.readOnly && this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
-      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe')`).pluck().get() !== 4) {
+    const observabilityTables = this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
+      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe')`).pluck().get();
+    const metricColumns = observabilityTables === 4
+      ? this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}> : [];
+    if (this.readOnly && (observabilityTables !== 4 || !metricColumns.some((column) => column.name === "connection_revision"))) {
       return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
         compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
     }

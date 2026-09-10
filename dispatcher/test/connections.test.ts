@@ -126,9 +126,23 @@ test("release healthは現行connection revisionのingress証跡だけを評価�
   db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now())).ingress.length,1);
   db.connections.revise("pilot",1,{...config,credentialRevision:2});
+  db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()),1);
   const health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ingress.length,0);
   assert.equal(health.ingress_connections.length,0);
+});
+
+test("readonly healthはrevision列追加前のobservability schemaを互換性結果にする", (t) => {
+  const {db,file,clock}=fixture(t);
+  db.close();
+  const legacy=new Database(file);
+  legacy.exec("ALTER TABLE external_ingress_metrics DROP COLUMN connection_revision");
+  legacy.close();
+  const readonly=new DispatcherDatabase(file,{},clock,{readOnly:true});
+  t.after(()=>readonly.close());
+  const health=readonly.externalReleaseHealth(new Date(clock.now()));
+  assert.equal("compatibility" in health ? health.compatibility : undefined,"migration_required");
+  assert.equal(health.ready,false);
 });
 
 test("verification trafficは通常data path成功として扱わない", (t) => {

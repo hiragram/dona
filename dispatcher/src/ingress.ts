@@ -95,6 +95,8 @@ export interface PersistReceipt {
   readonly source: ExternalEventSource;
   /** 認証済みbindingから得た値。provider ACKへ含めず、内部観測だけに使う。 */
   readonly connectionId: string;
+  /** 認証・永続化時に束縛されたmanaged connection revision。unmanagedは0。 */
+  readonly connectionRevision: number;
   readonly externalEventId: string;
   readonly outcome: EnqueueResult["outcome"];
   readonly committedAt: string;
@@ -440,6 +442,7 @@ export class ExternalIngressProcessor {
           sequence: 0,
           source,
           connectionId: verifiedConnectionId,
+          connectionRevision: verified.connection?.revision ?? 0,
           externalEventId: envelope.external_event_id,
           outcome: "duplicate_same",
           committedAt: request.receivedAt,
@@ -470,6 +473,7 @@ export class ExternalIngressProcessor {
       sequence: result.row.sequence,
       source,
       connectionId: verifiedConnectionId,
+      connectionRevision: verified.connection?.revision ?? 0,
       externalEventId: envelope.external_event_id,
       outcome: result.outcome,
       committedAt: result.committedAt ?? result.row.created_at,
