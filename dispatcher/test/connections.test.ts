@@ -166,9 +166,9 @@ test("verification conflictはdurable failureとして再送成功までgateす�
   const {db,clock}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["notion","*"])]);
   db.recordExternalIngress("notion","healthy","created",50,new Date(clock.now()));
-  db.recordExternalIngress("notion","conflict","verification_duplicate_conflict",50,new Date(clock.now()));
+  db.recordExternalIngress("notion","conflict","verification_duplicate_conflict",50,new Date(clock.now()),undefined,"event-a");
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
-  db.recordExternalIngress("notion","conflict","verification_duplicate_same",50,new Date(clock.now()));
+  db.recordExternalIngress("notion","conflict","verification_duplicate_same",50,new Date(clock.now()),undefined,"event-a");
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
@@ -176,10 +176,11 @@ test("通常duplicate conflictは同じdeliveryの再送一致でのみ回復す
   const {db,clock}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["custom","connection-a"])]);
   db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now())); clock.value+=1;
-  db.recordExternalIngress("custom","connection-a","duplicate_conflict",50,new Date(clock.now())); clock.value+=1;
-  db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()));
+  db.recordExternalIngress("custom","connection-a","duplicate_conflict",50,new Date(clock.now()),undefined,"event-a"); clock.value+=1;
+  db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()),undefined,"event-b"); clock.value+=1;
+  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()),undefined,"event-b");
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false); clock.value+=1;
-  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()));
+  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()),undefined,"event-a");
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
@@ -262,6 +263,21 @@ test("verification created観測latchはverification duplicateで解除する", 
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("notion","notion-pilot","verification_duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("controlとverificationの観測失敗latchは再起動後も専用成功まで維持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","connection-a"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","connection-a","control_acknowledged",50,new Date(clock.now())),false);
+  assert.equal(db.recordExternalIngress("custom","connection-a","verification_created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.close();
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  restarted.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()));
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  restarted.recordExternalIngress("custom","connection-a","control_acknowledged",50,new Date(clock.now()));
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  restarted.recordExternalIngress("custom","connection-a","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
 test("未帰属latchは全active connectionがfailure境界を越えるまで残る", (t) => {

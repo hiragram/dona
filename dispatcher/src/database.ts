@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, QueueClaimUnavailableError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
 import path from "node:path";
 
@@ -65,6 +65,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
   private readonly failedObservationLatches = new Map<string,{outcomes:Set<string>;boundary:number}>();
+  private readonly observationLatchPath: string;
   private readonly runtimeObservationFloor: number;
 
   readonly connections: ConnectionRegistry;
@@ -77,6 +78,7 @@ export class DispatcherDatabase {
       typeof (queuePolicyOrClock as { now?: unknown }).now === "function" ? queuePolicyOrClock as Clock : undefined;
     this.queuePolicy = queuePolicySchema.parse(legacyClock ? {} : queuePolicyOrClock);
     this.readOnly = options.readOnly === true;
+    this.observationLatchPath = `${databasePath}.observation-latches.json`;
     if (!this.readOnly) {
       fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
       fs.chmodSync(path.dirname(databasePath), 0o700);
@@ -101,6 +103,35 @@ export class DispatcherDatabase {
       ? [] : this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
     this.runtimeObservationFloor = runtimeMetricColumns.some((column)=>column.name==="last_observed_sequence")
       ? Number(this.db.prepare("SELECT coalesce(max(last_observed_sequence),0) FROM external_ingress_metrics").pluck().get()) : 0;
+    this.loadObservationLatches();
+  }
+
+  private loadObservationLatches(): void {
+    try {
+      const parsed=JSON.parse(fs.readFileSync(this.observationLatchPath,"utf8")) as {schema_version?:unknown;entries?:unknown};
+      if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) return;
+      for (const candidate of parsed.entries) {
+        if (candidate===null || typeof candidate!=="object") continue;
+        const {key,outcomes,boundary}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown};
+        if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
+          !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
+          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) continue;
+        this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary});
+      }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") this.failedObservationLatches.clear(); }
+  }
+
+  private persistObservationLatches(): void {
+    if (this.readOnly) return;
+    const temporary=`${this.observationLatchPath}.${process.pid}.${randomUUID()}.tmp`;
+    const payload=JSON.stringify({schema_version:1,entries:[...this.failedObservationLatches].map(([key,latch])=>
+      ({key,outcomes:[...latch.outcomes].sort(),boundary:latch.boundary}))});
+    try {
+      fs.writeFileSync(temporary,payload,{encoding:"utf8",mode:0o600,flag:"wx"});
+      const file=fs.openSync(temporary,"r"); try { fs.fsyncSync(file); } finally { fs.closeSync(file); }
+      fs.renameSync(temporary,this.observationLatchPath);
+      const directory=fs.openSync(path.dirname(this.observationLatchPath),"r"); try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } finally { try { fs.unlinkSync(temporary); } catch {} }
   }
 
   private migrateExternalObservability(): void {
@@ -122,6 +153,12 @@ export class DispatcherDatabase {
       );
       CREATE TABLE IF NOT EXISTS external_write_probe (
         id INTEGER PRIMARY KEY, payload BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_conflicts (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, connection_revision INTEGER NOT NULL,
+        verification INTEGER NOT NULL CHECK(verification IN (0,1)), delivery_hash TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,connection_revision,verification,delivery_hash)
       );
       CREATE TABLE IF NOT EXISTS external_event_errors (
         source TEXT NOT NULL, connection_id TEXT NOT NULL, error_code TEXT NOT NULL,
@@ -188,12 +225,16 @@ export class DispatcherDatabase {
     `);
   }
 
-  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date(), authenticatedRevision?: number): boolean {
+  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date(), authenticatedRevision?: number,
+    deliveryId?: string): boolean {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
     const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
     const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
     const latchKey=JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0]);
+    const deliveryKey=deliveryId === undefined ? undefined : JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0,
+      createHash("sha256").update(deliveryId).digest("hex")]);
     const latchedBefore=this.failedObservationLatches.get(latchKey);
+    const deliveryLatchedBefore=deliveryKey === undefined ? undefined : this.failedObservationLatches.get(deliveryKey);
     let observationBoundary=0;
     let busyTimeout=2_000;
     try {
@@ -219,6 +260,20 @@ export class DispatcherDatabase {
               THEN MAX(last_observed_at,excluded.last_observed_at) ELSE excluded.last_observed_at END,
             last_observed_sequence=excluded.last_observed_sequence,connection_revision=excluded.connection_revision`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value, revision);
+        if (deliveryId !== undefined) {
+          const deliveryHash=createHash("sha256").update(deliveryId).digest("hex");
+          if (["duplicate_conflict","verification_duplicate_conflict"].includes(outcome)) {
+            this.db.prepare(`INSERT INTO external_ingress_conflicts
+              (source,connection_id,connection_revision,verification,delivery_hash,observed_at) VALUES(?,?,?,?,?,?)
+              ON CONFLICT(source,connection_id,connection_revision,verification,delivery_hash)
+              DO UPDATE SET observed_at=MAX(observed_at,excluded.observed_at)`)
+              .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash,at.toISOString());
+          } else if (["duplicate_same","verification_duplicate_same"].includes(outcome)) {
+            this.db.prepare(`DELETE FROM external_ingress_conflicts WHERE source=? AND connection_id=? AND connection_revision=?
+              AND verification=? AND delivery_hash=?`)
+              .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash);
+          }
+        }
       }).immediate();
       const latched=this.failedObservationLatches.get(latchKey);
       const latchedOutcomes=latched?.outcomes;
@@ -241,23 +296,34 @@ export class DispatcherDatabase {
         latchedOutcomes.delete("verification_duplicate_conflict");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
+      if (deliveryKey !== undefined && ["duplicate_same","verification_duplicate_same"].includes(outcome)) {
+        const deliveryLatch=this.failedObservationLatches.get(deliveryKey);
+        if (deliveryLatch !== undefined) {
+          deliveryLatch.outcomes.delete(outcome === "duplicate_same" ? "duplicate_conflict" : "verification_duplicate_conflict");
+          if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
+        }
+      }
+      if (latchedBefore !== undefined || deliveryLatchedBefore !== undefined) try { this.persistObservationLatches(); } catch {}
       return true;
     } catch {
-      const latched=this.failedObservationLatches.get(latchKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
+      const failedKey=deliveryKey !== undefined && ["duplicate_conflict","verification_duplicate_conflict"].includes(outcome)
+        ? deliveryKey : latchKey;
+      const latched=this.failedObservationLatches.get(failedKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
       latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
-      this.failedObservationLatches.set(latchKey,latched);
+      this.failedObservationLatches.set(failedKey,latched);
+      try { this.persistObservationLatches(); } catch {}
       return false;
     } finally { try { this.db.pragma(`busy_timeout=${busyTimeout}`); } catch {} }
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
     const observabilityTables = this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
-      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe')`).pluck().get();
-    const metricColumns = observabilityTables === 4
+      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe','external_ingress_conflicts')`).pluck().get();
+    const metricColumns = observabilityTables === 5
       ? this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}> : [];
-    const metricSchema = observabilityTables === 4
+    const metricSchema = observabilityTables === 5
       ? this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string : "";
-    if (this.readOnly && (observabilityTables !== 4 || !metricColumns.some((column) => column.name === "connection_revision") ||
+    if (this.readOnly && (observabilityTables !== 5 || !metricColumns.some((column) => column.name === "connection_revision") ||
       !/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema))) {
       return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
         compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
@@ -353,6 +419,14 @@ export class DispatcherDatabase {
       const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
       return currentRevision === undefined || row.connection_revision === currentRevision;
     });
+    const unresolvedConflictRows=this.db.prepare(`SELECT source,connection_id,connection_revision,count(*) count
+      FROM external_ingress_conflicts GROUP BY source,connection_id,connection_revision`).all() as Array<{
+        source:string;connection_id:string;connection_revision:number;count:number;
+      }>;
+    const unresolvedConflictKeys=new Set(unresolvedConflictRows.filter((row)=>{
+      const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
+      return currentRevision===undefined || currentRevision===row.connection_revision;
+    }).map((row)=>JSON.stringify([row.source,row.connection_id])));
     const ingressByConnection = new Map<string, typeof storedIngress>();
     for (const row of effectiveIngress) {
       if (row.connection_id === "") continue;
@@ -362,6 +436,7 @@ export class DispatcherDatabase {
       ingressByConnection.set(key, rows);
     }
     const connectionKeys = new Set(ingressByConnection.keys());
+    for (const key of unresolvedConflictKeys) connectionKeys.add(key);
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
     for (const key of activeUnmanagedConnections ?? []) {
       const [,connection] = JSON.parse(key) as [string,string];
@@ -400,6 +475,7 @@ export class DispatcherDatabase {
         const terminal = terminalsByConnection.get(key);
         const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
+        const hasUnresolvedConflict=unresolvedConflictKeys.has(key);
         const allFailuresRecovered = failureRows.every((failure) => {
           const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
             "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(failure.outcome)
@@ -416,7 +492,7 @@ export class DispatcherDatabase {
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
               !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
-              unresolvedVerificationConflict || Number(terminal?.active_events ?? 0)>0));
+              unresolvedVerificationConflict || hasUnresolvedConflict || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
@@ -426,7 +502,7 @@ export class DispatcherDatabase {
         const dataPathObserved = requiresIngressSuccess ?
           currentProcessSuccess || recoveredPersistedEvent : managedState !== undefined || currentProcessSuccess;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && !hasUnresolvedConflict && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
           ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
             errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
