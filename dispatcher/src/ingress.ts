@@ -413,7 +413,9 @@ export class ExternalIngressProcessor {
       throw new ExternalIngressRegistrationMismatchError();
     }
     let owner: ProviderOwner | undefined;
-    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) throw new ExternalIngressAuthenticationError();
+    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) {
+      throw bindAuthenticatedError(new ExternalIngressAuthenticationError(),verifiedConnectionId,verifiedRevision);
+    }
     const verifiedResourceId = verifiedBinding?.resource ?? verified.resourceId;
     if (verifiedResourceId !== undefined) {
       const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,

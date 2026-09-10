@@ -371,6 +371,24 @@ test("wildcard registrationは現processのpersist済みevent latchを回復ま�
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("wildcard registrationはcontrol latchをpersist済みevent扱いしない", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","old-control","control_acknowledged",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("created起点failureの観測欠落はduplicateからcreated証跡を復元する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["figma","figma-pilot"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("figma","figma-pilot","post_persist_created_timeout",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,true);
+});
+
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
   db.recordExternalIngress("drive",undefined,"processing_timeout",50,new Date(clock.now()));
