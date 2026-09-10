@@ -116,7 +116,10 @@ export class DispatcherDatabase {
         AND NEW.source NOT IN ('slack','dona_job','dona_update')
       BEGIN
         INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
-        VALUES(NEW.source,coalesce((SELECT connection_id FROM connection_event_bindings WHERE event_id=NEW.event_id),'unattributed'),NEW.last_error_code,1,NEW.updated_at)
+        VALUES(NEW.source,coalesce(
+          (SELECT connection_id FROM connection_event_bindings WHERE event_id=NEW.event_id),
+          (SELECT l.connection FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=NEW.event_id),
+          ''),NEW.last_error_code,1,NEW.updated_at)
         ON CONFLICT(source,connection_id,error_code) DO UPDATE SET count=count+1,
           last_error_at=MAX(last_error_at,excluded.last_error_at);
       END;
@@ -178,11 +181,18 @@ export class DispatcherDatabase {
       FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
         source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
       }>;
-    const ingressConnections = [...new Set(storedIngress.filter((row) => row.connection_id !== "")
-      .map((row) => JSON.stringify([row.source,row.connection_id])))].map((key) => {
+    const laneConnections = this.db.prepare(`SELECT DISTINCT source,connection_id FROM (
+      SELECT source,connection connection_id FROM queue_lanes WHERE class='external' AND connection!='unverified_legacy'
+    ) ORDER BY source,connection_id`).all() as Array<{source:string;connection_id:string}>;
+    const connectionKeys = new Set(storedIngress.filter((row) => row.connection_id !== "")
+      .map((row) => JSON.stringify([row.source,row.connection_id])));
+    for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
+    const ingressConnections = [...connectionKeys].sort().map((key) => {
         const [source,connectionId] = JSON.parse(key) as [string,string];
         const rows = storedIngress.filter((row) => row.source === source && row.connection_id === connectionId);
-        const success = rows.filter((row) => ["created","duplicate_same","control_acknowledged"].includes(row.outcome))
+        const success = rows.filter((row) => ["created","duplicate_same"].includes(row.outcome))
+          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
+        const control = rows.filter((row) => row.outcome === "control_acknowledged")
           .map((row) => row.last_observed_at).sort().at(-1) ?? null;
         const failure = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome))
           .map((row) => row.last_observed_at).sort().at(-1) ?? null;
@@ -191,16 +201,17 @@ export class DispatcherDatabase {
           FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
           WHERE l.source=? AND l.connection=?`).get(source,connectionId) as {blocked:number|null;dead_letter:number|null};
         const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
-        return { source, connection_id: connectionId,
-          ready: (failure === null || (success !== null && success > failure)) && blocked === 0 && deadLetter === 0,
-          last_success_at: success, last_error_at: failure, blocked, dead_letter: deadLetter };
+        const state = projected.find((row) => row.provider === source && row.id === connectionId)?.state ?? "unmanaged";
+        return { source, connection_id: connectionId, state,
+          ready: state === "disabled" || ((failure === null || (success !== null && success > failure)) && blocked === 0 && deadLetter === 0),
+          last_success_at: success, last_control_at: control, last_error_at: failure, blocked, dead_letter: deadLetter };
       });
     const ingress = storedIngress.map((row) => ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
       ready: writable && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
-        ingressConnections.every((row) => row.ready),
+        ingressConnections.every((row) => row.state === "disabled" || row.ready),
       writable,
       connections: projected,
       ingress_connections: ingressConnections,

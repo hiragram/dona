@@ -254,7 +254,10 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/external-events/health") {
-        sendJson(response, 200, this.database.externalReleaseHealth());
+        const health = this.database.externalReleaseHealth();
+        const serviceReady = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
+        sendJson(response, 200, { ...health, ready: health.ready && serviceReady, service_ready: serviceReady });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/live") {

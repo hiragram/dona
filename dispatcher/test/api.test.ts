@@ -89,6 +89,15 @@ describe("DispatcherApi", () => {
     assert.equal(wakeCount, 2);
     assert.equal((await fs.stat(config.socketPath)).mode & 0o777, 0o600);
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
+    const releaseHealth = await request(config.socketPath, "GET", "/v1/external-events/health");
+    assert.equal(releaseHealth.status, 200);
+    assert.equal(releaseHealth.body.ready, true);
+    assert.equal(releaseHealth.body.service_ready, true);
+    api.beginShutdown();
+    const shutdownHealth = await request(config.socketPath, "GET", "/v1/external-events/health");
+    assert.equal(shutdownHealth.status, 200);
+    assert.equal(shutdownHealth.body.ready, false);
+    assert.equal(shutdownHealth.body.service_ready, false);
     await api.stop();
     database.close();
   });

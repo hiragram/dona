@@ -74,8 +74,8 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
   assert.deepEqual(health.connections[0]!.cursors, [
     { resource: "folder1", version: 0 }, { resource: "folder2", version: 7 },
   ]);
-  assert.deepEqual(health.ingress_connections, [{ source: "drive", connection_id: "pilot", ready: true,
-    last_success_at: new Date(clock.now()).toISOString(), last_error_at: null, blocked: 0, dead_letter: 0 }]);
+  assert.deepEqual(health.ingress_connections, [{ source: "drive", connection_id: "pilot", state: "verification_pending", ready: true,
+    last_success_at: new Date(clock.now()).toISOString(), last_control_at: null, last_error_at: null, blocked: 0, dead_letter: 0 }]);
   const encoded = JSON.stringify(health);
   assert.doesNotMatch(encoded, /cred_fixture|checkpoint|token|secret/i);
   db.close();
@@ -89,10 +89,14 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   db.recordExternalIngress("figma","figma-pilot","invalid_event",50,new Date(clock.now()));
   let health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ready,false);
-  assert.deepEqual(health.ingress_connections,[{source:"figma",connection_id:"figma-pilot",ready:false,
-    last_success_at:null,last_error_at:new Date(clock.now()).toISOString(),blocked:0,dead_letter:0}]);
+  assert.deepEqual(health.ingress_connections,[{source:"figma",connection_id:"figma-pilot",state:"unmanaged",ready:false,
+    last_success_at:null,last_control_at:null,last_error_at:new Date(clock.now()).toISOString(),blocked:0,dead_letter:0}]);
   clock.value+=1;
   db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
+  health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ingress_connections[0]!.ready,false);
+  clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
   health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ingress_connections[0]!.ready,true);
   const figmaSource=externalEventSource("figma");
