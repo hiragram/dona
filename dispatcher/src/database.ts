@@ -255,16 +255,16 @@ export class DispatcherDatabase {
       createHash("sha256").update(deliveryId).digest("hex")]);
     const latchedBefore=this.failedObservationLatches.get(latchKey);
     const deliveryLatchedBefore=deliveryKey === undefined ? undefined : this.failedObservationLatches.get(deliveryKey);
-    let observationBoundary=0;
+    let observationBoundary=Number.MAX_SAFE_INTEGER;
     let busyTimeout=2_000;
     try {
+      observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
       try { fs.unlinkSync(this.observationLatchPath); }
       catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
       const latchDirectory=fs.openSync(path.dirname(this.observationLatchPath),"r");
       try { fs.fsyncSync(latchDirectory); } finally { fs.closeSync(latchDirectory); }
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
-      observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
       const recoveredCreated = outcome === "duplicate_same" && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout"]
         .some((createdOutcome)=>(deliveryLatchedBefore ?? latchedBefore)?.outcomes.has(createdOutcome)===true);
       const effectiveOutcome = recoveredCreated ? "created" : outcome;
@@ -339,10 +339,10 @@ export class DispatcherDatabase {
         if (deliveryLatch !== undefined) {
           for (const recovered of outcome === "duplicate_same"
             ? ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
-              "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_conflict"]
+              "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict"]
             : ["verification_created","verification_acknowledgement_unavailable_after_created",
               "verification_post_persist_created_timeout","verification_acknowledgement_unavailable_after_duplicate",
-              "verification_post_persist_duplicate_timeout","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
+              "verification_post_persist_duplicate_timeout","verification_duplicate_same","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
           if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
         }
       }
@@ -617,7 +617,9 @@ export class DispatcherDatabase {
       const persistedEventLatch=[...latch.outcomes].some((outcome)=>["created","duplicate_same","acknowledgement_unavailable",
         "post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
         "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
-        "verification_created","verification_duplicate_same","verification_duplicate_conflict"].includes(outcome));
+        "control_acknowledgement_unavailable","verification_created","verification_duplicate_same","verification_duplicate_conflict",
+        "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+        "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout"].includes(outcome));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
         (persistedEventLatch || (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });

@@ -252,6 +252,19 @@ test("成功outcomeの観測latchは同じ成功の再観測で解除する", (t
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("duplicate成功の観測latchは同じdeliveryの再観測だけで解除する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","connection-a"])]);
+  db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()),undefined,"delivery-a");
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()),undefined,"delivery-a"),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()),undefined,"delivery-b");
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()),undefined,"delivery-a");
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("verification created観測latchはverification duplicateで解除する", (t) => {
   const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["notion","notion-pilot"])]);
@@ -446,6 +459,16 @@ test("wildcard registrationはcontrol latchをpersist済みevent扱いしない"
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("wildcard registrationは未解決control ACK failureを後続control成功まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","failed-control","control_acknowledgement_unavailable",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","failed-control","control_acknowledged",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("未認証outcomeの未帰属latchはsource-level gateへ含めない", (t) => {
   const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
@@ -461,6 +484,18 @@ test("wildcard registrationはverification latchを再送回復まで保持す�
   lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("wildcard registrationはverification ACK観測失敗を同じdeliveryの再送まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","verify","verification_post_persist_created_timeout",50,new Date(clock.now()),undefined,"delivery-a"),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()),undefined,"delivery-b");
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()),undefined,"delivery-a");
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
