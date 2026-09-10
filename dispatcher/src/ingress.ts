@@ -49,10 +49,12 @@ export class ExternalIngressTimeoutError extends Error {
     this.name = "ExternalIngressTimeoutError";
   }
 }
-export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeoutError {}
+export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeoutError {
+  constructor(readonly persistedOutcome: EnqueueResult["outcome"]) { super(); }
+}
 
 export class ExternalIngressAcknowledgementError extends Error {
-  constructor() {
+  constructor(readonly persistedOutcome?: EnqueueResult["outcome"]) {
     super("Provider acknowledgement could not be built");
     this.name = "ExternalIngressAcknowledgementError";
   }
@@ -476,7 +478,7 @@ export class ExternalIngressProcessor {
       });
     } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision); }
     try { remainingProcessingTime(processingDeadline); }
-    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(),verifiedConnectionId,verifiedRevision); }
+    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(result.outcome),verifiedConnectionId,verifiedRevision); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,
@@ -497,7 +499,7 @@ export class ExternalIngressProcessor {
     try {
       acknowledgement = validateAcknowledgement(registration.buildAcknowledgement(receipt));
     } catch {
-      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(), verifiedConnectionId,verifiedRevision);
+      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(result.outcome), verifiedConnectionId,verifiedRevision);
     }
     return { receipt, acknowledgement };
   }

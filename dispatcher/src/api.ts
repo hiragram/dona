@@ -567,11 +567,13 @@ export class DispatcherApi {
       const outcome = error instanceof ExternalIngressRegistrationMismatchError ? "registration_mismatch" :
         error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
         error instanceof ExternalIngressValidationError ? "invalid_event" :
-        error instanceof ExternalIngressPostPersistTimeoutError ? "post_persist_timeout" :
+        error instanceof ExternalIngressPostPersistTimeoutError ?
+          (error.persistedOutcome === "created" ? "post_persist_created_timeout" : "post_persist_duplicate_timeout") :
         error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
         error instanceof ExternalIngressControlAcknowledgementError ? "control_acknowledgement_unavailable" :
-        error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :
+        error instanceof ExternalIngressAcknowledgementError ?
+          (error.persistedOutcome === "created" ? "acknowledgement_unavailable_after_created" : "acknowledgement_unavailable_after_duplicate") :
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
       const connectionId = authenticatedConnectionId(error);
       const connectionRevision = authenticatedConnectionRevision(error);

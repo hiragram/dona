@@ -219,7 +219,10 @@ export class DispatcherDatabase {
       }).immediate();
       const latchedOutcomes=this.failedObservationLatches.get(latchKey);
       if (outcome === "created") {
-        this.failedObservationLatches.delete(latchKey);
+        if (latchedOutcomes !== undefined) {
+          for (const latched of [...latchedOutcomes]) if (latched !== "control_acknowledgement_unavailable") latchedOutcomes.delete(latched);
+          if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+        }
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
         latchedOutcomes.delete("created"); latchedOutcomes.delete("acknowledgement_unavailable"); latchedOutcomes.delete("post_persist_timeout");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
@@ -385,7 +388,7 @@ export class DispatcherDatabase {
         const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
         const allFailuresRecovered = failureRows.every((failure) => {
-          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout"].includes(failure.outcome)
+          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome)
             ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
             : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
             : successRow?.last_observed_sequence ?? 0;
@@ -394,13 +397,13 @@ export class DispatcherDatabase {
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true;
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
-        const requiresIngressSuccess=runtimeRegistered && ["github","notion","figma"].includes(source);
+        const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
-          ["acknowledgement_unavailable","post_persist_timeout"].includes(failure.outcome) &&
+          ["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome) &&
           (duplicateRow?.last_observed_sequence ?? 0) > failure.last_observed_sequence);
-        const unmanagedCurrentSuccess = managedState !== undefined || (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
+        const currentProcessSuccess = (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
         const dataPathObserved = requiresIngressSuccess ?
-          (managedState === undefined ? unmanagedCurrentSuccess : successRow !== undefined) || recoveredPersistedEvent : unmanagedCurrentSuccess;
+          currentProcessSuccess || recoveredPersistedEvent : managedState !== undefined || currentProcessSuccess;
         return { source, connection_id: connectionId, state,
           ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
@@ -414,6 +417,18 @@ export class DispatcherDatabase {
     for (const row of effectiveIngress) if (row.outcome === "created") {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
+    const createdPersistFailureOutcomes=new Set(["acknowledgement_unavailable","post_persist_timeout",
+      "acknowledgement_unavailable_after_created","post_persist_created_timeout"]);
+    const connectionDataPathSequence=new Map<string,number>();
+    for (const [key,rows] of ingressByConnection) {
+      let dataPathSequence=Math.max(0,...rows.filter((row)=>row.outcome==="created").map((row)=>row.last_observed_sequence));
+      const duplicateSequence=Math.max(0,...rows.filter((row)=>row.outcome==="duplicate_same").map((row)=>row.last_observed_sequence));
+      for (const failure of rows) if (createdPersistFailureOutcomes.has(failure.outcome) && duplicateSequence>failure.last_observed_sequence) {
+        sourceSuccessSequence.set(failure.source,Math.max(sourceSuccessSequence.get(failure.source) ?? 0,duplicateSequence));
+        dataPathSequence=Math.max(dataPathSequence,duplicateSequence);
+      }
+      connectionDataPathSequence.set(key,dataPathSequence);
+    }
     const activeRuntimeKeys=[...activeUnmanagedConnections ?? []].map((key) => JSON.parse(key) as [string,string]);
     const gateRuntimeKeys=activeRuntimeKeys.filter(([source,connection]) => connection === "*" ||
       projectedByConnection.get(JSON.stringify([source,connection]))?.state !== "disabled");
@@ -422,7 +437,7 @@ export class DispatcherDatabase {
     const unattributedDependenciesReady = effectiveIngress.filter((row) => row.connection_id === "" && sourceGateOutcomes.has(row.outcome))
       .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
         gateRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
-          (ingressByConnection.get(JSON.stringify([source,connection])) ?? []).some((metric) => metric.outcome === "created" && metric.last_observed_sequence > row.last_observed_sequence)) &&
+          (connectionDataPathSequence.get(JSON.stringify([source,connection])) ?? 0) > row.last_observed_sequence) &&
         (gateRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
           (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||

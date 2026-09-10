@@ -189,6 +189,7 @@ test("観測失敗latchはoutcome別に回復し廃止scopeをgateしない", (t
 
 test("created観測失敗後のduplicateは失われたdata path証跡を復旧する", (t) => {
   const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.connections.disable("pilot",1);
   const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
   assert.equal(db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now())),false);
   lock.exec("COMMIT"); lock.close();
@@ -206,13 +207,23 @@ test("unmanaged ingressはprocess起動後の成功だけをdata path証跡に�
 });
 
 test("control ACK failureは後続control成功だけで回復する", (t) => {
-  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.connections.disable("pilot",1);
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("figma","figma-pilot","control_acknowledgement_unavailable",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
   db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
-  db.recordExternalIngress("figma","figma-pilot","control_acknowledgement_unavailable",50,new Date(clock.now()));
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("duplicate起点のpost-persist timeoutはdata path成功に昇格しない", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.recordExternalIngress("figma","figma-pilot","post_persist_duplicate_timeout",50,new Date(clock.now()));
   db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
-  db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
-  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,true);
 });
 
 test("未帰属dependency failureはsourceの後続data-path成功までgateを閉じる", (t) => {
@@ -234,6 +245,22 @@ test("未帰属processing timeoutはactive sourceの後続成功までgateを閉
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false); clock.value+=1;
   db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("source-level failureはpersist済みcreatedのduplicate回復でも解除できる", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.connections.disable("pilot",1);
+  db.recordExternalIngress("figma",undefined,"processing_timeout",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","post_persist_created_timeout",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("managed ingressもprocess再起動後のdata path成功を要求する", (t) => {
+  const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
+  db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()),1); db.close();
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
 });
 
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
