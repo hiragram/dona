@@ -461,9 +461,9 @@ describe("external ingress contract", () => {
     const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([limited]));
     const body = fakeBody();
     const requestValue: RawIngressRequest = { body, headers: Object.entries(signedHeaders(body)), method: "POST", requestTarget: "/fake",
-      receivedAt: new Date().toISOString(), receivedAtMonotonic: performance.now() };
+      receivedAt: new Date().toISOString(), receivedAtMonotonic: performance.now()+1_000 };
     await assert.rejects(processor.process(externalEventSource("fake"), limited, requestValue, () => {
-      const until = performance.now()+5;
+      const until = performance.now()+1_100;
       while (performance.now()<until) { /* fixture: synchronous durable write */ }
       return { row: { event_id:"evt_fixture", sequence:1, source:"fake", external_event_id:"external-fixture",
         schema_version:1, event_type:"fake.changed", occurred_at:new Date().toISOString(), subject_json:"{}", payload_json:"{}",
