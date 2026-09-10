@@ -126,6 +126,7 @@ export interface PreparedExternalIngressAcknowledgement {
 
 export interface ExternalEventSourceRegistration {
   readonly source: string;
+  readonly connectionIds?: readonly string[];
   readonly maxBodyBytes: number;
   readonly bodyTimeoutMs: number;
   readonly processingTimeoutMs: number;
@@ -183,6 +184,9 @@ export class ExternalIngressRegistry {
   register(registration: ExternalEventSourceRegistration): void {
     const source = externalEventSource(registration.source);
     if (this.registrations.has(source)) throw new Error(`External event source is already registered: ${source}`);
+    if (registration.connectionIds?.some((connectionId) => !connectionIdPattern.test(connectionId))) {
+      throw new Error("External event source has an invalid connection identifier");
+    }
     for (const [value, name] of [
       [registration.maxBodyBytes, "maxBodyBytes"],
       [registration.bodyTimeoutMs, "bodyTimeoutMs"],
@@ -203,6 +207,14 @@ export class ExternalIngressRegistry {
     }
     const registration = this.registrations.get(source);
     return registration ? { source, registration } : undefined;
+  }
+
+  activeConnectionKeys(): ReadonlySet<string> {
+    const keys = new Set<string>();
+    for (const [source,registration] of this.registrations) {
+      for (const connectionId of registration.connectionIds ?? []) keys.add(JSON.stringify([source,connectionId]));
+    }
+    return keys;
   }
 }
 
@@ -351,6 +363,8 @@ export class ExternalIngressProcessor {
   registration(source: string) {
     return this.registry.get(source);
   }
+
+  activeConnectionKeys(): ReadonlySet<string> { return this.registry.activeConnectionKeys(); }
 
   async process(
     source: ExternalEventSource,

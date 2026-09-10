@@ -4,7 +4,7 @@
 
 ## read-only evidence
 
-`dona-dispatcher external-events health`または`GET /v1/external-events/health`を使う。出力は登録済みconnectionごとのstate、queue depth/lag、dead letter、subscription expiry/renewal unknown、cursor version、last delivery/reconcile/errorと、source/connection/outcome/固定latency bucketのingress集計を返す。credential参照、cursor token、provider本文、callback URLは返さない。未認証requestは任意のconnection labelを作れず、`unattributed`へ集約する。
+release判定には稼働中Dispatcherの`GET /v1/external-events/health`を使う。`dona-dispatcher external-events health`はDBだけを読むoffline evidenceであり、`service_ready: null`、`evidence_scope: "offline_database"`、`ready: false`を返すため、単独ではrelease成功の根拠にしない。出力は登録済みconnectionごとのstate、queue depth/lag、dead letter、subscription expiry/renewal unknown、cursor version、last delivery/reconcile/errorと、source/connection/outcome/固定latency bucketのingress集計を返す。credential参照、cursor token、provider本文、callback URLは返さない。未認証requestは任意のconnection labelを作れず、未帰属へ集約する。
 
 判定時は次を保存する。
 

@@ -74,6 +74,7 @@ export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceReg
   }
   return {
     source: "figma",
+    connectionIds: [config.connectionId],
     maxBodyBytes: 256 * 1_024,
     bodyTimeoutMs: 5_000,
     processingTimeoutMs: 5_000,

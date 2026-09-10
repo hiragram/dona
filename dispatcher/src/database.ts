@@ -116,7 +116,6 @@ export class DispatcherDatabase {
         count INTEGER NOT NULL, last_error_at TEXT NOT NULL,
         PRIMARY KEY(source,connection_id,error_code)
       );
-      UPDATE external_ingress_metrics SET connection_id='' WHERE connection_id='unattributed';
       DROP TRIGGER IF EXISTS external_event_error_history;
       CREATE TRIGGER external_event_error_history AFTER UPDATE OF last_error_code ON events
       WHEN NEW.last_error_code IS NOT NULL AND NEW.last_error_code!='provider_fetching'
@@ -136,6 +135,7 @@ export class DispatcherDatabase {
     const metricColumns = this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
     if (!metricColumns.some((column) => column.name === "last_observed_sequence")) {
       this.db.exec(`
+        UPDATE external_ingress_metrics SET connection_id='' WHERE connection_id='unattributed';
         ALTER TABLE external_ingress_metrics ADD COLUMN last_observed_sequence INTEGER NOT NULL DEFAULT 0;
         WITH ranked AS (
           SELECT rowid metric_rowid,row_number() OVER (ORDER BY last_observed_at,rowid) observation_sequence
@@ -171,22 +171,24 @@ export class DispatcherDatabase {
     } catch {}
   }
 
-  externalReleaseHealth(at = new Date()) {
-    return this.db.transaction(() => this.externalReleaseHealthSnapshot(at)).deferred();
+  externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
+    const writable = this.probeWritable();
+    return this.db.transaction(() => this.externalReleaseHealthSnapshot(at,writable,activeUnmanagedConnections)).deferred();
   }
 
-  private externalReleaseHealthSnapshot(at: Date) {
-    const now = at.getTime();
-    let writable = true;
+  private probeWritable(): boolean {
+    const rollback = Symbol("external health write probe rollback");
     try {
-      this.db.exec("SAVEPOINT external_health_write_probe");
-      this.db.prepare("INSERT INTO external_write_probe(payload) VALUES(zeroblob(4096))").run();
-      this.db.exec("ROLLBACK TO external_health_write_probe; RELEASE external_health_write_probe");
-    }
-    catch {
-      writable = false;
-      try { this.db.exec("ROLLBACK TO external_health_write_probe; RELEASE external_health_write_probe"); } catch {}
-    }
+      this.db.transaction(() => {
+        this.db.prepare("INSERT INTO external_write_probe(payload) VALUES(zeroblob(4096))").run();
+        throw rollback;
+      }).immediate();
+    } catch (error) { return error === rollback; }
+    return false;
+  }
+
+  private externalReleaseHealthSnapshot(at: Date, writable: boolean, activeUnmanagedConnections?: ReadonlySet<string>) {
+    const now = at.getTime();
     const connections = this.db.prepare(`SELECT c.id,c.provider,c.state,c.revision,
       (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
         WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('queued','retryable_failed')) queue_depth,
@@ -248,9 +250,10 @@ export class DispatcherDatabase {
           FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
           WHERE l.source=? AND l.connection=?`).get(source,connectionId) as {blocked:number|null;dead_letter:number|null};
         const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
-        const state = projectedByConnection.get(key)?.state ?? "unmanaged";
+        const managedState = projectedByConnection.get(key)?.state;
+        const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
         return { source, connection_id: connectionId, state,
-          ready: state === "disabled" || ((failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || ((failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure, blocked, dead_letter: deadLetter };
       });
     const ingress = storedIngress.map(({last_observed_sequence: _sequence, ...row}) =>
@@ -259,7 +262,7 @@ export class DispatcherDatabase {
       schema_version: 1,
       observed_at: at.toISOString(),
       ready: writable && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
-        ingressConnections.every((row) => row.state === "disabled" || row.ready),
+        ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
       connections: projected,
       ingress_connections: ingressConnections,

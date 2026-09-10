@@ -53,7 +53,11 @@ async function main(): Promise<void> {
   const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   try {
     if (args[0] === "external-events") {
-      if (command === "health") { console.log(JSON.stringify(database.externalReleaseHealth(), null, 2)); return; }
+      if (command === "health") {
+        const health = database.externalReleaseHealth();
+        console.log(JSON.stringify({ ...health, ready:false, service_ready:null, evidence_scope:"offline_database" }, null, 2));
+        return;
+      }
       usage();
     }
     if (args[0] === "queue") {
