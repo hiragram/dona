@@ -50,7 +50,7 @@ export class ExternalIngressTimeoutError extends Error {
   }
 }
 export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeoutError {
-  constructor(readonly persistedOutcome: EnqueueResult["outcome"]) { super(); }
+  constructor(readonly persistedOutcome: EnqueueResult["outcome"],readonly externalEventId: string,readonly verification: boolean) { super(); }
 }
 
 export class ExternalIngressAcknowledgementError extends Error {
@@ -474,7 +474,9 @@ export class ExternalIngressProcessor {
       };
     }
     if (owner && envelope.reply_target !== null) throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId,verifiedRevision);
-    const signal = registration.queueSignal?.(normalized, verified);
+    let signal: QueueAdmissionContext["coalesce"];
+    try { signal = registration.queueSignal?.(normalized, verified); }
+    catch (error) { throw bindAuthenticatedError(error,verifiedConnectionId,verifiedRevision); }
     let result: EnqueueResult;
     try {
       result = persist(envelope, {
@@ -487,7 +489,8 @@ export class ExternalIngressProcessor {
       });
     } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision); }
     try { remainingProcessingTime(processingDeadline); }
-    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(result.outcome),verifiedConnectionId,verifiedRevision); }
+    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(result.outcome,envelope.external_event_id,
+      verified.purpose==="verification"),verifiedConnectionId,verifiedRevision); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

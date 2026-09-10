@@ -124,7 +124,8 @@ export class DispatcherDatabase {
           typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) continue;
         this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary});
       }
-    } catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") this.failedObservationLatches.clear(); }
+    } catch { this.failedObservationLatches.set(JSON.stringify(["*","",0]),
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor}); }
   }
 
   private persistObservationLatches(): void {
@@ -547,6 +548,9 @@ export class DispatcherDatabase {
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
       !["github","notion","figma"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
+    const legacyExternalReady=(this.db.prepare(`SELECT count(*) count FROM queue_events q JOIN queue_lanes l USING(lane)
+      JOIN events e USING(event_id) WHERE l.class='external' AND l.connection='unverified_legacy' AND e.status!='completed'`)
+      .pluck().get() as number)===0;
     const activeObservationLatches=[...this.failedObservationLatches].filter(([key,latch]) => {
       const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
       if (source === "*") return gateRuntimeKeys.length>0 || projected.some((connection)=>connection.state!=="disabled");
@@ -574,7 +578,7 @@ export class DispatcherDatabase {
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && activeObservationLatches.length === 0 && wildcardRuntimeReady && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+      ready: writable && activeObservationLatches.length === 0 && wildcardRuntimeReady && registeredManagedReady && legacyExternalReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
         (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,

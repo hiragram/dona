@@ -568,7 +568,8 @@ export class DispatcherApi {
         error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
         error instanceof ExternalIngressValidationError ? "invalid_event" :
         error instanceof ExternalIngressPostPersistTimeoutError ?
-          (error.persistedOutcome === "created" ? "post_persist_created_timeout" : "post_persist_duplicate_timeout") :
+          (error.persistedOutcome === "duplicate_conflict" ? `${error.verification ? "verification_" : ""}duplicate_conflict` :
+            error.persistedOutcome === "created" ? "post_persist_created_timeout" : "post_persist_duplicate_timeout") :
         error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
         error instanceof ExternalIngressControlAcknowledgementError ? "control_acknowledgement_unavailable" :
@@ -577,7 +578,7 @@ export class DispatcherApi {
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
       const connectionId = authenticatedConnectionId(error);
       const connectionRevision = authenticatedConnectionRevision(error);
-      if (!observe(connectionId, outcome, connectionRevision)) {
+      if (!observe(connectionId, outcome, connectionRevision,error instanceof ExternalIngressPostPersistTimeoutError ? error.externalEventId : undefined)) {
         throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),
           connectionId ?? "unattributed");
       }

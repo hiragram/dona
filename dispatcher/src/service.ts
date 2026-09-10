@@ -136,7 +136,22 @@ export async function runService(
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   externalIngressRegistry ??= serviceExternalIngressRegistry(config, database);
-  for (const registration of additionalRegistrations) externalIngressRegistry.register(registration);
+  for (const registration of additionalRegistrations) {
+    if (registration.source !== "figma") { externalIngressRegistry.register(registration); continue; }
+    externalIngressRegistry.register({...registration,async authenticate(request) {
+      const verified=await registration.authenticate(request);
+      const connection=database.connections.get(verified.connectionId);
+      if (connection.provider!=="figma" || connection.state!=="active" || verified.resourceId===undefined) {
+        throw new Error("Figma connection is not active");
+      }
+      const subscription=database.connections.subscriptions(connection.id).filter((candidate)=>candidate.resource===verified.resourceId &&
+        candidate.revision===connection.revision && candidate.verifiedAt!==null &&
+        ["active","expiring","stop_candidate"].includes(candidate.state)).at(-1);
+      if (!subscription) throw new Error("Figma subscription is not active");
+      return {...verified,connection:{account:connection.account,revision:connection.revision,
+        credentialRevision:connection.credentialRevision,resource:verified.resourceId,generation:subscription.generation}};
+    }});
+  }
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
