@@ -210,11 +210,11 @@ export class ExternalIngressRegistry {
     return registration ? { source, registration } : undefined;
   }
 
-  activeConnectionKeys(): ReadonlySet<string> | undefined {
-    if ([...this.registrations.values()].some((registration) => registration.connectionIds === undefined)) return undefined;
+  activeConnectionKeys(): ReadonlySet<string> {
     const keys = new Set<string>();
     for (const [source,registration] of this.registrations) {
-      for (const connectionId of registration.connectionIds ?? []) keys.add(JSON.stringify([source,connectionId]));
+      if (registration.connectionIds === undefined) keys.add(JSON.stringify([source,"*"]));
+      else for (const connectionId of registration.connectionIds) keys.add(JSON.stringify([source,connectionId]));
     }
     return keys;
   }
@@ -366,7 +366,7 @@ export class ExternalIngressProcessor {
     return this.registry.get(source);
   }
 
-  activeConnectionKeys(): ReadonlySet<string> | undefined { return this.registry.activeConnectionKeys(); }
+  activeConnectionKeys(): ReadonlySet<string> { return this.registry.activeConnectionKeys(); }
 
   async process(
     source: ExternalEventSource,
@@ -448,7 +448,7 @@ export class ExternalIngressProcessor {
         acknowledgement,
       };
     }
-    if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
+    if (owner && envelope.reply_target !== null) throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId);
     const signal = registration.queueSignal?.(normalized, verified);
     let result: EnqueueResult;
     try {

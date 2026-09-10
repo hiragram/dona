@@ -64,7 +64,7 @@ export class EventNotDispatchableError extends Error {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
-  private observationPersistenceFailed = false;
+  private readonly failedObservationLatches = new Map<string,string>();
 
   readonly connections: ConnectionRegistry;
   readonly providerRegistration: ProviderRegistrationRegistry;
@@ -167,13 +167,16 @@ export class DispatcherDatabase {
 
   recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): boolean {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
+    const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
+    const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
+    const latchKey=JSON.stringify([safeSource,boundedConnection]);
+    let busyTimeout=2_000;
     try {
-      const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
-      const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId)
-        ? connectionId : "";
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
+      busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
+      this.db.pragma("busy_timeout=0");
       this.db.transaction(() => {
         const order = this.db.prepare("UPDATE external_ingress_sequence SET value=value+1 WHERE singleton=1 RETURNING value")
           .get() as {value:number};
@@ -183,9 +186,15 @@ export class DispatcherDatabase {
             last_observed_sequence=excluded.last_observed_sequence`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value);
       }).immediate();
-      this.observationPersistenceFailed = false;
+      const latchedOutcome=this.failedObservationLatches.get(latchKey);
+      if (outcome === "created" || (["acknowledgement_unavailable","post_persist_timeout"].includes(latchedOutcome ?? "") && outcome === "duplicate_same")) {
+        this.failedObservationLatches.delete(latchKey);
+      }
       return true;
-    } catch { this.observationPersistenceFailed = true; return false; }
+    } catch {
+      this.failedObservationLatches.set(latchKey,outcome);
+      return false;
+    } finally { try { this.db.pragma(`busy_timeout=${busyTimeout}`); } catch {} }
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
@@ -310,7 +319,8 @@ export class DispatcherDatabase {
         const successRow = latest((outcome) => outcome === "created");
         const duplicateRow = latest((outcome) => outcome === "duplicate_same");
         const controlRow = latest((outcome) => outcome === "control_acknowledged");
-        const failureRow = latest((outcome) => !["created","duplicate_same","control_acknowledged"].includes(outcome));
+        const failureRows = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome));
+        const failureRow = [...failureRows].sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
         const success = successRow?.last_observed_at ?? null;
         const control = controlRow?.last_observed_at ?? null;
         const failure = failureRow?.last_observed_at ?? null;
@@ -318,12 +328,19 @@ export class DispatcherDatabase {
         const terminal = terminalsByConnection.get(key);
         const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
-        const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
-        const dataPathObserved = managedState !== undefined || successRow !== undefined;
-        const recoveryRow = ["acknowledgement_unavailable","post_persist_timeout"].includes(failureRow?.outcome ?? "") &&
-          (duplicateRow?.last_observed_sequence ?? 0) > (successRow?.last_observed_sequence ?? 0) ? duplicateRow : successRow;
+        const allFailuresRecovered = failureRows.every((failure) => {
+          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout"].includes(failure.outcome)
+            ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
+            : successRow?.last_observed_sequence ?? 0;
+          return recoverySequence > failure.last_observed_sequence;
+        });
+        const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
+          activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true;
+        const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
+        const requiresIngressSuccess=runtimeRegistered && ["github","notion","figma"].includes(source);
+        const dataPathObserved = requiresIngressSuccess ? successRow !== undefined : managedState !== undefined || successRow !== undefined;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || (dataPathObserved && (failureRow === undefined || (recoveryRow !== undefined && recoveryRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
           ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
             errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
@@ -335,16 +352,21 @@ export class DispatcherDatabase {
     for (const row of storedIngress) if (row.outcome === "created") {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
-    const activeRuntimeSources = new Set([...activeUnmanagedConnections ?? []].map((key) => (JSON.parse(key) as [string,string])[0]));
+    const activeRuntimeKeys=[...activeUnmanagedConnections ?? []].map((key) => JSON.parse(key) as [string,string]);
+    const activeRuntimeSources = new Set(activeRuntimeKeys.map(([source]) => source));
     const unattributedDependenciesReady = storedIngress.filter((row) => row.connection_id === "" && row.outcome === "dependency_unavailable")
       .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
-        (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence);
+        activeRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
+          (ingressByConnection.get(JSON.stringify([source,connection])) ?? []).some((metric) => metric.outcome === "created" && metric.last_observed_sequence > row.last_observed_sequence)) &&
+        (activeRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
+          (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
-      !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true);
+      !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
+      activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && !this.observationPersistenceFailed && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+      ready: writable && this.failedObservationLatches.size === 0 && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
         (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
