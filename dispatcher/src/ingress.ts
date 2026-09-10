@@ -101,6 +101,7 @@ export interface PersistReceipt {
   readonly admission?: AdmissionCode;
   readonly ackAllowed?: boolean;
   readonly control?: true;
+  readonly verification?: true;
 }
 
 const authenticatedConnection = Symbol("authenticatedConnection");
@@ -474,6 +475,7 @@ export class ExternalIngressProcessor {
       committedAt: result.committedAt ?? result.row.created_at,
       admission: result.admission ?? result.outcome,
       ackAllowed: result.outcome !== "duplicate_conflict",
+      ...(verified.purpose === "verification" ? { verification: true as const } : {}),
     };
     if (result.outcome === "duplicate_conflict") return { receipt, acknowledgement: null };
 

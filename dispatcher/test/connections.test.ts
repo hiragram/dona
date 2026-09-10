@@ -121,6 +121,37 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   assert.equal(health.ingress_connections[0]!.ready,true);
 });
 
+test("release healthは現行connection revisionのingress証跡だけを評価する", (t) => {
+  const {db,clock}=fixture(t);
+  db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now())).ingress.length,1);
+  db.connections.revise("pilot",1,{...config,credentialRevision:2});
+  const health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ingress.length,0);
+  assert.equal(health.ingress_connections.length,0);
+});
+
+test("verification trafficは通常data path成功として扱わない", (t) => {
+  const {db,clock}=fixture(t);
+  const active=new Set([JSON.stringify(["notion","notion-pilot"])]);
+  db.recordExternalIngress("notion","notion-pilot","verification_created",50,new Date(clock.now()));
+  const health=db.externalReleaseHealth(new Date(clock.now()),active);
+  assert.equal(health.ingress_connections[0]!.ready,false);
+  assert.equal(health.ingress_connections[0]!.last_success_at,null);
+  assert.equal(health.ingress_connections[0]!.last_error_at,null);
+});
+
+test("persist後timeoutのduplicate確認は通常data pathを回復する", (t) => {
+  const {db,clock}=fixture(t);
+  const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.recordExternalIngress("figma","figma-pilot","post_persist_timeout",50,new Date(clock.now()));
+  clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  const health=db.externalReleaseHealth(new Date(clock.now()),active);
+  assert.equal(health.ingress_connections[0]!.ready,true);
+  assert.equal(health.ingress_connections[0]!.last_success_at,null);
+});
+
 test("未帰属dependency failureはsourceの後続data-path成功までgateを閉じる", (t) => {
   const {db,clock} = fixture(t);
   db.recordExternalIngress("drive",undefined,"dependency_unavailable",50,new Date(clock.now()));

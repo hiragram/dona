@@ -589,7 +589,9 @@ export class DispatcherApi {
     }
 
     const { receipt } = result;
-    if (!observe(receipt.connectionId, receipt.control === true ? "control_acknowledged" : receipt.outcome)) {
+    const observedOutcome = receipt.control === true ? "control_acknowledged" :
+      receipt.verification === true ? `verification_${receipt.outcome}` : receipt.outcome;
+    if (!observe(receipt.connectionId, observedOutcome)) {
       throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),receipt.connectionId);
     }
     if (receipt.outcome === "duplicate_conflict") {
