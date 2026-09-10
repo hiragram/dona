@@ -50,7 +50,8 @@ async function main(): Promise<void> {
   }
   if (!["event", "job", "queue", "external-events"].includes(args[0]!)) usage();
   const command = args[1];
-  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
+  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy, undefined,
+    {readOnly:args[0] === "external-events" && command === "health"});
   try {
     if (args[0] === "external-events") {
       if (command === "health") {

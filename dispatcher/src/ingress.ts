@@ -427,6 +427,9 @@ export class ExternalIngressProcessor {
     };
     const controlAcknowledgement = registration.controlAcknowledgement?.(normalized);
     if (controlAcknowledgement !== undefined) {
+      let acknowledgement: PreparedExternalIngressAcknowledgement;
+      try { acknowledgement = validateAcknowledgement(controlAcknowledgement); }
+      catch { throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(),verifiedConnectionId); }
       return {
         receipt: {
           schemaVersion: 1,
@@ -440,7 +443,7 @@ export class ExternalIngressProcessor {
           ackAllowed: true,
           control: true,
         },
-        acknowledgement: validateAcknowledgement(controlAcknowledgement),
+        acknowledgement,
       };
     }
     if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();

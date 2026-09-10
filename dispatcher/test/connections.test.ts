@@ -87,8 +87,11 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
 test("認証済みFigma connectionをbounded labelへ帰属し最新failureをgateする", (t) => {
   const {db,clock} = fixture(t);
   const active = new Set([JSON.stringify(["figma","figma-pilot"])]);
-  db.recordExternalIngress("figma","figma-pilot","invalid_event",50,new Date(clock.now()));
   let health=db.externalReleaseHealth(new Date(clock.now()),active);
+  assert.equal(health.ingress_connections[0]!.state,"unmanaged");
+  assert.equal(health.ingress_connections[0]!.ready,false);
+  db.recordExternalIngress("figma","figma-pilot","invalid_event",50,new Date(clock.now()));
+  health=db.externalReleaseHealth(new Date(clock.now()),active);
   assert.equal(health.ready,false);
   assert.deepEqual(health.ingress_connections,[{source:"figma",connection_id:"figma-pilot",state:"unmanaged",ready:false,
     last_success_at:null,last_control_at:null,last_error_at:new Date(clock.now()).toISOString(),blocked:0,dead_letter:0}]);
@@ -112,6 +115,7 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   health=db.externalReleaseHealth(new Date(clock.now()),active);
   assert.equal(health.ingress_connections[0]!.blocked,1);
   assert.equal(health.ingress_connections[0]!.ready,false);
+  assert.equal(health.ingress_connections[0]!.errors?.[0]?.error_code,"agent_blocked");
   health=db.externalReleaseHealth(new Date(clock.now()),new Set());
   assert.equal(health.ingress_connections[0]!.state,"retired");
   assert.equal(health.ingress_connections[0]!.ready,true);

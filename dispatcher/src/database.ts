@@ -63,24 +63,28 @@ export class EventNotDispatchableError extends Error {
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  private readonly readOnly: boolean;
 
   readonly connections: ConnectionRegistry;
   readonly providerRegistration: ProviderRegistrationRegistry;
   private claimsClosed = false;
   readonly queuePolicy: QueuePolicy;
 
-  constructor(databasePath: string, queuePolicyOrClock: unknown = {}, clock?: Clock) {
+  constructor(databasePath: string, queuePolicyOrClock: unknown = {}, clock?: Clock, options: {readOnly?:boolean} = {}) {
     const legacyClock = queuePolicyOrClock !== null && typeof queuePolicyOrClock === "object" &&
       typeof (queuePolicyOrClock as { now?: unknown }).now === "function" ? queuePolicyOrClock as Clock : undefined;
     this.queuePolicy = queuePolicySchema.parse(legacyClock ? {} : queuePolicyOrClock);
-    fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
-    fs.chmodSync(path.dirname(databasePath), 0o700);
-    this.db = new Database(databasePath);
-    fs.chmodSync(databasePath, 0o600);
-    this.db.pragma("journal_mode = WAL");
+    this.readOnly = options.readOnly === true;
+    if (!this.readOnly) {
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+      fs.chmodSync(path.dirname(databasePath), 0o700);
+    }
+    this.db = new Database(databasePath, this.readOnly ? {readonly:true,fileMustExist:true} : undefined);
+    if (!this.readOnly) fs.chmodSync(databasePath, 0o600);
+    if (!this.readOnly) this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    try {
+    try { if (!this.readOnly) {
       this.db.transaction(() => {
         this.migrate();
         if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
@@ -88,7 +92,7 @@ export class DispatcherDatabase {
         migrateEventRouting(this.db);
         this.migrateExternalObservability();
       }).immediate();
-    } catch (error) { this.db.close(); throw error; }
+    } } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
     this.providerRegistration = new ProviderRegistrationRegistry(this.db, clock ?? legacyClock);
   }
@@ -172,18 +176,21 @@ export class DispatcherDatabase {
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
-    const writable = this.probeWritable();
+    const writable = this.readOnly ? false : this.probeWritable();
     return this.db.transaction(() => this.externalReleaseHealthSnapshot(at,writable,activeUnmanagedConnections)).deferred();
   }
 
   private probeWritable(): boolean {
     const rollback = Symbol("external health write probe rollback");
+    const busyTimeout = this.db.pragma("busy_timeout", {simple:true}) as number;
+    this.db.pragma("busy_timeout=0");
     try {
       this.db.transaction(() => {
         this.db.prepare("INSERT INTO external_write_probe(payload) VALUES(zeroblob(4096))").run();
         throw rollback;
       }).immediate();
     } catch (error) { return error === rollback; }
+    finally { this.db.pragma(`busy_timeout=${busyTimeout}`); }
     return false;
   }
 
@@ -233,7 +240,17 @@ export class DispatcherDatabase {
     }
     const connectionKeys = new Set(ingressByConnection.keys());
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
+    for (const key of activeUnmanagedConnections ?? []) connectionKeys.add(key);
     const projectedByConnection = new Map(projected.map((row) => [JSON.stringify([row.provider,row.id]),row]));
+    const eventErrors = this.db.prepare(`SELECT source,connection_id,error_code,count,last_error_at
+      FROM external_event_errors ORDER BY source,connection_id,error_code`).all() as Array<{
+        source:string;connection_id:string;error_code:string;count:number;last_error_at:string;
+      }>;
+    const errorsByConnection = new Map<string,typeof eventErrors>();
+    for (const row of eventErrors) {
+      const key = JSON.stringify([row.source,row.connection_id]);
+      const rows = errorsByConnection.get(key) ?? []; rows.push(row); errorsByConnection.set(key,rows);
+    }
     const ingressConnections = [...connectionKeys].sort().map((key) => {
         const [source,connectionId] = JSON.parse(key) as [string,string];
         const rows = ingressByConnection.get(key) ?? [];
@@ -245,6 +262,7 @@ export class DispatcherDatabase {
         const success = successRow?.last_observed_at ?? null;
         const control = controlRow?.last_observed_at ?? null;
         const failure = failureRow?.last_observed_at ?? null;
+        const errors = errorsByConnection.get(key) ?? [];
         const terminal = this.db.prepare(`SELECT
           sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
           FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
@@ -252,9 +270,13 @@ export class DispatcherDatabase {
         const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
         const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
+        const observed = rows.length > 0;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || ((failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
-          last_success_at: success, last_control_at: control, last_error_at: failure, blocked, dead_letter: deadLetter };
+          ready: ["disabled","retired"].includes(state) || (observed && (failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
+          last_success_at: success, last_control_at: control, last_error_at: failure,
+          ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
+            errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
+          blocked, dead_letter: deadLetter };
       });
     const ingress = storedIngress.map(({last_observed_sequence: _sequence, ...row}) =>
       ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
