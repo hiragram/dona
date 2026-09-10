@@ -145,6 +145,7 @@ export async function runService(
         throw new Error("Figma connection is not active");
       }
       const subscription=database.connections.subscriptions(connection.id).filter((candidate)=>candidate.resource===verified.resourceId &&
+        candidate.providerId===verified.principal.webhook_id &&
         candidate.revision===connection.revision && candidate.verifiedAt!==null &&
         ["active","expiring","stop_candidate"].includes(candidate.state)).at(-1);
       if (!subscription) throw new Error("Figma subscription is not active");

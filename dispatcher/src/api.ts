@@ -578,7 +578,8 @@ export class DispatcherApi {
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
       const connectionId = authenticatedConnectionId(error);
       const connectionRevision = authenticatedConnectionRevision(error);
-      if (!observe(connectionId, outcome, connectionRevision,error instanceof ExternalIngressPostPersistTimeoutError ? error.externalEventId : undefined)) {
+      if (!observe(connectionId, outcome, connectionRevision,error instanceof ExternalIngressPostPersistTimeoutError ||
+        error instanceof ExternalIngressAcknowledgementError ? error.externalEventId : undefined)) {
         throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),
           connectionId ?? "unattributed");
       }

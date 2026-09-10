@@ -115,7 +115,7 @@ export class DispatcherDatabase {
   private loadObservationLatches(): void {
     try {
       const parsed=JSON.parse(fs.readFileSync(this.observationLatchPath,"utf8")) as {schema_version?:unknown;entries?:unknown};
-      if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) return;
+      if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) throw new Error("Invalid observation latch marker");
       for (const candidate of parsed.entries) {
         if (candidate===null || typeof candidate!=="object") continue;
         const {key,outcomes,boundary}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown};
@@ -166,6 +166,11 @@ export class DispatcherDatabase {
         verification INTEGER NOT NULL CHECK(verification IN (0,1)), delivery_hash TEXT NOT NULL,
         observed_at TEXT NOT NULL,
         PRIMARY KEY(source,connection_id,connection_revision,verification,delivery_hash)
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_recoveries (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, connection_revision INTEGER NOT NULL,
+        delivery_hash TEXT NOT NULL, failure_outcome TEXT NOT NULL, observed_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,connection_revision,delivery_hash,failure_outcome)
       );
       CREATE TABLE IF NOT EXISTS external_event_errors (
         source TEXT NOT NULL, connection_id TEXT NOT NULL, error_code TEXT NOT NULL,
@@ -282,6 +287,16 @@ export class DispatcherDatabase {
               AND verification=? AND delivery_hash=?`)
               .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash);
           }
+          if (["acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(outcome)) {
+            this.db.prepare(`INSERT INTO external_ingress_recoveries
+              (source,connection_id,connection_revision,delivery_hash,failure_outcome,observed_at) VALUES(?,?,?,?,?,?)
+              ON CONFLICT(source,connection_id,connection_revision,delivery_hash,failure_outcome)
+              DO UPDATE SET observed_at=MAX(observed_at,excluded.observed_at)`)
+              .run(safeSource,boundedConnection,revision,deliveryHash,outcome,at.toISOString());
+          } else if (outcome==="duplicate_same") {
+            this.db.prepare(`DELETE FROM external_ingress_recoveries WHERE source=? AND connection_id=?
+              AND connection_revision=? AND delivery_hash=?`).run(safeSource,boundedConnection,revision,deliveryHash);
+          }
         }
       }).immediate();
       const latched=this.failedObservationLatches.get(latchKey);
@@ -327,12 +342,12 @@ export class DispatcherDatabase {
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
     const observabilityTables = this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
-      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe','external_ingress_conflicts')`).pluck().get();
-    const metricColumns = observabilityTables === 5
+      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe','external_ingress_conflicts','external_ingress_recoveries')`).pluck().get();
+    const metricColumns = observabilityTables === 6
       ? this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}> : [];
-    const metricSchema = observabilityTables === 5
+    const metricSchema = observabilityTables === 6
       ? this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string : "";
-    if (this.readOnly && (observabilityTables !== 5 || !metricColumns.some((column) => column.name === "connection_revision") ||
+    if (this.readOnly && (observabilityTables !== 6 || !metricColumns.some((column) => column.name === "connection_revision") ||
       !/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema))) {
       return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
         compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
@@ -436,6 +451,13 @@ export class DispatcherDatabase {
       const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
       return currentRevision===undefined || currentRevision===row.connection_revision;
     }).map((row)=>JSON.stringify([row.source,row.connection_id])));
+    const unresolvedRecoveryKeys=new Set((this.db.prepare(`SELECT source,connection_id,connection_revision
+      FROM external_ingress_recoveries GROUP BY source,connection_id,connection_revision`).all() as Array<{
+        source:string;connection_id:string;connection_revision:number;
+      }>).filter((row)=>{
+        const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
+        return currentRevision===undefined || currentRevision===row.connection_revision;
+      }).map((row)=>JSON.stringify([row.source,row.connection_id])));
     const ingressByConnection = new Map<string, typeof storedIngress>();
     for (const row of effectiveIngress) {
       if (row.connection_id === "") continue;
@@ -446,6 +468,7 @@ export class DispatcherDatabase {
     }
     const connectionKeys = new Set(ingressByConnection.keys());
     for (const key of unresolvedConflictKeys) connectionKeys.add(key);
+    for (const key of unresolvedRecoveryKeys) connectionKeys.add(key);
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
     for (const key of activeUnmanagedConnections ?? []) {
       const [,connection] = JSON.parse(key) as [string,string];
@@ -485,6 +508,7 @@ export class DispatcherDatabase {
         const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
         const hasUnresolvedConflict=unresolvedConflictKeys.has(key);
+        const hasUnresolvedRecovery=unresolvedRecoveryKeys.has(key);
         const allFailuresRecovered = failureRows.every((failure) => {
           const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
             "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(failure.outcome)
@@ -501,7 +525,7 @@ export class DispatcherDatabase {
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
               !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
-              unresolvedVerificationConflict || hasUnresolvedConflict || Number(terminal?.active_events ?? 0)>0));
+              unresolvedVerificationConflict || hasUnresolvedConflict || hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
@@ -511,7 +535,8 @@ export class DispatcherDatabase {
         const dataPathObserved = requiresIngressSuccess ?
           currentProcessSuccess || recoveredPersistedEvent : managedState !== undefined || currentProcessSuccess;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && !hasUnresolvedConflict && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && !hasUnresolvedConflict &&
+            !hasUnresolvedRecovery && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
           ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
             errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),

@@ -54,7 +54,7 @@ export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeo
 }
 
 export class ExternalIngressAcknowledgementError extends Error {
-  constructor(readonly persistedOutcome?: EnqueueResult["outcome"]) {
+  constructor(readonly persistedOutcome?: EnqueueResult["outcome"],readonly externalEventId?:string) {
     super("Provider acknowledgement could not be built");
     this.name = "ExternalIngressAcknowledgementError";
   }
@@ -511,7 +511,7 @@ export class ExternalIngressProcessor {
     try {
       acknowledgement = validateAcknowledgement(registration.buildAcknowledgement(receipt));
     } catch {
-      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(result.outcome), verifiedConnectionId,verifiedRevision);
+      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(result.outcome,envelope.external_event_id), verifiedConnectionId,verifiedRevision);
     }
     return { receipt, acknowledgement };
   }
