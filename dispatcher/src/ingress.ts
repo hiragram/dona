@@ -420,7 +420,9 @@ export class ExternalIngressProcessor {
     if (verifiedResourceId !== undefined) {
       const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
         connection_id: verifiedConnectionId, resource_id: verifiedResourceId });
-      if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
+      if (!parsed.success || parsed.data.kind !== "provider_resource") {
+        throw bindAuthenticatedError(new ExternalIngressAuthenticationError(),verifiedConnectionId,verifiedRevision);
+      }
       owner = parsed.data;
     }
     let normalized: NormalizedExternalEvent;
@@ -447,7 +449,9 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
-    const controlAcknowledgement = registration.controlAcknowledgement?.(normalized);
+    let controlAcknowledgement: ExternalIngressAcknowledgement | undefined;
+    try { controlAcknowledgement = registration.controlAcknowledgement?.(normalized); }
+    catch { throw bindAuthenticatedError(new ExternalIngressControlAcknowledgementError(),verifiedConnectionId,verifiedRevision); }
     if (controlAcknowledgement !== undefined) {
       let acknowledgement: PreparedExternalIngressAcknowledgement;
       try { acknowledgement = validateAcknowledgement(controlAcknowledgement); }

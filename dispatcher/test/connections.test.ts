@@ -162,6 +162,17 @@ test("verification trafficは通常data path成功として扱わない", (t) =>
   assert.equal(health.ingress_connections[0]!.last_error_at,null);
 });
 
+test("verification conflictはdurable failureとして再送成功までgateする", (t) => {
+  const {db,clock}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["notion","*"])]);
+  db.recordExternalIngress("notion","healthy","created",50,new Date(clock.now()));
+  db.recordExternalIngress("notion","conflict","created",50,new Date(clock.now()));
+  db.recordExternalIngress("notion","conflict","verification_duplicate_conflict",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("notion","conflict","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("persist後timeoutのduplicate確認は通常data pathを回復する", (t) => {
   const {db,clock}=fixture(t);
   const active=new Set([JSON.stringify(["figma","figma-pilot"])]);

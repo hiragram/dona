@@ -387,9 +387,10 @@ export class DispatcherDatabase {
           .sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
         const successRow = latest((outcome) => outcome === "created");
         const duplicateRow = latest((outcome) => outcome === "duplicate_same");
+        const verificationDuplicateRow = latest((outcome) => outcome === "verification_duplicate_same");
         const controlRow = latest((outcome) => outcome === "control_acknowledged");
         const failureRows = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome) &&
-          !row.outcome.startsWith("verification_"));
+          (!row.outcome.startsWith("verification_") || row.outcome === "verification_duplicate_conflict"));
         const failureRow = [...failureRows].sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
         const success = successRow?.last_observed_at ?? null;
         const control = controlRow?.last_observed_at ?? null;
@@ -403,13 +404,15 @@ export class DispatcherDatabase {
             "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(failure.outcome)
             ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
             : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
+            : failure.outcome === "verification_duplicate_conflict" ? verificationDuplicateRow?.last_observed_sequence ?? 0
             : successRow?.last_observed_sequence ?? 0;
           return recoverySequence > failure.last_observed_sequence;
         });
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
-              !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) || Number(terminal?.active_events ?? 0)>0));
+              (!row.outcome.startsWith("verification_") || row.outcome === "verification_duplicate_conflict") &&
+              !row.outcome.startsWith("control_")) || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>

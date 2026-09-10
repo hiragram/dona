@@ -14,6 +14,7 @@ import {
   externalEventSource,
   ExternalIngressRegistry,
   ExternalIngressProcessor,
+  ExternalIngressControlAcknowledgementError,
   ExternalIngressTimeoutError,
   scopedExternalEventId,
   type ExternalEventSourceRegistration,
@@ -732,6 +733,26 @@ test("managed bindingとprovider ownerのresource不一致を認証失敗にす�
   await assert.rejects(processor.process(externalEventSource("fake"),registered,{
     body:fakeBody(),headers:[],method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
   },()=>{throw new Error("must not persist");}),/authentication/i);
+});
+
+test("owner schema failureを認証済みconnectionへ束縛する",async()=>{
+  const registered=registration({authenticate:async()=>({connectionId:"connection-trusted",resourceId:"x".repeat(513),
+    principal:{kind:"fake_installation"}})});
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[],method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),(error)=>authenticatedConnectionId(error)==="connection-trusted");
+});
+
+test("control acknowledgement hook failureを認証済みcontrol errorへ変換する",async()=>{
+  const definition=registration();
+  const registered={...definition,controlAcknowledgement(){throw new Error("temporary dependency failure");}};
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[["x-fake-signature",signature(fakeBody())],["x-fake-connection","connection-a"]],
+    method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),(error)=>error instanceof ExternalIngressControlAcknowledgementError &&
+    authenticatedConnectionId(error)==="connection-a");
 });
 
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
