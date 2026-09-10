@@ -260,6 +260,8 @@ export class DispatcherDatabase {
     try {
       try { fs.unlinkSync(this.observationLatchPath); }
       catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
+      const latchDirectory=fs.openSync(path.dirname(this.observationLatchPath),"r");
+      try { fs.fsyncSync(latchDirectory); } finally { fs.closeSync(latchDirectory); }
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
@@ -348,8 +350,8 @@ export class DispatcherDatabase {
       return true;
     } catch {
       const failedKey=deliveryKey !== undefined && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
-        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_conflict",
-        "verification_created","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict",
+        "verification_created","verification_duplicate_same","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
         "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout",
         "verification_duplicate_conflict"].includes(outcome)
         ? deliveryKey : latchKey;
