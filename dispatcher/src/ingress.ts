@@ -57,6 +57,7 @@ export class ExternalIngressAcknowledgementError extends Error {
     this.name = "ExternalIngressAcknowledgementError";
   }
 }
+export class ExternalIngressControlAcknowledgementError extends ExternalIngressAcknowledgementError {}
 
 export interface RawIngressRequest {
   readonly body: Buffer;
@@ -107,13 +108,17 @@ export interface PersistReceipt {
 }
 
 const authenticatedConnection = Symbol("authenticatedConnection");
-type AuthenticatedError = Error & { [authenticatedConnection]?: string };
-export function bindAuthenticatedError(error: unknown, connectionId: string): unknown {
-  if (error instanceof Error) (error as AuthenticatedError)[authenticatedConnection] = connectionId;
+type AuthenticatedError = Error & { [authenticatedConnection]?: {connectionId:string;revision?:number} };
+export function bindAuthenticatedError(error: unknown, connectionId: string, revision?: number): unknown {
+  if (error instanceof Error) (error as AuthenticatedError)[authenticatedConnection] =
+    {connectionId,...(revision === undefined ? {} : {revision})};
   return error;
 }
 export function authenticatedConnectionId(error: unknown): string | undefined {
-  return error instanceof Error ? (error as AuthenticatedError)[authenticatedConnection] : undefined;
+  return error instanceof Error ? (error as AuthenticatedError)[authenticatedConnection]?.connectionId : undefined;
+}
+export function authenticatedConnectionRevision(error: unknown): number | undefined {
+  return error instanceof Error ? (error as AuthenticatedError)[authenticatedConnection]?.revision : undefined;
 }
 
 export interface ExternalIngressAcknowledgement {
@@ -397,6 +402,10 @@ export class ExternalIngressProcessor {
     }
 
     const verifiedConnectionId = verified.connectionId;
+    const verifiedRevision = verified.connection?.revision ?? 0;
+    if (registration.connectionIds !== undefined && !registration.connectionIds.includes(verifiedConnectionId)) {
+      throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId,verifiedRevision);
+    }
     let owner: ProviderOwner | undefined;
     if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) throw new ExternalIngressAuthenticationError();
     const verifiedResourceId = verifiedBinding?.resource ?? verified.resourceId;
@@ -415,8 +424,8 @@ export class ExternalIngressProcessor {
       normalized = validateNormalizedExternalEvent(registration.parseNormalized(candidate));
       remainingProcessingTime(processingDeadline);
     } catch (error) {
-      if (error instanceof ExternalIngressTimeoutError) throw bindAuthenticatedError(error, verifiedConnectionId);
-      throw bindAuthenticatedError(new ExternalIngressValidationError(), verifiedConnectionId);
+      if (error instanceof ExternalIngressTimeoutError) throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision);
+      throw bindAuthenticatedError(new ExternalIngressValidationError(), verifiedConnectionId,verifiedRevision);
     }
 
     const envelope: EventEnvelope = {
@@ -434,7 +443,7 @@ export class ExternalIngressProcessor {
     if (controlAcknowledgement !== undefined) {
       let acknowledgement: PreparedExternalIngressAcknowledgement;
       try { acknowledgement = validateAcknowledgement(controlAcknowledgement); }
-      catch { throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(),verifiedConnectionId); }
+      catch { throw bindAuthenticatedError(new ExternalIngressControlAcknowledgementError(),verifiedConnectionId,verifiedRevision); }
       return {
         receipt: {
           schemaVersion: 1,
@@ -452,7 +461,7 @@ export class ExternalIngressProcessor {
         acknowledgement,
       };
     }
-    if (owner && envelope.reply_target !== null) throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId);
+    if (owner && envelope.reply_target !== null) throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId,verifiedRevision);
     const signal = registration.queueSignal?.(normalized, verified);
     let result: EnqueueResult;
     try {
@@ -464,9 +473,9 @@ export class ExternalIngressProcessor {
         ...(verified.purpose === "verification" ? { verification: true as const,
           ...(verified.verificationCommit ? { verificationCommit: verified.verificationCommit } : {}) } : {}),
       });
-    } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId); }
+    } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision); }
     try { remainingProcessingTime(processingDeadline); }
-    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(),verifiedConnectionId); }
+    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(),verifiedConnectionId,verifiedRevision); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,
@@ -487,7 +496,7 @@ export class ExternalIngressProcessor {
     try {
       acknowledgement = validateAcknowledgement(registration.buildAcknowledgement(receipt));
     } catch {
-      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(), verifiedConnectionId);
+      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(), verifiedConnectionId,verifiedRevision);
     }
     return { receipt, acknowledgement };
   }

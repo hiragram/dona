@@ -12,6 +12,7 @@ import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import {
   ExternalIngressAcknowledgementError,
+  ExternalIngressControlAcknowledgementError,
   ExternalIngressAuthenticationError,
   ExternalIngressProcessor,
   ExternalIngressRegistry,
@@ -20,6 +21,7 @@ import {
   ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   authenticatedConnectionId,
+  authenticatedConnectionRevision,
   bindAuthenticatedError,
   type PreparedExternalIngressAcknowledgement,
   type RawIngressRequest,
@@ -566,10 +568,12 @@ export class DispatcherApi {
         error instanceof ExternalIngressPostPersistTimeoutError ? "post_persist_timeout" :
         error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
+        error instanceof ExternalIngressControlAcknowledgementError ? "control_acknowledgement_unavailable" :
         error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
       const connectionId = authenticatedConnectionId(error);
-      if (!observe(connectionId, outcome)) {
+      const connectionRevision = authenticatedConnectionRevision(error);
+      if (!observe(connectionId, outcome, connectionRevision)) {
         throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),
           connectionId ?? "unattributed");
       }

@@ -64,7 +64,8 @@ export class EventNotDispatchableError extends Error {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
-  private readonly failedObservationLatches = new Map<string,string>();
+  private readonly failedObservationLatches = new Map<string,Set<string>>();
+  private readonly runtimeObservationFloor: number;
 
   readonly connections: ConnectionRegistry;
   readonly providerRegistration: ProviderRegistrationRegistry;
@@ -96,6 +97,10 @@ export class DispatcherDatabase {
     } } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
     this.providerRegistration = new ProviderRegistrationRegistry(this.db, clock ?? legacyClock);
+    const runtimeMetricColumns = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").get() === undefined
+      ? [] : this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
+    this.runtimeObservationFloor = runtimeMetricColumns.some((column)=>column.name==="last_observed_sequence")
+      ? Number(this.db.prepare("SELECT coalesce(max(last_observed_sequence),0) FROM external_ingress_metrics").pluck().get()) : 0;
   }
 
   private migrateExternalObservability(): void {
@@ -195,14 +200,21 @@ export class DispatcherDatabase {
             last_observed_sequence=excluded.last_observed_sequence,connection_revision=excluded.connection_revision`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value, revision);
       }).immediate();
-      const latchedOutcome=this.failedObservationLatches.get(latchKey);
-      if (outcome === "created" || (["acknowledgement_unavailable","post_persist_timeout"].includes(latchedOutcome ?? "") && outcome === "duplicate_same")) {
+      const latchedOutcomes=this.failedObservationLatches.get(latchKey);
+      if (outcome === "created") {
         this.failedObservationLatches.delete(latchKey);
+      } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
+        latchedOutcomes.delete("acknowledgement_unavailable"); latchedOutcomes.delete("post_persist_timeout");
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+      } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
+        latchedOutcomes.delete("control_acknowledgement_unavailable");
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
       if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,""]));
       return true;
     } catch {
-      this.failedObservationLatches.set(latchKey,outcome);
+      const latchedOutcomes=this.failedObservationLatches.get(latchKey) ?? new Set<string>();
+      latchedOutcomes.add(outcome); this.failedObservationLatches.set(latchKey,latchedOutcomes);
       return false;
     } finally { try { this.db.pragma(`busy_timeout=${busyTimeout}`); } catch {} }
   }
@@ -355,6 +367,7 @@ export class DispatcherDatabase {
         const allFailuresRecovered = failureRows.every((failure) => {
           const recoverySequence=["acknowledgement_unavailable","post_persist_timeout"].includes(failure.outcome)
             ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
+            : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
             : successRow?.last_observed_sequence ?? 0;
           return recoverySequence > failure.last_observed_sequence;
         });
@@ -365,7 +378,9 @@ export class DispatcherDatabase {
         const recoveredPersistedEvent = failureRows.some((failure) =>
           ["acknowledgement_unavailable","post_persist_timeout"].includes(failure.outcome) &&
           (duplicateRow?.last_observed_sequence ?? 0) > failure.last_observed_sequence);
-        const dataPathObserved = requiresIngressSuccess ? successRow !== undefined || recoveredPersistedEvent : managedState !== undefined || successRow !== undefined;
+        const unmanagedCurrentSuccess = managedState !== undefined || (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
+        const dataPathObserved = requiresIngressSuccess ?
+          (managedState === undefined ? unmanagedCurrentSuccess : successRow !== undefined) || recoveredPersistedEvent : unmanagedCurrentSuccess;
         return { source, connection_id: connectionId, state,
           ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
@@ -390,10 +405,17 @@ export class DispatcherDatabase {
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
       !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
+    const activeObservationLatches=[...this.failedObservationLatches.keys()].filter((key) => {
+      const [source,connectionId]=JSON.parse(key) as [string,string];
+      if (connectionId === "") return activeRuntimeSources.has(source) || projected.some((row) => row.provider===source && row.state!=="disabled");
+      const managed=projectedByConnection.get(key);
+      return managed !== undefined ? managed.state!=="disabled" : activeUnmanagedConnections?.has(key)===true ||
+        activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true;
+    });
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && this.failedObservationLatches.size === 0 && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+      ready: writable && activeObservationLatches.length === 0 && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
         (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
