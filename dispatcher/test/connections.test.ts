@@ -360,6 +360,17 @@ test("wildcard registrationは解決済みlaneの観測latchをretired扱いに�
   assert.equal(health.ready,true);
 });
 
+test("wildcard registrationは現processのpersist済みevent latchを回復まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","needs-retry","created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","needs-retry","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
   db.recordExternalIngress("drive",undefined,"processing_timeout",50,new Date(clock.now()));

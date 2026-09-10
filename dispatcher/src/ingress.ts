@@ -195,6 +195,9 @@ export class ExternalIngressRegistry {
 
   register(registration: ExternalEventSourceRegistration): void {
     const source = externalEventSource(registration.source);
+    if (registration.connectionIds !== undefined && registration.connectionIds.length === 0) {
+      throw new Error("connectionIds must be omitted or contain at least one connection");
+    }
     if (this.registrations.has(source)) throw new Error(`External event source is already registered: ${source}`);
     if (registration.connectionIds?.some((connectionId) => !connectionIdPattern.test(connectionId))) {
       throw new Error("External event source has an invalid connection identifier");

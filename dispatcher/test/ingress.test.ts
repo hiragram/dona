@@ -639,6 +639,7 @@ describe("external ingress contract", () => {
     assert.throws(() => new ExternalIngressRegistry([{ ...registration(), source: "slack" }]), /non-reserved/);
     assert.throws(() => new ExternalIngressRegistry([registration(), registration()]), /already registered/);
     assert.throws(() => new ExternalIngressRegistry([{ ...registration(), maxBodyBytes: 0 }]), /positive integer/);
+    assert.throws(() => new ExternalIngressRegistry([{ ...registration(), connectionIds: [] }]), /connectionIds/);
     assert.throws(
       () => new ExternalIngressRegistry([{ ...registration(), processingTimeoutMs: 60_001 }]),
       /hard limit/,

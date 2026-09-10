@@ -467,8 +467,10 @@ export class DispatcherDatabase {
       if (managedConnection !== undefined) return managedConnection.state!=="disabled" && managedConnection.revision===revision;
       if (activeUnmanagedConnections?.has(managedKey)===true) return true;
       const terminal=terminalsByConnection.get(managedKey);
+      const persistedEventLatch=[...latch.outcomes].some((outcome)=>outcome==="created" || outcome==="duplicate_same" ||
+        outcome.includes("acknowledgement") || outcome.startsWith("post_persist_"));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
-        ((connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
+        (persistedEventLatch || (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
     const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
       (sourceSuccessSequence.get(source) ?? 0)>this.runtimeObservationFloor);
