@@ -255,14 +255,17 @@ export class DispatcherDatabase {
       createHash("sha256").update(deliveryId).digest("hex")]);
     const latchedBefore=this.failedObservationLatches.get(latchKey);
     const deliveryLatchedBefore=deliveryKey === undefined ? undefined : this.failedObservationLatches.get(deliveryKey);
+    const observationIntentKey=JSON.stringify(["*","",0]);
+    const hadObservationIntent=this.failedObservationLatches.has(observationIntentKey);
     let observationBoundary=Number.MAX_SAFE_INTEGER;
     let busyTimeout=2_000;
     try {
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
-      try { fs.unlinkSync(this.observationLatchPath); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
-      const latchDirectory=fs.openSync(path.dirname(this.observationLatchPath),"r");
-      try { fs.fsyncSync(latchDirectory); } finally { fs.closeSync(latchDirectory); }
+      if (!hadObservationIntent) {
+        this.failedObservationLatches.set(observationIntentKey,
+          {outcomes:new Set(["persistence_unavailable"]),boundary:Number.MAX_SAFE_INTEGER});
+        this.persistObservationLatches();
+      }
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const recoveredCreated = outcome === "duplicate_same" && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout"]
@@ -313,6 +316,7 @@ export class DispatcherDatabase {
           }
         }
       }).immediate();
+      if (!hadObservationIntent) this.failedObservationLatches.delete(observationIntentKey);
       const latched=this.failedObservationLatches.get(latchKey);
       const latchedOutcomes=latched?.outcomes;
       if (outcome === "created") {
@@ -349,6 +353,7 @@ export class DispatcherDatabase {
       this.persistObservationLatches();
       return true;
     } catch {
+      if (!hadObservationIntent) this.failedObservationLatches.delete(observationIntentKey);
       const failedKey=deliveryKey !== undefined && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
         "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict",
         "verification_created","verification_duplicate_same","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
@@ -520,6 +525,7 @@ export class DispatcherDatabase {
         const duplicateRow = latest((outcome) => outcome === "duplicate_same");
         const verificationDuplicateRow = latest((outcome) => outcome === "verification_duplicate_same");
         const controlRow = latest((outcome) => outcome === "control_acknowledged");
+        const controlFailureRow = latest((outcome) => outcome === "control_acknowledgement_unavailable");
         const failureRows = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome) &&
           (!row.outcome.startsWith("verification_") || row.outcome === "verification_duplicate_conflict"));
         const failureRow = [...failureRows].sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
@@ -544,11 +550,12 @@ export class DispatcherDatabase {
         });
         const unresolvedVerificationConflict=(latest((outcome)=>outcome==="verification_duplicate_conflict")?.last_observed_sequence ?? 0) >
           (verificationDuplicateRow?.last_observed_sequence ?? 0);
+        const unresolvedControlFailure=(controlFailureRow?.last_observed_sequence ?? 0) > (controlRow?.last_observed_sequence ?? 0);
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
               !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
-              unresolvedVerificationConflict || hasUnresolvedConflict || hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
+              unresolvedVerificationConflict || unresolvedControlFailure || hasUnresolvedConflict || hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>

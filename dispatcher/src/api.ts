@@ -454,6 +454,8 @@ export class DispatcherApi {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
       } else if (error instanceof ExternalIngressUnavailableError) {
         sendJson(response, 503, errorBody("ingress_dependency_unavailable", "Provider ingress dependency is temporarily unavailable"));
+      } else if (error instanceof ExternalIngressRegistrationMismatchError) {
+        sendJson(response, 503, errorBody("registration_mismatch", "Provider ingress registration is temporarily inconsistent"));
       } else if (error instanceof ExternalIngressValidationError) {
         sendJson(response, 400, errorBody("invalid_provider_event", "Provider event is invalid"));
       } else if (error instanceof ExternalIngressAcknowledgementError) {

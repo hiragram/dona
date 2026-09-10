@@ -222,6 +222,20 @@ describe("external ingress contract", () => {
     database.close();
   });
 
+  test("registration mismatchはprovider再送可能な503を返す", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const api=new DispatcherApi(database,{isRunning:()=>true,wake:()=>{}},jobs,config,logger,
+      undefined,undefined,undefined,new ExternalIngressRegistry([{...registration(),connectionIds:["expected"]}]));
+    await api.start();
+    try {
+      const body=fakeBody(); const response=await request(config.socketPath,"fake",body,signedHeaders(body,"unexpected"));
+      assert.equal(response.status,503);
+      assert.equal((response.body.error as {code:string}).code,"registration_mismatch");
+      assert.equal(database.list().length,0);
+    } finally { await api.stop(); database.close(); }
+  });
+
   test("converges concurrent redelivery, rejects conflicting content, and scopes IDs by connection", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
