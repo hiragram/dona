@@ -72,6 +72,7 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
   }
   return {
     source: "github",
+    connectionIds: [config.connectionId],
     maxBodyBytes: 1_048_576,
     bodyTimeoutMs: 2_000,
     processingTimeoutMs: 9_500,

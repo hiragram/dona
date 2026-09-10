@@ -64,6 +64,7 @@ export class EventNotDispatchableError extends Error {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
+  private observationPersistenceFailed = false;
 
   readonly connections: ConnectionRegistry;
   readonly providerRegistration: ProviderRegistrationRegistry;
@@ -182,11 +183,17 @@ export class DispatcherDatabase {
             last_observed_sequence=excluded.last_observed_sequence`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value);
       }).immediate();
+      this.observationPersistenceFailed = false;
       return true;
-    } catch { return false; }
+    } catch { this.observationPersistenceFailed = true; return false; }
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
+    if (this.readOnly && this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
+      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe')`).pluck().get() !== 4) {
+      return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
+        compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
+    }
     const writable = this.readOnly ? false : this.probeWritable();
     return this.db.transaction(() => this.externalReleaseHealthSnapshot(at,writable,activeUnmanagedConnections)).deferred();
   }
@@ -227,11 +234,23 @@ export class DispatcherDatabase {
         id: string; provider: string; state: string; revision: number;
         dead_letter: number; blocked: number; renewal_unknown: number; [key: string]: unknown;
       }>;
+    const cursorRows = this.db.prepare(`SELECT connection_id,revision,resource,version FROM connection_cursors
+      ORDER BY connection_id,revision,resource`).all() as Array<{connection_id:string;revision:number;resource:string;version:number}>;
+    const cursorsByConnection = new Map<string,Array<{resource:string;version:number}>>();
+    for (const {connection_id,revision,resource,version} of cursorRows) {
+      const key=JSON.stringify([connection_id,revision]); const rows=cursorsByConnection.get(key) ?? [];
+      rows.push({resource,version}); cursorsByConnection.set(key,rows);
+    }
+    const managedErrorRows = this.db.prepare(`SELECT source,connection_id,error_code,count,last_error_at FROM external_event_errors
+      ORDER BY source,connection_id,error_code`).all() as Array<{source:string;connection_id:string;error_code:string;count:number;last_error_at:string}>;
+    const managedErrorsByConnection = new Map<string,Array<{error_code:string;count:number;last_error_at:string}>>();
+    for (const {source,connection_id,error_code,count,last_error_at} of managedErrorRows) {
+      const key=JSON.stringify([source,connection_id]); const rows=managedErrorsByConnection.get(key) ?? [];
+      rows.push({error_code,count,last_error_at}); managedErrorsByConnection.set(key,rows);
+    }
     const projected = connections.map((row) => ({ ...row,
-      cursors: this.db.prepare(`SELECT resource,version FROM connection_cursors
-        WHERE connection_id=? AND revision=? ORDER BY resource`).all(row.id, row.revision),
-      errors: this.db.prepare(`SELECT error_code,count,last_error_at FROM external_event_errors
-        WHERE source=? AND connection_id=? ORDER BY error_code`).all(row.provider, row.id),
+      cursors:cursorsByConnection.get(JSON.stringify([row.id,row.revision])) ?? [],
+      errors:managedErrorsByConnection.get(JSON.stringify([row.provider,row.id])) ?? [],
     }));
     const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence
       FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
@@ -260,10 +279,7 @@ export class DispatcherDatabase {
         source:string;connection_id:string;blocked:number;dead_letter:number;
       }>;
     const terminalsByConnection = new Map(terminalRows.map((row) => [JSON.stringify([row.source,row.connection_id]),row]));
-    const eventErrors = this.db.prepare(`SELECT source,connection_id,error_code,count,last_error_at
-      FROM external_event_errors ORDER BY source,connection_id,error_code`).all() as Array<{
-        source:string;connection_id:string;error_code:string;count:number;last_error_at:string;
-      }>;
+    const eventErrors = managedErrorRows;
     const errorsByConnection = new Map<string,typeof eventErrors>();
     for (const row of eventErrors) {
       const key = JSON.stringify([row.source,row.connection_id]);
@@ -275,6 +291,7 @@ export class DispatcherDatabase {
         const latest = (predicate: (outcome:string) => boolean) => rows.filter((row) => predicate(row.outcome))
           .sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
         const successRow = latest((outcome) => outcome === "created");
+        const duplicateRow = latest((outcome) => outcome === "duplicate_same");
         const controlRow = latest((outcome) => outcome === "control_acknowledged");
         const failureRow = latest((outcome) => !["created","duplicate_same","control_acknowledged"].includes(outcome));
         const success = successRow?.last_observed_at ?? null;
@@ -286,8 +303,10 @@ export class DispatcherDatabase {
         const managedState = projectedByConnection.get(key)?.state;
         const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
         const dataPathObserved = managedState !== undefined || successRow !== undefined;
+        const recoveryRow = failureRow?.outcome === "acknowledgement_unavailable" &&
+          (duplicateRow?.last_observed_sequence ?? 0) > (successRow?.last_observed_sequence ?? 0) ? duplicateRow : successRow;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || (dataPathObserved && (failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && (failureRow === undefined || (recoveryRow !== undefined && recoveryRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
           ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
             errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
@@ -299,12 +318,16 @@ export class DispatcherDatabase {
     for (const row of storedIngress) if (row.outcome === "created") {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
+    const activeRuntimeSources = new Set([...activeUnmanagedConnections ?? []].map((key) => (JSON.parse(key) as [string,string])[0]));
     const unattributedDependenciesReady = storedIngress.filter((row) => row.connection_id === "" && row.outcome === "dependency_unavailable")
-      .every((row) => (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence);
+      .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
+        (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence);
+    const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
+      !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true);
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+      ready: writable && !this.observationPersistenceFailed && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
         (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
