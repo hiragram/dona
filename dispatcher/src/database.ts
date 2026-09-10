@@ -122,6 +122,14 @@ export class DispatcherDatabase {
         if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
           !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
           typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) throw new Error("Invalid observation latch entry");
+        const keyParts=JSON.parse(key) as unknown;
+        if (!Array.isArray(keyParts) || ![3,4].includes(keyParts.length) ||
+          typeof keyParts[0]!=="string" || !(/^\*$/.test(keyParts[0]) || /^[a-z][a-z0-9._-]{0,63}$/.test(keyParts[0])) ||
+          typeof keyParts[1]!=="string" || !(/^$/.test(keyParts[1]) || /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(keyParts[1])) ||
+          typeof keyParts[2]!=="number" || !Number.isSafeInteger(keyParts[2]) || keyParts[2]<0 ||
+          (keyParts.length===4 && (typeof keyParts[3]!=="string" || !/^[a-f0-9]{64}$/.test(keyParts[3])))) {
+          throw new Error("Invalid observation latch key");
+        }
         this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary});
       }
     } catch { this.failedObservationLatches.set(JSON.stringify(["*","",0]),
@@ -288,7 +296,9 @@ export class DispatcherDatabase {
               .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash);
           }
           if (["acknowledgement_unavailable_after_created","post_persist_created_timeout",
-            "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout"].includes(outcome)) {
+            "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
+            "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+            "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout"].includes(outcome)) {
             this.db.prepare(`INSERT INTO external_ingress_recoveries
               (source,connection_id,connection_revision,delivery_hash,failure_outcome,observed_at) VALUES(?,?,?,?,?,?)
               ON CONFLICT(source,connection_id,connection_revision,delivery_hash,failure_outcome)
@@ -326,9 +336,11 @@ export class DispatcherDatabase {
         const deliveryLatch=this.failedObservationLatches.get(deliveryKey);
         if (deliveryLatch !== undefined) {
           for (const recovered of outcome === "duplicate_same"
-            ? ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout","duplicate_conflict"]
+            ? ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+              "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_conflict"]
             : ["verification_created","verification_acknowledgement_unavailable_after_created",
-              "verification_post_persist_created_timeout","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
+              "verification_post_persist_created_timeout","verification_acknowledgement_unavailable_after_duplicate",
+              "verification_post_persist_duplicate_timeout","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
           if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
         }
       }
@@ -336,8 +348,10 @@ export class DispatcherDatabase {
       return true;
     } catch {
       const failedKey=deliveryKey !== undefined && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
-        "duplicate_conflict","verification_created","verification_acknowledgement_unavailable_after_created",
-        "verification_post_persist_created_timeout","verification_duplicate_conflict"].includes(outcome)
+        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_conflict",
+        "verification_created","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+        "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout",
+        "verification_duplicate_conflict"].includes(outcome)
         ? deliveryKey : latchKey;
       const latched=this.failedObservationLatches.get(failedKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
       latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
