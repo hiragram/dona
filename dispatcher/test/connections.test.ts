@@ -230,6 +230,31 @@ test("成功outcomeの観測latchは同じ成功の再観測で解除する", (t
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("verification created観測latchはverification duplicateで解除する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["notion","notion-pilot"])]);
+  db.recordExternalIngress("notion","notion-pilot","created",50,new Date(clock.now()));
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("notion","notion-pilot","verification_created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("notion","notion-pilot","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("未帰属latchは全active connectionがfailure境界を越えるまで残る", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","a"]),JSON.stringify(["custom","b"])]);
+  db.recordExternalIngress("custom","a","created",50,new Date(clock.now()));
+  db.recordExternalIngress("custom","b","created",50,new Date(clock.now()));
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom",undefined,"processing_timeout",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("custom","a","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","b","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("duplicate起点のpost-persist timeoutはdata path成功に昇格しない", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
   db.recordExternalIngress("figma","figma-pilot","post_persist_duplicate_timeout",50,new Date(clock.now()));
@@ -306,6 +331,19 @@ test("wildcard registrationは履歴connectionを個別の再稼働対象にし�
   assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.state,"retired");
   restarted.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
   assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("wildcard registrationは未解決queue laneをactive gateに残す", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1); const source=externalEventSource("custom");
+  const queued=db.enqueue({schema_version:1,source,external_event_id:scopedExternalEventId(source,"blocked","event-1"),
+    type:"custom.changed",occurred_at:new Date(clock.now()).toISOString(),subject:{},payload:{},reply_target:null},
+    new Date(clock.now()),{connectionId:"blocked"}).row;
+  db.markBlocked(queued.event_id,"fixture"); db.close();
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  restarted.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  const health=restarted.externalReleaseHealth(new Date(clock.now()),new Set([JSON.stringify(["custom","*"])]));
+  assert.equal(health.ingress_connections.find((row)=>row.connection_id==="blocked")!.state,"unmanaged");
+  assert.equal(health.ready,false);
 });
 
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {

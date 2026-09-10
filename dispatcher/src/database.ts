@@ -64,7 +64,7 @@ export class EventNotDispatchableError extends Error {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
-  private readonly failedObservationLatches = new Map<string,Set<string>>();
+  private readonly failedObservationLatches = new Map<string,{outcomes:Set<string>;boundary:number}>();
   private readonly runtimeObservationFloor: number;
 
   readonly connections: ConnectionRegistry;
@@ -194,11 +194,13 @@ export class DispatcherDatabase {
     const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
     const latchKey=JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0]);
     const latchedBefore=this.failedObservationLatches.get(latchKey);
+    let observationBoundary=0;
     let busyTimeout=2_000;
     try {
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
-      const recoveredCreated = outcome === "duplicate_same" && latchedBefore?.has("created") === true;
+      observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
+      const recoveredCreated = outcome === "duplicate_same" && latchedBefore?.outcomes.has("created") === true;
       const effectiveOutcome = recoveredCreated ? "created" : outcome;
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(effectiveOutcome) ? effectiveOutcome : "internal_error";
       busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
@@ -217,7 +219,8 @@ export class DispatcherDatabase {
             last_observed_sequence=excluded.last_observed_sequence,connection_revision=excluded.connection_revision`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value, revision);
       }).immediate();
-      const latchedOutcomes=this.failedObservationLatches.get(latchKey);
+      const latched=this.failedObservationLatches.get(latchKey);
+      const latchedOutcomes=latched?.outcomes;
       if (outcome === "created") {
         if (latchedOutcomes !== undefined) {
           for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable"].includes(latched)) latchedOutcomes.delete(latched);
@@ -231,12 +234,15 @@ export class DispatcherDatabase {
       } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
         latchedOutcomes.delete("control_acknowledged"); latchedOutcomes.delete("control_acknowledgement_unavailable");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+      } else if (latchedOutcomes !== undefined && outcome === "verification_duplicate_same") {
+        latchedOutcomes.delete("verification_created"); latchedOutcomes.delete("verification_duplicate_same");
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
-      if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,"",0]));
       return true;
     } catch {
-      const latchedOutcomes=this.failedObservationLatches.get(latchKey) ?? new Set<string>();
-      latchedOutcomes.add(outcome); this.failedObservationLatches.set(latchKey,latchedOutcomes);
+      const latched=this.failedObservationLatches.get(latchKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
+      latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
+      this.failedObservationLatches.set(latchKey,latched);
       return false;
     } finally { try { this.db.pragma(`busy_timeout=${busyTimeout}`); } catch {} }
   }
@@ -359,10 +365,11 @@ export class DispatcherDatabase {
       if (connection !== "*") connectionKeys.add(key);
     }
     const terminalRows = this.db.prepare(`SELECT l.source,l.connection connection_id,
-      sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
+      sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter,
+      sum(e.status!='completed') active_events
       FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
       WHERE l.class='external' GROUP BY l.source,l.connection`).all() as Array<{
-        source:string;connection_id:string;blocked:number;dead_letter:number;
+        source:string;connection_id:string;blocked:number;dead_letter:number;active_events:number;
       }>;
     const terminalsByConnection = new Map(terminalRows.map((row) => [JSON.stringify([row.source,row.connection_id]),row]));
     const eventErrors = managedErrorRows;
@@ -399,7 +406,7 @@ export class DispatcherDatabase {
         });
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
-            rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor));
+            (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor) || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
@@ -447,9 +454,14 @@ export class DispatcherDatabase {
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
       !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
-    const activeObservationLatches=[...this.failedObservationLatches.keys()].filter((key) => {
+    const activeObservationLatches=[...this.failedObservationLatches].filter(([key,latch]) => {
       const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
-      if (connectionId === "") return activeRuntimeSources.has(source) || projected.some((row) => row.provider===source && row.state!=="disabled");
+      if (connectionId === "") {
+        const concrete=gateRuntimeKeys.filter(([candidate,candidateConnection])=>candidate===source && candidateConnection!=="*");
+        if (concrete.length>0) return concrete.some(([candidate,candidateConnection])=>
+          (connectionDataPathSequence.get(JSON.stringify([candidate,candidateConnection])) ?? 0)<=latch.boundary);
+        return activeRuntimeSources.has(source) && (sourceSuccessSequence.get(source) ?? 0)<=latch.boundary;
+      }
       const managedKey=JSON.stringify([source,connectionId]);
       const managedConnection=projectedByConnection.get(managedKey);
       return managedConnection !== undefined ? managedConnection.state!=="disabled" && managedConnection.revision===revision : activeUnmanagedConnections?.has(managedKey)===true ||
