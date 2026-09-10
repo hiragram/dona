@@ -98,6 +98,7 @@ export class DispatcherDatabase {
   }
 
   private migrateExternalObservability(): void {
+    const hadErrorHistory = this.db.prepare("SELECT 1 present FROM sqlite_master WHERE type='table' AND name='external_event_errors'").get() !== undefined;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS external_ingress_metrics (
         source TEXT NOT NULL,
@@ -134,6 +135,15 @@ export class DispatcherDatabase {
           last_error_at=MAX(last_error_at,excluded.last_error_at);
       END;
     `);
+    if (!hadErrorHistory) this.db.exec(`
+      INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
+      SELECT e.source,coalesce(b.connection_id,l.connection,''),e.last_error_code,count(*),max(e.updated_at)
+      FROM events e LEFT JOIN connection_event_bindings b USING(event_id)
+      LEFT JOIN queue_events q USING(event_id) LEFT JOIN queue_lanes l USING(lane)
+      WHERE e.last_error_code IS NOT NULL AND e.last_error_code!='provider_fetching'
+        AND e.source NOT IN ('slack','dona_job','dona_update')
+      GROUP BY e.source,coalesce(b.connection_id,l.connection,''),e.last_error_code;
+    `);
     const sequence = this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").get();
     if (sequence === undefined) this.db.prepare("INSERT INTO external_ingress_sequence(singleton,value) VALUES(1,0)").run();
     const metricColumns = this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
@@ -154,7 +164,7 @@ export class DispatcherDatabase {
     }
   }
 
-  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): void {
+  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): boolean {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
     try {
       const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
@@ -172,7 +182,8 @@ export class DispatcherDatabase {
             last_observed_sequence=excluded.last_observed_sequence`)
           .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value);
       }).immediate();
-    } catch {}
+      return true;
+    } catch { return false; }
   }
 
   externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
@@ -263,7 +274,7 @@ export class DispatcherDatabase {
         const rows = ingressByConnection.get(key) ?? [];
         const latest = (predicate: (outcome:string) => boolean) => rows.filter((row) => predicate(row.outcome))
           .sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
-        const successRow = latest((outcome) => ["created","duplicate_same"].includes(outcome));
+        const successRow = latest((outcome) => outcome === "created");
         const controlRow = latest((outcome) => outcome === "control_acknowledged");
         const failureRow = latest((outcome) => !["created","duplicate_same","control_acknowledged"].includes(outcome));
         const success = successRow?.last_observed_at ?? null;
@@ -285,7 +296,7 @@ export class DispatcherDatabase {
     const ingress = storedIngress.map(({last_observed_sequence: _sequence, ...row}) =>
       ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
     const sourceSuccessSequence = new Map<string,number>();
-    for (const row of storedIngress) if (["created","duplicate_same"].includes(row.outcome)) {
+    for (const row of storedIngress) if (row.outcome === "created") {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
     const unattributedDependenciesReady = storedIngress.filter((row) => row.connection_id === "" && row.outcome === "dependency_unavailable")
@@ -293,7 +304,8 @@ export class DispatcherDatabase {
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
+      ready: writable && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+        (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
       connections: projected,

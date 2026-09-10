@@ -517,9 +517,9 @@ export class DispatcherApi {
     // 未認証 request が認証済み delivery の source quota を消費しないよう、共有 bucket はここに置かない。
     // raw body の size/time limit 後、認証済み connection 単位の durable queue admission が rate を制限する。
     const monotonicNow = performance.now();
-    const observe = (connectionId: string | undefined, outcome: string): void => {
+    const observe = (connectionId: string | undefined, outcome: string): boolean => {
       const latency = performance.now() - startedAt;
-      setImmediate(() => this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency));
+      return this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency);
     };
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
@@ -566,7 +566,11 @@ export class DispatcherApi {
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
         error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
-      observe(authenticatedConnectionId(error), outcome);
+      const connectionId = authenticatedConnectionId(error);
+      if (!observe(connectionId, outcome)) {
+        throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),
+          connectionId ?? "unattributed");
+      }
       if (
         error instanceof ConnectionError ||
         error instanceof QueueAdmissionError ||
@@ -583,7 +587,9 @@ export class DispatcherApi {
     }
 
     const { receipt } = result;
-    observe(receipt.connectionId, receipt.control === true ? "control_acknowledged" : receipt.outcome);
+    if (!observe(receipt.connectionId, receipt.control === true ? "control_acknowledged" : receipt.outcome)) {
+      throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),receipt.connectionId);
+    }
     if (receipt.outcome === "duplicate_conflict") {
       this.logger.warn("External event duplicate conflicts with persisted content", {
         event_id: receipt.eventId,
