@@ -251,6 +251,10 @@ export class DispatcherApi {
         sendJson(response, 200, this.database.queueHealth());
         return;
       }
+      if (request.method === "GET" && url.pathname === "/v1/external-events/health") {
+        sendJson(response, 200, this.database.externalReleaseHealth());
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -477,6 +481,7 @@ export class DispatcherApi {
   }
 
   private async handleExternalIngress(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    const startedAt = performance.now();
     if (request.method !== "POST" || url.pathname.split("/").length !== 4) {
       throw new ApiRequestError(404, "not_found", "Route not found", true);
     }
@@ -538,6 +543,13 @@ export class DispatcherApi {
         },
       );
     } catch (error) {
+      const outcome = error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
+        error instanceof ExternalIngressValidationError ? "invalid_event" :
+        error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
+        error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
+        error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :
+        error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
+      this.database.recordExternalIngress(resolved.source, undefined, outcome, performance.now() - startedAt);
       if (
         error instanceof ConnectionError ||
         error instanceof QueueAdmissionError ||
@@ -553,6 +565,7 @@ export class DispatcherApi {
     }
 
     const { receipt } = result;
+    this.database.recordExternalIngress(receipt.source, receipt.connectionId, receipt.outcome, performance.now() - startedAt);
     if (receipt.outcome === "duplicate_conflict") {
       this.logger.warn("External event duplicate conflicts with persisted content", {
         event_id: receipt.eventId,

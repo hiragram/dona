@@ -86,10 +86,70 @@ export class DispatcherDatabase {
         if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
         migrateConnections(this.db);
         migrateEventRouting(this.db);
+        this.migrateExternalObservability();
       }).immediate();
     } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
     this.providerRegistration = new ProviderRegistrationRegistry(this.db, clock ?? legacyClock);
+  }
+
+  private migrateExternalObservability(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS external_ingress_metrics (
+        source TEXT NOT NULL,
+        connection_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        latency_bucket TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        PRIMARY KEY(source, connection_id, outcome, latency_bucket)
+      );
+    `);
+  }
+
+  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date()): void {
+    // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
+    try {
+      const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
+      const knownConnection = connectionId !== undefined && this.db.prepare("SELECT 1 FROM connections WHERE id=? AND provider=?").get(connectionId, safeSource);
+      const boundedConnection = knownConnection ? connectionId! : "unattributed";
+      const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
+      const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
+      this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at)
+        VALUES(?,?,?,?,1,?) ON CONFLICT(source,connection_id,outcome,latency_bucket)
+        DO UPDATE SET count=count+1,last_observed_at=excluded.last_observed_at`)
+        .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString());
+    } catch {}
+  }
+
+  externalReleaseHealth(at = new Date()) {
+    const now = at.getTime();
+    const connections = this.db.prepare(`SELECT c.id,c.provider,c.state,c.revision,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('queued','retryable_failed')) queue_depth,
+      coalesce((SELECT max(MAX(0, ?-strftime('%s',e.created_at)*1000)) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status!='completed'),0) queue_lag_ms,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status='dead_letter') dead_letter,
+      (SELECT max(last_delivery_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_delivery_at,
+      (SELECT max(last_reconcile_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_reconcile_at,
+      (SELECT min(expires_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
+        AND s.state NOT IN ('stopped','stop_candidate')) subscription_expires_at,
+      (SELECT count(*) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
+        AND s.state='renewal_unknown') renewal_unknown,
+      (SELECT max(version) FROM connection_cursors cur WHERE cur.connection_id=c.id AND cur.revision=c.revision) cursor_version,
+      (SELECT max(e.updated_at) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.last_error_code IS NOT NULL) last_error_at
+      FROM connections c ORDER BY c.provider,c.id`).all(now) as Array<Record<string, unknown>>;
+    return {
+      schema_version: 1,
+      observed_at: at.toISOString(),
+      ready: this.connections.health().ready && connections.every((row) => Number(row.dead_letter) === 0 && Number(row.renewal_unknown) === 0),
+      connections,
+      ingress: this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
+        FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all(),
+      queue: this.queueHealth(at),
+    };
   }
 
   private migrate(): void {

@@ -1,5 +1,7 @@
 # Dona Dispatcher
 
+External Eventsの横断release判定とincident/recoveryは [`docs/operations/external-event-release-gate.md`](../docs/operations/external-event-release-gate.md) を参照してください。
+
 ## Notion webhook pilot
 
 `createNotionRegistration`は、少数resourceに限定したNotion webhook adapterを提供する。初回の

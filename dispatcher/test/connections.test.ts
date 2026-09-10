@@ -55,6 +55,26 @@ function event(id = "change1"): EventEnvelope {
     occurred_at: "2026-09-05T00:00:00.000Z", subject: { resource: "folder1" }, payload: { value: 1 }, reply_target: null };
 }
 
+test("release healthはconnection別のqueue・cursor・ingress結果をsecretなしで公開する", (t) => {
+  const {db,clock,file} = fixture(t);
+  db.recordExternalIngress("drive", "pilot", "created", 99, new Date(clock.now()));
+  db.recordExternalIngress("drive", "unknown", "authentication_failed", 5_001, new Date(clock.now()));
+  const health = db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ready, false);
+  assert.deepEqual(health.ingress, [
+    { source: "drive", connection_id: "pilot", outcome: "created", latency_bucket: "lt_100ms", count: 1, last_observed_at: new Date(clock.now()).toISOString() },
+    { source: "drive", connection_id: "unattributed", outcome: "authentication_failed", latency_bucket: "gte_5s", count: 1, last_observed_at: new Date(clock.now()).toISOString() },
+  ]);
+  assert.deepEqual(health.connections.map((entry) => ({ id: entry.id, provider: entry.provider, state: entry.state })),
+    [{ id: "pilot", provider: "drive", state: "verification_pending" }]);
+  const encoded = JSON.stringify(health);
+  assert.doesNotMatch(encoded, /cred_fixture|checkpoint|token|secret/i);
+  db.close();
+  const reopened = new DispatcherDatabase(file,clock);
+  try { assert.equal(reopened.externalReleaseHealth(new Date(clock.now())).ingress.length,2); }
+  finally { reopened.close(); }
+});
+
 test("create→verify→renew→overlap dedup→cutover→stop→disable は永続化される", async (t) => {
   const {db,clock,driver,lifecycle,file} = fixture(t);
   await lifecycle.createOrRenew("pilot","folder1");
