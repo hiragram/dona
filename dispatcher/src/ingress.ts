@@ -410,7 +410,7 @@ export class ExternalIngressProcessor {
     const verifiedConnectionId = verified.connectionId;
     const verifiedRevision = verified.connection?.revision ?? 0;
     if (registration.connectionIds !== undefined && !registration.connectionIds.includes(verifiedConnectionId)) {
-      throw new ExternalIngressRegistrationMismatchError();
+      throw bindAuthenticatedError(new ExternalIngressRegistrationMismatchError(),verifiedConnectionId,verifiedRevision);
     }
     let owner: ProviderOwner | undefined;
     if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) {

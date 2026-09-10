@@ -83,8 +83,8 @@ export class DispatcherDatabase {
       try { return existing.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_ingress_conflicts'").get()!==undefined; }
       finally { existing.close(); } })();
     if (!this.readOnly) {
-      fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
-      fs.chmodSync(path.dirname(databasePath), 0o700);
+      const databaseDirectory=path.dirname(databasePath);
+      if (!fs.existsSync(databaseDirectory)) fs.mkdirSync(databaseDirectory,{recursive:true,mode:0o700});
     }
     this.db = new Database(databasePath, this.readOnly ? {readonly:true,fileMustExist:true} : undefined);
     if (!this.readOnly) fs.chmodSync(databasePath, 0o600);
@@ -253,19 +253,23 @@ export class DispatcherDatabase {
     const latchKey=JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0]);
     const deliveryKey=deliveryId === undefined ? undefined : JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0,
       createHash("sha256").update(deliveryId).digest("hex")]);
+    const deliveryBoundOutcomes=["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+      "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict",
+      "verification_created","verification_duplicate_same","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+      "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout","verification_duplicate_conflict"];
     const latchedBefore=this.failedObservationLatches.get(latchKey);
     const deliveryLatchedBefore=deliveryKey === undefined ? undefined : this.failedObservationLatches.get(deliveryKey);
-    const observationIntentKey=JSON.stringify(["*","",0]);
-    const hadObservationIntent=this.failedObservationLatches.has(observationIntentKey);
+    const observationIntentKey=deliveryKey !== undefined && deliveryBoundOutcomes.includes(outcome) ? deliveryKey : latchKey;
+    const observationIntent=this.failedObservationLatches.get(observationIntentKey);
+    const hadObservationIntent=observationIntent?.outcomes.has(outcome)===true;
     let observationBoundary=Number.MAX_SAFE_INTEGER;
     let busyTimeout=2_000;
     try {
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
-      if (!hadObservationIntent) {
-        this.failedObservationLatches.set(observationIntentKey,
-          {outcomes:new Set(["persistence_unavailable"]),boundary:Number.MAX_SAFE_INTEGER});
-        this.persistObservationLatches();
-      }
+      const pendingIntent=observationIntent ?? {outcomes:new Set<string>(),boundary:observationBoundary};
+      pendingIntent.outcomes.add(outcome); pendingIntent.boundary=Math.max(pendingIntent.boundary,observationBoundary);
+      this.failedObservationLatches.set(observationIntentKey,pendingIntent);
+      this.persistObservationLatches();
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const recoveredCreated = outcome === "duplicate_same" && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout"]
@@ -316,7 +320,11 @@ export class DispatcherDatabase {
           }
         }
       }).immediate();
-      if (!hadObservationIntent) this.failedObservationLatches.delete(observationIntentKey);
+      if (!hadObservationIntent) {
+        const completedIntent=this.failedObservationLatches.get(observationIntentKey);
+        completedIntent?.outcomes.delete(outcome);
+        if (completedIntent?.outcomes.size===0) this.failedObservationLatches.delete(observationIntentKey);
+      }
       const latched=this.failedObservationLatches.get(latchKey);
       const latchedOutcomes=latched?.outcomes;
       if (outcome === "created") {
@@ -353,12 +361,7 @@ export class DispatcherDatabase {
       this.persistObservationLatches();
       return true;
     } catch {
-      if (!hadObservationIntent) this.failedObservationLatches.delete(observationIntentKey);
-      const failedKey=deliveryKey !== undefined && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
-        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict",
-        "verification_created","verification_duplicate_same","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
-        "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout",
-        "verification_duplicate_conflict"].includes(outcome)
+      const failedKey=deliveryKey !== undefined && deliveryBoundOutcomes.includes(outcome)
         ? deliveryKey : latchKey;
       const latched=this.failedObservationLatches.get(failedKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
       latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
