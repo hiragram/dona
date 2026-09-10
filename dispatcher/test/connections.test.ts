@@ -66,8 +66,8 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
   const health = db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ready, false);
   assert.deepEqual(health.ingress, [
+    { source: "drive", connection_id: null, outcome: "authentication_failed", latency_bucket: "gte_5s", count: 1, last_observed_at: new Date(clock.now()).toISOString() },
     { source: "drive", connection_id: "pilot", outcome: "created", latency_bucket: "lt_100ms", count: 2, last_observed_at: new Date(clock.now()).toISOString() },
-    { source: "drive", connection_id: "unattributed", outcome: "authentication_failed", latency_bucket: "gte_5s", count: 1, last_observed_at: new Date(clock.now()).toISOString() },
   ]);
   assert.deepEqual(health.connections.map((entry) => ({ id: entry.id, provider: entry.provider, state: entry.state })),
     [{ id: "pilot", provider: "drive", state: "verification_pending" }]);
@@ -75,7 +75,7 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
     { resource: "folder1", version: 0 }, { resource: "folder2", version: 7 },
   ]);
   assert.deepEqual(health.ingress_connections, [{ source: "drive", connection_id: "pilot", ready: true,
-    last_success_at: new Date(clock.now()).toISOString(), last_error_at: null }]);
+    last_success_at: new Date(clock.now()).toISOString(), last_error_at: null, blocked: 0, dead_letter: 0 }]);
   const encoded = JSON.stringify(health);
   assert.doesNotMatch(encoded, /cred_fixture|checkpoint|token|secret/i);
   db.close();
@@ -90,11 +90,19 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   let health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ready,false);
   assert.deepEqual(health.ingress_connections,[{source:"figma",connection_id:"figma-pilot",ready:false,
-    last_success_at:null,last_error_at:new Date(clock.now()).toISOString()}]);
+    last_success_at:null,last_error_at:new Date(clock.now()).toISOString(),blocked:0,dead_letter:0}]);
   clock.value+=1;
   db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
   health=db.externalReleaseHealth(new Date(clock.now()));
   assert.equal(health.ingress_connections[0]!.ready,true);
+  const figmaSource=externalEventSource("figma");
+  const queued=db.enqueue({schema_version:1,source:figmaSource,external_event_id:scopedExternalEventId(figmaSource,"figma-pilot","event-1"),
+    type:"figma.file_update",occurred_at:new Date(clock.now()).toISOString(),subject:{file_key:"fixture"},payload:{},reply_target:null},
+    new Date(clock.now()),{connectionId:"figma-pilot"}).row;
+  db.markBlocked(queued.event_id,"fixture terminal failure");
+  health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ingress_connections[0]!.blocked,1);
+  assert.equal(health.ingress_connections[0]!.ready,false);
 });
 
 test("release healthはblockedと復旧済みerror履歴をrelease停止条件にする", async (t) => {

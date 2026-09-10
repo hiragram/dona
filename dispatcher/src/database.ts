@@ -109,6 +109,7 @@ export class DispatcherDatabase {
         count INTEGER NOT NULL, last_error_at TEXT NOT NULL,
         PRIMARY KEY(source,connection_id,error_code)
       );
+      UPDATE external_ingress_metrics SET connection_id='' WHERE connection_id='unattributed';
       DROP TRIGGER IF EXISTS external_event_error_history;
       CREATE TRIGGER external_event_error_history AFTER UPDATE OF last_error_code ON events
       WHEN NEW.last_error_code IS NOT NULL AND NEW.last_error_code!='provider_fetching'
@@ -128,7 +129,7 @@ export class DispatcherDatabase {
       const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId)
-        ? connectionId : "unattributed";
+        ? connectionId : "";
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
       this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at)
@@ -139,7 +140,14 @@ export class DispatcherDatabase {
   }
 
   externalReleaseHealth(at = new Date()) {
+    return this.db.transaction(() => this.externalReleaseHealthSnapshot(at)).deferred();
+  }
+
+  private externalReleaseHealthSnapshot(at: Date) {
     const now = at.getTime();
+    let writable = true;
+    try { this.db.prepare("UPDATE external_ingress_metrics SET count=count WHERE 0").run(); }
+    catch { writable = false; }
     const connections = this.db.prepare(`SELECT c.id,c.provider,c.state,c.revision,
       (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
         WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('queued','retryable_failed')) queue_depth,
@@ -166,26 +174,34 @@ export class DispatcherDatabase {
       errors: this.db.prepare(`SELECT error_code,count,last_error_at FROM external_event_errors
         WHERE source=? AND connection_id=? ORDER BY error_code`).all(row.provider, row.id),
     }));
-    const ingress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
+    const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
       FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
         source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
       }>;
-    const ingressConnections = [...new Set(ingress.filter((row) => row.connection_id !== "unattributed")
+    const ingressConnections = [...new Set(storedIngress.filter((row) => row.connection_id !== "")
       .map((row) => JSON.stringify([row.source,row.connection_id])))].map((key) => {
         const [source,connectionId] = JSON.parse(key) as [string,string];
-        const rows = ingress.filter((row) => row.source === source && row.connection_id === connectionId);
+        const rows = storedIngress.filter((row) => row.source === source && row.connection_id === connectionId);
         const success = rows.filter((row) => ["created","duplicate_same","control_acknowledged"].includes(row.outcome))
           .map((row) => row.last_observed_at).sort().at(-1) ?? null;
         const failure = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome))
           .map((row) => row.last_observed_at).sort().at(-1) ?? null;
-        return { source, connection_id: connectionId, ready: failure === null || (success !== null && success > failure),
-          last_success_at: success, last_error_at: failure };
+        const terminal = this.db.prepare(`SELECT
+          sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
+          FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
+          WHERE l.source=? AND l.connection=?`).get(source,connectionId) as {blocked:number|null;dead_letter:number|null};
+        const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
+        return { source, connection_id: connectionId,
+          ready: (failure === null || (success !== null && success > failure)) && blocked === 0 && deadLetter === 0,
+          last_success_at: success, last_error_at: failure, blocked, dead_letter: deadLetter };
       });
+    const ingress = storedIngress.map((row) => ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
+      ready: writable && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
         ingressConnections.every((row) => row.ready),
+      writable,
       connections: projected,
       ingress_connections: ingressConnections,
       ingress,
