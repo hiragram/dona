@@ -432,7 +432,9 @@ test("wildcard registrationは解決済みlaneの観測latchをretired扱いに�
     new Date(clock.now()),{connectionId:"old"}).row;
   const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
   assert.equal(db.recordExternalIngress("custom","old","queue_depth",50,new Date(clock.now())),false);
-  lock.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(queued.event_id); lock.exec("COMMIT"); lock.close();
+  clock.value+=1;
+  lock.prepare("UPDATE events SET status='completed',updated_at=? WHERE event_id=?").run(new Date(clock.now()).toISOString(),queued.event_id);
+  lock.exec("COMMIT"); lock.close();
   db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
   const health=db.externalReleaseHealth(new Date(clock.now()),new Set([JSON.stringify(["custom","*"])]));
   assert.equal(health.ingress_connections.find((row)=>row.connection_id==="old")!.state,"retired");

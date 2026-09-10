@@ -64,7 +64,7 @@ export class EventNotDispatchableError extends Error {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly readOnly: boolean;
-  private readonly failedObservationLatches = new Map<string,{outcomes:Set<string>;boundary:number}>();
+  private readonly failedObservationLatches = new Map<string,{outcomes:Set<string>;boundary:number;observedAt:number}>();
   private readonly observationLatchPath: string;
   private readonly runtimeObservationFloor: number;
 
@@ -108,7 +108,7 @@ export class DispatcherDatabase {
       ? Number(this.db.prepare("SELECT coalesce(max(last_observed_sequence),0) FROM external_ingress_metrics").pluck().get()) : 0;
     if (fs.existsSync(this.observationLatchPath)) this.loadObservationLatches();
     else if (hadDurableObservationSchema) this.failedObservationLatches.set(JSON.stringify(["*","",0]),
-      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor});
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor,observedAt:Date.now()});
     else if (!this.readOnly) this.persistObservationLatches();
   }
 
@@ -118,10 +118,11 @@ export class DispatcherDatabase {
       if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) throw new Error("Invalid observation latch marker");
       for (const candidate of parsed.entries) {
         if (candidate===null || typeof candidate!=="object") throw new Error("Invalid observation latch entry");
-        const {key,outcomes,boundary}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown};
+        const {key,outcomes,boundary,observed_at:observedAt=0}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown;observed_at?:unknown};
         if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
           !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
-          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) throw new Error("Invalid observation latch entry");
+          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0 ||
+          typeof observedAt!=="number" || !Number.isSafeInteger(observedAt) || observedAt<0) throw new Error("Invalid observation latch entry");
         const keyParts=JSON.parse(key) as unknown;
         if (!Array.isArray(keyParts) || ![3,4].includes(keyParts.length) ||
           typeof keyParts[0]!=="string" || !(/^\*$/.test(keyParts[0]) || /^[a-z][a-z0-9._-]{0,63}$/.test(keyParts[0])) ||
@@ -130,17 +131,17 @@ export class DispatcherDatabase {
           (keyParts.length===4 && (typeof keyParts[3]!=="string" || !/^[a-f0-9]{64}$/.test(keyParts[3])))) {
           throw new Error("Invalid observation latch key");
         }
-        this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary});
+        this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary,observedAt});
       }
     } catch { this.failedObservationLatches.set(JSON.stringify(["*","",0]),
-      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor}); }
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor,observedAt:Date.now()}); }
   }
 
   private persistObservationLatches(): void {
     if (this.readOnly) return;
     const temporary=`${this.observationLatchPath}.${process.pid}.${randomUUID()}.tmp`;
     const payload=JSON.stringify({schema_version:1,entries:[...this.failedObservationLatches].map(([key,latch])=>
-      ({key,outcomes:[...latch.outcomes].sort(),boundary:latch.boundary}))});
+      ({key,outcomes:[...latch.outcomes].sort(),boundary:latch.boundary,observed_at:latch.observedAt}))});
     try {
       fs.writeFileSync(temporary,payload,{encoding:"utf8",mode:0o600,flag:"wx"});
       const file=fs.openSync(temporary,"r"); try { fs.fsyncSync(file); } finally { fs.closeSync(file); }
@@ -266,8 +267,10 @@ export class DispatcherDatabase {
     let busyTimeout=2_000;
     try {
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
-      const pendingIntent=observationIntent ?? {outcomes:new Set<string>(),boundary:observationBoundary};
+      const observedAt=Number.isSafeInteger(at.getTime()) && at.getTime()>=0 ? at.getTime() : Date.now();
+      const pendingIntent=observationIntent ?? {outcomes:new Set<string>(),boundary:observationBoundary,observedAt};
       pendingIntent.outcomes.add(outcome); pendingIntent.boundary=Math.max(pendingIntent.boundary,observationBoundary);
+      pendingIntent.observedAt=Math.max(pendingIntent.observedAt,observedAt);
       this.failedObservationLatches.set(observationIntentKey,pendingIntent);
       this.persistObservationLatches();
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
@@ -363,8 +366,10 @@ export class DispatcherDatabase {
     } catch {
       const failedKey=deliveryKey !== undefined && deliveryBoundOutcomes.includes(outcome)
         ? deliveryKey : latchKey;
-      const latched=this.failedObservationLatches.get(failedKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
+      const latched=this.failedObservationLatches.get(failedKey) ??
+        {outcomes:new Set<string>(),boundary:observationBoundary,observedAt:Math.max(0,at.getTime())};
       latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
+      latched.observedAt=Math.max(latched.observedAt,Math.max(0,at.getTime()));
       this.failedObservationLatches.set(failedKey,latched);
       try { this.persistObservationLatches(); } catch {}
       return false;
@@ -507,10 +512,10 @@ export class DispatcherDatabase {
     }
     const terminalRows = this.db.prepare(`SELECT l.source,l.connection connection_id,
       sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter,
-      sum(e.status!='completed') active_events
+      sum(e.status!='completed') active_events,max(e.updated_at) last_event_at
       FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
       WHERE l.class='external' GROUP BY l.source,l.connection`).all() as Array<{
-        source:string;connection_id:string;blocked:number;dead_letter:number;active_events:number;
+        source:string;connection_id:string;blocked:number;dead_letter:number;active_events:number;last_event_at:string;
       }>;
     const terminalsByConnection = new Map(terminalRows.map((row) => [JSON.stringify([row.source,row.connection_id]),row]));
     const eventErrors = managedErrorRows;
@@ -634,7 +639,7 @@ export class DispatcherDatabase {
       const queueFailureLatch=[...latch.outcomes].some((outcome)=>
         ["queue_depth","queue_bytes","queue_rate","queue_lanes","queue_deliveries","queue_quiescing"].includes(outcome));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
-        (persistedEventLatch || (queueFailureLatch && terminal===undefined) ||
+        (persistedEventLatch || (queueFailureLatch && (terminal===undefined || Date.parse(terminal.last_event_at)<=latch.observedAt)) ||
           (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
     const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
