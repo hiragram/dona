@@ -193,11 +193,14 @@ export class DispatcherDatabase {
     const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
     const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
     const latchKey=JSON.stringify([safeSource,boundedConnection]);
+    const latchedBefore=this.failedObservationLatches.get(latchKey);
     let busyTimeout=2_000;
     try {
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
-      const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
+      const recoveredCreated = outcome === "duplicate_same" && latchedBefore?.has("created") === true;
+      const effectiveOutcome = recoveredCreated ? "created" : outcome;
+      const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(effectiveOutcome) ? effectiveOutcome : "internal_error";
       busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
       this.db.pragma("busy_timeout=0");
       this.db.transaction(() => {
@@ -218,7 +221,7 @@ export class DispatcherDatabase {
       if (outcome === "created") {
         this.failedObservationLatches.delete(latchKey);
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
-        latchedOutcomes.delete("acknowledgement_unavailable"); latchedOutcomes.delete("post_persist_timeout");
+        latchedOutcomes.delete("created"); latchedOutcomes.delete("acknowledgement_unavailable"); latchedOutcomes.delete("post_persist_timeout");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
         latchedOutcomes.delete("control_acknowledgement_unavailable");
@@ -412,13 +415,15 @@ export class DispatcherDatabase {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
     const activeRuntimeKeys=[...activeUnmanagedConnections ?? []].map((key) => JSON.parse(key) as [string,string]);
-    const activeRuntimeSources = new Set(activeRuntimeKeys.map(([source]) => source));
+    const gateRuntimeKeys=activeRuntimeKeys.filter(([source,connection]) => connection === "*" ||
+      projectedByConnection.get(JSON.stringify([source,connection]))?.state !== "disabled");
+    const activeRuntimeSources = new Set(gateRuntimeKeys.map(([source]) => source));
     const sourceGateOutcomes=new Set(["dependency_unavailable","processing_timeout","persistence_unavailable","registration_mismatch"]);
     const unattributedDependenciesReady = effectiveIngress.filter((row) => row.connection_id === "" && sourceGateOutcomes.has(row.outcome))
       .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
-        activeRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
+        gateRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
           (ingressByConnection.get(JSON.stringify([source,connection])) ?? []).some((metric) => metric.outcome === "created" && metric.last_observed_sequence > row.last_observed_sequence)) &&
-        (activeRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
+        (gateRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
           (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
       !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||

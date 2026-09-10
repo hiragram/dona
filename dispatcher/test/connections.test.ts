@@ -187,6 +187,15 @@ test("観測失敗latchはoutcome別に回復し廃止scopeをgateしない", (t
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),new Set()).ready,true);
 });
 
+test("created観測失敗後のduplicateは失われたdata path証跡を復旧する", (t) => {
+  const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,true);
+});
+
 test("unmanaged ingressはprocess起動後の成功だけをdata path証跡にする", (t) => {
   const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
   db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now())); db.close();
@@ -224,6 +233,13 @@ test("未帰属processing timeoutはactive sourceの後続成功までgateを閉
   db.recordExternalIngress("figma",undefined,"processing_timeout",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false); clock.value+=1;
   db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
+  db.recordExternalIngress("drive",undefined,"processing_timeout",50,new Date(clock.now()));
+  db.connections.disable("pilot",1);
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
