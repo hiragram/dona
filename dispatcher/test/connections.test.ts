@@ -166,10 +166,20 @@ test("verification conflictはdurable failureとして再送成功までgateす�
   const {db,clock}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["notion","*"])]);
   db.recordExternalIngress("notion","healthy","created",50,new Date(clock.now()));
-  db.recordExternalIngress("notion","conflict","created",50,new Date(clock.now()));
   db.recordExternalIngress("notion","conflict","verification_duplicate_conflict",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("notion","conflict","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("通常duplicate conflictは同じdeliveryの再送一致でのみ回復する", (t) => {
+  const {db,clock}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","connection-a"])]);
+  db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("custom","connection-a","duplicate_conflict",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false); clock.value+=1;
+  db.recordExternalIngress("custom","connection-a","duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
@@ -412,6 +422,16 @@ test("wildcard registrationはverification latchを再送回復まで保持す�
   const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
   assert.equal(db.recordExternalIngress("custom","verify","verification_created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("wildcard registrationは観測失敗したverification conflictを再送まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","verify","verification_duplicate_conflict",50,new Date(clock.now())),false);
   lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()));

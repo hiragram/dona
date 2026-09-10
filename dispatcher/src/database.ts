@@ -225,7 +225,7 @@ export class DispatcherDatabase {
       if (outcome === "created") {
         if (latchedOutcomes !== undefined) {
           for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable",
-            "verification_created","verification_duplicate_same"].includes(latched)) latchedOutcomes.delete(latched);
+            "verification_created","verification_duplicate_same","verification_duplicate_conflict"].includes(latched)) latchedOutcomes.delete(latched);
           if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
         }
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
@@ -238,6 +238,7 @@ export class DispatcherDatabase {
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       } else if (latchedOutcomes !== undefined && outcome === "verification_duplicate_same") {
         latchedOutcomes.delete("verification_created"); latchedOutcomes.delete("verification_duplicate_same");
+        latchedOutcomes.delete("verification_duplicate_conflict");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
       return true;
@@ -405,14 +406,17 @@ export class DispatcherDatabase {
             ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
             : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
             : failure.outcome === "verification_duplicate_conflict" ? verificationDuplicateRow?.last_observed_sequence ?? 0
+            : failure.outcome === "duplicate_conflict" ? duplicateRow?.last_observed_sequence ?? 0
             : successRow?.last_observed_sequence ?? 0;
           return recoverySequence > failure.last_observed_sequence;
         });
+        const unresolvedVerificationConflict=(latest((outcome)=>outcome==="verification_duplicate_conflict")?.last_observed_sequence ?? 0) >
+          (verificationDuplicateRow?.last_observed_sequence ?? 0);
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
-              (!row.outcome.startsWith("verification_") || row.outcome === "verification_duplicate_conflict") &&
-              !row.outcome.startsWith("control_")) || Number(terminal?.active_events ?? 0)>0));
+              !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
+              unresolvedVerificationConflict || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
@@ -476,7 +480,7 @@ export class DispatcherDatabase {
       const persistedEventLatch=[...latch.outcomes].some((outcome)=>["created","duplicate_same","acknowledgement_unavailable",
         "post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
         "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
-        "verification_created","verification_duplicate_same"].includes(outcome));
+        "verification_created","verification_duplicate_same","verification_duplicate_conflict"].includes(outcome));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
         (persistedEventLatch || (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
