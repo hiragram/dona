@@ -118,7 +118,8 @@ export class DispatcherDatabase {
       if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) throw new Error("Invalid observation latch marker");
       for (const candidate of parsed.entries) {
         if (candidate===null || typeof candidate!=="object") throw new Error("Invalid observation latch entry");
-        const {key,outcomes,boundary,observed_at:observedAt=0}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown;observed_at?:unknown};
+        const {key,outcomes,boundary,observed_at:observedAt=Number.MAX_SAFE_INTEGER}=candidate as
+          {key?:unknown;outcomes?:unknown;boundary?:unknown;observed_at?:unknown};
         if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
           !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
           typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0 ||
@@ -560,6 +561,7 @@ export class DispatcherDatabase {
           (verificationDuplicateRow?.last_observed_sequence ?? 0);
         const unresolvedControlFailure=(controlFailureRow?.last_observed_sequence ?? 0) > (controlRow?.last_observed_sequence ?? 0);
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
+          (managedState !== undefined && activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true) ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
               !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
