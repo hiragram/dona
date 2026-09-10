@@ -190,6 +190,7 @@ export class DispatcherDatabase {
       if (outcome === "created" || (["acknowledgement_unavailable","post_persist_timeout"].includes(latchedOutcome ?? "") && outcome === "duplicate_same")) {
         this.failedObservationLatches.delete(latchKey);
       }
+      if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,""]));
       return true;
     } catch {
       this.failedObservationLatches.set(latchKey,outcome);
@@ -296,7 +297,10 @@ export class DispatcherDatabase {
     }
     const connectionKeys = new Set(ingressByConnection.keys());
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
-    for (const key of activeUnmanagedConnections ?? []) connectionKeys.add(key);
+    for (const key of activeUnmanagedConnections ?? []) {
+      const [,connection] = JSON.parse(key) as [string,string];
+      if (connection !== "*") connectionKeys.add(key);
+    }
     const projectedByConnection = new Map(projected.map((row) => [JSON.stringify([row.provider,row.id]),row]));
     const terminalRows = this.db.prepare(`SELECT l.source,l.connection connection_id,
       sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
