@@ -126,17 +126,24 @@ test("release healthは現行connection revisionのingress証跡だけを評価�
   db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now())).ingress.length,1);
   db.connections.revise("pilot",1,{...config,credentialRevision:2});
+  db.recordExternalIngress("drive","pilot","queue_depth",50,new Date(clock.now()),2);
   db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()),1);
+  db.recordExternalIngress("drive","pilot","queue_depth",50,new Date(clock.now()),1);
   const health=db.externalReleaseHealth(new Date(clock.now()));
-  assert.equal(health.ingress.length,0);
-  assert.equal(health.ingress_connections.length,0);
+  assert.deepEqual(health.ingress.map((row)=>row.outcome),["queue_depth"]);
+  assert.equal(health.ingress_connections[0]!.ready,false);
 });
 
 test("readonly healthはrevision列追加前のobservability schemaを互換性結果にする", (t) => {
   const {db,file,clock}=fixture(t);
   db.close();
   const legacy=new Database(file);
-  legacy.exec("ALTER TABLE external_ingress_metrics DROP COLUMN connection_revision");
+  legacy.exec(`ALTER TABLE external_ingress_metrics RENAME TO metrics_current;
+    CREATE TABLE external_ingress_metrics(source TEXT NOT NULL,connection_id TEXT NOT NULL,outcome TEXT NOT NULL,
+      latency_bucket TEXT NOT NULL,count INTEGER NOT NULL,last_observed_at TEXT NOT NULL,last_observed_sequence INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(source,connection_id,outcome,latency_bucket));
+    INSERT INTO external_ingress_metrics SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence FROM metrics_current;
+    DROP TABLE metrics_current;`);
   legacy.close();
   const readonly=new DispatcherDatabase(file,{},clock,{readOnly:true});
   t.after(()=>readonly.close());
@@ -208,6 +215,16 @@ test("未帰属dependency failureはsourceの後続data-path成功までgateを�
   assert.equal(db.externalReleaseHealth(new Date(clock.now())).ready,false); // managed connection自体はverification pending
   db.connections.disable("pilot",1);
   assert.equal(db.externalReleaseHealth(new Date(clock.now())).ready,true);
+});
+
+test("未帰属processing timeoutはactive sourceの後続成功までgateを閉じる", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.connections.disable("pilot",1);
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("figma",undefined,"processing_timeout",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false); clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
 test("release healthのwritable probeは実書込みをrollbackする", (t) => {

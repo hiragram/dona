@@ -18,6 +18,7 @@ import {
   ExternalIngressRegistry,
   ExternalIngressTimeoutError,
   ExternalIngressPostPersistTimeoutError,
+  ExternalIngressRegistrationMismatchError,
   ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   authenticatedConnectionId,
@@ -563,7 +564,8 @@ export class DispatcherApi {
         },
       );
     } catch (error) {
-      const outcome = error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
+      const outcome = error instanceof ExternalIngressRegistrationMismatchError ? "registration_mismatch" :
+        error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
         error instanceof ExternalIngressValidationError ? "invalid_event" :
         error instanceof ExternalIngressPostPersistTimeoutError ? "post_persist_timeout" :
         error instanceof ExternalIngressTimeoutError ? "processing_timeout" :

@@ -115,7 +115,7 @@ export class DispatcherDatabase {
         last_observed_at TEXT NOT NULL,
         last_observed_sequence INTEGER NOT NULL DEFAULT 0,
         connection_revision INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(source, connection_id, outcome, latency_bucket)
+        PRIMARY KEY(source, connection_id, connection_revision, outcome, latency_bucket)
       );
       CREATE TABLE IF NOT EXISTS external_ingress_sequence (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL
@@ -172,6 +172,20 @@ export class DispatcherDatabase {
     if (!metricColumns.some((column) => column.name === "connection_revision")) {
       this.db.exec("ALTER TABLE external_ingress_metrics ADD COLUMN connection_revision INTEGER NOT NULL DEFAULT 0");
     }
+    const metricSchema=this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string;
+    if (!/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema)) this.db.exec(`
+      ALTER TABLE external_ingress_metrics RENAME TO external_ingress_metrics_legacy;
+      CREATE TABLE external_ingress_metrics (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, outcome TEXT NOT NULL, latency_bucket TEXT NOT NULL,
+        count INTEGER NOT NULL, last_observed_at TEXT NOT NULL, last_observed_sequence INTEGER NOT NULL DEFAULT 0,
+        connection_revision INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(source, connection_id, connection_revision, outcome, latency_bucket)
+      );
+      INSERT INTO external_ingress_metrics
+        SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence,connection_revision
+        FROM external_ingress_metrics_legacy;
+      DROP TABLE external_ingress_metrics_legacy;
+    `);
   }
 
   recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date(), authenticatedRevision?: number): boolean {
@@ -193,7 +207,7 @@ export class DispatcherDatabase {
         const order = this.db.prepare("UPDATE external_ingress_sequence SET value=value+1 WHERE singleton=1 RETURNING value")
           .get() as {value:number};
         this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence,connection_revision)
-          VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(source,connection_id,outcome,latency_bucket)
+          VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(source,connection_id,connection_revision,outcome,latency_bucket)
           DO UPDATE SET count=CASE WHEN connection_revision=excluded.connection_revision THEN count+1 ELSE 1 END,
             last_observed_at=CASE WHEN connection_revision=excluded.connection_revision
               THEN MAX(last_observed_at,excluded.last_observed_at) ELSE excluded.last_observed_at END,
@@ -224,7 +238,10 @@ export class DispatcherDatabase {
       ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe')`).pluck().get();
     const metricColumns = observabilityTables === 4
       ? this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}> : [];
-    if (this.readOnly && (observabilityTables !== 4 || !metricColumns.some((column) => column.name === "connection_revision"))) {
+    const metricSchema = observabilityTables === 4
+      ? this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string : "";
+    if (this.readOnly && (observabilityTables !== 4 || !metricColumns.some((column) => column.name === "connection_revision") ||
+      !/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema))) {
       return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
         compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
     }
@@ -396,7 +413,8 @@ export class DispatcherDatabase {
     }
     const activeRuntimeKeys=[...activeUnmanagedConnections ?? []].map((key) => JSON.parse(key) as [string,string]);
     const activeRuntimeSources = new Set(activeRuntimeKeys.map(([source]) => source));
-    const unattributedDependenciesReady = effectiveIngress.filter((row) => row.connection_id === "" && row.outcome === "dependency_unavailable")
+    const sourceGateOutcomes=new Set(["dependency_unavailable","processing_timeout","persistence_unavailable","registration_mismatch"]);
+    const unattributedDependenciesReady = effectiveIngress.filter((row) => row.connection_id === "" && sourceGateOutcomes.has(row.outcome))
       .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
         activeRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
           (ingressByConnection.get(JSON.stringify([source,connection])) ?? []).some((metric) => metric.outcome === "created" && metric.last_observed_sequence > row.last_observed_sequence)) &&
