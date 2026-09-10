@@ -268,7 +268,11 @@ export class DispatcherDatabase {
     let busyTimeout=2_000;
     try {
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
-      const observedAt=Number.isSafeInteger(at.getTime()) && at.getTime()>=0 ? at.getTime() : Date.now();
+      const laneLastUpdated=this.db.prepare(`SELECT max(e.updated_at) FROM queue_events q JOIN queue_lanes l USING(lane)
+        JOIN events e USING(event_id) WHERE l.class='external' AND l.source=? AND l.connection=?`).pluck().get(safeSource,boundedConnection);
+      const laneHighWater=typeof laneLastUpdated==="string" ? Date.parse(laneLastUpdated) : 0;
+      const requestObservedAt=Number.isSafeInteger(at.getTime()) && at.getTime()>=0 ? at.getTime() : Date.now();
+      const observedAt=Math.max(requestObservedAt,Number.isSafeInteger(laneHighWater) ? laneHighWater : Number.MAX_SAFE_INTEGER);
       const pendingIntent=observationIntent ?? {outcomes:new Set<string>(),boundary:observationBoundary,observedAt};
       pendingIntent.outcomes.add(outcome); pendingIntent.boundary=Math.max(pendingIntent.boundary,observationBoundary);
       pendingIntent.observedAt=Math.max(pendingIntent.observedAt,observedAt);
@@ -569,7 +573,8 @@ export class DispatcherDatabase {
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
             (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
               !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
-              unresolvedVerificationConflict || unresolvedControlFailure || hasUnresolvedConflict || hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
+              !allFailuresRecovered || unresolvedVerificationConflict || unresolvedControlFailure || hasUnresolvedConflict ||
+              hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
