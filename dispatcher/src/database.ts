@@ -117,11 +117,11 @@ export class DispatcherDatabase {
       const parsed=JSON.parse(fs.readFileSync(this.observationLatchPath,"utf8")) as {schema_version?:unknown;entries?:unknown};
       if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) throw new Error("Invalid observation latch marker");
       for (const candidate of parsed.entries) {
-        if (candidate===null || typeof candidate!=="object") continue;
+        if (candidate===null || typeof candidate!=="object") throw new Error("Invalid observation latch entry");
         const {key,outcomes,boundary}=candidate as {key?:unknown;outcomes?:unknown;boundary?:unknown};
         if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
           !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
-          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) continue;
+          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0) throw new Error("Invalid observation latch entry");
         this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary});
       }
     } catch { this.failedObservationLatches.set(JSON.stringify(["*","",0]),
@@ -256,7 +256,7 @@ export class DispatcherDatabase {
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
       const recoveredCreated = outcome === "duplicate_same" && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout"]
-        .some((createdOutcome)=>latchedBefore?.outcomes.has(createdOutcome)===true);
+        .some((createdOutcome)=>(deliveryLatchedBefore ?? latchedBefore)?.outcomes.has(createdOutcome)===true);
       const effectiveOutcome = recoveredCreated ? "created" : outcome;
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(effectiveOutcome) ? effectiveOutcome : "internal_error";
       busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
@@ -287,15 +287,17 @@ export class DispatcherDatabase {
               AND verification=? AND delivery_hash=?`)
               .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash);
           }
-          if (["acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(outcome)) {
+          if (["acknowledgement_unavailable_after_created","post_persist_created_timeout",
+            "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout"].includes(outcome)) {
             this.db.prepare(`INSERT INTO external_ingress_recoveries
               (source,connection_id,connection_revision,delivery_hash,failure_outcome,observed_at) VALUES(?,?,?,?,?,?)
               ON CONFLICT(source,connection_id,connection_revision,delivery_hash,failure_outcome)
               DO UPDATE SET observed_at=MAX(observed_at,excluded.observed_at)`)
               .run(safeSource,boundedConnection,revision,deliveryHash,outcome,at.toISOString());
-          } else if (outcome==="duplicate_same") {
+          } else if (["duplicate_same","verification_duplicate_same"].includes(outcome)) {
             this.db.prepare(`DELETE FROM external_ingress_recoveries WHERE source=? AND connection_id=?
-              AND connection_revision=? AND delivery_hash=?`).run(safeSource,boundedConnection,revision,deliveryHash);
+              AND connection_revision=? AND delivery_hash=? AND failure_outcome ${outcome.startsWith("verification_") ? "LIKE 'verification_%'" : "NOT LIKE 'verification_%'"}`)
+              .run(safeSource,boundedConnection,revision,deliveryHash);
           }
         }
       }).immediate();
@@ -323,14 +325,19 @@ export class DispatcherDatabase {
       if (deliveryKey !== undefined && ["duplicate_same","verification_duplicate_same"].includes(outcome)) {
         const deliveryLatch=this.failedObservationLatches.get(deliveryKey);
         if (deliveryLatch !== undefined) {
-          deliveryLatch.outcomes.delete(outcome === "duplicate_same" ? "duplicate_conflict" : "verification_duplicate_conflict");
+          for (const recovered of outcome === "duplicate_same"
+            ? ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout","duplicate_conflict"]
+            : ["verification_created","verification_acknowledgement_unavailable_after_created",
+              "verification_post_persist_created_timeout","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
           if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
         }
       }
       this.persistObservationLatches();
       return true;
     } catch {
-      const failedKey=deliveryKey !== undefined && ["duplicate_conflict","verification_duplicate_conflict"].includes(outcome)
+      const failedKey=deliveryKey !== undefined && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+        "duplicate_conflict","verification_created","verification_acknowledgement_unavailable_after_created",
+        "verification_post_persist_created_timeout","verification_duplicate_conflict"].includes(outcome)
         ? deliveryKey : latchKey;
       const latched=this.failedObservationLatches.get(failedKey) ?? {outcomes:new Set<string>(),boundary:observationBoundary};
       latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
@@ -571,7 +578,7 @@ export class DispatcherDatabase {
         (gateRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
           (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
-      !["github","notion","figma"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
+      !["github","notion","figma","google-drive"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
     const legacyExternalReady=(this.db.prepare(`SELECT count(*) count FROM queue_events q JOIN queue_lanes l USING(lane)
       JOIN events e USING(event_id) WHERE l.class='external' AND l.connection='unverified_legacy' AND e.status!='completed'`)
