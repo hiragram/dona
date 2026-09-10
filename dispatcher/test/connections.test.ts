@@ -165,7 +165,7 @@ test("verification trafficは通常data path成功として扱わない", (t) =>
 test("persist後timeoutのduplicate確認は通常data pathを回復する", (t) => {
   const {db,clock}=fixture(t);
   const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
-  db.recordExternalIngress("figma","figma-pilot","post_persist_timeout",50,new Date(clock.now()));
+  db.recordExternalIngress("figma","figma-pilot","post_persist_created_timeout",50,new Date(clock.now()));
   clock.value+=1;
   db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
   const health=db.externalReleaseHealth(new Date(clock.now()),active);
@@ -258,6 +258,13 @@ test("未帰属latchは全active connectionがfailure境界を越えるまで残
 test("duplicate起点のpost-persist timeoutはdata path成功に昇格しない", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
   db.recordExternalIngress("figma","figma-pilot","post_persist_duplicate_timeout",50,new Date(clock.now()));
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
+});
+
+test("legacy persist failureはduplicateで回復してもdata path成功に昇格しない", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.recordExternalIngress("figma","figma-pilot","post_persist_timeout",50,new Date(clock.now()));
   db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
 });
@@ -377,6 +384,24 @@ test("wildcard registrationはcontrol latchをpersist済みevent扱いしない"
   assert.equal(db.recordExternalIngress("custom","old-control","control_acknowledged",50,new Date(clock.now())),false);
   lock.exec("COMMIT"); lock.close();
   db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("未認証outcomeの未帰属latchはsource-level gateへ含めない", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom",undefined,"authentication_failed",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
+test("wildcard registrationはverification latchを再送回復まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","verify","verification_created",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","verify","verification_duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 

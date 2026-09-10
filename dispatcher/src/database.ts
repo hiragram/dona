@@ -407,11 +407,12 @@ export class DispatcherDatabase {
         });
         const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
           (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
-            (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor) || Number(terminal?.active_events ?? 0)>0));
+            (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
+              !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) || Number(terminal?.active_events ?? 0)>0));
         const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
-          ["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome) &&
+          ["acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome) &&
           (duplicateRow?.last_observed_sequence ?? 0) > Math.max(failure.last_observed_sequence,this.runtimeObservationFloor));
         const currentProcessSuccess = (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
         const dataPathObserved = requiresIngressSuccess ?
@@ -429,8 +430,7 @@ export class DispatcherDatabase {
     for (const row of effectiveIngress) if (row.outcome === "created") {
       sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
     }
-    const createdPersistFailureOutcomes=new Set(["acknowledgement_unavailable","post_persist_timeout",
-      "acknowledgement_unavailable_after_created","post_persist_created_timeout"]);
+    const createdPersistFailureOutcomes=new Set(["acknowledgement_unavailable_after_created","post_persist_created_timeout"]);
     const connectionDataPathSequence=new Map<string,number>();
     for (const [key,rows] of ingressByConnection) {
       let dataPathSequence=Math.max(0,...rows.filter((row)=>row.outcome==="created").map((row)=>row.last_observed_sequence));
@@ -458,6 +458,7 @@ export class DispatcherDatabase {
     const activeObservationLatches=[...this.failedObservationLatches].filter(([key,latch]) => {
       const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
       if (connectionId === "") {
+        if (![...latch.outcomes].some((outcome)=>sourceGateOutcomes.has(outcome))) return false;
         const concrete=gateRuntimeKeys.filter(([candidate,candidateConnection])=>candidate===source && candidateConnection!=="*");
         if (concrete.length>0) return concrete.some(([candidate,candidateConnection])=>
           (connectionDataPathSequence.get(JSON.stringify([candidate,candidateConnection])) ?? 0)<=latch.boundary);
@@ -470,7 +471,8 @@ export class DispatcherDatabase {
       const terminal=terminalsByConnection.get(managedKey);
       const persistedEventLatch=[...latch.outcomes].some((outcome)=>["created","duplicate_same","acknowledgement_unavailable",
         "post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
-        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(outcome));
+        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
+        "verification_created","verification_duplicate_same"].includes(outcome));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
         (persistedEventLatch || (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
