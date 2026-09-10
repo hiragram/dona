@@ -627,11 +627,15 @@ export class DispatcherDatabase {
       const persistedEventLatch=[...latch.outcomes].some((outcome)=>["created","duplicate_same","acknowledgement_unavailable",
         "post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
         "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
+        "processing_timeout","dependency_unavailable","persistence_unavailable","registration_mismatch",
         "control_acknowledgement_unavailable","verification_created","verification_duplicate_same","verification_duplicate_conflict",
         "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
         "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout"].includes(outcome));
+      const queueFailureLatch=[...latch.outcomes].some((outcome)=>
+        ["queue_depth","queue_bytes","queue_rate","queue_lanes","queue_deliveries","queue_quiescing"].includes(outcome));
       return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
-        (persistedEventLatch || (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
+        (persistedEventLatch || (queueFailureLatch && terminal===undefined) ||
+          (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
     const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
       (sourceSuccessSequence.get(source) ?? 0)>this.runtimeObservationFloor);

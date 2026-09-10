@@ -469,6 +469,16 @@ test("wildcard registrationは未解決control ACK failureを後続control成功
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("wildcard registrationは認証済みretryable failure latchを後続成功まで保持する", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]); const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","throttled","queue_depth",50,new Date(clock.now())),false);
+  lock.exec("COMMIT"); lock.close(); db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","throttled","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("wildcard registrationはdurable control ACK failureも後続control成功まで保持する", (t) => {
   const {db,clock}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["custom","*"])]);

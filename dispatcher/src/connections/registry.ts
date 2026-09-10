@@ -46,6 +46,7 @@ export class ConnectionRegistry {
     if (!row) throw new ConnectionError("not_found");
     return { ...parseConfig(JSON.parse(row.config_json)), revision: row.revision, state: row.state };
   }
+  assertCurrentClock(id: string): void { this.tick(id); }
   manages(source: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM connections WHERE provider=? LIMIT 1").get(source);
   }

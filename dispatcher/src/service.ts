@@ -142,6 +142,7 @@ export async function runService(
       const verified=await registration.authenticate(request);
       let lookup;
       try {
+        database.connections.assertCurrentClock(verified.connectionId);
         const connection=database.connections.get(verified.connectionId);
         lookup={connection,subscriptions:database.connections.subscriptions(connection.id)};
       } catch (error) {
