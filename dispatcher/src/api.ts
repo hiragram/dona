@@ -18,6 +18,8 @@ import {
   ExternalIngressTimeoutError,
   ExternalIngressUnavailableError,
   ExternalIngressValidationError,
+  authenticatedConnectionId,
+  bindAuthenticatedError,
   type PreparedExternalIngressAcknowledgement,
   type RawIngressRequest,
 } from "./ingress.js";
@@ -512,15 +514,27 @@ export class DispatcherApi {
     // 未認証 request が認証済み delivery の source quota を消費しないよう、共有 bucket はここに置かない。
     // raw body の size/time limit 後、認証済み connection 単位の durable queue admission が rate を制限する。
     const monotonicNow = performance.now();
+    const observe = (connectionId: string | undefined, outcome: string): void => {
+      const latency = performance.now() - startedAt;
+      setImmediate(() => this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency));
+    };
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
     if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
       request.resume();
+      observe(undefined, "body_too_large");
       throw new BodyTooLargeError();
     }
     const receivedAt = new Date().toISOString();
+    let body: Buffer;
+    try { body = await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs); }
+    catch (error) {
+      observe(undefined, error instanceof BodyTooLargeError ? "body_too_large" :
+        error instanceof BodyReadTimeoutError ? "body_timeout" : "body_incomplete");
+      throw error;
+    }
     const rawRequest: RawIngressRequest = Object.freeze({
-      body: await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs),
+      body,
       headers: rawHeaders(request),
       method: "POST",
       requestTarget: request.url!,
@@ -549,7 +563,7 @@ export class DispatcherApi {
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
         error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :
         error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
-      this.database.recordExternalIngress(resolved.source, undefined, outcome, performance.now() - startedAt);
+      observe(authenticatedConnectionId(error), outcome);
       if (
         error instanceof ConnectionError ||
         error instanceof QueueAdmissionError ||
@@ -561,11 +575,12 @@ export class DispatcherApi {
       ) {
         throw error;
       }
-      throw new PersistenceUnavailableError("External event could not be persisted");
+      throw bindAuthenticatedError(new PersistenceUnavailableError("External event could not be persisted"),
+        authenticatedConnectionId(error) ?? "unattributed");
     }
 
     const { receipt } = result;
-    this.database.recordExternalIngress(receipt.source, receipt.connectionId, receipt.outcome, performance.now() - startedAt);
+    observe(receipt.connectionId, receipt.control === true ? "control_acknowledged" : receipt.outcome);
     if (receipt.outcome === "duplicate_conflict") {
       this.logger.warn("External event duplicate conflicts with persisted content", {
         event_id: receipt.eventId,

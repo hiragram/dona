@@ -104,6 +104,19 @@ export class DispatcherDatabase {
         last_observed_at TEXT NOT NULL,
         PRIMARY KEY(source, connection_id, outcome, latency_bucket)
       );
+      CREATE TABLE IF NOT EXISTS external_event_errors (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, error_code TEXT NOT NULL,
+        count INTEGER NOT NULL, last_error_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,error_code)
+      );
+      CREATE TRIGGER IF NOT EXISTS external_event_error_history AFTER UPDATE OF last_error_code ON events
+      WHEN NEW.last_error_code IS NOT NULL AND NEW.source NOT IN ('slack','dona_job','dona_update')
+      BEGIN
+        INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
+        VALUES(NEW.source,coalesce((SELECT connection_id FROM connection_event_bindings WHERE event_id=NEW.event_id),'unattributed'),NEW.last_error_code,1,NEW.updated_at)
+        ON CONFLICT(source,connection_id,error_code) DO UPDATE SET count=count+1,
+          last_error_at=MAX(last_error_at,excluded.last_error_at);
+      END;
     `);
   }
 
@@ -117,7 +130,7 @@ export class DispatcherDatabase {
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
       this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at)
         VALUES(?,?,?,?,1,?) ON CONFLICT(source,connection_id,outcome,latency_bucket)
-        DO UPDATE SET count=count+1,last_observed_at=excluded.last_observed_at`)
+        DO UPDATE SET count=count+1,last_observed_at=MAX(last_observed_at,excluded.last_observed_at)`)
         .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString());
     } catch {}
   }
@@ -131,21 +144,30 @@ export class DispatcherDatabase {
         WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status!='completed'),0) queue_lag_ms,
       (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
         WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status='dead_letter') dead_letter,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('blocked','needs_review')) blocked,
       (SELECT max(last_delivery_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_delivery_at,
       (SELECT max(last_reconcile_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_reconcile_at,
       (SELECT min(expires_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
         AND s.state NOT IN ('stopped','stop_candidate')) subscription_expires_at,
       (SELECT count(*) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
         AND s.state='renewal_unknown') renewal_unknown,
-      (SELECT max(version) FROM connection_cursors cur WHERE cur.connection_id=c.id AND cur.revision=c.revision) cursor_version,
-      (SELECT max(e.updated_at) FROM connection_event_bindings b JOIN events e USING(event_id)
-        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.last_error_code IS NOT NULL) last_error_at
-      FROM connections c ORDER BY c.provider,c.id`).all(now) as Array<Record<string, unknown>>;
+      (SELECT max(last_error_at) FROM external_event_errors h WHERE h.connection_id=c.id AND h.source=c.provider) last_error_at
+      FROM connections c ORDER BY c.provider,c.id`).all(now) as Array<{
+        id: string; provider: string; state: string; revision: number;
+        dead_letter: number; blocked: number; renewal_unknown: number; [key: string]: unknown;
+      }>;
+    const projected = connections.map((row) => ({ ...row,
+      cursors: this.db.prepare(`SELECT resource,version FROM connection_cursors
+        WHERE connection_id=? AND revision=? ORDER BY resource`).all(row.id, row.revision),
+      errors: this.db.prepare(`SELECT error_code,count,last_error_at FROM external_event_errors
+        WHERE source=? AND connection_id=? ORDER BY error_code`).all(row.provider, row.id),
+    }));
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: this.connections.health().ready && connections.every((row) => Number(row.dead_letter) === 0 && Number(row.renewal_unknown) === 0),
-      connections,
+      ready: this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0),
+      connections: projected,
       ingress: this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
         FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all(),
       queue: this.queueHealth(at),
