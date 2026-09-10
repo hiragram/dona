@@ -192,7 +192,7 @@ export class DispatcherDatabase {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
     const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
     const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
-    const latchKey=JSON.stringify([safeSource,boundedConnection]);
+    const latchKey=JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0]);
     const latchedBefore=this.failedObservationLatches.get(latchKey);
     let busyTimeout=2_000;
     try {
@@ -224,13 +224,15 @@ export class DispatcherDatabase {
           if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
         }
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
-        latchedOutcomes.delete("created"); latchedOutcomes.delete("acknowledgement_unavailable"); latchedOutcomes.delete("post_persist_timeout");
+        for (const recovered of ["created","acknowledgement_unavailable","post_persist_timeout",
+          "acknowledgement_unavailable_after_created","post_persist_created_timeout",
+          "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"]) latchedOutcomes.delete(recovered);
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
         latchedOutcomes.delete("control_acknowledgement_unavailable");
         if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
       }
-      if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,""]));
+      if (outcome === "created") this.failedObservationLatches.delete(JSON.stringify([safeSource,"",0]));
       return true;
     } catch {
       const latchedOutcomes=this.failedObservationLatches.get(latchKey) ?? new Set<string>();
@@ -388,7 +390,8 @@ export class DispatcherDatabase {
         const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
         const allFailuresRecovered = failureRows.every((failure) => {
-          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome)
+          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+            "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(failure.outcome)
             ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
             : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
             : successRow?.last_observed_sequence ?? 0;
@@ -400,7 +403,7 @@ export class DispatcherDatabase {
         const requiresIngressSuccess=runtimeRegistered;
         const recoveredPersistedEvent = failureRows.some((failure) =>
           ["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome) &&
-          (duplicateRow?.last_observed_sequence ?? 0) > failure.last_observed_sequence);
+          (duplicateRow?.last_observed_sequence ?? 0) > Math.max(failure.last_observed_sequence,this.runtimeObservationFloor));
         const currentProcessSuccess = (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
         const dataPathObserved = requiresIngressSuccess ?
           currentProcessSuccess || recoveredPersistedEvent : managedState !== undefined || currentProcessSuccess;
@@ -444,16 +447,19 @@ export class DispatcherDatabase {
       !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
     const activeObservationLatches=[...this.failedObservationLatches.keys()].filter((key) => {
-      const [source,connectionId]=JSON.parse(key) as [string,string];
+      const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
       if (connectionId === "") return activeRuntimeSources.has(source) || projected.some((row) => row.provider===source && row.state!=="disabled");
-      const managed=projectedByConnection.get(key);
-      return managed !== undefined ? managed.state!=="disabled" : activeUnmanagedConnections?.has(key)===true ||
+      const managedKey=JSON.stringify([source,connectionId]);
+      const managedConnection=projectedByConnection.get(managedKey);
+      return managedConnection !== undefined ? managedConnection.state!=="disabled" && managedConnection.revision===revision : activeUnmanagedConnections?.has(managedKey)===true ||
         activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true;
     });
+    const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
+      (sourceSuccessSequence.get(source) ?? 0)>this.runtimeObservationFloor);
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && activeObservationLatches.length === 0 && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+      ready: writable && activeObservationLatches.length === 0 && wildcardRuntimeReady && registeredManagedReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
         (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,

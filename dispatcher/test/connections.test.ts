@@ -263,6 +263,30 @@ test("managed ingressもprocess再起動後のdata path成功を要求する", (
   assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
 });
 
+test("再起動前のduplicate回復は現processのdata path証跡にしない", (t) => {
+  const {db,clock,file}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.recordExternalIngress("figma","figma-pilot","post_persist_created_timeout",50,new Date(clock.now()));
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now())); db.close();
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,false);
+});
+
+test("duplicate起点のACK failureはduplicateで回復するがdata pathには昇格しない", (t) => {
+  const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["figma","figma-pilot"])]);
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","acknowledgement_unavailable_after_duplicate",50,new Date(clock.now())); clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","duplicate_same",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ingress_connections[0]!.ready,true);
+});
+
+test("wildcard registrationは架空行なしで現processのsource成功を要求する", (t) => {
+  const {db,clock}=fixture(t); db.connections.disable("pilot",1);
+  const active=new Set([JSON.stringify(["custom","*"])]);
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+  db.recordExternalIngress("custom","custom-1","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
+});
+
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
   db.recordExternalIngress("drive",undefined,"processing_timeout",50,new Date(clock.now()));
