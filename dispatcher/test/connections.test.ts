@@ -121,6 +121,17 @@ test("認証済みFigma connectionをbounded labelへ帰属し最新failureをga
   assert.equal(health.ingress_connections[0]!.ready,true);
 });
 
+test("未帰属dependency failureはsourceの後続data-path成功までgateを閉じる", (t) => {
+  const {db,clock} = fixture(t);
+  db.recordExternalIngress("drive",undefined,"dependency_unavailable",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now())).ready,false);
+  clock.value+=1;
+  db.recordExternalIngress("drive","pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now())).ready,false); // managed connection自体はverification pending
+  db.connections.disable("pilot",1);
+  assert.equal(db.externalReleaseHealth(new Date(clock.now())).ready,true);
+});
+
 test("release healthのwritable probeは実書込みをrollbackする", (t) => {
   const {db,file} = fixture(t);
   const health = db.externalReleaseHealth();

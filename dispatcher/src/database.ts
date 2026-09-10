@@ -242,6 +242,13 @@ export class DispatcherDatabase {
     for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
     for (const key of activeUnmanagedConnections ?? []) connectionKeys.add(key);
     const projectedByConnection = new Map(projected.map((row) => [JSON.stringify([row.provider,row.id]),row]));
+    const terminalRows = this.db.prepare(`SELECT l.source,l.connection connection_id,
+      sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
+      FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
+      WHERE l.class='external' GROUP BY l.source,l.connection`).all() as Array<{
+        source:string;connection_id:string;blocked:number;dead_letter:number;
+      }>;
+    const terminalsByConnection = new Map(terminalRows.map((row) => [JSON.stringify([row.source,row.connection_id]),row]));
     const eventErrors = this.db.prepare(`SELECT source,connection_id,error_code,count,last_error_at
       FROM external_event_errors ORDER BY source,connection_id,error_code`).all() as Array<{
         source:string;connection_id:string;error_code:string;count:number;last_error_at:string;
@@ -263,16 +270,13 @@ export class DispatcherDatabase {
         const control = controlRow?.last_observed_at ?? null;
         const failure = failureRow?.last_observed_at ?? null;
         const errors = errorsByConnection.get(key) ?? [];
-        const terminal = this.db.prepare(`SELECT
-          sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter
-          FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
-          WHERE l.source=? AND l.connection=?`).get(source,connectionId) as {blocked:number|null;dead_letter:number|null};
-        const blocked = terminal.blocked ?? 0, deadLetter = terminal.dead_letter ?? 0;
+        const terminal = terminalsByConnection.get(key);
+        const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
         const managedState = projectedByConnection.get(key)?.state;
         const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
-        const observed = rows.length > 0;
+        const dataPathObserved = managedState !== undefined || successRow !== undefined;
         return { source, connection_id: connectionId, state,
-          ready: ["disabled","retired"].includes(state) || (observed && (failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && (failureRow === undefined || (successRow !== undefined && successRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
           last_success_at: success, last_control_at: control, last_error_at: failure,
           ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
             errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
@@ -280,10 +284,16 @@ export class DispatcherDatabase {
       });
     const ingress = storedIngress.map(({last_observed_sequence: _sequence, ...row}) =>
       ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
+    const sourceSuccessSequence = new Map<string,number>();
+    for (const row of storedIngress) if (["created","duplicate_same"].includes(row.outcome)) {
+      sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
+    }
+    const unattributedDependenciesReady = storedIngress.filter((row) => row.connection_id === "" && row.outcome === "dependency_unavailable")
+      .every((row) => (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence);
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: writable && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
+      ready: writable && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
         ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
       writable,
       connections: projected,
