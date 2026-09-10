@@ -109,8 +109,10 @@ export class DispatcherDatabase {
         count INTEGER NOT NULL, last_error_at TEXT NOT NULL,
         PRIMARY KEY(source,connection_id,error_code)
       );
-      CREATE TRIGGER IF NOT EXISTS external_event_error_history AFTER UPDATE OF last_error_code ON events
-      WHEN NEW.last_error_code IS NOT NULL AND NEW.source NOT IN ('slack','dona_job','dona_update')
+      DROP TRIGGER IF EXISTS external_event_error_history;
+      CREATE TRIGGER external_event_error_history AFTER UPDATE OF last_error_code ON events
+      WHEN NEW.last_error_code IS NOT NULL AND NEW.last_error_code!='provider_fetching'
+        AND NEW.source NOT IN ('slack','dona_job','dona_update')
       BEGIN
         INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
         VALUES(NEW.source,coalesce((SELECT connection_id FROM connection_event_bindings WHERE event_id=NEW.event_id),'unattributed'),NEW.last_error_code,1,NEW.updated_at)
@@ -124,8 +126,9 @@ export class DispatcherDatabase {
     // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
     try {
       const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
-      const knownConnection = connectionId !== undefined && this.db.prepare("SELECT 1 FROM connections WHERE id=? AND provider=?").get(connectionId, safeSource);
-      const boundedConnection = knownConnection ? connectionId! : "unattributed";
+      // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
+      const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId)
+        ? connectionId : "unattributed";
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(outcome) ? outcome : "internal_error";
       this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at)
@@ -163,13 +166,29 @@ export class DispatcherDatabase {
       errors: this.db.prepare(`SELECT error_code,count,last_error_at FROM external_event_errors
         WHERE source=? AND connection_id=? ORDER BY error_code`).all(row.provider, row.id),
     }));
+    const ingress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
+      FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
+        source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
+      }>;
+    const ingressConnections = [...new Set(ingress.filter((row) => row.connection_id !== "unattributed")
+      .map((row) => JSON.stringify([row.source,row.connection_id])))].map((key) => {
+        const [source,connectionId] = JSON.parse(key) as [string,string];
+        const rows = ingress.filter((row) => row.source === source && row.connection_id === connectionId);
+        const success = rows.filter((row) => ["created","duplicate_same","control_acknowledged"].includes(row.outcome))
+          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
+        const failure = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome))
+          .map((row) => row.last_observed_at).sort().at(-1) ?? null;
+        return { source, connection_id: connectionId, ready: failure === null || (success !== null && success > failure),
+          last_success_at: success, last_error_at: failure };
+      });
     return {
       schema_version: 1,
       observed_at: at.toISOString(),
-      ready: this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0),
+      ready: this.connections.health().ready && projected.every((row) => Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0) &&
+        ingressConnections.every((row) => row.ready),
       connections: projected,
-      ingress: this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at
-        FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all(),
+      ingress_connections: ingressConnections,
+      ingress,
       queue: this.queueHealth(at),
     };
   }

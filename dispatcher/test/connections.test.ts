@@ -58,7 +58,7 @@ function event(id = "change1"): EventEnvelope {
 test("release healthはconnection別のqueue・cursor・ingress結果をsecretなしで公開する", (t) => {
   const {db,clock,file} = fixture(t);
   db.recordExternalIngress("drive", "pilot", "created", 99, new Date(clock.now()));
-  db.recordExternalIngress("drive", "unknown", "authentication_failed", 5_001, new Date(clock.now()));
+  db.recordExternalIngress("drive", undefined, "authentication_failed", 5_001, new Date(clock.now()));
   db.recordExternalIngress("drive", "pilot", "created", 99, new Date(clock.now() - 1_000));
   const raw = new Database(file);
   raw.prepare("INSERT INTO connection_cursors VALUES(?,?,?,?,?)").run("pilot","folder2",1,7,"private-cursor-token");
@@ -74,6 +74,8 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
   assert.deepEqual(health.connections[0]!.cursors, [
     { resource: "folder1", version: 0 }, { resource: "folder2", version: 7 },
   ]);
+  assert.deepEqual(health.ingress_connections, [{ source: "drive", connection_id: "pilot", ready: true,
+    last_success_at: new Date(clock.now()).toISOString(), last_error_at: null }]);
   const encoded = JSON.stringify(health);
   assert.doesNotMatch(encoded, /cred_fixture|checkpoint|token|secret/i);
   db.close();
@@ -82,10 +84,27 @@ test("release healthはconnection別のqueue・cursor・ingress結果をsecret�
   finally { reopened.close(); }
 });
 
+test("認証済みFigma connectionをbounded labelへ帰属し最新failureをgateする", (t) => {
+  const {db,clock} = fixture(t);
+  db.recordExternalIngress("figma","figma-pilot","invalid_event",50,new Date(clock.now()));
+  let health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ready,false);
+  assert.deepEqual(health.ingress_connections,[{source:"figma",connection_id:"figma-pilot",ready:false,
+    last_success_at:null,last_error_at:new Date(clock.now()).toISOString()}]);
+  clock.value+=1;
+  db.recordExternalIngress("figma","figma-pilot","control_acknowledged",50,new Date(clock.now()));
+  health=db.externalReleaseHealth(new Date(clock.now()));
+  assert.equal(health.ingress_connections[0]!.ready,true);
+});
+
 test("release healthはblockedと復旧済みerror履歴をrelease停止条件にする", async (t) => {
-  const {db,lifecycle} = fixture(t);
+  const {db,lifecycle,file} = fixture(t);
   await lifecycle.createOrRenew("pilot","folder1");
   const row = db.enqueueExternal(event(),binding()).row;
+  const raw = new Database(file);
+  raw.prepare("UPDATE events SET last_error_code='provider_fetching',updated_at=? WHERE event_id=?")
+    .run(new Date().toISOString(),row.event_id);
+  raw.close();
   db.recordPreDispatchFailure(row.event_id,"provider_fetch_failed","fixture",5);
   db.manualRetry(row.event_id,false);
   db.markBlocked(row.event_id,"operator review required");
