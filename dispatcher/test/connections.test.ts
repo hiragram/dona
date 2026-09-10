@@ -346,6 +346,20 @@ test("wildcard registrationは未解決queue laneをactive gateに残す", (t) =
   assert.equal(health.ready,false);
 });
 
+test("wildcard registrationは解決済みlaneの観測latchをretired扱いにする", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1); const source=externalEventSource("custom");
+  const queued=db.enqueue({schema_version:1,source,external_event_id:scopedExternalEventId(source,"old","event-1"),
+    type:"custom.changed",occurred_at:new Date(clock.now()).toISOString(),subject:{},payload:{},reply_target:null},
+    new Date(clock.now()),{connectionId:"old"}).row;
+  const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
+  assert.equal(db.recordExternalIngress("custom","old","queue_depth",50,new Date(clock.now())),false);
+  lock.prepare("UPDATE events SET status='completed' WHERE event_id=?").run(queued.event_id); lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("custom","current","created",50,new Date(clock.now()));
+  const health=db.externalReleaseHealth(new Date(clock.now()),new Set([JSON.stringify(["custom","*"])]));
+  assert.equal(health.ingress_connections.find((row)=>row.connection_id==="old")!.state,"retired");
+  assert.equal(health.ready,true);
+});
+
 test("disabled managed connectionはsource-level failureの復旧対象から外れる", (t) => {
   const {db,clock}=fixture(t); const active=new Set([JSON.stringify(["drive","pilot"])]);
   db.recordExternalIngress("drive",undefined,"processing_timeout",50,new Date(clock.now()));

@@ -464,8 +464,11 @@ export class DispatcherDatabase {
       }
       const managedKey=JSON.stringify([source,connectionId]);
       const managedConnection=projectedByConnection.get(managedKey);
-      return managedConnection !== undefined ? managedConnection.state!=="disabled" && managedConnection.revision===revision : activeUnmanagedConnections?.has(managedKey)===true ||
-        activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true;
+      if (managedConnection !== undefined) return managedConnection.state!=="disabled" && managedConnection.revision===revision;
+      if (activeUnmanagedConnections?.has(managedKey)===true) return true;
+      const terminal=terminalsByConnection.get(managedKey);
+      return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
+        ((connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
     });
     const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
       (sourceSuccessSequence.get(source) ?? 0)>this.runtimeObservationFloor);
