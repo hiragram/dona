@@ -280,6 +280,26 @@ test("controlとverificationの観測失敗latchは再起動後も専用成功�
   assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });
 
+test("durable latch marker欠損後の再起動は保守的にgateする", (t) => {
+  const {db,clock,file}=fixture(t); db.connections.disable("pilot",1); db.close();
+  fs.unlinkSync(`${file}.observation-latches.json`);
+  const restarted=new DispatcherDatabase(file,clock); t.after(()=>restarted.close());
+  const active=new Set([JSON.stringify(["custom","connection-a"])]);
+  restarted.recordExternalIngress("custom","connection-a","created",50,new Date(clock.now()));
+  assert.equal(restarted.externalReleaseHealth(new Date(clock.now()),active).ready,false);
+});
+
+test("activeなFigma connectionはruntime registrationを必須にする", async (t) => {
+  const {db,clock}=fixture(t); db.connections.disable("pilot",1);
+  db.connections.register({...config,id:"figma-pilot",provider:"figma"});
+  const driver=new FakeDriver(clock); driver.provider="figma";
+  const lifecycle=new ConnectionLifecycle(db.connections,driver,{authorize:async()=>true},20);
+  await lifecycle.createOrRenew("figma-pilot","folder1"); await lifecycle.verify("figma-pilot","folder1",1);
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),new Set()).ready,false);
+  db.recordExternalIngress("figma","figma-pilot","created",50,new Date(clock.now()),1);
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),new Set([JSON.stringify(["figma","figma-pilot"])])).ready,true);
+});
+
 test("未帰属latchは全active connectionがfailure境界を越えるまで残る", (t) => {
   const {db,clock,file}=fixture(t); db.connections.disable("pilot",1);
   const active=new Set([JSON.stringify(["custom","a"]),JSON.stringify(["custom","b"])]);

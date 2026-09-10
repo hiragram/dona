@@ -79,6 +79,9 @@ export class DispatcherDatabase {
     this.queuePolicy = queuePolicySchema.parse(legacyClock ? {} : queuePolicyOrClock);
     this.readOnly = options.readOnly === true;
     this.observationLatchPath = `${databasePath}.observation-latches.json`;
+    const hadDurableObservationSchema=fs.existsSync(databasePath) && (()=>{ const existing=new Database(databasePath,{readonly:true,fileMustExist:true});
+      try { return existing.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_ingress_conflicts'").get()!==undefined; }
+      finally { existing.close(); } })();
     if (!this.readOnly) {
       fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
       fs.chmodSync(path.dirname(databasePath), 0o700);
@@ -103,7 +106,10 @@ export class DispatcherDatabase {
       ? [] : this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
     this.runtimeObservationFloor = runtimeMetricColumns.some((column)=>column.name==="last_observed_sequence")
       ? Number(this.db.prepare("SELECT coalesce(max(last_observed_sequence),0) FROM external_ingress_metrics").pluck().get()) : 0;
-    this.loadObservationLatches();
+    if (fs.existsSync(this.observationLatchPath)) this.loadObservationLatches();
+    else if (hadDurableObservationSchema) this.failedObservationLatches.set(JSON.stringify(["*","",0]),
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor});
+    else if (!this.readOnly) this.persistObservationLatches();
   }
 
   private loadObservationLatches(): void {
@@ -238,6 +244,8 @@ export class DispatcherDatabase {
     let observationBoundary=0;
     let busyTimeout=2_000;
     try {
+      try { fs.unlinkSync(this.observationLatchPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
       // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
       const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
       observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
@@ -303,7 +311,7 @@ export class DispatcherDatabase {
           if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
         }
       }
-      if (latchedBefore !== undefined || deliveryLatchedBefore !== undefined) try { this.persistObservationLatches(); } catch {}
+      this.persistObservationLatches();
       return true;
     } catch {
       const failedKey=deliveryKey !== undefined && ["duplicate_conflict","verification_duplicate_conflict"].includes(outcome)
@@ -537,10 +545,11 @@ export class DispatcherDatabase {
         (gateRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
           (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
     const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
-      !["github","notion"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
+      !["github","notion","figma"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
       activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
     const activeObservationLatches=[...this.failedObservationLatches].filter(([key,latch]) => {
       const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
+      if (source === "*") return gateRuntimeKeys.length>0 || projected.some((connection)=>connection.state!=="disabled");
       if (connectionId === "") {
         if (![...latch.outcomes].some((outcome)=>sourceGateOutcomes.has(outcome))) return false;
         const concrete=gateRuntimeKeys.filter(([candidate,candidateConnection])=>candidate===source && candidateConnection!=="*");
