@@ -16,6 +16,7 @@ import {
   ExternalIngressProcessor,
   ExternalIngressRegistry,
   ExternalIngressTimeoutError,
+  ExternalIngressPostPersistTimeoutError,
   ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   authenticatedConnectionId,
@@ -562,6 +563,7 @@ export class DispatcherApi {
     } catch (error) {
       const outcome = error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
         error instanceof ExternalIngressValidationError ? "invalid_event" :
+        error instanceof ExternalIngressPostPersistTimeoutError ? "post_persist_timeout" :
         error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
         error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
         error instanceof ExternalIngressAcknowledgementError ? "acknowledgement_unavailable" :

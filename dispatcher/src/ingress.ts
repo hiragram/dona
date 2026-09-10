@@ -49,6 +49,7 @@ export class ExternalIngressTimeoutError extends Error {
     this.name = "ExternalIngressTimeoutError";
   }
 }
+export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeoutError {}
 
 export class ExternalIngressAcknowledgementError extends Error {
   constructor() {
@@ -209,7 +210,8 @@ export class ExternalIngressRegistry {
     return registration ? { source, registration } : undefined;
   }
 
-  activeConnectionKeys(): ReadonlySet<string> {
+  activeConnectionKeys(): ReadonlySet<string> | undefined {
+    if ([...this.registrations.values()].some((registration) => registration.connectionIds === undefined)) return undefined;
     const keys = new Set<string>();
     for (const [source,registration] of this.registrations) {
       for (const connectionId of registration.connectionIds ?? []) keys.add(JSON.stringify([source,connectionId]));
@@ -364,7 +366,7 @@ export class ExternalIngressProcessor {
     return this.registry.get(source);
   }
 
-  activeConnectionKeys(): ReadonlySet<string> { return this.registry.activeConnectionKeys(); }
+  activeConnectionKeys(): ReadonlySet<string> | undefined { return this.registry.activeConnectionKeys(); }
 
   async process(
     source: ExternalEventSource,
@@ -460,7 +462,7 @@ export class ExternalIngressProcessor {
       });
     } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId); }
     try { remainingProcessingTime(processingDeadline); }
-    catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId); }
+    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(),verifiedConnectionId); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,

@@ -252,6 +252,23 @@ export class DispatcherDatabase {
       cursors:cursorsByConnection.get(JSON.stringify([row.id,row.revision])) ?? [],
       errors:managedErrorsByConnection.get(JSON.stringify([row.provider,row.id])) ?? [],
     }));
+    const lifecycleAudit = this.db.prepare(`SELECT connection_id,revision,action,at FROM connection_audit
+      WHERE action IN ('credential_unavailable','verification_failed','response_unknown') ORDER BY connection_id,sequence`).all() as Array<{
+        connection_id:string;revision:number;action:string;at:number;
+      }>;
+    const lifecycleByConnection = new Map<string,typeof lifecycleAudit>();
+    for (const row of lifecycleAudit) { const rows=lifecycleByConnection.get(row.connection_id) ?? []; rows.push(row); lifecycleByConnection.set(row.connection_id,rows); }
+    const subscriptionErrors = this.db.prepare(`SELECT connection_id,resource,generation,revision,state,error
+      FROM connection_subscriptions WHERE error IS NOT NULL ORDER BY connection_id,resource,generation`).all() as Array<{
+        connection_id:string;resource:string;generation:number;revision:number;state:string;error:string;
+      }>;
+    const subscriptionsByConnection = new Map<string,typeof subscriptionErrors>();
+    for (const row of subscriptionErrors) { const rows=subscriptionsByConnection.get(row.connection_id) ?? []; rows.push(row); subscriptionsByConnection.set(row.connection_id,rows); }
+    for (const row of projected) {
+      const lifecycleErrors=lifecycleByConnection.get(row.id) ?? [], subscriptionErrorRows=subscriptionsByConnection.get(row.id) ?? [];
+      if (lifecycleErrors.length > 0) Object.assign(row,{lifecycle_errors:lifecycleErrors.map(({connection_id:_connectionId,...entry}) => entry)});
+      if (subscriptionErrorRows.length > 0) Object.assign(row,{subscription_errors:subscriptionErrorRows.map(({connection_id:_connectionId,...entry}) => entry)});
+    }
     const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence
       FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
         source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
@@ -303,7 +320,7 @@ export class DispatcherDatabase {
         const managedState = projectedByConnection.get(key)?.state;
         const state = managedState ?? (activeUnmanagedConnections?.has(key) === false ? "retired" : "unmanaged");
         const dataPathObserved = managedState !== undefined || successRow !== undefined;
-        const recoveryRow = failureRow?.outcome === "acknowledgement_unavailable" &&
+        const recoveryRow = ["acknowledgement_unavailable","post_persist_timeout"].includes(failureRow?.outcome ?? "") &&
           (duplicateRow?.last_observed_sequence ?? 0) > (successRow?.last_observed_sequence ?? 0) ? duplicateRow : successRow;
         return { source, connection_id: connectionId, state,
           ready: ["disabled","retired"].includes(state) || (dataPathObserved && (failureRow === undefined || (recoveryRow !== undefined && recoveryRow.last_observed_sequence > failureRow.last_observed_sequence)) && blocked === 0 && deadLetter === 0),
