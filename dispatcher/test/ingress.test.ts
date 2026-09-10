@@ -764,10 +764,15 @@ test("queue receipts expose coalescing and reject overload before provider ACK",
 
 test("normalizer mutation cannot replace the authenticated queue connection",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
-  const database=new DispatcherDatabase(config.databasePath);const definition=registration();
+  const database=new DispatcherDatabase(config.databasePath);const definition=registration();let acknowledgedRevision:number|undefined;
   const registry=new ExternalIngressRegistry([{...definition,normalize(raw,verified){
     (verified as {connectionId:string}).connectionId="forged";
+    const current=(verified as {connection:{revision:number}}).connection;
+    (verified as {connection:{revision:number}}).connection={...current,revision:99};
     return definition.normalize(raw,verified);
+  },buildAcknowledgement(receipt){
+    acknowledgedRevision=receipt.connectionRevision;
+    return definition.buildAcknowledgement(receipt);
   }}]);
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
   await api.start();
@@ -775,5 +780,6 @@ test("normalizer mutation cannot replace the authenticated queue connection",asy
     const body=fakeBody();assert.ok((await request(config.socketPath,"fake",body,signedHeaders(body))).status<300);
     assert.ok(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"connection-a","delivery-1")));
     assert.equal(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"forged","delivery-1")),undefined);
+    assert.equal(acknowledgedRevision,0);
   } finally {await api.stop();database.close();}
 });

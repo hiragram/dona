@@ -237,6 +237,8 @@ test("verification created観測latchはverification duplicateで解除する", 
   const lock=new Database(file); lock.exec("BEGIN IMMEDIATE");
   assert.equal(db.recordExternalIngress("notion","notion-pilot","verification_created",50,new Date(clock.now())),false);
   lock.exec("COMMIT"); lock.close();
+  db.recordExternalIngress("notion","notion-pilot","created",50,new Date(clock.now()));
+  assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,false);
   db.recordExternalIngress("notion","notion-pilot","verification_duplicate_same",50,new Date(clock.now()));
   assert.equal(db.externalReleaseHealth(new Date(clock.now()),active).ready,true);
 });

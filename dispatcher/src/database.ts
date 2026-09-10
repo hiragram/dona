@@ -224,7 +224,8 @@ export class DispatcherDatabase {
       const latchedOutcomes=latched?.outcomes;
       if (outcome === "created") {
         if (latchedOutcomes !== undefined) {
-          for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable"].includes(latched)) latchedOutcomes.delete(latched);
+          for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable",
+            "verification_created","verification_duplicate_same"].includes(latched)) latchedOutcomes.delete(latched);
           if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
         }
       } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
