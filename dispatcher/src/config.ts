@@ -17,6 +17,8 @@ export interface DispatcherConfig {
   maxAttempts: number;
   jobsWorkspaceRoot: string;
   jobResultsDir: string;
+  jobsPerEventMax:number;
+  jobObjectiveTotalMaxBytes:number;
   jobConcurrency: number;
   jobAgentStartTimeoutMs: number;
   jobCommandTimeoutMs: number;
@@ -87,6 +89,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
       env.DONA_JOBS_WORKSPACE_ROOT ?? path.join(os.homedir(), ".dona", "workspaces"),
     ),
     jobResultsDir: expandHome(env.DONA_JOB_RESULTS_DIR ?? path.join(base, "job-results")),
+    jobsPerEventMax:positiveInteger(env.DONA_JOBS_PER_EVENT_MAX,8,"DONA_JOBS_PER_EVENT_MAX"),
+    jobObjectiveTotalMaxBytes:positiveInteger(env.DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES,400_000,"DONA_JOB_OBJECTIVE_TOTAL_MAX_BYTES"),
     jobConcurrency: positiveInteger(env.DONA_JOB_CONCURRENCY, 4, "DONA_JOB_CONCURRENCY"),
     jobAgentStartTimeoutMs: positiveInteger(
       env.DONA_JOB_AGENT_START_TIMEOUT_MS,

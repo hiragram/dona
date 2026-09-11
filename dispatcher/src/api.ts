@@ -37,7 +37,7 @@ export function scheduleAccessConfirmationTimeout(issuedAt:string,now=Date.now()
 }
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string, readonly details?:Record<string,unknown>) {
     super(message);
   }
 }
@@ -51,8 +51,8 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.end(encoded);
 }
 
-function errorBody(code: string, message: string): unknown {
-  return { schema_version: 1, error: { code, message } };
+function errorBody(code: string, message: string, details?:Record<string,unknown>): unknown {
+  return { schema_version: 1, error: { code, message, ...(details?{details}:{}) } };
 }
 
 async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
@@ -426,7 +426,7 @@ export class DispatcherApi {
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
-        sendJson(response, error.status, errorBody(error.code, error.message));
+        sendJson(response, error.status, errorBody(error.code, error.message,error.details));
       } else if (error instanceof ScheduleApiError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
       } else if (error instanceof Error && error.name === "ZodError") {
@@ -572,7 +572,7 @@ export class DispatcherApi {
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
-        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message);
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
       }
       this.jobs.wake();

@@ -365,6 +365,19 @@ describe("DispatcherDatabase", () => {
     raw.close();
   });
 
+  test("fingerprintのないlegacy jobは一致payloadだけをreuseする",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const event=database.enqueue(eventEnvelope("Ev-legacy-reuse")).row;
+    const request={source_event_id:event.event_id,objective:"legacy",workspace:{kind:"scratch" as const}};
+    const job=database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const raw=new Database(config.databasePath); raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id); raw.close();
+    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.throws(()=>database.createJob({...request,objective:"changed"},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
+    database.close();
+  });
+
   for (const fault of ["jobs_copied", "indexes_recreated", "groups_backfilled", "scheduler_schema_ready"] as const) {
     test(`schema v3 migrationは${fault}障害でv2とscheduler永続化をrollbackする`, async () => {
       const { root, config } = await tempConfig(); roots.push(root);

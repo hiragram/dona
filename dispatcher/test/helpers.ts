@@ -25,6 +25,8 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       jobsWorkspaceRoot: path.join(root, "workspaces"),
       jobResultsDir: path.join(root, "job-results"),
       jobConcurrency: 4,
+      jobsPerEventMax: 8,
+      jobObjectiveTotalMaxBytes: 400_000,
       jobAgentStartTimeoutMs: 100,
       jobCommandTimeoutMs: 100,
       ghPath: "gh",

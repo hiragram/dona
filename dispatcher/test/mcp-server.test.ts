@@ -104,6 +104,7 @@ describe("Dona Dispatcher MCP server", () => {
         name: "delegate_job",
         arguments: {
           source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+          job_key:"implementation.primary",
           objective: "調査してPRを作る",
           workspace_kind: "github",
           repository: "owner/repo",
@@ -115,6 +116,7 @@ describe("Dona Dispatcher MCP server", () => {
         method: "createJob",
         args: [{
           source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+          job_key:"implementation.primary",
           objective: "調査してPRを作る",
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
         }],

@@ -438,6 +438,8 @@ export class DispatcherDatabase {
         const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
         if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
         if(stored===undefined&&jobKey!==legacyJobKey) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} has no immutable canonical payload fingerprint`);
+        if(stored===undefined&&(existing.objective!==parsedRequest.objective||existing.workspace_json!==stableStringify(parsedRequest.workspace)))
+          throw new JobCreationError("job_idempotency_conflict",`Legacy job key ${jobKey} does not match the persisted payload`);
         return {row:existing,outcome:"reused",duplicate:true};
       }
       if(binding.owner.kind==="schedule") {
@@ -561,7 +563,7 @@ export class DispatcherDatabase {
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
     return this.db.prepare(`
       WITH ranked AS (
-        SELECT job_id, ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,job_id) AS fairness_rank
+        SELECT job_id, ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,rowid) AS fairness_rank
         FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status='running'
       ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
         ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,job_id LIMIT ?
