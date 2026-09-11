@@ -103,7 +103,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 binding/audit HMAC signing keyは90日以内にrotationし、各recordへ用途と`key_version`を保存します。rotation済みkeyは新規MACへ使わず、OS credential store内のverification-only keyとして、そのkeyで署名した最後のrecordの400日保持とbackup expiryがともに終了するまで保護して保持します。その後はrecordを削除してからkeyを破棄します。verification keyが欠落、revoked、またはversion不明ならrecordを検証済みと扱わず、security decisionと自動実行をfail closedします。retained recordを別keyで暗黙にre-MACしません。
 
-Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら、requestに加えて`claimed` / `executing`を含む全nonterminal attemptを`needs_review`へ同じtransactionで固定し、decision/claim/executionを拒否します。payloadの再生成や元actionの自動再実行は行いません。
+Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら、requestに加えて`claimed` / `executing`を含む全nonterminal attemptを`needs_review`へ同じtransactionで固定し、decision/claim/executionを拒否します。さらにDB/backup外の保護されたcredential storeへbinding generationとenforcement policy generationの単調high-water markを保存し、restore内容がどちらかを巻き戻す場合は新規requestを含むapproval経路全体をfail closedします。現在generationへの二者operator再承認が完了するまで旧binding/policyをcurrentとして採用しません。payloadの再生成や元actionの自動再実行は行いません。
 
 理由: incident追跡とdata minimizationを両立します。安全側defaultは保存しないことです。legal/運用要件変更時はfield別classification、削除証跡、backup expiryを同時に更新します。
 
@@ -145,6 +145,12 @@ delivery attempt:
   dispatching -> acceptance_unknown (recovery only)
   acceptance_unknown -> sent|needs_review
 
+pending notice attempt:
+  pending -> dispatching
+  dispatching -> sent|failed|acceptance_unknown
+  dispatching -> acceptance_unknown (recovery only)
+  acceptance_unknown -> sent|needs_review
+
 presentation update attempt:
   pending -> dispatching
   pending -> aborted
@@ -170,6 +176,7 @@ execution attempt:
 - requestがcancel、expire、reject、またはinvalidateされる時点でdelivery attemptがまだ`pending`なら、同じtransactionで`aborted`へ収束させます。外部call未開始のattemptは以後claimせず、無効なapproval cardを新規送信しません。
 - binding/policy/restore invalidationは全nonterminal stateとapprovedから`needs_review`へtransactionalに遷移でき、配送結果と競合してもinvalidated requestを`sent`へ戻しません。
 - approval delivery workerは`chat.postMessage`直前に`dispatching`とattempt fenceをdurable commitします。復旧時の`dispatching`は送信済みの可能性があるため無条件に同じattemptを`acceptance_unknown`へ移し、read-only reconcileだけを行い再送しません。
+- 元threadのpending noticeはapproval cardと別のdelivery attemptとして、request ID、notice attempt ID、server-side MACの一意markerへbindingします。`chat.postMessage`直前に`dispatching` fenceをdurable commitし、timeoutまたは復旧時は`acceptance_unknown`からexact markerをread-only reconcileするだけで、0件でも再投稿しません。
 - presentation update workerはdispatch直前に保存済みpresentation revisionとcurrent desired revisionを照合し、staleな`pending` attemptを`aborted`へ収束させます。同じmessageに`dispatching`または`acceptance_unknown`のattemptがある間は後続updateを送らず、先行writeがterminalに一意確定するまで直列化します。曖昧な先行writeを飛び越えて新しい表示で上書きしません。
 - executorは`claimed`から外部callへ進む直前に、短いexecution期限、binding、policy、ordered thread revision、visibility、shared状態をcurrent sourceから再検証します。不一致や期限切れは外部callなしで`needs_review`へ収束させます。成功した場合だけ`executing`とattempt fenceをdurable commitして送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
@@ -178,11 +185,11 @@ execution attempt:
 
 ## Slack transport decision proof
 
-request作成時のrequesterは、認証済みEvent Envelopeのactor、またはDispatcherが永続化したbackground job ownerからserver-sideで導出します。source event/job ID、owner kind、actor/owner ID、instance、workspaceをimmutable requestへ結合し、会話本文、LLM出力、button valueからrequester IDを受け取りません。source ownershipが欠落または一致しなければrequestを作りません。
+request作成時のrequesterは、認証済みEvent Envelopeのactor、またはDispatcherが永続化したbackground job ownerからserver-sideで導出します。source event/job ID、owner kind、actor/owner ID、instance、workspaceをimmutable requestへ結合し、会話本文、LLM出力、button valueからrequester IDを受け取りません。source ownershipが欠落または一致しなければrequestを作りません。作成keyはserver-sideで`instance + workspace + source event/job ID + stable operation slot`から導出してunique constraintを設けます。同じkeyとcanonical action hashの再送は既存requestを返し、同じkeyで異なるactionは状態を変えずconflictとして`needs_review`にします。一つのsourceで複数actionを扱う場合も、順序から変動しない明示slotをDispatcherが永続化します。
 
 button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。3秒以内に、envelope IDをdedup keyとするdurable interactive inboxへ検証済みproofとcommandをcommitしてからACKします。ACKはapproval受理ではありません。ACK後のdecision workerは保存済みcommandだけを処理し、duplicate envelopeは同じinbox recordへ収束させます。decision確定時はstable event IDを持つ`dona_approval` outbox rowをdecisionと同じtransactionで一度だけ作成します。commit後はdurable outboxだけを配送し、process再起動時も未配送rowを回収します。`chat.update`は別のdurable attemptとして処理します。
 
-非supervisor、別workspace、別message、古いpresentation、duplicate、期限切れもACKしてから拒否・auditします。曖昧な`chat.postMessage`結果はdelivery attempt、曖昧な`chat.update`結果は独立したpresentation update attemptの`acceptance_unknown`として保存し、どちらもblind retryしません。update attemptはdecisionとpresentation revisionへbindingし、`chat.update`直前に`dispatching` fenceをdurable commitします。復旧した`dispatching`は無条件に`acceptance_unknown`へ移し、read-backしたexact revisionが1件の場合だけ同じattemptを収束させます。
+非supervisor、別workspace、別message、古いpresentation、duplicate、期限切れもACKしてから拒否・auditします。曖昧な`chat.postMessage`結果はdelivery attempt、曖昧な`chat.update`結果は独立したpresentation update attemptの`acceptance_unknown`として保存し、どちらもblind retryしません。update attemptはdecisionとpresentation revisionへbindingし、`chat.update`直前に`dispatching` fenceをdurable commitします。復旧した`dispatching`は無条件に`acceptance_unknown`へ移し、read-backしたexact revisionが1件の場合だけ同じattemptを`succeeded`へ収束させます。0件は`acceptance_unknown`のまま維持し、決定的rejectionだけを`failed`、複数件またはpagination不完全を`needs_review`にします。0件観測後も同一messageへの後続writeを送りません。
 
 MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeoutまたは`executing`復旧後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら`acceptance_unknown`のまま、2件以上またはpagination不完全なら`needs_review`とします。不在観測を決定的rejectionとみなさず、別の明示操作でも同じwriteを再送しません。同文、timestamp近接、message textだけではattemptを同定しません。
 
