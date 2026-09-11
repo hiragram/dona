@@ -23,6 +23,7 @@
 | clock rewind after restart | nonterminal / `approved` | wall clockがdurable high-water markより前 | `expired`または`needs_review` | なし |
 | cancel by another actor | nonterminal / `approved` | requester/instance/workspace/revision不一致 | 状態不変、audit | なし |
 | restore without payload | nonterminal / `approved` | payload参照欠落またはHMAC不一致 | `needs_review` | なし |
+| invalidate before delivery call | request terminal、attempt `pending` | 外部call未開始 | attempt `aborted` | なし |
 
 ## Consume / execution transition table
 
@@ -36,6 +37,8 @@
 | known rejection | APIが決定的拒否 | `failed` | 同じwriteを再送しない |
 | timeout after send | acceptanceを証明不能 | `acceptance_unknown` | read-only reconcileのみ |
 | crash after external-call fence | durable stateが`executing` | 送信結果なしでrestart | 同じattemptを`acceptance_unknown`へ移す | read-only reconcileのみ、再送禁止 |
+| claimed precondition drift | `claimed`、execution直前に期限/binding/thread/visibility不一致 | `needs_review`、外部callなし | 自動retry不可 |
+| restore claimed/executing | payload欠落またはHMAC不一致 | `needs_review` | 再開・再送禁止 |
 | reconciled accepted | exact idempotency key/resultを発見 | 同じattemptを`succeeded`へ更新 | 新attemptを作らない |
 | reconciled rejected | exact rejection receiptを発見 | 同じattemptを`failed`へ更新 | 新attemptを作らない |
 
@@ -47,6 +50,7 @@
 | post rejected | `dispatching` | Slackの決定的error | `failed` |
 | post timeout | `dispatching` | acceptanceを証明不能 | `acceptance_unknown`、再投稿禁止 |
 | crash after delivery fence | durable stateが`dispatching` | 結果なしでrestart | 同じattemptを`acceptance_unknown`へ移し、再投稿禁止 |
+| request invalidated before fence | `pending` | requestがterminal | 同じtransactionで`aborted`、送信禁止 |
 | unknown reconciled sent | `acceptance_unknown` | saved presentation identityがexactly 1件 | 同じattemptを`sent`へ更新 |
 | unknown marker absent | `acceptance_unknown` | bounded全pageで0件 | `acceptance_unknown`のまま、再送禁止 |
 | unknown marker ambiguous | `acceptance_unknown` | 複数件、pagination不完全 | `needs_review`、再送禁止 |
@@ -61,13 +65,14 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 
 | Case | Initial | Observation | Expected |
 | --- | --- | --- | --- |
-| update accepted | `pending` | decision/presentation revisionと一致 | `succeeded` |
-| update rejected | `pending` | Slackの決定的error | `failed` |
-| update timeout | `pending` | acceptanceを証明不能 | `acceptance_unknown`、再update禁止 |
+| update accepted | `dispatching` | decision/presentation revisionと一致 | `succeeded` |
+| update rejected | `dispatching` | Slackの決定的error | `failed` |
+| update timeout | `dispatching` | acceptanceを証明不能 | `acceptance_unknown`、再update禁止 |
+| crash after update fence | durable stateが`dispatching` | 結果なしでrestart | `acceptance_unknown`へ移し、再update禁止 |
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
 | update ambiguous | `acceptance_unknown` | revision 0/複数件、pagination不完全 | `needs_review` |
 
-presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。
+presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Typed action fixture: `slack.post_thread_reply.v1`
 
@@ -98,12 +103,19 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
       "edited_ts": "1700000001.000001",
       "content_hmac_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
+    "ordered_thread_revision": {
+      "complete": true,
+      "items": [
+        {"message_ts": "1700000000.000001", "edited_ts": "1700000001.000001", "content_hmac_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        {"message_ts": "1700000002.000001", "edited_ts": null, "content_hmac_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+      ]
+    },
     "workspace_binding_revision": 3
   }
 }
 ```
 
-CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとroot message HMACはUIへ表示しません。rootが未編集なら`edited_ts`の明示的なnullと内容HMACを保存し、consume時に両方を再取得します。
+CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
@@ -120,6 +132,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - supervisorがprivate targetから外れた場合はdecision/consumeを`needs_review`へ遷移
 - claim直後のcrashでもattempt専用暗号化payloadから同じ本文を復元し、別attemptは作らない
 - external-call開始fence後のcrashでは復旧時に同じattemptをunknownへ移し、marker 0件でも再送しない
+- claim復旧後もexecution期限と全preconditionを`executing`直前に再検証し、drift時は外部callなしで`needs_review`
+- approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
+- retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
 
