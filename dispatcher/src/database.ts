@@ -578,9 +578,11 @@ export class DispatcherDatabase {
 
   listOwnerJobs(sourceEventId: string, limit = 100): JobRow[] {
     const binding=readEventJobBinding(this.db,sourceEventId);
-    if(!binding) throw new Error("Unknown job owner");
+    const completion=!binding?this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined:undefined;
+    const ownerJson=binding?stableStringify(binding.owner):completion?.owner_json;
+    if(!ownerJson) throw new Error("Unknown job owner");
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(stableStringify(binding.owner),limit) as JobRow[];
+      WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(ownerJson,limit) as JobRow[];
   }
 
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
