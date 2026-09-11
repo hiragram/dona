@@ -4,7 +4,7 @@ import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
 
-import { DispatcherDatabase } from "../src/database.js";
+import { DispatcherDatabase, JobCreationError } from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -189,6 +189,26 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("owner-aware admissionは通常multi-jobの順序・limit・fairnessを維持する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:2,jobObjectiveTotalMaxBytes:100});
+    const firstEvent=database.enqueue(eventEnvelope("Ev-owner-aware-a" )).row;
+    const secondEnvelope=eventEnvelope("Ev-owner-aware-b"); secondEnvelope.reply_target!.thread_ts="1756722031.000001"; secondEnvelope.subject.thread_ts="1756722031.000001";
+    const secondEvent=database.enqueue(secondEnvelope).row;
+    const request=(source_event_id:string,job_key:string,objective=job_key)=>({source_event_id,job_key,objective,workspace:{kind:"scratch" as const}});
+    const first=database.createJob(request(firstEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    const second=database.createJob(request(firstEvent.event_id,"two"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    const other=database.createJob(request(secondEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    assert.equal(database.createJob(request(firstEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.throws(()=>database.createJob(request(firstEvent.event_id,"one","changed"),config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
+    assert.throws(()=>database.createJob(request(firstEvent.event_id,"three"),config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded");
+    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
+    assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
+    database.close();
+  });
+
   test("does not copy untrusted objective text into the Herdr-visible agent name", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -327,7 +347,8 @@ describe("DispatcherDatabase", () => {
     const bridge = new Database(config.databasePath);
     bridge.prepare("UPDATE jobs SET job_key='bridge-key' WHERE job_id=?").run(job.job_id);
     bridge.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)").run(job.job_id,event.updated_at);
-    bridge.prepare("INSERT INTO job_groups VALUES(?,?,?,?,?,?,?)").run(event.event_id,event.updated_at,"legacy",null,null,event.created_at,event.updated_at);
+    bridge.prepare("UPDATE job_groups SET sealed_at=?,notification_mode='legacy',created_at=?,updated_at=? WHERE source_event_id=?")
+      .run(event.updated_at,event.created_at,event.updated_at,event.event_id);
     const schedulerTables = (bridge.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count;
     bridge.pragma("user_version = 2");
     bridge.close();

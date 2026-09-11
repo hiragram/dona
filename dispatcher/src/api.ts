@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { dispatcherSchemaCompatibility, type DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, JobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
@@ -572,17 +572,13 @@ export class DispatcherApi {
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message);
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
-      }
-      if (result.payloadMismatch) {
-        this.logger.warn("Duplicate job request differs from persisted job", {
-          job_id: result.row.job_id,
-          source_event_id: result.row.source_event_id,
-        });
       }
       this.jobs.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         duplicate: result.duplicate,
         job: result.row,
       });
@@ -614,6 +610,10 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(!sourceEventId) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
+      try { this.database.assertJobSourceMatchesThread(jobId,sourceEventId); }
+      catch { throw new ApiRequestError(403,"owner_mismatch","Job does not belong to the event owner"); }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }

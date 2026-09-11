@@ -45,9 +45,12 @@ export type JobWorkspace =
 
 export interface CreateJobRequest {
   source_event_id: string;
+  job_key?: string;
   objective: string;
   workspace: JobWorkspace;
 }
+
+export interface CanonicalJobPayload { objective: string; workspace: JobWorkspace; }
 
 export interface SteerJobRequest {
   source_event_id: string;
@@ -122,6 +125,7 @@ export interface EnqueueResult {
 export interface JobRow {
   job_id: string;
   source_event_id: string;
+  job_key: string;
   source: string;
   workspace_id: string | null;
   channel_id: string | null;
@@ -152,6 +156,6 @@ export interface JobRow {
 
 export interface CreateJobResult {
   row: JobRow;
+  outcome: "created" | "reused";
   duplicate: boolean;
-  payloadMismatch: boolean;
 }

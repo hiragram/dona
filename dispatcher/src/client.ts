@@ -14,8 +14,8 @@ export class DispatcherApiClient {
     return this.request("POST", "/v1/jobs", input);
   }
 
-  getJob(jobId: string): Promise<Record<string, unknown>> {
-    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}`);
+  getJob(jobId: string,sourceEventId:string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}?${new URLSearchParams({source_event_id:sourceEventId})}`);
   }
 
   authorizeJobNotification(eventId:string,receipt?:string):Promise<Record<string,unknown>> {

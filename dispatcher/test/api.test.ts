@@ -145,6 +145,7 @@ describe("DispatcherApi", () => {
     const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-job-api"));
     const created = await request(config.socketPath, "POST", "/v1/jobs", {
       source_event_id: accepted.body.event_id,
+      job_key:"primary",
       objective: "リポジトリを調査する",
       workspace: { kind: "github", repository: "owner/repo" },
     });
@@ -152,16 +153,27 @@ describe("DispatcherApi", () => {
     const job = created.body.job as Record<string, unknown>;
     assert.match(String(job.job_id), /^job_/);
     assert.equal(jobWakeCount, 1);
-    const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}`);
+    const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}?source_event_id=${accepted.body.event_id}`);
     assert.equal(shown.status, 200);
     assert.equal((shown.body.job as Record<string, unknown>).source_event_id, accepted.body.event_id);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}`)).status,400);
+    const otherEnvelope=eventEnvelope("Ev-job-api-other");
+    otherEnvelope.reply_target!.thread_ts="1756722031.000001";
+    otherEnvelope.subject.thread_ts="1756722031.000001";
+    const other=await request(config.socketPath,"POST","/v1/events",otherEnvelope);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,403);
+    const siblingRequest={source_event_id:accepted.body.event_id,job_key:"sibling",objective:"追加調査",workspace:{kind:"scratch"}};
+    const sibling=await request(config.socketPath,"POST","/v1/jobs",siblingRequest);
+    assert.equal(sibling.status,202);
+    assert.equal((await request(config.socketPath,"POST","/v1/jobs",siblingRequest)).status,200);
+    assert.equal((await request(config.socketPath,"POST","/v1/jobs",{...siblingRequest,objective:"差し替え"})).status,409);
     const listed = await request(
       config.socketPath,
       "GET",
       "/v1/jobs?workspace_id=T_TEST&channel_id=C_TEST&thread_ts=1756722030.123456",
     );
     assert.equal(listed.status, 200);
-    assert.equal((listed.body.jobs as unknown[]).length, 1);
+    assert.equal((listed.body.jobs as unknown[]).length, 2);
     await api.stop();
     database.close();
   });

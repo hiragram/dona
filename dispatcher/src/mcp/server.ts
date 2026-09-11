@@ -6,7 +6,7 @@ import type { Logger } from "../logger.js";
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
-  getJob(jobId: string): Promise<Record<string, unknown>>;
+  getJob(jobId: string,sourceEventId:string): Promise<Record<string, unknown>>;
   authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
@@ -143,11 +143,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("get_job_status", {
     title: "Get background job status",
     description: "ジョブの状態、workspace path、結果、エラーを取得します。",
-    inputSchema: { job_id: jobId },
+    inputSchema: { job_id: jobId, source_event_id:eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ job_id }) => {
+  }, async ({ job_id,source_event_id }) => {
     try {
-      return success(await client.getJob(job_id));
+      return success(await client.getJob(job_id,source_event_id));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }
