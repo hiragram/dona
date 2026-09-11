@@ -1,5 +1,7 @@
 # Scheduler ローカル運用runbook
 
+利用・release gate全体は[Scheduler 利用・release gateガイド](../scheduler-guide.md)を参照する。
+
 `/health/live` はprocessの生存だけを示す。`/health/ready` はDB read/write、worker、scheduler loopに加え、期限切れauthorization、stale claim、retention遅延がないことを確認する。`/metrics/scheduler` と `dona-dispatcher scheduler health` は本文・target・tokenを含まない件数、lag、operation counterだけを返す。
 
 ## 診断

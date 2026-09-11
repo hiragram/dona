@@ -15,7 +15,7 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts serve",
     "start": "node dist/cli.js serve",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "node ../scripts/run-scheduler-integration-gate.mjs && tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

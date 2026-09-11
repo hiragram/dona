@@ -73,7 +73,7 @@ Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" }
 
 Dispatcher packageには、常駐Dispatcherとは別プロセスのstdio MCPも含まれます。MCP自身はSQLiteやHerdrへ直接触らず、常駐DispatcherのUDS APIだけを呼びます。
 
-schedule操作は、呼出し元が指定したworkspace・actor・返信先を信用しません。`source_event_id`で保存済みSlack eventを引き、actor、workspace、固定thread、30日以内のauthorization snapshotをserver-sideで組み立てます。`preview_schedule`で有限horizonのoccurrence・policy・固定target・失効時刻を確認してから、`create_schedule`を呼びます。writeのtimeoutや切断時はblind retryせず、同じidempotency keyの状態を`get_schedule`または`list_schedules`で照合してください。updateとpause/resume/cancelは必ず取得済みの`expected_revision`を渡します。
+schedule操作は、呼出し元が指定したworkspace・actor・返信先を信用しません。`source_event_id`で保存済みSlack eventを引き、actor、workspace、固定thread、30日以内のauthorization snapshotをserver-sideで組み立てます。`preview_schedule`で有限horizonのoccurrence・policy・固定target・失効時刻を確認してから、`create_schedule`を呼びます。writeのtimeoutや切断時はblind retryせず、同じidempotency keyの状態を`get_schedule`または`list_schedules`で照合してください。updateとpause/resume/cancelは必ず取得済みの`expected_revision`を渡します。利用例、security model、release/rollback gateは[Scheduler 利用・release gateガイド](../docs/scheduler-guide.md)を参照してください。
 
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
