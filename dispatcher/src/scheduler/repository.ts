@@ -1109,12 +1109,19 @@ export class SchedulerRepository {
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
             AND c.notification_state IN ('pending','failed','needs_review'))))`, add(now,-2592000), add(now,-2592000), add(now,-2592000)),
       orphan_revisions: count(`SELECT count(*) AS count FROM schedule_revisions WHERE content IS NULL AND terminal_at<=? AND NOT EXISTS
-        (SELECT 1 FROM schedules s WHERE s.schedule_id=schedule_revisions.schedule_id AND s.revision=schedule_revisions.revision)
+        (SELECT 1 FROM schedules s WHERE s.schedule_id=schedule_revisions.schedule_id AND s.revision=schedule_revisions.revision
+          AND NOT (s.terminal_at IS NOT NULL AND s.terminal_at<=? AND NOT EXISTS
+            (SELECT 1 FROM schedule_runs sr WHERE sr.schedule_id=s.schedule_id AND NOT
+              (sr.terminal_at IS NOT NULL AND sr.terminal_at<=? AND NOT EXISTS
+                (SELECT 1 FROM connector_outbox so WHERE so.run_id=sr.run_id AND (so.terminal_at IS NULL OR so.terminal_at>?))
+                AND NOT EXISTS (SELECT 1 FROM job_completion_results sc WHERE json_extract(sc.owner_json,'$.run_id')=sr.run_id
+                  AND sc.notification_state IN ('pending','failed','needs_review'))))))
         AND NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=schedule_revisions.schedule_id
           AND r.revision=schedule_revisions.revision AND NOT (r.terminal_at IS NOT NULL AND r.terminal_at<=? AND NOT EXISTS
             (SELECT 1 FROM connector_outbox o WHERE o.run_id=r.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
             AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
-              AND c.notification_state IN ('pending','failed','needs_review'))))`, add(now,-2592000),add(now,-2592000),add(now,-2592000)),
+              AND c.notification_state IN ('pending','failed','needs_review'))))`, add(now,-2592000),add(now,-2592000),
+                add(now,-2592000),add(now,-2592000),add(now,-2592000),add(now,-2592000)),
       job_contents: count(`SELECT count(*) AS count FROM jobs j WHERE (j.result_json IS NOT NULL OR j.objective<>'[deleted]') AND EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.content_delete_at<=?
           AND json_extract(c.owner_json,'$.kind')='schedule') AND NOT EXISTS

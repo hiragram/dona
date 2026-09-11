@@ -115,6 +115,7 @@ test("retention readinessは次回hourly purgeまで猶予しevent相関indexを
   for (const name of ["job_completion_source_event_idx", "job_completion_notification_event_idx", "job_completion_run_idx"]) {
     assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name));
   }
+  assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='schedule_audit_event_retention_idx'").get());
 });
 
 test("authorization readinessは実行可能なdue scheduleだけを対象にする", () => {
@@ -141,7 +142,9 @@ test("retention planはrunのないterminal scheduleを期限後に数える", (
   const { repo, raw } = setup();
   repo.create("cancelled",input,due,actor,now);
   raw.prepare("UPDATE schedules SET state='cancelled',terminal_at=?,updated_at=? WHERE schedule_id='cancelled'").run(now,now);
-  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").terminal_schedules,1);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,terminal_at=? WHERE schedule_id='cancelled'").run(now);
+  const plan=repo.retentionPlan("2026-11-01T00:00:00Z");
+  assert.equal(plan.terminal_schedules,1); assert.equal(plan.orphan_revisions,1);
 });
 
 test("retention planは削除予定runの後に孤立するrevisionも数える", () => {
