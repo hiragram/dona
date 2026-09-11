@@ -204,6 +204,9 @@ describe("DispatcherDatabase", () => {
       (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
     assert.throws(()=>database.createJob(request(firstEvent.event_id,"three"),config.jobsWorkspaceRoot,config.jobResultsDir),
       (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded");
+    const followUp=database.enqueue(eventEnvelope("Ev-owner-aware-follow-up")).row;
+    assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
     assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
     assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
     database.close();
@@ -372,6 +375,9 @@ describe("DispatcherDatabase", () => {
     const request={source_event_id:event.event_id,objective:"legacy",workspace:{kind:"scratch" as const}};
     const job=database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).row;
     const raw=new Database(config.databasePath); raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id); raw.close();
+    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    const followUp=database.enqueue(eventEnvelope("Ev-legacy-reuse-follow-up")).row;
+    database.appendQueuedJobInstruction(job.job_id,followUp.event_id,"追加条件");
     assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
     assert.throws(()=>database.createJob({...request,objective:"changed"},config.jobsWorkspaceRoot,config.jobResultsDir),
       (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");

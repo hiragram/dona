@@ -259,6 +259,13 @@ export class DispatcherDatabase {
         CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
         CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
       `);
+      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json FROM jobs WHERE job_key=?").all(legacyJobKey) as Array<{job_id:string;objective:string;workspace_json:string}>) {
+        const workspace=JSON.parse(row.workspace_json) as CreateJobRequest["workspace"];
+        if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined) continue;
+        const request={source_event_id:"migration",objective:row.objective,workspace};
+        this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(
+          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(row.objective,"utf8")),row.job_id);
+      }
       if (hasLegacyStopMarkers) this.db.exec(`
         INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
         SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);
@@ -440,7 +447,16 @@ export class DispatcherDatabase {
         if(stored===undefined&&jobKey!==legacyJobKey) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} has no immutable canonical payload fingerprint`);
         if(stored===undefined&&(existing.objective!==parsedRequest.objective||existing.workspace_json!==stableStringify(parsedRequest.workspace)))
           throw new JobCreationError("job_idempotency_conflict",`Legacy job key ${jobKey} does not match the persisted payload`);
-        return {row:existing,outcome:"reused",duplicate:true};
+        if(stored===undefined) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
+        if(binding.owner.kind==="schedule") {
+          const authorized=this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
+            JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+            WHERE r.run_id=? AND r.job_id=? AND r.revision=? AND r.status='started'
+              AND s.state='active' AND s.revision=r.revision AND julianday(v.expires_at)>julianday(?)`).get(
+            binding.owner.run_id,existing.job_id,binding.owner.revision,at.toISOString());
+          if(!["dispatching","waiting_agent"].includes(sourceEvent.status)||!authorized) throw new Error("Schedule run is no longer authorized for job reuse");
+        }
+        return {row:this.getJobRequired(existing.job_id),outcome:"reused",duplicate:true};
       }
       if(binding.owner.kind==="schedule") {
         if(!["dispatching","waiting_agent"].includes(sourceEvent.status)) {
@@ -824,10 +840,17 @@ export class DispatcherDatabase {
     const row = this.getJobRequired(jobId);
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
     if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
-    this.db.prepare(`
-      UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
-      WHERE job_id = ?
-    `).run(`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`, sourceEventId, nowUtc(), jobId);
+    const suffix=`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
+    this.db.transaction(()=>{
+      const siblings=this.db.prepare("SELECT job_id,objective FROM jobs WHERE source_event_id=?").all(row.source_event_id) as Array<{job_id:string;objective:string}>;
+      const current=siblings.reduce((sum,sibling)=>sum+Buffer.byteLength(sibling.objective,"utf8"),0);
+      const attempted=current+Buffer.byteLength(suffix,"utf8");
+      if(attempted>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
+      this.db.prepare(`
+        UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
+        WHERE job_id = ?
+      `).run(suffix, sourceEventId, nowUtc(), jobId);
+    }).immediate();
     return this.getJobRequired(jobId);
   }
 

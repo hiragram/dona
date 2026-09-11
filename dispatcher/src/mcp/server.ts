@@ -100,7 +100,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。異なるjob_keyで同じeventから複数jobを作成できます。",
     inputSchema: {
       source_event_id: eventId,
-      job_key:z.string().regex(/^[a-z0-9](?:[a-z0-9._-]{0,63})$/).optional(),
+      job_key:z.string().regex(/^[a-z0-9](?:[a-z0-9._-]{0,63})$/).refine(value=>value!=="legacy-default").optional(),
       objective: z.string().min(1).max(100_000),
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
