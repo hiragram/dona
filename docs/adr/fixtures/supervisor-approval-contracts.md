@@ -73,13 +73,14 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` | 同じmessage | 先行attemptの一意なterminalまで後続dispatch禁止 |
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
 | update absent | `acceptance_unknown` | bounded全pageでrevision 0件 | `acceptance_unknown`のまま、後続update禁止 |
-| update ambiguous | `acceptance_unknown` | revision複数件、pagination不完全 | `needs_review`、自動後続update禁止 |
+| update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
+| update duplicate | `acceptance_unknown` | exact revision複数件 | `needs_review`、自動後続update禁止 |
 
 presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Pending notice delivery fixture
 
-元threadのpending noticeはapproval cardとは別attemptとし、request ID、共通field `notification_attempt_id`、notification kind、server-side MACを含む認証済みmarkerへbindingします。外部call前の`dispatching` fence、復旧時の`acceptance_unknown`、全pageのexact marker reconcileはapproval card deliveryと同じ規則を使います。0件観測はunknownのままで再投稿しません。request terminal時に未開始の`pending` notice attemptは同じtransactionで`aborted`にします。
+元threadのpending noticeはapproval cardとは別attemptとし、request ID、共通field `notification_attempt_id`、notification kind、server-side MACを含む認証済みmarkerへbindingします。`request ID + notification kind`をattempt creation keyとして一意化し、retry/並行workerは既存attemptへ収束します。外部call前の`dispatching` fence、復旧時の`acceptance_unknown`、全pageのexact marker reconcileはapproval card deliveryと同じ規則を使います。0件観測はunknownのままで再投稿しません。request terminal時に未開始の`pending` notice attemptは同じtransactionで`aborted`にします。
 
 ## Typed action fixture: `slack.post_thread_reply.v1`
 
