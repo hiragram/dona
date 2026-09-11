@@ -271,3 +271,23 @@ test("decision記録障害とone-shot除外はrun admissionをrollbackしない"
   assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs WHERE schedule_id = 'one_shot'").get() as { n: number }).n, 1);
   assert.equal(warnings.length, 1);
 });
+
+test("shutdownは非同期policy decisionのsettleを待つ", async () => {
+  const { repo, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  repo.create("async_metric", daily(due), due, actor, clock.now());
+  clock.set(due);
+  let resolveDecision: (() => void) | undefined;
+  const service = new SchedulerService(repo, clock, () => {}, logger, {
+    owner: "scheduler_a",
+    recordPolicyDecision: () => new Promise<void>(resolve => { resolveDecision = resolve; }),
+  });
+  assert.equal(service.runBatch(), 1);
+  let stopped = false;
+  const stopping = service.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, false);
+  resolveDecision!();
+  await stopping;
+  assert.equal(stopped, true);
+});

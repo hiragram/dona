@@ -78,6 +78,7 @@ export class SchedulerService {
   private loopPromise: Promise<void> | undefined;
   private lastPurgeAt: number | undefined;
   private readonly recordPolicyDecision: (decision: SchedulerPolicyDecision) => void | Promise<void>;
+  private readonly pendingPolicyDecisions = new Set<Promise<void>>();
 
   constructor(
     private readonly repository: SchedulerRepository,
@@ -118,6 +119,7 @@ export class SchedulerService {
     this.stopping = true;
     this.wake();
     await this.loopPromise;
+    await Promise.allSettled([...this.pendingPolicyDecisions]);
     this.repository.releaseClaims(this.owner, this.clock.now());
     this.running = false;
   }
@@ -195,7 +197,10 @@ export class SchedulerService {
 
   private emitPolicyDecision(decision: SchedulerPolicyDecision): void {
     try {
-      Promise.resolve(this.recordPolicyDecision(decision)).catch(error => this.warnPolicyDecisionFailure(decision.schedule_id, error));
+      const pending = Promise.resolve(this.recordPolicyDecision(decision))
+        .catch(error => this.warnPolicyDecisionFailure(decision.schedule_id, error));
+      this.pendingPolicyDecisions.add(pending);
+      void pending.finally(() => this.pendingPolicyDecisions.delete(pending));
     } catch (error) {
       this.warnPolicyDecisionFailure(decision.schedule_id, error);
     }
