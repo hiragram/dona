@@ -19,7 +19,7 @@ release_state: safe_off
 
 | Issue | 固有の責務 |
 | --- | --- |
-| [#15](https://github.com/hiragram/dona/issues/15) | trust boundary、lifecycle、UX、運用方針のADR |
+| [#15](https://github.com/hiragram/dona/issues/15) | [trust boundary、lifecycle、UX、運用方針のADR](./adr/0001-supervisor-approval.md) |
 | [#16](https://github.com/hiragram/dona/issues/16) | transport-neutral domain、SQLite repository、audit/outbox |
 | [#17](https://github.com/hiragram/dona/issues/17) | instance/supervisor binding、bootstrap、rotation、break-glass |
 | [#18](https://github.com/hiragram/dona/issues/18) | UDS/MCP API、LLM assessment policy、AGENTS integration |
