@@ -128,18 +128,23 @@ decision stateとexecution stateは別のrecordとして扱います。
 ```text
 request:
   requested -> delivery_pending
+  requested|delivery_pending|delivery_unknown -> cancelled|expired
   delivery_pending -> sent|delivery_failed|delivery_unknown
-  delivery_unknown -> sent|delivery_failed
+  delivery_unknown -> sent|needs_review
   sent -> approved|rejected|cancelled|expired|needs_review
   approved -> consumed|execution_cancelled|consume_expired|needs_review
 
 delivery attempt:
   pending -> sent|failed|acceptance_unknown
-  acceptance_unknown -> sent|failed
+  acceptance_unknown -> sent|needs_review
+
+presentation update attempt:
+  pending -> succeeded|failed|acceptance_unknown
+  acceptance_unknown -> succeeded|failed|needs_review
 
 execution attempt:
   not_started -> claimed -> executing -> succeeded|failed|acceptance_unknown
-  acceptance_unknown -> succeeded|failed
+  acceptance_unknown -> succeeded|failed|needs_review
 ```
 
 - `approved`は外部実行の開始・受付・成功を意味しません。
@@ -148,6 +153,7 @@ execution attempt:
 - claim transactionはrequest、decision、binding、policy、snapshot/hash、expiry、operation preconditionを再検証し、consume ledgerとattemptを原子的に作ります。
 - approved後の失効・取消とclaimは同じrequest revisionを条件に原子的に競合させ、失効済みapprovalをclaim可能なまま残しません。
 - delivery attemptとexecution attemptの`acceptance_unknown`は独立して保存し、exact message identityまたはoperation固有receiptをread-only reconcileできた場合だけ同じattemptをterminalへ収束させます。request stateとの遷移はattempt更新と同一transactionで行います。
+- delivery中のcancelはdelivery結果とtransactionalに競合させます。cancelが先着したrequestは、遅れてcardが`sent`と確認されても`cancelled`のまま維持し、interactive decisionを拒否してpresentation update対象にします。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
 
 全transitionのdecision tableはfixtureに記載します。
@@ -156,9 +162,9 @@ execution attempt:
 
 button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。eventは3秒以内にACKしますが、ACKはapproval受理ではありません。decision transaction、resume event enqueue、`chat.update`はACK後に処理します。
 
-非supervisor、別workspace、別message、古いpresentation、duplicate、期限切れもACKしてから拒否・auditします。曖昧な`chat.postMessage` / `chat.update`結果はblind retryせず、deliveryを`acceptance_unknown`としてreconcileへ送ります。
+非supervisor、別workspace、別message、古いpresentation、duplicate、期限切れもACKしてから拒否・auditします。曖昧な`chat.postMessage`結果はdelivery attempt、曖昧な`chat.update`結果は独立したpresentation update attemptの`acceptance_unknown`として保存し、どちらもblind retryしません。update attemptはdecisionとpresentation revisionへbindingし、read-backしたexact revisionが1件の場合だけ同じattemptを収束させます。
 
-MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeout後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら明示的なreconcile結果、2件以上またはpagination不完全なら`needs_review`とします。同文、timestamp近接、message textだけではattemptを同定しません。
+MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeout後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら`acceptance_unknown`のまま、2件以上またはpagination不完全なら`needs_review`とします。不在観測を決定的rejectionとみなさず、別の明示操作でも同じwriteを再送しません。同文、timestamp近接、message textだけではattemptを同定しません。
 
 ## Release gate
 
