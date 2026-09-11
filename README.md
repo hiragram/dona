@@ -58,6 +58,10 @@ Herdrの`dona`セッション内には、事前に`dona-main`という名前のC
 
 updater自身はroutine updateの対象外です。stable updater/policy/schemaの更新には、非terminal requestを拒否し、旧DBとfilesをbackupして新旧version healthを照合する`./scripts/install-self-update.sh --upgrade-control`をmaintenance windowで使います。app DB schema migrationとGitHub repository settings変更は対象外です。
 
+## Integration manifest
+
+- [Supervisor approval integration](./docs/supervisor-approval-integration.md): Issue #26の子Issueを集約するbranch、native dependency graph、merge gate、未検証境界
+
 ## 全体検証
 
 ```sh
