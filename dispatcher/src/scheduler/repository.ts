@@ -1060,7 +1060,9 @@ export class SchedulerRepository {
     const counters = Object.fromEntries((this.db.prepare(`SELECT operation, count(*) AS count FROM schedule_audit
       GROUP BY operation ORDER BY operation`).all() as Array<{ operation: string; count: number }>)
       .map(row => [row.operation, row.count]));
-    const retention = this.retentionPlan(now);
+    // The maintenance loop purges hourly. Content that became eligible since the
+    // previous healthy purge is pending routine maintenance, not overdue.
+    const retention = this.retentionPlan(add(now, -3600));
     return {
       observed_at: now,
       due_lag_seconds: oldest.value === null ? 0 : Math.max(0, Math.floor((Date.parse(now) - Date.parse(oldest.value)) / 1000)),
@@ -1105,7 +1107,10 @@ export class SchedulerRepository {
       orphan_revisions: count(`SELECT count(*) AS count FROM schedule_revisions WHERE content IS NULL AND terminal_at<=? AND NOT EXISTS
         (SELECT 1 FROM schedules s WHERE s.schedule_id=schedule_revisions.schedule_id AND s.revision=schedule_revisions.revision)
         AND NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=schedule_revisions.schedule_id
-          AND r.revision=schedule_revisions.revision)`, add(now,-2592000)),
+          AND r.revision=schedule_revisions.revision AND NOT (r.terminal_at<=? AND NOT EXISTS
+            (SELECT 1 FROM connector_outbox o WHERE o.run_id=r.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
+            AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+              AND c.notification_state IN ('pending','failed','needs_review'))))`, add(now,-2592000),add(now,-2592000),add(now,-2592000)),
       job_contents: count(`SELECT count(*) AS count FROM jobs j WHERE (j.result_json IS NOT NULL OR j.objective<>'[deleted]') AND EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.content_delete_at<=?
           AND json_extract(c.owner_json,'$.kind')='schedule') AND NOT EXISTS
@@ -1113,16 +1118,26 @@ export class SchedulerRepository {
       event_contents: count(`SELECT count(*) AS count FROM events e WHERE e.source IN ('dona_schedule','dona_job') AND
         (e.result_json IS NOT NULL OR (e.source='dona_schedule' AND json_extract(e.payload_json,'$.work.objective') IS NOT NULL
           AND json_extract(e.payload_json,'$.work.objective')<>'[deleted]') OR (e.source='dona_job' AND
-          (json_extract(e.payload_json,'$.result') IS NOT NULL OR json_extract(e.payload_json,'$.error_message') IS NOT NULL))) AND EXISTS
-        (SELECT 1 FROM job_completion_results c WHERE (c.source_event_id=e.event_id OR c.notification_event_id=e.event_id)
-          AND c.content_delete_at<=?)`, now),
+          (json_extract(e.payload_json,'$.result') IS NOT NULL OR json_extract(e.payload_json,'$.error_message') IS NOT NULL))) AND
+        ((e.source='dona_schedule' AND (EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR
+          EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review'
+            AND a.created_at<=?))) OR EXISTS (SELECT 1 FROM job_completion_results c
+          WHERE (c.source_event_id=e.event_id OR c.notification_event_id=e.event_id) AND c.content_delete_at<=?
+            AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+              WHERE (newer.source_event_id=e.event_id OR newer.notification_event_id=e.event_id)
+                AND newer.content_delete_at>?)))`, add(now,-604800), add(now,-604800), now, now),
       result_files: count(`SELECT count(*) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`, now),
       event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND EXISTS
         (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR EXISTS
-        (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?)) OR
+        (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=e.event_id
+            AND newer.content_delete_at>?)) OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id
+              AND a.operation='event_needs_review' AND a.created_at<=?)) OR
         (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=e.event_id
-          AND c.content_delete_at<=?)))`, add(now,-604800), now, now),
+          AND c.content_delete_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+            WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?))))`, add(now,-604800), now, now,
+              add(now,-604800), now, now),
       consumed_nonces: count("SELECT count(*) AS count FROM schedule_access_receipt_nonces WHERE consumed_at<=?", add(now,-86400)),
     };
   }
@@ -1134,10 +1149,12 @@ export class SchedulerRepository {
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
-      WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (r.terminal_at<=? OR c.content_delete_at<=? OR EXISTS
+      WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (r.terminal_at<=? OR (c.content_delete_at<=? AND NOT EXISTS
+        (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=e.event_id AND newer.content_delete_at>?)) OR EXISTS
         (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))
-        OR (e.source='dona_job' AND c.notification_event_id=e.event_id AND c.content_delete_at<=?))`)
-      .all(add(now,-604800),now,add(now,-604800),now) as Array<{event_id:string;result_path:string}>;
+        OR (e.source='dona_job' AND c.notification_event_id=e.event_id AND c.content_delete_at<=? AND NOT EXISTS
+          (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?)))`)
+      .all(add(now,-604800),now,now,add(now,-604800),now,now) as Array<{event_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
@@ -1165,12 +1182,14 @@ export class SchedulerRepository {
             AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
       this.db.prepare(`UPDATE events SET result_json=NULL WHERE event_id IN (SELECT r.event_id FROM schedule_runs r
         WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
-          WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
-          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
+          WHERE c.source_event_id=r.event_id AND c.content_delete_at<=? AND NOT EXISTS
+            (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=r.event_id AND newer.content_delete_at>?)) OR EXISTS (SELECT 1 FROM schedule_audit a
+          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,now,add(now,-604800));
       this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,
         last_error_message=CASE WHEN last_error_code='operator_notification_reconcile_claimed' THEN last_error_message ELSE NULL END
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
-          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
+          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?) AND NOT EXISTS
+          (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=events.event_id AND newer.content_delete_at>?)`).run(now,now);
       const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
       this.db.prepare(`DELETE FROM job_owner_bindings WHERE job_id IN
         (SELECT c.job_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
