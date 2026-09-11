@@ -16,7 +16,7 @@ export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
-  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
@@ -273,7 +273,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal, true);
   }
 
-  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    const statusTimeoutMs = timeoutMs ?? this.config.jobCommandTimeoutMs;
     return this.herdr([
       "agent", "prompt", agentName, text,
       "--wait",
@@ -281,8 +282,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--until", "idle",
       "--until", "done",
       "--until", "blocked",
-      "--timeout", String(this.config.jobCommandTimeoutMs),
-    ], this.config.jobCommandTimeoutMs + 5_000, signal);
+      "--timeout", String(statusTimeoutMs),
+    ], statusTimeoutMs + 5_000, signal);
   }
 
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {

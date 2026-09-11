@@ -876,10 +876,11 @@ describe("JobSupervisor", () => {
     database.markJobRunning(job.job_id);
     const steers: string[] = [];
     const steerTargets: string[] = [];
+    const steerTimeouts: Array<number | undefined> = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
       async get() { return ok("working"); },
-      async prompt(agentName, text) { steerTargets.push(agentName); steers.push(text); return ok("working"); },
+      async prompt(agentName, text, _signal, timeoutMs) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); return ok("working"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
     };
@@ -888,6 +889,7 @@ describe("JobSupervisor", () => {
     assert.equal(result.duplicate, false);
     assert.deepEqual(steers, ["追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name]);
+    assert.deepEqual(steerTimeouts, [undefined]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
@@ -958,9 +960,11 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
-  test("requires review when initial prompt acceptance times out instead of retrying", async () => {
+  test("prompt status timeout後も再送せずbounded reconcileする", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
+    config.jobPromptReconcileMs = 40;
+    config.jobPromptReconcilePollMs = 10;
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-prompt-timeout");
     let promptCount = 0;
@@ -972,6 +976,9 @@ describe("JobSupervisor", () => {
         promptCount += 1;
         return failed("timeout", true);
       },
+      async get() {
+        return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+      },
     });
     const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
     supervisor.start();
@@ -980,7 +987,7 @@ describe("JobSupervisor", () => {
 
     const updated = database.getJob(job.job_id)!;
     assert.equal(updated.status, "needs_review");
-    assert.equal(updated.last_error_code, "timeout");
+    assert.equal(updated.last_error_code, "prompt_acceptance_unproven");
     assert.equal(promptCount, 1);
     assert.equal(database.get(updated.completion_event_id!)?.event_type, "job_needs_review");
     database.close();
@@ -1183,8 +1190,71 @@ describe("JobSupervisor", () => {
     await supervisor.stop();
     const updated = database.getJob(job.job_id)!;
     assert.equal(promptCount, 1);
-    assert.equal(updated.last_error_code, "prompt_acceptance_unproven");
+    assert.equal(updated.last_error_code, "prompt_reconcile_invalid_response");
     assert.equal(updated.prompt_accepted_at, null);
+    database.close();
+  });
+
+  test("reconcileはabsolute tickと各readのbounded timeoutを維持する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    config.jobPromptReconcileMs = 30_000;
+    config.jobPromptReconcilePollMs = 5_000;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-monotonic");
+    let prompted = false;
+    let now = 0;
+    const reads: Array<{ at: number; timeoutMs: number | undefined }> = [];
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; return failed("agent_prompt_stalled"); },
+      async get(_agentName, _signal, timeoutMs) {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        reads.push({ at: now, timeoutMs });
+        now += 5_000;
+        return failed("timeout", true);
+      },
+    });
+    const clock = {
+      now: () => now,
+      async delay(milliseconds: number) { now += milliseconds; },
+    };
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined, undefined, clock);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    await supervisor.stop();
+    assert.deepEqual(reads.map((read) => read.at), [0, 5_000, 10_000, 15_000, 20_000, 25_000]);
+    assert.deepEqual(reads.map((read) => read.timeoutMs), [5_000, 5_000, 5_000, 5_000, 5_000, 5_000]);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "prompt_reconcile_timeout");
+    database.close();
+  });
+
+  test("transient read failure後に同一identityの進行を回収する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    config.jobPromptReconcileMs = 100;
+    config.jobPromptReconcilePollMs = 10;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stalled-transient-recovery");
+    let prompted = false;
+    let reconcileReads = 0;
+    let prompts = 0;
+    const runtime = fakeRuntime({
+      async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+      async prompt() { prompted = true; prompts += 1; return failed("agent_prompt_stalled"); },
+      async get() {
+        if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
+        reconcileReads += 1;
+        if (reconcileReads === 1) throw new Error("temporary transport failure");
+        if (reconcileReads === 2) return failed("agent_not_found");
+        return { ...ok("blocked"), agentIdentity: "agent", stateChangeSeq: 2 };
+      },
+    });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "blocked");
+    await supervisor.stop();
+    assert.equal(prompts, 1);
+    assert.equal(reconcileReads, 3);
+    assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
     database.close();
   });
 

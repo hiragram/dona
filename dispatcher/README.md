@@ -50,6 +50,9 @@ DONA_JOB_CONCURRENCY=4
 DONA_JOB_CONCURRENCY_PER_EVENT=2
 DONA_JOB_AGENT_START_TIMEOUT_MS=30000
 DONA_JOB_COMMAND_TIMEOUT_MS=10000
+DONA_JOB_PROMPT_TIMEOUT_MS=30000
+DONA_JOB_PROMPT_RECONCILE_MS=30000
+DONA_JOB_PROMPT_RECONCILE_POLL_MS=5000
 DONA_GH_PATH=gh
 DONA_GIT_PATH=git
 DONA_UPDATER_SOCKET_PATH=~/Library/Application Support/Dona/update-control/updater.sock
@@ -70,6 +73,8 @@ herdr --session dona agent get dona-main
 herdr --session dona agent prompt dona-main <prompt>
 herdr --session dona agent wait dona-main --until idle --until done --until blocked --timeout 120000
 ```
+
+最初のbackground job promptだけは`DONA_JOB_PROMPT_TIMEOUT_MS`（既定30秒）をstatus待機へ使い、汎用`DONA_JOB_COMMAND_TIMEOUT_MS`は変更しません。受理不明時はさらに`DONA_JOB_PROMPT_RECONCILE_MS`（既定30秒）のmonotonic absolute deadline内で、`DONA_JOB_PROMPT_RECONCILE_POLL_MS`（既定5秒）ごとに同一agent identity、`state_change_seq`、Result Envelopeをread-onlyで照合します。各status readはpoll間隔と残り時間の小さい方を上限にし、最終deadlineでもResultを再確認します。準備やprocess cleanupを除く既定の最大待機は概ねprompt 30秒 + reconcile 30秒です。運用判断は[background job prompt reconcile runbook](../docs/operations/background-job-prompt-reconcile.md)を参照してください。
 
 バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、30文字の`job_id`をそのままHerdr agent名としてCodexを起動します。新規`job_id`はULID互換の26文字の末尾4文字を固定slugにし、たとえば改善作業は`job_01m1ne631mt99zdpwfmrwsenhc`になります。slugは外部入力を転写せず、`enhc`（改善）、`mend`（修正）、`feat`（実装）、`test`（テスト）、`read`（文書）、`rvwx`（レビュー）、`rsch`（調査）、`sync`（更新）、`send`（デプロイ）、`tags`（リリース）、`task`（その他）の固定語彙から選びます。ULIDの時刻部と60bitのランダム値を保持し、既存のjob ID形式、DB schema v2、`agent_name = job_id`も維持するため、旧リリースへ戻した場合も新規ジョブを同じ名前で制御できます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みのagent名も再起動時にそのまま使います。
 
