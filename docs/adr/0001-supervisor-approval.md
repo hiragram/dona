@@ -75,7 +75,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 ### 4. Cancelと競合
 
-採用: requesterはdecision前のrequestをcancelできます。approve/reject/cancel/expireは単一decision slotをtransactionで先着確定し、後着は状態を変えません。approval後は未consume requestを`execution_cancelled`、期限切れを`consume_expired`、binding/policy/snapshot driftを`needs_review`へ遷移できます。これらとconsume claimは同一transactionで競合させ、先着した一つだけを確定します。claim取得後はexecutorを強制中断せず結果を追跡します。
+採用: requesterはdecision前のrequestをcancelできます。cancel commandも認証済みtransport connection provenanceを起点にactor、instance、workspace、persisted requester、request revisionを照合し、handle所持だけでは受理しません。不一致は状態不変でauditします。approve/reject/cancel/expireは単一decision slotをtransactionで先着確定し、後着は状態を変えません。approval後は未consume requestを`execution_cancelled`、期限切れを`consume_expired`、binding/policy/snapshot driftを`needs_review`へ遷移できます。これらとconsume claimは同一transactionで競合させ、先着した一つだけを確定します。claim取得後はexecutorを強制中断せず結果を追跡します。
 
 理由: cancelを外部実行取消と誤認させません。安全側defaultは不明な競合を`needs_review`へ送ることです。将来、operation固有の補償操作は別typed actionとして設計します。
 
@@ -101,11 +101,13 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 採用: request表示projectionとdecisionは90日、auditとexecution metadataは400日保持します。本文bindingにはapplication secretを使うHMACを用い、raw SHA-256 digestをUIや長期metadataへ残しません。承認待ちの生成本文だけはowner-onlyのapplication-level envelope encryption済みpayload storeへ保存し、鍵はDB/backupと分離したOS credential storeで管理します。reject/cancel/expire時は即時削除します。consume claim時は同じtransactionでrequest payloadをattempt専用の暗号化payloadへ移し、attemptがdurableな`succeeded` / `failed`へ収束した時点で削除します。`acceptance_unknown`では最大24時間保持してreconcileし、期限後はpayloadを削除してattemptを`needs_review`へ固定し自動再実行しません。payloadはbackup対象外です。tokenとprivate download URLは保存しません。SQLite、backup、exportはowner-onlyとし、binding/audit HMAC keyは90日以内にrotationします。
 
+Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら`needs_review`へ固定し、decision/claim/executionを拒否します。payloadの再生成や元actionの自動再実行は行いません。
+
 理由: incident追跡とdata minimizationを両立します。安全側defaultは保存しないことです。legal/運用要件変更時はfield別classification、削除証跡、backup expiryを同時に更新します。
 
 ### 9. Private contextの開示
 
-採用: supervisorにはoperation kind、requester、期限、リスク理由、本文から導出できないopaque action IDを表示します。さらにsupervisorのcurrent visibilityを証明したtargetについて、exact stable target ID/表示名、exact draft本文、解決済みのuser mention対象を表示します。content MAC、不要な参加者一覧、添付、secret、private URLは表示しません。exact targetと送信内容を判断できる安全なprojectionをoperation側が作れなければrequestを作らず、人間へ安全な別経路で確認を求めます。
+採用: supervisorにはoperation kind、requester、期限、リスク理由、本文から導出できないopaque action IDを表示します。さらにsupervisorのcurrent visibilityを証明したtargetについて、exact stable target ID/表示名、exact draft本文、解決済みのuser mention対象を表示します。draftとmention対象はSlack `plain_text` blockへ文字どおりescapeして表示し、mrkdwn、link解析、mention、emoji変換、unfurlを無効化します。content MAC、不要な参加者一覧、添付、secret、private URLは表示しません。exact targetと送信内容を判断できる安全なprojectionをoperation側が作れなければrequestを作らず、人間へ安全な別経路で確認を求めます。
 
 理由: supervisor権限は全conversation閲覧権限を意味しません。安全側defaultは非開示・非実行です。将来変更はSlackのcurrent membership/visibility proofとfield単位の同意を要します。
 
@@ -128,7 +130,7 @@ decision stateとexecution stateは別のrecordとして扱います。
 ```text
 request:
   requested -> delivery_pending
-  requested|delivery_pending|delivery_unknown -> cancelled|expired
+  requested|delivery_pending|delivery_unknown -> cancelled|expired|needs_review
   delivery_pending -> sent|delivery_failed|delivery_unknown
   delivery_unknown -> sent|needs_review
   sent -> approved|rejected|cancelled|expired|needs_review
@@ -144,6 +146,7 @@ presentation update attempt:
 
 execution attempt:
   not_started -> claimed -> executing -> succeeded|failed|acceptance_unknown
+  executing -> acceptance_unknown (recovery only)
   acceptance_unknown -> succeeded|failed|needs_review
 ```
 
@@ -154,17 +157,21 @@ execution attempt:
 - approved後の失効・取消とclaimは同じrequest revisionを条件に原子的に競合させ、失効済みapprovalをclaim可能なまま残しません。
 - delivery attemptとexecution attemptの`acceptance_unknown`は独立して保存し、exact message identityまたはoperation固有receiptをread-only reconcileできた場合だけ同じattemptをterminalへ収束させます。request stateとの遷移はattempt更新と同一transactionで行います。
 - delivery中のcancelはdelivery結果とtransactionalに競合させます。cancelが先着したrequestは、遅れてcardが`sent`と確認されても`cancelled`のまま維持し、interactive decisionを拒否してpresentation update対象にします。
+- binding/policy/restore invalidationは全nonterminal stateとapprovedから`needs_review`へtransactionalに遷移でき、配送結果と競合してもinvalidated requestを`sent`へ戻しません。
+- executorは外部call直前に`executing`とattempt fenceをdurable commitしてから送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
 
 全transitionのdecision tableはfixtureに記載します。
 
 ## Slack transport decision proof
 
-button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。eventは3秒以内にACKしますが、ACKはapproval受理ではありません。decision transaction、resume event enqueue、`chat.update`はACK後に処理します。
+button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。3秒以内に、envelope IDをdedup keyとするdurable interactive inboxへ検証済みproofとcommandをcommitしてからACKします。ACKはapproval受理ではありません。ACK後のdecision workerは保存済みcommandだけを処理し、duplicate envelopeは同じinbox recordへ収束させます。resume event enqueueと`chat.update`もdecision commit後に処理します。
 
 非supervisor、別workspace、別message、古いpresentation、duplicate、期限切れもACKしてから拒否・auditします。曖昧な`chat.postMessage`結果はdelivery attempt、曖昧な`chat.update`結果は独立したpresentation update attemptの`acceptance_unknown`として保存し、どちらもblind retryしません。update attemptはdecisionとpresentation revisionへbindingし、read-backしたexact revisionが1件の場合だけ同じattemptを収束させます。
 
-MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeout後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら`acceptance_unknown`のまま、2件以上またはpagination不完全なら`needs_review`とします。不在観測を決定的rejectionとみなさず、別の明示操作でも同じwriteを再送しません。同文、timestamp近接、message textだけではattemptを同定しません。
+MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeoutまたは`executing`復旧後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら`acceptance_unknown`のまま、2件以上またはpagination不完全なら`needs_review`とします。不在観測を決定的rejectionとみなさず、別の明示操作でも同じwriteを再送しません。同文、timestamp近接、message textだけではattemptを同定しません。
+
+cancel、expire、reject、`needs_review`など全terminal/invalid stateで遅着cardを発見した場合、requestを`sent`へ戻さずinteractive decisionを恒久拒否します。exact cardをredactedな無効表示へ変えるpresentation update attemptを一度だけ作り、そのupdateが曖昧なら再送せず`acceptance_unknown`としてreconcileします。
 
 ## Release gate
 
