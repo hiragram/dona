@@ -21,6 +21,8 @@
 | cancel after approve | `approved` | consume claim前 | `execution_cancelled` | なし |
 | expire after approve | `approved` | consume TTL超過 | `consume_expired` | なし |
 | clock rewind after restart | nonterminal / `approved` | wall clockがdurable high-water markより前 | `expired`または`needs_review` | なし |
+| cancel by another actor | nonterminal / `approved` | requester/instance/workspace/revision不一致 | 状態不変、audit | なし |
+| restore without payload | nonterminal / `approved` | payload参照欠落またはHMAC不一致 | `needs_review` | なし |
 
 ## Consume / execution transition table
 
@@ -33,6 +35,7 @@
 | consume expiry | consume TTL超過 | attemptなし、expired扱い | 再承認が必要 |
 | known rejection | APIが決定的拒否 | `failed` | 同じwriteを再送しない |
 | timeout after send | acceptanceを証明不能 | `acceptance_unknown` | read-only reconcileのみ |
+| crash after external-call fence | durable stateが`executing` | 送信結果なしでrestart | 同じattemptを`acceptance_unknown`へ移す | read-only reconcileのみ、再送禁止 |
 | reconciled accepted | exact idempotency key/resultを発見 | 同じattemptを`succeeded`へ更新 | 新attemptを作らない |
 | reconciled rejected | exact rejection receiptを発見 | 同じattemptを`failed`へ更新 | 新attemptを作らない |
 
@@ -48,6 +51,8 @@
 | unknown marker ambiguous | `acceptance_unknown` | 複数件、pagination不完全 | `needs_review`、再送禁止 |
 
 requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ設定します。decisionは`synchronized sent`からだけ受理し、`delivery_failed`はterminal、`delivery_unknown`はreconcile待ちとしてapprove/reject actionを拒否します。requester cancelは`requested` / `delivery_pending` / `delivery_unknown` / `sent`からtransactionalに競合でき、cancel後に遅延deliveryが確定してもrequestを再び`sent`へ戻しません。
+
+binding rotation、policy risk increase、restore不整合は`requested` / `delivery_pending` / `delivery_unknown` / `sent` / `approved`のすべてから`needs_review`へ遷移でき、deliveryの遅着結果より先着したinvalid stateを維持します。全terminal/invalid stateで遅着cardが見つかった場合はdecisionを拒否し、exact cardをredactedな無効表示へ変える独立update attemptを作ります。
 
 ## Presentation update attempt transition table
 
@@ -97,7 +102,7 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
 
 CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとroot message HMACはUIへ表示しません。rootが未編集なら`edited_ts`の明示的なnullと内容HMACを保存し、consume時に両方を再取得します。
 
-request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
+request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
 送信時はexecution attempt IDとserver-side MACから一意な`block_id` markerを作り、Slack messageの本文を変えずblockへ保存します。送信前とtimeout後のread-backはchannel/threadの全pageを完走し、同marker 0件、exactly 1件、複数件を区別します。timeout後の0件は不在確定ではなくunknownのままです。pagination cursor欠落・反復、別Bot author、marker MAC不一致はreconcile成功にしません。
 
@@ -111,6 +116,8 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - Slack Connectを含むshared channel、または承認後にshared化されたchannelはrequest/decision/consumeで拒否
 - supervisorがprivate targetから外れた場合はdecision/consumeを`needs_review`へ遷移
 - claim直後のcrashでもattempt専用暗号化payloadから同じ本文を復元し、別attemptは作らない
+- external-call開始fence後のcrashでは復旧時に同じattemptをunknownへ移し、marker 0件でも再送しない
+- interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
 
 ## Threat review scenarios
 
