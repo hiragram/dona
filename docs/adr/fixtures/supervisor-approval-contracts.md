@@ -59,6 +59,8 @@ requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ�
 
 approval card送信前にdelivery attemptの`dispatching` fenceをdurable commitします。復旧した`dispatching`は送信済みか否かを推測せず`acceptance_unknown`へ移し、exact markerのread-only reconcileだけを行います。
 
+approval card attemptも`request ID + approval_card`をcreation keyとして一意化し、retry/並行workerは既存attemptと同じ`notification_attempt_id`へ収束します。
+
 binding rotation、policy risk increase、restore不整合は`requested` / `delivery_pending` / `delivery_unknown` / `sent` / `approved`のすべてから`needs_review`へ遷移でき、deliveryの遅着結果より先着したinvalid stateを維持します。全terminal/invalid stateで遅着cardが見つかった場合はdecisionを拒否し、exact cardをredactedな無効表示へ変える独立update attemptを作ります。
 
 ## Presentation update attempt transition table
