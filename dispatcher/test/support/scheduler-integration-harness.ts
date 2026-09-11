@@ -9,6 +9,7 @@ import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../../src/database.js";
 import type { Logger } from "../../src/logger.js";
 import { FakeClock } from "../../src/scheduler/clock.js";
+import { ScheduleApiService } from "../../src/scheduler/api.js";
 import { ReminderPublisher, type ReminderDelivery, type SlackReminderCommand } from "../../src/scheduler/reminder-publisher.js";
 import type { Actor, RevisionInput } from "../../src/scheduler/repository.js";
 import { SchedulerService } from "../../src/scheduler/service.js";
@@ -30,16 +31,23 @@ export class FaultInjector {
 
 export class FakeSlack {
   readonly calls: SlackReminderCommand[] = [];
+  readonly workCalls: Array<{ event_id: string; channel_id: string; thread_ts: string; text: string }> = [];
   constructor(private readonly outcomes: ReminderDelivery[]) {}
   async preflight(): Promise<ReminderDelivery> { return { outcome: "prepared" }; }
   async deliver(command: SlackReminderCommand): Promise<ReminderDelivery> {
     this.calls.push(command);
     return this.outcomes.shift() ?? { outcome: "accepted", receipt_id: `fake-${this.calls.length}` };
   }
+  postWorkResult(eventId: string, text: string) {
+    const call = { event_id: eventId, channel_id: "C_GATE", thread_ts: "1.000001", text };
+    this.workCalls.push(call);
+    return { ...call, message_ts: `2.${String(this.workCalls.length).padStart(6, "0")}` };
+  }
 }
 
 export class FakeJobRuntime {
   readonly calls: Array<{ event_id: string; objective: string }> = [];
+  readonly slack = new FakeSlack([]);
   run(harness: SchedulerIntegrationHarness, eventId: string, objective: string): { job_id: string; status: "completed"; summary: string } {
     this.calls.push({ event_id: eventId, objective });
     harness.database.beginDispatch(eventId, path.join(harness.root, "event-results", `${eventId}.json`), new Date(harness.clock.now()));
@@ -65,15 +73,16 @@ export class FakeJobRuntime {
       harness.database.authorizeJobNotification(notification.event_id, new Date(harness.clock.now()));
       harness.database.authorizeJobNotification(notification.event_id, new Date(harness.clock.now()), { workspace_id: "T_GATE", channel_id: "C_GATE",
         user_id: "U_GATE", issued_at: new Date(harness.clock.now()).toISOString(), nonce: `notify_${notification.event_id}` });
+      const posted = this.slack.postWorkResult(notification.event_id, payload.result.summary);
       harness.database.saveCompleted(notification.event_id, { schema_version: 1, event_id: notification.event_id, status: "completed", actions: [
         { tool: "dona_dispatcher.authorize_job_notification", event_id: notification.event_id, authorized: true },
         { tool: "dona_slack.check_user_channel_access", workspace: "test", workspace_id: "T_GATE", channel_id: "C_GATE", user_id: "U_GATE", authorized: true },
         { tool: "dona_dispatcher.authorize_job_notification", event_id: notification.event_id, authorized: true, access_receipt_verified: true },
         { tool: "dona_slack.post_message", event_id: notification.event_id, workspace: "test", channel_id: "C_GATE", thread_ts: "1.000001",
-          message_ts: "2.000001", body_sha256: bodyHash, reply_broadcast: false, mrkdwn: false, parse: "none" },
+          message_ts: posted.message_ts, body_sha256: bodyHash, reply_broadcast: false, mrkdwn: false, parse: "none" },
         { tool: "dona_slack.set_agent_session_status", workspace: "test", channel_id: "C_GATE", thread_ts: "1.000001", status: "active" },
       ], completed_at: harness.clock.now() }, path.join(harness.root, "event-results", `${notification.event_id}.json`), new Date(harness.clock.now()),
-      { event_id: notification.event_id, workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001", message_ts: "2.000001",
+      { event_id: notification.event_id, workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001", message_ts: posted.message_ts,
         body_sha256: bodyHash, posted_at: harness.clock.now(), reply_broadcast: false, identity_block_verified: true, session_status: "active" });
     }
     return { job_id: job.job_id, status: "completed", summary: "read-only work completed" };
@@ -88,6 +97,7 @@ export class SchedulerIntegrationHarness {
   readonly clock: FakeClock;
   readonly repo = this.database.scheduler.withCodecs({ recurrence: value => value, policy: value => value });
   readonly fault = new FaultInjector();
+  readonly scheduleIds = new Map<string, string>();
   private readonly policy = fs.readFileSync(new URL("../../../docs/adr/fixtures/scheduler-v1/policy.json", import.meta.url), "utf8");
 
   constructor(at = "2026-09-05T00:00:00Z") { this.clock = new FakeClock(at); }
@@ -113,7 +123,22 @@ export class SchedulerIntegrationHarness {
   }
 
   materialize(scheduleId: string, input: RevisionInput, due: string): string {
-    this.repo.create(scheduleId, input, due, integrationActor, this.clock.now());
+    const source = this.database.enqueue({ schema_version: 1, source: "slack", external_event_id: `gate-create-${scheduleId}`,
+      type: "app_mention", occurred_at: new Date(this.clock.now()).toISOString(),
+      subject: { workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001", actor_id: "U_GATE" }, payload: { text: "schedule" },
+      reply_target: { kind: "slack_thread", workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001" } }).row;
+    this.database.beginDispatch(source.event_id, path.join(this.root, "event-results", `${source.event_id}.json`), new Date(this.clock.now()));
+    this.database.markWaiting(source.event_id, new Date(this.clock.now()));
+    const recurrence = JSON.parse(input.recurrence_json) as Record<string, unknown>;
+    const definition = { recurrence, action: input.action === "slack.reminder.post"
+      ? { kind: "reminder", body: input.content }
+      : { kind: "work", objective: input.content, notify: input.target.kind === "none" ? "none" : "origin_thread" } };
+    const api = new ScheduleApiService(this.database, () => new Date(this.clock.now()), () => {});
+    const preview = api.preview({ source_event_id: source.event_id, definition, after: this.clock.now(), before_or_equal: "2026-09-07T00:01:00Z", limit: 10 });
+    assert.equal(preview.preview.occurrences[0]?.occurrence_at, due);
+    const created = api.create({ source_event_id: source.event_id, idempotency_key: scheduleId, definition });
+    this.scheduleIds.set(scheduleId, created.schedule.schedule_id);
+    scheduleId = created.schedule.schedule_id;
     this.clock.set(due);
     const service = new SchedulerService(this.repo, this.clock, () => {}, integrationLogger, { owner: "gate-instance" });
     assert.equal(service.runBatch(), 1);
@@ -131,6 +156,7 @@ export class SchedulerIntegrationHarness {
     Object.assign(reopened, {
       root: this.root, filename: this.filename,
       database: new DispatcherDatabase(this.filename), raw: new Database(this.filename), clock: new FakeClock(this.clock.now()), fault: this.fault,
+      scheduleIds: this.scheduleIds,
     });
     Object.defineProperty(reopened, "repo", { value: reopened.database.scheduler.withCodecs({ recurrence: (value: string) => value, policy: (value: string) => value }) });
     Object.defineProperty(reopened, "policy", { value: this.policy });

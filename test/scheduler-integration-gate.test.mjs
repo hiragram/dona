@@ -6,7 +6,7 @@ const runner = fs.readFileSync(new URL("../scripts/run-scheduler-integration-gat
 const fixtures = JSON.parse(fs.readFileSync(new URL("../docs/adr/fixtures/scheduler-v1/cases.json", import.meta.url), "utf8"));
 
 test("scheduler integration gateは実runnerのpass/fail/skip件数を検査する", () => {
-  assert.match(runner, /const expected = 48/);
+  assert.match(runner, /const expected = 49/);
   assert.match(runner, /test\/scheduler\.test\.ts/);
   for (const field of ["tests", "pass", "fail", "skipped"]) assert.match(runner, new RegExp(`summary\\.${field}`));
   assert.match(runner, /child\.status !== 0/);
