@@ -43,14 +43,17 @@
 
 | Case | Initial | Observation | Expected |
 | --- | --- | --- | --- |
-| post accepted | `pending` | exact message identityを取得 | `sent` |
-| post rejected | `pending` | Slackの決定的error | `failed` |
-| post timeout | `pending` | acceptanceを証明不能 | `acceptance_unknown`、再投稿禁止 |
+| post accepted | `dispatching` | exact message identityを取得 | `sent` |
+| post rejected | `dispatching` | Slackの決定的error | `failed` |
+| post timeout | `dispatching` | acceptanceを証明不能 | `acceptance_unknown`、再投稿禁止 |
+| crash after delivery fence | durable stateが`dispatching` | 結果なしでrestart | 同じattemptを`acceptance_unknown`へ移し、再投稿禁止 |
 | unknown reconciled sent | `acceptance_unknown` | saved presentation identityがexactly 1件 | 同じattemptを`sent`へ更新 |
 | unknown marker absent | `acceptance_unknown` | bounded全pageで0件 | `acceptance_unknown`のまま、再送禁止 |
 | unknown marker ambiguous | `acceptance_unknown` | 複数件、pagination不完全 | `needs_review`、再送禁止 |
 
 requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ設定します。decisionは`synchronized sent`からだけ受理し、`delivery_failed`はterminal、`delivery_unknown`はreconcile待ちとしてapprove/reject actionを拒否します。requester cancelは`requested` / `delivery_pending` / `delivery_unknown` / `sent`からtransactionalに競合でき、cancel後に遅延deliveryが確定してもrequestを再び`sent`へ戻しません。
+
+approval card送信前にdelivery attemptの`dispatching` fenceをdurable commitします。復旧した`dispatching`は送信済みか否かを推測せず`acceptance_unknown`へ移し、exact markerのread-only reconcileだけを行います。
 
 binding rotation、policy risk increase、restore不整合は`requested` / `delivery_pending` / `delivery_unknown` / `sent` / `approved`のすべてから`needs_review`へ遷移でき、deliveryの遅着結果より先着したinvalid stateを維持します。全terminal/invalid stateで遅着cardが見つかった場合はdecisionを拒否し、exact cardをredactedな無効表示へ変える独立update attemptを作ります。
 
@@ -117,6 +120,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - supervisorがprivate targetから外れた場合はdecision/consumeを`needs_review`へ遷移
 - claim直後のcrashでもattempt専用暗号化payloadから同じ本文を復元し、別attemptは作らない
 - external-call開始fence後のcrashでは復旧時に同じattemptをunknownへ移し、marker 0件でも再送しない
+- execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
 
 ## Threat review scenarios

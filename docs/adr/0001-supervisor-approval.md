@@ -99,7 +99,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 ### 8. Retention・backup・暗号化
 
-採用: request表示projectionとdecisionは90日、auditとexecution metadataは400日保持します。本文bindingにはapplication secretを使うHMACを用い、raw SHA-256 digestをUIや長期metadataへ残しません。承認待ちの生成本文だけはowner-onlyのapplication-level envelope encryption済みpayload storeへ保存し、鍵はDB/backupと分離したOS credential storeで管理します。reject/cancel/expire時は即時削除します。consume claim時は同じtransactionでrequest payloadをattempt専用の暗号化payloadへ移し、attemptがdurableな`succeeded` / `failed`へ収束した時点で削除します。`acceptance_unknown`では最大24時間保持してreconcileし、期限後はpayloadを削除してattemptを`needs_review`へ固定し自動再実行しません。payloadはbackup対象外です。tokenとprivate download URLは保存しません。SQLite、backup、exportはowner-onlyとし、binding/audit HMAC keyは90日以内にrotationします。
+採用: request表示projectionとdecisionは90日、auditとexecution metadataは400日保持します。本文bindingにはapplication secretを使うHMACを用い、raw SHA-256 digestをUIや長期metadataへ残しません。承認待ちの生成本文だけはowner-onlyのapplication-level envelope encryption済みpayload storeへ保存し、鍵はDB/backupと分離したOS credential storeで管理します。reject/cancel/expire時は即時削除します。consume claim時は同じtransactionでrequest payloadをattempt専用の暗号化payloadへ移し、attemptがdurableな`succeeded` / `failed` / `needs_review`へ収束した時点で即時削除します。`acceptance_unknown`では最大24時間保持してreconcileし、期限後はpayloadを削除してattemptを`needs_review`へ固定し自動再実行しません。状態にかかわらずattempt payloadの最大保持は24時間です。payloadはbackup対象外です。tokenとprivate download URLは保存しません。SQLite、backup、exportはowner-onlyとし、binding/audit HMAC keyは90日以内にrotationします。
 
 Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら`needs_review`へ固定し、decision/claim/executionを拒否します。payloadの再生成や元actionの自動再実行は行いません。
 
@@ -137,7 +137,9 @@ request:
   approved -> consumed|execution_cancelled|consume_expired|needs_review
 
 delivery attempt:
-  pending -> sent|failed|acceptance_unknown
+  pending -> dispatching
+  dispatching -> sent|failed|acceptance_unknown
+  dispatching -> acceptance_unknown (recovery only)
   acceptance_unknown -> sent|needs_review
 
 presentation update attempt:
@@ -158,6 +160,7 @@ execution attempt:
 - delivery attemptとexecution attemptの`acceptance_unknown`は独立して保存し、exact message identityまたはoperation固有receiptをread-only reconcileできた場合だけ同じattemptをterminalへ収束させます。request stateとの遷移はattempt更新と同一transactionで行います。
 - delivery中のcancelはdelivery結果とtransactionalに競合させます。cancelが先着したrequestは、遅れてcardが`sent`と確認されても`cancelled`のまま維持し、interactive decisionを拒否してpresentation update対象にします。
 - binding/policy/restore invalidationは全nonterminal stateとapprovedから`needs_review`へtransactionalに遷移でき、配送結果と競合してもinvalidated requestを`sent`へ戻しません。
+- approval delivery workerは`chat.postMessage`直前に`dispatching`とattempt fenceをdurable commitします。復旧時の`dispatching`は送信済みの可能性があるため無条件に同じattemptを`acceptance_unknown`へ移し、read-only reconcileだけを行い再送しません。
 - executorは外部call直前に`executing`とattempt fenceをdurable commitしてから送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
 
