@@ -205,6 +205,9 @@ export class DispatcherDatabase {
     const currentVersion = this.db.pragma("user_version", { simple: true }) as number;
     if (currentVersion < 3) {
       const jobsHasKey = (this.db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
+      const hasLegacyStopMarkers = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
+      this.db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
+      if (hasLegacyStopMarkers) this.db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
       this.db.exec(`
         CREATE TABLE jobs_v3 (
           job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -241,6 +244,11 @@ export class DispatcherDatabase {
         CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
         CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
       `);
+      if (hasLegacyStopMarkers) this.db.exec(`
+        INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
+        SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);
+      `);
+      this.db.exec("DROP TABLE legacy_job_stop_markers_v3");
       this.migrationHook("indexes_recreated");
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS job_groups (

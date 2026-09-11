@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import type { DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
@@ -228,7 +228,10 @@ export class DispatcherApi {
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: 2,
+          app_schema: dispatcherSchemaCompatibility.write,
+          app_schema_read_min: dispatcherSchemaCompatibility.read_min,
+          app_schema_read_max: dispatcherSchemaCompatibility.read_max,
+          app_schema_write: dispatcherSchemaCompatibility.write,
           config: 1,
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),

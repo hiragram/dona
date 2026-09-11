@@ -326,6 +326,7 @@ describe("DispatcherDatabase", () => {
     seeded.close();
     const bridge = new Database(config.databasePath);
     bridge.prepare("UPDATE jobs SET job_key='bridge-key' WHERE job_id=?").run(job.job_id);
+    bridge.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)").run(job.job_id,event.updated_at);
     bridge.prepare("INSERT INTO job_groups VALUES(?,?,?,?,?,?,?)").run(event.event_id,event.updated_at,"legacy",null,null,event.created_at,event.updated_at);
     const schedulerTables = (bridge.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count;
     bridge.pragma("user_version = 2");
@@ -336,6 +337,7 @@ describe("DispatcherDatabase", () => {
     assert.equal(raw.pragma("user_version", { simple: true }), 3);
     assert.equal((raw.prepare("SELECT job_key FROM jobs WHERE job_id=?").get(job.job_id) as {job_key:string}).job_key,"bridge-key");
     assert.equal((raw.prepare("SELECT notification_mode FROM job_groups WHERE source_event_id=?").get(event.event_id) as {notification_mode:string}).notification_mode,"legacy");
+    assert.equal((raw.prepare("SELECT stopped_at FROM legacy_job_agents_to_stop WHERE job_id=?").get(job.job_id) as {stopped_at:string}).stopped_at,event.updated_at);
     assert.equal((raw.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count,schedulerTables);
     assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");
     assert.deepEqual(raw.pragma("foreign_key_check"), []);
