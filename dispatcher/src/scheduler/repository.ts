@@ -1066,7 +1066,7 @@ export class SchedulerRepository {
       due_lag_seconds: oldest.value === null ? 0 : Math.max(0, Math.floor((Date.parse(now) - Date.parse(oldest.value)) / 1000)),
       due_schedules: scalar("SELECT count(*) AS count FROM schedules WHERE state='active' AND next_due<=?", now),
       stale_claims: scalar(`SELECT count(*) AS count FROM schedule_claims c JOIN schedules s USING(schedule_id)
-        WHERE s.state='active' AND c.claim_until IS NOT NULL AND c.claim_until<=?`, now),
+        WHERE s.state='active' AND s.next_due<=? AND c.claim_until IS NOT NULL AND c.claim_until<=?`, now, now),
       outbox_backlog: scalar("SELECT count(*) AS count FROM connector_outbox WHERE status IN ('pending','claimed','request_started')"),
       needs_review: scalar(`SELECT (SELECT count(*) FROM schedules WHERE state='needs_review') +
         (SELECT count(*) FROM schedule_runs WHERE status='needs_review') +
@@ -1108,13 +1108,22 @@ export class SchedulerRepository {
           AND r.revision=schedule_revisions.revision)`, add(now,-2592000)),
       job_contents: count(`SELECT count(*) AS count FROM jobs j WHERE (j.result_json IS NOT NULL OR j.objective<>'[deleted]') AND EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.content_delete_at<=?
-          AND json_extract(c.owner_json,'$.kind')='schedule')`, now),
+          AND json_extract(c.owner_json,'$.kind')='schedule') AND NOT EXISTS
+        (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`, now, now),
       event_contents: count(`SELECT count(*) AS count FROM events e WHERE e.source IN ('dona_schedule','dona_job') AND
-        (e.result_json IS NOT NULL OR e.payload_json NOT IN ('{}','{"work":{"objective":"[deleted]"}}')) AND EXISTS
+        (e.result_json IS NOT NULL OR (e.source='dona_schedule' AND json_extract(e.payload_json,'$.work.objective') IS NOT NULL
+          AND json_extract(e.payload_json,'$.work.objective')<>'[deleted]') OR (e.source='dona_job' AND
+          (json_extract(e.payload_json,'$.result') IS NOT NULL OR json_extract(e.payload_json,'$.error_message') IS NOT NULL))) AND EXISTS
         (SELECT 1 FROM job_completion_results c WHERE (c.source_event_id=e.event_id OR c.notification_event_id=e.event_id)
           AND c.content_delete_at<=?)`, now),
       result_files: count(`SELECT count(*) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL`, now),
+      event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND EXISTS
+        (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR EXISTS
+        (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?)) OR
+        (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=e.event_id
+          AND c.content_delete_at<=?)))`, add(now,-604800), now, now),
+      consumed_nonces: count("SELECT count(*) AS count FROM schedule_access_receipt_nonces WHERE consumed_at<=?", add(now,-86400)),
     };
   }
   purge(now: string): void {
