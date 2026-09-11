@@ -10,6 +10,7 @@ import type { Logger } from "../src/logger.js";
 import { FakeClock } from "../src/scheduler/clock.js";
 import type { Actor, RevisionInput } from "../src/scheduler/repository.js";
 import { SchedulerService } from "../src/scheduler/service.js";
+import type { SchedulerPolicyDecision } from "../src/scheduler/service.js";
 
 const policy = fs.readFileSync(new URL("../../docs/adr/fixtures/scheduler-v1/policy.json", import.meta.url), "utf8");
 const actor: Actor = { tenant_id: "T_TEST", actor_id: "U_TEST", role: "owner", source_event_id: null };
@@ -226,4 +227,67 @@ test("startup scanはpoll前にbatch上限を二重実行しない", async () =>
   await new Promise((resolve) => setTimeout(resolve, 10));
   await service.stop();
   assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs").get() as { n: number }).n, 2);
+});
+
+test("recurring policy decisionをaction別・reason別に型付きで記録する", () => {
+  const { repo, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  const decisions: SchedulerPolicyDecision[] = [];
+  repo.create("work_recurring", daily(due), due, actor, clock.now());
+  repo.create("reminder_recurring", {
+    ...daily(due),
+    action: "slack.reminder.post",
+    target: { kind: "thread", workspace_id: actor.tenant_id, channel_id: "C_TEST", thread_ts: "1757030400.000001" },
+    content: "確認してください",
+  }, due, actor, clock.now());
+  clock.set("2026-09-05T00:16:01Z");
+  const service = new SchedulerService(repo, clock, () => {}, logger, {
+    owner: "scheduler_a",
+    recordPolicyDecision: decision => { decisions.push(decision); },
+  });
+  assert.equal(service.runBatch(), 2);
+  assert.deepEqual(decisions.map(({ action, outcome, policy_version }) => ({ action, outcome, policy_version }))
+    .sort((left, right) => left.action.localeCompare(right.action)), [
+    { action: "slack.reminder.post", outcome: "skipped_misfire", policy_version: 1 },
+    { action: "work.read_only", outcome: "skipped_misfire", policy_version: 1 },
+  ]);
+});
+
+test("decision記録障害とone-shot除外はrun admissionをrollbackしない", async () => {
+  const { repo, raw, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  repo.create("metric_failure", daily(due), due, actor, clock.now());
+  repo.create("one_shot", once(due), due, actor, clock.now());
+  clock.set(due);
+  const warnings: unknown[] = [];
+  const failureLogger: Logger = { ...logger, warn: (_message, fields) => warnings.push(fields) };
+  const service = new SchedulerService(repo, clock, () => {}, failureLogger, {
+    owner: "scheduler_a",
+    recordPolicyDecision: async () => { throw new Error("metric unavailable"); },
+  });
+  assert.equal(service.runBatch(), 2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs WHERE schedule_id = 'metric_failure'").get() as { n: number }).n, 1);
+  assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs WHERE schedule_id = 'one_shot'").get() as { n: number }).n, 1);
+  assert.equal(warnings.length, 1);
+});
+
+test("shutdownは非同期policy decisionのsettleを待つ", async () => {
+  const { repo, clock } = setup();
+  const due = "2026-09-05T00:01:00Z";
+  repo.create("async_metric", daily(due), due, actor, clock.now());
+  clock.set(due);
+  let resolveDecision: (() => void) | undefined;
+  const service = new SchedulerService(repo, clock, () => {}, logger, {
+    owner: "scheduler_a",
+    recordPolicyDecision: () => new Promise<void>(resolve => { resolveDecision = resolve; }),
+  });
+  assert.equal(service.runBatch(), 1);
+  let stopped = false;
+  const stopping = service.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, false);
+  resolveDecision!();
+  await stopping;
+  assert.equal(stopped, true);
 });

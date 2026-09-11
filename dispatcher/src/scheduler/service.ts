@@ -41,6 +41,17 @@ export interface SchedulerServiceOptions {
   leaseSeconds?: number;
   pollMilliseconds?: number;
   owner?: string;
+  recordPolicyDecision?: (decision: SchedulerPolicyDecision) => void | Promise<void>;
+}
+
+export interface SchedulerPolicyDecision {
+  schedule_id: string;
+  revision: number;
+  action: "slack.reminder.post" | "work.read_only";
+  policy_version: 1;
+  outcome: "admitted" | "skipped_misfire" | "skipped_overlap";
+  scheduled_for: string;
+  compact_misfire_count: number;
 }
 
 export function nextPersistedOccurrence(definition: ScheduleDefinition, after: string): ReturnType<typeof nextOccurrence> {
@@ -66,6 +77,8 @@ export class SchedulerService {
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
   private lastPurgeAt: number | undefined;
+  private readonly recordPolicyDecision: (decision: SchedulerPolicyDecision) => void | Promise<void>;
+  private readonly pendingPolicyDecisions = new Set<Promise<void>>();
 
   constructor(
     private readonly repository: SchedulerRepository,
@@ -78,6 +91,9 @@ export class SchedulerService {
     this.batchSize = options.batchSize ?? 10;
     this.leaseSeconds = options.leaseSeconds ?? 60;
     this.pollMilliseconds = options.pollMilliseconds ?? 1_000;
+    this.recordPolicyDecision = options.recordPolicyDecision ?? ((decision) => {
+      this.logger.info("Scheduler policy decision", { ...decision });
+    });
     if (!Number.isInteger(this.batchSize) || this.batchSize < 1 || this.batchSize > 100) throw new Error("invalid_batch_size");
     if (!Number.isInteger(this.pollMilliseconds) || this.pollMilliseconds < 1 || this.pollMilliseconds > 60_000) throw new Error("invalid_poll_interval");
   }
@@ -103,6 +119,7 @@ export class SchedulerService {
     this.stopping = true;
     this.wake();
     await this.loopPromise;
+    await Promise.allSettled([...this.pendingPolicyDecisions]);
     this.repository.releaseClaims(this.owner, this.clock.now());
     this.running = false;
   }
@@ -140,7 +157,7 @@ export class SchedulerService {
         const compactSkip = occurrences.length > 1
           ? { from: firstDue, through: occurrences.at(-2)!.occurrence_at, count: occurrences.length - 1 }
           : undefined;
-        this.repository.materialize(
+        const result = this.repository.materialize(
           claim.schedule_id,
           claim.revision,
           scheduledFor,
@@ -151,6 +168,17 @@ export class SchedulerService {
           compactSkip,
           { owner: this.owner, fence: claim.claim_fence, occurrenceKey: occurrence.key },
         );
+        const outcome = result.run.reason === "misfire" ? "skipped_misfire"
+          : result.run.reason === "overlap" ? "skipped_overlap" : "admitted";
+        if (definition.recurrence.kind !== "once") this.emitPolicyDecision({
+            schedule_id: claim.schedule_id,
+            revision: claim.revision,
+            action: definition.action.action,
+            policy_version: definition.policy.version,
+            outcome,
+            scheduled_for: scheduledFor,
+            compact_misfire_count: compactSkip?.count ?? 0,
+          });
         materialized++;
       } catch (error) {
         this.logger.warn("Due schedule could not be materialized", {
@@ -165,6 +193,25 @@ export class SchedulerService {
 
   private actor(tenantId: string): Actor {
     return { tenant_id: tenantId, actor_id: "scheduler", role: "admin", source_event_id: null };
+  }
+
+  private emitPolicyDecision(decision: SchedulerPolicyDecision): void {
+    try {
+      const pending = Promise.resolve(this.recordPolicyDecision(decision))
+        .catch(error => this.warnPolicyDecisionFailure(decision.schedule_id, error));
+      this.pendingPolicyDecisions.add(pending);
+      void pending.finally(() => this.pendingPolicyDecisions.delete(pending));
+    } catch (error) {
+      this.warnPolicyDecisionFailure(decision.schedule_id, error);
+    }
+  }
+
+  private warnPolicyDecisionFailure(scheduleId: string, error: unknown): void {
+    this.logger.warn("Scheduler policy decision recording failed", {
+      schedule_id: scheduleId,
+      error_code: "scheduler_policy_metric_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
   }
 
   private async loop(): Promise<void> {
