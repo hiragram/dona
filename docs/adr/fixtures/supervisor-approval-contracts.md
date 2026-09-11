@@ -18,6 +18,9 @@
 | binding rotation | nonterminal / `approved` | revision変更 | `needs_review` | なし |
 | policy risk increase | nonterminal / `approved` | policy revision変更 | `needs_review` | なし |
 | model-only update | nonterminal | enforcement revision不変 | 状態維持 | なし |
+| cancel after approve | `approved` | consume claim前 | `execution_cancelled` | なし |
+| expire after approve | `approved` | consume TTL超過 | `consume_expired` | なし |
+| clock rewind after restart | nonterminal / `approved` | wall clockがdurable high-water markより前 | `expired`または`needs_review` | なし |
 
 ## Consume / execution transition table
 
@@ -31,6 +34,17 @@
 | known rejection | APIが決定的拒否 | `failed` | 同じwriteを再送しない |
 | timeout after send | acceptanceを証明不能 | `acceptance_unknown` | read-only reconcileのみ |
 | reconciled accepted | exact idempotency key/resultを発見 | 同じattemptを`succeeded`へ更新 | 新attemptを作らない |
+| reconciled rejected | exact rejection receiptを発見 | 同じattemptを`failed`へ更新 | 新attemptを作らない |
+
+## Delivery attempt transition table
+
+| Case | Initial | Observation | Expected |
+| --- | --- | --- | --- |
+| post accepted | `pending` | exact message identityを取得 | `sent` |
+| post rejected | `pending` | Slackの決定的error | `failed` |
+| post timeout | `pending` | acceptanceを証明不能 | `acceptance_unknown`、再投稿禁止 |
+| unknown reconciled sent | `acceptance_unknown` | saved presentation identityがexactly 1件 | 同じattemptを`sent`へ更新 |
+| unknown reconciled absent | `acceptance_unknown` | bounded全page確認で不存在を証明 | 同じattemptを`failed`へ更新、別送信は新しい明示操作 |
 
 ## Typed action fixture: `slack.post_thread_reply.v1`
 
@@ -45,33 +59,41 @@
     "thread_ts": "1700000000.000001"
   },
   "policy": {
-    "reply_broadcast": false
+    "reply_broadcast": false,
+    "special_mentions": "deny_all",
+    "allowed_user_mentions": ["user_example"],
+    "max_user_mentions": 3
   },
-  "content_ref": "server-side:content_example",
-  "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "encrypted_content_ref": "payload-store:content_example",
+  "content_hmac_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "preconditions": {
     "thread_exists": true,
+    "root_message_revision": {
+      "edited_ts": "1700000001.000001",
+      "content_hmac_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
     "workspace_binding_revision": 3
   }
 }
 ```
 
-CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、owner-privateなserver-side参照からexecutor直前に取得してdigestを再検証します。
+CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、最大20分の暗号化payload storeからexecutor直前に取得してserver-side HMACを再検証します。content HMACとroot message HMACはUIへ表示しません。rootが未編集なら`edited_ts`の明示的なnullと内容HMACを保存し、consume時に両方を再取得します。
 
 期待する否定fixture:
 
 - `operation_kind`を任意のtool名へ変更するとunknown operationで拒否
-- `workspace_id`、channel、thread、broadcast flag、content digestのどれか一つでも変更するとhash不一致
+- `workspace_id`、channel、thread、broadcast flag、mention policy、content HMAC、root revisionのどれか一つでも変更するとhash不一致
 - 別instance、別binding revision、別requestのdecisionを転用するとconsume拒否
 - DM/private thread由来contextをpresentationへ追加するとdata-classification test失敗
+- `<!channel>`、`<!here>`、user group、allowlist外または4名以上のuser mentionはgatewayとexecutorの両方で拒否
 
 ## Threat review scenarios
 
 | Scenario | Presentation | Required proof | Expected |
 | --- | --- | --- | --- |
 | public thread、安全なprojection | policyが明示許可すればthread可 | supervisor membership、same team、exact coordinates | valid decisionのみ記録 |
-| private channel | supervisor DMのみ | same team/user/appとsaved DM coordinates | channel名・本文を非開示 |
-| DM / group DM | supervisor DMのみ | sourceとdecisionのworkspace binding | 参加者・本文を非開示 |
+| private channel | supervisor DMのみ、exact stable target ID/nameを表示 | same team/user/app、supervisorのcurrent channel visibility、saved DM coordinates | visibilityまたは安全なtarget表示がなければUIを作らない |
+| DM / group DM | supervisor DMのみ、exact targetを表示 | sourceとdecisionのworkspace binding、supervisorが対象conversationを現在閲覧可能 | 参加者一覧・本文は非開示、visibility不明なら拒否 |
 | cross-workspace actor | 表示済みでも無効 | team不一致 | ACK後拒否・audit |
 | non-supervisor actor | 表示済みでも無効 | user/revision不一致 | ACK後拒否・audit |
 | high-impact operation | UIを作らない | 独立second factor/二者承認contractなし | unsupportedでfail closed |
