@@ -206,10 +206,12 @@ describe("DispatcherDatabase", () => {
       (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
     assert.throws(()=>database.createJob(request(firstEvent.event_id,"three"),config.jobsWorkspaceRoot,config.jobResultsDir),
       (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded");
+    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
     const followUp=database.enqueue(eventEnvelope("Ev-owner-aware-follow-up")).row;
     assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)),
       (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
-    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
+    database.beginJobPreparation(first.row.job_id);
+    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[other.row.job_id,second.row.job_id]);
     assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
     database.close();
   });
@@ -372,7 +374,8 @@ describe("DispatcherDatabase", () => {
     bridge.pragma("user_version = 2");
     bridge.close();
     const migrated = new DispatcherDatabase(config.databasePath);
-    assert.equal(migrated.createJob({source_event_id:event.event_id,job_key:"bridge-key",objective:"preserve",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.throws(()=>migrated.createJob({source_event_id:event.event_id,job_key:"bridge-key",objective:"preserve",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
     migrated.close();
     const raw = new Database(config.databasePath);
     assert.equal(raw.pragma("user_version", { simple: true }), 3);

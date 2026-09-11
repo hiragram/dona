@@ -49,13 +49,6 @@ function nowUtc(): string {
   return new Date().toISOString();
 }
 
-function preSteerObjective(objective:string,steerEventId:string|null):string {
-  if(steerEventId===null) return objective;
-  const marker="\n\n[DONA_FOLLOW_UP]\n";
-  const index=objective.indexOf(marker);
-  return index>=0&&objective.endsWith("\n[/DONA_FOLLOW_UP]")?objective.slice(0,index):objective;
-}
-
 function retryAt(attemptCount: number, now: Date): string {
   const delay = retryDelaysMs[Math.min(Math.max(attemptCount - 1, 0), retryDelaysMs.length - 1)]!;
   return new Date(now.getTime() + delay).toISOString();
@@ -268,11 +261,10 @@ export class DispatcherDatabase {
       `);
       for (const row of this.db.prepare("SELECT job_id,objective,workspace_json,steer_event_id FROM jobs").all() as Array<{job_id:string;objective:string;workspace_json:string;steer_event_id:string|null}>) {
         const workspace=JSON.parse(row.workspace_json) as CreateJobRequest["workspace"];
-        if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined) continue;
-        const creationObjective=preSteerObjective(row.objective,row.steer_event_id);
-        const request={source_event_id:"migration",objective:creationObjective,workspace};
+        if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined||row.steer_event_id!==null) continue;
+        const request={source_event_id:"migration",objective:row.objective,workspace};
         this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(
-          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(creationObjective,"utf8")),row.job_id);
+          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(row.objective,"utf8")),row.job_id);
       }
       if (hasLegacyStopMarkers) this.db.exec(`
         INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
@@ -589,8 +581,9 @@ export class DispatcherDatabase {
     return this.db.prepare(`
       WITH ranked AS (
         SELECT job_id, ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,rowid) AS fairness_rank
-        FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status='running'
+        FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status IN ('preparing','dispatching','running')
       ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
+        WHERE jobs.status IN ('queued','retryable_failed','running')
         ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,job_id LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
   }
