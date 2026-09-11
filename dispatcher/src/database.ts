@@ -22,7 +22,7 @@ import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
-import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
+import { canonicalJobPayloadSha256, jobCreationPayloadSha256FromWorkspace,
   legacyJobKey, parseCreateJobRequest, serializeJobWorkspace, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
@@ -259,7 +259,7 @@ export class DispatcherDatabase {
         CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
         CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
       `);
-      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json FROM jobs WHERE job_key=?").all(legacyJobKey) as Array<{job_id:string;objective:string;workspace_json:string}>) {
+      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json FROM jobs").all() as Array<{job_id:string;objective:string;workspace_json:string}>) {
         const workspace=JSON.parse(row.workspace_json) as CreateJobRequest["workspace"];
         if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined) continue;
         const request={source_event_id:"migration",objective:row.objective,workspace};
@@ -444,9 +444,8 @@ export class DispatcherDatabase {
       if (existing) {
         const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
         if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
-        if(stored===undefined&&jobKey!==legacyJobKey) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} has no immutable canonical payload fingerprint`);
         if(stored===undefined&&(existing.objective!==parsedRequest.objective||existing.workspace_json!==stableStringify(parsedRequest.workspace)))
-          throw new JobCreationError("job_idempotency_conflict",`Legacy job key ${jobKey} does not match the persisted payload`);
+          throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
         if(stored===undefined) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
         if(binding.owner.kind==="schedule") {
           const authorized=this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
@@ -477,7 +476,7 @@ export class DispatcherDatabase {
         if(group?.notification_mode==="legacy"&&jobKey!==legacyJobKey) throw new JobCreationError("job_group_closed","Legacy job group does not accept additional keys");
         const admitted=this.db.prepare("SELECT objective,workspace_json FROM jobs WHERE source_event_id=?").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
-        const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
+        const currentBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }

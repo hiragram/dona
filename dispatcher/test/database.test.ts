@@ -212,6 +212,18 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("queued steer後の実objective byteを後続job admissionへ算入する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:3,jobObjectiveTotalMaxBytes:100});
+    const event=database.enqueue(eventEnvelope("Ev-steer-admission-bytes")).row;
+    const first=database.createJob({source_event_id:event.event_id,job_key:"first",objective:"a",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const followUp=database.enqueue(eventEnvelope("Ev-steer-admission-bytes-follow-up")).row;
+    database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50));
+    assert.throws(()=>database.createJob({source_event_id:event.event_id,job_key:"second",objective:"c".repeat(20),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
+    database.close();
+  });
+
   test("does not copy untrusted objective text into the Herdr-visible agent name", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -349,6 +361,7 @@ describe("DispatcherDatabase", () => {
     seeded.close();
     const bridge = new Database(config.databasePath);
     bridge.prepare("UPDATE jobs SET job_key='bridge-key' WHERE job_id=?").run(job.job_id);
+    bridge.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id);
     bridge.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)").run(job.job_id,event.updated_at);
     bridge.prepare("UPDATE job_groups SET sealed_at=?,notification_mode='legacy',created_at=?,updated_at=? WHERE source_event_id=?")
       .run(event.updated_at,event.created_at,event.updated_at,event.event_id);
@@ -356,6 +369,7 @@ describe("DispatcherDatabase", () => {
     bridge.pragma("user_version = 2");
     bridge.close();
     const migrated = new DispatcherDatabase(config.databasePath);
+    assert.equal(migrated.createJob({source_event_id:event.event_id,job_key:"bridge-key",objective:"preserve",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
     migrated.close();
     const raw = new Database(config.databasePath);
     assert.equal(raw.pragma("user_version", { simple: true }), 3);

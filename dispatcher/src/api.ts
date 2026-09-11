@@ -623,6 +623,7 @@ export class DispatcherApi {
         const result = await this.jobs.steer(jobId, input.source_event_id, input.instruction);
         sendJson(response, 200, { schema_version: 1, duplicate: result.duplicate, job: result.row });
       } catch (error) {
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
         throw new ApiRequestError(409, "job_steer_failed", error instanceof Error ? error.message : String(error));
       }
       return;
