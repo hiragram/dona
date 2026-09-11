@@ -41,6 +41,17 @@ export interface SchedulerServiceOptions {
   leaseSeconds?: number;
   pollMilliseconds?: number;
   owner?: string;
+  recordPolicyDecision?: (decision: SchedulerPolicyDecision) => void;
+}
+
+export interface SchedulerPolicyDecision {
+  schedule_id: string;
+  revision: number;
+  action: "slack.reminder.post" | "work.read_only";
+  policy_version: 1;
+  outcome: "admitted" | "skipped_misfire" | "skipped_overlap";
+  scheduled_for: string;
+  compact_misfire_count: number;
 }
 
 export function nextPersistedOccurrence(definition: ScheduleDefinition, after: string): ReturnType<typeof nextOccurrence> {
@@ -66,6 +77,7 @@ export class SchedulerService {
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
   private lastPurgeAt: number | undefined;
+  private readonly recordPolicyDecision: (decision: SchedulerPolicyDecision) => void;
 
   constructor(
     private readonly repository: SchedulerRepository,
@@ -78,6 +90,9 @@ export class SchedulerService {
     this.batchSize = options.batchSize ?? 10;
     this.leaseSeconds = options.leaseSeconds ?? 60;
     this.pollMilliseconds = options.pollMilliseconds ?? 1_000;
+    this.recordPolicyDecision = options.recordPolicyDecision ?? ((decision) => {
+      this.logger.info("Scheduler policy decision", { ...decision });
+    });
     if (!Number.isInteger(this.batchSize) || this.batchSize < 1 || this.batchSize > 100) throw new Error("invalid_batch_size");
     if (!Number.isInteger(this.pollMilliseconds) || this.pollMilliseconds < 1 || this.pollMilliseconds > 60_000) throw new Error("invalid_poll_interval");
   }
@@ -140,7 +155,7 @@ export class SchedulerService {
         const compactSkip = occurrences.length > 1
           ? { from: firstDue, through: occurrences.at(-2)!.occurrence_at, count: occurrences.length - 1 }
           : undefined;
-        this.repository.materialize(
+        const result = this.repository.materialize(
           claim.schedule_id,
           claim.revision,
           scheduledFor,
@@ -151,6 +166,25 @@ export class SchedulerService {
           compactSkip,
           { owner: this.owner, fence: claim.claim_fence, occurrenceKey: occurrence.key },
         );
+        const outcome = result.run.reason === "misfire" ? "skipped_misfire"
+          : result.run.reason === "overlap" ? "skipped_overlap" : "admitted";
+        try {
+          this.recordPolicyDecision({
+            schedule_id: claim.schedule_id,
+            revision: claim.revision,
+            action: definition.action.action,
+            policy_version: definition.policy.version,
+            outcome,
+            scheduled_for: scheduledFor,
+            compact_misfire_count: compactSkip?.count ?? 0,
+          });
+        } catch (error) {
+          this.logger.warn("Scheduler policy decision recording failed", {
+            schedule_id: claim.schedule_id,
+            error_code: "scheduler_policy_metric_failed",
+            error_message: error instanceof Error ? error.message : String(error),
+          });
+        }
         materialized++;
       } catch (error) {
         this.logger.warn("Due schedule could not be materialized", {
