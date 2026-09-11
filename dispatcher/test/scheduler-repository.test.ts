@@ -74,7 +74,7 @@ test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   raw.exec(`DROP TABLE schedule_audit; DROP TABLE connector_outbox; DROP TABLE schedule_runs;
     DROP TABLE schedule_claims; DROP TABLE schedules; DROP TABLE schedule_revisions;
     DROP TABLE schedule_list_sequence; DROP TABLE scheduler_schema`);
-  assert.equal(raw.pragma("user_version", { simple: true }), 2);
+  assert.equal(raw.pragma("user_version", { simple: true }), 3);
   const reopened = new DispatcherDatabase(filename);
   assert.equal(reopened.get(event.event_id)?.external_event_id, "legacy");
   assert.equal(raw.pragma("journal_mode", { simple: true }), "wal");
