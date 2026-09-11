@@ -83,6 +83,8 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 採用: bindingはDona instance ID、Slack team ID、supervisor user ID、revision、statusへ結合し、通常event/MCPから作成・変更できないlocal operator操作とします。bootstrap、rotation、revokeは、別OS accountまたは別hardware-backed credentialへ結合した独立actor二人のauthorizationを必須とし、proposerとconfirmerを同一identityで兼任できません。rotation/revokeは旧revisionのpending/approved requestをinvalidateします。break-glassも二人のoperator確認、理由、最大30分、有効範囲、終了後reviewを必須とし、approvalを迂回せず一時supervisor bindingを発行します。
 
+enforcement policyを緩和する変更もlocal operator専用とし、許可operation/targetの拡大、approval省略、shared channel許可、TTL延長などのexact policy digestと次generationへ結合した独立actor二人のauthorizationなしではactivateしません。単なるgeneration増加やhigh-water mark前進を緩和の承認証跡として代用しません。
+
 理由: approval経路による自己昇格を防ぎます。安全側defaultはbinding不在・競合・失効時のrequest拒否です。別IAM導入時もinstance/workspace/revision bindingと監査を弱めません。
 
 ### 6. High-impact action
@@ -103,7 +105,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 binding/audit HMAC signing keyは90日以内にrotationし、各recordへ用途と`key_version`を保存します。rotation済みkeyは新規MACへ使わず、OS credential store内のverification-only keyとして、そのkeyで署名した最後のrecordの400日保持とbackup expiryがともに終了するまで保護して保持します。その後はrecordを削除してからkeyを破棄します。verification keyが欠落、revoked、またはversion不明ならrecordを検証済みと扱わず、security decisionと自動実行をfail closedします。retained recordを別keyで暗黙にre-MACしません。
 
-Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら、requestに加えて`claimed` / `executing`を含む全nonterminal attemptを`needs_review`へ同じtransactionで固定し、decision/claim/executionを拒否します。さらにDB/backup外の保護されたcredential storeへbinding generationとenforcement policy generationの単調high-water markを保存し、restore内容がどちらかを巻き戻す場合は新規requestを含むapproval経路全体をfail closedします。現在generationへの二者operator再承認が完了するまで旧binding/policyをcurrentとして採用しません。payloadの再生成や元actionの自動再実行は行いません。
+Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/approved requestとattemptのpayload参照・HMACを検査します。backup対象外payloadが欠落または不一致なら、requestに加えて`claimed` / `executing`を含む全nonterminal attemptを`needs_review`へ同じtransactionで固定し、decision/claim/executionを拒否します。さらにDB/backup外の保護されたcredential storeへbinding generationとenforcement policy generationの単調high-water markを保存します。markの欠落、読取不能、integrity不明、またはrestore内容がmarkを巻き戻す場合は、新規requestを含むapproval経路全体をfail closedします。現在generationへの二者operator再承認が完了するまで復元DBのbinding/policyをcurrentとして採用しません。payloadの再生成や元actionの自動再実行は行いません。
 
 理由: incident追跡とdata minimizationを両立します。安全側defaultは保存しないことです。legal/運用要件変更時はfield別classification、削除証跡、backup expiryを同時に更新します。
 
@@ -147,6 +149,7 @@ delivery attempt:
 
 pending notice attempt:
   pending -> dispatching
+  pending -> aborted
   dispatching -> sent|failed|acceptance_unknown
   dispatching -> acceptance_unknown (recovery only)
   acceptance_unknown -> sent|needs_review
@@ -176,7 +179,7 @@ execution attempt:
 - requestがcancel、expire、reject、またはinvalidateされる時点でdelivery attemptがまだ`pending`なら、同じtransactionで`aborted`へ収束させます。外部call未開始のattemptは以後claimせず、無効なapproval cardを新規送信しません。
 - binding/policy/restore invalidationは全nonterminal stateとapprovedから`needs_review`へtransactionalに遷移でき、配送結果と競合してもinvalidated requestを`sent`へ戻しません。
 - approval delivery workerは`chat.postMessage`直前に`dispatching`とattempt fenceをdurable commitします。復旧時の`dispatching`は送信済みの可能性があるため無条件に同じattemptを`acceptance_unknown`へ移し、read-only reconcileだけを行い再送しません。
-- 元threadのpending noticeはapproval cardと別のdelivery attemptとして、request ID、notice attempt ID、server-side MACの一意markerへbindingします。`chat.postMessage`直前に`dispatching` fenceをdurable commitし、timeoutまたは復旧時は`acceptance_unknown`からexact markerをread-only reconcileするだけで、0件でも再投稿しません。
+- 元threadのpending noticeはapproval cardと別のdelivery attemptとして、request ID、共通field `notification_attempt_id`、notification kind、server-side MACの一意markerへbindingします。`chat.postMessage`直前に`dispatching` fenceをdurable commitし、timeoutまたは復旧時は`acceptance_unknown`からexact markerをread-only reconcileするだけで、0件でも再投稿しません。requestがterminalになる時点でnotice attemptが`pending`なら、同じtransactionで`aborted`へ収束させて新規noticeを送りません。
 - presentation update workerはdispatch直前に保存済みpresentation revisionとcurrent desired revisionを照合し、staleな`pending` attemptを`aborted`へ収束させます。同じmessageに`dispatching`または`acceptance_unknown`のattemptがある間は後続updateを送らず、先行writeがterminalに一意確定するまで直列化します。曖昧な先行writeを飛び越えて新しい表示で上書きしません。
 - executorは`claimed`から外部callへ進む直前に、短いexecution期限、binding、policy、ordered thread revision、visibility、shared状態をcurrent sourceから再検証します。不一致や期限切れは外部callなしで`needs_review`へ収束させます。成功した場合だけ`executing`とattempt fenceをdurable commitして送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
@@ -185,7 +188,7 @@ execution attempt:
 
 ## Slack transport decision proof
 
-request作成時のrequesterは、認証済みEvent Envelopeのactor、またはDispatcherが永続化したbackground job ownerからserver-sideで導出します。source event/job ID、owner kind、actor/owner ID、instance、workspaceをimmutable requestへ結合し、会話本文、LLM出力、button valueからrequester IDを受け取りません。source ownershipが欠落または一致しなければrequestを作りません。作成keyはserver-sideで`instance + workspace + source event/job ID + stable operation slot`から導出してunique constraintを設けます。同じkeyとcanonical action hashの再送は既存requestを返し、同じkeyで異なるactionは状態を変えずconflictとして`needs_review`にします。一つのsourceで複数actionを扱う場合も、順序から変動しない明示slotをDispatcherが永続化します。
+request作成時のrequesterは、認証済みEvent Envelopeのactor、またはDispatcherが永続化したbackground job ownerからserver-sideで導出します。source event/job ID、owner kind、actor/owner ID、instance、workspaceをimmutable requestへ結合し、会話本文、LLM出力、button valueからrequester IDを受け取りません。source ownershipが欠落または一致しなければrequestを作りません。作成keyはserver-sideで`instance + workspace + source event/job ID + stable operation slot`から導出してunique constraintを設けます。同じkeyとsemantic action hashの再送は既存requestを返し、同じkeyで異なるactionは状態を変えずconflictとして`needs_review`にします。一つのsourceで複数actionを扱う場合も、順序から変動しない明示slotをDispatcherが永続化します。creation keyを先に検索してからpayloadを割り当て、action hashにはstorage locator、暗号nonce、ciphertextなどの保存時metadataを含めず、typed operation、target、policy、precondition、content HMACだけを含めます。
 
 button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。3秒以内に、envelope IDをdedup keyとするdurable interactive inboxへ検証済みproofとcommandをcommitしてからACKします。ACKはapproval受理ではありません。ACK後のdecision workerは保存済みcommandだけを処理し、duplicate envelopeは同じinbox recordへ収束させます。decision確定時はstable event IDを持つ`dona_approval` outbox rowをdecisionと同じtransactionで一度だけ作成します。commit後はdurable outboxだけを配送し、process再起動時も未配送rowを回収します。`chat.update`は別のdurable attemptとして処理します。
 
@@ -195,7 +198,7 @@ MVP replyは、承認済み本文を変えない一意なexecution attempt IDと
 
 cancel、expire、reject、`needs_review`など全terminal/invalid stateで遅着cardを発見した場合、requestを`sent`へ戻さずinteractive decisionを恒久拒否します。exact cardをredactedな無効表示へ変えるpresentation update attemptを一度だけ作り、そのupdateが曖昧なら再送せず`acceptance_unknown`としてreconcileします。
 
-ordered thread revisionは利用者の会話contextだけを対象にします。Dona自身が投稿したpending noticeまたはapproval cardは、認証済みapp author、request ID、delivery attempt ID、server-side MACがすべて一致する専用markerで識別できる場合だけ集合から除外します。本文類似やBot authorだけでは除外しません。それ以外のreply追加・削除・編集はcontext driftです。
+ordered thread revisionは利用者の会話contextだけを対象にします。Dona自身が投稿したpending noticeまたはapproval cardは、認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACがすべて一致する専用markerで識別できる場合だけ集合から除外します。本文類似やBot authorだけでは除外しません。それ以外のreply追加・削除・編集はcontext driftです。
 
 ## Release gate
 
