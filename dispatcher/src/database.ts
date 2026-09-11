@@ -20,13 +20,16 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
-import { migrateScheduler } from "./scheduler/schema.js";
+import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+export const dispatcherSchemaCompatibility = { read_min: 2, read_max: 3, write: 3 } as const;
+export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled" | SchedulerMigrationStep;
+export type DispatcherMigrationHook = (step: DispatcherMigrationStep) => void;
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
@@ -61,7 +64,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, private readonly migrationHook: DispatcherMigrationHook = () => {}) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -70,8 +73,10 @@ export class DispatcherDatabase {
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
     try {
-      this.migrate();
-      migrateScheduler(this.db);
+      this.db.transaction(() => {
+        this.migrate();
+        migrateScheduler(this.db, this.migrationHook, true);
+      }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
       const eventColumns=new Set((this.db.prepare("PRAGMA table_info(events)").all() as Array<{name:string}>).map(row=>row.name));
@@ -131,7 +136,7 @@ export class DispatcherDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 2) throw new Error(`Database schema version ${version} is newer than supported version 2`);
+    if (version > dispatcherSchemaCompatibility.read_max) throw new Error(`Database schema version ${version} is newer than supported version ${dispatcherSchemaCompatibility.read_max}`);
     if (version < 1) this.db.exec(`
       CREATE TABLE events (
         sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,6 +202,67 @@ export class DispatcherDatabase {
       CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
       PRAGMA user_version = 2;
     `);
+    const currentVersion = this.db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion < 3) {
+      const jobsHasKey = (this.db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
+      this.db.exec(`
+        CREATE TABLE jobs_v3 (
+          job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL REFERENCES events(event_id),
+          job_key TEXT NOT NULL DEFAULT 'legacy-default', source TEXT NOT NULL,
+          workspace_id TEXT, channel_id TEXT, thread_ts TEXT, actor_id TEXT,
+          objective TEXT NOT NULL, workspace_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN (${jobStatusSql})), attempt_count INTEGER NOT NULL DEFAULT 0,
+          available_at TEXT NOT NULL, workspace_path TEXT NOT NULL, result_path TEXT NOT NULL,
+          herdr_workspace_id TEXT, herdr_pane_id TEXT, agent_name TEXT NOT NULL UNIQUE,
+          dispatch_started_at TEXT, prompt_accepted_at TEXT, completed_at TEXT, result_json TEXT,
+          completion_event_id TEXT REFERENCES events(event_id), steer_event_id TEXT,
+          steer_state TEXT CHECK (steer_state IN ('dispatching', 'accepted') OR steer_state IS NULL),
+          last_error_code TEXT, last_error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE (source_event_id, job_key)
+        );
+        INSERT INTO jobs_v3 (
+          job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
+          objective, workspace_json, status, attempt_count, available_at, workspace_path, result_path,
+          herdr_workspace_id, herdr_pane_id, agent_name, dispatch_started_at, prompt_accepted_at,
+          completed_at, result_json, completion_event_id, steer_event_id, steer_state,
+          last_error_code, last_error_message, created_at, updated_at
+        ) SELECT job_id, source_event_id, ${jobsHasKey ? "job_key" : "'legacy-default'"}, source,
+          workspace_id, channel_id, thread_ts, actor_id, objective, workspace_json, status, attempt_count,
+          available_at, workspace_path, result_path, herdr_workspace_id, herdr_pane_id, agent_name,
+          dispatch_started_at, prompt_accepted_at, completed_at, result_json, completion_event_id,
+          steer_event_id, steer_state, last_error_code, last_error_message, created_at, updated_at FROM jobs;
+      `);
+      this.migrationHook("jobs_copied");
+      this.db.exec(`
+        DROP TABLE jobs;
+        ALTER TABLE jobs_v3 RENAME TO jobs;
+        CREATE INDEX jobs_run_idx ON jobs(status, available_at, created_at);
+        CREATE INDEX jobs_thread_idx ON jobs(workspace_id, channel_id, thread_ts, created_at);
+        CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
+        CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
+      `);
+      this.migrationHook("indexes_recreated");
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS job_groups (
+          source_event_id TEXT PRIMARY KEY REFERENCES events(event_id), sealed_at TEXT,
+          notification_mode TEXT NOT NULL CHECK (notification_mode IN ('grouped', 'legacy')),
+          attention_event_id TEXT REFERENCES events(event_id), all_terminal_event_id TEXT REFERENCES events(event_id),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS job_groups_transition_idx ON job_groups(notification_mode, sealed_at, updated_at);
+      `);
+      const eventColumns = new Set((this.db.pragma("table_info(events)") as Array<{ name: string }>).map(({ name }) => name));
+      if (["status", "completed_at", "updated_at"].every((column) => eventColumns.has(column))) this.db.exec(`
+          INSERT OR IGNORE INTO job_groups(source_event_id, sealed_at, notification_mode, attention_event_id, all_terminal_event_id, created_at, updated_at)
+          SELECT jobs.source_event_id,
+            CASE WHEN events.status NOT IN ('dispatching', 'waiting_agent') THEN COALESCE(events.completed_at, events.updated_at, MAX(jobs.updated_at)) ELSE NULL END,
+            CASE WHEN MAX(CASE WHEN jobs.completion_event_id IS NOT NULL THEN 1 ELSE 0 END) = 1 THEN 'legacy' ELSE 'grouped' END,
+            NULL, NULL, MIN(jobs.created_at), MAX(jobs.updated_at)
+          FROM jobs JOIN events ON events.event_id = jobs.source_event_id GROUP BY jobs.source_event_id;
+      `);
+      this.db.pragma("user_version = 3");
+      this.migrationHook("groups_backfilled");
+    }
   }
 
   close(): void {

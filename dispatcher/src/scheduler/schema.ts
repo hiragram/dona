@@ -2,8 +2,14 @@ import type Database from "better-sqlite3";
 import { definitionFingerprint, type DefinitionFingerprintInput } from "./fingerprint.js";
 
 // Core user_version is owned by the Dispatcher (including the independent v3 job migration).
-export function migrateScheduler(db: Database.Database): void {
-  db.transaction(() => {
+export type SchedulerMigrationStep = "scheduler_schema_ready";
+
+export function migrateScheduler(
+  db: Database.Database,
+  migrationHook: (step: SchedulerMigrationStep) => void = () => {},
+  outerTransaction = false,
+): void {
+  const migrate = () => {
     db.exec(`CREATE TABLE IF NOT EXISTS scheduler_schema (
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL
     )`);
@@ -47,6 +53,7 @@ export function migrateScheduler(db: Database.Database): void {
       // Version 2 existed only on an unmerged development head. Normalize it so the
       // released version-1 reader can still open this expand-only schema on rollback.
       if (row.version === 2) db.exec("UPDATE scheduler_schema SET version = 1 WHERE singleton = 1");
+      migrationHook("scheduler_schema_ready");
       return;
     }
     db.exec(`
@@ -117,5 +124,8 @@ export function migrateScheduler(db: Database.Database): void {
       CREATE INDEX schedule_audit_event_retention_idx ON schedule_audit(source_event_id, operation, created_at);
       INSERT INTO scheduler_schema VALUES (1, 1);
     `);
-  }).immediate();
+    migrationHook("scheduler_schema_ready");
+  };
+  if (outerTransaction) migrate();
+  else db.transaction(migrate).immediate();
 }

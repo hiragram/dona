@@ -292,4 +292,77 @@ describe("DispatcherDatabase", () => {
     for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
     reopened.close();
   });
+
+  test("schema v3はmulti-jobとschedule runのcardinalityを同時に保持する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const dispatcher = new DispatcherDatabase(config.databasePath);
+    const event = dispatcher.enqueue(eventEnvelope("Ev-schema-v3-cardinality")).row;
+    dispatcher.close();
+    const raw = new Database(config.databasePath);
+    assert.equal(raw.pragma("user_version", { simple: true }), 3);
+    const original = raw.prepare("SELECT * FROM jobs WHERE 0").all();
+    assert.deepEqual(original, []);
+    const insert = raw.prepare(`INSERT INTO jobs(job_id,source_event_id,job_key,source,objective,workspace_json,status,available_at,workspace_path,result_path,agent_name,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const values = (jobId: string, jobKey: string) => [jobId,event.event_id,jobKey,"slack","work","{\"kind\":\"scratch\"}","queued",event.created_at,"/tmp/work","/tmp/result",jobId,event.created_at,event.created_at];
+    insert.run(...values("job_schema_v3_a","first"));
+    insert.run(...values("job_schema_v3_b","second"));
+    assert.throws(() => insert.run(...values("job_schema_v3_c","first")), /UNIQUE constraint failed/);
+
+    const owner = JSON.stringify({kind:"schedule",tenant_id:"T1",owner_id:"U1",schedule_id:"schedule_1",run_id:"run_1",revision:1});
+    const destination = JSON.stringify({kind:"none"});
+    raw.prepare("INSERT INTO job_owner_bindings VALUES(?,?,?,?)").run("job_schema_v3_a",event.event_id,owner,destination);
+    assert.throws(() => raw.prepare("INSERT INTO job_owner_bindings VALUES(?,?,?,?)").run("job_schema_v3_b",event.event_id,owner,destination), /UNIQUE constraint failed/);
+    assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");
+    assert.deepEqual(raw.pragma("foreign_key_check"), []);
+    raw.close();
+  });
+
+  test("bridge由来v2のjob key・groupとscheduler tableをv3で保持する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const seeded = new DispatcherDatabase(config.databasePath);
+    const event = seeded.enqueue(eventEnvelope("Ev-v2-bridge-preserve")).row;
+    const job = seeded.createJob({source_event_id:event.event_id,objective:"preserve",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    seeded.close();
+    const bridge = new Database(config.databasePath);
+    bridge.prepare("UPDATE jobs SET job_key='bridge-key' WHERE job_id=?").run(job.job_id);
+    bridge.prepare("INSERT INTO job_groups VALUES(?,?,?,?,?,?,?)").run(event.event_id,event.updated_at,"legacy",null,null,event.created_at,event.updated_at);
+    const schedulerTables = (bridge.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count;
+    bridge.pragma("user_version = 2");
+    bridge.close();
+    const migrated = new DispatcherDatabase(config.databasePath);
+    migrated.close();
+    const raw = new Database(config.databasePath);
+    assert.equal(raw.pragma("user_version", { simple: true }), 3);
+    assert.equal((raw.prepare("SELECT job_key FROM jobs WHERE job_id=?").get(job.job_id) as {job_key:string}).job_key,"bridge-key");
+    assert.equal((raw.prepare("SELECT notification_mode FROM job_groups WHERE source_event_id=?").get(event.event_id) as {notification_mode:string}).notification_mode,"legacy");
+    assert.equal((raw.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count,schedulerTables);
+    assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");
+    assert.deepEqual(raw.pragma("foreign_key_check"), []);
+    raw.close();
+  });
+
+  for (const fault of ["jobs_copied", "indexes_recreated", "groups_backfilled", "scheduler_schema_ready"] as const) {
+    test(`schema v3 migrationは${fault}障害でv2とscheduler永続化をrollbackする`, async () => {
+      const { root, config } = await tempConfig(); roots.push(root);
+      const seeded = new DispatcherDatabase(config.databasePath);
+      const event = seeded.enqueue(eventEnvelope(`Ev-migration-${fault}`)).row;
+      seeded.close();
+      const before = new Database(config.databasePath);
+      before.pragma("user_version = 2");
+      const scheduleCount = (before.prepare("SELECT count(*) AS count FROM scheduler_schema").get() as {count:number}).count;
+      before.close();
+      assert.throws(() => new DispatcherDatabase(config.databasePath, (step) => {
+        if (step === fault) throw new Error(`injected:${fault}`);
+      }), new RegExp(`injected:${fault}`));
+      const after = new Database(config.databasePath);
+      assert.equal(after.pragma("user_version", { simple: true }), 2);
+      assert.equal((after.prepare("SELECT count(*) AS count FROM scheduler_schema").get() as {count:number}).count, scheduleCount);
+      assert.equal((after.prepare("SELECT external_event_id FROM events WHERE event_id=?").get(event.event_id) as {external_event_id:string}).external_event_id, `Ev-migration-${fault}`);
+      assert.equal(after.prepare("SELECT 1 FROM sqlite_master WHERE name='jobs_v3'").get(), undefined);
+      assert.equal(after.pragma("integrity_check", { simple: true }), "ok");
+      assert.deepEqual(after.pragma("foreign_key_check"), []);
+      after.close();
+    });
+  }
 });
