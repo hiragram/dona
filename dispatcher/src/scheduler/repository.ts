@@ -44,6 +44,17 @@ export interface ScheduleView extends Schedule {
   expires_at: string; recurrence_json: string; policy_json: string; content_hash: string; authorization_id: string;
 }
 export interface ListedSchedule { schedule: ScheduleView; sequence: number }
+export interface SchedulerOperationalSnapshot {
+  observed_at: string;
+  due_lag_seconds: number;
+  due_schedules: number;
+  stale_claims: number;
+  outbox_backlog: number;
+  needs_review: number;
+  authorization_expired: number;
+  retention_overdue: number;
+  counters: Record<string, number>;
+}
 export interface Outbox {
   outbox_id: string; run_id: string; kind: "slack.reminder.post" | "slack.work_result.post";
   idempotency_key: string; target_json: string; content: string | null; content_hash: string;
@@ -1040,6 +1051,128 @@ export class SchedulerRepository {
   auditHistory(scheduleId: string): unknown[] {
     return this.db.prepare("SELECT * FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence").all(scheduleId);
   }
+  operationalSnapshot(now: string): SchedulerOperationalSnapshot {
+    utc(now);
+    const scalar = (sql: string, ...values: unknown[]): number =>
+      (this.db.prepare(sql).get(...values) as { count: number }).count;
+    const oldest = this.db.prepare("SELECT MIN(next_due) AS value FROM schedules WHERE state='active' AND next_due<=?")
+      .get(now) as { value: string | null };
+    const counters = Object.fromEntries((this.db.prepare(`SELECT operation, count(*) AS count FROM schedule_audit
+      GROUP BY operation ORDER BY operation`).all() as Array<{ operation: string; count: number }>)
+      .map(row => [row.operation, row.count]));
+    // The maintenance loop purges hourly. Content that became eligible since the
+    // previous healthy purge is pending routine maintenance, not overdue.
+    const retention = this.retentionPlan(add(now, -3600));
+    return {
+      observed_at: now,
+      due_lag_seconds: oldest.value === null ? 0 : Math.max(0, Math.floor((Date.parse(now) - Date.parse(oldest.value)) / 1000)),
+      due_schedules: scalar("SELECT count(*) AS count FROM schedules WHERE state='active' AND next_due<=?", now),
+      stale_claims: scalar(`SELECT count(*) AS count FROM schedule_claims c JOIN schedules s USING(schedule_id)
+        WHERE s.state='active' AND s.next_due<=? AND c.claim_until IS NOT NULL AND c.claim_until<=?`, now, now),
+      outbox_backlog: scalar("SELECT count(*) AS count FROM connector_outbox WHERE status IN ('pending','claimed','request_started')"),
+      needs_review: scalar(`SELECT (SELECT count(*) FROM schedules WHERE state='needs_review') +
+        (SELECT count(*) FROM schedule_runs WHERE status='needs_review') +
+        (SELECT count(*) FROM connector_outbox WHERE status='needs_review') AS count`),
+      authorization_expired: scalar(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
+        ON r.schedule_id=s.schedule_id AND r.revision=s.revision
+        WHERE s.state='active' AND s.next_due<=? AND r.expires_at<=?`, now, now),
+      retention_overdue: Object.entries(retention).filter(([key]) => key !== "current_authorizations")
+        .reduce((sum, [, value]) => sum + value, 0),
+      counters,
+    };
+  }
+  listOutbox(status?: Outbox["status"], limit = 50): ReconciledOutbox[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    const allowed = ["pending","claimed","request_started","sent","failed","cancelled","needs_review"];
+    if (status !== undefined && !allowed.includes(status)) throw new Error("invalid_outbox_status");
+    return this.db.prepare(`SELECT outbox_id,run_id,kind,idempotency_key,content_hash,status,attempt,available_at,
+      lease_until,request_started_at,receipt_id,created_at,updated_at,terminal_at,content_delete_at
+      FROM connector_outbox WHERE (? IS NULL OR status=?) ORDER BY updated_at DESC,outbox_id LIMIT ?`)
+      .all(status ?? null, status ?? null, limit) as ReconciledOutbox[];
+  }
+  retentionPlan(now: string): Record<string, number> {
+    utc(now);
+    const count = (sql: string, ...values: unknown[]): number => (this.db.prepare(sql).get(...values) as { count: number }).count;
+    return {
+      current_authorizations: count(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
+        ON r.schedule_id=s.schedule_id AND r.revision=s.revision WHERE s.state IN ('active','paused') AND r.expires_at<=?`, now),
+      revision_contents: count("SELECT count(*) AS count FROM schedule_revisions WHERE content IS NOT NULL AND (content_delete_at<=? OR expires_at<=?)", now, add(now,-604800)),
+      outbox_contents: count("SELECT count(*) AS count FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?", now),
+      audit_rows: count("SELECT count(*) AS count FROM schedule_audit WHERE created_at<=?", add(now,-7776000)),
+      terminal_runs: count(`SELECT count(*) AS count FROM schedule_runs WHERE terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM connector_outbox o WHERE o.run_id=schedule_runs.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id
+          AND c.notification_state IN ('pending','failed','needs_review'))
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c JOIN jobs j USING(job_id)
+          WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id AND j.herdr_workspace_id IS NOT NULL)`, add(now,-2592000), add(now,-2592000)),
+      terminal_schedules: count(`SELECT count(*) AS count FROM schedules s WHERE terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=s.schedule_id AND NOT (r.terminal_at IS NOT NULL AND r.terminal_at<=? AND NOT EXISTS
+          (SELECT 1 FROM connector_outbox o WHERE o.run_id=r.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+            AND c.notification_state IN ('pending','failed','needs_review')) AND NOT EXISTS
+          (SELECT 1 FROM job_completion_results c JOIN jobs j USING(job_id)
+            WHERE json_extract(c.owner_json,'$.run_id')=r.run_id AND j.herdr_workspace_id IS NOT NULL)))`, add(now,-2592000), add(now,-2592000), add(now,-2592000)),
+      orphan_revisions: count(`SELECT count(*) AS count FROM schedule_revisions WHERE content IS NULL AND terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM schedules s WHERE s.schedule_id=schedule_revisions.schedule_id AND s.revision=schedule_revisions.revision
+          AND NOT (s.terminal_at IS NOT NULL AND s.terminal_at<=? AND NOT EXISTS
+            (SELECT 1 FROM schedule_runs sr WHERE sr.schedule_id=s.schedule_id AND NOT
+              (sr.terminal_at IS NOT NULL AND sr.terminal_at<=? AND NOT EXISTS
+                (SELECT 1 FROM connector_outbox so WHERE so.run_id=sr.run_id AND (so.terminal_at IS NULL OR so.terminal_at>?))
+                AND NOT EXISTS (SELECT 1 FROM job_completion_results sc WHERE json_extract(sc.owner_json,'$.run_id')=sr.run_id
+                  AND sc.notification_state IN ('pending','failed','needs_review')) AND NOT EXISTS
+                (SELECT 1 FROM job_completion_results sc JOIN jobs sj USING(job_id)
+                  WHERE json_extract(sc.owner_json,'$.run_id')=sr.run_id AND sj.herdr_workspace_id IS NOT NULL)))))
+        AND NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=schedule_revisions.schedule_id
+          AND r.revision=schedule_revisions.revision AND NOT (r.terminal_at IS NOT NULL AND r.terminal_at<=? AND NOT EXISTS
+            (SELECT 1 FROM connector_outbox o WHERE o.run_id=r.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
+            AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=r.run_id
+              AND c.notification_state IN ('pending','failed','needs_review')) AND NOT EXISTS
+            (SELECT 1 FROM job_completion_results c JOIN jobs j USING(job_id)
+              WHERE json_extract(c.owner_json,'$.run_id')=r.run_id AND j.herdr_workspace_id IS NOT NULL)))`, add(now,-2592000),add(now,-2592000),
+                add(now,-2592000),add(now,-2592000),add(now,-2592000),add(now,-2592000)),
+      job_contents: count(`SELECT count(*) AS count FROM jobs j WHERE (j.result_json IS NOT NULL OR j.objective<>'[deleted]') AND EXISTS
+        (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.content_delete_at<=?
+          AND json_extract(c.owner_json,'$.kind')='schedule') AND NOT EXISTS
+        (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`, now, now),
+      event_contents: count(`SELECT count(*) AS count FROM events e WHERE e.source IN ('dona_schedule','dona_job') AND
+        (e.result_json IS NOT NULL OR (e.source='dona_schedule' AND json_extract(e.payload_json,'$.work.objective') IS NOT NULL
+          AND json_extract(e.payload_json,'$.work.objective')<>'[deleted]') OR (e.source='dona_job' AND
+          (json_extract(e.payload_json,'$.result') IS NOT NULL OR json_extract(e.payload_json,'$.error_message') IS NOT NULL))) AND
+        ((e.source='dona_schedule' AND (EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR
+          EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review'
+            AND a.created_at<=?) OR EXISTS (SELECT 1 FROM job_completion_results c
+          WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
+            AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+              WHERE newer.source_event_id=e.event_id AND newer.content_delete_at>?)))) OR
+          (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c
+            WHERE c.notification_event_id=e.event_id AND c.content_delete_at<=? AND NOT EXISTS
+              (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=e.event_id
+                AND newer.content_delete_at>?))))`, add(now,-604800), add(now,-604800), now, now, now, now),
+      result_files: count(`SELECT count(DISTINCT c.job_id) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
+        AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=c.job_id AND newer.content_delete_at>?)`, now, now),
+      event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (EXISTS
+        (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR EXISTS
+        (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=e.event_id
+            AND newer.content_delete_at>?)) OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id
+              AND a.operation='event_needs_review' AND a.created_at<=?))) OR
+        (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=e.event_id
+          AND c.content_delete_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+            WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?))))`, add(now,-604800), now, now,
+              add(now,-604800), now, now),
+      metadata_rows: count(`SELECT count(*) AS count FROM job_completion_results c JOIN schedule_runs r
+        ON r.run_id=json_extract(c.owner_json,'$.run_id') WHERE r.terminal_at<=?
+          AND c.notification_state NOT IN ('pending','failed','needs_review') AND
+          (EXISTS (SELECT 1 FROM job_owner_bindings b WHERE b.job_id=c.job_id) OR
+            EXISTS (SELECT 1 FROM event_job_bindings b WHERE b.event_id=c.source_event_id) OR
+            EXISTS (SELECT 1 FROM events e WHERE e.event_id IN (c.source_event_id,c.notification_event_id)
+              AND (e.subject_json<>'{}' OR e.payload_json<>'{}' OR e.reply_target_json IS NOT NULL)) OR
+            c.destination_json<>'{"kind":"none"}' OR (json_extract(c.owner_json,'$.kind')='schedule' AND
+            json_extract(c.owner_json,'$.run_id')<>'deleted'))`, add(now,-2592000)),
+      consumed_nonces: count("SELECT count(*) AS count FROM schedule_access_receipt_nonces WHERE consumed_at<=?", add(now,-86400)),
+    };
+  }
   purge(now: string): void {
     utc(now);
     const resultFiles=this.db.prepare(`SELECT DISTINCT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
@@ -1048,10 +1181,12 @@ export class SchedulerRepository {
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
-      WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (r.terminal_at<=? OR c.content_delete_at<=? OR EXISTS
+      WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (r.terminal_at<=? OR (c.content_delete_at<=? AND NOT EXISTS
+        (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=e.event_id AND newer.content_delete_at>?)) OR EXISTS
         (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))
-        OR (e.source='dona_job' AND c.notification_event_id=e.event_id AND c.content_delete_at<=?))`)
-      .all(add(now,-604800),now,add(now,-604800),now) as Array<{event_id:string;result_path:string}>;
+        OR (e.source='dona_job' AND c.notification_event_id=e.event_id AND c.content_delete_at<=? AND NOT EXISTS
+          (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?)))`)
+      .all(add(now,-604800),now,now,add(now,-604800),now,now) as Array<{event_id:string;result_path:string}>;
     this.db.transaction(() => {
       const currentExpired = this.db.prepare(`SELECT s.* FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id = s.schedule_id AND r.revision = s.revision
@@ -1079,12 +1214,14 @@ export class SchedulerRepository {
             AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),add(now,-604800));
       this.db.prepare(`UPDATE events SET result_json=NULL WHERE event_id IN (SELECT r.event_id FROM schedule_runs r
         WHERE r.event_id IS NOT NULL AND (r.terminal_at<=? OR EXISTS (SELECT 1 FROM job_completion_results c
-          WHERE c.source_event_id=r.event_id AND c.content_delete_at<=?) OR EXISTS (SELECT 1 FROM schedule_audit a
-          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,add(now,-604800));
+          WHERE c.source_event_id=r.event_id AND c.content_delete_at<=? AND NOT EXISTS
+            (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=r.event_id AND newer.content_delete_at>?)) OR EXISTS (SELECT 1 FROM schedule_audit a
+          WHERE a.source_event_id=r.event_id AND a.operation='event_needs_review' AND a.created_at<=?)))`).run(add(now,-604800),now,now,add(now,-604800));
       this.db.prepare(`UPDATE events SET payload_json=json_remove(json_remove(payload_json,'$.result'),'$.error_message'),result_json=NULL,
         last_error_message=CASE WHEN last_error_code='operator_notification_reconcile_claimed' THEN last_error_message ELSE NULL END
         WHERE event_id IN (SELECT notification_event_id FROM job_completion_results
-          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?)`).run(now);
+          WHERE notification_event_id IS NOT NULL AND content_delete_at<=?) AND NOT EXISTS
+          (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=events.event_id AND newer.content_delete_at>?)`).run(now,now);
       const metadataDeadline=add(now,-2592000), deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
       this.db.prepare(`DELETE FROM job_owner_bindings WHERE job_id IN
         (SELECT c.job_id FROM job_completion_results c JOIN schedule_runs r ON r.run_id=json_extract(c.owner_json,'$.run_id')
@@ -1110,7 +1247,9 @@ export class SchedulerRepository {
       this.db.prepare(`DELETE FROM schedule_runs WHERE terminal_at <= ? AND NOT EXISTS
         (SELECT 1 FROM connector_outbox o WHERE o.run_id = schedule_runs.run_id AND (o.terminal_at IS NULL OR o.terminal_at > ?))
         AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id
-          AND c.notification_state IN ('pending','failed','needs_review'))`)
+          AND c.notification_state IN ('pending','failed','needs_review')) AND NOT EXISTS
+        (SELECT 1 FROM job_completion_results c JOIN jobs j USING(job_id)
+          WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id AND j.herdr_workspace_id IS NOT NULL)`)
         .run(add(now, -2592000), add(now, -2592000));
       this.db.prepare(`DELETE FROM schedules WHERE terminal_at <= ? AND NOT EXISTS
         (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = schedules.schedule_id)`).run(add(now, -2592000));

@@ -86,6 +86,128 @@ test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
+test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで集約する", () => {
+  const { repo, raw } = setup();
+  repo.create("ops", input, due, actor, now);
+  raw.prepare("INSERT INTO schedule_claims(schedule_id,claim_owner,claim_until,claim_fence) VALUES(?,?,?,?)")
+    .run("ops", "instance_a", due, 1);
+  const snapshot = repo.operationalSnapshot(later);
+  assert.equal(snapshot.due_schedules, 1);
+  assert.equal(snapshot.stale_claims, 1);
+  assert.equal(snapshot.due_lag_seconds, 86_400);
+  assert.equal(snapshot.authorization_expired, 0);
+  assert.equal(JSON.stringify(snapshot).includes(input.content), false);
+  assert.deepEqual(repo.retentionPlan(later), { current_authorizations: 0, revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
+    terminal_schedules: 0, orphan_revisions: 0, job_contents: 0, event_contents: 0, result_files: 0,
+    event_result_files: 0, metadata_rows: 0, consumed_nonces: 0 });
+  raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
+  assert.equal(repo.operationalSnapshot(later).stale_claims, 0);
+});
+
+test("retention readinessは次回hourly purgeまで猶予しevent相関indexを持つ", () => {
+  const { repo, raw } = setup();
+  repo.create("retention_grace", input, due, actor, now);
+  raw.prepare("UPDATE schedule_revisions SET content_delete_at=? WHERE schedule_id=? AND revision=1")
+    .run("2026-09-06T00:00:30Z", "retention_grace");
+  assert.equal(repo.retentionPlan("2026-09-06T00:01:00Z").revision_contents, 1);
+  assert.equal(repo.operationalSnapshot("2026-09-06T00:01:00Z").retention_overdue, 0);
+  assert.equal(repo.operationalSnapshot("2026-09-06T01:00:31Z").retention_overdue, 1);
+  for (const name of ["job_completion_source_event_idx", "job_completion_notification_event_idx", "job_completion_run_idx"]) {
+    assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name));
+  }
+  assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='schedule_audit_event_retention_idx'").get());
+});
+
+test("authorization readinessは実行可能なdue scheduleだけを対象にする", () => {
+  const { repo } = setup();
+  const expiring={...input,expires_at:"2026-09-06T00:00:00Z"};
+  repo.create("future_expired", expiring, "2026-09-20T00:00:00Z", actor, now);
+  repo.create("paused_expired", expiring, due, actor, now);
+  repo.transition("paused_expired",1,"pause",actor,due);
+  assert.equal(repo.retentionPlan("2026-09-10T00:00:00Z").current_authorizations,2);
+  assert.equal(repo.operationalSnapshot("2026-09-10T00:00:00Z").authorization_expired,0);
+  assert.equal(repo.operationalSnapshot("2026-09-10T00:00:00Z").retention_overdue,0);
+});
+
+test("retention dry-runは未解決通知と新しいoutboxに保護されたrunを除外する", () => {
+  const { repo, raw } = setup();
+  repo.create("protected", input, due, actor, now);
+  repo.materialize("protected",1,due,afterLater,due,actor,null,undefined,
+    {owner:"instance_a",fence:(repo.claimDue("instance_a",due)!).claim_fence,occurrenceKey:'["protected","2026-09-05T00:01:00Z"]'});
+  raw.prepare("UPDATE schedule_runs SET status='failed',terminal_at=? WHERE schedule_id='protected'").run(now);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").terminal_runs,0);
+});
+
+test("retention planはrunのないterminal scheduleを期限後に数える", () => {
+  const { repo, raw } = setup();
+  repo.create("cancelled",input,due,actor,now);
+  raw.prepare("UPDATE schedules SET state='cancelled',terminal_at=?,updated_at=? WHERE schedule_id='cancelled'").run(now,now);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,terminal_at=? WHERE schedule_id='cancelled'").run(now);
+  const plan=repo.retentionPlan("2026-11-01T00:00:00Z");
+  assert.equal(plan.terminal_schedules,1); assert.equal(plan.orphan_revisions,1);
+});
+
+test("retention planは削除予定runの後に孤立するrevisionも数える", () => {
+  const { repo, raw } = setup();
+  repo.create("orphan_after_run", input, due, actor, now);
+  repo.materialize("orphan_after_run", 1, due, afterLater, due, actor);
+  repo.transition("orphan_after_run", 1, "pause", actor, due);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL WHERE schedule_id=? AND revision=1").run("orphan_after_run");
+  const plan = repo.retentionPlan("2026-11-01T00:00:00Z");
+  assert.equal(plan.terminal_runs, 1);
+  assert.equal(plan.orphan_revisions, 1);
+});
+
+test("retention planはneeds_review eventを含め新しいcompletionの保持期間を優先する", () => {
+  const { repo, raw, dispatcher } = setup();
+  repo.create("event_retention", {...input,action:"work.read_only",target:{kind:"none"}}, due, actor, now);
+  const run = repo.materialize("event_retention", 1, due, afterLater, due, actor).run;
+  raw.prepare("UPDATE events SET result_json='{}',result_path='/tmp/event-result' WHERE event_id=?").run(run.event_id);
+  raw.prepare(`INSERT INTO schedule_audit(schedule_id,revision,tenant_id,actor_id,source_event_id,operation,before_json,after_json,created_at)
+    VALUES(?,?,?,?,?,'event_needs_review',NULL,'{}',?)`).run("event_retention",1,"T_TEST","scheduler",run.event_id,now);
+  assert.deepEqual(raw.prepare("SELECT source,result_json,result_path FROM events WHERE event_id=?").get(run.event_id),
+    {source:"dona_schedule",result_json:"{}",result_path:"/tmp/event-result"});
+  let plan = repo.retentionPlan("2026-09-20T00:00:00Z");
+  assert.equal(plan.event_contents, 1); assert.equal(plan.event_result_files, 1);
+
+  const event = dispatcher.enqueue(eventEnvelope("retention-completion")).row;
+  raw.prepare("UPDATE events SET source='dona_schedule',result_json='{}' WHERE event_id=?").run(event.event_id);
+  const insert = raw.prepare(`INSERT INTO job_completion_results(job_id,job_status,source_event_id,owner_json,destination_json,
+    work_state,notification_state,materialized_at,content_delete_at) VALUES(?,?,?,?,?,'completed','none',?,?)`);
+  const owner=JSON.stringify({kind:"schedule",tenant_id:"T_TEST",owner_id:"U_TEST",schedule_id:"event_retention",run_id:run.run_id,revision:1});
+  insert.run("retention-job","blocked",event.event_id,owner,'{"kind":"none"}',now,"2026-09-06T00:00:00Z");
+  insert.run("retention-job","completed",event.event_id,owner,'{"kind":"none"}',now,"2026-09-20T00:00:00Z");
+  plan = repo.retentionPlan("2026-09-13T00:00:00Z");
+  assert.equal(plan.event_contents, 1); assert.equal(plan.result_files, 0);
+  raw.prepare("UPDATE schedule_runs SET status='completed',terminal_at=? WHERE run_id=?").run(now,run.run_id);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,2);
+  const deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
+  raw.prepare("UPDATE job_completion_results SET owner_json=? WHERE job_id=?").run(deletedOwner,"retention-job");
+  raw.prepare("UPDATE events SET subject_json='{}',payload_json='{}',reply_target_json=NULL WHERE event_id=?").run(event.event_id);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,0);
+
+  const beforeSlack=repo.retentionPlan("2026-09-20T00:00:00Z");
+  const slackEvent=dispatcher.enqueue(eventEnvelope("ordinary-slack-retention")).row;
+  raw.prepare("UPDATE events SET result_json='{}',result_path='/tmp/slack-result' WHERE event_id=?").run(slackEvent.event_id);
+  insert.run("ordinary-job","completed",slackEvent.event_id,
+    JSON.stringify({kind:"slack_thread",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001"}),
+    '{"kind":"none"}',now,"2026-09-06T00:00:00Z");
+  plan=repo.retentionPlan("2026-09-20T00:00:00Z");
+  assert.equal(plan.event_contents,beforeSlack.event_contents);
+  assert.equal(plan.event_result_files,beforeSlack.event_result_files);
+});
+
+test("retention planはterminal_at未設定のrunを残存参照として扱う", () => {
+  const {repo,raw}=setup();
+  repo.create("nonterminal_reference",{...input,action:"work.read_only",target:{kind:"none"}},due,actor,now);
+  const run=repo.materialize("nonterminal_reference",1,due,afterLater,due,actor).run;
+  repo.transition("nonterminal_reference",1,"cancel",actor,due);
+  raw.prepare("UPDATE schedule_runs SET status='needs_review',terminal_at=NULL WHERE run_id=?").run(run.run_id);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,terminal_at=? WHERE schedule_id=? AND revision=1").run(now,"nonterminal_reference");
+  const plan=repo.retentionPlan("2026-11-01T00:00:00Z");
+  assert.equal(plan.terminal_schedules,0); assert.equal(plan.orphan_revisions,0);
+});
+
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {
   const raw = new Database(":memory:");
   try {

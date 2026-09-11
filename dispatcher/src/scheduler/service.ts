@@ -99,6 +99,10 @@ export class SchedulerService {
   }
 
   isRunning(): boolean { return this.running; }
+  operationalState(): { running: boolean; last_purge_at: string | null } {
+    return { running: this.running,
+      last_purge_at: this.lastPurgeAt === undefined ? null : new Date(this.lastPurgeAt).toISOString().replace(".000Z", "Z") };
+  }
 
   start(): void {
     if (this.loopPromise) return;

@@ -111,6 +111,9 @@ export interface ApiUpdateClient {
 export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
+export interface ApiSchedulerState {
+  operationalState(): { running: boolean; last_purge_at: string | null };
+}
 
 export class DispatcherApi {
   private server: http.Server | undefined;
@@ -132,6 +135,7 @@ export class DispatcherApi {
     private readonly updateNotifications?: ApiWorkerState,
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
+    private readonly schedulerState?: ApiSchedulerState,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   async start(): Promise<void> {
@@ -167,6 +171,20 @@ export class DispatcherApi {
     this.shuttingDown = true;
   }
 
+  private readiness(): { ready: boolean; scheduler: Record<string, unknown> } {
+    let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+      (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
+    let operations: ReturnType<DispatcherDatabase["scheduler"]["operationalSnapshot"]> | undefined;
+    try {
+      this.database.assertReadableWritable();
+      operations = this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
+    } catch { ready = false; }
+    const scheduler = this.schedulerState?.operationalState();
+    ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
+      operations.stale_claims === 0 && operations.retention_overdue === 0;
+    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations } };
+  }
+
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
@@ -193,32 +211,26 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
-          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
-        try {
-          this.database.assertReadableWritable();
-        } catch {
-          ready = false;
-        }
-        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        const health = this.readiness();
+        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/metrics/scheduler") {
+        sendJson(response, 200, { schema_version: 1,
+          scheduler: this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z")) });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
-          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
-        try {
-          this.database.assertReadableWritable();
-        } catch {
-          ready = false;
-        }
-        sendJson(response, ready ? 200 : 503, {
+        const health = this.readiness();
+        sendJson(response, health.ready ? 200 : 503, {
           schema_version: 1,
-          status: ready ? "ready" : "not_ready",
+          status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
           app_schema: 2,
           config: 1,
+          scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;

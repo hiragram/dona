@@ -31,6 +31,10 @@ export function migrateScheduler(db: Database.Database): void {
         CREATE UNIQUE INDEX IF NOT EXISTS schedules_list_sequence_idx ON schedules(list_sequence);
         CREATE TABLE IF NOT EXISTS schedule_list_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_value INTEGER NOT NULL);
         INSERT OR IGNORE INTO schedule_list_sequence VALUES (1, COALESCE((SELECT MAX(list_sequence) + 1 FROM schedules), 1));`);
+      const auditColumns = new Set((db.prepare("SELECT name FROM pragma_table_info('schedule_audit')").all() as Array<{ name: string }>).map(column => column.name));
+      if (["source_event_id", "operation", "created_at"].every(column => auditColumns.has(column))) {
+        db.exec("CREATE INDEX IF NOT EXISTS schedule_audit_event_retention_idx ON schedule_audit(source_event_id, operation, created_at)");
+      }
       if (!columns.some(column => column.name === "create_payload_hash")) {
         db.exec("ALTER TABLE schedules ADD COLUMN create_payload_hash TEXT");
         const revisions = db.prepare(`SELECT schedule_id, recurrence_json, policy_json, action, target_json, content_hash
@@ -110,6 +114,7 @@ export function migrateScheduler(db: Database.Database): void {
       );
       CREATE INDEX schedule_audit_order_idx ON schedule_audit(schedule_id, sequence);
       CREATE INDEX schedule_audit_retention_idx ON schedule_audit(created_at);
+      CREATE INDEX schedule_audit_event_retention_idx ON schedule_audit(source_event_id, operation, created_at);
       INSERT INTO scheduler_schema VALUES (1, 1);
     `);
   }).immediate();

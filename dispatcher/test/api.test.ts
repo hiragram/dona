@@ -91,6 +91,27 @@ describe("DispatcherApi", () => {
     database.close();
   });
 
+  test("readyはprocess liveとscheduler loopを分離しredacted metricsを公開する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,
+      ()=>new Date("2026-09-11T00:00:00Z"),()=>{},
+      {operationalState:()=>({running:false,last_purge_at:null})});
+    await api.start();
+    assert.equal((await request(config.socketPath,"GET","/health/live")).status,200);
+    const ready=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(ready.status,503);
+    const metrics=await request(config.socketPath,"GET","/metrics/scheduler");
+    assert.equal(metrics.status,200);
+    assert.deepEqual(Object.keys(metrics.body),["schema_version","scheduler"]);
+    database.assertReadableWritable=()=>{throw new Error("database unavailable");};
+    const unavailable=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(unavailable.status,503);
+    assert.equal((unavailable.body.scheduler as {error_code:string}).error_code,"scheduler_storage_unavailable");
+    assert.equal((await request(config.socketPath,"GET","/health/version")).status,503);
+    await api.stop(); database.close();
+  });
+
   test("rejects invalid media types and oversized bodies", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
