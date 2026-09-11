@@ -72,9 +72,14 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | stale before dispatch | `pending` | current desired revisionと不一致 | `aborted`、update禁止 |
 | prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` | 同じmessage | 先行attemptの一意なterminalまで後続dispatch禁止 |
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
-| update ambiguous | `acceptance_unknown` | revision 0/複数件、pagination不完全 | `needs_review` |
+| update absent | `acceptance_unknown` | bounded全pageでrevision 0件 | `acceptance_unknown`のまま、後続update禁止 |
+| update ambiguous | `acceptance_unknown` | revision複数件、pagination不完全 | `needs_review`、自動後続update禁止 |
 
 presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
+
+## Pending notice delivery fixture
+
+元threadのpending noticeはapproval cardとは別attemptとし、request ID、notice attempt ID、server-side MACを含む認証済みmarkerへbindingします。外部call前の`dispatching` fence、復旧時の`acceptance_unknown`、全pageのexact marker reconcileはapproval card deliveryと同じ規則を使います。0件観測はunknownのままで再投稿しません。
 
 ## Typed action fixture: `slack.post_thread_reply.v1`
 
@@ -87,7 +92,9 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
   "request_source": {
     "source_event_id": "event_example",
     "owner_kind": "authenticated_event_actor",
-    "owner_id": "user_requester_example"
+    "owner_id": "user_requester_example",
+    "operation_slot": "reply_1",
+    "creation_key": "server-derived-instance-workspace-source-slot"
   },
   "target": {
     "channel_id": "channel_example",
@@ -122,7 +129,7 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
 }
 ```
 
-CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、delivery attempt ID、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
+CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。creation keyはinstance、workspace、source event/job、stable operation slotからserver-sideで導出し、同じkey/action hashは既存requestへ収束、hash不一致はconflictにします。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、delivery attempt ID、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
@@ -144,6 +151,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
 - 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
+- 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
+- pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
+- restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
