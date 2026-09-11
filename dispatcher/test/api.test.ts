@@ -104,6 +104,10 @@ describe("DispatcherApi", () => {
     const metrics=await request(config.socketPath,"GET","/metrics/scheduler");
     assert.equal(metrics.status,200);
     assert.deepEqual(Object.keys(metrics.body),["schema_version","scheduler"]);
+    database.assertReadableWritable=()=>{throw new Error("database unavailable");};
+    const unavailable=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(unavailable.status,503);
+    assert.equal((unavailable.body.scheduler as {error_code:string}).error_code,"scheduler_storage_unavailable");
     await api.stop(); database.close();
   });
 

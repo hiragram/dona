@@ -199,17 +199,18 @@ export class DispatcherApi {
       if (request.method === "GET" && url.pathname === "/health/ready") {
         let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
           (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
+        let operations: ReturnType<DispatcherDatabase["scheduler"]["operationalSnapshot"]> | undefined;
         try {
           this.database.assertReadableWritable();
+          operations = this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
         } catch {
           ready = false;
         }
         const scheduler = this.schedulerState?.operationalState();
-        const operations = this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
-        ready = ready && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
+        ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
           operations.stale_claims === 0 && operations.retention_overdue === 0;
         sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready",
-          scheduler: { ...scheduler, ...operations } });
+          scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations } });
         return;
       }
       if (request.method === "GET" && url.pathname === "/metrics/scheduler") {

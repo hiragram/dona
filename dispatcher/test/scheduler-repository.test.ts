@@ -98,6 +98,17 @@ test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで
   assert.equal(snapshot.authorization_expired, 0);
   assert.equal(JSON.stringify(snapshot).includes(input.content), false);
   assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0 });
+  raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
+  assert.equal(repo.operationalSnapshot(later).stale_claims, 0);
+});
+
+test("retention dry-runは未解決通知と新しいoutboxに保護されたrunを除外する", () => {
+  const { repo, raw } = setup();
+  repo.create("protected", input, due, actor, now);
+  repo.materialize("protected",1,due,afterLater,due,actor,null,undefined,
+    {owner:"instance_a",fence:(repo.claimDue("instance_a",due)!).claim_fence,occurrenceKey:'["protected","2026-09-05T00:01:00Z"]'});
+  raw.prepare("UPDATE schedule_runs SET status='failed',terminal_at=? WHERE schedule_id='protected'").run(now);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").terminal_runs,0);
 });
 
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {

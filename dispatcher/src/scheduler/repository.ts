@@ -1060,19 +1060,20 @@ export class SchedulerRepository {
     const counters = Object.fromEntries((this.db.prepare(`SELECT operation, count(*) AS count FROM schedule_audit
       GROUP BY operation ORDER BY operation`).all() as Array<{ operation: string; count: number }>)
       .map(row => [row.operation, row.count]));
+    const retention = this.retentionPlan(now);
     return {
       observed_at: now,
       due_lag_seconds: oldest.value === null ? 0 : Math.max(0, Math.floor((Date.parse(now) - Date.parse(oldest.value)) / 1000)),
       due_schedules: scalar("SELECT count(*) AS count FROM schedules WHERE state='active' AND next_due<=?", now),
-      stale_claims: scalar("SELECT count(*) AS count FROM schedule_claims WHERE claim_until IS NOT NULL AND claim_until<=?", now),
+      stale_claims: scalar(`SELECT count(*) AS count FROM schedule_claims c JOIN schedules s USING(schedule_id)
+        WHERE s.state='active' AND c.claim_until IS NOT NULL AND c.claim_until<=?`, now),
       outbox_backlog: scalar("SELECT count(*) AS count FROM connector_outbox WHERE status IN ('pending','claimed','request_started')"),
       needs_review: scalar(`SELECT (SELECT count(*) FROM schedules WHERE state='needs_review') +
         (SELECT count(*) FROM schedule_runs WHERE status='needs_review') +
         (SELECT count(*) FROM connector_outbox WHERE status='needs_review') AS count`),
       authorization_expired: scalar(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id=s.schedule_id AND r.revision=s.revision WHERE s.state IN ('active','paused') AND r.expires_at<=?`, now),
-      retention_overdue: scalar(`SELECT (SELECT count(*) FROM schedule_revisions WHERE content IS NOT NULL AND content_delete_at<=?) +
-        (SELECT count(*) FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?) AS count`, now, now),
+      retention_overdue: Object.values(retention).reduce((sum, value) => sum + value, 0),
       counters,
     };
   }
@@ -1092,7 +1093,10 @@ export class SchedulerRepository {
       revision_contents: count("SELECT count(*) AS count FROM schedule_revisions WHERE content IS NOT NULL AND (content_delete_at<=? OR expires_at<=?)", now, add(now,-604800)),
       outbox_contents: count("SELECT count(*) AS count FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?", now),
       audit_rows: count("SELECT count(*) AS count FROM schedule_audit WHERE created_at<=?", add(now,-7776000)),
-      terminal_runs: count(`SELECT count(*) AS count FROM schedule_runs WHERE terminal_at<=? AND status<>'needs_review'`, add(now,-2592000)),
+      terminal_runs: count(`SELECT count(*) AS count FROM schedule_runs WHERE terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM connector_outbox o WHERE o.run_id=schedule_runs.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id
+          AND c.notification_state IN ('pending','failed','needs_review'))`, add(now,-2592000), add(now,-2592000)),
     };
   }
   purge(now: string): void {
