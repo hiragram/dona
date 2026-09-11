@@ -1076,7 +1076,8 @@ export class SchedulerRepository {
       authorization_expired: scalar(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id=s.schedule_id AND r.revision=s.revision
         WHERE s.state='active' AND s.next_due<=? AND r.expires_at<=?`, now, now),
-      retention_overdue: Object.values(retention).reduce((sum, value) => sum + value, 0),
+      retention_overdue: Object.entries(retention).filter(([key]) => key !== "current_authorizations")
+        .reduce((sum, [, value]) => sum + value, 0),
       counters,
     };
   }
@@ -1093,6 +1094,8 @@ export class SchedulerRepository {
     utc(now);
     const count = (sql: string, ...values: unknown[]): number => (this.db.prepare(sql).get(...values) as { count: number }).count;
     return {
+      current_authorizations: count(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
+        ON r.schedule_id=s.schedule_id AND r.revision=s.revision WHERE s.state IN ('active','paused') AND r.expires_at<=?`, now),
       revision_contents: count("SELECT count(*) AS count FROM schedule_revisions WHERE content IS NOT NULL AND (content_delete_at<=? OR expires_at<=?)", now, add(now,-604800)),
       outbox_contents: count("SELECT count(*) AS count FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?", now),
       audit_rows: count("SELECT count(*) AS count FROM schedule_audit WHERE created_at<=?", add(now,-7776000)),
@@ -1122,20 +1125,23 @@ export class SchedulerRepository {
           (json_extract(e.payload_json,'$.result') IS NOT NULL OR json_extract(e.payload_json,'$.error_message') IS NOT NULL))) AND
         ((e.source='dona_schedule' AND (EXISTS (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR
           EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id AND a.operation='event_needs_review'
-            AND a.created_at<=?))) OR EXISTS (SELECT 1 FROM job_completion_results c
-          WHERE (c.source_event_id=e.event_id OR c.notification_event_id=e.event_id) AND c.content_delete_at<=?
+            AND a.created_at<=?) OR EXISTS (SELECT 1 FROM job_completion_results c
+          WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
             AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
-              WHERE (newer.source_event_id=e.event_id OR newer.notification_event_id=e.event_id)
-                AND newer.content_delete_at>?)))`, add(now,-604800), add(now,-604800), now, now),
-      result_files: count(`SELECT count(*) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
+              WHERE newer.source_event_id=e.event_id AND newer.content_delete_at>?)))) OR
+          (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c
+            WHERE c.notification_event_id=e.event_id AND c.content_delete_at<=? AND NOT EXISTS
+              (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=e.event_id
+                AND newer.content_delete_at>?))))`, add(now,-604800), add(now,-604800), now, now, now, now),
+      result_files: count(`SELECT count(DISTINCT c.job_id) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=c.job_id AND newer.content_delete_at>?)`, now, now),
-      event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND EXISTS
+      event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (EXISTS
         (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
           AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.source_event_id=e.event_id
             AND newer.content_delete_at>?)) OR EXISTS (SELECT 1 FROM schedule_audit a WHERE a.source_event_id=e.event_id
-              AND a.operation='event_needs_review' AND a.created_at<=?)) OR
+              AND a.operation='event_needs_review' AND a.created_at<=?))) OR
         (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=e.event_id
           AND c.content_delete_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
             WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?))))`, add(now,-604800), now, now,
@@ -1143,7 +1149,11 @@ export class SchedulerRepository {
       metadata_rows: count(`SELECT count(*) AS count FROM job_completion_results c JOIN schedule_runs r
         ON r.run_id=json_extract(c.owner_json,'$.run_id') WHERE r.terminal_at<=?
           AND c.notification_state NOT IN ('pending','failed','needs_review') AND
-          (c.destination_json<>'{"kind":"none"}' OR (json_extract(c.owner_json,'$.kind')='schedule' AND
+          (EXISTS (SELECT 1 FROM job_owner_bindings b WHERE b.job_id=c.job_id) OR
+            EXISTS (SELECT 1 FROM event_job_bindings b WHERE b.event_id=c.source_event_id) OR
+            EXISTS (SELECT 1 FROM events e WHERE e.event_id IN (c.source_event_id,c.notification_event_id)
+              AND (e.subject_json<>'{}' OR e.payload_json<>'{}' OR e.reply_target_json IS NOT NULL)) OR
+            c.destination_json<>'{"kind":"none"}' OR (json_extract(c.owner_json,'$.kind')='schedule' AND
             json_extract(c.owner_json,'$.run_id')<>'deleted' AND
             NOT EXISTS (SELECT 1 FROM jobs j WHERE j.job_id=c.job_id AND j.herdr_workspace_id IS NOT NULL)))`, add(now,-2592000)),
       consumed_nonces: count("SELECT count(*) AS count FROM schedule_access_receipt_nonces WHERE consumed_at<=?", add(now,-86400)),

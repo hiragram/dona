@@ -97,7 +97,7 @@ test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで
   assert.equal(snapshot.due_lag_seconds, 86_400);
   assert.equal(snapshot.authorization_expired, 0);
   assert.equal(JSON.stringify(snapshot).includes(input.content), false);
-  assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
+  assert.deepEqual(repo.retentionPlan(later), { current_authorizations: 0, revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
     terminal_schedules: 0, orphan_revisions: 0, job_contents: 0, event_contents: 0, result_files: 0,
     event_result_files: 0, metadata_rows: 0, consumed_nonces: 0 });
   raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
@@ -123,7 +123,9 @@ test("authorization readinessは実行可能なdue scheduleだけを対象にす
   repo.create("future_expired", expiring, "2026-09-20T00:00:00Z", actor, now);
   repo.create("paused_expired", expiring, due, actor, now);
   repo.transition("paused_expired",1,"pause",actor,due);
+  assert.equal(repo.retentionPlan("2026-09-10T00:00:00Z").current_authorizations,2);
   assert.equal(repo.operationalSnapshot("2026-09-10T00:00:00Z").authorization_expired,0);
+  assert.equal(repo.operationalSnapshot("2026-09-10T00:00:00Z").retention_overdue,0);
 });
 
 test("retention dry-runは未解決通知と新しいoutboxに保護されたrunを除外する", () => {
@@ -178,7 +180,18 @@ test("retention planはneeds_review eventを含め新しいcompletionの保持�
   assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,2);
   const deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
   raw.prepare("UPDATE job_completion_results SET owner_json=? WHERE job_id=?").run(deletedOwner,"retention-job");
+  raw.prepare("UPDATE events SET subject_json='{}',payload_json='{}',reply_target_json=NULL WHERE event_id=?").run(event.event_id);
   assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,0);
+
+  const beforeSlack=repo.retentionPlan("2026-09-20T00:00:00Z");
+  const slackEvent=dispatcher.enqueue(eventEnvelope("ordinary-slack-retention")).row;
+  raw.prepare("UPDATE events SET result_json='{}',result_path='/tmp/slack-result' WHERE event_id=?").run(slackEvent.event_id);
+  insert.run("ordinary-job","completed",slackEvent.event_id,
+    JSON.stringify({kind:"slack_thread",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1.000001"}),
+    '{"kind":"none"}',now,"2026-09-06T00:00:00Z");
+  plan=repo.retentionPlan("2026-09-20T00:00:00Z");
+  assert.equal(plan.event_contents,beforeSlack.event_contents);
+  assert.equal(plan.event_result_files,beforeSlack.event_result_files);
 });
 
 test("retention planはterminal_at未設定のrunを残存参照として扱う", () => {
