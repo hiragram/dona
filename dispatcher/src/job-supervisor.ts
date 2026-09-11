@@ -496,7 +496,12 @@ export class JobSupervisor {
     const promptBaseline = await this.readPromptBaseline(preparing);
     if (this.stopping) return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
-    const prompted = await this.runtime.prompt(dispatching.agent_name, buildJobPrompt(dispatching, this.progress !== undefined), this.abortController.signal);
+    const prompted = await this.runtime.prompt(
+      dispatching.agent_name,
+      buildJobPrompt(dispatching, this.progress !== undefined),
+      this.abortController.signal,
+      this.config.jobPromptTimeoutMs,
+    );
     if (prompted.aborted || this.stopping) {
       this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while job prompt acceptance was unknown");
       return;
@@ -551,17 +556,12 @@ export class JobSupervisor {
     const deadline = startedAt + this.config.jobPromptReconcileMs;
     let nextTick = startedAt;
     const transientReasons = new Set<string>();
-    const advanceTick = (): void => {
-      const elapsed = Math.max(0, this.clock.now() - startedAt);
-      nextTick = startedAt
-        + (Math.floor(elapsed / this.config.jobPromptReconcilePollMs) + 1)
-          * this.config.jobPromptReconcilePollMs;
-    };
     while (!this.stopping && this.clock.now() < deadline) {
       const waitMs = nextTick - this.clock.now();
       if (waitMs > 0) await this.clock.delay(waitMs, this.abortController.signal);
       if (this.stopping || this.clock.now() >= deadline) break;
       if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+      nextTick += this.config.jobPromptReconcilePollMs;
       const remainingMs = Math.max(1, deadline - this.clock.now());
       let observed: HerdrCommandResult;
       try {
@@ -574,7 +574,6 @@ export class JobSupervisor {
         if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         if (this.stopping || this.abortController.signal.aborted) break;
         transientReasons.add("transport_failure");
-        advanceTick();
         continue;
       }
       if (observed.aborted || this.stopping) {
@@ -594,7 +593,6 @@ export class JobSupervisor {
             ? "agent_not_found"
             : "transport_failure";
         transientReasons.add(reason);
-        advanceTick();
         continue;
       }
       if (initial.agentIdentity && observed.agentIdentity && initial.agentIdentity !== observed.agentIdentity) {
@@ -633,7 +631,6 @@ export class JobSupervisor {
         await this.monitor(this.database.getJob(row.job_id)!);
         return;
       }
-      advanceTick();
     }
     if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
     const terminalCode = transientReasons.size > 1

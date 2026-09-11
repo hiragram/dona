@@ -876,10 +876,11 @@ describe("JobSupervisor", () => {
     database.markJobRunning(job.job_id);
     const steers: string[] = [];
     const steerTargets: string[] = [];
+    const steerTimeouts: Array<number | undefined> = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
       async get() { return ok("working"); },
-      async prompt(agentName, text) { steerTargets.push(agentName); steers.push(text); return ok("working"); },
+      async prompt(agentName, text, _signal, timeoutMs) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); return ok("working"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
     };
@@ -888,6 +889,7 @@ describe("JobSupervisor", () => {
     assert.equal(result.duplicate, false);
     assert.deepEqual(steers, ["追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name]);
+    assert.deepEqual(steerTimeouts, [undefined]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
@@ -1208,7 +1210,7 @@ describe("JobSupervisor", () => {
       async get(_agentName, _signal, timeoutMs) {
         if (!prompted) return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 };
         reads.push({ at: now, timeoutMs });
-        now += 1_000;
+        now += 5_000;
         return failed("timeout", true);
       },
     });

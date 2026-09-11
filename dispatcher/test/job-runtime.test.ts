@@ -30,7 +30,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
       jobCommandTimeoutMs: 77,
       jobPromptTimeoutMs: 30_000,
     };
-    const result = await new HerdrJobAgentRuntime(config).prompt("agent-1", "依頼");
+    const result = await new HerdrJobAgentRuntime(config).prompt("agent-1", "依頼", undefined, config.jobPromptTimeoutMs);
     assert.equal(result.ok, true);
     const args = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
     assert.deepEqual(args.slice(-2), ["--timeout", "30000"]);
