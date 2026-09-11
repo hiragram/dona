@@ -38,6 +38,11 @@ for (const slice of slices) test(`vertical slice: ${slice.id}`, async () => {
       }
     };
     await exercise(runId);
+    if (!slice.recurring) {
+      const schedule = harness.repo.get(slice.id.replaceAll(" ", "_"));
+      assert.equal(schedule?.state, "completed");
+      assert.equal(schedule?.next_due, null);
+    }
     if (slice.recurring) {
       const nextDue = harness.repo.get(slice.id.replaceAll(" ", "_"))?.next_due;
       assert.equal(nextDue, "2026-09-06T00:01:00Z");
@@ -59,7 +64,12 @@ test("restartとduplicate wakeでもrunとprovider callを一度だけにする"
   try {
     const runId = harness.materialize("restart_duplicate", harness.input("slack.reminder.post", false, due), due);
     harness = harness.reopen();
+    const restarted = new SchedulerService(harness.repo, harness.clock, () => {}, { debug() {}, info() {}, warn() {}, error() {} }, { owner: "restart-instance" });
+    assert.equal(restarted.runBatch(), 0);
+    assert.equal(restarted.runBatch(), 0);
     assert.equal(harness.raw.prepare("SELECT count(*) AS n FROM schedule_runs").pluck().get(), 1);
+    assert.equal(harness.raw.prepare("SELECT count(*) AS n FROM events WHERE source='dona_schedule'").pluck().get(), 0);
+    assert.equal(harness.raw.prepare("SELECT count(*) AS n FROM connector_outbox").pluck().get(), 1);
     const slack = new FakeSlack([{ outcome: "accepted", receipt_id: "fake-receipt" }]);
     await harness.publisher(slack).publishOne();
     await harness.publisher(slack).publishOne();
@@ -81,7 +91,7 @@ test("transaction partial failureはreminder/workのrun/event/outbox/binding/aud
       assert.equal(harness.raw.prepare("SELECT count(*) FROM schedule_runs").pluck().get(), 0);
       assert.equal(harness.raw.prepare("SELECT count(*) FROM connector_outbox").pluck().get(), 0);
       assert.equal(harness.raw.prepare("SELECT count(*) FROM events WHERE source='dona_schedule'").pluck().get(), 0);
-      assert.equal(harness.raw.prepare("SELECT count(*) FROM event_job_bindings").pluck().get(), 0);
+      assert.equal(harness.raw.prepare("SELECT count(*) FROM event_job_bindings WHERE json_extract(owner_json,'$.kind')='schedule'").pluck().get(), 0);
       assert.equal(harness.repo.get(scheduleId)?.next_due, due);
     } finally { harness.close(); }
   }

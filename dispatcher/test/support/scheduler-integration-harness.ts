@@ -41,11 +41,9 @@ export class FakeJobRuntime {
   readonly calls: Array<{ event_id: string; objective: string }> = [];
   run(harness: SchedulerIntegrationHarness, eventId: string, objective: string): { job_id: string; status: "completed"; summary: string } {
     this.calls.push({ event_id: eventId, objective });
-    const event = harness.database.get(eventId)!;
-    const payload = JSON.parse(event.payload_json) as { work: Record<string, unknown> };
-    payload.work.authorization_target = { workspace_id: "T_GATE", channel_id: "C_GATE" };
-    harness.raw.prepare("UPDATE events SET status='waiting_agent',schedule_access_checked_at=?,payload_json=? WHERE event_id=?")
-      .run(new Date(harness.clock.now()).toISOString(), JSON.stringify(payload), eventId);
+    harness.database.beginDispatch(eventId, path.join(harness.root, "event-results", `${eventId}.json`), new Date(harness.clock.now()));
+    harness.database.recordScheduleJobAccess(eventId, { workspace_id: "T_GATE", channel_id: "C_GATE", user_id: "U_GATE",
+      issued_at: new Date(harness.clock.now()).toISOString(), nonce: `receipt_${eventId}` }, new Date(harness.clock.now()));
     const created = harness.database.createJob({ source_event_id: eventId, objective, workspace: { kind: "scratch" } },
       path.join(harness.root, "jobs"), path.join(harness.root, "results"), new Date(harness.clock.now()));
     const job = created.row;
@@ -75,13 +73,17 @@ export class SchedulerIntegrationHarness {
   close(): void { this.raw.close(); this.database.close(); fs.rmSync(this.root, { recursive: true, force: true }); }
 
   input(action: "slack.reminder.post" | "work.read_only", recurring: boolean, due: string): RevisionInput {
+    const authorizationEvent = action === "work.read_only" ? this.database.enqueue({ schema_version: 1, source: "slack",
+      external_event_id: `gate-auth-${recurring}`, type: "app_mention", occurred_at: new Date(this.clock.now()).toISOString(),
+      subject: { workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001", actor_id: "U_GATE" }, payload: { text: "schedule" },
+      reply_target: { kind: "slack_thread", workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001" } }).row : undefined;
     return {
       recurrence_json: recurring
         ? '{"interval":1,"kind":"daily","local_time":"09:01:00","start_date":"2026-09-05","timezone":"Asia/Tokyo","tzdb_version":"2025b","version":1}\n'
         : `${JSON.stringify({ at: due, kind: "once", version: 1 })}\n`,
       policy_json: this.policy, policy_version: 1,
       timezone: recurring ? "Asia/Tokyo" : null, tzdb_version: recurring ? "2025b" : null,
-      authorization_id: `auth_${action.replaceAll(".", "_")}_${recurring}`, authorization_revision: 1,
+      authorization_id: authorizationEvent ? `${authorizationEvent.event_id}:1` : `auth_${action.replaceAll(".", "_")}_${recurring}`, authorization_revision: 1,
       approver_id: integrationActor.actor_id, approved_at: this.clock.now(), expires_at: "2026-09-30T00:00:00Z",
       action,
       target: action === "slack.reminder.post"
