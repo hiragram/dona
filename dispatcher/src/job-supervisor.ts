@@ -82,6 +82,16 @@ interface ActiveJob {
   operation: Promise<void>;
 }
 
+interface SupervisorClock {
+  now(): number;
+  delay(milliseconds: number, signal: AbortSignal): Promise<void>;
+}
+
+const systemClock: SupervisorClock = {
+  now: () => performance.now(),
+  delay: abortableDelay,
+};
+
 export class JobSupervisor {
   private readonly wakeSignal = new WakeSignal();
   private readonly abortController = new AbortController();
@@ -108,6 +118,7 @@ export class JobSupervisor {
     private readonly logger: Logger,
     private readonly wakeEventWorker: () => void,
     private progress?: JobProgressCoordinator,
+    private readonly clock: SupervisorClock = systemClock,
   ) {}
 
   isRunning(): boolean {
@@ -491,7 +502,7 @@ export class JobSupervisor {
       return;
     }
     if (!prompted.ok) {
-      if (!prompted.timedOut && prompted.errorCode === "agent_prompt_stalled") {
+      if (prompted.timedOut || prompted.errorCode === "agent_prompt_stalled") {
         await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
         return;
       }
@@ -536,11 +547,36 @@ export class JobSupervisor {
   }
 
   private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
-    const deadline = Date.now() + this.config.jobPromptReconcileMs;
-    while (!this.stopping && Date.now() <= deadline) {
+    const startedAt = this.clock.now();
+    const deadline = startedAt + this.config.jobPromptReconcileMs;
+    let nextTick = startedAt;
+    const transientReasons = new Set<string>();
+    const advanceTick = (): void => {
+      const elapsed = Math.max(0, this.clock.now() - startedAt);
+      nextTick = startedAt
+        + (Math.floor(elapsed / this.config.jobPromptReconcilePollMs) + 1)
+          * this.config.jobPromptReconcilePollMs;
+    };
+    while (!this.stopping && this.clock.now() < deadline) {
+      const waitMs = nextTick - this.clock.now();
+      if (waitMs > 0) await this.clock.delay(waitMs, this.abortController.signal);
+      if (this.stopping || this.clock.now() >= deadline) break;
       if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
-      const remainingMs = Math.max(1, deadline - Date.now());
-      const observed = await this.runtime.get(row.agent_name, this.abortController.signal, remainingMs);
+      const remainingMs = Math.max(1, deadline - this.clock.now());
+      let observed: HerdrCommandResult;
+      try {
+        observed = await this.runtime.get(
+          row.agent_name,
+          this.abortController.signal,
+          Math.min(this.config.jobPromptReconcilePollMs, remainingMs),
+        );
+      } catch {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        if (this.stopping || this.abortController.signal.aborted) break;
+        transientReasons.add("transport_failure");
+        advanceTick();
+        continue;
+      }
       if (observed.aborted || this.stopping) {
         if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         this.database.markJobNeedsReview(row.job_id, "prompt_interrupted", "Dispatcher stopped while prompt reconciliation was incomplete");
@@ -548,12 +584,37 @@ export class JobSupervisor {
       }
       if (!observed.ok) {
         if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
-        this.database.markJobNeedsReview(row.job_id, observed.timedOut ? "prompt_reconcile_timeout" : observed.errorCode ?? "prompt_reconcile_failed", commandMessage(observed));
-        return;
+        if (["invalid_response", "malformed_response", "response_too_large", "output_too_large"].includes(observed.errorCode ?? "")) {
+          this.database.markJobNeedsReview(row.job_id, "prompt_reconcile_invalid_response", "Herdr agent status response was not safe to reconcile");
+          return;
+        }
+        const reason = observed.timedOut || observed.errorCode === "timeout"
+          ? "timeout"
+          : ["agent_not_found", "agent_not_running"].includes(observed.errorCode ?? "")
+            ? "agent_not_found"
+            : "transport_failure";
+        transientReasons.add(reason);
+        advanceTick();
+        continue;
       }
       if (initial.agentIdentity && observed.agentIdentity && initial.agentIdentity !== observed.agentIdentity) {
         if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
         this.database.markJobNeedsReview(row.job_id, "prompt_agent_identity_changed", "Herdr agent identity changed during prompt reconciliation");
+        return;
+      }
+      if (initial.agentIdentity && !observed.agentIdentity) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_reconcile_invalid_response", "Herdr agent status omitted the expected identity");
+        return;
+      }
+      if (initial.stateChangeSeq !== undefined && observed.stateChangeSeq === undefined) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_reconcile_invalid_response", "Herdr agent status omitted the expected sequence");
+        return;
+      }
+      if (initial.stateChangeSeq !== undefined && observed.stateChangeSeq !== undefined && observed.stateChangeSeq < initial.stateChangeSeq) {
+        if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+        this.database.markJobNeedsReview(row.job_id, "prompt_state_sequence_rollback", "Herdr agent state sequence moved backwards during prompt reconciliation");
         return;
       }
       const sameAgent = initial.agentIdentity !== undefined
@@ -572,12 +633,21 @@ export class JobSupervisor {
         await this.monitor(this.database.getJob(row.job_id)!);
         return;
       }
-      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+      advanceTick();
     }
     if (await this.tryCompleteAfterUnknownAcceptance(row)) return;
+    const terminalCode = transientReasons.size > 1
+      ? "prompt_reconcile_transient_failures"
+      : transientReasons.has("timeout")
+        ? "prompt_reconcile_timeout"
+        : transientReasons.has("agent_not_found")
+          ? "agent_not_found"
+          : transientReasons.has("transport_failure")
+            ? "prompt_reconcile_transport_failure"
+            : "prompt_acceptance_unproven";
     this.database.markJobNeedsReview(
       row.job_id,
-      this.stopping ? "prompt_interrupted" : "prompt_acceptance_unproven",
+      this.stopping ? "prompt_interrupted" : terminalCode,
       this.stopping
         ? "Dispatcher stopped while prompt reconciliation was incomplete"
         : "Herdr prompt acceptance could not be proven without resubmission",

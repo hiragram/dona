@@ -281,8 +281,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--until", "idle",
       "--until", "done",
       "--until", "blocked",
-      "--timeout", String(this.config.jobCommandTimeoutMs),
-    ], this.config.jobCommandTimeoutMs + 5_000, signal);
+      "--timeout", String(this.config.jobPromptTimeoutMs),
+    ], this.config.jobPromptTimeoutMs + 5_000, signal);
   }
 
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {

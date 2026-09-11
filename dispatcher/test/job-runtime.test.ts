@@ -15,6 +15,28 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("promptだけに専用status timeoutを渡し汎用command timeoutを維持する", async () => {
+    const { root, config: baseConfig } = await tempConfig(); roots.push(root);
+    const capturePath = path.join(root, "prompt-argv.json");
+    const fakeHerdrPath = path.join(root, "fake-prompt-herdr.mjs");
+    await fs.writeFile(fakeHerdrPath, `#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
+`, { mode: 0o700 });
+    const config = {
+      ...baseConfig,
+      herdrPath: fakeHerdrPath,
+      jobCommandTimeoutMs: 77,
+      jobPromptTimeoutMs: 30_000,
+    };
+    const result = await new HerdrJobAgentRuntime(config).prompt("agent-1", "依頼");
+    assert.equal(result.ok, true);
+    const args = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
+    assert.deepEqual(args.slice(-2), ["--timeout", "30000"]);
+    assert.equal(args.includes("77"), false);
+  });
+
   test("omits the progress directory and prompt contract when progress is disabled", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

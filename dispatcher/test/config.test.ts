@@ -20,6 +20,10 @@ describe("job resource config", () => {
     assert.equal(defaults.jobObjectiveTotalMaxBytes, jobResourceDefaults.jobObjectiveTotalMaxBytes);
     assert.equal(defaults.jobConcurrency, 4);
     assert.equal(defaults.jobConcurrencyPerEvent, jobResourceDefaults.jobConcurrencyPerEvent);
+    assert.equal(defaults.jobCommandTimeoutMs, 10_000);
+    assert.equal(defaults.jobPromptTimeoutMs, 30_000);
+    assert.equal(defaults.jobPromptReconcileMs, 30_000);
+    assert.equal(defaults.jobPromptReconcilePollMs, 5_000);
 
     const configured = loadConfig({
       DONA_JOBS_PER_EVENT_MAX: "32",
@@ -31,6 +35,31 @@ describe("job resource config", () => {
     assert.equal(configured.jobObjectiveTotalMaxBytes, 1);
     assert.equal(configured.jobConcurrency, 1);
     assert.equal(configured.jobConcurrencyPerEvent, 2);
+  });
+
+  test("prompt専用timeoutとbounded reconcile設定を検証する", () => {
+    const configured = loadConfig({
+      DONA_JOB_COMMAND_TIMEOUT_MS: "7000",
+      DONA_JOB_PROMPT_TIMEOUT_MS: "31000",
+      DONA_JOB_PROMPT_RECONCILE_MS: "32000",
+      DONA_JOB_PROMPT_RECONCILE_POLL_MS: "4000",
+    });
+    assert.equal(configured.jobCommandTimeoutMs, 7_000);
+    assert.equal(configured.jobPromptTimeoutMs, 31_000);
+    assert.equal(configured.jobPromptReconcileMs, 32_000);
+    assert.equal(configured.jobPromptReconcilePollMs, 4_000);
+    for (const name of [
+      "DONA_JOB_PROMPT_TIMEOUT_MS",
+      "DONA_JOB_PROMPT_RECONCILE_MS",
+      "DONA_JOB_PROMPT_RECONCILE_POLL_MS",
+    ]) {
+      assert.throws(() => loadConfig({ [name]: "0" }), /positive integer/);
+      assert.throws(() => loadConfig({ [name]: "-1" }), /positive integer/);
+    }
+    assert.throws(
+      () => loadConfig({ DONA_JOB_PROMPT_RECONCILE_MS: "4999" }),
+      /must be at most DONA_JOB_PROMPT_RECONCILE_MS/,
+    );
   });
 
   test("rejects non-positive, non-integer, and hard-bound violations at startup", () => {
