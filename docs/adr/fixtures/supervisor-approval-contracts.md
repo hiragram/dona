@@ -129,7 +129,7 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
 }
 ```
 
-CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。semantic action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。creation keyはinstance、workspace、source event/job、stable operation slotからserver-sideで導出し、同じkey/action hashは既存requestへ収束、hash不一致はconflictにします。`encrypted_content_ref`、暗号nonce、ciphertextはsemantic action hash対象外とし、creation key lookupをpayload allocationより先に行います。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
+CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。semantic action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。creation keyはinstance、workspace、source event/job、stable operation slotからserver-sideで導出し、同じkey/action hashは既存requestへ収束、hash不一致はconflictにします。instance、workspace、request source/owner、operation、target、policy、precondition、content HMACはsemantic action hashへ含めます。`encrypted_content_ref`、暗号nonce、ciphertextだけを対象外とし、creation key lookupをpayload allocationより先に行います。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
@@ -156,6 +156,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - high-water markの欠落、読取不能、integrity不明も二者再承認までfail closed
 - policy緩和はexact digestと次generationに対する独立actor二人のauthorizationが必須
+- 時刻high-water markはbackup外へ保存し、restore/restart時の欠落や巻戻しで全未完了requestをfail closed
+- approval cardのdispatching直前にvisibility/shared状態を再検証し、不一致なら送信せずpayload削除
+- 本文不要となる全terminal/invalid request transitionでpayloadを同一transaction削除
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
