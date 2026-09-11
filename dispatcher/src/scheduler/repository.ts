@@ -1144,6 +1144,7 @@ export class SchedulerRepository {
         ON r.run_id=json_extract(c.owner_json,'$.run_id') WHERE r.terminal_at<=?
           AND c.notification_state NOT IN ('pending','failed','needs_review') AND
           (c.destination_json<>'{"kind":"none"}' OR (json_extract(c.owner_json,'$.kind')='schedule' AND
+            json_extract(c.owner_json,'$.run_id')<>'deleted' AND
             NOT EXISTS (SELECT 1 FROM jobs j WHERE j.job_id=c.job_id AND j.herdr_workspace_id IS NOT NULL)))`, add(now,-2592000)),
       consumed_nonces: count("SELECT count(*) AS count FROM schedule_access_receipt_nonces WHERE consumed_at<=?", add(now,-86400)),
     };

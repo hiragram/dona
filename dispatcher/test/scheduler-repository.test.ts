@@ -174,6 +174,11 @@ test("retention planはneeds_review eventを含め新しいcompletionの保持�
   insert.run("retention-job","completed",event.event_id,owner,'{"kind":"none"}',now,"2026-09-20T00:00:00Z");
   plan = repo.retentionPlan("2026-09-13T00:00:00Z");
   assert.equal(plan.event_contents, 1); assert.equal(plan.result_files, 0);
+  raw.prepare("UPDATE schedule_runs SET status='completed',terminal_at=? WHERE run_id=?").run(now,run.run_id);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,2);
+  const deletedOwner='{"kind":"schedule","owner_id":"deleted","revision":1,"run_id":"deleted","schedule_id":"deleted","tenant_id":"deleted"}';
+  raw.prepare("UPDATE job_completion_results SET owner_json=? WHERE job_id=?").run(deletedOwner,"retention-job");
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").metadata_rows,0);
 });
 
 test("retention planはterminal_at未設定のrunを残存参照として扱う", () => {
