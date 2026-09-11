@@ -243,7 +243,7 @@ test("recurring policy decisionをaction別・reason別に型付きで記録す�
   clock.set("2026-09-05T00:16:01Z");
   const service = new SchedulerService(repo, clock, () => {}, logger, {
     owner: "scheduler_a",
-    recordPolicyDecision: decision => decisions.push(decision),
+    recordPolicyDecision: decision => { decisions.push(decision); },
   });
   assert.equal(service.runBatch(), 2);
   assert.deepEqual(decisions.map(({ action, outcome, policy_version }) => ({ action, outcome, policy_version }))
@@ -253,15 +253,21 @@ test("recurring policy decisionをaction別・reason別に型付きで記録す�
   ]);
 });
 
-test("decision記録障害はrun admissionをrollbackしない", () => {
+test("decision記録障害とone-shot除外はrun admissionをrollbackしない", async () => {
   const { repo, raw, clock } = setup();
   const due = "2026-09-05T00:01:00Z";
   repo.create("metric_failure", daily(due), due, actor, clock.now());
+  repo.create("one_shot", once(due), due, actor, clock.now());
   clock.set(due);
-  const service = new SchedulerService(repo, clock, () => {}, logger, {
+  const warnings: unknown[] = [];
+  const failureLogger: Logger = { ...logger, warn: (_message, fields) => warnings.push(fields) };
+  const service = new SchedulerService(repo, clock, () => {}, failureLogger, {
     owner: "scheduler_a",
-    recordPolicyDecision: () => { throw new Error("metric unavailable"); },
+    recordPolicyDecision: async () => { throw new Error("metric unavailable"); },
   });
-  assert.equal(service.runBatch(), 1);
+  assert.equal(service.runBatch(), 2);
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs WHERE schedule_id = 'metric_failure'").get() as { n: number }).n, 1);
+  assert.equal((raw.prepare("SELECT count(*) n FROM schedule_runs WHERE schedule_id = 'one_shot'").get() as { n: number }).n, 1);
+  assert.equal(warnings.length, 1);
 });

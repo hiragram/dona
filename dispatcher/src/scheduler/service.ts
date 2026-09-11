@@ -41,7 +41,7 @@ export interface SchedulerServiceOptions {
   leaseSeconds?: number;
   pollMilliseconds?: number;
   owner?: string;
-  recordPolicyDecision?: (decision: SchedulerPolicyDecision) => void;
+  recordPolicyDecision?: (decision: SchedulerPolicyDecision) => void | Promise<void>;
 }
 
 export interface SchedulerPolicyDecision {
@@ -77,7 +77,7 @@ export class SchedulerService {
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
   private lastPurgeAt: number | undefined;
-  private readonly recordPolicyDecision: (decision: SchedulerPolicyDecision) => void;
+  private readonly recordPolicyDecision: (decision: SchedulerPolicyDecision) => void | Promise<void>;
 
   constructor(
     private readonly repository: SchedulerRepository,
@@ -168,8 +168,7 @@ export class SchedulerService {
         );
         const outcome = result.run.reason === "misfire" ? "skipped_misfire"
           : result.run.reason === "overlap" ? "skipped_overlap" : "admitted";
-        try {
-          this.recordPolicyDecision({
+        if (definition.recurrence.kind !== "once") this.emitPolicyDecision({
             schedule_id: claim.schedule_id,
             revision: claim.revision,
             action: definition.action.action,
@@ -178,13 +177,6 @@ export class SchedulerService {
             scheduled_for: scheduledFor,
             compact_misfire_count: compactSkip?.count ?? 0,
           });
-        } catch (error) {
-          this.logger.warn("Scheduler policy decision recording failed", {
-            schedule_id: claim.schedule_id,
-            error_code: "scheduler_policy_metric_failed",
-            error_message: error instanceof Error ? error.message : String(error),
-          });
-        }
         materialized++;
       } catch (error) {
         this.logger.warn("Due schedule could not be materialized", {
@@ -199,6 +191,22 @@ export class SchedulerService {
 
   private actor(tenantId: string): Actor {
     return { tenant_id: tenantId, actor_id: "scheduler", role: "admin", source_event_id: null };
+  }
+
+  private emitPolicyDecision(decision: SchedulerPolicyDecision): void {
+    try {
+      Promise.resolve(this.recordPolicyDecision(decision)).catch(error => this.warnPolicyDecisionFailure(decision.schedule_id, error));
+    } catch (error) {
+      this.warnPolicyDecisionFailure(decision.schedule_id, error);
+    }
+  }
+
+  private warnPolicyDecisionFailure(scheduleId: string, error: unknown): void {
+    this.logger.warn("Scheduler policy decision recording failed", {
+      schedule_id: scheduleId,
+      error_code: "scheduler_policy_metric_failed",
+      error_message: error instanceof Error ? error.message : String(error),
+    });
   }
 
   private async loop(): Promise<void> {
