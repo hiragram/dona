@@ -2,7 +2,7 @@
 
 ## 利用者向け操作
 
-作成前に`preview_schedule`でtimezone、次回時刻、固定target、authorization expiryを確認する。確認した同じSlack event/threadから`create_schedule`を実行し、返された`revision`を以後の更新へ使う。`pause_schedule`は新規物化を止めるが既存runを取り消さない。`cancel_schedule`、`resume_schedule`はrevision競合時に現状を再取得し、blind retryしない。`get_schedule_history`では`scheduled`、`started`、`skipped`、`misfired`、`completed`、`failed`、`needs_review`を区別する。
+作成前に`preview_schedule`でtimezone、次回時刻、固定target、authorization expiryを確認する。確認した同じSlack event/threadから`create_schedule`を実行し、返された`revision`を以後の更新へ使う。`pause_schedule`は新規物化を止め、未送信outboxを持つ未開始runまたは未委任work runを取り消す一方、開始済みrunは継続する。取り消したrunはresume後も復元しない。`cancel_schedule`、`resume_schedule`はrevision競合時に現状を再取得し、blind retryしない。`get_schedule_history`では`scheduled`、`started`、`skipped`、`misfired`、`completed`、`failed`、`needs_review`を区別する。
 
 対応actionはone-shot/recurringの`slack.reminder.post`とread-only workである。自由なprovider writeや別workspace targetは許可しない。Slackのtimeout等で受理が不明なrunは`needs_review`となり、自動再投稿されない。
 

@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-const integration = fs.readFileSync(new URL("../dispatcher/test/scheduler-integration-gate.test.ts", import.meta.url), "utf8");
+const runner = fs.readFileSync(new URL("../scripts/run-scheduler-integration-gate.mjs", import.meta.url), "utf8");
 const fixtures = JSON.parse(fs.readFileSync(new URL("../docs/adr/fixtures/scheduler-v1/cases.json", import.meta.url), "utf8"));
 
-test("scheduler integration gateは4 vertical sliceとfailure matrixを0件にしない", () => {
-  for (const name of ["one-shot reminder", "recurring reminder", "one-shot work", "recurring work",
-    "restartとduplicate wake", "transaction partial failure", "provider timeout after send", "shared harness self-test"]) assert.match(integration, new RegExp(name));
-  assert.equal((integration.match(/test\(/g) ?? []).length, 5);
+test("scheduler integration gateは実runnerのpass/fail/skip件数を検査する", () => {
+  assert.match(runner, /const expected = 8/);
+  for (const field of ["tests", "pass", "fail", "skipped"]) assert.match(runner, new RegExp(`summary\\.${field}`));
+  assert.match(runner, /child\.status !== 0/);
 });
 
 test("ADR fixtureの全case IDをdecision gateへ列挙できる", () => {

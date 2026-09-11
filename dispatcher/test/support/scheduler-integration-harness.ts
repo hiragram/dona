@@ -39,9 +39,25 @@ export class FakeSlack {
 
 export class FakeJobRuntime {
   readonly calls: Array<{ event_id: string; objective: string }> = [];
-  run(eventId: string, objective: string): { status: "completed"; summary: string } {
+  run(harness: SchedulerIntegrationHarness, eventId: string, objective: string): { job_id: string; status: "completed"; summary: string } {
     this.calls.push({ event_id: eventId, objective });
-    return { status: "completed", summary: "read-only work completed" };
+    const event = harness.database.get(eventId)!;
+    const payload = JSON.parse(event.payload_json) as { work: Record<string, unknown> };
+    payload.work.authorization_target = { workspace_id: "T_GATE", channel_id: "C_GATE" };
+    harness.raw.prepare("UPDATE events SET status='waiting_agent',schedule_access_checked_at=?,payload_json=? WHERE event_id=?")
+      .run(new Date(harness.clock.now()).toISOString(), JSON.stringify(payload), eventId);
+    const created = harness.database.createJob({ source_event_id: eventId, objective, workspace: { kind: "scratch" } },
+      path.join(harness.root, "jobs"), path.join(harness.root, "results"), new Date(harness.clock.now()));
+    const job = created.row;
+    harness.database.beginJobPreparation(job.job_id, new Date(harness.clock.now()));
+    harness.database.beginJobDispatch(job.job_id, new Date(harness.clock.now()));
+    harness.database.markJobRunning(job.job_id, new Date(harness.clock.now()));
+    harness.clock.advance(1);
+    harness.database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed",
+      summary: "read-only work completed", output: { format: "markdown", text: "fixture result" }, actions: [],
+      completed_at: harness.clock.now() }, job.result_path, new Date(harness.clock.now()));
+    harness.database.enqueueJobNotification(job.job_id, new Date(harness.clock.now()));
+    return { job_id: job.job_id, status: "completed", summary: "read-only work completed" };
   }
 }
 
