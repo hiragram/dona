@@ -98,7 +98,7 @@ test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで
   assert.equal(snapshot.authorization_expired, 0);
   assert.equal(JSON.stringify(snapshot).includes(input.content), false);
   assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
-    terminal_schedules: 0, orphan_revisions: 0 });
+    terminal_schedules: 0, orphan_revisions: 0, job_contents: 0, event_contents: 0, result_files: 0 });
   raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
   assert.equal(repo.operationalSnapshot(later).stale_claims, 0);
 });

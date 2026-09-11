@@ -48,6 +48,7 @@ async function main(): Promise<void> {
       if (command === "health") { console.log(JSON.stringify(database.scheduler.operationalSnapshot(now), null, 2)); return; }
       if (command === "outbox") {
         const statusAt=args.indexOf("--status"),limitAt=args.indexOf("--limit");
+        if ((statusAt >= 0 && !args[statusAt+1]) || (limitAt >= 0 && !args[limitAt+1])) usage();
         console.log(JSON.stringify(database.scheduler.listOutbox(statusAt<0?undefined:args[statusAt+1] as never,
           limitAt<0?50:Number(args[limitAt+1])),null,2)); return;
       }

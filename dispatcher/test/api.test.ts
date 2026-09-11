@@ -108,6 +108,7 @@ describe("DispatcherApi", () => {
     const unavailable=await request(config.socketPath,"GET","/health/ready");
     assert.equal(unavailable.status,503);
     assert.equal((unavailable.body.scheduler as {error_code:string}).error_code,"scheduler_storage_unavailable");
+    assert.equal((await request(config.socketPath,"GET","/health/version")).status,503);
     await api.stop(); database.close();
   });
 
