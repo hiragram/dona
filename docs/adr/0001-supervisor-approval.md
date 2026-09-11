@@ -147,6 +147,7 @@ delivery attempt:
 
 presentation update attempt:
   pending -> dispatching
+  pending -> aborted
   dispatching -> succeeded|failed|acceptance_unknown
   dispatching -> acceptance_unknown (recovery only)
   acceptance_unknown -> succeeded|failed|needs_review
@@ -169,12 +170,15 @@ execution attempt:
 - requestがcancel、expire、reject、またはinvalidateされる時点でdelivery attemptがまだ`pending`なら、同じtransactionで`aborted`へ収束させます。外部call未開始のattemptは以後claimせず、無効なapproval cardを新規送信しません。
 - binding/policy/restore invalidationは全nonterminal stateとapprovedから`needs_review`へtransactionalに遷移でき、配送結果と競合してもinvalidated requestを`sent`へ戻しません。
 - approval delivery workerは`chat.postMessage`直前に`dispatching`とattempt fenceをdurable commitします。復旧時の`dispatching`は送信済みの可能性があるため無条件に同じattemptを`acceptance_unknown`へ移し、read-only reconcileだけを行い再送しません。
+- presentation update workerはdispatch直前に保存済みpresentation revisionとcurrent desired revisionを照合し、staleな`pending` attemptを`aborted`へ収束させます。同じmessageに`dispatching`または`acceptance_unknown`のattemptがある間は後続updateを送らず、先行writeがterminalに一意確定するまで直列化します。曖昧な先行writeを飛び越えて新しい表示で上書きしません。
 - executorは`claimed`から外部callへ進む直前に、短いexecution期限、binding、policy、ordered thread revision、visibility、shared状態をcurrent sourceから再検証します。不一致や期限切れは外部callなしで`needs_review`へ収束させます。成功した場合だけ`executing`とattempt fenceをdurable commitして送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
 
 全transitionのdecision tableはfixtureに記載します。
 
 ## Slack transport decision proof
+
+request作成時のrequesterは、認証済みEvent Envelopeのactor、またはDispatcherが永続化したbackground job ownerからserver-sideで導出します。source event/job ID、owner kind、actor/owner ID、instance、workspaceをimmutable requestへ結合し、会話本文、LLM出力、button valueからrequester IDを受け取りません。source ownershipが欠落または一致しなければrequestを作りません。
 
 button valueにはopaque request handleとpresentation revision以外を含めません。Socket ModeにはHTTP Request Signing相当の署名付きrequestがないため、workspace別の認証済みSocket接続をprovenanceの起点とします。接続確立時に認証済みteam/app identityとworkspace registry revisionを保存し、各`interactive` / `block_actions` envelopeを、その接続identity、payloadのteam、actor user、app、container channel、message timestamp、action ID、保存済みpresentationと照合します。接続identityとpayload identityが一致しなければ拒否します。3秒以内に、envelope IDをdedup keyとするdurable interactive inboxへ検証済みproofとcommandをcommitしてからACKします。ACKはapproval受理ではありません。ACK後のdecision workerは保存済みcommandだけを処理し、duplicate envelopeは同じinbox recordへ収束させます。decision確定時はstable event IDを持つ`dona_approval` outbox rowをdecisionと同じtransactionで一度だけ作成します。commit後はdurable outboxだけを配送し、process再起動時も未配送rowを回収します。`chat.update`は別のdurable attemptとして処理します。
 
@@ -183,6 +187,8 @@ button valueにはopaque request handleとpresentation revision以外を含め�
 MVP replyは、承認済み本文を変えない一意なexecution attempt IDとMACをSlack Blockの`block_id`へ埋め込みます。送信前にworkspace/channel/threadの全pageで同じmarkerが0件であることを確認し、timeoutまたは`executing`復旧後は全pageを同じpagination fenceで読み、exact markerが1件ならaccepted、0件なら`acceptance_unknown`のまま、2件以上またはpagination不完全なら`needs_review`とします。不在観測を決定的rejectionとみなさず、別の明示操作でも同じwriteを再送しません。同文、timestamp近接、message textだけではattemptを同定しません。
 
 cancel、expire、reject、`needs_review`など全terminal/invalid stateで遅着cardを発見した場合、requestを`sent`へ戻さずinteractive decisionを恒久拒否します。exact cardをredactedな無効表示へ変えるpresentation update attemptを一度だけ作り、そのupdateが曖昧なら再送せず`acceptance_unknown`としてreconcileします。
+
+ordered thread revisionは利用者の会話contextだけを対象にします。Dona自身が投稿したpending noticeまたはapproval cardは、認証済みapp author、request ID、delivery attempt ID、server-side MACがすべて一致する専用markerで識別できる場合だけ集合から除外します。本文類似やBot authorだけでは除外しません。それ以外のreply追加・削除・編集はcontext driftです。
 
 ## Release gate
 
