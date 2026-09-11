@@ -99,7 +99,7 @@ test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで
   assert.equal(JSON.stringify(snapshot).includes(input.content), false);
   assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
     terminal_schedules: 0, orphan_revisions: 0, job_contents: 0, event_contents: 0, result_files: 0,
-    event_result_files: 0, consumed_nonces: 0 });
+    event_result_files: 0, metadata_rows: 0, consumed_nonces: 0 });
   raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
   assert.equal(repo.operationalSnapshot(later).stale_claims, 0);
 });
@@ -112,9 +112,18 @@ test("retention readinessは次回hourly purgeまで猶予しevent相関indexを
   assert.equal(repo.retentionPlan("2026-09-06T00:01:00Z").revision_contents, 1);
   assert.equal(repo.operationalSnapshot("2026-09-06T00:01:00Z").retention_overdue, 0);
   assert.equal(repo.operationalSnapshot("2026-09-06T01:00:31Z").retention_overdue, 1);
-  for (const name of ["job_completion_source_event_idx", "job_completion_notification_event_idx"]) {
+  for (const name of ["job_completion_source_event_idx", "job_completion_notification_event_idx", "job_completion_run_idx"]) {
     assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name));
   }
+});
+
+test("authorization readinessは実行可能なdue scheduleだけを対象にする", () => {
+  const { repo } = setup();
+  const expiring={...input,expires_at:"2026-09-06T00:00:00Z"};
+  repo.create("future_expired", expiring, "2026-09-20T00:00:00Z", actor, now);
+  repo.create("paused_expired", expiring, due, actor, now);
+  repo.transition("paused_expired",1,"pause",actor,due);
+  assert.equal(repo.operationalSnapshot("2026-09-10T00:00:00Z").authorization_expired,0);
 });
 
 test("retention dry-runは未解決通知と新しいoutboxに保護されたrunを除外する", () => {
@@ -164,7 +173,18 @@ test("retention planはneeds_review eventを含め新しいcompletionの保持�
   insert.run("retention-job","blocked",event.event_id,owner,'{"kind":"none"}',now,"2026-09-06T00:00:00Z");
   insert.run("retention-job","completed",event.event_id,owner,'{"kind":"none"}',now,"2026-09-20T00:00:00Z");
   plan = repo.retentionPlan("2026-09-13T00:00:00Z");
-  assert.equal(plan.event_contents, 1);
+  assert.equal(plan.event_contents, 1); assert.equal(plan.result_files, 0);
+});
+
+test("retention planはterminal_at未設定のrunを残存参照として扱う", () => {
+  const {repo,raw}=setup();
+  repo.create("nonterminal_reference",{...input,action:"work.read_only",target:{kind:"none"}},due,actor,now);
+  const run=repo.materialize("nonterminal_reference",1,due,afterLater,due,actor).run;
+  repo.transition("nonterminal_reference",1,"cancel",actor,due);
+  raw.prepare("UPDATE schedule_runs SET status='needs_review',terminal_at=NULL WHERE run_id=?").run(run.run_id);
+  raw.prepare("UPDATE schedule_revisions SET content=NULL,terminal_at=? WHERE schedule_id=? AND revision=1").run(now,"nonterminal_reference");
+  const plan=repo.retentionPlan("2026-11-01T00:00:00Z");
+  assert.equal(plan.terminal_schedules,0); assert.equal(plan.orphan_revisions,0);
 });
 
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {

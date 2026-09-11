@@ -35,6 +35,7 @@ export function migrateJobRouting(db: Database.Database): void {
       CREATE INDEX IF NOT EXISTS job_owner_lookup_idx ON job_owner_bindings(owner_json);
       CREATE INDEX IF NOT EXISTS job_completion_source_event_idx ON job_completion_results(source_event_id, content_delete_at);
       CREATE INDEX IF NOT EXISTS job_completion_notification_event_idx ON job_completion_results(notification_event_id, content_delete_at);
+      CREATE INDEX IF NOT EXISTS job_completion_run_idx ON job_completion_results(json_extract(owner_json,'$.run_id'));
       CREATE UNIQUE INDEX IF NOT EXISTS schedule_job_owner_idx ON event_job_bindings(json_extract(owner_json,'$.run_id')) WHERE json_extract(owner_json,'$.kind')='schedule';
       CREATE TRIGGER IF NOT EXISTS event_job_binding_immutable BEFORE UPDATE ON event_job_bindings BEGIN SELECT RAISE(ABORT,'event_job_binding_immutable'); END;
       CREATE TRIGGER IF NOT EXISTS job_owner_binding_immutable BEFORE UPDATE ON job_owner_bindings BEGIN SELECT RAISE(ABORT,'job_owner_binding_immutable'); END;
