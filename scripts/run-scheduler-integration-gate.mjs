@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 
-const expected = 8;
-const child = spawnSync(process.execPath, ["--import", "tsx", "--test", "test/scheduler-integration-gate.test.ts"], {
-  cwd: new URL("../dispatcher/", import.meta.url), encoding: "utf8", env: process.env,
+const expected = 48;
+const child = spawnSync(process.execPath, ["--import", "tsx", "--test", "--test-reporter=spec",
+  "test/scheduler-integration-gate.test.ts", "test/scheduler.test.ts"], {
+  cwd: new URL("../dispatcher/", import.meta.url), encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" },
 });
 process.stdout.write(child.stdout);
 process.stderr.write(child.stderr);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -50,11 +51,31 @@ export class FakeJobRuntime {
     harness.database.beginJobPreparation(job.job_id, new Date(harness.clock.now()));
     harness.database.beginJobDispatch(job.job_id, new Date(harness.clock.now()));
     harness.database.markJobRunning(job.job_id, new Date(harness.clock.now()));
+    harness.database.saveCompleted(eventId, { schema_version: 1, event_id: eventId, status: "completed", summary: "job delegated",
+      actions: [], completed_at: harness.clock.now() }, path.join(harness.root, "event-results", `${eventId}.json`), new Date(harness.clock.now()));
     harness.clock.advance(1);
     harness.database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed",
       summary: "read-only work completed", output: { format: "markdown", text: "fixture result" }, actions: [],
       completed_at: harness.clock.now() }, job.result_path, new Date(harness.clock.now()));
-    harness.database.enqueueJobNotification(job.job_id, new Date(harness.clock.now()));
+    const notification = harness.database.enqueueJobNotification(job.job_id, new Date(harness.clock.now())).row;
+    if (notification.event_id !== eventId) {
+      const payload = JSON.parse(notification.payload_json) as { result: { summary: string } };
+      const bodyHash = createHash("sha256").update(payload.result.summary).digest("hex");
+      harness.database.beginDispatch(notification.event_id, path.join(harness.root, "event-results", `${notification.event_id}.json`), new Date(harness.clock.now()));
+      harness.database.authorizeJobNotification(notification.event_id, new Date(harness.clock.now()));
+      harness.database.authorizeJobNotification(notification.event_id, new Date(harness.clock.now()), { workspace_id: "T_GATE", channel_id: "C_GATE",
+        user_id: "U_GATE", issued_at: new Date(harness.clock.now()).toISOString(), nonce: `notify_${notification.event_id}` });
+      harness.database.saveCompleted(notification.event_id, { schema_version: 1, event_id: notification.event_id, status: "completed", actions: [
+        { tool: "dona_dispatcher.authorize_job_notification", event_id: notification.event_id, authorized: true },
+        { tool: "dona_slack.check_user_channel_access", workspace: "test", workspace_id: "T_GATE", channel_id: "C_GATE", user_id: "U_GATE", authorized: true },
+        { tool: "dona_dispatcher.authorize_job_notification", event_id: notification.event_id, authorized: true, access_receipt_verified: true },
+        { tool: "dona_slack.post_message", event_id: notification.event_id, workspace: "test", channel_id: "C_GATE", thread_ts: "1.000001",
+          message_ts: "2.000001", body_sha256: bodyHash, reply_broadcast: false, mrkdwn: false, parse: "none" },
+        { tool: "dona_slack.set_agent_session_status", workspace: "test", channel_id: "C_GATE", thread_ts: "1.000001", status: "active" },
+      ], completed_at: harness.clock.now() }, path.join(harness.root, "event-results", `${notification.event_id}.json`), new Date(harness.clock.now()),
+      { event_id: notification.event_id, workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001", message_ts: "2.000001",
+        body_sha256: bodyHash, posted_at: harness.clock.now(), reply_broadcast: false, identity_block_verified: true, session_status: "active" });
+    }
     return { job_id: job.job_id, status: "completed", summary: "read-only work completed" };
   }
 }
@@ -86,9 +107,7 @@ export class SchedulerIntegrationHarness {
       authorization_id: authorizationEvent ? `${authorizationEvent.event_id}:1` : `auth_${action.replaceAll(".", "_")}_${recurring}`, authorization_revision: 1,
       approver_id: integrationActor.actor_id, approved_at: this.clock.now(), expires_at: "2026-09-30T00:00:00Z",
       action,
-      target: action === "slack.reminder.post"
-        ? { kind: "thread", workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001" }
-        : { kind: "none" },
+      target: { kind: "thread", workspace_id: "T_GATE", channel_id: "C_GATE", thread_ts: "1.000001" },
       content: action === "slack.reminder.post" ? "fixture reminder" : "inspect repository read-only",
     };
   }

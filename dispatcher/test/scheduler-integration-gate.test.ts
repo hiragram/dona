@@ -33,6 +33,11 @@ for (const slice of slices) test(`vertical slice: ${slice.id}`, async () => {
         assert.equal(runtime.calls.length, 1);
         assert.equal(harness.database.getJob(result.job_id)?.status, "completed");
         assert.equal(harness.repo.getRun(currentRunId)?.status, "completed");
+        assert.equal(harness.database.get(event.event_id)?.status, "completed");
+        const notification = harness.raw.prepare("SELECT notification_event_id,notification_state FROM job_completion_results WHERE job_id=?")
+          .get(result.job_id) as { notification_event_id: string; notification_state: string };
+        assert.equal(notification.notification_state, "accepted");
+        assert.equal(harness.database.get(notification.notification_event_id)?.status, "completed");
         assert.equal(event.source, "dona_schedule");
         assert.equal(JSON.parse(event.payload_json).work.scope, "read_only");
       }
