@@ -49,6 +49,13 @@ function nowUtc(): string {
   return new Date().toISOString();
 }
 
+function preSteerObjective(objective:string,steerEventId:string|null):string {
+  if(steerEventId===null) return objective;
+  const marker="\n\n[DONA_FOLLOW_UP]\n";
+  const index=objective.indexOf(marker);
+  return index>=0&&objective.endsWith("\n[/DONA_FOLLOW_UP]")?objective.slice(0,index):objective;
+}
+
 function retryAt(attemptCount: number, now: Date): string {
   const delay = retryDelaysMs[Math.min(Math.max(attemptCount - 1, 0), retryDelaysMs.length - 1)]!;
   return new Date(now.getTime() + delay).toISOString();
@@ -259,12 +266,13 @@ export class DispatcherDatabase {
         CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
         CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
       `);
-      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json FROM jobs").all() as Array<{job_id:string;objective:string;workspace_json:string}>) {
+      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json,steer_event_id FROM jobs").all() as Array<{job_id:string;objective:string;workspace_json:string;steer_event_id:string|null}>) {
         const workspace=JSON.parse(row.workspace_json) as CreateJobRequest["workspace"];
         if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined) continue;
-        const request={source_event_id:"migration",objective:row.objective,workspace};
+        const creationObjective=preSteerObjective(row.objective,row.steer_event_id);
+        const request={source_event_id:"migration",objective:creationObjective,workspace};
         this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(
-          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(row.objective,"utf8")),row.job_id);
+          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(creationObjective,"utf8")),row.job_id);
       }
       if (hasLegacyStopMarkers) this.db.exec(`
         INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
@@ -1023,7 +1031,9 @@ export class DispatcherDatabase {
   assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const owner=this.db.prepare("SELECT owner_json FROM job_owner_bindings WHERE job_id=?").get(jobId) as {owner_json:string}|undefined;
-    if(!binding||!owner||stableStringify(binding.owner)!==owner.owner_json) throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
+    const completion=this.db.prepare("SELECT owner_json FROM job_completion_results WHERE job_id=? AND notification_event_id=?").get(jobId,sourceEventId) as {owner_json:string}|undefined;
+    if(!owner||(!binding&&completion?.owner_json!==owner.owner_json)||(binding&&stableStringify(binding.owner)!==owner.owner_json))
+      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
   }
 
   private assertJobSteerAllowed(jobId:string):void {
