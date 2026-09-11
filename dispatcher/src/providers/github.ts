@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import {
   ExternalIngressAuthenticationError,
+  ExternalIngressUnavailableError,
   ExternalIngressValidationError,
   type ExternalEventSourceRegistration,
   type NormalizedExternalEvent,
@@ -71,6 +72,7 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
   }
   return {
     source: "github",
+    connectionIds: [config.connectionId],
     maxBodyBytes: 1_048_576,
     bodyTimeoutMs: 2_000,
     processingTimeoutMs: 9_500,
@@ -81,8 +83,12 @@ export function githubPilotRegistration(config: GitHubPilotConfig): ExternalEven
       if (!deliveryPattern.test(deliveryId) || !eventPattern.test(event) || !(event in config.events)) {
         throw new ExternalIngressAuthenticationError();
       }
-      const binding = await config.resolveBinding();
-      const secret = await config.resolveWebhookSecret(binding.credentialRevision);
+      let binding: Awaited<ReturnType<GitHubPilotConfig["resolveBinding"]>>;
+      let secret: Buffer;
+      try {
+        binding = await config.resolveBinding();
+        secret = await config.resolveWebhookSecret(binding.credentialRevision);
+      } catch { throw new ExternalIngressUnavailableError(); }
       try {
         if (secret.length < 32) throw new ExternalIngressAuthenticationError();
         verifyGitHubSignature(request.body, signature, secret);

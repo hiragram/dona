@@ -75,6 +75,7 @@ function verificationAttempt(requestTarget: string): string | undefined {
 export function createNotionRegistration(options: NotionRegistrationOptions): ExternalEventSourceRegistration {
   return {
     source: "notion",
+    connectionIds: [options.connectionId],
     maxBodyBytes: 512 * 1024,
     bodyTimeoutMs: 10_000,
     processingTimeoutMs: 10_000,

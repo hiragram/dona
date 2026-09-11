@@ -10,15 +10,19 @@ import { z } from "zod";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import {
+  authenticatedConnectionId,
   externalEventSource,
   ExternalIngressRegistry,
   ExternalIngressProcessor,
+  ExternalIngressControlAcknowledgementError,
+  ExternalIngressTimeoutError,
   scopedExternalEventId,
   type ExternalEventSourceRegistration,
   type RawIngressRequest,
 } from "../src/ingress.js";
 import type { Logger } from "../src/logger.js";
 import { envelopeFromRow } from "../src/prompt.js";
+import type { EnqueueResult } from "../src/types.js";
 import { tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -216,6 +220,20 @@ describe("external ingress contract", () => {
 
     await api.stop();
     database.close();
+  });
+
+  test("registration mismatchはprovider再送可能な503を返す", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const api=new DispatcherApi(database,{isRunning:()=>true,wake:()=>{}},jobs,config,logger,
+      undefined,undefined,undefined,new ExternalIngressRegistry([{...registration(),connectionIds:["expected"]}]));
+    await api.start();
+    try {
+      const body=fakeBody(); const response=await request(config.socketPath,"fake",body,signedHeaders(body,"unexpected"));
+      assert.equal(response.status,503);
+      assert.equal((response.body.error as {code:string}).code,"registration_mismatch");
+      assert.equal(database.list().length,0);
+    } finally { await api.stop(); database.close(); }
   });
 
   test("converges concurrent redelivery, rejects conflicting content, and scopes IDs by connection", async () => {
@@ -452,6 +470,24 @@ describe("external ingress contract", () => {
     database.close();
   });
 
+  test("persist後のprocessing timeoutも認証済みconnectionへ帰属する", async () => {
+    const definition = registration();
+    const limited = { ...definition, processingTimeoutMs: 1 };
+    const processor = new ExternalIngressProcessor(new ExternalIngressRegistry([limited]));
+    const body = fakeBody();
+    const requestValue: RawIngressRequest = { body, headers: Object.entries(signedHeaders(body)), method: "POST", requestTarget: "/fake",
+      receivedAt: new Date().toISOString(), receivedAtMonotonic: performance.now()+1_000 };
+    await assert.rejects(processor.process(externalEventSource("fake"), limited, requestValue, () => {
+      const until = performance.now()+1_100;
+      while (performance.now()<until) { /* fixture: synchronous durable write */ }
+      return { row: { event_id:"evt_fixture", sequence:1, source:"fake", external_event_id:"external-fixture",
+        schema_version:1, event_type:"fake.changed", occurred_at:new Date().toISOString(), subject_json:"{}", payload_json:"{}",
+        reply_target_json:null, trace_json:null, payload_hash:"fixture", status:"queued", attempts:0, available_at:new Date().toISOString(),
+        last_error:null, last_error_code:null, processing_started_at:null, created_at:new Date().toISOString(), updated_at:new Date().toISOString() },
+        outcome:"created" as const, duplicate:false, payloadMismatch:false } as unknown as EnqueueResult;
+    }), (error: unknown) => error instanceof ExternalIngressTimeoutError && authenticatedConnectionId(error)==="connection-a");
+  });
+
   test("enforces raw body and processing time limits without acknowledging or persisting", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -618,6 +654,7 @@ describe("external ingress contract", () => {
     assert.throws(() => new ExternalIngressRegistry([{ ...registration(), source: "slack" }]), /non-reserved/);
     assert.throws(() => new ExternalIngressRegistry([registration(), registration()]), /already registered/);
     assert.throws(() => new ExternalIngressRegistry([{ ...registration(), maxBodyBytes: 0 }]), /positive integer/);
+    assert.throws(() => new ExternalIngressRegistry([{ ...registration(), connectionIds: [] }]), /connectionIds/);
     assert.throws(
       () => new ExternalIngressRegistry([{ ...registration(), processingTimeoutMs: 60_001 }]),
       /hard limit/,
@@ -712,6 +749,26 @@ test("managed bindingとprovider ownerのresource不一致を認証失敗にす�
   },()=>{throw new Error("must not persist");}),/authentication/i);
 });
 
+test("owner schema failureを認証済みconnectionへ束縛する",async()=>{
+  const registered=registration({authenticate:async()=>({connectionId:"connection-trusted",resourceId:"x".repeat(513),
+    principal:{kind:"fake_installation"}})});
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[],method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),(error)=>authenticatedConnectionId(error)==="connection-trusted");
+});
+
+test("control acknowledgement hook failureを認証済みcontrol errorへ変換する",async()=>{
+  const definition=registration();
+  const registered={...definition,controlAcknowledgement(){throw new Error("temporary dependency failure");}};
+  const processor=new ExternalIngressProcessor(new ExternalIngressRegistry([registered]));
+  await assert.rejects(processor.process(externalEventSource("fake"),registered,{
+    body:fakeBody(),headers:[["x-fake-signature",signature(fakeBody())],["x-fake-connection","connection-a"]],
+    method:"POST",requestTarget:"/v1/ingress/fake",receivedAt:new Date().toISOString(),
+  },()=>{throw new Error("must not persist");}),(error)=>error instanceof ExternalIngressControlAcknowledgementError &&
+    authenticatedConnectionId(error)==="connection-a");
+});
+
 test("queue receipts expose coalescing and reject overload before provider ACK",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath,{defaults:{depth:1,bytes:1_048_576,rate:100,burst:100,coalescing:true}});
@@ -742,10 +799,15 @@ test("queue receipts expose coalescing and reject overload before provider ACK",
 
 test("normalizer mutation cannot replace the authenticated queue connection",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
-  const database=new DispatcherDatabase(config.databasePath);const definition=registration();
+  const database=new DispatcherDatabase(config.databasePath);const definition=registration();let acknowledgedRevision:number|undefined;
   const registry=new ExternalIngressRegistry([{...definition,normalize(raw,verified){
     (verified as {connectionId:string}).connectionId="forged";
+    const current=(verified as {connection:{revision:number}}).connection;
+    (verified as {connection:{revision:number}}).connection={...current,revision:99};
     return definition.normalize(raw,verified);
+  },buildAcknowledgement(receipt){
+    acknowledgedRevision=receipt.connectionRevision;
+    return definition.buildAcknowledgement(receipt);
   }}]);
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,registry);
   await api.start();
@@ -753,5 +815,6 @@ test("normalizer mutation cannot replace the authenticated queue connection",asy
     const body=fakeBody();assert.ok((await request(config.socketPath,"fake",body,signedHeaders(body))).status<300);
     assert.ok(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"connection-a","delivery-1")));
     assert.equal(database.getByExternalId("fake",scopedExternalEventId(externalEventSource("fake"),"forged","delivery-1")),undefined);
+    assert.equal(acknowledgedRevision,0);
   } finally {await api.stop();database.close();}
 });

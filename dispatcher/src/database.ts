@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { queuePolicySchema, queueIdentity, coalesceKey, QueueAdmissionError, QueueClaimUnavailableError, type QueuePolicy, type QueueAdmissionContext } from "./queue.js";
 import path from "node:path";
 
@@ -63,33 +63,610 @@ export class EventNotDispatchableError extends Error {
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
+  private readonly readOnly: boolean;
+  private readonly failedObservationLatches = new Map<string,{outcomes:Set<string>;boundary:number;observedAt:number}>();
+  private readonly observationLatchPath: string;
+  private readonly runtimeObservationFloor: number;
 
   readonly connections: ConnectionRegistry;
   readonly providerRegistration: ProviderRegistrationRegistry;
   private claimsClosed = false;
   readonly queuePolicy: QueuePolicy;
 
-  constructor(databasePath: string, queuePolicyOrClock: unknown = {}, clock?: Clock) {
+  constructor(databasePath: string, queuePolicyOrClock: unknown = {}, clock?: Clock, options: {readOnly?:boolean} = {}) {
     const legacyClock = queuePolicyOrClock !== null && typeof queuePolicyOrClock === "object" &&
       typeof (queuePolicyOrClock as { now?: unknown }).now === "function" ? queuePolicyOrClock as Clock : undefined;
     this.queuePolicy = queuePolicySchema.parse(legacyClock ? {} : queuePolicyOrClock);
-    fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
-    fs.chmodSync(path.dirname(databasePath), 0o700);
-    this.db = new Database(databasePath);
-    fs.chmodSync(databasePath, 0o600);
-    this.db.pragma("journal_mode = WAL");
+    this.readOnly = options.readOnly === true;
+    this.observationLatchPath = `${databasePath}.observation-latches.json`;
+    const hadDurableObservationSchema=fs.existsSync(databasePath) && (()=>{ const existing=new Database(databasePath,{readonly:true,fileMustExist:true});
+      try { return existing.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_ingress_conflicts'").get()!==undefined; }
+      finally { existing.close(); } })();
+    if (!this.readOnly) {
+      const databaseDirectory=path.dirname(databasePath);
+      if (!fs.existsSync(databaseDirectory)) fs.mkdirSync(databaseDirectory,{recursive:true,mode:0o700});
+    }
+    this.db = new Database(databasePath, this.readOnly ? {readonly:true,fileMustExist:true} : undefined);
+    if (!this.readOnly) fs.chmodSync(databasePath, 0o600);
+    if (!this.readOnly) this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    try {
+    try { if (!this.readOnly) {
       this.db.transaction(() => {
         this.migrate();
         if ((this.db.pragma("user_version", { simple: true }) as number) < 4) this.migrateQueue();
         migrateConnections(this.db);
         migrateEventRouting(this.db);
+        this.migrateExternalObservability();
       }).immediate();
-    } catch (error) { this.db.close(); throw error; }
+    } } catch (error) { this.db.close(); throw error; }
     this.connections = new ConnectionRegistry(this.db, clock ?? legacyClock);
     this.providerRegistration = new ProviderRegistrationRegistry(this.db, clock ?? legacyClock);
+    const runtimeMetricColumns = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").get() === undefined
+      ? [] : this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
+    this.runtimeObservationFloor = runtimeMetricColumns.some((column)=>column.name==="last_observed_sequence")
+      ? Number(this.db.prepare("SELECT coalesce(max(last_observed_sequence),0) FROM external_ingress_metrics").pluck().get()) : 0;
+    if (fs.existsSync(this.observationLatchPath)) this.loadObservationLatches();
+    else if (hadDurableObservationSchema) this.failedObservationLatches.set(JSON.stringify(["*","",0]),
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor,observedAt:Date.now()});
+    else if (!this.readOnly) this.persistObservationLatches();
+  }
+
+  private loadObservationLatches(): void {
+    try {
+      const parsed=JSON.parse(fs.readFileSync(this.observationLatchPath,"utf8")) as {schema_version?:unknown;entries?:unknown};
+      if (parsed.schema_version!==1 || !Array.isArray(parsed.entries)) throw new Error("Invalid observation latch marker");
+      for (const candidate of parsed.entries) {
+        if (candidate===null || typeof candidate!=="object") throw new Error("Invalid observation latch entry");
+        const {key,outcomes,boundary,observed_at:observedAt=Number.MAX_SAFE_INTEGER}=candidate as
+          {key?:unknown;outcomes?:unknown;boundary?:unknown;observed_at?:unknown};
+        if (typeof key!=="string" || key.length>512 || !Array.isArray(outcomes) ||
+          !outcomes.every((outcome)=>typeof outcome==="string" && /^[a-z][a-z0-9_]{0,63}$/.test(outcome)) ||
+          typeof boundary!=="number" || !Number.isSafeInteger(boundary) || boundary<0 ||
+          typeof observedAt!=="number" || !Number.isSafeInteger(observedAt) || observedAt<0) throw new Error("Invalid observation latch entry");
+        const keyParts=JSON.parse(key) as unknown;
+        if (!Array.isArray(keyParts) || ![3,4].includes(keyParts.length) ||
+          typeof keyParts[0]!=="string" || !(/^\*$/.test(keyParts[0]) || /^[a-z][a-z0-9._-]{0,63}$/.test(keyParts[0])) ||
+          typeof keyParts[1]!=="string" || !(/^$/.test(keyParts[1]) || /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(keyParts[1])) ||
+          typeof keyParts[2]!=="number" || !Number.isSafeInteger(keyParts[2]) || keyParts[2]<0 ||
+          (keyParts.length===4 && (typeof keyParts[3]!=="string" || !/^[a-f0-9]{64}$/.test(keyParts[3])))) {
+          throw new Error("Invalid observation latch key");
+        }
+        this.failedObservationLatches.set(key,{outcomes:new Set(outcomes),boundary,observedAt});
+      }
+    } catch { this.failedObservationLatches.set(JSON.stringify(["*","",0]),
+      {outcomes:new Set(["persistence_unavailable"]),boundary:this.runtimeObservationFloor,observedAt:Date.now()}); }
+  }
+
+  private persistObservationLatches(): void {
+    if (this.readOnly) return;
+    const temporary=`${this.observationLatchPath}.${process.pid}.${randomUUID()}.tmp`;
+    const payload=JSON.stringify({schema_version:1,entries:[...this.failedObservationLatches].map(([key,latch])=>
+      ({key,outcomes:[...latch.outcomes].sort(),boundary:latch.boundary,observed_at:latch.observedAt}))});
+    try {
+      fs.writeFileSync(temporary,payload,{encoding:"utf8",mode:0o600,flag:"wx"});
+      const file=fs.openSync(temporary,"r"); try { fs.fsyncSync(file); } finally { fs.closeSync(file); }
+      fs.renameSync(temporary,this.observationLatchPath);
+      const directory=fs.openSync(path.dirname(this.observationLatchPath),"r"); try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } finally { try { fs.unlinkSync(temporary); } catch {} }
+  }
+
+  private migrateExternalObservability(): void {
+    const hadErrorHistory = this.db.prepare("SELECT 1 present FROM sqlite_master WHERE type='table' AND name='external_event_errors'").get() !== undefined;
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS external_ingress_metrics (
+        source TEXT NOT NULL,
+        connection_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        latency_bucket TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        last_observed_sequence INTEGER NOT NULL DEFAULT 0,
+        connection_revision INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(source, connection_id, connection_revision, outcome, latency_bucket)
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_sequence (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_write_probe (
+        id INTEGER PRIMARY KEY, payload BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_conflicts (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, connection_revision INTEGER NOT NULL,
+        verification INTEGER NOT NULL CHECK(verification IN (0,1)), delivery_hash TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,connection_revision,verification,delivery_hash)
+      );
+      CREATE TABLE IF NOT EXISTS external_ingress_recoveries (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, connection_revision INTEGER NOT NULL,
+        delivery_hash TEXT NOT NULL, failure_outcome TEXT NOT NULL, observed_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,connection_revision,delivery_hash,failure_outcome)
+      );
+      CREATE TABLE IF NOT EXISTS external_event_errors (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, error_code TEXT NOT NULL,
+        count INTEGER NOT NULL, last_error_at TEXT NOT NULL,
+        PRIMARY KEY(source,connection_id,error_code)
+      );
+      DROP TRIGGER IF EXISTS external_event_error_history;
+      CREATE TRIGGER external_event_error_history AFTER UPDATE OF last_error_code ON events
+      WHEN NEW.last_error_code IS NOT NULL AND NEW.last_error_code!='provider_fetching'
+        AND NEW.source NOT IN ('slack','dona_job','dona_update')
+      BEGIN
+        INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
+        VALUES(NEW.source,coalesce(
+          (SELECT connection_id FROM connection_event_bindings WHERE event_id=NEW.event_id),
+          (SELECT l.connection FROM queue_events q JOIN queue_lanes l USING(lane) WHERE q.event_id=NEW.event_id),
+          ''),NEW.last_error_code,1,NEW.updated_at)
+        ON CONFLICT(source,connection_id,error_code) DO UPDATE SET count=count+1,
+          last_error_at=MAX(last_error_at,excluded.last_error_at);
+      END;
+    `);
+    if (!hadErrorHistory) this.db.exec(`
+      INSERT INTO external_event_errors(source,connection_id,error_code,count,last_error_at)
+      SELECT e.source,coalesce(b.connection_id,l.connection,''),e.last_error_code,count(*),max(e.updated_at)
+      FROM events e LEFT JOIN connection_event_bindings b USING(event_id)
+      LEFT JOIN queue_events q USING(event_id) LEFT JOIN queue_lanes l USING(lane)
+      WHERE e.last_error_code IS NOT NULL AND e.last_error_code!='provider_fetching'
+        AND e.source NOT IN ('slack','dona_job','dona_update')
+      GROUP BY e.source,coalesce(b.connection_id,l.connection,''),e.last_error_code;
+    `);
+    const sequence = this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").get();
+    if (sequence === undefined) this.db.prepare("INSERT INTO external_ingress_sequence(singleton,value) VALUES(1,0)").run();
+    const metricColumns = this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}>;
+    if (!metricColumns.some((column) => column.name === "last_observed_sequence")) {
+      this.db.exec(`
+        UPDATE external_ingress_metrics SET connection_id='' WHERE connection_id='unattributed';
+        ALTER TABLE external_ingress_metrics ADD COLUMN last_observed_sequence INTEGER NOT NULL DEFAULT 0;
+        WITH ranked AS (
+          SELECT rowid metric_rowid,row_number() OVER (ORDER BY last_observed_at,rowid) observation_sequence
+          FROM external_ingress_metrics WHERE last_observed_sequence=0
+        )
+        UPDATE external_ingress_metrics SET last_observed_sequence=(
+          SELECT observation_sequence FROM ranked WHERE metric_rowid=external_ingress_metrics.rowid
+        ) WHERE last_observed_sequence=0;
+        UPDATE external_ingress_sequence SET value=MAX(value,
+          coalesce((SELECT max(last_observed_sequence) FROM external_ingress_metrics),0)) WHERE singleton=1;
+      `);
+    }
+    if (!metricColumns.some((column) => column.name === "connection_revision")) {
+      this.db.exec("ALTER TABLE external_ingress_metrics ADD COLUMN connection_revision INTEGER NOT NULL DEFAULT 0");
+    }
+    const metricSchema=this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string;
+    if (!/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema)) this.db.exec(`
+      ALTER TABLE external_ingress_metrics RENAME TO external_ingress_metrics_legacy;
+      CREATE TABLE external_ingress_metrics (
+        source TEXT NOT NULL, connection_id TEXT NOT NULL, outcome TEXT NOT NULL, latency_bucket TEXT NOT NULL,
+        count INTEGER NOT NULL, last_observed_at TEXT NOT NULL, last_observed_sequence INTEGER NOT NULL DEFAULT 0,
+        connection_revision INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(source, connection_id, connection_revision, outcome, latency_bucket)
+      );
+      INSERT INTO external_ingress_metrics
+        SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence,connection_revision
+        FROM external_ingress_metrics_legacy;
+      DROP TABLE external_ingress_metrics_legacy;
+    `);
+  }
+
+  recordExternalIngress(source: string, connectionId: string | undefined, outcome: string, latencyMs: number, at = new Date(), authenticatedRevision?: number,
+    deliveryId?: string): boolean {
+    // 観測記録はACK/persistenceの本来の結果を上書きしない。DB停止時はhealth自体がnot-readyになる。
+    const safeSource = /^[a-z][a-z0-9._-]{0,63}$/.test(source) ? source : "unknown";
+    const boundedConnection = connectionId !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(connectionId) ? connectionId : "";
+    const latchKey=JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0]);
+    const deliveryKey=deliveryId === undefined ? undefined : JSON.stringify([safeSource,boundedConnection,authenticatedRevision ?? 0,
+      createHash("sha256").update(deliveryId).digest("hex")]);
+    const deliveryBoundOutcomes=["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+      "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict",
+      "verification_created","verification_duplicate_same","verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+      "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout","verification_duplicate_conflict"];
+    const latchedBefore=this.failedObservationLatches.get(latchKey);
+    const deliveryLatchedBefore=deliveryKey === undefined ? undefined : this.failedObservationLatches.get(deliveryKey);
+    const observationIntentKey=deliveryKey !== undefined && deliveryBoundOutcomes.includes(outcome) ? deliveryKey : latchKey;
+    const observationIntent=this.failedObservationLatches.get(observationIntentKey);
+    const hadObservationIntent=observationIntent?.outcomes.has(outcome)===true;
+    let observationBoundary=Number.MAX_SAFE_INTEGER;
+    let busyTimeout=2_000;
+    try {
+      observationBoundary=Number(this.db.prepare("SELECT value FROM external_ingress_sequence WHERE singleton=1").pluck().get() ?? 0);
+      const laneLastUpdated=this.db.prepare(`SELECT max(e.updated_at) FROM queue_events q JOIN queue_lanes l USING(lane)
+        JOIN events e USING(event_id) WHERE l.class='external' AND l.source=? AND l.connection=?`).pluck().get(safeSource,boundedConnection);
+      const laneHighWater=typeof laneLastUpdated==="string" ? Date.parse(laneLastUpdated) : 0;
+      const requestObservedAt=Number.isSafeInteger(at.getTime()) && at.getTime()>=0 ? at.getTime() : Date.now();
+      const observedAt=Math.max(requestObservedAt,Number.isSafeInteger(laneHighWater) ? laneHighWater : Number.MAX_SAFE_INTEGER);
+      const pendingIntent=observationIntent ?? {outcomes:new Set<string>(),boundary:observationBoundary,observedAt};
+      pendingIntent.outcomes.add(outcome); pendingIntent.boundary=Math.max(pendingIntent.boundary,observationBoundary);
+      pendingIntent.observedAt=Math.max(pendingIntent.observedAt,observedAt);
+      this.failedObservationLatches.set(observationIntentKey,pendingIntent);
+      this.persistObservationLatches();
+      // connectionIdはsource adapterの認証成功後だけ渡され、safe identifierへ検証済み。
+      const bucket = latencyMs < 100 ? "lt_100ms" : latencyMs < 1_000 ? "lt_1s" : latencyMs < 5_000 ? "lt_5s" : "gte_5s";
+      const recoveredCreated = outcome === "duplicate_same" && ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout"]
+        .some((createdOutcome)=>(deliveryLatchedBefore ?? latchedBefore)?.outcomes.has(createdOutcome)===true);
+      const effectiveOutcome = recoveredCreated ? "created" : outcome;
+      const safeOutcome = /^[a-z][a-z0-9_]{0,63}$/.test(effectiveOutcome) ? effectiveOutcome : "internal_error";
+      busyTimeout=this.db.pragma("busy_timeout",{simple:true}) as number;
+      this.db.pragma("busy_timeout=0");
+      this.db.transaction(() => {
+        const revision = boundedConnection === "" ? 0 : authenticatedRevision ?? (this.db.prepare(
+          "SELECT revision FROM connections WHERE provider=? AND id=?",
+        ).get(safeSource,boundedConnection) as {revision:number}|undefined)?.revision ?? 0;
+        const order = this.db.prepare("UPDATE external_ingress_sequence SET value=value+1 WHERE singleton=1 RETURNING value")
+          .get() as {value:number};
+        this.db.prepare(`INSERT INTO external_ingress_metrics(source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence,connection_revision)
+          VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(source,connection_id,connection_revision,outcome,latency_bucket)
+          DO UPDATE SET count=CASE WHEN connection_revision=excluded.connection_revision THEN count+1 ELSE 1 END,
+            last_observed_at=CASE WHEN connection_revision=excluded.connection_revision
+              THEN MAX(last_observed_at,excluded.last_observed_at) ELSE excluded.last_observed_at END,
+            last_observed_sequence=excluded.last_observed_sequence,connection_revision=excluded.connection_revision`)
+          .run(safeSource, boundedConnection, safeOutcome, bucket, at.toISOString(), order.value, revision);
+        if (deliveryId !== undefined) {
+          const deliveryHash=createHash("sha256").update(deliveryId).digest("hex");
+          if (["duplicate_conflict","verification_duplicate_conflict"].includes(outcome)) {
+            this.db.prepare(`INSERT INTO external_ingress_conflicts
+              (source,connection_id,connection_revision,verification,delivery_hash,observed_at) VALUES(?,?,?,?,?,?)
+              ON CONFLICT(source,connection_id,connection_revision,verification,delivery_hash)
+              DO UPDATE SET observed_at=MAX(observed_at,excluded.observed_at)`)
+              .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash,at.toISOString());
+          } else if (["duplicate_same","verification_duplicate_same"].includes(outcome)) {
+            this.db.prepare(`DELETE FROM external_ingress_conflicts WHERE source=? AND connection_id=? AND connection_revision=?
+              AND verification=? AND delivery_hash=?`)
+              .run(safeSource,boundedConnection,revision,outcome.startsWith("verification_") ? 1 : 0,deliveryHash);
+          }
+          if (["acknowledgement_unavailable_after_created","post_persist_created_timeout",
+            "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
+            "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+            "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout"].includes(outcome)) {
+            this.db.prepare(`INSERT INTO external_ingress_recoveries
+              (source,connection_id,connection_revision,delivery_hash,failure_outcome,observed_at) VALUES(?,?,?,?,?,?)
+              ON CONFLICT(source,connection_id,connection_revision,delivery_hash,failure_outcome)
+              DO UPDATE SET observed_at=MAX(observed_at,excluded.observed_at)`)
+              .run(safeSource,boundedConnection,revision,deliveryHash,outcome,at.toISOString());
+          } else if (["duplicate_same","verification_duplicate_same"].includes(outcome)) {
+            this.db.prepare(`DELETE FROM external_ingress_recoveries WHERE source=? AND connection_id=?
+              AND connection_revision=? AND delivery_hash=? AND failure_outcome ${outcome.startsWith("verification_") ? "LIKE 'verification_%'" : "NOT LIKE 'verification_%'"}`)
+              .run(safeSource,boundedConnection,revision,deliveryHash);
+          }
+        }
+      }).immediate();
+      if (!hadObservationIntent) {
+        const completedIntent=this.failedObservationLatches.get(observationIntentKey);
+        completedIntent?.outcomes.delete(outcome);
+        if (completedIntent?.outcomes.size===0) this.failedObservationLatches.delete(observationIntentKey);
+      }
+      const latched=this.failedObservationLatches.get(latchKey);
+      const latchedOutcomes=latched?.outcomes;
+      if (outcome === "created") {
+        if (latchedOutcomes !== undefined) {
+          for (const latched of [...latchedOutcomes]) if (!["control_acknowledged","control_acknowledgement_unavailable",
+            "verification_created","verification_duplicate_same","verification_duplicate_conflict"].includes(latched)) latchedOutcomes.delete(latched);
+          if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+        }
+      } else if (latchedOutcomes !== undefined && outcome === "duplicate_same") {
+        for (const recovered of ["created","duplicate_same","acknowledgement_unavailable","post_persist_timeout",
+          "acknowledgement_unavailable_after_created","post_persist_created_timeout",
+          "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"]) latchedOutcomes.delete(recovered);
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+      } else if (latchedOutcomes !== undefined && outcome === "control_acknowledged") {
+        latchedOutcomes.delete("control_acknowledged"); latchedOutcomes.delete("control_acknowledgement_unavailable");
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+      } else if (latchedOutcomes !== undefined && outcome === "verification_duplicate_same") {
+        latchedOutcomes.delete("verification_created"); latchedOutcomes.delete("verification_duplicate_same");
+        latchedOutcomes.delete("verification_duplicate_conflict");
+        if (latchedOutcomes.size === 0) this.failedObservationLatches.delete(latchKey);
+      }
+      if (deliveryKey !== undefined && ["duplicate_same","verification_duplicate_same"].includes(outcome)) {
+        const deliveryLatch=this.failedObservationLatches.get(deliveryKey);
+        if (deliveryLatch !== undefined) {
+          for (const recovered of outcome === "duplicate_same"
+            ? ["created","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+              "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout","duplicate_same","duplicate_conflict"]
+            : ["verification_created","verification_acknowledgement_unavailable_after_created",
+              "verification_post_persist_created_timeout","verification_acknowledgement_unavailable_after_duplicate",
+              "verification_post_persist_duplicate_timeout","verification_duplicate_same","verification_duplicate_conflict"]) deliveryLatch.outcomes.delete(recovered);
+          if (deliveryLatch.outcomes.size===0) this.failedObservationLatches.delete(deliveryKey);
+        }
+      }
+      this.persistObservationLatches();
+      return true;
+    } catch {
+      const failedKey=deliveryKey !== undefined && deliveryBoundOutcomes.includes(outcome)
+        ? deliveryKey : latchKey;
+      const latched=this.failedObservationLatches.get(failedKey) ??
+        {outcomes:new Set<string>(),boundary:observationBoundary,observedAt:Math.max(0,at.getTime())};
+      latched.outcomes.add(outcome); latched.boundary=Math.max(latched.boundary,observationBoundary);
+      latched.observedAt=Math.max(latched.observedAt,Math.max(0,at.getTime()));
+      this.failedObservationLatches.set(failedKey,latched);
+      try { this.persistObservationLatches(); } catch {}
+      return false;
+    } finally { try { this.db.pragma(`busy_timeout=${busyTimeout}`); } catch {} }
+  }
+
+  externalReleaseHealth(at = new Date(), activeUnmanagedConnections?: ReadonlySet<string>) {
+    const observabilityTables = this.db.prepare(`SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN
+      ('external_ingress_metrics','external_ingress_sequence','external_event_errors','external_write_probe','external_ingress_conflicts','external_ingress_recoveries')`).pluck().get();
+    const metricColumns = observabilityTables === 6
+      ? this.db.pragma("table_info(external_ingress_metrics)") as Array<{name:string}> : [];
+    const metricSchema = observabilityTables === 6
+      ? this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='external_ingress_metrics'").pluck().get() as string : "";
+    if (this.readOnly && (observabilityTables !== 6 || !metricColumns.some((column) => column.name === "connection_revision") ||
+      !/PRIMARY KEY\s*\(source,\s*connection_id,\s*connection_revision,/i.test(metricSchema))) {
+      return {schema_version:1,observed_at:at.toISOString(),ready:false,writable:false,
+        compatibility:"migration_required",connections:[],ingress_connections:[],ingress:[],queue:null};
+    }
+    const writable = this.readOnly ? false : this.probeWritable();
+    return this.db.transaction(() => this.externalReleaseHealthSnapshot(at,writable,activeUnmanagedConnections)).deferred();
+  }
+
+  private probeWritable(): boolean {
+    const rollback = Symbol("external health write probe rollback");
+    const busyTimeout = this.db.pragma("busy_timeout", {simple:true}) as number;
+    this.db.pragma("busy_timeout=0");
+    try {
+      this.db.transaction(() => {
+        this.db.prepare("INSERT INTO external_write_probe(payload) VALUES(zeroblob(4096))").run();
+        throw rollback;
+      }).immediate();
+    } catch (error) { return error === rollback; }
+    finally { this.db.pragma(`busy_timeout=${busyTimeout}`); }
+    return false;
+  }
+
+  private externalReleaseHealthSnapshot(at: Date, writable: boolean, activeUnmanagedConnections?: ReadonlySet<string>) {
+    const now = at.getTime();
+    const connections = this.db.prepare(`SELECT c.id,c.provider,c.state,c.revision,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('queued','retryable_failed')) queue_depth,
+      coalesce((SELECT max(MAX(0, ?-strftime('%s',e.created_at)*1000)) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status!='completed'),0) queue_lag_ms,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status='dead_letter') dead_letter,
+      (SELECT count(*) FROM connection_event_bindings b JOIN events e USING(event_id)
+        WHERE b.connection_id=c.id AND b.revision=c.revision AND e.status IN ('blocked','needs_review')) blocked,
+      (SELECT max(last_delivery_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_delivery_at,
+      (SELECT max(last_reconcile_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision) last_reconcile_at,
+      (SELECT min(expires_at) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
+        AND s.state NOT IN ('stopped','stop_candidate')) subscription_expires_at,
+      (SELECT count(*) FROM connection_subscriptions s WHERE s.connection_id=c.id AND s.revision=c.revision
+        AND s.state='renewal_unknown') renewal_unknown,
+      (SELECT max(last_error_at) FROM external_event_errors h WHERE h.connection_id=c.id AND h.source=c.provider) last_error_at
+      FROM connections c ORDER BY c.provider,c.id`).all(now) as Array<{
+        id: string; provider: string; state: string; revision: number;
+        dead_letter: number; blocked: number; renewal_unknown: number; [key: string]: unknown;
+      }>;
+    const cursorRows = this.db.prepare(`SELECT connection_id,revision,resource,version FROM connection_cursors
+      ORDER BY connection_id,revision,resource`).all() as Array<{connection_id:string;revision:number;resource:string;version:number}>;
+    const cursorsByConnection = new Map<string,Array<{resource:string;version:number}>>();
+    for (const {connection_id,revision,resource,version} of cursorRows) {
+      const key=JSON.stringify([connection_id,revision]); const rows=cursorsByConnection.get(key) ?? [];
+      rows.push({resource,version}); cursorsByConnection.set(key,rows);
+    }
+    const managedErrorRows = this.db.prepare(`SELECT source,connection_id,error_code,count,last_error_at FROM external_event_errors
+      ORDER BY source,connection_id,error_code`).all() as Array<{source:string;connection_id:string;error_code:string;count:number;last_error_at:string}>;
+    const managedErrorsByConnection = new Map<string,Array<{error_code:string;count:number;last_error_at:string}>>();
+    for (const {source,connection_id,error_code,count,last_error_at} of managedErrorRows) {
+      const key=JSON.stringify([source,connection_id]); const rows=managedErrorsByConnection.get(key) ?? [];
+      rows.push({error_code,count,last_error_at}); managedErrorsByConnection.set(key,rows);
+    }
+    const projected = connections.map((row) => ({ ...row,
+      cursors:cursorsByConnection.get(JSON.stringify([row.id,row.revision])) ?? [],
+      errors:managedErrorsByConnection.get(JSON.stringify([row.provider,row.id])) ?? [],
+    }));
+    const lifecycleAudit = this.db.prepare(`SELECT connection_id,action,count(*) count,max(at) last_at FROM connection_audit
+      WHERE action IN ('credential_unavailable','verification_failed','response_unknown')
+      GROUP BY connection_id,action ORDER BY connection_id,action`).all() as Array<{
+        connection_id:string;action:string;count:number;last_at:number;
+      }>;
+    const lifecycleByConnection = new Map<string,typeof lifecycleAudit>();
+    for (const row of lifecycleAudit) { const rows=lifecycleByConnection.get(row.connection_id) ?? []; rows.push(row); lifecycleByConnection.set(row.connection_id,rows); }
+    const subscriptionErrors = this.db.prepare(`SELECT s.connection_id,s.state,count(*) count,max(s.generation) latest_generation
+      FROM connection_subscriptions s JOIN connections c ON c.id=s.connection_id AND c.revision=s.revision
+      WHERE s.error IS NOT NULL GROUP BY s.connection_id,s.state ORDER BY s.connection_id,s.state`).all() as Array<{
+        connection_id:string;state:string;count:number;latest_generation:number;
+      }>;
+    const subscriptionsByConnection = new Map<string,typeof subscriptionErrors>();
+    for (const row of subscriptionErrors) { const rows=subscriptionsByConnection.get(row.connection_id) ?? []; rows.push(row); subscriptionsByConnection.set(row.connection_id,rows); }
+    for (const row of projected) {
+      const lifecycleErrors=lifecycleByConnection.get(row.id) ?? [], subscriptionErrorRows=subscriptionsByConnection.get(row.id) ?? [];
+      if (lifecycleErrors.length > 0) Object.assign(row,{lifecycle_errors:lifecycleErrors.map(({connection_id:_connectionId,...entry}) => entry)});
+      if (subscriptionErrorRows.length > 0) Object.assign(row,{subscription_errors:subscriptionErrorRows.map(({connection_id:_connectionId,...entry}) => entry)});
+    }
+    const storedIngress = this.db.prepare(`SELECT source,connection_id,outcome,latency_bucket,count,last_observed_at,last_observed_sequence,connection_revision
+      FROM external_ingress_metrics ORDER BY source,connection_id,outcome,latency_bucket`).all() as Array<{
+        source: string; connection_id: string; outcome: string; latency_bucket: string; count: number; last_observed_at: string;
+        last_observed_sequence: number; connection_revision:number;
+      }>;
+    const laneConnections = this.db.prepare(`SELECT DISTINCT source,connection_id FROM (
+      SELECT source,connection connection_id FROM queue_lanes WHERE class='external' AND connection!='unverified_legacy'
+    ) ORDER BY source,connection_id`).all() as Array<{source:string;connection_id:string}>;
+    const projectedByConnection = new Map(projected.map((row) => [JSON.stringify([row.provider,row.id]),row]));
+    const effectiveIngress = storedIngress.filter((row) => {
+      if (row.connection_id === "") return true;
+      const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
+      return currentRevision === undefined || row.connection_revision === currentRevision;
+    });
+    const unresolvedConflictRows=this.db.prepare(`SELECT source,connection_id,connection_revision,count(*) count
+      FROM external_ingress_conflicts GROUP BY source,connection_id,connection_revision`).all() as Array<{
+        source:string;connection_id:string;connection_revision:number;count:number;
+      }>;
+    const unresolvedConflictKeys=new Set(unresolvedConflictRows.filter((row)=>{
+      const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
+      return currentRevision===undefined || currentRevision===row.connection_revision;
+    }).map((row)=>JSON.stringify([row.source,row.connection_id])));
+    const unresolvedRecoveryKeys=new Set((this.db.prepare(`SELECT source,connection_id,connection_revision
+      FROM external_ingress_recoveries GROUP BY source,connection_id,connection_revision`).all() as Array<{
+        source:string;connection_id:string;connection_revision:number;
+      }>).filter((row)=>{
+        const currentRevision=projectedByConnection.get(JSON.stringify([row.source,row.connection_id]))?.revision;
+        return currentRevision===undefined || currentRevision===row.connection_revision;
+      }).map((row)=>JSON.stringify([row.source,row.connection_id])));
+    const ingressByConnection = new Map<string, typeof storedIngress>();
+    for (const row of effectiveIngress) {
+      if (row.connection_id === "") continue;
+      const key = JSON.stringify([row.source,row.connection_id]);
+      const rows = ingressByConnection.get(key) ?? [];
+      rows.push(row);
+      ingressByConnection.set(key, rows);
+    }
+    const connectionKeys = new Set(ingressByConnection.keys());
+    for (const key of unresolvedConflictKeys) connectionKeys.add(key);
+    for (const key of unresolvedRecoveryKeys) connectionKeys.add(key);
+    for (const row of laneConnections) connectionKeys.add(JSON.stringify([row.source,row.connection_id]));
+    for (const row of projected) if (row.state!=="disabled" &&
+      activeUnmanagedConnections?.has(JSON.stringify([row.provider,"*"]))===true) {
+      connectionKeys.add(JSON.stringify([row.provider,row.id]));
+    }
+    for (const key of activeUnmanagedConnections ?? []) {
+      const [,connection] = JSON.parse(key) as [string,string];
+      if (connection !== "*") connectionKeys.add(key);
+    }
+    const terminalRows = this.db.prepare(`SELECT l.source,l.connection connection_id,
+      sum(e.status IN ('blocked','needs_review')) blocked,sum(e.status='dead_letter') dead_letter,
+      sum(e.status!='completed') active_events,max(e.updated_at) last_event_at
+      FROM queue_events q JOIN queue_lanes l USING(lane) JOIN events e USING(event_id)
+      WHERE l.class='external' GROUP BY l.source,l.connection`).all() as Array<{
+        source:string;connection_id:string;blocked:number;dead_letter:number;active_events:number;last_event_at:string;
+      }>;
+    const terminalsByConnection = new Map(terminalRows.map((row) => [JSON.stringify([row.source,row.connection_id]),row]));
+    const eventErrors = managedErrorRows;
+    const errorsByConnection = new Map<string,typeof eventErrors>();
+    for (const row of eventErrors) {
+      const key = JSON.stringify([row.source,row.connection_id]);
+      const rows = errorsByConnection.get(key) ?? []; rows.push(row); errorsByConnection.set(key,rows);
+    }
+    const ingressConnections = [...connectionKeys].sort().map((key) => {
+        const [source,connectionId] = JSON.parse(key) as [string,string];
+        const rows = ingressByConnection.get(key) ?? [];
+        const latest = (predicate: (outcome:string) => boolean) => rows.filter((row) => predicate(row.outcome))
+          .sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
+        const successRow = latest((outcome) => outcome === "created");
+        const duplicateRow = latest((outcome) => outcome === "duplicate_same");
+        const verificationDuplicateRow = latest((outcome) => outcome === "verification_duplicate_same");
+        const controlRow = latest((outcome) => outcome === "control_acknowledged");
+        const controlFailureRow = latest((outcome) => outcome === "control_acknowledgement_unavailable");
+        const failureRows = rows.filter((row) => !["created","duplicate_same","control_acknowledged"].includes(row.outcome) &&
+          (!row.outcome.startsWith("verification_") || row.outcome === "verification_duplicate_conflict"));
+        const failureRow = [...failureRows].sort((left,right) => right.last_observed_sequence-left.last_observed_sequence)[0];
+        const success = successRow?.last_observed_at ?? null;
+        const control = controlRow?.last_observed_at ?? null;
+        const failure = failureRow?.last_observed_at ?? null;
+        const errors = errorsByConnection.get(key) ?? [];
+        const terminal = terminalsByConnection.get(key);
+        const blocked = terminal?.blocked ?? 0, deadLetter = terminal?.dead_letter ?? 0;
+        const managedState = projectedByConnection.get(key)?.state;
+        const hasUnresolvedConflict=unresolvedConflictKeys.has(key);
+        const hasUnresolvedRecovery=unresolvedRecoveryKeys.has(key);
+        const allFailuresRecovered = failureRows.every((failure) => {
+          const recoverySequence=["acknowledgement_unavailable","post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+            "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout"].includes(failure.outcome)
+            ? Math.max(successRow?.last_observed_sequence ?? 0,duplicateRow?.last_observed_sequence ?? 0)
+            : failure.outcome === "control_acknowledgement_unavailable" ? controlRow?.last_observed_sequence ?? 0
+            : failure.outcome === "verification_duplicate_conflict" ? verificationDuplicateRow?.last_observed_sequence ?? 0
+            : failure.outcome === "duplicate_conflict" ? duplicateRow?.last_observed_sequence ?? 0
+            : successRow?.last_observed_sequence ?? 0;
+          return recoverySequence > failure.last_observed_sequence;
+        });
+        const unresolvedVerificationConflict=(latest((outcome)=>outcome==="verification_duplicate_conflict")?.last_observed_sequence ?? 0) >
+          (verificationDuplicateRow?.last_observed_sequence ?? 0);
+        const unresolvedControlFailure=(controlFailureRow?.last_observed_sequence ?? 0) > (controlRow?.last_observed_sequence ?? 0);
+        const runtimeRegistered=activeUnmanagedConnections?.has(key) === true ||
+          (managedState !== undefined && activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true) ||
+          (activeUnmanagedConnections?.has(JSON.stringify([source,"*"])) === true &&
+            (rows.some((row)=>row.last_observed_sequence>this.runtimeObservationFloor &&
+              !row.outcome.startsWith("verification_") && !row.outcome.startsWith("control_")) ||
+              !allFailuresRecovered || unresolvedVerificationConflict || unresolvedControlFailure || hasUnresolvedConflict ||
+              hasUnresolvedRecovery || Number(terminal?.active_events ?? 0)>0));
+        const state = managedState ?? (activeUnmanagedConnections !== undefined && !runtimeRegistered ? "retired" : "unmanaged");
+        const requiresIngressSuccess=runtimeRegistered;
+        const recoveredPersistedEvent = failureRows.some((failure) =>
+          ["acknowledgement_unavailable_after_created","post_persist_created_timeout"].includes(failure.outcome) &&
+          (duplicateRow?.last_observed_sequence ?? 0) > Math.max(failure.last_observed_sequence,this.runtimeObservationFloor));
+        const currentProcessSuccess = (successRow?.last_observed_sequence ?? 0) > this.runtimeObservationFloor;
+        const dataPathObserved = requiresIngressSuccess ?
+          currentProcessSuccess || recoveredPersistedEvent : managedState !== undefined || currentProcessSuccess;
+        return { source, connection_id: connectionId, state,
+          ready: ["disabled","retired"].includes(state) || (dataPathObserved && allFailuresRecovered && !hasUnresolvedConflict &&
+            !hasUnresolvedRecovery && blocked === 0 && deadLetter === 0),
+          last_success_at: success, last_control_at: control, last_error_at: failure,
+          ...(errors.length > 0 ? {last_event_error_at:errors.map((row) => row.last_error_at).sort().at(-1)!,
+            errors:errors.map(({source:_source,connection_id:_connectionId,...row}) => row)} : {}),
+          blocked, dead_letter: deadLetter };
+      });
+    const ingress = effectiveIngress.map(({last_observed_sequence: _sequence,connection_revision:_revision, ...row}) =>
+      ({ ...row, connection_id: row.connection_id === "" ? null : row.connection_id }));
+    const sourceSuccessSequence = new Map<string,number>();
+    for (const row of effectiveIngress) if (row.outcome === "created") {
+      sourceSuccessSequence.set(row.source,Math.max(sourceSuccessSequence.get(row.source) ?? 0,row.last_observed_sequence));
+    }
+    const createdPersistFailureOutcomes=new Set(["acknowledgement_unavailable_after_created","post_persist_created_timeout"]);
+    const connectionDataPathSequence=new Map<string,number>();
+    for (const [key,rows] of ingressByConnection) {
+      let dataPathSequence=Math.max(0,...rows.filter((row)=>row.outcome==="created").map((row)=>row.last_observed_sequence));
+      const duplicateSequence=Math.max(0,...rows.filter((row)=>row.outcome==="duplicate_same").map((row)=>row.last_observed_sequence));
+      for (const failure of rows) if (createdPersistFailureOutcomes.has(failure.outcome) && duplicateSequence>failure.last_observed_sequence) {
+        sourceSuccessSequence.set(failure.source,Math.max(sourceSuccessSequence.get(failure.source) ?? 0,duplicateSequence));
+        dataPathSequence=Math.max(dataPathSequence,duplicateSequence);
+      }
+      connectionDataPathSequence.set(key,dataPathSequence);
+    }
+    const activeRuntimeKeys=[...activeUnmanagedConnections ?? []].map((key) => JSON.parse(key) as [string,string]);
+    const gateRuntimeKeys=activeRuntimeKeys.filter(([source,connection]) => connection === "*" ||
+      projectedByConnection.get(JSON.stringify([source,connection]))?.state !== "disabled");
+    const activeRuntimeSources = new Set(gateRuntimeKeys.map(([source]) => source));
+    const sourceGateOutcomes=new Set(["dependency_unavailable","processing_timeout","persistence_unavailable","registration_mismatch"]);
+    const unattributedDependenciesReady = effectiveIngress.filter((row) => row.connection_id === "" && sourceGateOutcomes.has(row.outcome))
+      .every((row) => !(activeRuntimeSources.has(row.source) || projected.some((connection) => connection.provider === row.source && connection.state !== "disabled")) ||
+        gateRuntimeKeys.filter(([source,connection]) => source === row.source && connection !== "*").every(([source,connection]) =>
+          (connectionDataPathSequence.get(JSON.stringify([source,connection])) ?? 0) > row.last_observed_sequence) &&
+        (gateRuntimeKeys.some(([source,connection]) => source === row.source && connection !== "*") ||
+          (sourceSuccessSequence.get(row.source) ?? 0) > row.last_observed_sequence));
+    const registeredManagedReady = projected.every((connection) => connection.state === "disabled" ||
+      !["github","notion","figma","google-drive"].includes(connection.provider) || activeUnmanagedConnections?.has(JSON.stringify([connection.provider,connection.id])) === true ||
+      activeUnmanagedConnections?.has(JSON.stringify([connection.provider,"*"])) === true);
+    const legacyExternalReady=(this.db.prepare(`SELECT count(*) count FROM queue_events q JOIN queue_lanes l USING(lane)
+      JOIN events e USING(event_id) WHERE l.class='external' AND l.connection='unverified_legacy' AND e.status!='completed'`)
+      .pluck().get() as number)===0;
+    const activeObservationLatches=[...this.failedObservationLatches].filter(([key,latch]) => {
+      const [source,connectionId,revision]=JSON.parse(key) as [string,string,number];
+      if (source === "*") return gateRuntimeKeys.length>0 || projected.some((connection)=>connection.state!=="disabled");
+      if (connectionId === "") {
+        if (![...latch.outcomes].some((outcome)=>sourceGateOutcomes.has(outcome))) return false;
+        const concrete=gateRuntimeKeys.filter(([candidate,candidateConnection])=>candidate===source && candidateConnection!=="*");
+        if (concrete.length>0) return concrete.some(([candidate,candidateConnection])=>
+          (connectionDataPathSequence.get(JSON.stringify([candidate,candidateConnection])) ?? 0)<=latch.boundary);
+        return activeRuntimeSources.has(source) && (sourceSuccessSequence.get(source) ?? 0)<=latch.boundary;
+      }
+      const managedKey=JSON.stringify([source,connectionId]);
+      const managedConnection=projectedByConnection.get(managedKey);
+      if (managedConnection !== undefined) return managedConnection.state!=="disabled" && managedConnection.revision===revision;
+      if (activeUnmanagedConnections?.has(managedKey)===true) return true;
+      const terminal=terminalsByConnection.get(managedKey);
+      const persistedEventLatch=[...latch.outcomes].some((outcome)=>["created","duplicate_same","acknowledgement_unavailable",
+        "post_persist_timeout","acknowledgement_unavailable_after_created","post_persist_created_timeout",
+        "acknowledgement_unavailable_after_duplicate","post_persist_duplicate_timeout",
+        "processing_timeout","dependency_unavailable","persistence_unavailable","registration_mismatch",
+        "control_acknowledgement_unavailable","verification_created","verification_duplicate_same","verification_duplicate_conflict",
+        "verification_acknowledgement_unavailable_after_created","verification_post_persist_created_timeout",
+        "verification_acknowledgement_unavailable_after_duplicate","verification_post_persist_duplicate_timeout"].includes(outcome));
+      const queueFailureLatch=[...latch.outcomes].some((outcome)=>
+        ["queue_depth","queue_bytes","queue_rate","queue_lanes","queue_deliveries","queue_quiescing"].includes(outcome));
+      return activeUnmanagedConnections?.has(JSON.stringify([source,"*"]))===true &&
+        (persistedEventLatch || (queueFailureLatch && (terminal===undefined || Date.parse(terminal.last_event_at)<=latch.observedAt)) ||
+          (connectionDataPathSequence.get(managedKey) ?? 0)>this.runtimeObservationFloor || Number(terminal?.active_events ?? 0)>0);
+    });
+    const wildcardRuntimeReady=gateRuntimeKeys.filter(([,connection])=>connection==="*").every(([source])=>
+      (sourceSuccessSequence.get(source) ?? 0)>this.runtimeObservationFloor);
+    return {
+      schema_version: 1,
+      observed_at: at.toISOString(),
+      ready: writable && activeObservationLatches.length === 0 && wildcardRuntimeReady && registeredManagedReady && legacyExternalReady && unattributedDependenciesReady && this.connections.health().ready && projected.every((row) => row.state === "disabled" ||
+        (Number(row.dead_letter) === 0 && Number(row.blocked) === 0 && Number(row.renewal_unknown) === 0)) &&
+        ingressConnections.every((row) => ["disabled","retired"].includes(row.state) || row.ready),
+      writable,
+      connections: projected,
+      ingress_connections: ingressConnections,
+      ingress,
+      queue: this.queueHealth(at),
+    };
   }
 
   private migrate(): void {

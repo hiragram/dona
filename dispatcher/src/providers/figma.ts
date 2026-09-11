@@ -74,6 +74,7 @@ export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceReg
   }
   return {
     source: "figma",
+    connectionIds: [config.connectionId],
     maxBodyBytes: 256 * 1_024,
     bodyTimeoutMs: 5_000,
     processingTimeoutMs: 5_000,
@@ -83,7 +84,9 @@ export function figmaIngress(config: FigmaIngressConfig): ExternalEventSourceReg
       if (passcode === undefined || !equalSecret(passcode, config.passcode)) {
         throw new ExternalIngressAuthenticationError();
       }
-      return { connectionId: config.connectionId, resourceId: config.fileKey, principal: { kind: "figma_webhook" } };
+      const webhookId=typeof (parsed as Record<string,unknown>).webhook_id==="string"
+        ? (parsed as Record<string,string>).webhook_id : "";
+      return { connectionId: config.connectionId, resourceId: config.fileKey, principal: { kind: "figma_webhook",webhook_id:webhookId } };
     },
     normalize(request) {
       const parsed = payloadSchema.safeParse(decode(request.body));

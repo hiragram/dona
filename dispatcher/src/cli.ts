@@ -19,6 +19,7 @@ function usage(): never {
   dona-dispatcher serve
   dona-dispatcher queue status
   dona-dispatcher queue deliveries <event_id>
+  dona-dispatcher external-events health
   dona-dispatcher event list [--status STATUS]
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
@@ -47,10 +48,19 @@ async function main(): Promise<void> {
     console.log(JSON.stringify(runConnectionCli(config.databasePath, args.slice(1)), null, 2));
     return;
   }
-  if (!["event", "job", "queue"].includes(args[0]!)) usage();
+  if (!["event", "job", "queue", "external-events"].includes(args[0]!)) usage();
   const command = args[1];
-  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
+  const database = new DispatcherDatabase(config.databasePath, config.queuePolicy, undefined,
+    {readOnly:args[0] === "external-events" && command === "health"});
   try {
+    if (args[0] === "external-events") {
+      if (command === "health") {
+        const health = database.externalReleaseHealth();
+        console.log(JSON.stringify({ ...health, ready:false, service_ready:null, evidence_scope:"offline_database" }, null, 2));
+        return;
+      }
+      usage();
+    }
     if (args[0] === "queue") {
       if (command === "status") { console.log(JSON.stringify(database.queueHealth(),null,2)); return; }
       if (command === "deliveries") { console.log(JSON.stringify(database.queueDispatchMetadata(eventIdAt(args,2)),null,2)); return; }

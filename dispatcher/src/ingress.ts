@@ -49,13 +49,18 @@ export class ExternalIngressTimeoutError extends Error {
     this.name = "ExternalIngressTimeoutError";
   }
 }
+export class ExternalIngressPostPersistTimeoutError extends ExternalIngressTimeoutError {
+  constructor(readonly persistedOutcome: EnqueueResult["outcome"],readonly externalEventId: string,readonly verification: boolean) { super(); }
+}
 
 export class ExternalIngressAcknowledgementError extends Error {
-  constructor() {
+  constructor(readonly persistedOutcome?: EnqueueResult["outcome"],readonly externalEventId?:string,readonly verification=false) {
     super("Provider acknowledgement could not be built");
     this.name = "ExternalIngressAcknowledgementError";
   }
 }
+export class ExternalIngressControlAcknowledgementError extends ExternalIngressAcknowledgementError {}
+export class ExternalIngressRegistrationMismatchError extends ExternalIngressValidationError {}
 
 export interface RawIngressRequest {
   readonly body: Buffer;
@@ -92,11 +97,31 @@ export interface PersistReceipt {
   readonly eventId: string;
   readonly sequence: number;
   readonly source: ExternalEventSource;
+  /** 認証済みbindingから得た値。provider ACKへ含めず、内部観測だけに使う。 */
+  readonly connectionId: string;
+  /** 認証・永続化時に束縛されたmanaged connection revision。unmanagedは0。 */
+  readonly connectionRevision: number;
   readonly externalEventId: string;
   readonly outcome: EnqueueResult["outcome"];
   readonly committedAt: string;
   readonly admission?: AdmissionCode;
   readonly ackAllowed?: boolean;
+  readonly control?: true;
+  readonly verification?: true;
+}
+
+const authenticatedConnection = Symbol("authenticatedConnection");
+type AuthenticatedError = Error & { [authenticatedConnection]?: {connectionId:string;revision?:number} };
+export function bindAuthenticatedError(error: unknown, connectionId: string, revision?: number): unknown {
+  if (error instanceof Error) (error as AuthenticatedError)[authenticatedConnection] =
+    {connectionId,...(revision === undefined ? {} : {revision})};
+  return error;
+}
+export function authenticatedConnectionId(error: unknown): string | undefined {
+  return error instanceof Error ? (error as AuthenticatedError)[authenticatedConnection]?.connectionId : undefined;
+}
+export function authenticatedConnectionRevision(error: unknown): number | undefined {
+  return error instanceof Error ? (error as AuthenticatedError)[authenticatedConnection]?.revision : undefined;
 }
 
 export interface ExternalIngressAcknowledgement {
@@ -113,6 +138,7 @@ export interface PreparedExternalIngressAcknowledgement {
 
 export interface ExternalEventSourceRegistration {
   readonly source: string;
+  readonly connectionIds?: readonly string[];
   readonly maxBodyBytes: number;
   readonly bodyTimeoutMs: number;
   readonly processingTimeoutMs: number;
@@ -169,7 +195,13 @@ export class ExternalIngressRegistry {
 
   register(registration: ExternalEventSourceRegistration): void {
     const source = externalEventSource(registration.source);
+    if (registration.connectionIds !== undefined && registration.connectionIds.length === 0) {
+      throw new Error("connectionIds must be omitted or contain at least one connection");
+    }
     if (this.registrations.has(source)) throw new Error(`External event source is already registered: ${source}`);
+    if (registration.connectionIds?.some((connectionId) => !connectionIdPattern.test(connectionId))) {
+      throw new Error("External event source has an invalid connection identifier");
+    }
     for (const [value, name] of [
       [registration.maxBodyBytes, "maxBodyBytes"],
       [registration.bodyTimeoutMs, "bodyTimeoutMs"],
@@ -190,6 +222,15 @@ export class ExternalIngressRegistry {
     }
     const registration = this.registrations.get(source);
     return registration ? { source, registration } : undefined;
+  }
+
+  activeConnectionKeys(): ReadonlySet<string> {
+    const keys = new Set<string>();
+    for (const [source,registration] of this.registrations) {
+      if (registration.connectionIds === undefined) keys.add(JSON.stringify([source,"*"]));
+      else for (const connectionId of registration.connectionIds) keys.add(JSON.stringify([source,connectionId]));
+    }
+    return keys;
   }
 }
 
@@ -339,6 +380,8 @@ export class ExternalIngressProcessor {
     return this.registry.get(source);
   }
 
+  activeConnectionKeys(): ReadonlySet<string> { return this.registry.activeConnectionKeys(); }
+
   async process(
     source: ExternalEventSource,
     registration: ExternalEventSourceRegistration,
@@ -365,13 +408,21 @@ export class ExternalIngressProcessor {
     }
 
     const verifiedConnectionId = verified.connectionId;
+    const verifiedRevision = verified.connection?.revision ?? 0;
+    if (registration.connectionIds !== undefined && !registration.connectionIds.includes(verifiedConnectionId)) {
+      throw bindAuthenticatedError(new ExternalIngressRegistrationMismatchError(),verifiedConnectionId,verifiedRevision);
+    }
     let owner: ProviderOwner | undefined;
-    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) throw new ExternalIngressAuthenticationError();
+    if (verifiedBinding && verified.resourceId !== undefined && verified.resourceId !== verifiedBinding.resource) {
+      throw bindAuthenticatedError(new ExternalIngressAuthenticationError(),verifiedConnectionId,verifiedRevision);
+    }
     const verifiedResourceId = verifiedBinding?.resource ?? verified.resourceId;
     if (verifiedResourceId !== undefined) {
       const parsed = eventOwnerSchema.safeParse({ kind: "provider_resource", source,
         connection_id: verifiedConnectionId, resource_id: verifiedResourceId });
-      if (!parsed.success || parsed.data.kind !== "provider_resource") throw new ExternalIngressAuthenticationError();
+      if (!parsed.success || parsed.data.kind !== "provider_resource") {
+        throw bindAuthenticatedError(new ExternalIngressAuthenticationError(),verifiedConnectionId,verifiedRevision);
+      }
       owner = parsed.data;
     }
     let normalized: NormalizedExternalEvent;
@@ -383,8 +434,8 @@ export class ExternalIngressProcessor {
       normalized = validateNormalizedExternalEvent(registration.parseNormalized(candidate));
       remainingProcessingTime(processingDeadline);
     } catch (error) {
-      if (error instanceof ExternalIngressTimeoutError) throw error;
-      throw new ExternalIngressValidationError();
+      if (error instanceof ExternalIngressTimeoutError) throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision);
+      throw bindAuthenticatedError(new ExternalIngressValidationError(), verifiedConnectionId,verifiedRevision);
     }
 
     const envelope: EventEnvelope = {
@@ -398,43 +449,61 @@ export class ExternalIngressProcessor {
       reply_target: normalized.replyTarget,
       ...(normalized.trace === undefined ? {} : { trace: normalized.trace }),
     };
-    const controlAcknowledgement = registration.controlAcknowledgement?.(normalized);
+    let controlAcknowledgement: ExternalIngressAcknowledgement | undefined;
+    try { controlAcknowledgement = registration.controlAcknowledgement?.(normalized); }
+    catch { throw bindAuthenticatedError(new ExternalIngressControlAcknowledgementError(),verifiedConnectionId,verifiedRevision); }
     if (controlAcknowledgement !== undefined) {
+      let acknowledgement: PreparedExternalIngressAcknowledgement;
+      try { acknowledgement = validateAcknowledgement(controlAcknowledgement); }
+      catch { throw bindAuthenticatedError(new ExternalIngressControlAcknowledgementError(),verifiedConnectionId,verifiedRevision); }
       return {
         receipt: {
           schemaVersion: 1,
           eventId: "control",
           sequence: 0,
           source,
+          connectionId: verifiedConnectionId,
+          connectionRevision: verifiedRevision,
           externalEventId: envelope.external_event_id,
           outcome: "duplicate_same",
           committedAt: request.receivedAt,
           ackAllowed: true,
+          control: true,
         },
-        acknowledgement: validateAcknowledgement(controlAcknowledgement),
+        acknowledgement,
       };
     }
-    if (owner && envelope.reply_target !== null) throw new ExternalIngressValidationError();
-    const signal = registration.queueSignal?.(normalized, verified);
-    const result = persist(envelope, {
-      connectionId: verifiedConnectionId,
-      ...(signal ? { coalesce: signal } : {}),
-      ...(verifiedBinding ? { binding: verifiedBinding } : {}),
-      ...(owner ? { owner } : {}),
-      ...(verified.purpose === "verification" ? { verification: true as const,
-        ...(verified.verificationCommit ? { verificationCommit: verified.verificationCommit } : {}) } : {}),
-    });
-    remainingProcessingTime(processingDeadline);
+    if (owner && envelope.reply_target !== null) throw bindAuthenticatedError(new ExternalIngressValidationError(),verifiedConnectionId,verifiedRevision);
+    let signal: QueueAdmissionContext["coalesce"];
+    try { signal = registration.queueSignal?.(normalized, verified); }
+    catch (error) { throw bindAuthenticatedError(error,verifiedConnectionId,verifiedRevision); }
+    let result: EnqueueResult;
+    try {
+      result = persist(envelope, {
+        connectionId: verifiedConnectionId,
+        ...(signal ? { coalesce: signal } : {}),
+        ...(verifiedBinding ? { binding: verifiedBinding } : {}),
+        ...(owner ? { owner } : {}),
+        ...(verified.purpose === "verification" ? { verification: true as const,
+          ...(verified.verificationCommit ? { verificationCommit: verified.verificationCommit } : {}) } : {}),
+      });
+    } catch (error) { throw bindAuthenticatedError(error, verifiedConnectionId,verifiedRevision); }
+    try { remainingProcessingTime(processingDeadline); }
+    catch { throw bindAuthenticatedError(new ExternalIngressPostPersistTimeoutError(result.outcome,envelope.external_event_id,
+      verified.purpose==="verification"),verifiedConnectionId,verifiedRevision); }
     const receipt: PersistReceipt = {
       schemaVersion: 1,
       eventId: result.row.event_id,
       sequence: result.row.sequence,
       source,
+      connectionId: verifiedConnectionId,
+      connectionRevision: verifiedRevision,
       externalEventId: envelope.external_event_id,
       outcome: result.outcome,
       committedAt: result.committedAt ?? result.row.created_at,
       admission: result.admission ?? result.outcome,
       ackAllowed: result.outcome !== "duplicate_conflict",
+      ...(verified.purpose === "verification" ? { verification: true as const } : {}),
     };
     if (result.outcome === "duplicate_conflict") return { receipt, acknowledgement: null };
 
@@ -442,7 +511,8 @@ export class ExternalIngressProcessor {
     try {
       acknowledgement = validateAcknowledgement(registration.buildAcknowledgement(receipt));
     } catch {
-      throw new ExternalIngressAcknowledgementError();
+      throw bindAuthenticatedError(new ExternalIngressAcknowledgementError(result.outcome,envelope.external_event_id,
+        verified.purpose==="verification"), verifiedConnectionId,verifiedRevision);
     }
     return { receipt, acknowledgement };
   }

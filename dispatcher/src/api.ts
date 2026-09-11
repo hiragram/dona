@@ -12,12 +12,18 @@ import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import {
   ExternalIngressAcknowledgementError,
+  ExternalIngressControlAcknowledgementError,
   ExternalIngressAuthenticationError,
   ExternalIngressProcessor,
   ExternalIngressRegistry,
   ExternalIngressTimeoutError,
+  ExternalIngressPostPersistTimeoutError,
+  ExternalIngressRegistrationMismatchError,
   ExternalIngressUnavailableError,
   ExternalIngressValidationError,
+  authenticatedConnectionId,
+  authenticatedConnectionRevision,
+  bindAuthenticatedError,
   type PreparedExternalIngressAcknowledgement,
   type RawIngressRequest,
 } from "./ingress.js";
@@ -251,6 +257,13 @@ export class DispatcherApi {
         sendJson(response, 200, this.database.queueHealth());
         return;
       }
+      if (request.method === "GET" && url.pathname === "/v1/external-events/health") {
+        const health = this.database.externalReleaseHealth(new Date(),this.externalIngress.activeConnectionKeys());
+        const serviceReady = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
+        sendJson(response, 200, { ...health, ready: health.ready && serviceReady, service_ready: serviceReady });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -441,6 +454,8 @@ export class DispatcherApi {
         sendJson(response, 401, errorBody("authentication_failed", "Provider authentication failed"));
       } else if (error instanceof ExternalIngressUnavailableError) {
         sendJson(response, 503, errorBody("ingress_dependency_unavailable", "Provider ingress dependency is temporarily unavailable"));
+      } else if (error instanceof ExternalIngressRegistrationMismatchError) {
+        sendJson(response, 503, errorBody("registration_mismatch", "Provider ingress registration is temporarily inconsistent"));
       } else if (error instanceof ExternalIngressValidationError) {
         sendJson(response, 400, errorBody("invalid_provider_event", "Provider event is invalid"));
       } else if (error instanceof ExternalIngressAcknowledgementError) {
@@ -477,6 +492,7 @@ export class DispatcherApi {
   }
 
   private async handleExternalIngress(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    const startedAt = performance.now();
     if (request.method !== "POST" || url.pathname.split("/").length !== 4) {
       throw new ApiRequestError(404, "not_found", "Route not found", true);
     }
@@ -507,15 +523,27 @@ export class DispatcherApi {
     // 未認証 request が認証済み delivery の source quota を消費しないよう、共有 bucket はここに置かない。
     // raw body の size/time limit 後、認証済み connection 単位の durable queue admission が rate を制限する。
     const monotonicNow = performance.now();
+    const observe = (connectionId: string | undefined, outcome: string, connectionRevision?: number, deliveryId?: string): boolean => {
+      const latency = performance.now() - startedAt;
+      return this.database.recordExternalIngress(resolved.source, connectionId, outcome, latency, undefined, connectionRevision,deliveryId);
+    };
     const declaredLength = Number(request.headers["content-length"] ?? 0);
     const bodyLimit = Math.min(this.config.requestMaxBytes, resolved.registration.maxBodyBytes);
     if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
       request.resume();
+      observe(undefined, "body_too_large");
       throw new BodyTooLargeError();
     }
     const receivedAt = new Date().toISOString();
+    let body: Buffer;
+    try { body = await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs); }
+    catch (error) {
+      observe(undefined, error instanceof BodyTooLargeError ? "body_too_large" :
+        error instanceof BodyReadTimeoutError ? "body_timeout" : "body_incomplete");
+      throw error;
+    }
     const rawRequest: RawIngressRequest = Object.freeze({
-      body: await readBody(request, bodyLimit, resolved.registration.bodyTimeoutMs),
+      body,
       headers: rawHeaders(request),
       method: "POST",
       requestTarget: request.url!,
@@ -538,6 +566,25 @@ export class DispatcherApi {
         },
       );
     } catch (error) {
+      const outcome = error instanceof ExternalIngressRegistrationMismatchError ? "registration_mismatch" :
+        error instanceof ExternalIngressAuthenticationError ? "authentication_failed" :
+        error instanceof ExternalIngressValidationError ? "invalid_event" :
+        error instanceof ExternalIngressPostPersistTimeoutError ?
+          (error.persistedOutcome === "duplicate_conflict" ? `${error.verification ? "verification_" : ""}duplicate_conflict` :
+            `${error.verification ? "verification_" : ""}${error.persistedOutcome === "created" ? "post_persist_created_timeout" : "post_persist_duplicate_timeout"}`) :
+        error instanceof ExternalIngressTimeoutError ? "processing_timeout" :
+        error instanceof ExternalIngressUnavailableError ? "dependency_unavailable" :
+        error instanceof ExternalIngressControlAcknowledgementError ? "control_acknowledgement_unavailable" :
+        error instanceof ExternalIngressAcknowledgementError ?
+          `${error.verification ? "verification_" : ""}${error.persistedOutcome === "created" ? "acknowledgement_unavailable_after_created" : "acknowledgement_unavailable_after_duplicate"}` :
+        error instanceof QueueAdmissionError ? error.code : error instanceof ConnectionError ? error.code : "persistence_unavailable";
+      const connectionId = authenticatedConnectionId(error);
+      const connectionRevision = authenticatedConnectionRevision(error);
+      if (!observe(connectionId, outcome, connectionRevision,error instanceof ExternalIngressPostPersistTimeoutError ||
+        error instanceof ExternalIngressAcknowledgementError ? error.externalEventId : undefined)) {
+        throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),
+          connectionId ?? "unattributed");
+      }
       if (
         error instanceof ConnectionError ||
         error instanceof QueueAdmissionError ||
@@ -549,10 +596,16 @@ export class DispatcherApi {
       ) {
         throw error;
       }
-      throw new PersistenceUnavailableError("External event could not be persisted");
+      throw bindAuthenticatedError(new PersistenceUnavailableError("External event could not be persisted"),
+        authenticatedConnectionId(error) ?? "unattributed");
     }
 
     const { receipt } = result;
+    const observedOutcome = receipt.control === true ? "control_acknowledged" :
+      receipt.verification === true ? `verification_${receipt.outcome}` : receipt.outcome;
+    if (!observe(receipt.connectionId, observedOutcome, receipt.connectionRevision,receipt.externalEventId)) {
+      throw bindAuthenticatedError(new PersistenceUnavailableError("External ingress observation could not be persisted"),receipt.connectionId);
+    }
     if (receipt.outcome === "duplicate_conflict") {
       this.logger.warn("External event duplicate conflicts with persisted content", {
         event_id: receipt.eventId,

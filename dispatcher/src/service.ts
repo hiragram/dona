@@ -2,7 +2,7 @@ import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
-import { ExternalIngressRegistry, type ExternalEventSourceRegistration } from "./ingress.js";
+import { ExternalIngressRegistry, ExternalIngressUnavailableError, type ExternalEventSourceRegistration } from "./ingress.js";
 import { githubPilotRegistration } from "./providers/github.js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -136,7 +136,31 @@ export async function runService(
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, config.queuePolicy);
   externalIngressRegistry ??= serviceExternalIngressRegistry(config, database);
-  for (const registration of additionalRegistrations) externalIngressRegistry.register(registration);
+  for (const registration of additionalRegistrations) {
+    if (registration.source !== "figma") { externalIngressRegistry.register(registration); continue; }
+    externalIngressRegistry.register({...registration,async authenticate(request) {
+      const verified=await registration.authenticate(request);
+      let lookup;
+      try {
+        database.connections.assertCurrentClock(verified.connectionId);
+        const connection=database.connections.get(verified.connectionId);
+        lookup={connection,subscriptions:database.connections.subscriptions(connection.id)};
+      } catch (error) {
+        if (error instanceof ConnectionError && error.code!=="clock_skew") throw error;
+        throw new ExternalIngressUnavailableError();
+      }
+      const {connection,subscriptions}=lookup;
+      if (connection.provider!=="figma" || connection.state!=="active" || verified.resourceId===undefined) {
+        throw new Error("Figma connection is not active");
+      }
+      const subscription=subscriptions.filter((candidate)=>candidate.resource===verified.resourceId &&
+          candidate.providerId===verified.principal.webhook_id && candidate.revision===connection.revision && candidate.verifiedAt!==null &&
+          (candidate.expiresAt===null || candidate.expiresAt>Date.now()) && ["active","expiring","stop_candidate"].includes(candidate.state)).at(-1);
+      if (!subscription) throw new Error("Figma subscription is not active");
+      return {...verified,connection:{account:connection.account,revision:connection.revision,
+        credentialRevision:connection.credentialRevision,resource:verified.resourceId,generation:subscription.generation}};
+    }});
+  }
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   const herdr = new HerdrProcessClient({
     executable: config.herdrPath,
