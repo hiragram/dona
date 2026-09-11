@@ -168,4 +168,3 @@ Codex host approvalは、Codexがtoolやcommandを実行してよいかをhost�
 - approval UXが利用可能でも、安全なresume/execution完成まではwriteが無効です。
 - supervisorがprivate contextを閲覧できない場合、一部requestは承認画面を作らず停止します。
 - audit可能性と引き換えに永続metadataを保持するため、retentionとbackup deletionを運用対象にします。
-
