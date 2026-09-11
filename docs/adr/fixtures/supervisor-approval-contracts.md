@@ -168,6 +168,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - pending noticeのdispatching transactionでもcurrent request state/revisionとTTLを再検証
 - 同一boot IDのcontinuous clockだけをprocess再起動後の経過証明に使い、boot変更/証明不能なら未完了requestを失効
 - boot変更/経過証明不能ではclaimed attemptを外部callなしでneeds_review、executingをunknown経由のneeds_reviewとしてpayload削除
+- boot変更/経過証明不能時に既存のacceptance_unknown attemptもpayload即時削除・needs_reviewへ固定
 - restore current binding/policyはgenerationに加えて予約済みcanonical digestとcommit transaction IDも完全一致必須
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更

@@ -71,6 +71,8 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 採用: request/decision TTLは15分、承認後のconsume TTLは5分です。request作成時の`expires_at`とapproval時の`consume_expires_at`はDBへ保存し、transactionごとのUTC high-water markはDB/backup外のrollback-resistant credential storeへintegrity保護して保存します。process内ではmonotonic elapsed timeとwall clockの大きい方を有効時刻とします。同じOS bootを識別する認証済みboot IDとsuspendを含むcontinuous-clock readingもrequest/mark/attemptへ保存し、process再起動後はboot ID一致時だけ保存済みreadingからの経過を期限判定へ使います。boot ID変更、continuous clockの巻戻し/取得不能、または再起動を越えた経過を証明不能な場合は、既存の全nonterminal/approved requestに加え、外部call未開始の`claimed` attemptを外部callなしで`needs_review`へ固定してpayloadを削除します。`executing` attemptは送信済みの可能性を保ったまま`acceptance_unknown`から`needs_review`へ収束させ、payloadを削除して再送しません。時刻を伴うDB transactionの前に、transaction ID、直前mark、候補markを結合したwrite-ahead reservationを、保存済み直前markを条件とする原子的compare-and-swapでcredential storeへdurable commitし、DB rowはそのreservation IDと候補markを参照してからcommitします。stale reservation、CAS競合、mark writeの失敗・結果不明ではDB transactionを開始せずapproval経路をfail closedにします。候補markはcurrent mark未満を許さず、小さい遅着writeで上書きできません。DB commit前のcrashで未使用reservationが残った場合もmarkを巻き戻さず、安全側に時刻が進んだものとして扱います。再起動/restore後にmarkが欠落、読取不能、integrity不明、DB参照との不一致、wall clockが保存済みmarkより前、または許容driftを超える時刻異常なら、時刻とmarkが安全に回復するまで全nonterminal/approved requestをexpireまたは`needs_review`としてfail closedし、期限を延長しません。
 
+すでに`acceptance_unknown`のattemptもboot変更または経過証明不能時には保持開始からの24時間を証明できないため、即時にpayloadを削除して`needs_review`へ固定し、read-only metadata以外を保持しません。
+
 理由: 人間の判断時間とcontext driftを分離します。安全側defaultは期限切れです。変更はoperation risk、実測応答時間、incident記録を基にversioned policyで行い、既存requestへ遡及延長しません。
 
 ### 4. Cancelと競合
