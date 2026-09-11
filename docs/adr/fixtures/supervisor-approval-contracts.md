@@ -44,9 +44,22 @@
 | post rejected | `pending` | Slackの決定的error | `failed` |
 | post timeout | `pending` | acceptanceを証明不能 | `acceptance_unknown`、再投稿禁止 |
 | unknown reconciled sent | `acceptance_unknown` | saved presentation identityがexactly 1件 | 同じattemptを`sent`へ更新 |
-| unknown reconciled absent | `acceptance_unknown` | bounded全page確認で不存在を証明 | 同じattemptを`failed`へ更新、別送信は新しい明示操作 |
+| unknown marker absent | `acceptance_unknown` | bounded全pageで0件 | `acceptance_unknown`のまま、再送禁止 |
+| unknown marker ambiguous | `acceptance_unknown` | 複数件、pagination不完全 | `needs_review`、再送禁止 |
 
-requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ設定します。decisionは`synchronized sent`からだけ受理し、`delivery_failed`はterminal、`delivery_unknown`はreconcile待ちとしてapprove/reject actionを拒否します。
+requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ設定します。decisionは`synchronized sent`からだけ受理し、`delivery_failed`はterminal、`delivery_unknown`はreconcile待ちとしてapprove/reject actionを拒否します。requester cancelは`requested` / `delivery_pending` / `delivery_unknown` / `sent`からtransactionalに競合でき、cancel後に遅延deliveryが確定してもrequestを再び`sent`へ戻しません。
+
+## Presentation update attempt transition table
+
+| Case | Initial | Observation | Expected |
+| --- | --- | --- | --- |
+| update accepted | `pending` | decision/presentation revisionと一致 | `succeeded` |
+| update rejected | `pending` | Slackの決定的error | `failed` |
+| update timeout | `pending` | acceptanceを証明不能 | `acceptance_unknown`、再update禁止 |
+| update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
+| update ambiguous | `acceptance_unknown` | revision 0/複数件、pagination不完全 | `needs_review` |
+
+presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。
 
 ## Typed action fixture: `slack.post_thread_reply.v1`
 
@@ -86,7 +99,7 @@ CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの�
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
-送信時はexecution attempt IDとserver-side MACから一意な`block_id` markerを作り、Slack messageの本文を変えずblockへ保存します。送信前とtimeout後のread-backはchannel/threadの全pageを完走し、同marker 0件、exactly 1件、複数件を区別します。pagination cursor欠落・反復、別Bot author、marker MAC不一致はreconcile成功にしません。
+送信時はexecution attempt IDとserver-side MACから一意な`block_id` markerを作り、Slack messageの本文を変えずblockへ保存します。送信前とtimeout後のread-backはchannel/threadの全pageを完走し、同marker 0件、exactly 1件、複数件を区別します。timeout後の0件は不在確定ではなくunknownのままです。pagination cursor欠落・反復、別Bot author、marker MAC不一致はreconcile成功にしません。
 
 期待する否定fixture:
 
