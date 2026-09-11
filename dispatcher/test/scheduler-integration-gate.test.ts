@@ -140,13 +140,15 @@ test("provider timeout after sendはneeds_reviewとなりblind retryしない", 
 });
 
 test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過してからworkを許可する", async () => {
-  const harness = new SchedulerIntegrationHarness();
+  const liveNow = new Date(Math.floor(Date.now() / 1000) * 1000);
+  const liveDue = new Date(liveNow.getTime() + 1000).toISOString().replace(".000Z", "Z");
+  const harness = new SchedulerIntegrationHarness(liveNow.toISOString().replace(".000Z", "Z"));
   const { root, config } = await tempConfig();
   const token = "gate-internal-token-32-bytes-minimum";
   let api: DispatcherApi | undefined;
   let slack: http.Server | undefined;
   try {
-    const runId = harness.materialize("signed_access", harness.input("work.read_only", false, due), due);
+    const runId = harness.materialize("signed_access", harness.input("work.read_only", false, liveDue), liveDue);
     const eventId = harness.repo.getRun(runId)!.event_id!;
     harness.database.beginDispatch(eventId, path.join(harness.root, "event-results", `${eventId}.json`), new Date(harness.clock.now()));
     fs.mkdirSync(path.dirname(config.updateInternalTokenPath), { recursive: true, mode: 0o700 });
@@ -173,9 +175,33 @@ test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過
       issued_at: new Date().toISOString(), nonce: `signed_${eventId}` };
     const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
     const receipt = `${payload}.${createHmac("sha256", token).update(payload).digest("base64url")}`;
-    const authorized = await new DispatcherApiClient(config.socketPath).recordScheduleJobAccess(eventId, receipt);
+    const client = new DispatcherApiClient(config.socketPath);
+    const authorized = await client.recordScheduleJobAccess(eventId, receipt);
     assert.equal(authorized.authorized, true);
     assert.equal(harness.database.get(eventId)?.status, "waiting_agent");
+    const created = await client.createJob({ source_event_id: eventId, objective: "inspect repository read-only", workspace: { kind: "scratch" } });
+    const job = created.job as { job_id: string };
+    assert.ok(job.job_id);
+    await assert.rejects(client.recordScheduleJobAccess(eventId, receipt), /schedule_access_receipt_mismatch/);
+    harness.database.beginJobPreparation(job.job_id, new Date());
+    harness.database.beginJobDispatch(job.job_id, new Date());
+    harness.database.markJobRunning(job.job_id, new Date());
+    harness.database.saveCompleted(eventId, { schema_version: 1, event_id: eventId, status: "completed", summary: "job delegated",
+      actions: [], completed_at: new Date().toISOString() }, path.join(harness.root, "event-results", `${eventId}.json`), new Date());
+    harness.database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id, status: "completed", summary: "read-only work completed",
+      output: { format: "markdown", text: "fixture result" }, actions: [], completed_at: new Date().toISOString() },
+      harness.database.getJob(job.job_id)!.result_path, new Date());
+    const notification = harness.database.enqueueJobNotification(job.job_id, new Date()).row;
+    harness.database.beginDispatch(notification.event_id, path.join(harness.root, "event-results", `${notification.event_id}.json`), new Date());
+    assert.equal((await client.authorizeJobNotification(notification.event_id)).authorized, true);
+    const notificationClaims = { ...claims, event_id: notification.event_id, issued_at: new Date().toISOString(), nonce: `notify_${notification.event_id}` };
+    const notificationPayload = Buffer.from(JSON.stringify(notificationClaims)).toString("base64url");
+    const notificationReceipt = `${notificationPayload}.${createHmac("sha256", token).update(notificationPayload).digest("base64url")}`;
+    assert.equal((await client.authorizeJobNotification(notification.event_id, notificationReceipt)).authorized, true);
+    const fakeSlack = new FakeSlack([]);
+    const posted = fakeSlack.postWorkResult(notification.event_id, "read-only work completed");
+    assert.equal(posted.event_id, notification.event_id);
+    assert.equal(fakeSlack.workCalls.length, 1);
   } finally {
     if (api) await api.stop();
     if (slack?.listening) await new Promise<void>((resolve, reject) => slack!.close(error => error ? reject(error) : resolve()));

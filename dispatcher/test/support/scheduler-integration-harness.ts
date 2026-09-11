@@ -134,7 +134,8 @@ export class SchedulerIntegrationHarness {
       ? { kind: "reminder", body: input.content }
       : { kind: "work", objective: input.content, notify: input.target.kind === "none" ? "none" : "origin_thread" } };
     const api = new ScheduleApiService(this.database, () => new Date(this.clock.now()), () => {});
-    const preview = api.preview({ source_event_id: source.event_id, definition, after: this.clock.now(), before_or_equal: "2026-09-07T00:01:00Z", limit: 10 });
+    const preview = api.preview({ source_event_id: source.event_id, definition, after: this.clock.now(),
+      before_or_equal: new Date(Date.parse(due) + 2 * 86400000).toISOString().replace(".000Z", "Z"), limit: 10 });
     assert.equal(preview.preview.occurrences[0]?.occurrence_at, due);
     const created = api.create({ source_event_id: source.event_id, idempotency_key: scheduleId, definition });
     this.scheduleIds.set(scheduleId, created.schedule.schedule_id);
