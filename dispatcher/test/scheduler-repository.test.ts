@@ -86,6 +86,20 @@ test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
 });
 
+test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで集約する", () => {
+  const { repo, raw } = setup();
+  repo.create("ops", input, due, actor, now);
+  raw.prepare("INSERT INTO schedule_claims(schedule_id,claim_owner,claim_until,claim_fence) VALUES(?,?,?,?)")
+    .run("ops", "instance_a", due, 1);
+  const snapshot = repo.operationalSnapshot(later);
+  assert.equal(snapshot.due_schedules, 1);
+  assert.equal(snapshot.stale_claims, 1);
+  assert.equal(snapshot.due_lag_seconds, 86_400);
+  assert.equal(snapshot.authorization_expired, 0);
+  assert.equal(JSON.stringify(snapshot).includes(input.content), false);
+  assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0 });
+});
+
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {
   const raw = new Database(":memory:");
   try {

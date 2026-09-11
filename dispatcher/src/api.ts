@@ -111,6 +111,9 @@ export interface ApiUpdateClient {
 export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
+export interface ApiSchedulerState {
+  operationalState(): { running: boolean; wake_lag_seconds: number; last_purge_at: string | null };
+}
 
 export class DispatcherApi {
   private server: http.Server | undefined;
@@ -132,6 +135,7 @@ export class DispatcherApi {
     private readonly updateNotifications?: ApiWorkerState,
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
+    private readonly schedulerState?: ApiSchedulerState,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   async start(): Promise<void> {
@@ -200,7 +204,17 @@ export class DispatcherApi {
         } catch {
           ready = false;
         }
-        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        const scheduler = this.schedulerState?.operationalState();
+        const operations = this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
+        ready = ready && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
+          operations.stale_claims === 0 && operations.retention_overdue === 0;
+        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready",
+          scheduler: { ...scheduler, ...operations } });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/metrics/scheduler") {
+        sendJson(response, 200, { schema_version: 1,
+          scheduler: this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z")) });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {

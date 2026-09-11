@@ -19,7 +19,10 @@ function usage(): never {
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
   dona-dispatcher job show <job_id>
-  dona-dispatcher job reconcile-run <run_id> <failed|cancelled>`);
+  dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher scheduler health
+  dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
+  dona-dispatcher scheduler retention [--apply --force]`);
   process.exit(2);
 }
 
@@ -36,10 +39,26 @@ async function main(): Promise<void> {
     await runService(config);
     return;
   }
-  if (!["event", "job"].includes(args[0]!)) usage();
+  if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
   const command = args[1];
   const database = new DispatcherDatabase(config.databasePath);
   try {
+    if (args[0] === "scheduler") {
+      const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+      if (command === "health") { console.log(JSON.stringify(database.scheduler.operationalSnapshot(now), null, 2)); return; }
+      if (command === "outbox") {
+        const statusAt=args.indexOf("--status"),limitAt=args.indexOf("--limit");
+        console.log(JSON.stringify(database.scheduler.listOutbox(statusAt<0?undefined:args[statusAt+1] as never,
+          limitAt<0?50:Number(args[limitAt+1])),null,2)); return;
+      }
+      if (command === "retention") {
+        const plan=database.scheduler.retentionPlan(now);
+        if (!args.includes("--apply")) { console.log(JSON.stringify({dry_run:true,...plan},null,2)); return; }
+        if (!args.includes("--force")) throw new Error("retention apply requires --force; run without --apply for dry-run");
+        database.scheduler.purge(now); console.log(JSON.stringify({dry_run:false,...plan},null,2)); return;
+      }
+      usage();
+    }
     if (args[0] === "job") {
       if (command === "list") {
         const statusIndex = args.indexOf("--status");

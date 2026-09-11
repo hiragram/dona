@@ -44,6 +44,17 @@ export interface ScheduleView extends Schedule {
   expires_at: string; recurrence_json: string; policy_json: string; content_hash: string; authorization_id: string;
 }
 export interface ListedSchedule { schedule: ScheduleView; sequence: number }
+export interface SchedulerOperationalSnapshot {
+  observed_at: string;
+  due_lag_seconds: number;
+  due_schedules: number;
+  stale_claims: number;
+  outbox_backlog: number;
+  needs_review: number;
+  authorization_expired: number;
+  retention_overdue: number;
+  counters: Record<string, number>;
+}
 export interface Outbox {
   outbox_id: string; run_id: string; kind: "slack.reminder.post" | "slack.work_result.post";
   idempotency_key: string; target_json: string; content: string | null; content_hash: string;
@@ -1039,6 +1050,50 @@ export class SchedulerRepository {
   }
   auditHistory(scheduleId: string): unknown[] {
     return this.db.prepare("SELECT * FROM schedule_audit WHERE schedule_id = ? ORDER BY sequence").all(scheduleId);
+  }
+  operationalSnapshot(now: string): SchedulerOperationalSnapshot {
+    utc(now);
+    const scalar = (sql: string, ...values: unknown[]): number =>
+      (this.db.prepare(sql).get(...values) as { count: number }).count;
+    const oldest = this.db.prepare("SELECT MIN(next_due) AS value FROM schedules WHERE state='active' AND next_due<=?")
+      .get(now) as { value: string | null };
+    const counters = Object.fromEntries((this.db.prepare(`SELECT operation, count(*) AS count FROM schedule_audit
+      GROUP BY operation ORDER BY operation`).all() as Array<{ operation: string; count: number }>)
+      .map(row => [row.operation, row.count]));
+    return {
+      observed_at: now,
+      due_lag_seconds: oldest.value === null ? 0 : Math.max(0, Math.floor((Date.parse(now) - Date.parse(oldest.value)) / 1000)),
+      due_schedules: scalar("SELECT count(*) AS count FROM schedules WHERE state='active' AND next_due<=?", now),
+      stale_claims: scalar("SELECT count(*) AS count FROM schedule_claims WHERE claim_until IS NOT NULL AND claim_until<=?", now),
+      outbox_backlog: scalar("SELECT count(*) AS count FROM connector_outbox WHERE status IN ('pending','claimed','request_started')"),
+      needs_review: scalar(`SELECT (SELECT count(*) FROM schedules WHERE state='needs_review') +
+        (SELECT count(*) FROM schedule_runs WHERE status='needs_review') +
+        (SELECT count(*) FROM connector_outbox WHERE status='needs_review') AS count`),
+      authorization_expired: scalar(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
+        ON r.schedule_id=s.schedule_id AND r.revision=s.revision WHERE s.state IN ('active','paused') AND r.expires_at<=?`, now),
+      retention_overdue: scalar(`SELECT (SELECT count(*) FROM schedule_revisions WHERE content IS NOT NULL AND content_delete_at<=?) +
+        (SELECT count(*) FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?) AS count`, now, now),
+      counters,
+    };
+  }
+  listOutbox(status?: Outbox["status"], limit = 50): ReconciledOutbox[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid_limit");
+    const allowed = ["pending","claimed","request_started","sent","failed","cancelled","needs_review"];
+    if (status !== undefined && !allowed.includes(status)) throw new Error("invalid_outbox_status");
+    return this.db.prepare(`SELECT outbox_id,run_id,kind,idempotency_key,content_hash,status,attempt,available_at,
+      lease_until,request_started_at,receipt_id,created_at,updated_at,terminal_at,content_delete_at
+      FROM connector_outbox WHERE (? IS NULL OR status=?) ORDER BY updated_at DESC,outbox_id LIMIT ?`)
+      .all(status ?? null, status ?? null, limit) as ReconciledOutbox[];
+  }
+  retentionPlan(now: string): Record<string, number> {
+    utc(now);
+    const count = (sql: string, ...values: unknown[]): number => (this.db.prepare(sql).get(...values) as { count: number }).count;
+    return {
+      revision_contents: count("SELECT count(*) AS count FROM schedule_revisions WHERE content IS NOT NULL AND (content_delete_at<=? OR expires_at<=?)", now, add(now,-604800)),
+      outbox_contents: count("SELECT count(*) AS count FROM connector_outbox WHERE content IS NOT NULL AND content_delete_at<=?", now),
+      audit_rows: count("SELECT count(*) AS count FROM schedule_audit WHERE created_at<=?", add(now,-7776000)),
+      terminal_runs: count(`SELECT count(*) AS count FROM schedule_runs WHERE terminal_at<=? AND status<>'needs_review'`, add(now,-2592000)),
+    };
   }
   purge(now: string): void {
     utc(now);
