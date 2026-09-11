@@ -69,6 +69,8 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update rejected | `dispatching` | Slackの決定的error | `failed` |
 | update timeout | `dispatching` | acceptanceを証明不能 | `acceptance_unknown`、再update禁止 |
 | crash after update fence | durable stateが`dispatching` | 結果なしでrestart | `acceptance_unknown`へ移し、再update禁止 |
+| stale before dispatch | `pending` | current desired revisionと不一致 | `aborted`、update禁止 |
+| prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` | 同じmessage | 先行attemptの一意なterminalまで後続dispatch禁止 |
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
 | update ambiguous | `acceptance_unknown` | revision 0/複数件、pagination不完全 | `needs_review` |
 
@@ -82,6 +84,11 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
   "operation_kind": "slack.post_thread_reply.v1",
   "instance_id": "instance_example",
   "workspace_id": "workspace_example",
+  "request_source": {
+    "source_event_id": "event_example",
+    "owner_kind": "authenticated_event_actor",
+    "owner_id": "user_requester_example"
+  },
   "target": {
     "channel_id": "channel_example",
     "thread_ts": "1700000000.000001"
@@ -115,7 +122,7 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
 }
 ```
 
-CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。
+CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、delivery attempt ID、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ原子的に移し、外部送信のdurable terminal結果まで保持します。
 
@@ -134,6 +141,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - external-call開始fence後のcrashでは復旧時に同じattemptをunknownへ移し、marker 0件でも再送しない
 - claim復旧後もexecution期限と全preconditionを`executing`直前に再検証し、drift時は外部callなしで`needs_review`
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
+- requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
+- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止
+- Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
