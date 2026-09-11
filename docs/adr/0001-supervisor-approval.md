@@ -69,7 +69,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 ### 3. TTL
 
-採用: request/decision TTLは15分、承認後のconsume TTLは5分です。request作成時の`expires_at`とapproval時の`consume_expires_at`はDBへ保存し、transactionごとのUTC high-water markはDB/backup外のrollback-resistant credential storeへintegrity保護して保存します。process内ではmonotonic elapsed timeとwall clockの大きい方を有効時刻とし、各transactionでhigh-water markを単調増加させます。再起動/restore後にmarkが欠落、読取不能、integrity不明、wall clockが保存済みmarkより前、または許容driftを超える時刻異常なら、時刻とmarkが安全に回復するまで全nonterminal/approved requestをexpireまたは`needs_review`としてfail closedし、期限を延長しません。
+採用: request/decision TTLは15分、承認後のconsume TTLは5分です。request作成時の`expires_at`とapproval時の`consume_expires_at`はDBへ保存し、transactionごとのUTC high-water markはDB/backup外のrollback-resistant credential storeへintegrity保護して保存します。process内ではmonotonic elapsed timeとwall clockの大きい方を有効時刻とします。時刻を伴うDB transactionの前に、transaction ID、直前mark、候補markを結合したwrite-ahead reservationをcredential storeへdurable commitし、DB rowはそのreservation IDと候補markを参照してからcommitします。mark reservationの失敗・結果不明ではDB transactionを開始せずapproval経路をfail closedにします。DB commit前のcrashで未使用reservationが残った場合もmarkを巻き戻さず、安全側に時刻が進んだものとして扱います。再起動/restore後にmarkが欠落、読取不能、integrity不明、DB参照との不一致、wall clockが保存済みmarkより前、または許容driftを超える時刻異常なら、時刻とmarkが安全に回復するまで全nonterminal/approved requestをexpireまたは`needs_review`としてfail closedし、期限を延長しません。
 
 理由: 人間の判断時間とcontext driftを分離します。安全側defaultは期限切れです。変更はoperation risk、実測応答時間、incident記録を基にversioned policyで行い、既存requestへ遡及延長しません。
 
@@ -181,7 +181,7 @@ execution attempt:
 - approval delivery workerはexact draftを復号する前かつ`dispatching` fence直前にsupervisorのcurrent target visibilityとshared状態を再取得します。不一致または証明不能なら外部callなしでrequestを`needs_review`、`pending` attemptを`aborted`へ同じtransactionで収束させpayloadを削除します。成功した場合だけ`chat.postMessage`直前に`dispatching`とattempt fenceをdurable commitします。復旧時の`dispatching`は送信済みの可能性があるため無条件に同じattemptを`acceptance_unknown`へ移し、read-only reconcileだけを行い再送しません。
 - 元threadのpending noticeはapproval cardと別のdelivery attemptとして、request ID、共通field `notification_attempt_id`、notification kind、server-side MACの一意markerへbindingします。`chat.postMessage`直前に`dispatching` fenceをdurable commitし、timeoutまたは復旧時は`acceptance_unknown`からexact markerをread-only reconcileするだけで、0件でも再投稿しません。requestがterminalになる時点でnotice attemptが`pending`なら、同じtransactionで`aborted`へ収束させて新規noticeを送りません。
 - presentation update workerはdispatch直前に保存済みpresentation revisionとcurrent desired revisionを照合し、staleな`pending` attemptを`aborted`へ収束させます。同じmessageに`dispatching`または`acceptance_unknown`のattemptがある間は後続updateを送らず、先行writeがterminalに一意確定するまで直列化します。曖昧な先行writeを飛び越えて新しい表示で上書きしません。
-- executorは`claimed`から外部callへ進む直前に、短いexecution期限、binding、policy、ordered thread revision、visibility、shared状態をcurrent sourceから再検証します。不一致や期限切れは外部callなしで`needs_review`へ収束させます。成功した場合だけ`executing`とattempt fenceをdurable commitして送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
+- executorは`claimed`から外部callへ進む直前に、短いexecution期限、binding、policy、ordered thread revision、supervisor visibility、shared状態に加え、persisted requesterがcurrent targetで当該operationを要求できるmembership/authorizationを認証済みsourceから再検証します。不一致や期限切れは外部callなしで`needs_review`へ収束させます。成功した場合だけ`executing`とattempt fenceをdurable commitして送信します。復旧時に`executing`を観測したworkerは送信済みの可能性があるため、必ず同じattemptを`acceptance_unknown`へ移してread-only reconcileし、markerが0件でも再送しません。
 - `acceptance_unknown`から同じwriteを自動再実行しません。read-only reconcileで一意に確定できる場合だけ既存attemptの結果を更新し、別attemptを作りません。
 
 全transitionのdecision tableはfixtureに記載します。
@@ -198,7 +198,9 @@ MVP replyは、承認済み本文を変えない一意なexecution attempt IDと
 
 cancel、expire、reject、`needs_review`など全terminal/invalid stateで遅着cardを発見した場合、requestを`sent`へ戻さずinteractive decisionを恒久拒否します。exact cardをredactedな無効表示へ変えるpresentation update attemptを一度だけ作り、そのupdateが曖昧なら再送せず`acceptance_unknown`としてreconcileします。
 
-ordered thread revisionは利用者の会話contextだけを対象にします。Dona自身が投稿したpending noticeまたはapproval cardは、認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACがすべて一致する専用markerで識別できる場合だけ集合から除外します。本文類似やBot authorだけでは除外しません。それ以外のreply追加・削除・編集はcontext driftです。
+requestがterminalになった後に`dispatching` / `acceptance_unknown`のpending noticeが遅着またはreconcileで`sent`と確定しても、request stateは戻しません。exact noticeをredactedなterminal表示へ変えるpresentation update attemptを一度だけ作り、同一messageの直列化とacceptance-unknown規則を適用します。
+
+ordered thread revisionは利用者の会話contextだけを対象にします。Dona自身が投稿したpending noticeまたはapproval cardは、認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACがすべて一致する専用markerで識別できる場合だけ集合から除外します。本文類似やBot authorだけでは除外しません。それ以外のreply追加・削除・編集はcontext driftです。requesterのcurrent membership/authorization revisionもsnapshotへ含め、request作成、decision、consume、`executing` fence直前に再取得します。
 
 ## Release gate
 

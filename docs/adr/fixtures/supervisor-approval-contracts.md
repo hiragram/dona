@@ -124,7 +124,8 @@ presentation update attemptは初回delivery attemptと別recordにし、decisio
         {"message_ts": "1700000002.000001", "edited_ts": null, "content_hmac_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
       ]
     },
-    "workspace_binding_revision": 3
+    "workspace_binding_revision": 3,
+    "requester_authorization_revision": 7
   }
 }
 ```
@@ -159,6 +160,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 時刻high-water markはbackup外へ保存し、restore/restart時の欠落や巻戻しで全未完了requestをfail closed
 - approval cardのdispatching直前にvisibility/shared状態を再検証し、不一致なら送信せずpayload削除
 - 本文不要となる全terminal/invalid request transitionでpayloadを同一transaction削除
+- credential storeへ時刻mark reservationをDBより先にdurable commitし、失敗/不明ではDB writeを開始しない
+- request作成、decision、consume、executing直前にrequesterのcurrent membership/operation authorizationを再検証
+- terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
