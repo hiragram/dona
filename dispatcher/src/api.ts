@@ -112,7 +112,7 @@ export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
 export interface ApiSchedulerState {
-  operationalState(): { running: boolean; wake_lag_seconds: number; last_purge_at: string | null };
+  operationalState(): { running: boolean; last_purge_at: string | null };
 }
 
 export class DispatcherApi {

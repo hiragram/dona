@@ -1097,6 +1097,12 @@ export class SchedulerRepository {
         (SELECT 1 FROM connector_outbox o WHERE o.run_id=schedule_runs.run_id AND (o.terminal_at IS NULL OR o.terminal_at>?))
         AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE json_extract(c.owner_json,'$.run_id')=schedule_runs.run_id
           AND c.notification_state IN ('pending','failed','needs_review'))`, add(now,-2592000), add(now,-2592000)),
+      terminal_schedules: count(`SELECT count(*) AS count FROM schedules WHERE terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=schedules.schedule_id)`, add(now,-2592000)),
+      orphan_revisions: count(`SELECT count(*) AS count FROM schedule_revisions WHERE content IS NULL AND terminal_at<=? AND NOT EXISTS
+        (SELECT 1 FROM schedules s WHERE s.schedule_id=schedule_revisions.schedule_id AND s.revision=schedule_revisions.revision)
+        AND NOT EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=schedule_revisions.schedule_id
+          AND r.revision=schedule_revisions.revision)`, add(now,-2592000)),
     };
   }
   purge(now: string): void {

@@ -99,9 +99,8 @@ export class SchedulerService {
   }
 
   isRunning(): boolean { return this.running; }
-  operationalState(now = this.clock.now()): { running: boolean; wake_lag_seconds: number; last_purge_at: string | null } {
-    const snapshot = this.repository.operationalSnapshot(now);
-    return { running: this.running, wake_lag_seconds: snapshot.due_lag_seconds,
+  operationalState(): { running: boolean; last_purge_at: string | null } {
+    return { running: this.running,
       last_purge_at: this.lastPurgeAt === undefined ? null : new Date(this.lastPurgeAt).toISOString().replace(".000Z", "Z") };
   }
 

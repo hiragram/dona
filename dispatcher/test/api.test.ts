@@ -96,7 +96,7 @@ describe("DispatcherApi", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const api = new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,
       ()=>new Date("2026-09-11T00:00:00Z"),()=>{},
-      {operationalState:()=>({running:false,wake_lag_seconds:0,last_purge_at:null})});
+      {operationalState:()=>({running:false,last_purge_at:null})});
     await api.start();
     assert.equal((await request(config.socketPath,"GET","/health/live")).status,200);
     const ready=await request(config.socketPath,"GET","/health/ready");

@@ -97,7 +97,8 @@ test("運用snapshotはlag・backlog・stale lease・retentionを本文なしで
   assert.equal(snapshot.due_lag_seconds, 86_400);
   assert.equal(snapshot.authorization_expired, 0);
   assert.equal(JSON.stringify(snapshot).includes(input.content), false);
-  assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0 });
+  assert.deepEqual(repo.retentionPlan(later), { revision_contents: 0, outbox_contents: 0, audit_rows: 0, terminal_runs: 0,
+    terminal_schedules: 0, orphan_revisions: 0 });
   raw.prepare("UPDATE schedules SET state='expired' WHERE schedule_id='ops'").run();
   assert.equal(repo.operationalSnapshot(later).stale_claims, 0);
 });
@@ -109,6 +110,13 @@ test("retention dry-runは未解決通知と新しいoutboxに保護されたrun
     {owner:"instance_a",fence:(repo.claimDue("instance_a",due)!).claim_fence,occurrenceKey:'["protected","2026-09-05T00:01:00Z"]'});
   raw.prepare("UPDATE schedule_runs SET status='failed',terminal_at=? WHERE schedule_id='protected'").run(now);
   assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").terminal_runs,0);
+});
+
+test("retention planはrunのないterminal scheduleを期限後に数える", () => {
+  const { repo, raw } = setup();
+  repo.create("cancelled",input,due,actor,now);
+  raw.prepare("UPDATE schedules SET state='cancelled',terminal_at=?,updated_at=? WHERE schedule_id='cancelled'").run(now,now);
+  assert.equal(repo.retentionPlan("2026-11-01T00:00:00Z").terminal_schedules,1);
 });
 
 test("extension migration失敗は全DDLをrollbackしcore versionを保持する", () => {
