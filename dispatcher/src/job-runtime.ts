@@ -429,7 +429,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     let baseBranch = requestedBaseRef;
-    const upstream = baseBranch?.match(/^(.*?)@\{(?:upstream|u|push)\}$/) ?? undefined;
+    const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
       || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD";
     if (usesDefaultBranch) {
@@ -442,9 +442,20 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = `refs/heads/${viewed.stdout.trim()}`;
     } else if (upstream) {
+      let trackingRevision = baseBranch!;
+      if (!upstream[1]) {
+        const viewed = await runProcess(
+          this.config.ghPath,
+          ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+          120_000,
+          signal,
+        );
+        if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
+        trackingRevision = `${viewed.stdout.trim()}@{${upstream[2]}}`;
+      }
       const tracked = await runProcess(
         this.config.gitPath,
-        ["-C", repositoryPath, "rev-parse", "--symbolic-full-name", baseBranch!],
+        ["-C", repositoryPath, "rev-parse", "--symbolic-full-name", trackingRevision],
         this.config.jobCommandTimeoutMs,
         signal,
       );
