@@ -438,7 +438,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = viewed.stdout.trim();
     }
-    if (baseBranch === "HEAD" || baseBranch === "origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
+    if (baseBranch === "HEAD" || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
       const viewed = await runProcess(
         this.config.ghPath,
         ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
@@ -453,6 +453,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       ? baseBranch.slice("refs/heads/".length)
       : baseBranch.startsWith("refs/remotes/origin/")
         ? baseBranch.slice("refs/remotes/origin/".length)
+        : baseBranch.startsWith("remotes/origin/")
+          ? baseBranch.slice("remotes/origin/".length)
         : baseBranch.startsWith("origin/")
           ? baseBranch.slice("origin/".length)
           : undefined;

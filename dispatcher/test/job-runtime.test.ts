@@ -421,8 +421,10 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", `main:refs/heads/${hexBranch}`);
     const cases = [
       { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
       { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
       { event: "Ev-github-short-commit", baseRef: shortCommit, expected: nonTipSha },
