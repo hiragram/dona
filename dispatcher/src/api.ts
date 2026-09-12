@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { dispatcherSchemaCompatibility, type DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, JobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
@@ -37,7 +37,7 @@ export function scheduleAccessConfirmationTimeout(issuedAt:string,now=Date.now()
 }
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string, readonly details?:Record<string,unknown>) {
     super(message);
   }
 }
@@ -51,8 +51,8 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.end(encoded);
 }
 
-function errorBody(code: string, message: string): unknown {
-  return { schema_version: 1, error: { code, message } };
+function errorBody(code: string, message: string, details?:Record<string,unknown>): unknown {
+  return { schema_version: 1, error: { code, message, ...(details?{details}:{}) } };
 }
 
 async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
@@ -426,7 +426,7 @@ export class DispatcherApi {
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
-        sendJson(response, error.status, errorBody(error.code, error.message));
+        sendJson(response, error.status, errorBody(error.code, error.message,error.details));
       } else if (error instanceof ScheduleApiError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
       } else if (error instanceof Error && error.name === "ZodError") {
@@ -572,17 +572,13 @@ export class DispatcherApi {
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
-      }
-      if (result.payloadMismatch) {
-        this.logger.warn("Duplicate job request differs from persisted job", {
-          job_id: result.row.job_id,
-          source_event_id: result.row.source_event_id,
-        });
       }
       this.jobs.wake();
       sendJson(response, result.duplicate ? 200 : 202, {
         schema_version: 1,
+        outcome: result.outcome,
         duplicate: result.duplicate,
         job: result.row,
       });
@@ -591,7 +587,9 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
       const sourceEventId=url.searchParams.get("source_event_id");
       if(sourceEventId){
-        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId)});}
+        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId).map(
+          ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+            ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}))});}
         catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
         return;
       }
@@ -614,6 +612,10 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(!sourceEventId) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
+      try { this.database.assertJobSourceMatchesThread(jobId,sourceEventId); }
+      catch { throw new ApiRequestError(403,"owner_mismatch","Job does not belong to the event owner"); }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }
@@ -623,6 +625,7 @@ export class DispatcherApi {
         const result = await this.jobs.steer(jobId, input.source_event_id, input.instruction);
         sendJson(response, 200, { schema_version: 1, duplicate: result.duplicate, job: result.row });
       } catch (error) {
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
         throw new ApiRequestError(409, "job_steer_failed", error instanceof Error ? error.message : String(error));
       }
       return;

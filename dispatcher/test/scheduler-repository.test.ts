@@ -984,7 +984,9 @@ test("scheduled objectiveは承認済み文字列をtrimせず委任し空白だ
   repo.create("objective_exact",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);
   const run=repo.materialize("objective_exact",1,due,later,due,actor).run;
   assert.throws(()=>createScheduledJob(dispatcher, raw, {source_event_id:run.event_id!,objective:objective.trim(),workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results"),/persisted read-only scope/);
-  assert.equal(createScheduledJob(dispatcher, raw, {source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row.objective,objective);
+  const scheduled=createScheduledJob(dispatcher, raw, {source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  assert.equal(scheduled.objective,objective);
+  assert.throws(()=>dispatcher.appendQueuedJobInstruction(scheduled.job_id,run.event_id!,"差し替え"),/cannot be steered/i);
   assert.throws(()=>repo.create("objective_blank",{...input,action:"work.read_only",target:{kind:"none"},content:"   "},due,actor,now),/invalid_content/);
 });
 

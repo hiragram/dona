@@ -6,7 +6,7 @@ import type { Logger } from "../logger.js";
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
-  getJob(jobId: string): Promise<Record<string, unknown>>;
+  getJob(jobId: string,sourceEventId:string): Promise<Record<string, unknown>>;
   authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
@@ -53,7 +53,7 @@ function success(data: Record<string, unknown>) {
   };
 }
 
-function dispatcherApiError(error: unknown): { code: string; message: string } | undefined {
+function dispatcherApiError(error: unknown): { code: string; message: string; details?:Record<string,unknown> } | undefined {
   if (!(error instanceof DispatcherClientError) || !error.body || typeof error.body !== "object" || Array.isArray(error.body)) {
     return undefined;
   }
@@ -64,7 +64,9 @@ function dispatcherApiError(error: unknown): { code: string; message: string } |
     typeof structured.message !== "string" || structured.message.length > 2_000) {
     return undefined;
   }
-  return { code: structured.code, message: structured.message };
+  const details=structured.details;
+  return { code: structured.code, message: structured.message,
+    ...(details&&typeof details==="object"&&!Array.isArray(details)?{details:details as Record<string,unknown>}:{}) };
 }
 
 function failure(error: unknown, logger: Logger, tool: string) {
@@ -95,23 +97,24 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("delegate_job", {
     title: "Delegate background job",
-    description: "長時間になりそうな調査・開発を、別のCodexワーカーへ委任します。1 eventにつき1 jobです。",
+    description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。異なるjob_keyで同じeventから複数jobを作成できます。",
     inputSchema: {
       source_event_id: eventId,
+      job_key:z.string().regex(/^[a-z0-9](?:[a-z0-9._-]{0,63})$/).refine(value=>value!=="legacy-default").optional(),
       objective: z.string().min(1).max(100_000),
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async ({ source_event_id, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
     try {
       if (workspace_kind === "github" && !repo) throw new Error("repository is required for a GitHub job");
       if (workspace_kind === "scratch" && (repo || base_ref)) throw new Error("repository/base_ref are only valid for a GitHub job");
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
-      return success(await client.createJob({ source_event_id, objective, workspace }));
+      return success(await client.createJob({ source_event_id, ...(job_key?{job_key}:{}), objective, workspace }));
     } catch (error) {
       return failure(error, logger, "delegate_job");
     }
@@ -143,11 +146,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("get_job_status", {
     title: "Get background job status",
     description: "ジョブの状態、workspace path、結果、エラーを取得します。",
-    inputSchema: { job_id: jobId },
+    inputSchema: { job_id: jobId, source_event_id:eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ job_id }) => {
+  }, async ({ job_id,source_event_id }) => {
     try {
-      return success(await client.getJob(job_id));
+      return success(await client.getJob(job_id,source_event_id));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }

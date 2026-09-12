@@ -4,7 +4,7 @@ import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
 
-import { DispatcherDatabase } from "../src/database.js";
+import { DispatcherDatabase, JobCreationError } from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -183,9 +183,51 @@ describe("DispatcherDatabase", () => {
     const notification = database.enqueueJobNotification(created.row.job_id);
     const duplicate = database.enqueueJobNotification(created.row.job_id);
     assert.equal(notification.row.source, "dona_job");
+    assert.doesNotThrow(()=>database.assertJobSourceMatchesThread(created.row.job_id,notification.row.event_id));
+    const siblingSource=database.enqueue(eventEnvelope("Ev-job-sibling")).row;
+    const sibling=database.createJob({source_event_id:siblingSource.event_id,objective:"sibling",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    assert.doesNotThrow(()=>database.assertJobSourceMatchesThread(sibling.job_id,notification.row.event_id));
+    assert.deepEqual(new Set(database.listOwnerJobs(notification.row.event_id).map(row=>row.job_id)),new Set([created.row.job_id,sibling.job_id]));
     assert.equal(notification.row.event_type, "job_completed");
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");
     assert.equal(duplicate.row.event_id, notification.row.event_id);
+    database.close();
+  });
+
+  test("owner-aware admissionは通常multi-jobの順序・limit・fairnessを維持する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:2,jobObjectiveTotalMaxBytes:100});
+    const firstEvent=database.enqueue(eventEnvelope("Ev-owner-aware-a" )).row;
+    const secondEnvelope=eventEnvelope("Ev-owner-aware-b"); secondEnvelope.reply_target!.thread_ts="1756722031.000001"; secondEnvelope.subject.thread_ts="1756722031.000001";
+    const secondEvent=database.enqueue(secondEnvelope).row;
+    const request=(source_event_id:string,job_key:string,objective=job_key)=>({source_event_id,job_key,objective,workspace:{kind:"scratch" as const}});
+    const first=database.createJob(request(firstEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    const second=database.createJob(request(firstEvent.event_id,"two"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    const other=database.createJob(request(secondEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir);
+    assert.equal(database.createJob(request(firstEvent.event_id,"one"),config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.throws(()=>database.createJob(request(firstEvent.event_id,"one","changed"),config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
+    assert.throws(()=>database.createJob(request(firstEvent.event_id,"three"),config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded");
+    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
+    const followUp=database.enqueue(eventEnvelope("Ev-owner-aware-follow-up")).row;
+    assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
+    database.beginJobPreparation(first.row.job_id);
+    assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[other.row.job_id,second.row.job_id]);
+    assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
+    database.close();
+  });
+
+  test("queued steer後の実objective byteを後続job admissionへ算入する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:3,jobObjectiveTotalMaxBytes:100});
+    const event=database.enqueue(eventEnvelope("Ev-steer-admission-bytes")).row;
+    const first=database.createJob({source_event_id:event.event_id,job_key:"first",objective:"a",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const followUp=database.enqueue(eventEnvelope("Ev-steer-admission-bytes-follow-up")).row;
+    database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50));
+    assert.throws(()=>database.createJob({source_event_id:event.event_id,job_key:"second",objective:"c".repeat(20),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
     database.close();
   });
 
@@ -326,12 +368,17 @@ describe("DispatcherDatabase", () => {
     seeded.close();
     const bridge = new Database(config.databasePath);
     bridge.prepare("UPDATE jobs SET job_key='bridge-key' WHERE job_id=?").run(job.job_id);
+    bridge.prepare("UPDATE jobs SET workspace_json=?,objective=?,steer_event_id=? WHERE job_id=?").run('{"kind":"scratch"}',
+      "preserve\n\n[DONA_FOLLOW_UP]\n追加条件\n[/DONA_FOLLOW_UP]","legacy-follow-up",job.job_id);
     bridge.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)").run(job.job_id,event.updated_at);
-    bridge.prepare("INSERT INTO job_groups VALUES(?,?,?,?,?,?,?)").run(event.event_id,event.updated_at,"legacy",null,null,event.created_at,event.updated_at);
+    bridge.prepare("UPDATE job_groups SET sealed_at=?,notification_mode='legacy',created_at=?,updated_at=? WHERE source_event_id=?")
+      .run(event.updated_at,event.created_at,event.updated_at,event.event_id);
     const schedulerTables = (bridge.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count;
     bridge.pragma("user_version = 2");
     bridge.close();
     const migrated = new DispatcherDatabase(config.databasePath);
+    assert.throws(()=>migrated.createJob({source_event_id:event.event_id,job_key:"bridge-key",objective:"preserve",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
     migrated.close();
     const raw = new Database(config.databasePath);
     assert.equal(raw.pragma("user_version", { simple: true }), 3);
@@ -342,6 +389,22 @@ describe("DispatcherDatabase", () => {
     assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");
     assert.deepEqual(raw.pragma("foreign_key_check"), []);
     raw.close();
+  });
+
+  test("fingerprintのないlegacy jobは一致payloadだけをreuseする",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const event=database.enqueue(eventEnvelope("Ev-legacy-reuse")).row;
+    const request={source_event_id:event.event_id,objective:"legacy",workspace:{kind:"scratch" as const}};
+    const job=database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const raw=new Database(config.databasePath); raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id); raw.close();
+    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    const followUp=database.enqueue(eventEnvelope("Ev-legacy-reuse-follow-up")).row;
+    database.appendQueuedJobInstruction(job.job_id,followUp.event_id,"追加条件");
+    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.throws(()=>database.createJob({...request,objective:"changed"},config.jobsWorkspaceRoot,config.jobResultsDir),
+      (error)=>error instanceof JobCreationError&&error.code==="job_idempotency_conflict");
+    database.close();
   });
 
   for (const fault of ["jobs_copied", "indexes_recreated", "groups_backfilled", "scheduler_schema_ready"] as const) {

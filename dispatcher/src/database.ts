@@ -22,7 +22,8 @@ import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
-import { stableStringify } from "./validation.js";
+import { canonicalJobPayloadSha256, jobCreationPayloadSha256FromWorkspace,
+  legacyJobKey, parseCreateJobRequest, serializeJobWorkspace, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -30,6 +31,13 @@ const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
 export const dispatcherSchemaCompatibility = { read_min: 2, read_max: 3, write: 3 } as const;
 export type DispatcherMigrationStep = "jobs_copied" | "indexes_recreated" | "groups_backfilled" | SchedulerMigrationStep;
 export type DispatcherMigrationHook = (step: DispatcherMigrationStep) => void;
+export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
+export class JobCreationError extends Error {
+  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded", message: string,
+    readonly limitDetails?: { resource: "jobs_per_event" | "objective_utf8_bytes_per_event"; current: number; attempted: number; maximum: number }) {
+    super(message); this.name = "JobCreationError";
+  }
+}
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
@@ -63,8 +71,15 @@ function containsHostAbsolutePath(value:string):boolean {
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
+  private readonly migrationHook: DispatcherMigrationHook;
+  private readonly jobAdmissionLimits: JobAdmissionLimits;
 
-  constructor(databasePath: string, private readonly migrationHook: DispatcherMigrationHook = () => {}) {
+  constructor(databasePath: string, migrationHookOrLimits: DispatcherMigrationHook | JobAdmissionLimits = () => {}) {
+    this.migrationHook = typeof migrationHookOrLimits === "function" ? migrationHookOrLimits : () => {};
+    this.jobAdmissionLimits = typeof migrationHookOrLimits === "function"
+      ? { jobsPerEventMax: 8, jobObjectiveTotalMaxBytes: 400_000 } : migrationHookOrLimits;
+    if (!Number.isSafeInteger(this.jobAdmissionLimits.jobsPerEventMax) || this.jobAdmissionLimits.jobsPerEventMax < 1 || this.jobAdmissionLimits.jobsPerEventMax > 32) throw new Error("jobsPerEventMax must be between 1 and 32");
+    if (!Number.isSafeInteger(this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) || this.jobAdmissionLimits.jobObjectiveTotalMaxBytes < 1) throw new Error("jobObjectiveTotalMaxBytes must be positive");
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(databasePath), 0o700);
     this.db = new Database(databasePath);
@@ -244,6 +259,13 @@ export class DispatcherDatabase {
         CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
         CREATE INDEX jobs_runnable_fair_idx ON jobs(source_event_id, created_at, job_id, available_at) WHERE status = 'queued';
       `);
+      for (const row of this.db.prepare("SELECT job_id,objective,workspace_json,steer_event_id FROM jobs").all() as Array<{job_id:string;objective:string;workspace_json:string;steer_event_id:string|null}>) {
+        const workspace=JSON.parse(row.workspace_json) as CreateJobRequest["workspace"];
+        if(jobCreationPayloadSha256FromWorkspace(workspace)!==undefined||row.steer_event_id!==null) continue;
+        const request={source_event_id:"migration",objective:row.objective,workspace};
+        this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(
+          serializeJobWorkspace(workspace,canonicalJobPayloadSha256(request),Buffer.byteLength(row.objective,"utf8")),row.job_id);
+      }
       if (hasLegacyStopMarkers) this.db.exec(`
         INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
         SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);
@@ -389,8 +411,12 @@ export class DispatcherDatabase {
     resultDir: string,
     at = new Date(),
   ): CreateJobResult {
-    const sourceEvent = this.getRequired(request.source_event_id);
-    const workspaceJson = stableStringify(request.workspace);
+    const parsedRequest=parseCreateJobRequest(request);
+    const sourceEvent = this.getRequired(parsedRequest.source_event_id);
+    const jobKey=parsedRequest.job_key??legacyJobKey;
+    const canonicalPayloadSha256=canonicalJobPayloadSha256(parsedRequest);
+    const objectiveUtf8Bytes=Buffer.byteLength(parsedRequest.objective,"utf8");
+    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -400,12 +426,12 @@ export class DispatcherDatabase {
     const threadTs = stringValue(replyTarget.thread_ts);
     const binding = readEventJobBinding(this.db, sourceEvent.event_id);
     if (!binding) throw new Error(`Event ${sourceEvent.event_id} does not have an authorized job owner`);
-    if (binding.owner.kind === "schedule" && request.workspace.kind !== "scratch") {
+    if (binding.owner.kind === "schedule" && parsedRequest.workspace.kind !== "scratch") {
       throw new Error("Scheduled work permits only a scratch workspace");
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
-      if (typeof payload.work?.objective!=="string" || payload.work.objective !== request.objective || payload.work.scope !== "read_only" ||
+      if (parsedRequest.job_key!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
         throw new Error("Scheduled work request does not match its persisted read-only scope");
       }
@@ -413,14 +439,23 @@ export class DispatcherDatabase {
 
     const created = this.db.transaction((): CreateJobResult | undefined => {
       const existing = this.db
-        .prepare("SELECT * FROM jobs WHERE source_event_id = ?")
-        .get(request.source_event_id) as JobRow | undefined;
+        .prepare("SELECT * FROM jobs WHERE source_event_id = ? AND job_key = ?")
+        .get(parsedRequest.source_event_id,jobKey) as JobRow | undefined;
       if (existing) {
-        return {
-          row: existing,
-          duplicate: true,
-          payloadMismatch: existing.objective !== request.objective || existing.workspace_json !== workspaceJson,
-        };
+        const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
+        if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
+        if(stored===undefined&&(existing.objective!==parsedRequest.objective||existing.workspace_json!==stableStringify(parsedRequest.workspace)))
+          throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
+        if(stored===undefined) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
+        if(binding.owner.kind==="schedule") {
+          const authorized=this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
+            JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+            WHERE r.run_id=? AND r.job_id=? AND r.revision=? AND r.status='started'
+              AND s.state='active' AND s.revision=r.revision AND julianday(v.expires_at)>julianday(?)`).get(
+            binding.owner.run_id,existing.job_id,binding.owner.revision,at.toISOString());
+          if(!["dispatching","waiting_agent"].includes(sourceEvent.status)||!authorized) throw new Error("Schedule run is no longer authorized for job reuse");
+        }
+        return {row:this.getJobRequired(existing.job_id),outcome:"reused",duplicate:true};
       }
       if(binding.owner.kind==="schedule") {
         if(!["dispatching","waiting_agent"].includes(sourceEvent.status)) {
@@ -433,16 +468,27 @@ export class DispatcherDatabase {
         const consumed=this.db.prepare(`UPDATE events SET schedule_access_consumed_at=? WHERE event_id=? AND schedule_access_checked_at>=?
           AND schedule_access_checked_at<=? AND schedule_access_consumed_at IS NULL`).run(at.toISOString(),sourceEvent.event_id,earliest,at.toISOString()).changes;
         if(consumed!==1) throw new Error("Scheduled work current access receipt is missing or expired");
+      } else {
+        if(["completed","blocked","needs_review","dead_letter"].includes(sourceEvent.status)) throw new JobCreationError("job_group_closed","Source event is closed");
+        const group=this.db.prepare("SELECT sealed_at,notification_mode FROM job_groups WHERE source_event_id=?").get(sourceEvent.event_id) as {sealed_at:string|null;notification_mode:string}|undefined;
+        if(group?.sealed_at) throw new JobCreationError("job_group_closed","Job group is sealed");
+        if(group?.notification_mode==="grouped"&&parsedRequest.job_key===undefined) throw new JobCreationError("job_group_closed","Grouped jobs require an explicit job key");
+        if(group?.notification_mode==="legacy"&&jobKey!==legacyJobKey) throw new JobCreationError("job_group_closed","Legacy job group does not accept additional keys");
+        const admitted=this.db.prepare("SELECT objective,workspace_json FROM jobs WHERE source_event_id=?").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
+        if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
+        const currentBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
+        if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
 
-      const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, request.objective);
-      const workspacePath = request.workspace.kind === "scratch"
+      const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, parsedRequest.objective);
+      const workspacePath = parsedRequest.workspace.kind === "scratch"
         ? path.join(workspaceRoot, "scratch", jobId)
         : path.join(
           workspaceRoot,
           "github",
-          request.workspace.repository.split("/")[0]!,
-          request.workspace.repository.split("/")[1]!,
+          parsedRequest.workspace.repository.split("/")[0]!,
+          parsedRequest.workspace.repository.split("/")[1]!,
           "worktrees",
           jobId,
         );
@@ -450,19 +496,20 @@ export class DispatcherDatabase {
       const timestamp = at.toISOString();
       this.db.prepare(`
         INSERT INTO jobs (
-          job_id, source_event_id, source, workspace_id, channel_id, thread_ts, actor_id,
+          job_id, source_event_id, job_key, source, workspace_id, channel_id, thread_ts, actor_id,
           objective, workspace_json, status, available_at, workspace_path, result_path,
           agent_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
       `).run(
         jobId,
-        request.source_event_id,
+        parsedRequest.source_event_id,
+        jobKey,
         sourceEvent.source,
         workspaceId,
         channelId,
         threadTs,
         stringValue(subject.actor_id),
-        request.objective,
+        parsedRequest.objective,
         workspaceJson,
         timestamp,
         workspacePath,
@@ -486,7 +533,7 @@ export class DispatcherDatabase {
           return undefined;
         }
       }
-      return { row: this.getJobRequired(jobId), duplicate: false, payloadMismatch: false };
+      return { row: this.getJobRequired(jobId), outcome:"created", duplicate: false };
     }).immediate();
     if (!created) throw new Error("Schedule run is no longer authorized for job creation");
     return created;
@@ -523,17 +570,21 @@ export class DispatcherDatabase {
 
   listOwnerJobs(sourceEventId: string, limit = 100): JobRow[] {
     const binding=readEventJobBinding(this.db,sourceEventId);
-    if(!binding) throw new Error("Unknown job owner");
+    const completion=!binding?this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined:undefined;
+    const ownerJson=binding?stableStringify(binding.owner):completion?.owner_json;
+    if(!ownerJson) throw new Error("Unknown job owner");
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
-      WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(stableStringify(binding.owner),limit) as JobRow[];
+      WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(ownerJson,limit) as JobRow[];
   }
 
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
     return this.db.prepare(`
-      SELECT * FROM jobs
-      WHERE (status IN ('queued', 'retryable_failed') AND available_at <= ?)
-         OR status = 'running'
-      ORDER BY created_at LIMIT ?
+      WITH ranked AS (
+        SELECT job_id,rowid AS insertion_order,ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,rowid) AS fairness_rank
+        FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status IN ('preparing','dispatching','running')
+      ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
+        WHERE jobs.status IN ('queued','retryable_failed','running')
+        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,ranked.insertion_order LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
   }
 
@@ -791,10 +842,17 @@ export class DispatcherDatabase {
     const row = this.getJobRequired(jobId);
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
     if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
-    this.db.prepare(`
-      UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
-      WHERE job_id = ?
-    `).run(`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`, sourceEventId, nowUtc(), jobId);
+    const suffix=`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
+    this.db.transaction(()=>{
+      const siblings=this.db.prepare("SELECT job_id,objective FROM jobs WHERE source_event_id=?").all(row.source_event_id) as Array<{job_id:string;objective:string}>;
+      const current=siblings.reduce((sum,sibling)=>sum+Buffer.byteLength(sibling.objective,"utf8"),0);
+      const attempted=current+Buffer.byteLength(suffix,"utf8");
+      if(attempted>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
+      this.db.prepare(`
+        UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
+        WHERE job_id = ?
+      `).run(suffix, sourceEventId, nowUtc(), jobId);
+    }).immediate();
     return this.getJobRequired(jobId);
   }
 
@@ -968,7 +1026,9 @@ export class DispatcherDatabase {
   assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const owner=this.db.prepare("SELECT owner_json FROM job_owner_bindings WHERE job_id=?").get(jobId) as {owner_json:string}|undefined;
-    if(!binding||!owner||stableStringify(binding.owner)!==owner.owner_json) throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
+    const completion=this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined;
+    if(!owner||(!binding&&completion?.owner_json!==owner.owner_json)||(binding&&stableStringify(binding.owner)!==owner.owner_json))
+      throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
   }
 
   private assertJobSteerAllowed(jobId:string):void {
