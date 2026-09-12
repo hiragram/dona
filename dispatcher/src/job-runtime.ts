@@ -124,9 +124,10 @@ function runProcess(
   timeoutMs: number,
   signal?: AbortSignal,
   settleBeforeClose = false,
+  stdin = "",
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -172,6 +173,7 @@ function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
+    child.stdin.end(stdin);
   });
 }
 
@@ -463,7 +465,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         throw new Error(`GitHub base ref ${baseBranch} is ambiguous with a remote tag`);
       }
       if (!sameNameTag.ok && sameNameTag.exitCode !== 2) {
-        throw commandError("Git remote tag ambiguity check failed", sameNameTag);
+        throw safeCommandError("Git remote tag ambiguity check failed", sameNameTag);
       }
     }
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "FETCH_HEAD" || baseBranch === "origin"
@@ -538,8 +540,10 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         if (pushRemote !== "origin" || configuredPush.ok) {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
         }
-        if (mode === "upstream" && trackedMerge.ok && mergeRef.startsWith("refs/heads/")) baseBranch = mergeRef;
+        if ((mode === "upstream" || mode === "tracking") && trackedRemote.ok && trackedRemote.stdout.trim() === pushRemote
+          && trackedMerge.ok && mergeRef.startsWith("refs/heads/")) baseBranch = mergeRef;
         else if (mode === "current") baseBranch = `refs/heads/${branchName}`;
+        else if (mode === "matching") baseBranch = `refs/heads/${branchName}`;
         else if (mode === "simple" && trackedRemote.ok && trackedMerge.ok && trackedRemote.stdout.trim() === pushRemote && mergeRef === `refs/heads/${branchName}`) {
           baseBranch = mergeRef;
         } else {
@@ -764,14 +768,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
         const temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
         if (temporaryRefs.length === 0) break;
-        for (const temporaryRef of temporaryRefs) {
-          const deleted = await runProcess(
-            this.config.gitPath,
-            ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
-            this.config.jobCommandTimeoutMs,
-          );
-          if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
-        }
+        const deleted = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "update-ref", "--stdin"],
+          this.config.jobCommandTimeoutMs,
+          undefined,
+          false,
+          temporaryRefs.map((temporaryRef) => `delete ${temporaryRef}\n`).join(""),
+        );
+        if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
       }
     }
   }

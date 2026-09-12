@@ -531,6 +531,48 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("push trackingとmatchingを解決し異なるtracking remoteは拒否する", async () => {
+    const fixture = await githubFixture();
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(fixture.seedPath, "push", "origin", "feature/test:refs/heads/stable");
+    await git(repositoryPath, "config", "branch.main.remote", "origin");
+    await git(repositoryPath, "config", "branch.main.merge", "refs/heads/stable");
+    await git(repositoryPath, "config", "push.default", "tracking");
+    const trackingSource = fixture.database.enqueue(eventEnvelope("Ev-github-push-tracking")).row;
+    const trackingJob = fixture.database.createJob({
+      source_event_id: trackingSource.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main@{push}" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await new HerdrJobAgentRuntime(fixture.config).prepare(trackingJob);
+    assert.equal(await git(trackingJob.workspace_path, "rev-parse", "HEAD"), fixture.raceSha);
+
+    await git(repositoryPath, "config", "push.default", "matching");
+    const matchingSource = fixture.database.enqueue(eventEnvelope("Ev-github-push-matching")).row;
+    const matchingJob = fixture.database.createJob({
+      source_event_id: matchingSource.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main@{push}" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await new HerdrJobAgentRuntime(fixture.config).prepare(matchingJob);
+    assert.equal(await git(matchingJob.workspace_path, "rev-parse", "HEAD"), await git(fixture.seedPath, "rev-parse", "main"));
+
+    await git(repositoryPath, "config", "branch.main.remote", "upstream");
+    await git(repositoryPath, "config", "branch.main.pushRemote", "origin");
+    await git(repositoryPath, "config", "push.default", "upstream");
+    const rejectedSource = fixture.database.enqueue(eventEnvelope("Ev-github-push-wrong-upstream")).row;
+    const rejectedJob = fixture.database.createJob({
+      source_event_id: rejectedSource.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main@{push}" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await assert.rejects(
+      new HerdrJobAgentRuntime(fixture.config).prepare(rejectedJob),
+      /does not resolve to an origin branch/,
+    );
+    fixture.database.close();
+  });
+
   test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
     const fixture = await githubFixture();
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
