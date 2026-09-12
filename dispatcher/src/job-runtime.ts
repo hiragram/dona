@@ -553,24 +553,20 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         signal,
       );
       if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseRef} could not be fetched`, fetchedObjects);
-      const resolvedCommit = await runProcess(
+      const remoteCommits = await runProcess(
         this.config.gitPath,
-        ["-C", repositoryPath, "rev-parse", "--verify", `${baseRef}^{commit}`],
+        ["-C", repositoryPath, "rev-list", `--glob=${objectNamespace}/*`],
         this.config.jobCommandTimeoutMs,
         signal,
       );
-      const candidate = resolvedCommit.stdout.trim();
-      if (!resolvedCommit.ok || !/^[0-9a-f]{40,64}$/i.test(candidate)) {
+      if (!remoteCommits.ok) throw commandError("Git remote commit candidates could not be inspected", remoteCommits);
+      const candidates = [...new Set(
+        remoteCommits.stdout.trim().split("\n").filter((sha) => sha.toLowerCase().startsWith(baseRef.toLowerCase())),
+      )];
+      if (candidates.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(candidates[0] ?? "")) {
         throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
       }
-      const reachable = await runProcess(
-        this.config.gitPath,
-        ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", `--contains=${candidate}`, objectNamespace],
-        this.config.jobCommandTimeoutMs,
-        signal,
-      );
-      if (!reachable.ok || !reachable.stdout.trim()) throw new Error(`Git remote commit ${baseRef} is not reachable`);
-      return candidate;
+      return candidates[0]!;
     } finally {
       const listedRefs = await runProcess(
         this.config.gitPath,

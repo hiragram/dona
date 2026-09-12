@@ -413,6 +413,10 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", "main");
     await git(fixture.seedPath, "tag", "release-test", fixture.featureSha);
     await git(fixture.seedPath, "push", "origin", "refs/tags/release-test");
+    const shortCommit = nonTipSha.slice(0, 12);
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(repositoryPath, "fetch", path.join(fixture.root, "origin.git"), `feature/test:refs/heads/local-collision-source`);
+    await git(repositoryPath, "branch", shortCommit, fixture.featureSha);
     const hexBranch = "a".repeat(40);
     await git(fixture.seedPath, "push", "origin", `main:refs/heads/${hexBranch}`);
     const cases = [
@@ -421,7 +425,7 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
       { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
-      { event: "Ev-github-short-commit", baseRef: nonTipSha.slice(0, 12), expected: nonTipSha },
+      { event: "Ev-github-short-commit", baseRef: shortCommit, expected: nonTipSha },
       { event: "Ev-github-hex-branch", baseRef: hexBranch, expected: await git(fixture.seedPath, "rev-parse", "main") },
     ];
     for (const item of cases) {
@@ -434,7 +438,6 @@ describe("GitHub workspace provisioning", () => {
       await new HerdrJobAgentRuntime(fixture.config).prepare(job);
       assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), item.expected);
     }
-    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     assert.equal(await git(repositoryPath, "for-each-ref", "--format=%(refname)", "refs/dona/objects"), "");
     fixture.database.close();
   });
