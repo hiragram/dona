@@ -332,9 +332,8 @@ if (args.includes("remote") && args.includes("get-url")) {
   process.exit(0);
 }
 const fetchIndex = args.indexOf("fetch");
-if (fetchIndex >= 0 && args[fetchIndex + 2] === "origin") {
-  args[fetchIndex + 2] = ${JSON.stringify(bare)};
-}
+const remoteIndex = args.findIndex((arg, index) => index > 1 && arg === "origin");
+if (remoteIndex >= 0) args[remoteIndex] = ${JSON.stringify(bare)};
 const result = spawnSync("git", args, { stdio: "inherit" });
 process.exit(result.status ?? 2);
 `, { mode: 0o700 });
@@ -379,7 +378,7 @@ describe("GitHub workspace provisioning", () => {
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "missing" },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
-    await assert.rejects(new HerdrJobAgentRuntime(fixture.config).prepare(job), /Git fetch failed for branch missing/);
+    await assert.rejects(new HerdrJobAgentRuntime(fixture.config).prepare(job), /Git remote base ref missing was not found/);
     const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.some((args) => args[2] === "worktree" || (args[2] === "agent" && args[3] === "start")), false);
     fixture.database.close();
@@ -404,6 +403,28 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
+    const fixture = await githubFixture();
+    await git(fixture.seedPath, "tag", "release-test", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/release-test");
+    const cases = [
+      { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
+      { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
+    ];
+    for (const item of cases) {
+      const source = fixture.database.enqueue(eventEnvelope(item.event)).row;
+      const job = fixture.database.createJob({
+        source_event_id: source.event_id,
+        objective: "確認する",
+        workspace: { kind: "github", repository: "owner/repo", base_ref: item.baseRef },
+      }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+      await new HerdrJobAgentRuntime(fixture.config).prepare(job);
+      assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), item.expected);
+    }
+    fixture.database.close();
+  });
+
   test("fetch failureではref解決・worktree作成・agent起動へ進まない", async () => {
     const fixture = await githubFixture();
     const failingGit = path.join(fixture.root, "fetch-failure-git.mjs");
@@ -412,6 +433,8 @@ import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 if (args.includes("remote") && args.includes("get-url")) { process.stdout.write("https://github.com/owner/repo.git\\n"); process.exit(0); }
 if (args.includes("fetch")) { process.stderr.write("injected fetch failure\\n"); process.exit(1); }
+const remoteIndex = args.findIndex((arg, index) => index > 1 && arg === "origin");
+if (remoteIndex >= 0) args[remoteIndex] = ${JSON.stringify(path.join(fixture.root, "origin.git"))};
 const result = spawnSync("git", args, { stdio: "inherit" });
 process.exit(result.status ?? 2);
 `, { mode: 0o700 });

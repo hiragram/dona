@@ -386,30 +386,69 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = viewed.stdout.trim();
     }
-    const checked = await runProcess(
-      this.config.gitPath,
-      ["check-ref-format", "--branch", baseBranch],
-      this.config.jobCommandTimeoutMs,
-      signal,
-    );
-    if (!checked.ok) throw new Error("GitHub base branch name is invalid");
-    const remoteRef = `refs/remotes/origin/${baseBranch}`;
+    const explicitTag = baseBranch.startsWith("refs/tags/") ? baseBranch : undefined;
+    const explicitBranch = baseBranch.startsWith("refs/heads/")
+      ? baseBranch.slice("refs/heads/".length)
+      : baseBranch.startsWith("refs/remotes/origin/")
+        ? baseBranch.slice("refs/remotes/origin/".length)
+        : baseBranch.startsWith("origin/")
+          ? baseBranch.slice("origin/".length)
+          : undefined;
+    const rawCommit = /^[0-9a-f]{40,64}$/i.test(baseBranch) ? baseBranch : undefined;
+    let sourceRef: string;
+    let fetchedRef: string;
+    if (rawCommit) {
+      sourceRef = rawCommit;
+      fetchedRef = "FETCH_HEAD";
+    } else if (explicitTag) {
+      sourceRef = explicitTag;
+      fetchedRef = `refs/dona/tags/${row.job_id}`;
+    } else if (explicitBranch) {
+      sourceRef = `refs/heads/${explicitBranch}`;
+      fetchedRef = `refs/remotes/origin/${explicitBranch}`;
+    } else {
+      const checked = await runProcess(
+        this.config.gitPath,
+        ["check-ref-format", "--branch", baseBranch],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!checked.ok) throw new Error("GitHub base ref name is invalid");
+      const advertised = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--refs", "origin", `refs/heads/${baseBranch}`, `refs/tags/${baseBranch}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
+      const advertisedRefs = advertised.stdout.trim().split("\n").map((line) => line.split("\t")[1]).filter(Boolean);
+      if (advertisedRefs.includes(`refs/heads/${baseBranch}`)) {
+        sourceRef = `refs/heads/${baseBranch}`;
+        fetchedRef = `refs/remotes/origin/${baseBranch}`;
+      } else if (advertisedRefs.includes(`refs/tags/${baseBranch}`)) {
+        sourceRef = `refs/tags/${baseBranch}`;
+        fetchedRef = `refs/dona/tags/${row.job_id}`;
+      } else {
+        throw new Error(`Git remote base ref ${baseBranch} was not found`);
+      }
+    }
+    const refspec = fetchedRef === "FETCH_HEAD" ? sourceRef : `+${sourceRef}:${fetchedRef}`;
     const fetched = await runProcess(
       this.config.gitPath,
-      ["-C", repositoryPath, "fetch", "--prune", "origin", `+refs/heads/${baseBranch}:${remoteRef}`],
+      ["-C", repositoryPath, "fetch", "--prune", "origin", refspec],
       120_000,
       signal,
     );
-    if (!fetched.ok) throw safeCommandError(`Git fetch failed for branch ${baseBranch}`, fetched);
+    if (!fetched.ok) throw safeCommandError(`Git fetch failed for ref ${baseBranch}`, fetched);
     const resolved = await runProcess(
       this.config.gitPath,
-      ["-C", repositoryPath, "rev-parse", "--verify", `${remoteRef}^{commit}`],
+      ["-C", repositoryPath, "rev-parse", "--verify", `${fetchedRef}^{commit}`],
       this.config.jobCommandTimeoutMs,
       signal,
     );
     const baseSha = resolved.stdout.trim();
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
-      throw commandError(`Git remote base branch ${baseBranch} was not found`, resolved);
+      throw commandError(`Git remote base ref ${baseBranch} was not found`, resolved);
     }
     const created = await this.herdr([
       "worktree", "create",
