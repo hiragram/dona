@@ -466,7 +466,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         throw commandError("Git remote tag ambiguity check failed", sameNameTag);
       }
     }
-    const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
+    const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "FETCH_HEAD" || baseBranch === "origin"
       || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
       || (upstream !== undefined && !upstream[1]);
     if (usesDefaultBranch) {
@@ -503,6 +503,23 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       baseBranch = `refs/heads/${trackedRef.slice("refs/remotes/origin/".length)}`;
     }
     if (!baseBranch) throw new Error("GitHub base ref could not be resolved");
+    if (baseBranch.startsWith("origin/") && baseBranch !== "origin/HEAD") {
+      const branchName = baseBranch.slice("origin/".length);
+      const advertised = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--refs", "origin", `refs/heads/${branchName}`, `refs/tags/${baseBranch}`],
+        120_000,
+        signal,
+      );
+      if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
+      const advertisedRefs = advertised.stdout.trim().split("\n").map((line) => line.split("\t")[1]).filter(Boolean);
+      const hasBranch = advertisedRefs.includes(`refs/heads/${branchName}`);
+      const hasTag = advertisedRefs.includes(`refs/tags/${baseBranch}`);
+      if (hasBranch && hasTag) throw new Error(`Git remote base ref ${baseBranch} is ambiguous`);
+      if (hasTag) baseBranch = `refs/tags/${baseBranch}`;
+      else if (hasBranch) baseBranch = `refs/heads/${branchName}`;
+      else throw new Error(`Git remote base ref ${baseBranch} was not found`);
+    }
     const explicitTag = baseBranch.startsWith("refs/tags/")
       ? baseBranch
       : baseBranch.startsWith("tags/")

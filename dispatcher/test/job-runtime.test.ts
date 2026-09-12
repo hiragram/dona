@@ -428,6 +428,33 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("origin slash refは同名tagを維持しbranchとの曖昧性を拒否する", async () => {
+    const fixture = await githubFixture();
+    await git(fixture.seedPath, "tag", "origin/release", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/origin/release");
+    const tagSource = fixture.database.enqueue(eventEnvelope("Ev-github-origin-tag")).row;
+    const tagJob = fixture.database.createJob({
+      source_event_id: tagSource.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "origin/release" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await new HerdrJobAgentRuntime(fixture.config).prepare(tagJob);
+    assert.equal(await git(tagJob.workspace_path, "rev-parse", "HEAD"), fixture.featureSha);
+
+    await git(fixture.seedPath, "push", "origin", "main:refs/heads/release");
+    const ambiguousSource = fixture.database.enqueue(eventEnvelope("Ev-github-origin-ambiguous")).row;
+    const ambiguousJob = fixture.database.createJob({
+      source_event_id: ambiguousSource.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "origin/release" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await assert.rejects(
+      new HerdrJobAgentRuntime(fixture.config).prepare(ambiguousJob),
+      /Git remote base ref origin\/release is ambiguous/,
+    );
+    fixture.database.close();
+  });
+
   test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
     const fixture = await githubFixture();
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
@@ -458,6 +485,7 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-heads-prefix", baseRef: "heads/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-fetch-head", baseRef: "FETCH_HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: fixture.raceSha },
