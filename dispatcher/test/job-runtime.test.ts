@@ -415,6 +415,9 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", "main");
     await git(fixture.seedPath, "tag", "release-test", fixture.featureSha);
     await git(fixture.seedPath, "push", "origin", "refs/tags/release-test");
+    await git(fixture.seedPath, "tag", "-a", "annotated-test", "-m", "annotated", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/annotated-test");
+    const annotatedTagSha = await git(fixture.seedPath, "rev-parse", "refs/tags/annotated-test");
     const shortCommit = nonTipSha.slice(0, 12);
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(repositoryPath, "fetch", path.join(fixture.root, "origin.git"), `feature/test:refs/heads/local-collision-source`);
@@ -423,16 +426,20 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", `main:refs/heads/${hexBranch}`);
     const cases = [
       { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-origin-default", baseRef: "origin", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-heads-prefix", baseRef: "heads/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
       { event: "Ev-github-tags-prefix", baseRef: "tags/release-test", expected: fixture.featureSha },
       { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
       { event: "Ev-github-short-commit", baseRef: shortCommit, expected: nonTipSha },
+      { event: "Ev-github-annotated-tag-object", baseRef: annotatedTagSha, expected: fixture.featureSha },
       { event: "Ev-github-hex-branch", baseRef: hexBranch, expected: await git(fixture.seedPath, "rev-parse", "main") },
     ];
     for (const item of cases) {

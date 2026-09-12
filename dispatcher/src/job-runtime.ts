@@ -191,8 +191,9 @@ function resolveCommitPrefix(
     let aborted = false;
     let settled = false;
     const inspect = (line: string): void => {
-      if (candidates.size < 2 && /^[0-9a-f]{40,64}$/i.test(line) && line.toLowerCase().startsWith(prefix.toLowerCase())) {
-        candidates.add(line);
+      const objectId = line.split(" ", 1)[0] ?? "";
+      if (candidates.size < 2 && /^[0-9a-f]{40,64}$/i.test(objectId) && objectId.toLowerCase().startsWith(prefix.toLowerCase())) {
+        candidates.add(objectId);
       }
     };
     const finish = (ok: boolean): void => {
@@ -428,7 +429,11 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     let baseBranch = requestedBaseRef;
-    if (!baseBranch) {
+    const upstream = baseBranch?.match(/^(.*?)@\{(?:upstream|u)\}$/) ?? undefined;
+    const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
+      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
+      || (upstream !== undefined && !upstream[1]);
+    if (usesDefaultBranch) {
       const viewed = await runProcess(
         this.config.ghPath,
         ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
@@ -437,17 +442,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       );
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = `refs/heads/${viewed.stdout.trim()}`;
+    } else if (upstream) {
+      const upstreamBranch = upstream[1]!.startsWith("refs/heads/")
+        ? upstream[1]!.slice("refs/heads/".length)
+        : upstream[1]!.startsWith("heads/")
+          ? upstream[1]!.slice("heads/".length)
+          : upstream[1]!;
+      baseBranch = `refs/heads/${upstreamBranch}`;
     }
-    if (baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
-      const viewed = await runProcess(
-        this.config.ghPath,
-        ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-        120_000,
-        signal,
-      );
-      if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
-      baseBranch = `refs/heads/${viewed.stdout.trim()}`;
-    }
+    if (!baseBranch) throw new Error("GitHub base ref could not be resolved");
     const explicitTag = baseBranch.startsWith("refs/tags/")
       ? baseBranch
       : baseBranch.startsWith("tags/")
@@ -614,19 +617,29 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         signal,
       );
       if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseRef} could not be fetched`, fetchedObjects);
-      const remoteCommits = await resolveCommitPrefix(
+      const remoteObjects = await resolveCommitPrefix(
         this.config.gitPath,
-        ["-C", repositoryPath, "rev-list", `--glob=${objectNamespace}/*`],
+        ["-C", repositoryPath, "rev-list", "--objects", `--glob=${objectNamespace}/*`],
         baseRef,
         120_000,
         signal,
       );
-      if (!remoteCommits.ok) throw new Error(`Git remote commit candidates could not be inspected: ${remoteCommits.stderr.trim() || "command failed"}`);
-      const candidates = remoteCommits.candidates;
+      if (!remoteObjects.ok) throw new Error(`Git remote commit candidates could not be inspected: ${remoteObjects.stderr.trim() || "command failed"}`);
+      const candidates = remoteObjects.candidates;
       if (candidates.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(candidates[0] ?? "")) {
         throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
       }
-      return candidates[0]!;
+      const peeled = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--verify", `${candidates[0]}^{commit}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const commit = peeled.stdout.trim();
+      if (!peeled.ok || !/^[0-9a-f]{40,64}$/i.test(commit)) {
+        throw new Error(`Git remote commit ${baseRef} does not identify a commit`);
+      }
+      return commit;
     } finally {
       while (true) {
         const listedRefs = await runProcess(
