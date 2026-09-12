@@ -392,6 +392,8 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "commit", "-m", "advance main");
     const remoteMainSha = await git(fixture.seedPath, "rev-parse", "HEAD");
     await git(fixture.seedPath, "push", "origin", "main");
+    await git(fixture.seedPath, "tag", "main", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/main");
     const source = fixture.database.enqueue(eventEnvelope("Ev-github-default-base")).row;
     const job = fixture.database.createJob({
       source_event_id: source.event_id,
@@ -424,6 +426,7 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-heads-prefix", baseRef: "heads/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
