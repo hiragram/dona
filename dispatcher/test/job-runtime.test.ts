@@ -411,6 +411,7 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
       { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
+      { event: "Ev-github-short-commit", baseRef: fixture.featureSha.slice(0, 12), expected: fixture.featureSha },
     ];
     for (const item of cases) {
       const source = fixture.database.enqueue(eventEnvelope(item.event)).row;

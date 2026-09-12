@@ -399,7 +399,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     let fetchedRef: string;
     if (rawCommit) {
       sourceRef = rawCommit;
-      fetchedRef = "FETCH_HEAD";
+      fetchedRef = `refs/dona/commits/${row.job_id}`;
     } else if (explicitTag) {
       sourceRef = explicitTag;
       fetchedRef = `refs/dona/tags/${row.job_id}`;
@@ -428,11 +428,25 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       } else if (advertisedRefs.includes(`refs/tags/${baseBranch}`)) {
         sourceRef = `refs/tags/${baseBranch}`;
         fetchedRef = `refs/dona/tags/${row.job_id}`;
+      } else if (/^[0-9a-f]{4,39}$/i.test(baseBranch)) {
+        const remoteObjects = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "ls-remote", "origin"],
+          this.config.jobCommandTimeoutMs,
+          signal,
+        );
+        if (!remoteObjects.ok) throw safeCommandError(`Git remote commit ${baseBranch} could not be inspected`, remoteObjects);
+        const candidates = [...new Set(remoteObjects.stdout.trim().split("\n")
+          .map((line) => line.split("\t")[0] ?? "")
+          .filter((sha) => sha.toLowerCase().startsWith(baseBranch.toLowerCase())))];
+        if (candidates.length !== 1) throw new Error(`Git remote commit ${baseBranch} was not uniquely resolved`);
+        sourceRef = candidates[0]!;
+        fetchedRef = `refs/dona/commits/${row.job_id}`;
       } else {
         throw new Error(`Git remote base ref ${baseBranch} was not found`);
       }
     }
-    const refspec = fetchedRef === "FETCH_HEAD" ? sourceRef : `+${sourceRef}:${fetchedRef}`;
+    const refspec = `+${sourceRef}:${fetchedRef}`;
     const fetched = await runProcess(
       this.config.gitPath,
       ["-C", repositoryPath, "fetch", "--prune", "origin", refspec],
