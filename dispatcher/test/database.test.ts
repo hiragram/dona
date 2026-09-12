@@ -184,7 +184,10 @@ describe("DispatcherDatabase", () => {
     const duplicate = database.enqueueJobNotification(created.row.job_id);
     assert.equal(notification.row.source, "dona_job");
     assert.doesNotThrow(()=>database.assertJobSourceMatchesThread(created.row.job_id,notification.row.event_id));
-    assert.equal(database.listOwnerJobs(notification.row.event_id)[0]?.job_id,created.row.job_id);
+    const siblingSource=database.enqueue(eventEnvelope("Ev-job-sibling")).row;
+    const sibling=database.createJob({source_event_id:siblingSource.event_id,objective:"sibling",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    assert.doesNotThrow(()=>database.assertJobSourceMatchesThread(sibling.job_id,notification.row.event_id));
+    assert.deepEqual(new Set(database.listOwnerJobs(notification.row.event_id).map(row=>row.job_id)),new Set([created.row.job_id,sibling.job_id]));
     assert.equal(notification.row.event_type, "job_completed");
     assert.equal(envelopeFromRow(notification.row).source, "dona_job");
     assert.equal(duplicate.row.event_id, notification.row.event_id);

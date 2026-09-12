@@ -1026,7 +1026,7 @@ export class DispatcherDatabase {
   assertJobSourceMatchesThread(jobId: string, sourceEventId: string): void {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const owner=this.db.prepare("SELECT owner_json FROM job_owner_bindings WHERE job_id=?").get(jobId) as {owner_json:string}|undefined;
-    const completion=this.db.prepare("SELECT owner_json FROM job_completion_results WHERE job_id=? AND notification_event_id=?").get(jobId,sourceEventId) as {owner_json:string}|undefined;
+    const completion=this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined;
     if(!owner||(!binding&&completion?.owner_json!==owner.owner_json)||(binding&&stableStringify(binding.owner)!==owner.owner_json))
       throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
   }
