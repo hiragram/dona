@@ -479,6 +479,7 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", "feature/test:refs/heads/stable");
     await git(repositoryPath, "config", "branch.main.remote", "origin");
     await git(repositoryPath, "config", "branch.main.merge", "refs/heads/stable");
+    await git(repositoryPath, "config", "--add", "branch.main.merge", "refs/heads/main");
     await git(repositoryPath, "update-ref", "-d", "refs/remotes/origin/stable");
     const source = fixture.database.enqueue(eventEnvelope("Ev-github-missing-tracking-ref")).row;
     const job = fixture.database.createJob({

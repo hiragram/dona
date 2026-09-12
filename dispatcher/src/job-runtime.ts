@@ -497,12 +497,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         ),
         runProcess(
           this.config.gitPath,
-          ["-C", repositoryPath, "config", "--get", `branch.${branchName}.merge`],
+          ["-C", repositoryPath, "config", "--get-all", `branch.${branchName}.merge`],
           this.config.jobCommandTimeoutMs,
           signal,
         ),
       ]);
-      const mergeRef = trackedMerge.stdout.trim();
+      const mergeRef = trackedMerge.stdout.trim().split("\n")[0] ?? "";
       if (upstreamKind !== "push") {
         if (!trackedRemote.ok || trackedRemote.stdout.trim() !== "origin" || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
@@ -771,7 +771,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           ["-C", repositoryPath, "for-each-ref", "--count=100", "--format=%(refname)", objectNamespace],
           this.config.jobCommandTimeoutMs,
         );
-        if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
+        if (!listedRefs.ok) throw safeCommandError("Git temporary ref inspection failed", listedRefs);
         const temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
         if (temporaryRefs.length === 0) break;
         const deleted = await runProcess(
@@ -782,7 +782,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           false,
           temporaryRefs.map((temporaryRef) => `delete ${temporaryRef}\n`).join(""),
         );
-        if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
+        if (!deleted.ok) throw safeCommandError("Git temporary ref cleanup failed", deleted);
       }
     }
   }
