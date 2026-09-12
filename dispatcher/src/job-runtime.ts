@@ -386,6 +386,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = viewed.stdout.trim();
     }
+    if (baseBranch === "origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
+      const viewed = await runProcess(
+        this.config.ghPath,
+        ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
+      baseBranch = viewed.stdout.trim();
+    }
     const explicitTag = baseBranch.startsWith("refs/tags/") ? baseBranch : undefined;
     const explicitBranch = baseBranch.startsWith("refs/heads/")
       ? baseBranch.slice("refs/heads/".length)
@@ -394,13 +404,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         : baseBranch.startsWith("origin/")
           ? baseBranch.slice("origin/".length)
           : undefined;
-    const rawCommit = /^[0-9a-f]{40,64}$/i.test(baseBranch) ? baseBranch : undefined;
     let sourceRef: string;
     let fetchedRef: string;
-    if (rawCommit) {
-      sourceRef = rawCommit;
-      fetchedRef = `refs/dona/commits/${row.job_id}`;
-    } else if (explicitTag) {
+    if (explicitTag) {
       sourceRef = explicitTag;
       fetchedRef = `refs/dona/tags/${row.job_id}`;
     } else if (explicitBranch) {
@@ -428,19 +434,37 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       } else if (advertisedRefs.includes(`refs/tags/${baseBranch}`)) {
         sourceRef = `refs/tags/${baseBranch}`;
         fetchedRef = `refs/dona/tags/${row.job_id}`;
-      } else if (/^[0-9a-f]{4,39}$/i.test(baseBranch)) {
-        const remoteObjects = await runProcess(
+      } else if (/^[0-9a-f]{4,64}$/i.test(baseBranch)) {
+        const objectNamespace = `refs/dona/objects/${row.job_id}`;
+        const fetchedObjects = await runProcess(
           this.config.gitPath,
-          ["-C", repositoryPath, "ls-remote", "origin"],
+          [
+            "-C", repositoryPath, "fetch", "--prune", "origin",
+            `+refs/heads/*:${objectNamespace}/heads/*`,
+            `+refs/tags/*:${objectNamespace}/tags/*`,
+          ],
+          120_000,
+          signal,
+        );
+        if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseBranch} could not be fetched`, fetchedObjects);
+        const resolvedCommit = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "rev-parse", "--verify", `${baseBranch}^{commit}`],
           this.config.jobCommandTimeoutMs,
           signal,
         );
-        if (!remoteObjects.ok) throw safeCommandError(`Git remote commit ${baseBranch} could not be inspected`, remoteObjects);
-        const candidates = [...new Set(remoteObjects.stdout.trim().split("\n")
-          .map((line) => line.split("\t")[0] ?? "")
-          .filter((sha) => sha.toLowerCase().startsWith(baseBranch.toLowerCase())))];
-        if (candidates.length !== 1) throw new Error(`Git remote commit ${baseBranch} was not uniquely resolved`);
-        sourceRef = candidates[0]!;
+        const candidate = resolvedCommit.stdout.trim();
+        if (!resolvedCommit.ok || !/^[0-9a-f]{40,64}$/i.test(candidate)) {
+          throw new Error(`Git remote commit ${baseBranch} was not uniquely resolved`);
+        }
+        const reachable = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", `--contains=${candidate}`, objectNamespace],
+          this.config.jobCommandTimeoutMs,
+          signal,
+        );
+        if (!reachable.ok || !reachable.stdout.trim()) throw new Error(`Git remote commit ${baseBranch} is not reachable`);
+        sourceRef = candidate;
         fetchedRef = `refs/dona/commits/${row.job_id}`;
       } else {
         throw new Error(`Git remote base ref ${baseBranch} was not found`);
