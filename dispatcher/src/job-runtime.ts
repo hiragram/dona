@@ -166,6 +166,11 @@ function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 1_048_576) stderr += chunk.toString("utf8");
     });
+    child.stdin.on("error", (error) => {
+      stderr = error.message;
+      terminate();
+      finish({ ok: false, stdout, stderr, exitCode: child.exitCode, timedOut, aborted });
+    });
     child.once("error", (error) => {
       stderr = error.message;
       finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
