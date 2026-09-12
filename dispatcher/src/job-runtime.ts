@@ -243,7 +243,7 @@ function commandError(label: string, result: HerdrCommandResult): Error {
   return error;
 }
 
-function safeCommandError(label: string, result: HerdrCommandResult): Error {
+function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
   const error = new Error(label);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
@@ -747,7 +747,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         120_000,
         signal,
       );
-      if (!remoteObjects.ok) throw new Error(`Git remote commit candidates could not be inspected: ${remoteObjects.stderr.trim() || "command failed"}`);
+      if (!remoteObjects.ok) throw safeCommandError("Git remote commit candidates could not be inspected", remoteObjects);
       const candidates = remoteObjects.candidates;
       if (candidates.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(candidates[0] ?? "")) {
         throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
