@@ -490,6 +490,27 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
         trackingRevision = `${viewed.stdout.trim()}@{${upstream[2]}}`;
       }
+      if (upstream[1] && upstream[2] !== "push") {
+        const [trackedRemote, trackedMerge] = await Promise.all([
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get", `branch.${upstream[1]}.remote`],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get", `branch.${upstream[1]}.merge`],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+        ]);
+        const mergeRef = trackedMerge.stdout.trim();
+        if (!trackedRemote.ok || trackedRemote.stdout.trim() !== "origin" || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
+          throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
+        }
+        baseBranch = mergeRef;
+      } else {
       const tracked = await runProcess(
         this.config.gitPath,
         ["-C", repositoryPath, "rev-parse", "--symbolic-full-name", trackingRevision],
@@ -501,6 +522,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
       }
       baseBranch = `refs/heads/${trackedRef.slice("refs/remotes/origin/".length)}`;
+      }
     }
     if (!baseBranch) throw new Error("GitHub base ref could not be resolved");
     if (baseBranch.startsWith("origin/") && baseBranch !== "origin/HEAD") {
