@@ -431,7 +431,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     let baseBranch = requestedBaseRef;
     const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
-      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD";
+      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
+      || (upstream !== undefined && !upstream[1]);
     if (usesDefaultBranch) {
       const viewed = await runProcess(
         this.config.ghPath,
@@ -525,7 +526,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const refspec = `+${sourceRef}:${fetchedRef}`;
     const fetched = await runProcess(
       this.config.gitPath,
-      ["-C", repositoryPath, "fetch", "--prune", "origin", refspec],
+      ["-C", repositoryPath, "fetch", "--refmap=", "--prune", "origin", refspec],
       120_000,
       signal,
     );
@@ -624,7 +625,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const fetchedObjects = await runProcess(
         this.config.gitPath,
         [
-          "-C", repositoryPath, "fetch", "--prune", "origin",
+          "-C", repositoryPath, "fetch", "--refmap=", "--prune", "origin",
           `+refs/heads/*:${objectNamespace}/heads/*`,
           `+refs/tags/*:${objectNamespace}/tags/*`,
         ],

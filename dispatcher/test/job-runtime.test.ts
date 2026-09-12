@@ -355,6 +355,9 @@ describe("GitHub workspace provisioning", () => {
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(fixture.seedPath, "push", "origin", "main:refs/heads/foo");
+    await git(repositoryPath, "update-ref", "refs/remotes/origin/foo/bar", await git(repositoryPath, "rev-parse", "HEAD"));
 
     await new HerdrJobAgentRuntime(fixture.config).prepare(job);
 
@@ -436,9 +439,9 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
-      { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: fixture.raceSha },
+      { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: fixture.raceSha },
-      { event: "Ev-github-push-head", baseRef: "@{push}", expected: fixture.raceSha },
+      { event: "Ev-github-push-head", baseRef: "@{push}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-main-push", baseRef: "main@{push}", expected: fixture.raceSha },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
