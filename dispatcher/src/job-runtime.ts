@@ -448,9 +448,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = viewed.stdout.trim();
     }
-    const explicitTag = baseBranch.startsWith("refs/tags/") ? baseBranch : undefined;
+    const explicitTag = baseBranch.startsWith("refs/tags/")
+      ? baseBranch
+      : baseBranch.startsWith("tags/")
+        ? `refs/${baseBranch}`
+        : undefined;
     const explicitBranch = baseBranch.startsWith("refs/heads/")
       ? baseBranch.slice("refs/heads/".length)
+      : baseBranch.startsWith("heads/")
+        ? baseBranch.slice("heads/".length)
       : baseBranch.startsWith("refs/remotes/origin/")
         ? baseBranch.slice("refs/remotes/origin/".length)
         : baseBranch.startsWith("remotes/origin/")
@@ -622,19 +628,23 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       }
       return candidates[0]!;
     } finally {
-      const listedRefs = await runProcess(
-        this.config.gitPath,
-        ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", objectNamespace],
-        this.config.jobCommandTimeoutMs,
-      );
-      if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
-      for (const temporaryRef of listedRefs.stdout.trim().split("\n").filter(Boolean)) {
-        const deleted = await runProcess(
+      while (true) {
+        const listedRefs = await runProcess(
           this.config.gitPath,
-          ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
+          ["-C", repositoryPath, "for-each-ref", "--count=100", "--format=%(refname)", objectNamespace],
           this.config.jobCommandTimeoutMs,
         );
-        if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
+        if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
+        const temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
+        if (temporaryRefs.length === 0) break;
+        for (const temporaryRef of temporaryRefs) {
+          const deleted = await runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
+            this.config.jobCommandTimeoutMs,
+          );
+          if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
+        }
       }
     }
   }
