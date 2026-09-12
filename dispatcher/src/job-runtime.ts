@@ -458,7 +458,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       return created;
     }
     let baseBranch = requestedBaseRef;
-    const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
+    const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/i) ?? undefined;
+    const upstreamKind = upstream?.[2]?.toLowerCase();
     if (baseBranch === "origin" || baseBranch === "origin/HEAD") {
       const sameNameTag = await runProcess(
         this.config.gitPath,
@@ -502,7 +503,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         ),
       ]);
       const mergeRef = trackedMerge.stdout.trim();
-      if (upstream[2] !== "push") {
+      if (upstreamKind !== "push") {
         if (!trackedRemote.ok || trackedRemote.stdout.trim() !== "origin" || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
         }
@@ -646,7 +647,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     );
     const baseSha = resolved.stdout.trim();
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
-      throw commandError(`Git remote base ref ${baseBranch} was not found`, resolved);
+      throw safeCommandError(`Git remote base ref ${baseBranch} was not found`, resolved);
     }
     const created = await this.herdr([
       "worktree", "create",
