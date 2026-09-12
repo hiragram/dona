@@ -587,7 +587,9 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
       const sourceEventId=url.searchParams.get("source_event_id");
       if(sourceEventId){
-        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId)});}
+        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId).map(
+          ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+            ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}))});}
         catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
         return;
       }

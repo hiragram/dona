@@ -167,6 +167,11 @@ describe("DispatcherApi", () => {
     assert.equal(sibling.status,202);
     assert.equal((await request(config.socketPath,"POST","/v1/jobs",siblingRequest)).status,200);
     assert.equal((await request(config.socketPath,"POST","/v1/jobs",{...siblingRequest,objective:"差し替え"})).status,409);
+    const ownerList=await request(config.socketPath,"GET",`/v1/jobs?source_event_id=${accepted.body.event_id}`);
+    assert.equal(ownerList.status,200);
+    assert.equal((ownerList.body.jobs as unknown[]).length,2);
+    assert.equal("objective" in (ownerList.body.jobs as Array<Record<string,unknown>>)[0]!,false);
+    assert.equal("workspace_json" in (ownerList.body.jobs as Array<Record<string,unknown>>)[0]!,false);
     const listed = await request(
       config.socketPath,
       "GET",

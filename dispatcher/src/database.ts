@@ -580,11 +580,11 @@ export class DispatcherDatabase {
   listRunnableJobs(at = new Date(), limit = 100): JobRow[] {
     return this.db.prepare(`
       WITH ranked AS (
-        SELECT job_id, ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,rowid) AS fairness_rank
+        SELECT job_id,rowid AS insertion_order,ROW_NUMBER() OVER (PARTITION BY source_event_id ORDER BY created_at,rowid) AS fairness_rank
         FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status IN ('preparing','dispatching','running')
       ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
         WHERE jobs.status IN ('queued','retryable_failed','running')
-        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,job_id LIMIT ?
+        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,ranked.insertion_order LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
   }
 
