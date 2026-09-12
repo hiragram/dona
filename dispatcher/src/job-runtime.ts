@@ -368,6 +368,13 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (normalizedRepository(origin.stdout) !== repository.toLowerCase()) {
       throw new Error(`Existing repository origin does not match ${repository}`);
     }
+    if (await exists(path.join(row.workspace_path, ".git"))) {
+      const expectedSha = await this.resolveExistingJobBranch(row, repositoryPath, signal);
+      await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+      return this.herdr([
+        "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
+      ], this.config.jobCommandTimeoutMs + 5_000, signal);
+    }
     let baseBranch = requestedBaseRef;
     if (!baseBranch) {
       const viewed = await runProcess(
@@ -404,12 +411,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
       throw commandError(`Git remote base branch ${baseBranch} was not found`, resolved);
     }
-    if (await exists(path.join(row.workspace_path, ".git"))) {
-      await this.verifyWorktreeIdentity(row, repositoryPath, baseSha, signal);
-      return this.herdr([
-        "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
-      ], this.config.jobCommandTimeoutMs + 5_000, signal);
-    }
     const created = await this.herdr([
       "worktree", "create",
       "--cwd", repositoryPath,
@@ -440,6 +441,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) {
       throw new Error(`Existing repository origin does not match ${repository}`);
     }
+    const expectedSha = await this.resolveExistingJobBranch(row, repositoryPath, signal);
+    await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+  }
+
+  private async resolveExistingJobBranch(
+    row: JobRow,
+    repositoryPath: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     const branch = `refs/heads/dona/${row.job_id}`;
     const resolved = await runProcess(
       this.config.gitPath,
@@ -451,7 +461,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
       throw commandError(`Existing job branch dona/${row.job_id} could not be resolved`, resolved);
     }
-    await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+    return expectedSha;
   }
 
   private async verifyWorktreeIdentity(
