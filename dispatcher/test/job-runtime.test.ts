@@ -474,6 +474,26 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("local tracking refがなくてもpush設定からremote destinationを解決する", async () => {
+    const fixture = await githubFixture();
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(fixture.seedPath, "push", "origin", "feature/test:refs/heads/stable");
+    await git(repositoryPath, "config", "branch.main.remote", "origin");
+    await git(repositoryPath, "config", "branch.main.merge", "refs/heads/stable");
+    await git(repositoryPath, "config", "push.default", "upstream");
+    await git(repositoryPath, "update-ref", "-d", "refs/remotes/origin/stable");
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-missing-push-ref")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main@{push}" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+
+    await new HerdrJobAgentRuntime(fixture.config).prepare(job);
+    assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), fixture.raceSha);
+    fixture.database.close();
+  });
+
   test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
     const fixture = await githubFixture();
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
