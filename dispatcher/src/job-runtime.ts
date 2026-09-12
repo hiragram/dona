@@ -452,15 +452,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     let baseBranch = requestedBaseRef;
     const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
-    if (baseBranch === "origin") {
+    if (baseBranch === "origin" || baseBranch === "origin/HEAD") {
       const sameNameTag = await runProcess(
         this.config.gitPath,
-        ["-C", repositoryPath, "ls-remote", "--exit-code", "--refs", "--tags", "origin", "refs/tags/origin"],
+        ["-C", repositoryPath, "ls-remote", "--exit-code", "--refs", "--tags", "origin", `refs/tags/${baseBranch}`],
         120_000,
         signal,
       );
       if (sameNameTag.ok && sameNameTag.stdout.trim()) {
-        throw new Error("GitHub base ref origin is ambiguous with a remote tag");
+        throw new Error(`GitHub base ref ${baseBranch} is ambiguous with a remote tag`);
       }
       if (!sameNameTag.ok && sameNameTag.exitCode !== 2) {
         throw commandError("Git remote tag ambiguity check failed", sameNameTag);
@@ -495,11 +495,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         ),
       ]);
       const mergeRef = trackedMerge.stdout.trim();
-      if (!trackedRemote.ok || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
-        throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
-      }
       if (upstream[2] !== "push") {
-        if (trackedRemote.stdout.trim() !== "origin") {
+        if (!trackedRemote.ok || trackedRemote.stdout.trim() !== "origin" || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
         }
         baseBranch = mergeRef;
@@ -534,14 +531,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           ? branchPushRemote.stdout.trim()
           : defaultPushRemote.ok && defaultPushRemote.stdout.trim()
             ? defaultPushRemote.stdout.trim()
-            : trackedRemote.stdout.trim();
+            : trackedRemote.ok && trackedRemote.stdout.trim()
+              ? trackedRemote.stdout.trim()
+              : "origin";
         const mode = pushDefault.ok && pushDefault.stdout.trim() ? pushDefault.stdout.trim() : "simple";
         if (pushRemote !== "origin" || configuredPush.ok) {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
         }
-        if (mode === "upstream") baseBranch = mergeRef;
+        if (mode === "upstream" && trackedMerge.ok && mergeRef.startsWith("refs/heads/")) baseBranch = mergeRef;
         else if (mode === "current") baseBranch = `refs/heads/${branchName}`;
-        else if (mode === "simple" && trackedRemote.stdout.trim() === pushRemote && mergeRef === `refs/heads/${branchName}`) {
+        else if (mode === "simple" && trackedRemote.ok && trackedMerge.ok && trackedRemote.stdout.trim() === pushRemote && mergeRef === `refs/heads/${branchName}`) {
           baseBranch = mergeRef;
         } else {
           throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);

@@ -428,6 +428,24 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("origin HEADと同名remote tagの曖昧性を拒否する", async () => {
+    const fixture = await githubFixture();
+    await git(fixture.seedPath, "tag", "origin/HEAD", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/origin/HEAD");
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-ambiguous-origin-head")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "origin/HEAD" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+
+    await assert.rejects(
+      new HerdrJobAgentRuntime(fixture.config).prepare(job),
+      /GitHub base ref origin\/HEAD is ambiguous with a remote tag/,
+    );
+    fixture.database.close();
+  });
+
   test("origin slash refは同名tagを維持しbranchとの曖昧性を拒否する", async () => {
     const fixture = await githubFixture();
     await git(fixture.seedPath, "tag", "origin/release", fixture.featureSha);
@@ -491,6 +509,25 @@ describe("GitHub workspace provisioning", () => {
 
     await new HerdrJobAgentRuntime(fixture.config).prepare(job);
     assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), fixture.raceSha);
+    fixture.database.close();
+  });
+
+  test("push currentはtracking設定なしで同名remote branchを解決する", async () => {
+    const fixture = await githubFixture();
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(repositoryPath, "config", "--unset-all", "branch.main.remote").catch(() => undefined);
+    await git(repositoryPath, "config", "--unset-all", "branch.main.merge").catch(() => undefined);
+    await git(repositoryPath, "config", "push.default", "current");
+    await git(repositoryPath, "update-ref", "-d", "refs/remotes/origin/main");
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-push-current")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "main@{push}" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+
+    await new HerdrJobAgentRuntime(fixture.config).prepare(job);
+    assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), await git(fixture.seedPath, "rev-parse", "main"));
     fixture.database.close();
   });
 
