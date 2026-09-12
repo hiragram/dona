@@ -408,6 +408,26 @@ describe("GitHub workspace provisioning", () => {
     fixture.database.close();
   });
 
+  test("bare originと同名remote tagの曖昧性を拒否する", async () => {
+    const fixture = await githubFixture();
+    await git(fixture.seedPath, "tag", "origin", fixture.featureSha);
+    await git(fixture.seedPath, "push", "origin", "refs/tags/origin");
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-ambiguous-origin")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "origin" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+
+    await assert.rejects(
+      new HerdrJobAgentRuntime(fixture.config).prepare(job),
+      /GitHub base ref origin is ambiguous with a remote tag/,
+    );
+    const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.some((args) => args[2] === "worktree" || (args[2] === "agent" && args[3] === "start")), false);
+    fixture.database.close();
+  });
+
   test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
     const fixture = await githubFixture();
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");

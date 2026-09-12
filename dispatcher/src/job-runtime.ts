@@ -452,6 +452,20 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     let baseBranch = requestedBaseRef;
     const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
+    if (baseBranch === "origin") {
+      const sameNameTag = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--exit-code", "--refs", "--tags", "origin", "refs/tags/origin"],
+        120_000,
+        signal,
+      );
+      if (sameNameTag.ok && sameNameTag.stdout.trim()) {
+        throw new Error("GitHub base ref origin is ambiguous with a remote tag");
+      }
+      if (!sameNameTag.ok && sameNameTag.exitCode !== 2) {
+        throw commandError("Git remote tag ambiguity check failed", sameNameTag);
+      }
+    }
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
       || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
       || (upstream !== undefined && !upstream[1]);
