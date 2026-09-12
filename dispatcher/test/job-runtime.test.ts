@@ -407,6 +407,7 @@ describe("GitHub workspace provisioning", () => {
 
   test("origin branch、remote tag、raw commit SHAの既存base_ref形式を維持する", async () => {
     const fixture = await githubFixture();
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(fixture.seedPath, "checkout", "main");
     const nonTipSha = await git(fixture.seedPath, "rev-parse", "HEAD");
     await fs.writeFile(path.join(fixture.seedPath, "main-next.txt"), "next\n");
@@ -418,8 +419,12 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "tag", "-a", "annotated-test", "-m", "annotated", fixture.featureSha);
     await git(fixture.seedPath, "push", "origin", "refs/tags/annotated-test");
     const annotatedTagSha = await git(fixture.seedPath, "rev-parse", "refs/tags/annotated-test");
+    await git(fixture.seedPath, "push", "origin", `feature/test:refs/heads/stable`);
+    await git(repositoryPath, "fetch", path.join(fixture.root, "origin.git"), `stable:refs/remotes/origin/stable`);
+    await git(repositoryPath, "config", "branch.main.remote", "origin");
+    await git(repositoryPath, "config", "branch.main.merge", "refs/heads/stable");
+    await git(repositoryPath, "config", "push.default", "upstream");
     const shortCommit = nonTipSha.slice(0, 12);
-    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(repositoryPath, "fetch", path.join(fixture.root, "origin.git"), `feature/test:refs/heads/local-collision-source`);
     await git(repositoryPath, "branch", shortCommit, fixture.featureSha);
     const hexBranch = "a".repeat(40);
@@ -431,10 +436,10 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-remotes-origin-prefix", baseRef: "remotes/origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
-      { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
-      { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
-      { event: "Ev-github-push-head", baseRef: "@{push}", expected: await git(fixture.seedPath, "rev-parse", "main") },
-      { event: "Ev-github-main-push", baseRef: "main@{push}", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: fixture.raceSha },
+      { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: fixture.raceSha },
+      { event: "Ev-github-push-head", baseRef: "@{push}", expected: fixture.raceSha },
+      { event: "Ev-github-main-push", baseRef: "main@{push}", expected: fixture.raceSha },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
@@ -452,7 +457,7 @@ describe("GitHub workspace provisioning", () => {
         workspace: { kind: "github", repository: "owner/repo", base_ref: item.baseRef },
       }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
       await new HerdrJobAgentRuntime(fixture.config).prepare(job);
-      assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), item.expected);
+      assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), item.expected, item.event);
     }
     assert.equal(await git(repositoryPath, "for-each-ref", "--format=%(refname)", "refs/dona/objects"), "");
     fixture.database.close();

@@ -431,8 +431,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     let baseBranch = requestedBaseRef;
     const upstream = baseBranch?.match(/^(.*?)@\{(?:upstream|u|push)\}$/) ?? undefined;
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
-      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
-      || (upstream !== undefined && !upstream[1]);
+      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD";
     if (usesDefaultBranch) {
       const viewed = await runProcess(
         this.config.ghPath,
@@ -443,12 +442,17 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = `refs/heads/${viewed.stdout.trim()}`;
     } else if (upstream) {
-      const upstreamBranch = upstream[1]!.startsWith("refs/heads/")
-        ? upstream[1]!.slice("refs/heads/".length)
-        : upstream[1]!.startsWith("heads/")
-          ? upstream[1]!.slice("heads/".length)
-          : upstream[1]!;
-      baseBranch = `refs/heads/${upstreamBranch}`;
+      const tracked = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--symbolic-full-name", baseBranch!],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const trackedRef = tracked.stdout.trim();
+      if (!tracked.ok || !trackedRef.startsWith("refs/remotes/origin/") || trackedRef === "refs/remotes/origin/HEAD") {
+        throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
+      }
+      baseBranch = `refs/heads/${trackedRef.slice("refs/remotes/origin/".length)}`;
     }
     if (!baseBranch) throw new Error("GitHub base ref could not be resolved");
     const explicitTag = baseBranch.startsWith("refs/tags/")
