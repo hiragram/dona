@@ -175,6 +175,59 @@ function runProcess(
   });
 }
 
+function resolveCommitPrefix(
+  executable: string,
+  args: string[],
+  prefix: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; candidates: string[]; stderr: string; timedOut: boolean; aborted: boolean }> {
+  return new Promise((resolve) => {
+    const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const candidates = new Set<string>();
+    let remainder = "";
+    let stderr = "";
+    let timedOut = false;
+    let aborted = false;
+    let settled = false;
+    const inspect = (line: string): void => {
+      if (candidates.size < 2 && /^[0-9a-f]{40,64}$/i.test(line) && line.toLowerCase().startsWith(prefix.toLowerCase())) {
+        candidates.add(line);
+      }
+    };
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (remainder) inspect(remainder);
+      resolve({ ok: ok && !timedOut && !aborted, candidates: [...candidates], stderr, timedOut, aborted });
+    };
+    const terminate = (): void => {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      forceKill.unref();
+    };
+    const abort = (): void => { aborted = true; terminate(); };
+    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
+    timer.unref();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    child.stdout.on("data", (chunk: Buffer) => {
+      const lines = `${remainder}${chunk.toString("utf8")}`.split("\n");
+      remainder = lines.pop() ?? "";
+      for (const line of lines) inspect(line);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < 2_000) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => { stderr = error.message; finish(false); });
+    child.once("close", (code) => finish(code === 0));
+  });
+}
+
 function commandError(label: string, result: HerdrCommandResult): Error {
   const detail = (result.stderr || result.stdout || "command failed").trim().slice(0, 2_000);
   const error = new Error(`${label}: ${detail}`);
@@ -379,7 +432,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const viewed = await runProcess(
         this.config.ghPath,
         ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-        this.config.jobCommandTimeoutMs,
+        120_000,
         signal,
       );
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
@@ -389,7 +442,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const viewed = await runProcess(
         this.config.ghPath,
         ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-        this.config.jobCommandTimeoutMs,
+        120_000,
         signal,
       );
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
@@ -553,16 +606,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         signal,
       );
       if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseRef} could not be fetched`, fetchedObjects);
-      const remoteCommits = await runProcess(
+      const remoteCommits = await resolveCommitPrefix(
         this.config.gitPath,
         ["-C", repositoryPath, "rev-list", `--glob=${objectNamespace}/*`],
+        baseRef,
         this.config.jobCommandTimeoutMs,
         signal,
       );
-      if (!remoteCommits.ok) throw commandError("Git remote commit candidates could not be inspected", remoteCommits);
-      const candidates = [...new Set(
-        remoteCommits.stdout.trim().split("\n").filter((sha) => sha.toLowerCase().startsWith(baseRef.toLowerCase())),
-      )];
+      if (!remoteCommits.ok) throw new Error(`Git remote commit candidates could not be inspected: ${remoteCommits.stderr.trim() || "command failed"}`);
+      const candidates = remoteCommits.candidates;
       if (candidates.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(candidates[0] ?? "")) {
         throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
       }
