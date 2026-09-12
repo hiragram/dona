@@ -429,7 +429,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     let baseBranch = requestedBaseRef;
-    const upstream = baseBranch?.match(/^(.*?)@\{(?:upstream|u)\}$/) ?? undefined;
+    const upstream = baseBranch?.match(/^(.*?)@\{(?:upstream|u|push)\}$/) ?? undefined;
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
       || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
       || (upstream !== undefined && !upstream[1]);

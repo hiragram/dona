@@ -433,6 +433,8 @@ describe("GitHub workspace provisioning", () => {
       { event: "Ev-github-at-head", baseRef: "@", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-upstream-head", baseRef: "@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-main-upstream", baseRef: "main@{upstream}", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-push-head", baseRef: "@{push}", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-main-push", baseRef: "main@{push}", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-remotes-origin-head", baseRef: "remotes/origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
