@@ -417,6 +417,7 @@ describe("GitHub workspace provisioning", () => {
     await git(fixture.seedPath, "push", "origin", `main:refs/heads/${hexBranch}`);
     const cases = [
       { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
+      { event: "Ev-github-head", baseRef: "HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-head", baseRef: "origin/HEAD", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-tag", baseRef: "release-test", expected: fixture.featureSha },
       { event: "Ev-github-commit", baseRef: fixture.featureSha, expected: fixture.featureSha },
@@ -433,6 +434,8 @@ describe("GitHub workspace provisioning", () => {
       await new HerdrJobAgentRuntime(fixture.config).prepare(job);
       assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), item.expected);
     }
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    assert.equal(await git(repositoryPath, "for-each-ref", "--format=%(refname)", "refs/dona/objects"), "");
     fixture.database.close();
   });
 
@@ -511,6 +514,7 @@ process.exit(2);
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await assert.rejects(new HerdrJobAgentRuntime(fixture.config).prepare(job), /Git worktree HEAD mismatch/);
     await assert.rejects(new HerdrJobAgentRuntime(fixture.config).prepare(job), /Git worktree HEAD mismatch/);
     const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.some((args) => args[2] === "agent" && args[3] === "start"), false);

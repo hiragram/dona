@@ -386,7 +386,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
       baseBranch = viewed.stdout.trim();
     }
-    if (baseBranch === "origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
+    if (baseBranch === "HEAD" || baseBranch === "origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD") {
       const viewed = await runProcess(
         this.config.ghPath,
         ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
@@ -406,17 +406,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           : undefined;
     let sourceRef: string;
     let fetchedRef: string;
+    let temporaryRefs: string[] = [];
     if (explicitTag) {
       sourceRef = explicitTag;
-      fetchedRef = `refs/dona/tags/${row.job_id}`;
+      fetchedRef = `refs/dona/bases/${row.job_id}`;
     } else if (explicitBranch) {
       sourceRef = `refs/heads/${explicitBranch}`;
-      fetchedRef = `refs/remotes/origin/${explicitBranch}`;
+      fetchedRef = `refs/dona/bases/${row.job_id}`;
     } else {
       const checked = await runProcess(
         this.config.gitPath,
         ["check-ref-format", "--branch", baseBranch],
-        this.config.jobCommandTimeoutMs,
+        120_000,
         signal,
       );
       if (!checked.ok) throw new Error("GitHub base ref name is invalid");
@@ -428,12 +429,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       );
       if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
       const advertisedRefs = advertised.stdout.trim().split("\n").map((line) => line.split("\t")[1]).filter(Boolean);
-      if (advertisedRefs.includes(`refs/heads/${baseBranch}`)) {
+      const hasBranch = advertisedRefs.includes(`refs/heads/${baseBranch}`);
+      const hasTag = advertisedRefs.includes(`refs/tags/${baseBranch}`);
+      if (hasBranch && hasTag) throw new Error(`Git remote base ref ${baseBranch} is ambiguous`);
+      if (hasBranch) {
         sourceRef = `refs/heads/${baseBranch}`;
-        fetchedRef = `refs/remotes/origin/${baseBranch}`;
-      } else if (advertisedRefs.includes(`refs/tags/${baseBranch}`)) {
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else if (hasTag) {
         sourceRef = `refs/tags/${baseBranch}`;
-        fetchedRef = `refs/dona/tags/${row.job_id}`;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
       } else if (/^[0-9a-f]{4,64}$/i.test(baseBranch)) {
         const objectNamespace = `refs/dona/objects/${row.job_id}`;
         const fetchedObjects = await runProcess(
@@ -464,8 +468,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           signal,
         );
         if (!reachable.ok || !reachable.stdout.trim()) throw new Error(`Git remote commit ${baseBranch} is not reachable`);
+        const listedRefs = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", objectNamespace],
+          this.config.jobCommandTimeoutMs,
+          signal,
+        );
+        if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
+        temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
         sourceRef = candidate;
-        fetchedRef = `refs/dona/commits/${row.job_id}`;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
       } else {
         throw new Error(`Git remote base ref ${baseBranch} was not found`);
       }
@@ -487,6 +499,15 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const baseSha = resolved.stdout.trim();
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
       throw commandError(`Git remote base ref ${baseBranch} was not found`, resolved);
+    }
+    for (const temporaryRef of temporaryRefs) {
+      const deleted = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
     }
     const created = await this.herdr([
       "worktree", "create",
@@ -527,7 +548,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     repositoryPath: string,
     signal?: AbortSignal,
   ): Promise<string> {
-    const branch = `refs/heads/dona/${row.job_id}`;
+    const branch = `refs/dona/bases/${row.job_id}`;
     const resolved = await runProcess(
       this.config.gitPath,
       ["-C", repositoryPath, "rev-parse", "--verify", `${branch}^{commit}`],
