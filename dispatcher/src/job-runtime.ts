@@ -610,7 +610,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         this.config.gitPath,
         ["-C", repositoryPath, "rev-list", `--glob=${objectNamespace}/*`],
         baseRef,
-        this.config.jobCommandTimeoutMs,
+        120_000,
         signal,
       );
       if (!remoteCommits.ok) throw new Error(`Git remote commit candidates could not be inspected: ${remoteCommits.stderr.trim() || "command failed"}`);
