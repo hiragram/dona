@@ -598,6 +598,7 @@ describe("GitHub workspace provisioning", () => {
     await git(repositoryPath, "branch", shortCommit, fixture.featureSha);
     const hexBranch = "a".repeat(40);
     await git(fixture.seedPath, "push", "origin", `main:refs/heads/${hexBranch}`);
+    await git(fixture.seedPath, "push", "origin", `main:refs/heads/${fixture.featureSha}`);
     const cases = [
       { event: "Ev-github-origin-prefix", baseRef: "origin/main", expected: await git(fixture.seedPath, "rev-parse", "main") },
       { event: "Ev-github-origin-default", baseRef: "origin", expected: await git(fixture.seedPath, "rev-parse", "main") },

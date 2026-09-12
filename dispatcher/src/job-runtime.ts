@@ -618,7 +618,20 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const hasBranch = advertisedRefs.includes(`refs/heads/${baseBranch}`);
       const hasTag = advertisedRefs.includes(`refs/tags/${baseBranch}`);
       if (hasBranch && hasTag) throw new Error(`Git remote base ref ${baseBranch} is ambiguous`);
-      if (hasBranch) {
+      let resolvedObject: string | undefined;
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseBranch)) {
+        try {
+          resolvedObject = await this.resolveRemoteCommit(repositoryPath, baseBranch, row, signal);
+        } catch (error) {
+          if (!(error instanceof Error && error.message === `Git remote commit ${baseBranch} was not uniquely resolved` && (hasBranch || hasTag))) {
+            throw error;
+          }
+        }
+      }
+      if (resolvedObject) {
+        sourceRef = resolvedObject;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else if (hasBranch) {
         sourceRef = `refs/heads/${baseBranch}`;
         fetchedRef = `refs/dona/bases/${row.job_id}`;
       } else if (hasTag) {
@@ -708,7 +721,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       migrateLegacyRef = true;
     }
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
-      throw commandError(`Existing job branch dona/${row.job_id} could not be resolved`, resolved);
+      throw safeCommandError(`Existing job branch dona/${row.job_id} could not be resolved`, resolved);
     }
     await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
     if (migrateLegacyRef) {
@@ -718,7 +731,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         this.config.jobCommandTimeoutMs,
         signal,
       );
-      if (!persisted.ok) throw commandError("Existing job base identity could not be migrated", persisted);
+      if (!persisted.ok) throw safeCommandError("Existing job base identity could not be migrated", persisted);
     }
   }
 
