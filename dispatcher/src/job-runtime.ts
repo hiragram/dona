@@ -369,8 +369,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       throw new Error(`Existing repository origin does not match ${repository}`);
     }
     if (await exists(path.join(row.workspace_path, ".git"))) {
-      const expectedSha = await this.resolveExistingJobBranch(row, repositoryPath, signal);
-      await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+      await this.verifyExistingWorktreeIdentity(row, repositoryPath, signal);
       return this.herdr([
         "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
@@ -406,7 +405,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           : undefined;
     let sourceRef: string;
     let fetchedRef: string;
-    let temporaryRefs: string[] = [];
     if (explicitTag) {
       sourceRef = explicitTag;
       fetchedRef = `refs/dona/bases/${row.job_id}`;
@@ -424,7 +422,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const advertised = await runProcess(
         this.config.gitPath,
         ["-C", repositoryPath, "ls-remote", "--refs", "origin", `refs/heads/${baseBranch}`, `refs/tags/${baseBranch}`],
-        this.config.jobCommandTimeoutMs,
+        120_000,
         signal,
       );
       if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
@@ -439,44 +437,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         sourceRef = `refs/tags/${baseBranch}`;
         fetchedRef = `refs/dona/bases/${row.job_id}`;
       } else if (/^[0-9a-f]{4,64}$/i.test(baseBranch)) {
-        const objectNamespace = `refs/dona/objects/${row.job_id}`;
-        const fetchedObjects = await runProcess(
-          this.config.gitPath,
-          [
-            "-C", repositoryPath, "fetch", "--prune", "origin",
-            `+refs/heads/*:${objectNamespace}/heads/*`,
-            `+refs/tags/*:${objectNamespace}/tags/*`,
-          ],
-          120_000,
-          signal,
-        );
-        if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseBranch} could not be fetched`, fetchedObjects);
-        const resolvedCommit = await runProcess(
-          this.config.gitPath,
-          ["-C", repositoryPath, "rev-parse", "--verify", `${baseBranch}^{commit}`],
-          this.config.jobCommandTimeoutMs,
-          signal,
-        );
-        const candidate = resolvedCommit.stdout.trim();
-        if (!resolvedCommit.ok || !/^[0-9a-f]{40,64}$/i.test(candidate)) {
-          throw new Error(`Git remote commit ${baseBranch} was not uniquely resolved`);
-        }
-        const reachable = await runProcess(
-          this.config.gitPath,
-          ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", `--contains=${candidate}`, objectNamespace],
-          this.config.jobCommandTimeoutMs,
-          signal,
-        );
-        if (!reachable.ok || !reachable.stdout.trim()) throw new Error(`Git remote commit ${baseBranch} is not reachable`);
-        const listedRefs = await runProcess(
-          this.config.gitPath,
-          ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", objectNamespace],
-          this.config.jobCommandTimeoutMs,
-          signal,
-        );
-        if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
-        temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
-        sourceRef = candidate;
+        sourceRef = await this.resolveRemoteCommit(repositoryPath, baseBranch, row, signal);
         fetchedRef = `refs/dona/bases/${row.job_id}`;
       } else {
         throw new Error(`Git remote base ref ${baseBranch} was not found`);
@@ -499,15 +460,6 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const baseSha = resolved.stdout.trim();
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
       throw commandError(`Git remote base ref ${baseBranch} was not found`, resolved);
-    }
-    for (const temporaryRef of temporaryRefs) {
-      const deleted = await runProcess(
-        this.config.gitPath,
-        ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
-        this.config.jobCommandTimeoutMs,
-        signal,
-      );
-      if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
     }
     const created = await this.herdr([
       "worktree", "create",
@@ -539,27 +491,102 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) {
       throw new Error(`Existing repository origin does not match ${repository}`);
     }
-    const expectedSha = await this.resolveExistingJobBranch(row, repositoryPath, signal);
-    await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+    await this.verifyExistingWorktreeIdentity(row, repositoryPath, signal);
   }
 
-  private async resolveExistingJobBranch(
+  private async verifyExistingWorktreeIdentity(
     row: JobRow,
     repositoryPath: string,
     signal?: AbortSignal,
-  ): Promise<string> {
-    const branch = `refs/dona/bases/${row.job_id}`;
-    const resolved = await runProcess(
+  ): Promise<void> {
+    const baseRef = `refs/dona/bases/${row.job_id}`;
+    let resolved = await runProcess(
       this.config.gitPath,
-      ["-C", repositoryPath, "rev-parse", "--verify", `${branch}^{commit}`],
+      ["-C", repositoryPath, "rev-parse", "--verify", `${baseRef}^{commit}`],
       this.config.jobCommandTimeoutMs,
       signal,
     );
-    const expectedSha = resolved.stdout.trim();
+    let expectedSha = resolved.stdout.trim();
+    let migrateLegacyRef = false;
+    if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
+      const legacyRef = `refs/heads/dona/${row.job_id}`;
+      resolved = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--verify", `${legacyRef}^{commit}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      expectedSha = resolved.stdout.trim();
+      migrateLegacyRef = true;
+    }
     if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
       throw commandError(`Existing job branch dona/${row.job_id} could not be resolved`, resolved);
     }
-    return expectedSha;
+    await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+    if (migrateLegacyRef) {
+      const persisted = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "update-ref", baseRef, expectedSha],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!persisted.ok) throw commandError("Existing job base identity could not be migrated", persisted);
+    }
+  }
+
+  private async resolveRemoteCommit(
+    repositoryPath: string,
+    baseRef: string,
+    row: JobRow,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const objectNamespace = `refs/dona/objects/${row.job_id}`;
+    try {
+      const fetchedObjects = await runProcess(
+        this.config.gitPath,
+        [
+          "-C", repositoryPath, "fetch", "--prune", "origin",
+          `+refs/heads/*:${objectNamespace}/heads/*`,
+          `+refs/tags/*:${objectNamespace}/tags/*`,
+        ],
+        120_000,
+        signal,
+      );
+      if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseRef} could not be fetched`, fetchedObjects);
+      const resolvedCommit = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--verify", `${baseRef}^{commit}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const candidate = resolvedCommit.stdout.trim();
+      if (!resolvedCommit.ok || !/^[0-9a-f]{40,64}$/i.test(candidate)) {
+        throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
+      }
+      const reachable = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", `--contains=${candidate}`, objectNamespace],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!reachable.ok || !reachable.stdout.trim()) throw new Error(`Git remote commit ${baseRef} is not reachable`);
+      return candidate;
+    } finally {
+      const listedRefs = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "for-each-ref", "--format=%(refname)", objectNamespace],
+        this.config.jobCommandTimeoutMs,
+      );
+      if (!listedRefs.ok) throw commandError("Git temporary ref inspection failed", listedRefs);
+      for (const temporaryRef of listedRefs.stdout.trim().split("\n").filter(Boolean)) {
+        const deleted = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "update-ref", "-d", temporaryRef],
+          this.config.jobCommandTimeoutMs,
+        );
+        if (!deleted.ok) throw commandError("Git temporary ref cleanup failed", deleted);
+      }
+    }
   }
 
   private async verifyWorktreeIdentity(

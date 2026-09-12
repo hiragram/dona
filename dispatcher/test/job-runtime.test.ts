@@ -465,6 +465,22 @@ process.exit(result.status ?? 2);
     fixture.database.close();
   });
 
+  test("raw commit解決失敗でも一時remote refを残さない", async () => {
+    const fixture = await githubFixture();
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-missing-commit")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "deadbeef" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    await assert.rejects(new HerdrJobAgentRuntime(fixture.config).prepare(job), /was not uniquely resolved/);
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    assert.equal(await git(repositoryPath, "for-each-ref", "--format=%(refname)", "refs/dona/objects"), "");
+    const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.some((args) => args[2] === "worktree" || (args[2] === "agent" && args[3] === "start")), false);
+    fixture.database.close();
+  });
+
   test("既存worktreeのHEAD mismatchでは既存agentを再利用しない", async () => {
     const fixture = await githubFixture();
     const source = fixture.database.enqueue(eventEnvelope("Ev-github-head-mismatch")).row;
@@ -498,8 +514,11 @@ process.exit(2);
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const runtime = new HerdrJobAgentRuntime(fixture.config);
     await runtime.prepare(job);
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(repositoryPath, "update-ref", "-d", `refs/dona/bases/${job.job_id}`);
     await runtime.prepare(job);
     assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), fixture.featureSha);
+    assert.equal(await git(repositoryPath, "rev-parse", `refs/dona/bases/${job.job_id}`), fixture.featureSha);
     const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[2] === "worktree" && args[3] === "create").length, 1);
     assert.equal(calls.filter((args) => args[2] === "workspace" && args[3] === "create").length, 1);
