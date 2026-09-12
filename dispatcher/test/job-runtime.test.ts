@@ -552,6 +552,25 @@ process.exit(2);
     fixture.database.close();
   });
 
+  test("worktree作成前の再試行は永続化済みbase SHAを維持する", async () => {
+    const fixture = await githubFixture();
+    const source = fixture.database.enqueue(eventEnvelope("Ev-github-persisted-base-retry")).row;
+    const job = fixture.database.createJob({
+      source_event_id: source.event_id,
+      objective: "確認する",
+      workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
+    }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
+    const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
+    await git(repositoryPath, "fetch", path.join(fixture.root, "origin.git"), `feature/test:refs/dona/bases/${job.job_id}`);
+    await git(fixture.root, "--git-dir", path.join(fixture.root, "origin.git"), "update-ref", "refs/heads/feature/test", fixture.raceSha);
+
+    await new HerdrJobAgentRuntime(fixture.config).prepare(job);
+
+    assert.equal(await git(job.workspace_path, "rev-parse", "HEAD"), fixture.featureSha);
+    assert.equal(await git(repositoryPath, "rev-parse", `refs/dona/bases/${job.job_id}`), fixture.featureSha);
+    fixture.database.close();
+  });
+
   test("worktree作成後のHEAD mismatchではagentを起動しない", async () => {
     const fixture = await githubFixture({ mismatchedWorktreeHead: true });
     const source = fixture.database.enqueue(eventEnvelope("Ev-github-created-head-mismatch")).row;

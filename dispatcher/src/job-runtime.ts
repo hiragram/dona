@@ -428,6 +428,28 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
+    const persistedBaseRef = `refs/dona/bases/${row.job_id}`;
+    const persistedBase = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "rev-parse", "--verify", `${persistedBaseRef}^{commit}`],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const persistedBaseSha = persistedBase.stdout.trim();
+    if (persistedBase.ok && /^[0-9a-f]{40,64}$/i.test(persistedBaseSha)) {
+      const created = await this.herdr([
+        "worktree", "create",
+        "--cwd", repositoryPath,
+        "--branch", `dona/${row.job_id}`,
+        "--base", persistedBaseSha,
+        "--path", row.workspace_path,
+        "--label", row.agent_name,
+        "--no-focus",
+      ], 120_000, signal);
+      if (!created.ok) throw commandError("Herdr worktree creation failed", created);
+      await this.verifyWorktreeIdentity(row, repositoryPath, persistedBaseSha, signal);
+      return created;
+    }
     let baseBranch = requestedBaseRef;
     const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/) ?? undefined;
     const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "origin"
