@@ -357,7 +357,7 @@ describe("GitHub workspace provisioning", () => {
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(fixture.seedPath, "push", "origin", "main:refs/heads/foo");
-    await git(repositoryPath, "update-ref", "refs/remotes/origin/foo/bar", await git(repositoryPath, "rev-parse", "HEAD"));
+    await git(repositoryPath, "update-ref", "refs/remotes/origin/foo/bar", await git(repositoryPath, "rev-parse", "refs/remotes/origin/main"));
 
     await new HerdrJobAgentRuntime(fixture.config).prepare(job);
 
