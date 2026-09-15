@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
 import { describe, test } from "node:test";
 
@@ -10,6 +11,13 @@ import {
 } from "../src/config.js";
 
 describe("job resource config", () => {
+  test("pre-activationでもDispatcher test fileを逐次実行する", () => {
+    const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      scripts?: { test?: string };
+    };
+    assert.equal(packageJson.scripts?.test, "tsx --test --test-concurrency=1 test/**/*.test.ts");
+  });
+
   test("expands documented home-relative paths consistently", () => {
     assert.equal(expandHome("~/Library/Application Support/Dona/release-manifest.json"),
       `${os.homedir()}/Library/Application Support/Dona/release-manifest.json`);
