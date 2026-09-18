@@ -12,6 +12,7 @@ import {
 
 describe("job resource config", () => {
   test("pre-activationでもDispatcher test fileを逐次実行する", () => {
+    assert.equal(process.env.DONA_CHECKPOINT_REPORTER_NONCE, undefined);
     const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
       scripts?: { test?: string };
     };
@@ -20,17 +21,12 @@ describe("job resource config", () => {
     assert.match(runner, /--test-concurrency=1/);
     assert.match(runner, /\[dispatcher-test:\$\{checkpointNonce\}\] file-start/);
     assert.match(runner, /\[dispatcher-test:\$\{checkpointNonce\}\] file-finish/);
-    assert.match(runner, /checkpoint-hooks\.mjs/);
     assert.match(runner, /checkpoint-reporter\.mjs/);
     assert.match(runner, /test-reporter-destination=stderr/);
-    const hooks = fs.readFileSync(new URL("./checkpoint-hooks.mjs", import.meta.url), "utf8");
-    assert.match(hooks, /beforeEach/);
-    assert.doesNotMatch(hooks, /afterEach/);
-    assert.match(hooks, /\[dispatcher-test:\$\{nonce\}\] case-start/);
-    assert.match(hooks, /`\\n\[dispatcher-test:\$\{nonce\}\] case-start/);
-    assert.match(hooks, /createHash\("sha256"\)/);
-    assert.match(hooks, /delete process\.env\.DONA_CHECKPOINT_START_NONCE/);
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
+    assert.match(reporter, /event\.type === "test:start"/);
+    assert.match(reporter, /event\.data\.details\?\.type === "suite"/);
+    assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
     assert.match(reporter, /"case-finish"/);
     assert.match(reporter, /`\\n\[dispatcher-test:\$\{nonce\}\]/);
     assert.match(runner, /process\.argv\.slice\(2\)/);

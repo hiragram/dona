@@ -140,6 +140,25 @@ test("ProcessRunner preserves the failed case when the file failure follows", as
   );
 });
 
+test("ProcessRunner binds the next file nonce after the previous file finishes", async () => {
+  const script = `
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-finish test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb] file-start test/job-runtime.test.ts\\n');
+    process.stderr.write('[dispatcher-test:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb] case-start test/job-runtime.test.ts:012345abcdef#1\\n');
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(
+    result.output_checkpoint,
+    "file=file-start test/job-runtime.test.ts; last_finish=file-finish test/api.test.ts; timeout=test/job-runtime.test.ts:012345abcdef#1",
+  );
+});
+
 test("ProcessRunner does not report truncation below the configured output limit", async () => {
   const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stdout.write('x'.repeat(513))"], {
     timeoutMs: 1_000,

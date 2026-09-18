@@ -76,6 +76,7 @@ export class ProcessRunner {
               if (!lastFinished) lastFinished = fileState;
               currentFile = undefined;
               unfinishedCases.clear();
+              checkpointNonce = undefined;
             }
             refreshCheckpoint();
             continue;

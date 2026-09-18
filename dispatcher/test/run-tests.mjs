@@ -9,7 +9,6 @@ const testFiles = (await fs.readdir(testDirectory))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
 const tsx = path.resolve("node_modules", ".bin", "tsx");
-const checkpointHooks = path.resolve("test", "checkpoint-hooks.mjs");
 const checkpointReporter = path.resolve("test", "checkpoint-reporter.mjs");
 const forwardedArguments = process.argv.slice(2);
 
@@ -21,8 +20,6 @@ for (const name of testFiles) {
     const child = spawn(tsx, [
       "--test",
       "--test-concurrency=1",
-      "--import",
-      checkpointHooks,
       "--test-reporter=spec",
       "--test-reporter-destination=stdout",
       `--test-reporter=${checkpointReporter}`,
@@ -33,7 +30,6 @@ for (const name of testFiles) {
       env: {
         ...process.env,
         DONA_DISPATCHER_TEST_FILE: relative,
-        DONA_CHECKPOINT_START_NONCE: checkpointNonce,
         DONA_CHECKPOINT_REPORTER_NONCE: checkpointNonce,
       },
       stdio: "inherit",
