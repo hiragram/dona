@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, test } from "node:test";
+import { after, afterEach, before, describe, test } from "node:test";
 import { promisify } from "node:util";
 
 import { DispatcherDatabase } from "../src/database.js";
@@ -256,6 +257,37 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return (await exec("git", ["-C", cwd, ...args])).stdout.trim();
 }
 
+let githubTemplateRoot: string | undefined;
+let githubTemplateBare: string | undefined;
+
+before(async () => {
+  githubTemplateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "dona-github-fixture-template-"));
+  githubTemplateBare = path.join(githubTemplateRoot, "origin.git");
+  const seed = path.join(githubTemplateRoot, "seed");
+  await exec("git", ["init", "--bare", githubTemplateBare]);
+  await exec("git", ["init", "-b", "main", seed]);
+  await git(seed, "config", "user.email", "test@example.com");
+  await git(seed, "config", "user.name", "Test");
+  await fs.writeFile(path.join(seed, "state.txt"), "A\n");
+  await git(seed, "add", "state.txt");
+  await git(seed, "commit", "-m", "A");
+  await git(seed, "branch", "feature/test");
+  await git(seed, "remote", "add", "origin", githubTemplateBare);
+  await git(seed, "push", "origin", "main", "feature/test");
+  await git(githubTemplateRoot, "--git-dir", githubTemplateBare, "symbolic-ref", "HEAD", "refs/heads/main");
+  await git(seed, "checkout", "feature/test");
+  await fs.writeFile(path.join(seed, "state.txt"), "B\n");
+  await git(seed, "commit", "-am", "B");
+  await git(seed, "push", "origin", "feature/test");
+  await fs.writeFile(path.join(seed, "state.txt"), "C\n");
+  await git(seed, "commit", "-am", "C");
+  await git(seed, "push", "origin", "HEAD:refs/heads/race-source");
+});
+
+after(async () => {
+  if (githubTemplateRoot) await fs.rm(githubTemplateRoot, { recursive: true, force: true });
+});
+
 async function githubFixture(options: { mismatchedWorktreeHead?: boolean } = {}): Promise<{
   root: string;
   config: Awaited<ReturnType<typeof tempConfig>>["config"];
@@ -266,33 +298,28 @@ async function githubFixture(options: { mismatchedWorktreeHead?: boolean } = {})
   seedPath: string;
 }> {
   const { root, config } = await tempConfig(); roots.push(root);
+  assert.ok(githubTemplateBare, "GitHub fixture template must be initialized");
   const bare = path.join(root, "origin.git");
   const seed = path.join(root, "seed");
   const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
-  await exec("git", ["init", "--bare", bare]);
-  await exec("git", ["init", "-b", "main", seed]);
+  // Clone the immutable object template into case-local repositories. Refs,
+  // configs, worktrees, and logs remain isolated while commit construction is
+  // paid once per test-file run instead of once per provisioning case.
+  await exec("git", ["clone", "--bare", "--shared", githubTemplateBare, bare]);
+  await exec("git", ["clone", "--shared", bare, seed]);
   await git(seed, "config", "user.email", "test@example.com");
   await git(seed, "config", "user.name", "Test");
-  await fs.writeFile(path.join(seed, "state.txt"), "A\n");
-  await git(seed, "add", "state.txt");
-  await git(seed, "commit", "-m", "A");
-  await git(seed, "branch", "feature/test");
-  await git(seed, "remote", "add", "origin", bare);
-  await git(seed, "push", "origin", "main", "feature/test");
+  await git(seed, "checkout", "feature/test");
+  const featureSha = await git(seed, "rev-parse", "HEAD");
+  const raceSha = await git(seed, "rev-parse", "refs/remotes/origin/race-source");
+  // Preserve the original race fixture: the local source branch has advanced
+  // to C while origin/feature/test still points at the fetched B commit.
+  await git(seed, "reset", "--hard", raceSha);
   await fs.mkdir(path.dirname(repositoryPath), { recursive: true });
-  await exec("git", ["clone", bare, repositoryPath]);
+  await exec("git", ["clone", "--shared", bare, repositoryPath]);
   await git(repositoryPath, "remote", "set-url", "origin", "https://github.com/owner/repo.git");
   await git(repositoryPath, "branch", "feature/test", "origin/feature/test");
 
-  await git(seed, "checkout", "feature/test");
-  await fs.writeFile(path.join(seed, "state.txt"), "B\n");
-  await git(seed, "commit", "-am", "B");
-  const featureSha = await git(seed, "rev-parse", "HEAD");
-  await git(seed, "push", "origin", "feature/test");
-  await fs.writeFile(path.join(seed, "state.txt"), "C\n");
-  await git(seed, "commit", "-am", "C");
-  const raceSha = await git(seed, "rev-parse", "HEAD");
-  await git(seed, "push", "origin", "HEAD:refs/heads/race-source");
 
   const logPath = path.join(root, "herdr-calls.jsonl");
   const fakeHerdr = path.join(root, "fake-herdr.mjs");

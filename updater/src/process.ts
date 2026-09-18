@@ -37,8 +37,17 @@ export class ProcessRunner {
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
       let capturedBytes = 0;
+      let checkpointBuffer = "";
+      let outputCheckpoint: string | undefined;
       let timedOut = false;
+      const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
+        checkpointBuffer = (checkpointBuffer + chunk.toString("utf8")).slice(-512);
+        for (const match of checkpointBuffer.matchAll(/\[dispatcher-test\] (?:start|complete|failed) test\/[A-Za-z0-9._-]+\.test\.ts/g)) {
+          outputCheckpoint = match[0];
+        }
+      };
       const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
+        inspectCheckpoints(chunk);
         if (capturedBytes >= options.outputLimitBytes) {
           truncated = true;
           return current;
@@ -52,6 +61,18 @@ export class ProcessRunner {
       child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk)));
       child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
       let hardKillTimer: NodeJS.Timeout | undefined;
+      let closedCode: number | null | undefined;
+      const finish = (): void => {
+        if (closedCode === undefined) return;
+        resolve({
+          exit_code: closedCode,
+          stdout: stdout.toString("utf8"),
+          stderr: stderr.toString("utf8"),
+          timed_out: timedOut,
+          output_truncated: truncated,
+          ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
+        });
+      };
       const signalGroup = (signal: NodeJS.Signals): void => {
         if (child.pid) {
           try {
@@ -66,8 +87,11 @@ export class ProcessRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         signalGroup("SIGTERM");
-        hardKillTimer = setTimeout(() => signalGroup("SIGKILL"), 1_000);
-        hardKillTimer.unref();
+        hardKillTimer = setTimeout(() => {
+          signalGroup("SIGKILL");
+          hardKillTimer = undefined;
+          finish();
+        }, 1_000);
       }, options.timeoutMs);
       timer.unref();
       child.once("error", (error) => {
@@ -77,14 +101,8 @@ export class ProcessRunner {
       });
       child.once("close", (code) => {
         clearTimeout(timer);
-        if (hardKillTimer) clearTimeout(hardKillTimer);
-        resolve({
-          exit_code: code,
-          stdout: stdout.toString("utf8"),
-          stderr: stderr.toString("utf8"),
-          timed_out: timedOut,
-          output_truncated: truncated,
-        });
+        closedCode = code;
+        if (!hardKillTimer) finish();
       });
     });
   }
