@@ -9,6 +9,7 @@ const testFiles = (await fs.readdir(testDirectory))
   .sort();
 const tsx = path.resolve("node_modules", ".bin", "tsx");
 const checkpointHooks = path.resolve("test", "checkpoint-hooks.mjs");
+const checkpointReporter = path.resolve("test", "checkpoint-reporter.mjs");
 const forwardedArguments = process.argv.slice(2);
 
 for (const name of testFiles) {
@@ -20,6 +21,10 @@ for (const name of testFiles) {
       "--test-concurrency=1",
       "--import",
       checkpointHooks,
+      "--test-reporter=spec",
+      "--test-reporter-destination=stdout",
+      `--test-reporter=${checkpointReporter}`,
+      "--test-reporter-destination=stderr",
       ...forwardedArguments,
       relative,
     ], {

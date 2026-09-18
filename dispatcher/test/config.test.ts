@@ -21,12 +21,17 @@ describe("job resource config", () => {
     assert.match(runner, /\[dispatcher-test\] file-start/);
     assert.match(runner, /\[dispatcher-test\] file-finish/);
     assert.match(runner, /checkpoint-hooks\.mjs/);
+    assert.match(runner, /checkpoint-reporter\.mjs/);
+    assert.match(runner, /test-reporter-destination=stderr/);
     const hooks = fs.readFileSync(new URL("./checkpoint-hooks.mjs", import.meta.url), "utf8");
     assert.match(hooks, /beforeEach/);
-    assert.match(hooks, /afterEach/);
+    assert.doesNotMatch(hooks, /afterEach/);
     assert.match(hooks, /\[dispatcher-test\] case-start/);
-    assert.match(hooks, /\[dispatcher-test\] case-finish/);
+    assert.match(hooks, /`\\n\[dispatcher-test\] case-start/);
     assert.match(hooks, /createHash\("sha256"\)/);
+    const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
+    assert.match(reporter, /"case-finish"/);
+    assert.match(reporter, /`\\n\[dispatcher-test\]/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
   });
 

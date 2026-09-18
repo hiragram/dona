@@ -43,13 +43,19 @@ export class ProcessRunner {
       let lastFinished: string | undefined;
       const unfinishedCases = new Set<string>();
       let timedOut = false;
+      let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
       const marker = /^\[dispatcher-test\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)$/;
-      const caseMarker = /^\[dispatcher-test\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
+      const caseMarker = /^\[dispatcher-test\] case-start (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
+      const caseTerminalMarker = /^\[dispatcher-test\] (case-(?:finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12})$/;
       const refreshCheckpoint = (): void => {
+        if (timeoutCheckpoint) {
+          outputCheckpoint = timeoutCheckpoint;
+          return;
+        }
         const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
-        outputCheckpoint = `last_finish=${lastFinished ?? "none"}; ${timedOut ? "timeout" : "unfinished"}=${unfinished}`;
+        outputCheckpoint = `last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}`;
       };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
         const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
@@ -67,15 +73,19 @@ export class ProcessRunner {
             continue;
           }
           const testMatch = caseMarker.exec(line);
-          if (!testMatch) continue;
-          const action = testMatch[1];
-          const identity = testMatch[2];
-          if (!action || !identity) continue;
-          if (action === "case-start") unfinishedCases.add(identity);
-          else {
-            unfinishedCases.delete(identity);
-            lastFinished = `${action} ${identity}`;
+          if (testMatch?.[1]) {
+            unfinishedCases.add(testMatch[1]);
+            refreshCheckpoint();
+            continue;
           }
+          const terminalMatch = caseTerminalMarker.exec(line);
+          const action = terminalMatch?.[1];
+          const prefix = terminalMatch?.[2];
+          if (!action || !prefix) continue;
+          const identity = [...unfinishedCases].reverse().find((candidate) => candidate.startsWith(`${prefix}#`));
+          if (!identity) continue;
+          unfinishedCases.delete(identity);
+          lastFinished = `${action} ${identity}`;
           refreshCheckpoint();
         }
       };
@@ -125,7 +135,9 @@ export class ProcessRunner {
       };
       const timer = setTimeout(() => {
         timedOut = true;
-        refreshCheckpoint();
+        const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
+        timeoutCheckpoint = `last_finish=${lastFinished ?? "none"}; timeout=${unfinished}`;
+        outputCheckpoint = timeoutCheckpoint;
         termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
