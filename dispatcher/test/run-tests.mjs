@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -14,7 +15,8 @@ const forwardedArguments = process.argv.slice(2);
 
 for (const name of testFiles) {
   const relative = path.posix.join("test", name);
-  process.stderr.write(`[dispatcher-test] file-start ${relative}\n`);
+  const checkpointNonce = randomBytes(16).toString("hex");
+  process.stderr.write(`[dispatcher-test:${checkpointNonce}] file-start ${relative}\n`);
   const exitCode = await new Promise((resolve, reject) => {
     const child = spawn(tsx, [
       "--test",
@@ -28,15 +30,20 @@ for (const name of testFiles) {
       ...forwardedArguments,
       relative,
     ], {
-      env: { ...process.env, DONA_DISPATCHER_TEST_FILE: relative },
+      env: {
+        ...process.env,
+        DONA_DISPATCHER_TEST_FILE: relative,
+        DONA_CHECKPOINT_START_NONCE: checkpointNonce,
+        DONA_CHECKPOINT_REPORTER_NONCE: checkpointNonce,
+      },
       stdio: "inherit",
     });
     child.once("error", reject);
     child.once("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
   });
   if (exitCode !== 0) {
-    process.stderr.write(`[dispatcher-test] file-fail ${relative}\n`);
+    process.stderr.write(`[dispatcher-test:${checkpointNonce}] file-fail ${relative}\n`);
     process.exit(exitCode);
   }
-  process.stderr.write(`[dispatcher-test] file-finish ${relative}\n`);
+  process.stderr.write(`[dispatcher-test:${checkpointNonce}] file-finish ${relative}\n`);
 }

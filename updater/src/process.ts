@@ -39,23 +39,24 @@ export class ProcessRunner {
       let capturedBytes = 0;
       let checkpointBuffer = "";
       let outputCheckpoint: string | undefined;
+      let checkpointNonce: string | undefined;
       let currentFile: string | undefined;
+      let fileState: string | undefined;
       let lastFinished: string | undefined;
       const unfinishedCases = new Set<string>();
       let timedOut = false;
       let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
-      const marker = /^\[dispatcher-test\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)$/;
-      const caseMarker = /^\[dispatcher-test\] case-start (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
-      const caseTerminalMarker = /^\[dispatcher-test\] (case-(?:finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12})$/;
+      const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)$/;
+      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
       const refreshCheckpoint = (): void => {
         if (timeoutCheckpoint) {
           outputCheckpoint = timeoutCheckpoint;
           return;
         }
         const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
-        outputCheckpoint = `last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}`;
+        outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}`;
       };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
         const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
@@ -63,9 +64,16 @@ export class ProcessRunner {
         for (const line of lines) {
           const fileMatch = marker.exec(line);
           if (fileMatch) {
-            if (fileMatch[1] === "file-start") currentFile = fileMatch[2];
+            const nonce = fileMatch[1];
+            const action = fileMatch[2];
+            const identity = fileMatch[3];
+            if (!nonce || !action || !identity) continue;
+            if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
+            if (nonce !== checkpointNonce) continue;
+            fileState = `${action} ${identity}`;
+            if (action === "file-start") currentFile = identity;
             else {
-              lastFinished = `${fileMatch[1]} ${fileMatch[2]}`;
+              if (!lastFinished) lastFinished = fileState;
               currentFile = undefined;
               unfinishedCases.clear();
             }
@@ -73,24 +81,24 @@ export class ProcessRunner {
             continue;
           }
           const testMatch = caseMarker.exec(line);
-          if (testMatch?.[1]) {
-            unfinishedCases.add(testMatch[1]);
-            refreshCheckpoint();
-            continue;
+          const nonce = testMatch?.[1];
+          const action = testMatch?.[2];
+          const identity = testMatch?.[3];
+          if (!nonce || nonce !== checkpointNonce || !action || !identity) continue;
+          if (action === "case-start") unfinishedCases.add(identity);
+          else {
+            unfinishedCases.delete(identity);
+            lastFinished = `${action} ${identity}`;
           }
-          const terminalMatch = caseTerminalMarker.exec(line);
-          const action = terminalMatch?.[1];
-          const prefix = terminalMatch?.[2];
-          if (!action || !prefix) continue;
-          const identity = [...unfinishedCases].reverse().find((candidate) => candidate.startsWith(`${prefix}#`));
-          if (!identity) continue;
-          unfinishedCases.delete(identity);
-          lastFinished = `${action} ${identity}`;
           refreshCheckpoint();
         }
       };
-      const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
-        inspectCheckpoints(chunk);
+      const append = (
+        current: Buffer<ArrayBufferLike>,
+        chunk: Buffer<ArrayBufferLike>,
+        inspect: boolean,
+      ): Buffer<ArrayBufferLike> => {
+        if (inspect) inspectCheckpoints(chunk);
         if (capturedBytes >= options.outputLimitBytes) {
           truncated = true;
           return current;
@@ -101,8 +109,8 @@ export class ProcessRunner {
         capturedBytes += captured.length;
         return Buffer.concat([current, captured]);
       };
-      child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk)));
-      child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
+      child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk, false)));
+      child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk, true)));
       let hardKillTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null = null;
@@ -136,7 +144,7 @@ export class ProcessRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
-        timeoutCheckpoint = `last_finish=${lastFinished ?? "none"}; timeout=${unfinished}`;
+        timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}`;
         outputCheckpoint = timeoutCheckpoint;
         termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {

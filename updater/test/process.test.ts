@@ -39,24 +39,24 @@ test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", asyn
 });
 
 test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit truncation", async () => {
-  const script = "process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096)); process.stderr.write('[dispatcher-test] file-start test/job-runtime.test.ts\\n[dispatcher-test] case-start test/job-runtime.test.ts:012345abcdef#9\\n')";
+  const script = "process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096)); process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/job-runtime.test.ts\\n[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/job-runtime.test.ts:012345abcdef#9\\n')";
   const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
     timeoutMs: 1_000,
     outputLimitBytes: 1_024,
   });
   assert.equal(result.exit_code, 0);
   assert.equal(result.output_truncated, true);
-  assert.equal(result.output_checkpoint, "last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
+  assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
   assert.equal(Buffer.byteLength(result.stdout), 1_024);
 });
 
 test("ProcessRunner prioritizes the unfinished case and cleanup result on timeout", async () => {
   const script = `
-    process.stderr.write('[dispatcher-test] file-start test/api.test.ts\\n');
-    process.stderr.write('[dispatcher-test] case-start test/api.test.ts:012345abcdef#1\\n');
-    process.stderr.write('[dispatcher-test] case-finish test/api.test.ts:012345abcdef\\n');
-    process.stderr.write('[dispatcher-test] case-start test/api.test.ts:fedcba543210#2\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-finish test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#1\\n');
     process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096));
     process.on('SIGTERM', () => {});
     setInterval(() => {}, 1000);
@@ -69,7 +69,7 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
   assert.equal(result.output_truncated, true);
   assert.equal(
     result.output_checkpoint,
-    "last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#2",
+    "file=file-start test/api.test.ts; last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#1",
   );
   assert.equal(result.exit_signal, "SIGKILL");
   assert.equal(result.cleanup_status, "term=group-sent,kill=group-sent,closed=yes");
@@ -79,24 +79,24 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
 test("ProcessRunner recognizes a dedicated checkpoint after partial test output", async () => {
   const script = `
     process.stdout.write('partial-without-newline');
-    process.stderr.write('other-partial-without-newline');
-    setTimeout(() => process.stderr.write('\\n[dispatcher-test] case-start test/api.test.ts:fedcba543210#7\\n'), 10);
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\nother-partial-without-newline');
+    setTimeout(() => process.stderr.write('\\n[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#7\\n'), 10);
     setTimeout(() => {}, 1000);
   `;
   const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
     timeoutMs: 100,
     outputLimitBytes: 1_024,
   });
-  assert.equal(result.output_checkpoint, "last_finish=none; timeout=test/api.test.ts:fedcba543210#7");
+  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#7");
 });
 
 test("ProcessRunner freezes the timeout identity during cleanup output", async () => {
   const script = `
-    process.stderr.write('[dispatcher-test] file-start test/api.test.ts\\n');
-    process.stderr.write('[dispatcher-test] case-start test/api.test.ts:fedcba543210#2\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#2\\n');
     process.on('SIGTERM', () => {
-      process.stderr.write('[dispatcher-test] case-finish test/api.test.ts:fedcba543210\\n');
-      process.stderr.write('[dispatcher-test] file-fail test/api.test.ts\\n');
+      process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-finish test/api.test.ts:fedcba543210#2\\n');
+      process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-fail test/api.test.ts\\n');
     });
     setInterval(() => {}, 1000);
   `;
@@ -104,7 +104,40 @@ test("ProcessRunner freezes the timeout identity during cleanup output", async (
     timeoutMs: 100,
     outputLimitBytes: 1_024,
   });
-  assert.equal(result.output_checkpoint, "last_finish=none; timeout=test/api.test.ts:fedcba543210#2");
+  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#2");
+});
+
+test("ProcessRunner ignores marker-shaped output without the bound nonce", async () => {
+  const script = `
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\\n');
+    process.stdout.write('[dispatcher-test:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb] file-finish test/api.test.ts\\n');
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:012345abcdef#1");
+});
+
+test("ProcessRunner preserves the failed case when the file failure follows", async () => {
+  const script = `
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-fail test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-fail test/api.test.ts\\n');
+    process.exitCode = 1;
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 1_000,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(
+    result.output_checkpoint,
+    "file=file-fail test/api.test.ts; last_finish=case-fail test/api.test.ts:012345abcdef#1; unfinished=none",
+  );
 });
 
 test("ProcessRunner does not report truncation below the configured output limit", async () => {

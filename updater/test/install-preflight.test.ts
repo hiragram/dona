@@ -291,11 +291,11 @@ test("pre-activation command errors preserve timeout diagnostics before bounded 
   const { root, policy } = await tempPolicy();
   const result: CommandResult = {
     exit_code: null,
-    stdout: `token=secret-value\n${"x".repeat(2_000)}`,
-    stderr: "",
+    stdout: `assertion failed\ntoken=secret-value\n${"x".repeat(2_000)}`,
+    stderr: "control checkpoint stream",
     timed_out: true,
     output_truncated: true,
-    output_checkpoint: "last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#2",
+    output_checkpoint: "file=file-start test/api.test.ts; last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#1",
     exit_signal: "SIGKILL",
     cleanup_status: "term=group-sent,kill=group-sent,closed=yes",
   };
@@ -303,8 +303,9 @@ test("pre-activation command errors preserve timeout diagnostics before bounded 
   try {
     await assert.rejects(new CanonicalBuild(policy, runner).toolchain(), (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
-      assert.match(message, /checkpoint=last_finish=case-finish test\/api\.test\.ts:012345abcdef#1; timeout=test\/api\.test\.ts:fedcba543210#2/);
+      assert.match(message, /checkpoint=file=file-start test\/api\.test\.ts; last_finish=case-finish test\/api\.test\.ts:012345abcdef#1; timeout=test\/api\.test\.ts:fedcba543210#1/);
       assert.match(message, /runner=exit:null,signal:SIGKILL,cleanup:term=group-sent,kill=group-sent,closed=yes/);
+      assert.match(message, /stderr=control checkpoint stream; stdout=assertion failed/);
       assert.equal(message.includes("secret-value"), false);
       assert.ok(message.length <= 1_000);
       return true;
