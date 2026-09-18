@@ -19,8 +19,15 @@ describe("job resource config", () => {
     const runner = fs.readFileSync(new URL("./run-tests.mjs", import.meta.url), "utf8");
     assert.match(runner, /--test-concurrency=1/);
     assert.match(runner, /\[dispatcher-test\] start/);
-    assert.match(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /failureOutputLimitBytes = 64 \* 1024/);
+    assert.match(runner, /stdio: \["ignore", "pipe", "pipe"\]/);
+    assert.doesNotMatch(runner, /\[dispatcher-test\] complete/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
+    const markerBytes = fs.readdirSync(new URL("./", import.meta.url))
+      .filter((name) => name.endsWith(".test.ts"))
+      .sort()
+      .reduce((total, name) => total + Buffer.byteLength(`[dispatcher-test] start test/${name}\n`), 0);
+    assert.ok(markerBytes <= 800, `checkpoint markers exceed the legacy diagnostic budget: ${markerBytes}`);
   });
 
   test("expands documented home-relative paths consistently", () => {
