@@ -29,7 +29,9 @@ const mainAgentStartupPrompt =
 
 function commandError(name: string, result: CommandResult): Error {
   const suffix = result.timed_out ? "timed out" : `exited ${result.exit_code}`;
-  return new Error(redactText(`${name} ${suffix}: ${result.stderr || result.stdout}`, 1_000));
+  const head = (result.stderr || result.stdout).slice(0, 400);
+  const checkpoint = result.output_tail ? `; bounded output tail: ${result.output_tail}` : "";
+  return new Error(redactText(`${name} ${suffix}: ${head}${checkpoint}`, 1_000));
 }
 
 function requireSuccess(name: string, result: CommandResult): string {

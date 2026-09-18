@@ -37,13 +37,18 @@ export class ProcessRunner {
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
       let capturedBytes = 0;
+      const tailLimitBytes = Math.min(4_096, Math.floor(options.outputLimitBytes / 2));
+      const headLimitBytes = options.outputLimitBytes - tailLimitBytes;
+      let outputTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let timedOut = false;
       const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
-        if (capturedBytes >= options.outputLimitBytes) {
+        outputTail = Buffer.concat([outputTail, chunk]);
+        if (outputTail.length > tailLimitBytes) outputTail = outputTail.subarray(outputTail.length - tailLimitBytes);
+        if (capturedBytes >= headLimitBytes) {
           truncated = true;
           return current;
         }
-        const remaining = options.outputLimitBytes - capturedBytes;
+        const remaining = headLimitBytes - capturedBytes;
         if (chunk.length > remaining) truncated = true;
         const captured = chunk.subarray(0, remaining);
         capturedBytes += captured.length;
@@ -52,6 +57,18 @@ export class ProcessRunner {
       child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk)));
       child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
       let hardKillTimer: NodeJS.Timeout | undefined;
+      let closedCode: number | null | undefined;
+      const finish = (): void => {
+        if (closedCode === undefined) return;
+        resolve({
+          exit_code: closedCode,
+          stdout: stdout.toString("utf8"),
+          stderr: stderr.toString("utf8"),
+          timed_out: timedOut,
+          output_truncated: truncated,
+          ...(truncated ? { output_tail: outputTail.toString("utf8") } : {}),
+        });
+      };
       const signalGroup = (signal: NodeJS.Signals): void => {
         if (child.pid) {
           try {
@@ -66,7 +83,11 @@ export class ProcessRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         signalGroup("SIGTERM");
-        hardKillTimer = setTimeout(() => signalGroup("SIGKILL"), 1_000);
+        hardKillTimer = setTimeout(() => {
+          signalGroup("SIGKILL");
+          hardKillTimer = undefined;
+          finish();
+        }, 1_000);
         hardKillTimer.unref();
       }, options.timeoutMs);
       timer.unref();
@@ -77,14 +98,8 @@ export class ProcessRunner {
       });
       child.once("close", (code) => {
         clearTimeout(timer);
-        if (hardKillTimer) clearTimeout(hardKillTimer);
-        resolve({
-          exit_code: code,
-          stdout: stdout.toString("utf8"),
-          stderr: stderr.toString("utf8"),
-          timed_out: timedOut,
-          output_truncated: truncated,
-        });
+        closedCode = code;
+        if (!hardKillTimer) finish();
       });
     });
   }

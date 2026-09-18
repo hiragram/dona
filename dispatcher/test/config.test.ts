@@ -15,7 +15,11 @@ describe("job resource config", () => {
     const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
       scripts?: { test?: string };
     };
-    assert.equal(packageJson.scripts?.test, "tsx --test --test-concurrency=1 test/**/*.test.ts");
+    assert.equal(packageJson.scripts?.test, "node test/run-tests.mjs");
+    const runner = fs.readFileSync(new URL("./run-tests.mjs", import.meta.url), "utf8");
+    assert.match(runner, /--test-concurrency=1/);
+    assert.match(runner, /\[dispatcher-test\] start/);
+    assert.match(runner, /\[dispatcher-test\] complete/);
   });
 
   test("expands documented home-relative paths consistently", () => {

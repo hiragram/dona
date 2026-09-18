@@ -272,6 +272,7 @@ export interface CommandResult {
   stderr: string;
   timed_out: boolean;
   output_truncated: boolean;
+  output_tail?: string;
 }
 
 export interface ActivationReceipt {

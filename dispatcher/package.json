@@ -15,7 +15,7 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts serve",
     "start": "node dist/cli.js serve",
-    "test": "tsx --test --test-concurrency=1 test/**/*.test.ts",
+    "test": "node test/run-tests.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
