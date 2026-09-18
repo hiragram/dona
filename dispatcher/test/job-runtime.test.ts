@@ -257,8 +257,8 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return (await exec("git", ["-C", cwd, ...args])).stdout.trim();
 }
 
-let githubTemplateRoot: string;
-let githubTemplateBare: string;
+let githubTemplateRoot: string | undefined;
+let githubTemplateBare: string | undefined;
 
 before(async () => {
   githubTemplateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "dona-github-fixture-template-"));
@@ -274,6 +274,7 @@ before(async () => {
   await git(seed, "branch", "feature/test");
   await git(seed, "remote", "add", "origin", githubTemplateBare);
   await git(seed, "push", "origin", "main", "feature/test");
+  await git(githubTemplateRoot, "--git-dir", githubTemplateBare, "symbolic-ref", "HEAD", "refs/heads/main");
   await git(seed, "checkout", "feature/test");
   await fs.writeFile(path.join(seed, "state.txt"), "B\n");
   await git(seed, "commit", "-am", "B");
@@ -284,7 +285,7 @@ before(async () => {
 });
 
 after(async () => {
-  await fs.rm(githubTemplateRoot, { recursive: true, force: true });
+  if (githubTemplateRoot) await fs.rm(githubTemplateRoot, { recursive: true, force: true });
 });
 
 async function githubFixture(options: { mismatchedWorktreeHead?: boolean } = {}): Promise<{
@@ -297,6 +298,7 @@ async function githubFixture(options: { mismatchedWorktreeHead?: boolean } = {})
   seedPath: string;
 }> {
   const { root, config } = await tempConfig(); roots.push(root);
+  assert.ok(githubTemplateBare, "GitHub fixture template must be initialized");
   const bare = path.join(root, "origin.git");
   const seed = path.join(root, "seed");
   const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");

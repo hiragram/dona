@@ -20,6 +20,7 @@ describe("job resource config", () => {
     assert.match(runner, /--test-concurrency=1/);
     assert.match(runner, /\[dispatcher-test\] start/);
     assert.match(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /process\.argv\.slice\(2\)/);
   });
 
   test("expands documented home-relative paths consistently", () => {

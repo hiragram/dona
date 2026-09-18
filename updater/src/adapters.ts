@@ -29,8 +29,8 @@ const mainAgentStartupPrompt =
 
 function commandError(name: string, result: CommandResult): Error {
   const suffix = result.timed_out ? "timed out" : `exited ${result.exit_code}`;
-  const head = (result.stderr || result.stdout).slice(0, 400);
-  const checkpoint = result.output_tail ? `; bounded output tail: ${result.output_tail}` : "";
+  const head = redactText((result.stderr || result.stdout).slice(0, 700), 700);
+  const checkpoint = result.output_checkpoint ? `; checkpoint: ${result.output_checkpoint}` : "";
   return new Error(redactText(`${name} ${suffix}: ${head}${checkpoint}`, 1_000));
 }
 

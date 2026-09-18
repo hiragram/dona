@@ -8,12 +8,13 @@ const testFiles = (await fs.readdir(testDirectory))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
 const tsx = path.resolve("node_modules", ".bin", "tsx");
+const forwardedArguments = process.argv.slice(2);
 
 for (const name of testFiles) {
   const relative = path.posix.join("test", name);
   process.stdout.write(`[dispatcher-test] start ${relative}\n`);
   const exitCode = await new Promise((resolve, reject) => {
-    const child = spawn(tsx, ["--test", "--test-concurrency=1", relative], {
+    const child = spawn(tsx, ["--test", "--test-concurrency=1", ...forwardedArguments, relative], {
       env: process.env,
       stdio: "inherit",
     });

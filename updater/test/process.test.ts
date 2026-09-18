@@ -11,7 +11,7 @@ test("ProcessRunner bounds output and times out without invoking a shell", async
   assert.equal(result.timed_out, true);
   assert.equal(result.output_truncated, true);
   assert.ok(Buffer.byteLength(result.stdout) <= 1_024);
-  assert.ok(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.output_tail ?? "") <= 1_024);
+  assert.ok(Buffer.byteLength(result.stdout) <= 1_024);
 });
 
 test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", async () => {
@@ -38,14 +38,24 @@ test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", asyn
   }
 });
 
-test("ProcessRunner preserves a bounded terminal checkpoint after head truncation", async () => {
-  const script = "process.stdout.write('x'.repeat(4096)); process.stdout.write('[dispatcher-test] start test/job-runtime.test.ts\\n')";
+test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit truncation", async () => {
+  const script = "process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096)); process.stdout.write('[dispatcher-test] start test/job-runtime.test.ts\\n')";
   const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
     timeoutMs: 1_000,
     outputLimitBytes: 1_024,
   });
   assert.equal(result.exit_code, 0);
   assert.equal(result.output_truncated, true);
-  assert.match(result.output_tail ?? "", /\[dispatcher-test\] start test\/job-runtime\.test\.ts/);
-  assert.ok(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.output_tail ?? "") <= 1_024);
+  assert.equal(result.output_checkpoint, "[dispatcher-test] start test/job-runtime.test.ts");
+  assert.equal(result.output_checkpoint.includes("secret-value"), false);
+  assert.equal(Buffer.byteLength(result.stdout), 1_024);
+});
+
+test("ProcessRunner does not report truncation below the configured output limit", async () => {
+  const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stdout.write('x'.repeat(513))"], {
+    timeoutMs: 1_000,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(result.output_truncated, false);
+  assert.equal(Buffer.byteLength(result.stdout), 513);
 });

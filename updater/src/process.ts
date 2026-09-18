@@ -37,18 +37,22 @@ export class ProcessRunner {
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
       let capturedBytes = 0;
-      const tailLimitBytes = Math.min(4_096, Math.floor(options.outputLimitBytes / 2));
-      const headLimitBytes = options.outputLimitBytes - tailLimitBytes;
-      let outputTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      let checkpointBuffer = "";
+      let outputCheckpoint: string | undefined;
       let timedOut = false;
+      const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
+        checkpointBuffer = (checkpointBuffer + chunk.toString("utf8")).slice(-512);
+        for (const match of checkpointBuffer.matchAll(/\[dispatcher-test\] (?:start|complete|failed) test\/[A-Za-z0-9._-]+\.test\.ts/g)) {
+          outputCheckpoint = match[0];
+        }
+      };
       const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
-        outputTail = Buffer.concat([outputTail, chunk]);
-        if (outputTail.length > tailLimitBytes) outputTail = outputTail.subarray(outputTail.length - tailLimitBytes);
-        if (capturedBytes >= headLimitBytes) {
+        inspectCheckpoints(chunk);
+        if (capturedBytes >= options.outputLimitBytes) {
           truncated = true;
           return current;
         }
-        const remaining = headLimitBytes - capturedBytes;
+        const remaining = options.outputLimitBytes - capturedBytes;
         if (chunk.length > remaining) truncated = true;
         const captured = chunk.subarray(0, remaining);
         capturedBytes += captured.length;
@@ -66,7 +70,7 @@ export class ProcessRunner {
           stderr: stderr.toString("utf8"),
           timed_out: timedOut,
           output_truncated: truncated,
-          ...(truncated ? { output_tail: outputTail.toString("utf8") } : {}),
+          ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
         });
       };
       const signalGroup = (signal: NodeJS.Signals): void => {
@@ -88,7 +92,6 @@ export class ProcessRunner {
           hardKillTimer = undefined;
           finish();
         }, 1_000);
-        hardKillTimer.unref();
       }, options.timeoutMs);
       timer.unref();
       child.once("error", (error) => {
