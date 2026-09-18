@@ -18,8 +18,15 @@ describe("job resource config", () => {
     assert.equal(packageJson.scripts?.test, "node test/run-tests.mjs");
     const runner = fs.readFileSync(new URL("./run-tests.mjs", import.meta.url), "utf8");
     assert.match(runner, /--test-concurrency=1/);
-    assert.match(runner, /\[dispatcher-test\] start/);
-    assert.match(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /\[dispatcher-test\] file-start/);
+    assert.match(runner, /\[dispatcher-test\] file-finish/);
+    assert.match(runner, /checkpoint-hooks\.mjs/);
+    const hooks = fs.readFileSync(new URL("./checkpoint-hooks.mjs", import.meta.url), "utf8");
+    assert.match(hooks, /beforeEach/);
+    assert.match(hooks, /afterEach/);
+    assert.match(hooks, /\[dispatcher-test\] case-start/);
+    assert.match(hooks, /\[dispatcher-test\] case-finish/);
+    assert.match(hooks, /createHash\("sha256"\)/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
   });
 

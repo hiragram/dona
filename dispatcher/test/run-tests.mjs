@@ -8,22 +8,30 @@ const testFiles = (await fs.readdir(testDirectory))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
 const tsx = path.resolve("node_modules", ".bin", "tsx");
+const checkpointHooks = path.resolve("test", "checkpoint-hooks.mjs");
 const forwardedArguments = process.argv.slice(2);
 
 for (const name of testFiles) {
   const relative = path.posix.join("test", name);
-  process.stdout.write(`[dispatcher-test] start ${relative}\n`);
+  process.stderr.write(`[dispatcher-test] file-start ${relative}\n`);
   const exitCode = await new Promise((resolve, reject) => {
-    const child = spawn(tsx, ["--test", "--test-concurrency=1", ...forwardedArguments, relative], {
-      env: process.env,
+    const child = spawn(tsx, [
+      "--test",
+      "--test-concurrency=1",
+      "--import",
+      checkpointHooks,
+      ...forwardedArguments,
+      relative,
+    ], {
+      env: { ...process.env, DONA_DISPATCHER_TEST_FILE: relative },
       stdio: "inherit",
     });
     child.once("error", reject);
     child.once("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
   });
   if (exitCode !== 0) {
-    process.stderr.write(`[dispatcher-test] failed ${relative}\n`);
+    process.stderr.write(`[dispatcher-test] file-fail ${relative}\n`);
     process.exit(exitCode);
   }
-  process.stdout.write(`[dispatcher-test] complete ${relative}\n`);
+  process.stderr.write(`[dispatcher-test] file-finish ${relative}\n`);
 }

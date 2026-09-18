@@ -39,11 +39,44 @@ export class ProcessRunner {
       let capturedBytes = 0;
       let checkpointBuffer = "";
       let outputCheckpoint: string | undefined;
+      let currentFile: string | undefined;
+      let lastFinished: string | undefined;
+      const unfinishedCases = new Set<string>();
       let timedOut = false;
+      let termOutcome = "not-sent";
+      let killOutcome = "not-sent";
+      const marker = /^\[dispatcher-test\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)$/;
+      const caseMarker = /^\[dispatcher-test\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
+      const refreshCheckpoint = (): void => {
+        const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
+        outputCheckpoint = `last_finish=${lastFinished ?? "none"}; ${timedOut ? "timeout" : "unfinished"}=${unfinished}`;
+      };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
-        checkpointBuffer = (checkpointBuffer + chunk.toString("utf8")).slice(-512);
-        for (const match of checkpointBuffer.matchAll(/\[dispatcher-test\] (?:start|complete|failed) test\/[A-Za-z0-9._-]+\.test\.ts/g)) {
-          outputCheckpoint = match[0];
+        const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
+        checkpointBuffer = (lines.pop() ?? "").slice(-256);
+        for (const line of lines) {
+          const fileMatch = marker.exec(line);
+          if (fileMatch) {
+            if (fileMatch[1] === "file-start") currentFile = fileMatch[2];
+            else {
+              lastFinished = `${fileMatch[1]} ${fileMatch[2]}`;
+              currentFile = undefined;
+              unfinishedCases.clear();
+            }
+            refreshCheckpoint();
+            continue;
+          }
+          const testMatch = caseMarker.exec(line);
+          if (!testMatch) continue;
+          const action = testMatch[1];
+          const identity = testMatch[2];
+          if (!action || !identity) continue;
+          if (action === "case-start") unfinishedCases.add(identity);
+          else {
+            unfinishedCases.delete(identity);
+            lastFinished = `${action} ${identity}`;
+          }
+          refreshCheckpoint();
         }
       };
       const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
@@ -62,8 +95,12 @@ export class ProcessRunner {
       child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
       let hardKillTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
+      let exitSignal: NodeJS.Signals | null = null;
       const finish = (): void => {
         if (closedCode === undefined) return;
+        const cleanupStatus = timedOut
+          ? `term=${termOutcome},kill=${killOutcome},closed=yes`
+          : "term=not-sent,kill=not-sent,closed=yes";
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -71,24 +108,27 @@ export class ProcessRunner {
           timed_out: timedOut,
           output_truncated: truncated,
           ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
+          ...(exitSignal ? { exit_signal: exitSignal } : {}),
+          cleanup_status: cleanupStatus,
         });
       };
-      const signalGroup = (signal: NodeJS.Signals): void => {
+      const signalGroup = (signal: NodeJS.Signals): string => {
         if (child.pid) {
           try {
             process.kill(-child.pid, signal);
-            return;
+            return "group-sent";
           } catch {
             // Fall back to the direct child when process groups are unavailable.
           }
         }
-        child.kill(signal);
+        return child.kill(signal) ? "child-sent" : "unavailable";
       };
       const timer = setTimeout(() => {
         timedOut = true;
-        signalGroup("SIGTERM");
+        refreshCheckpoint();
+        termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
-          signalGroup("SIGKILL");
+          killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
           finish();
         }, 1_000);
@@ -99,9 +139,10 @@ export class ProcessRunner {
         if (hardKillTimer) clearTimeout(hardKillTimer);
         reject(error);
       });
-      child.once("close", (code) => {
+      child.once("close", (code, signal) => {
         clearTimeout(timer);
         closedCode = code;
+        exitSignal = signal;
         if (!hardKillTimer) finish();
       });
     });

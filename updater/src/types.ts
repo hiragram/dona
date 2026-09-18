@@ -273,6 +273,8 @@ export interface CommandResult {
   timed_out: boolean;
   output_truncated: boolean;
   output_checkpoint?: string;
+  exit_signal?: NodeJS.Signals;
+  cleanup_status?: string;
 }
 
 export interface ActivationReceipt {

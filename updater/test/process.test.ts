@@ -39,16 +39,41 @@ test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", asyn
 });
 
 test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit truncation", async () => {
-  const script = "process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096)); process.stdout.write('[dispatcher-test] start test/job-runtime.test.ts\\n')";
+  const script = "process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096)); process.stderr.write('[dispatcher-test] file-start test/job-runtime.test.ts\\n[dispatcher-test] case-start test/job-runtime.test.ts:012345abcdef#9\\n')";
   const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
     timeoutMs: 1_000,
     outputLimitBytes: 1_024,
   });
   assert.equal(result.exit_code, 0);
   assert.equal(result.output_truncated, true);
-  assert.equal(result.output_checkpoint, "[dispatcher-test] start test/job-runtime.test.ts");
+  assert.equal(result.output_checkpoint, "last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
   assert.equal(Buffer.byteLength(result.stdout), 1_024);
+});
+
+test("ProcessRunner prioritizes the unfinished case and cleanup result on timeout", async () => {
+  const script = `
+    process.stderr.write('[dispatcher-test] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test] case-start test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test] case-finish test/api.test.ts:012345abcdef#1\\n');
+    process.stderr.write('[dispatcher-test] case-start test/api.test.ts:fedcba543210#2\\n');
+    process.stdout.write('token=secret-value\\n' + 'x'.repeat(4096));
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(result.timed_out, true);
+  assert.equal(result.output_truncated, true);
+  assert.equal(
+    result.output_checkpoint,
+    "last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#2",
+  );
+  assert.equal(result.exit_signal, "SIGKILL");
+  assert.equal(result.cleanup_status, "term=group-sent,kill=group-sent,closed=yes");
+  assert.equal(result.output_checkpoint.includes("secret-value"), false);
 });
 
 test("ProcessRunner does not report truncation below the configured output limit", async () => {

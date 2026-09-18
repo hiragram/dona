@@ -10,6 +10,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { CanonicalBuild } from "../src/adapters.js";
+import { ProcessRunner } from "../src/process.js";
+import type { CommandResult } from "../src/types.js";
 import { tempPolicy } from "./helpers.js";
 
 const execute = promisify(execFile);
@@ -280,6 +282,33 @@ test("stable updater uses separate controller-owned npm config files", async () 
     await fs.unlink(userConfig);
     await fs.symlink("/dev/null", userConfig);
     await assert.rejects(new CanonicalBuild(policy).toolchain(), /npm_config_file_is_not_private_and_empty/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pre-activation command errors preserve timeout diagnostics before bounded output", async () => {
+  const { root, policy } = await tempPolicy();
+  const result: CommandResult = {
+    exit_code: null,
+    stdout: `token=secret-value\n${"x".repeat(2_000)}`,
+    stderr: "",
+    timed_out: true,
+    output_truncated: true,
+    output_checkpoint: "last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#2",
+    exit_signal: "SIGKILL",
+    cleanup_status: "term=group-sent,kill=group-sent,closed=yes",
+  };
+  const runner = { run: async () => result } as unknown as ProcessRunner;
+  try {
+    await assert.rejects(new CanonicalBuild(policy, runner).toolchain(), (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /checkpoint=last_finish=case-finish test\/api\.test\.ts:012345abcdef#1; timeout=test\/api\.test\.ts:fedcba543210#2/);
+      assert.match(message, /runner=exit:null,signal:SIGKILL,cleanup:term=group-sent,kill=group-sent,closed=yes/);
+      assert.equal(message.includes("secret-value"), false);
+      assert.ok(message.length <= 1_000);
+      return true;
+    });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
