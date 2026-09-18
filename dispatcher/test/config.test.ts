@@ -22,6 +22,8 @@ describe("job resource config", () => {
     assert.match(runner, /failureOutputLimitBytes = 64 \* 1024/);
     assert.match(runner, /stdio: \["ignore", "pipe", "pipe"\]/);
     assert.doesNotMatch(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /process\.exitCode = exitCode/);
+    assert.doesNotMatch(runner, /process\.exit\(exitCode\)/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
     const markerBytes = fs.readdirSync(new URL("./", import.meta.url))
       .filter((name) => name.endsWith(".test.ts"))

@@ -39,6 +39,7 @@ for (const name of testFiles) {
   if (exitCode !== 0) {
     process.stderr.write(`[dispatcher-test] failed ${relative}\n`);
     if (failureOutput.length > 0) process.stderr.write(failureOutput);
-    process.exit(exitCode);
+    process.exitCode = exitCode;
+    break;
   }
 }
