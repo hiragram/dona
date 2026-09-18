@@ -27,7 +27,7 @@ test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", asyn
       setInterval(() => {}, 1000);
     `;
     const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
-      timeoutMs: 30,
+      timeoutMs: 1_000,
       outputLimitBytes: 1_024,
     });
     assert.equal(result.timed_out, true);
