@@ -1,12 +1,13 @@
-import type Database from "better-sqlite3";
+import { applyClockBoundMutation } from "./clock-provenance.js";
 import { assertSecurityDurability } from "../audit/durability.js";
+import { types } from "node:util";
+import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "../audit/synchronous.js";
+import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
+import type Database from "better-sqlite3";
 import { auditEventSchema, type AuditEvent, type AuditKeyLookup } from "../audit/codec.js";
 import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
-import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
-import { assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema, verifyApprovalIntegrity } from "./schema.js";
-import { applyClockBoundMutation } from "./clock-provenance.js";
 
 export interface ApprovalTransactionProviders {
   clock: ProtectedClockSource;
@@ -15,12 +16,12 @@ export interface ApprovalTransactionProviders {
   auditKeys: AuditKeyLookup;
   auditSigningKeyVersion: number;
   maximumClockDriftMs: number;
-  /** Local operational admission wait, 0..30,000 ms. No automatic retry. */
   lockWaitTimeoutMs?: number;
 }
 export class ApprovalTransactionError extends Error {
   constructor() { super("approval_transaction_unverified"); this.name = "ApprovalTransactionError"; }
 }
+
 export class ApprovalTransactionBusyError extends Error {
   constructor() { super("approval_transaction_busy"); this.name = "ApprovalTransactionBusyError"; }
 }
@@ -40,36 +41,62 @@ export class ApprovalTransaction {
   run(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {
       assertSynchronousCallback(mutation);
-      return withSecurityTransactionLock(this.db, () => this.runInside(transactionId, eventInput, mutation), this.providers.lockWaitTimeoutMs);
-    } catch (error) {
-      if (error instanceof SecurityCoordinationBusyError) throw new ApprovalTransactionBusyError();
-      throw new ApprovalTransactionError();
-    }
+      const event = auditEventSchema.omit({ occurred_at: true }).parse(eventInput);
+      return this.runPrepared(transactionId, mark => ({ event, resource_digest: null, mutation: () => mutation(mark) }));
+    } catch (error) { if (error instanceof ApprovalTransactionBusyError) throw error; throw new ApprovalTransactionError(); }
   }
-  private runInside(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
+
+  /** prepare performs synchronous reads under the writer lock. It chooses the
+   * actual audit outcome and planned metadata digest before anchor reservation;
+   * an ordinary duplicate/conflict should return a denial plan, not throw after
+   * reserve. Plaintext and transport proof must never enter resource metadata. */
+  runPrepared<F extends () => unknown>(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: SynchronousCallback<F>;
+  }): ReturnType<F>;
+  runPrepared(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
+  }): unknown {
+    try {
+      assertSynchronousCallback(prepare);
+      return withSecurityTransactionLock(this.db, () => this.runPreparedInside(transactionId, prepare), this.providers.lockWaitTimeoutMs);
+    }
+    catch (error) { if (error instanceof SecurityCoordinationBusyError) throw new ApprovalTransactionBusyError(); throw new ApprovalTransactionError(); }
+  }
+  private runPreparedInside(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
+  }): unknown {
     try {
       assertSecurityDurability(this.db);
       if (this.db.inTransaction || this.db.pragma("foreign_keys", { simple: true }) !== 1
         || (this.db.pragma("synchronous", { simple: true }) as number) < 2) throw new ApprovalTransactionError();
-      const event = auditEventSchema.omit({ occurred_at: true }).parse(eventInput);
       verifyApprovalSchema(this.db);
-      // Protect audit integrity before making even an unused clock reservation.
       this.audit.verify();
       const mark = Object.freeze(reserveClockMark(this.providers.clockMarks, this.providers.clock,
         transactionId, this.providers.maximumClockDriftMs));
       const requireCurrent = () => {
         const current = this.providers.clockMarks.read();
-        if (Object.keys(current).length !== Object.keys(mark).length || !(Object.keys(mark) as Array<keyof ClockMark>).every(key => current[key] === mark[key])) throw new ApprovalTransactionError();
+        if (Object.keys(current).length !== Object.keys(mark).length
+          || !(Object.keys(mark) as Array<keyof ClockMark>).every(key => current[key] === mark[key])) throw new ApprovalTransactionError();
       };
       requireCurrent();
-      return this.audit.append(transactionId, this.providers.auditSigningKeyVersion,
-        { ...event, occurred_at: mark.effective_utc }, () => {
-          requireCurrent(); verifyApprovalSchema(this.db);
-          const result = applyClockBoundMutation(this.db, mark, () => mutation(mark));
-          requireCurrent();
-          verifyApprovalSchema(this.db);
-          return result;
-        }).result;
+      return this.audit.appendPrepared(transactionId, this.providers.auditSigningKeyVersion, () => {
+        requireCurrent(); verifyApprovalSchema(this.db);
+        const plan = prepare(mark);
+        if (plan === null || typeof plan !== "object" || types.isProxy(plan)
+          || Object.getPrototypeOf(plan) !== Object.prototype) throw new ApprovalTransactionError();
+        const descriptors = Object.getOwnPropertyDescriptors(plan);
+        if (Reflect.ownKeys(descriptors).length !== 3 || !["event", "resource_digest", "mutation"].every(name => {
+          const descriptor = descriptors[name]; return descriptor !== undefined && "value" in descriptor;
+        })) throw new ApprovalTransactionError();
+        assertSynchronousCallback(descriptors.mutation!.value);
+        assertSynchronousResult({ event: descriptors.event!.value, resource_digest: descriptors.resource_digest!.value });
+        const event = auditEventSchema.omit({ occurred_at: true }).parse(plan.event);
+        return { event: { ...event, occurred_at: mark.effective_utc }, resource_digest: plan.resource_digest,
+          mutation: () => {
+            requireCurrent();
+            const result = applyClockBoundMutation(this.db, mark, plan.mutation); requireCurrent(); verifyApprovalSchema(this.db); return result;
+          } };
+      }).result;
     } catch { throw new ApprovalTransactionError(); }
   }
 }

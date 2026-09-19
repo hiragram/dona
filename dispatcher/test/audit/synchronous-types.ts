@@ -59,3 +59,21 @@ function nestedContracts(db: Database.Database, audit: AuditRepository, event: A
   // @ts-expect-error promises inside records and arrays are deferred results
   audit.append("nested", 1, event, () => ({ rows: [{ later: [Promise.resolve(result)] }] }));
 }
+
+function preparedContracts(audit:AuditRepository, approval:ApprovalTransaction,event:AuditEvent) {
+ const text:string=audit.readVerified(()=>"text");
+ const result:number=audit.appendPrepared('tx',1,()=>({event,resource_digest:null,mutation:()=>1})).result;
+ const output:string=approval.runPrepared('tx',()=>({event,resource_digest:null,mutation:()=>text}));
+ // @ts-expect-error deferred read cannot compile
+ audit.readVerified(async()=>text);
+ // @ts-expect-error deferred mutation cannot compile
+ audit.appendPrepared('tx',1,()=>({event,resource_digest:null,mutation:async()=>result}));
+ // @ts-expect-error deferred prepared mutation cannot compile
+ approval.runPrepared('tx',()=>({event,resource_digest:null,mutation:()=>Promise.resolve(output)}));
+ // @ts-expect-error generator read escapes the transaction
+ audit.readVerified(function*(){yield text;});
+ // @ts-expect-error generator mutation escapes the transaction
+ audit.appendPrepared('tx',1,()=>({event,resource_digest:null,mutation:function*(){yield result;}}));
+ // @ts-expect-error iterator mutation escapes the transaction
+ approval.runPrepared('tx',()=>({event,resource_digest:null,mutation:()=>[output].values()}));
+}

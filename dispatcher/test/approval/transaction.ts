@@ -1028,3 +1028,37 @@ test("非WAL journal modeはclockとaudit予約前に拒否し設定を変更し
     assert.equal(count(db,"approval_clock_reservations"),0);assert.equal(count(db,"security_audit_records"),0);
   }
 });
+
+test("事前判定の競合ではrequestを置換せず拒否監査とclock参照を確定する",t=>{
+  const{db,transaction,anchors}=setup(t);
+  const create=(tx:string)=>transaction.runPrepared(tx,mark=>{
+    const exists=db.prepare("SELECT 1 FROM approval_requests WHERE request_id='r1'").get();
+    return{event:{...event,outcome:exists?"denied":"pending",reason:exists?"idempotency_conflict":"none"},
+      resource_digest:exists?null:"a".repeat(64),mutation:()=>{if(!exists)insertRequest(db,mark.transaction_id);return exists?"conflict":"created";}};
+  });
+  assert.equal(create('tx1'),'created');assert.equal(create('tx2'),'conflict');
+  assert.equal(count(db,'approval_requests'),1);assert.equal(count(db,'approval_clock_reservations'),2);
+  assert.equal(anchors.value.pending_transaction_id,null);
+  const record=JSON.parse((db.prepare('SELECT record_json FROM security_audit_records WHERE sequence=2').get()as{record_json:string}).record_json);
+  assert.equal(record.event.outcome,'denied');assert.equal(record.event.reason,'idempotency_conflict');
+});
+test("事前判定失敗時はclockを戻さずaudit anchorを予約しない",t=>{
+  const{db,transaction,marks,anchors,audit}=setup(t);
+  assert.throws(()=>transaction.runPrepared('tx1',()=>{insertRequest(db,'tx1');return{event,resource_digest:null,mutation:()=>null};}),ApprovalTransactionError);
+  assert.equal(marks.value.transaction_id,'tx1');assert.deepEqual(anchors.calls,[]);assert.equal(audit.verify().sequence,0);
+  assert.equal(count(db,'approval_requests'),0);assert.equal(count(db,'approval_clock_reservations'),0);
+  transaction.run('tx2',event,mark=>insertRequest(db,mark.transaction_id));
+  assert.equal(audit.verify().sequence,1);assert.equal(count(db,'approval_requests'),1);
+});
+
+
+test("事前計画のgetterとProxyを実行せず予約前に拒否する", t => {
+  for (const kind of ["getter", "proxy"]) {
+    const { transaction, anchors, db } = setup(t); let effects = 0;
+    const plan = kind === "proxy" ? new Proxy({}, { get() { effects++; return undefined; } })
+      : Object.defineProperty({}, "mutation", { get() { effects++; return () => {}; } });
+    assert.throws(() => transaction.runPrepared("invalid_plan", () => plan as never));
+    assert.equal(effects, 0); assert.deepEqual(anchors.calls, []);
+    assert.equal(count(db, "security_audit_records"), 0);
+  }
+});

@@ -6,7 +6,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../../src/database.js";
 import { AuditRepository, installAuditSchema, type AuditAnchorStore } from "../../src/audit/repository.js";
-import { AuditIntegrityError, signAuditCheckpoint, type AuditAnchor, type AuditEvent, type AuditKey } from "../../src/audit/codec.js";
+import { AuditIntegrityError, signAuditCheckpoint, verifyAuditRecord, type AuditAnchor, type AuditEvent, type AuditKey } from "../../src/audit/codec.js";
 
 const key: AuditKey = { version: 1, purpose: "audit", state: "active", activated_at: "2026-09-01T00:00:00.000Z",
   signing_expires_at: "2026-11-01T00:00:00.000Z", secret: Buffer.alloc(32, 0x42) };
@@ -337,4 +337,105 @@ test("共通auditの更新もjournal・同期設定不足なら予約前に拒�
     assert.throws(()=>repository.pruneRetainedPrefix(),AuditIntegrityError);
     assert.deepEqual(store.calls,[]);assert.equal(repository.verify().sequence,0);
   }
+});
+
+test("重複を通常の監査結果へ収束させ、anchorを未確定で残さない", t => {
+  const { db, repository, store } = setup(t);
+  const create = (tx: string) => repository.appendPrepared(tx, 1, () => {
+    const existing = db.prepare("SELECT id FROM decisions WHERE id='request_1'").get();
+    return { event: { ...event, outcome: existing ? "denied" : "allowed", reason: existing ? "decision_conflict" : "none" },
+      resource_digest: existing ? null : "a".repeat(64),
+      mutation: () => { if (!existing) db.exec("INSERT INTO decisions VALUES ('request_1','approved')"); return existing ? "conflict" : "created"; } };
+  });
+  const first = create("prepared_1"); const duplicate = create("prepared_2");
+  assert.equal(first.result,"created"); assert.equal(first.record.codec_version,2);
+  assert.equal(duplicate.result,"conflict"); assert.equal(duplicate.record.event.outcome,"denied");
+  assert.equal(count(db,"decisions"),1); assert.equal(store.value.pending_transaction_id,null); assert.equal(repository.verify().sequence,2);
+});
+test("事前判定のSQL更新を予約前に拒否し、接続設定を復元する", t => {
+  const { db, repository, store } = setup(t);
+  assert.throws(() => repository.appendPrepared("prepared_1",1,() => {
+    db.exec("INSERT INTO decisions VALUES ('bad','approved')"); return {event,resource_digest:null,mutation:()=>null};
+  }), AuditIntegrityError);
+  assert.equal(count(db,"decisions"),0);assert.deepEqual(store.calls,[]);assert.equal(db.pragma("query_only",{simple:true}),0);
+  repository.append("prepared_2",1,event,()=>{ db.exec("INSERT INTO decisions VALUES ('request_1','approved')"); });
+  assert.equal(repository.verify().sequence,1);
+});
+test("事前判定の非同期処理をanchor予約前に拒否する", t => {
+  const { repository, store } = setup(t);
+  assert.throws(() => repository.appendPrepared("prepared_1",1,(async () => ({event,resource_digest:null,mutation:()=>null})) as never),AuditIntegrityError);
+  assert.deepEqual(store.calls,[]);assert.equal(repository.verify().sequence,0);
+});
+test("検証付き読み取りは更新とpeer commit後の古い結果を拒否する", t => {
+  const { db, filename, repository, store } = setup(t);
+  assert.throws(() => repository.readVerified(() => { db.exec("INSERT INTO decisions VALUES ('bad','approved')"); }),AuditIntegrityError);
+  assert.equal(count(db,"decisions"),0);assert.deepEqual(store.calls,[]);
+  const peer = new Database(filename); peer.pragma("synchronous=FULL"); const peerRepository = new AuditRepository(peer,store,keys);
+  try {
+    assert.throws(() => repository.readVerified(() => {
+      const before = count(db,"decisions");
+      peerRepository.append("peer_1",1,event,()=>{ peer.exec("INSERT INTO decisions VALUES ('request_1','approved')"); });
+      return before;
+    }),AuditIntegrityError);
+    assert.equal(repository.readVerified(()=>count(db,"decisions")),1);
+  } finally {peer.close();}
+});
+
+test("record v2の業務digestを認証しv1混在chainも検証する", t => {
+  const { repository } = setup(t);
+  const legacy = repository.append("legacy_1",1,event,()=>null);
+  const current = repository.appendPrepared("current_1",1,()=>({event,resource_digest:"a".repeat(64),mutation:()=>null}));
+  assert.equal(legacy.record.codec_version,1);assert.equal(current.record.codec_version,2);
+  assert.deepEqual(verifyAuditRecord(JSON.parse(JSON.stringify(current.record)),keys),current.record);
+  assert.equal(repository.verify().sequence,2);
+  assert.throws(()=>verifyAuditRecord({...current.record,resource_digest:"b".repeat(64)},keys),AuditIntegrityError);
+  const downgraded = {...current.record} as Record<string,unknown>;
+  downgraded.codec_version=1;delete downgraded.resource_digest;
+  assert.throws(()=>verifyAuditRecord(downgraded,keys),AuditIntegrityError);
+  assert.throws(()=>verifyAuditRecord({...current.record,codec_version:3},keys),AuditIntegrityError);
+  const checkpoint2=signAuditCheckpoint({codec_version:1,chain_id:current.record.chain_id,transaction_id:'checkpoint_2',signed_at:at,key_version:1},keys,current.record);
+  assert.equal(checkpoint2.sequence,2);assert.equal(checkpoint2.through_mac,current.record.mac);
+});
+
+test("不正な更新計画とread-only接続ではanchorを予約しない", t => {
+  const { db, repository, store } = setup(t);
+  const plans = [
+    {event,resource_digest:undefined,mutation:()=>null},
+    {event,resource_digest:null,mutation:null},
+    {event:{...event,resource_id:null},resource_digest:"a".repeat(64),mutation:()=>null},
+  ];
+  for (const plan of plans) {
+    assert.throws(()=>repository.appendPrepared("bad_plan",1,()=>plan as never),AuditIntegrityError);
+    assert.deepEqual(store.calls,[]);
+  }
+  db.pragma("query_only=ON");
+  assert.throws(()=>repository.append("readonly",1,event,()=>null),AuditIntegrityError);
+  assert.deepEqual(store.calls,[]);
+  assert.equal(repository.readVerified(()=>count(db,"decisions")),0);
+  assert.equal(db.pragma("query_only",{simple:true}),1);
+  db.pragma("query_only=OFF");
+  repository.append("valid",1,event,()=>null);
+  assert.equal(repository.verify().sequence,1);
+});
+
+
+test("事前判定と検証付きreadではtransaction切替とquery_only解除を拒否する", t => {
+  for (const mode of ["read", "prepare"]) {
+    for (const sql of ["COMMIT", "SAVEPOINT guard_point", "PRAGMA query_only=OFF"]) {
+      const { db, repository, store } = setup(t);
+      const callback = () => { db.exec(sql); return { event, resource_digest: null, mutation: () => {} }; };
+      assert.throws(() => mode === "read" ? repository.readVerified(callback as never)
+        : repository.appendPrepared("blocked_plan", 1, callback));
+      assert.equal(db.inTransaction, false); assert.equal(db.pragma("query_only", { simple: true }), 0);
+      assert.deepEqual(store.calls, []); assert.equal(repository.verify().sequence, 0);
+    }
+  }
+});
+
+test("事前prepareしたwriteも検証付きreadで実行できない", t => {
+  const { db, repository, store } = setup(t);
+  const statement = db.prepare("INSERT INTO decisions VALUES ('request_1','approved')");
+  assert.throws(() => repository.readVerified(() => { statement.run(); }));
+  assert.equal(count(db, "decisions"), 0); assert.deepEqual(store.calls, []);
+  assert.equal(repository.verify().sequence, 0);
 });
