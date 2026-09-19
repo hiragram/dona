@@ -61,6 +61,15 @@ function nestedContracts(db: Database.Database, audit: AuditRepository, event: A
 }
 
 function preparedContracts(audit:AuditRepository, approval:ApprovalTransaction,event:AuditEvent) {
+ const resource_commitments=[{scope:event.scope,resource_id:"root",resource_digest:"a".repeat(64)}];
+ const multiResult:string=audit.appendPrepared("multi",1,()=>({event,resource_commitments,mutation:()=>"done"})).result;
+ const multiOutput:string=approval.runPrepared("multi",()=>({event,resource_commitments,mutation:()=>multiResult}));
+ // @ts-expect-error both root encodings are ambiguous
+ audit.appendPrepared("both",1,()=>({event,resource_commitments,resource_digest:null,mutation:()=>null}));
+ // @ts-expect-error multi-root mutations cannot escape into deferred work
+ approval.runPrepared("multi_async",()=>({event,resource_commitments,mutation:async()=>multiOutput}));
+ // @ts-expect-error multi-root prepare must not be asynchronous
+ audit.appendPrepared("async_prepare",1,async()=>({event,resource_commitments,mutation:()=>null}));
  const text:string=audit.readVerified(()=>"text");
  const result:number=audit.appendPrepared('tx',1,()=>({event,resource_digest:null,mutation:()=>1})).result;
  const output:string=approval.runPrepared('tx',()=>({event,resource_digest:null,mutation:()=>text}));

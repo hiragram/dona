@@ -1,0 +1,11 @@
+# 複数状態の原子的監査commitment
+
+Web ingressの一回nonceと、job/approvalの業務状態は、同じsecurity transactionで確定する必要がある。record v3は監査eventの実resource IDを必須とし、固定scopeとresource IDで識別する複数のaggregate rootを署名する。eventのresource IDがnullの計画はanchor予約前に拒否する。
+
+各commitmentはscope、resource_id、resource_digestだけを持ち、canonical key順の一意な配列とする。空配列、重複、順序違い、未知fieldを拒否する。全chainで保持するaggregate rootは従来どおり64件以下であり、principal/session/jobごとにrootを増やさない。recordのcanonical UTF-8表現が既存SQLite containerの8192 byteを超える場合は、anchor予約前に拒否する。容量のために原子的更新を別transactionへ分割しない。
+
+record v1/v2のfield・署名・検証結果を変えず、混在chainから最新rootを求める。v3の各rootは同じrecord sequenceへ進む。retention checkpoint v2は、削除境界までに確定した全rootを保持し、400日保持、署名keyの寿命、DB外CASの順序を変えない。
+
+appendPrepared/runPreparedの従来のresource_digest計画は維持し、resource_commitments計画を追加する。両方の指定は拒否する。read-only prepare、同期callback、現在clock参照、単一SQLite transaction、anchor reserve/finalizeの検証を両形式へ適用する。
+
+この機構はmetadata digestを署名する共通基盤であり、業務repositoryは実metadataとの照合、current identity・role・resourceの認可、一回nonce、実更新後のreadbackを同じtransactionで行う必要がある。任意のdigestを渡すだけでWeb/approval認可が完成したとは扱わない。実credential/CAS providerやruntime readinessを提供する変更ではない。
