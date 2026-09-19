@@ -1,0 +1,395 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
+import Database from "better-sqlite3";
+import { DispatcherDatabase } from "../../src/database.js";
+import {
+  installApprovalSchema,
+  ApprovalSchemaError,
+} from "../../src/approval/schema.js";
+
+function setup(t: { after(fn: () => void): void }, existing = false) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "approval-schema-"));
+  const filename = path.join(root, "fixture.sqlite");
+  if (existing) new DispatcherDatabase(filename).close();
+  const db = new Database(filename);
+  db.pragma("journal_mode=WAL");
+  db.pragma("foreign_keys=ON");
+  if (existing)
+    db.exec(
+      "CREATE TABLE existing_events (id TEXT PRIMARY KEY); INSERT INTO existing_events VALUES ('original')",
+    );
+  installApprovalSchema(db);
+  db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run(
+    "tx_1",
+    JSON.stringify({ codec_version: 1, transaction_id: "tx_1" }),
+  );
+  t.after(() => {
+    db.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { db, filename };
+}
+function request(db: Database.Database, id = "r1") {
+  const snapshot = {
+    codec_version: 1,
+    operation_kind: "slack.post_thread_reply.v1",
+    instance_id: "i1",
+    workspace_id: "w1",
+    policy_revision: 1,
+  };
+  db.prepare(
+    `INSERT INTO approval_requests (request_id,instance_id,workspace_id,creation_key,snapshot_json,semantic_hash,
+    binding_id,binding_revision,policy_revision,model_version,state,revision,created_at,expires_at,clock_transaction_id)
+    VALUES (?,'i1','w1',?,?,?,'b1',1,1,'model-1','sent',1,'2026-09-19T00:00:00.000Z','2026-09-19T00:15:00.000Z','tx_1')`,
+  ).run(id, id.padEnd(64, "0"), JSON.stringify(snapshot), "a".repeat(64));
+}
+function decide(
+  db: Database.Database,
+  id = "r1",
+  kind = "approve",
+  workspace = "w1",
+  presentation: number | null = 1,
+) {
+  const actor =
+    kind === "cancel"
+      ? "requester"
+      : kind === "expire"
+        ? "system"
+        : "supervisor";
+  db.prepare(
+    `INSERT INTO approval_decisions VALUES (?,?, 'i1',?,?,'b1',1,?,?, 'actor1',?,'2026-09-19T00:01:00.000Z','tx_1')`,
+  ).run("d_" + id, id, workspace, "a".repeat(64), kind, actor, presentation);
+}
+function consume(db: Database.Database, requestId = "r1") {
+  db.prepare(
+    "INSERT INTO approval_consumes VALUES (?,?,?,'approve',?,'2026-09-19T00:02:00.000Z','tx_1')",
+  ).run("c_" + requestId, requestId, "d_" + requestId, "a_" + requestId);
+  db.prepare(
+    `INSERT INTO approval_execution_attempts VALUES (?,?,?,'claimed',1,'2026-09-19T00:02:00.000Z',
+    '2026-09-19T00:03:00.000Z','2026-09-20T00:02:00.000Z',NULL,NULL,'tx_1')`,
+  ).run("a_" + requestId, requestId, "c_" + requestId);
+}
+function notification(
+  db: Database.Database,
+  id: string,
+  kind = "approval_card",
+) {
+  db.prepare(
+    "INSERT INTO approval_notifications VALUES (?,'r1',?,'pending',1,1,?,1,0,NULL,'tx_1')",
+  ).run(id, kind, "b".repeat(64));
+}
+
+test("既存データ・WAL・schema versionを保ち、再open後も制約を維持する", (t) => {
+  for (const existing of [false, true]) {
+    const { db, filename } = setup(t, existing);
+    const originalVersion = db.pragma("user_version", { simple: true });
+    request(db);
+    decide(db);
+    db.transaction(() => consume(db)).immediate();
+    const reopened = new Database(filename);
+    reopened.pragma("foreign_keys=ON");
+    try {
+      installApprovalSchema(reopened);
+      assert.equal(
+        reopened.pragma("user_version", { simple: true }),
+        originalVersion,
+      );
+      assert.equal(reopened.pragma("journal_mode", { simple: true }), "wal");
+      if (existing)
+        assert.deepEqual(
+          reopened.prepare("SELECT * FROM existing_events").all(),
+          [{ id: "original" }],
+        );
+      assert.equal(
+        (
+          reopened
+            .prepare("SELECT state FROM approval_execution_attempts")
+            .get() as { state: string }
+        ).state,
+        "claimed",
+      );
+      assert.deepEqual(reopened.pragma("foreign_key_check"), []);
+      assert.equal(reopened.pragma("integrity_check", { simple: true }), "ok");
+    } finally {
+      reopened.close();
+    }
+  }
+});
+test("部分schema・欠落したfence・未知versionを自動修復せず拒否する", (t) => {
+  const { db } = setup(t);
+  db.exec("DROP INDEX approval_one_message_write");
+  assert.throws(() => installApprovalSchema(db), ApprovalSchemaError);
+  assert.equal(
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE name='approval_one_message_write'",
+      )
+      .get(),
+    undefined,
+  );
+  const other = new Database(":memory:");
+  other.pragma("foreign_keys=ON");
+  try {
+    other.exec("CREATE TABLE approval_requests (id TEXT)");
+    assert.throws(() => installApprovalSchema(other), ApprovalSchemaError);
+    assert.equal(
+      other
+        .prepare("SELECT 1 FROM sqlite_master WHERE name='approval_schema'")
+        .get(),
+      undefined,
+    );
+    other.exec(
+      "DROP TABLE approval_requests; CREATE TABLE approval_schema(version INTEGER); INSERT INTO approval_schema VALUES(2)",
+    );
+    assert.throws(() => installApprovalSchema(other), ApprovalSchemaError);
+  } finally {
+    other.close();
+  }
+});
+test("decision slotはscope越境・presentation欠落・再open後の重複decisionを拒否する", (t) => {
+  const { db, filename } = setup(t);
+  request(db);
+  assert.throws(() => decide(db, "r1", "approve", "other"));
+  assert.throws(() => decide(db, "r1", "approve", "w1", null));
+  decide(db);
+  const peer = new Database(filename);
+  peer.pragma("foreign_keys=ON");
+  try {
+    assert.throws(() => decide(peer, "r1", "cancel"));
+    assert.equal(
+      (
+        peer.prepare("SELECT kind FROM approval_decisions").get() as {
+          kind: string;
+        }
+      ).kind,
+      "approve",
+    );
+  } finally {
+    peer.close();
+  }
+});
+test("consumeとattemptを同時にcommitし、未承認と二重attemptを拒否する", (t) => {
+  const { db, filename } = setup(t);
+  request(db);
+  decide(db);
+  request(db, "r2");
+  decide(db, "r2", "reject");
+  assert.throws(() =>
+    db
+      .transaction(() =>
+        db.exec(
+          "INSERT INTO approval_consumes VALUES ('c_r1','r1','d_r1','approve','a_r1','now','tx_1')",
+        ),
+      )
+      .immediate(),
+  );
+  assert.equal(
+    (
+      db.prepare("SELECT count(*) n FROM approval_consumes").get() as {
+        n: number;
+      }
+    ).n,
+    0,
+  );
+  assert.throws(() => db.transaction(() => consume(db, "r2")).immediate());
+  db.transaction(() => consume(db)).immediate();
+  const peer = new Database(filename);
+  peer.pragma("foreign_keys=ON");
+  try {
+    assert.throws(() => peer.transaction(() => consume(peer)).immediate());
+    assert.equal(
+      (
+        peer
+          .prepare("SELECT count(*) n FROM approval_execution_attempts")
+          .get() as { n: number }
+      ).n,
+      1,
+    );
+  } finally {
+    peer.close();
+  }
+});
+test("受理不明でもnotificationのcreation keyを維持し、pending noticeは別slotを使う", (t) => {
+  const { db } = setup(t);
+  request(db);
+  notification(db, "n1");
+  db.exec(
+    "UPDATE approval_notifications SET state='acceptance_unknown',fence=1 WHERE notification_attempt_id='n1'",
+  );
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_notifications SET marker_mac='" +
+        "c".repeat(64) +
+        "' WHERE notification_attempt_id='n1'",
+    ),
+  );
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_notifications SET state='sent' WHERE notification_attempt_id='n1'",
+    ),
+  );
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',message_ref='exact_message' WHERE notification_attempt_id='n1'",
+  );
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_notifications SET message_ref='other_message' WHERE notification_attempt_id='n1'",
+    ),
+  );
+  assert.throws(() => notification(db, "n2"));
+  notification(db, "notice1", "pending_notice");
+  assert.equal(
+    (
+      db.prepare("SELECT count(*) n FROM approval_notifications").get() as {
+        n: number;
+      }
+    ).n,
+    2,
+  );
+});
+test("受理不明のmessage更新が確定するまで後続writeをfenceする", (t) => {
+  const { db } = setup(t);
+  request(db);
+  notification(db, "n1");
+  const insert = db.prepare(
+    "INSERT INTO approval_presentation_updates VALUES (?,'n1','message1',?, ?,1,'tx_1')",
+  );
+  insert.run("u1", 1, "dispatching");
+  insert.run("u2", 2, "pending");
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_presentation_updates SET desired_revision=3 WHERE update_id='u1'",
+    ),
+  );
+  db.exec(
+    "UPDATE approval_presentation_updates SET state='acceptance_unknown' WHERE update_id='u1'",
+  );
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_presentation_updates SET state='dispatching' WHERE update_id='u2'",
+    ),
+  );
+  db.exec(
+    "UPDATE approval_presentation_updates SET state='succeeded' WHERE update_id='u1'",
+  );
+  db.exec(
+    "UPDATE approval_presentation_updates SET state='dispatching' WHERE update_id='u2'",
+  );
+});
+test("immutable source・clock・decisionの差替えと存在しないreservation参照を拒否する", (t) => {
+  const { db } = setup(t);
+  request(db);
+  decide(db);
+  for (const sql of [
+    "UPDATE approval_requests SET snapshot_json='{}'",
+    "UPDATE approval_requests SET expires_at='later'",
+    "UPDATE approval_decisions SET kind='reject'",
+    "UPDATE approval_clock_reservations SET mark_json='{}'",
+    "UPDATE approval_requests SET clock_transaction_id='missing'",
+  ])
+    assert.throws(() => db.exec(sql));
+  assert.throws(() =>
+    db
+      .prepare("INSERT INTO approval_clock_reservations VALUES (?,?)")
+      .run("tx_2", "{}"),
+  );
+});
+test("decision event outboxは安定したevent identityで重複を防ぎ、外部配送と分離する", (t) => {
+  const { db } = setup(t);
+  request(db);
+  decide(db);
+  db.exec(
+    "INSERT INTO approval_event_outbox VALUES ('evt1','d_r1','dona_approval.decision.v1','pending',NULL)",
+  );
+  assert.throws(() =>
+    db.exec(
+      "INSERT INTO approval_event_outbox VALUES ('evt2','d_r1','dona_approval.decision.v1','pending',NULL)",
+    ),
+  );
+  assert.throws(() =>
+    db.exec("UPDATE approval_event_outbox SET state='delivered'"),
+  );
+  db.exec(
+    "UPDATE approval_event_outbox SET state='delivered',delivered_at='2026-09-19T00:02:00.000Z'",
+  );
+});
+
+test(
+  "独立workerのconsume競合は一件だけをcommitし、同じattemptを二重作成しない",
+  { timeout: 5000 },
+  async (t) => {
+    const { db, filename } = setup(t);
+    request(db);
+    decide(db);
+    const barrier = new SharedArrayBuffer(4);
+    const gate = new Int32Array(barrier);
+    const modulePath = createRequire(import.meta.url).resolve("better-sqlite3");
+    const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    const Database = require(workerData.modulePath);
+    const db = new Database(workerData.filename);
+    db.pragma('foreign_keys=ON'); db.pragma('busy_timeout=2000');
+    const gate = new Int32Array(workerData.barrier);
+    parentPort.postMessage('ready');
+    while (Atomics.load(gate,0)===0) Atomics.wait(gate,0,0,2000);
+    try {
+      db.transaction(() => {
+        db.exec("INSERT INTO approval_consumes VALUES ('c_r1','r1','d_r1','approve','a_r1','now','tx_1')");
+        db.exec("INSERT INTO approval_execution_attempts VALUES ('a_r1','r1','c_r1','claimed',1,'now','expiry','payload-expiry',NULL,NULL,'tx_1')");
+      }).immediate();
+      parentPort.postMessage('claimed');
+    } catch (error) { parentPort.postMessage(error.code.startsWith('SQLITE_CONSTRAINT') ? 'conflict' : error.code); }
+    finally { db.close(); }
+  `;
+    let readyCount = 0;
+    const workers = [0, 1].map(
+      () =>
+        new Worker(source, {
+          eval: true,
+          workerData: { filename, barrier, modulePath },
+        }),
+    );
+    t.after(async () => {
+      await Promise.all(workers.map((worker) => worker.terminate()));
+    });
+    const results = await Promise.all(
+      workers.map(
+        (worker) =>
+          new Promise<string>((resolve, reject) => {
+            worker.on("error", reject);
+            worker.on("message", (message: string) => {
+              if (message === "ready") {
+                if (++readyCount === 2) {
+                  Atomics.store(gate, 0, 1);
+                  Atomics.notify(gate, 0, 2);
+                }
+              } else resolve(message);
+            });
+          }),
+      ),
+    );
+    assert.deepEqual(results.sort(), ["claimed", "conflict"]);
+    assert.equal(
+      (
+        db.prepare("SELECT count(*) n FROM approval_consumes").get() as {
+          n: number;
+        }
+      ).n,
+      1,
+    );
+    assert.equal(
+      (
+        db
+          .prepare("SELECT count(*) n FROM approval_execution_attempts")
+          .get() as { n: number }
+      ).n,
+      1,
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  },
+);

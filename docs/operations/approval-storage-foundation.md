@@ -1,0 +1,35 @@
+# 承認のSQLite正本とtransaction境界
+
+[#16](https://github.com/hiragram/dona/issues/16)の部分実装。[共通部品](approval-foundation.md)に続き、durable metadataの制約、保護時計と[共通監査](shared-audit-foundation.md)を結ぶtransaction、transport向けDTOを追加する。
+
+## 保存する記録
+
+request、decision、consume ledger、execution attempt、notification、decision event outbox、presentation updateを別tableにする。requestのinstance/workspace、snapshot/hash、binding、policy、作成時刻・期限は更新できない。decision slotはrequestごとに一件で、scope/hash/bindingの複合foreign keyを持つ。approve/rejectにはsupervisor actorとpresentation revisionが必要で、reject/cancel/expireからconsumeを作れない。
+
+consumeとexecution attemptは互いを参照するdeferred foreign keyで結び、同じtransactionで両方を保存する。requestごとの一意制約によって二件目のattemptを作れない。notificationはrequestとkindをcreation keyにし、受理不明でも別markerを割り当てない。decision event outboxはdecisionとevent IDを一意に結び、外部notificationの状態と区別する。presentation updateは同じmessageにdispatchingまたはacceptance_unknownがある間、後続writeをpartial unique indexで拒否する。
+
+installerはopt-inで、Dispatcherの既存user_versionやruntime migrationを変更しない。clean DBと既存Dispatcher DBの両方に追加できる。schemaはtableだけでなくindex・trigger・foreign key・CHECKを含む正規定義と照合し、未知versionや欠落を自動修復しない。実runtimeへの接続前にはrelease compatibilityと単調migrationへの統合が別途必要になる。
+
+SQL制約は認証・policy判断の代わりにはならない。snapshotの完全なcodec検証、現在のbinding/visibility/authorization、request revisionとstateの遷移は後続repository/brokerが検証する。低水準のSQLを外部入力へ公開しない。
+
+## 時計と監査を結ぶtransaction
+
+`ApprovalTransaction`は同じSQLite connectionと必須providerを受ける内部境界で、公開approval APIではない。foreign key有効・synchronous FULL以上・既知schema・監査chainの完全性を確認した後、DB transactionを開始する前に保護clock markを一度だけreserveする。
+
+同じtransaction IDを使うaudit appendのSQL transaction内でclock reservation rowを保存し、同期的な業務mutationを実行する。auditの時刻は呼出側から受けず、reserve済みclock markから導出する。markが途中で進んだ場合も成功扱いせず、DB mutationをrollbackする。SQL failureではrequest・clock参照・audit rowが一緒にrollbackされるが、DB外のreservationを取消・再利用しない。
+
+DB commit後のaudit finalizeまたはread-backが失敗すると、commit済みの可能性を持つ共通エラーを返す。呼出側は戻り値がないことを未実行の証拠にせず、durable状態をread-only reconcileする。自動retryは行わない。callbackは同じconnectionの同期SQLだけに限定し、外部write・手動commit・非同期処理を禁止する。brokerの本人確認と最新preconditionの照合は、この境界を使う前後の設計・実装として残る。
+
+## transport境界
+
+`ApprovalChannel`へ渡すのはopaque request handle、presentation revision、notification attempt IDと最小表示projectionだけ。exact draftはsupervisorのcurrent visibilityを検証した後の一時DTOに限定し、audit/outboxや長期DBへ保存しない。配送結果はsent、known rejection、acceptance unknownを分ける。read-only reconcileで不明または複数一致を成功扱いしない。
+
+Slack SocketやWebAuthnのraw proofはadapter内で検証・durable inboxへ保存し、coreへはそのopaque参照を返す。handleやproof参照を利用者が提示しただけでは認可せず、adapterの認証済みprovenanceとserver-side bindingを後続brokerが照合する。このPRには実adapterを含めない。
+
+## 検証と未接続範囲
+
+一時SQLiteを使い、clean/既存schema・再open・rollback・cross-scope decision拒否・二つの独立workerのconsume競合・notification重複・受理不明のmessage fenceを検証する。保護storeはtest fixtureだけで、clock/auditのreserve・finalize失敗と応答喪失、secretを含むprovider例外のredactionを確認する。
+
+request/decision/consumeの公開repository API、暗号化payloadの移送・削除・backup除外、restore/retention、binding/policy、実clock/CAS/key provider、service・executor接続は未実装。既存のSQLite全体backupへpayload tableを追加してはいけない。WALでは複数のATTACH database全体のcommitは原子的ではないため、別payload DBへの移送を同一transactionの保証に使わない。[SQLite公式資料](https://sqlite.org/wal.html)
+
+この部分実装のtest成功を、Issue全体、実IdP/WebAuthn/browser、productionの完了証拠とは扱わない。外部実行のsafe_offは維持する。
