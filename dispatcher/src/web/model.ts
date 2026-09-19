@@ -14,6 +14,7 @@ const sessionSchema=z.strictObject({state:sessionStateSchema,cookie_key_version:
  .refine(value=>(value.state.state==="active") === (value.payload_ref!==null && value.payload_digest!==null)
   && (value.state.state!=="revoked" || (value.payload_ref===null && value.payload_digest===null)));
 export type StoredWebSession=z.infer<typeof sessionSchema>;
+export { sessionSchema as storedWebSessionSchema };
 const loginBindingSchema=z.strictObject({instance_id:id,tenant_id:id,login_ref:id,bff_generation:revision,
  cookie_key_version:revision,cookie_digest:digest,created_at:utc,expires_at:utc})
  .refine(value=>Date.parse(value.expires_at)-Date.parse(value.created_at)===300000);
