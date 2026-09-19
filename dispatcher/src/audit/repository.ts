@@ -1,5 +1,6 @@
-import Database from "better-sqlite3";
 import { assertSecurityDurability } from "./durability.js";
+import Database from "better-sqlite3";
+import { types } from "node:util";
 import { loadSecurityExtension, withMutationSqlGuard } from "./file-identity.js";
 import { verifyApprovalSchema } from "../approval/schema.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
@@ -131,23 +132,80 @@ export class AuditRepository {
     });
   }
 
+  /** Read callback shares the verified SQLite snapshot. It must use this same
+   * connection for synchronous reads only, without external side effects. */
+  readVerified<F extends () => unknown>(reader: SynchronousCallback<F>): ReturnType<F>;
+  readVerified(reader: () => unknown): unknown {
+    return guard(() => {
+      if (this.db.inTransaction) throw new AuditIntegrityError();
+      return this.db.transaction(() => {
+        this.verifyInside();
+        const result = this.readOnly(reader);
+        this.verifyInside();
+        return result;
+      })();
+    });
+  }
+
+  private readOnly<T>(reader: () => T, validate: (value: T) => void = assertSynchronousResult): T {
+    assertSynchronousCallback(reader);
+    const changes = () => (this.db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+    const before = changes();
+    const prior = this.db.pragma("query_only", { simple: true }) as number;
+    this.db.pragma("query_only = ON");
+    try {
+      if (this.db.pragma("query_only", { simple: true }) !== 1) throw new AuditIntegrityError();
+      const result = withMutationSqlGuard(this.db, reader);
+      validate(result);
+      if (!this.db.inTransaction || changes() !== before) throw new AuditIntegrityError();
+      return result;
+    } finally { this.db.pragma(prior === 1 ? "query_only = ON" : "query_only = OFF"); }
+  }
+
   /** mutation must perform synchronous SQL on this same DB connection only.
    * It must not commit, issue external writes, or return deferred work. The returned
    * value is released only after durable finalize and a complete verified reread. */
   append<F extends () => unknown>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: SynchronousCallback<F>): { record: AuditRecord; result: ReturnType<F> };
   append(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => unknown): { record: AuditRecord; result: unknown } {
     return guard(() => {
-      assertSecurityDurability(this.db);
       assertSynchronousCallback(mutation);
-      if (this.db.inTransaction) throw new AuditIntegrityError();
+      return this.appendPrepared(transactionId, keyVersion, () => ({ event, resource_digest: null, mutation }));
+    });
+  }
+
+  /** Determine the event and mutation from current state while holding the writer
+   * lock, before reserving an anchor. A normal conflict can therefore become an
+   * audited denial instead of throwing after reservation and stranding the chain.
+   * prepare has the same synchronous-read-only contract as readVerified. */
+  appendPrepared<F extends () => unknown>(transactionId: string, keyVersion: number,
+    prepare: () => { event: AuditEvent; resource_digest: string | null; mutation: SynchronousCallback<F> }): { record: AuditRecord; result: ReturnType<F> };
+  appendPrepared(transactionId: string, keyVersion: number,
+    prepare: () => { event: AuditEvent; resource_digest: string | null; mutation: () => unknown }): { record: AuditRecord; result: unknown } {
+    return guard(() => {
+      assertSecurityDurability(this.db);
+      if (this.db.inTransaction || this.db.readonly || this.db.pragma("query_only", { simple: true }) !== 0) throw new AuditIntegrityError();
       loadSecurityExtension(this.db);
       let reservation: AuditAnchor | undefined;
       const committed = this.db.transaction(() => {
         const current = this.verifyInside();
+        const { event, resource_digest, mutation } = this.readOnly(prepare, plan => {
+          // Plans stay inside this transaction. Only their explicitly named
+          // mutation may be callable; no accessor or deferred data is admitted.
+          if (plan === null || typeof plan !== "object" || types.isProxy(plan)
+            || Object.getPrototypeOf(plan) !== Object.prototype) throw new AuditIntegrityError();
+          const descriptors = Object.getOwnPropertyDescriptors(plan);
+          if (Reflect.ownKeys(descriptors).length !== 3 || !["event", "resource_digest", "mutation"].every(name => {
+            const descriptor = descriptors[name]; return descriptor !== undefined && "value" in descriptor;
+          })) throw new AuditIntegrityError();
+          assertSynchronousCallback(descriptors.mutation!.value);
+          assertSynchronousResult({ event: descriptors.event!.value, resource_digest: descriptors.resource_digest!.value });
+        });
+        assertSynchronousCallback(mutation);
         if (this.db.prepare("SELECT 1 FROM security_audit_records WHERE transaction_id=?").get(transactionId)) throw new AuditIntegrityError();
-        const record = signAuditRecord({ codec_version: 1, chain_id: current.chain_id,
-          sequence: current.sequence + 1, transaction_id: transactionId, previous_mac: current.mac,
-          key_version: keyVersion, event }, this.keys);
+        const body = { chain_id: current.chain_id, sequence: current.sequence + 1,
+          transaction_id: transactionId, previous_mac: current.mac, key_version: keyVersion, event };
+        const record = signAuditRecord(resource_digest === null ? { codec_version: 1, ...body }
+          : { codec_version: 2, resource_digest, ...body }, this.keys);
         // Verify ordering, key state and record input before the first external write.
         const existing = this.records();
         const extended = function* () { yield* existing; yield record; };

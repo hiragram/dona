@@ -55,7 +55,7 @@ export const auditEventSchema = z.strictObject({
 });
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 
-const recordBodySchema = z.strictObject({
+const recordBodyV1Schema = z.strictObject({
   codec_version: z.literal(1),
   chain_id: opaqueId,
   sequence: integer.min(1),
@@ -64,7 +64,14 @@ const recordBodySchema = z.strictObject({
   key_version: integer.min(1),
   event: auditEventSchema,
 });
-const recordSchema = recordBodySchema.extend({ record_digest: digest, mac: digest });
+const recordBodyV2Schema = recordBodyV1Schema.extend({ codec_version: z.literal(2), resource_digest: digest,
+  event: auditEventSchema.refine(event => event.resource_id !== null) });
+const recordBodySchema = z.discriminatedUnion("codec_version", [recordBodyV1Schema, recordBodyV2Schema]);
+const recordSchema = z.discriminatedUnion("codec_version", [
+  recordBodyV1Schema.extend({ record_digest: digest, mac: digest }),
+  recordBodyV2Schema.extend({ record_digest: digest, mac: digest }),
+]);
+export type AuditRecordSigningInput = z.infer<typeof recordBodySchema>;
 export type AuditRecord = z.infer<typeof recordSchema>;
 
 const checkpointBodySchema = z.strictObject({
@@ -146,7 +153,7 @@ function mac(key: AuditKey, purpose: string, body: unknown): string {
     .update(canonical(body), "utf8").digest("hex");
 }
 
-export function signAuditRecord(input: Omit<AuditRecord, "record_digest" | "mac">, lookup: AuditKeyLookup): AuditRecord {
+export function signAuditRecord(input: AuditRecordSigningInput, lookup: AuditKeyLookup): AuditRecord {
   return protect(() => {
     const body = recordBodySchema.parse(input);
     const key = checkedKey(lookup, body.key_version, body.event.occurred_at);
