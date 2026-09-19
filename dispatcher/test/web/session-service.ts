@@ -108,6 +108,14 @@ test("既存socket・公開directory・symlink parentは上書きしない", asy
   assert.ok(fs.statSync(f.socket).isSocket());
 });
 
+test("起動後にUDS権限が変化してもrepositoryへ到達させない", async t => {
+  const f = await serviceFixture(t), calls = f.anchors.calls.length;
+  fs.chmodSync(f.directory, 0o755); await assert.rejects(call(f.socket)); fs.chmodSync(f.directory, 0o700);
+  fs.chmodSync(f.socket, 0o666); await assert.rejects(call(f.socket)); fs.chmodSync(f.socket, 0o600);
+  assert.equal(f.anchors.calls.length, calls); assert.equal(f.readState().used_nonces.length, 0);
+  assert.equal(await call(f.socket), fixture.response_proof);
+});
+
 test("raw header重複・chunked body・不完全requestをboundedに拒否する", async t => {
   const f = await serviceFixture(t), before = f.anchors.calls.length;
   const socketPath = path.join(f.directory, "bounded");

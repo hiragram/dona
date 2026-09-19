@@ -45,6 +45,7 @@ async function body(request: http.IncomingMessage, expected: number): Promise<st
  * must establish protected providers/readiness before constructing the service. */
 export class WebSessionService {
   private server: http.Server | undefined;
+  private endpoint: { dev: number; ino: number } | undefined;
   private readonly sockets = new Set<net.Socket>();
   private readonly scope: ServiceScope;
   constructor(private readonly socketPath: string, scope: ServiceScope, private readonly repository: WebAuthRepository,
@@ -82,22 +83,30 @@ export class WebSessionService {
       fs.chmodSync(this.socketPath, 0o600);
       const after = fs.lstatSync(this.socketPath);
       if (after.dev !== socket.dev || after.ino !== socket.ino || (after.mode & 0o777) !== 0o600) throw new WebServiceError();
-      server.on("error", () => { for (const socket of this.sockets) socket.destroy(); });
+      this.endpoint = { dev: after.dev, ino: after.ino };
+      server.on("error", () => { void this.close(); });
     } catch { await this.close(); throw new WebServiceError(); }
   }
   async close(): Promise<void> {
-    const server = this.server; this.server = undefined; if (!server) return;
+    const server = this.server; this.server = undefined; this.endpoint = undefined; if (!server) return;
     for (const socket of this.sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+  private assertEndpoint(): void {
+    privateParent(this.socketPath); const current = fs.lstatSync(this.socketPath);
+    if (!this.endpoint || !current.isSocket() || current.uid !== process.getuid?.() || current.nlink !== 1
+      || (current.mode & 0o777) !== 0o600 || current.dev !== this.endpoint.dev || current.ino !== this.endpoint.ino) throw new WebServiceError();
   }
   private async handle(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
     const started = performance.now();
     try {
+      this.assertEndpoint();
       const headers = requestHeaders(request), raw = await body(request, headers.length);
       if (performance.now() - started >= this.deadlineMs || request.socket.destroyed || response.destroyed) throw new WebServiceError();
       verifyServiceRequest(headers.proof, raw, this.scope, this.credentials, this.now());
       const input = parseSessionServiceInput(raw);
       if (performance.now() - started >= this.deadlineMs || request.socket.destroyed || response.destroyed) throw new WebServiceError();
+      this.assertEndpoint();
       const result = this.repository.verifySessionIngress("web_service_" + randomBytes(16).toString("hex"),
         input.context, input.method, input.target, Buffer.alloc(0));
       let reply: SessionServiceResult;
@@ -106,6 +115,7 @@ export class WebSessionService {
       else throw new WebServiceError();
       if (performance.now() - started >= this.deadlineMs || response.destroyed) throw new WebServiceError();
       const proof = signServiceResponse(headers.proof, raw, reply, this.scope, this.credentials, this.now());
+      this.assertEndpoint();
       response.writeHead(200, { "content-type": "application/vnd.dona.web-session-response", "content-length": String(Buffer.byteLength(proof)), connection: "close" });
       response.end(proof);
     } catch { response.destroy(); }
