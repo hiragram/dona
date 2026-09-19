@@ -9,9 +9,10 @@ export class SecurityCoordinationError extends Error {
   constructor() { super("security_transaction_coordination_failed"); this.name = "SecurityCoordinationError"; }
 }
 
-function privateRegular(filename: string): void {
+function privateRegular(filename: string, singleLink = false): void {
   const info = fs.lstatSync(filename);
-  if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new SecurityCoordinationError();
+  if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0
+    || (singleLink && info.nlink !== 1)) throw new SecurityCoordinationError();
 }
 
 /** Publish an owner-only empty file without ever opening/closing an extra fd on
@@ -42,7 +43,8 @@ export function withSecurityTransactionLock<T>(business: Database.Database, work
   try {
     if (!business.open || business.memory || business.readonly || business.inTransaction || !path.isAbsolute(business.name)) throw new SecurityCoordinationError();
     const target = fs.realpathSync(business.name);
-    privateRegular(target);
+    // Hard-linked business DB paths could select different mutex/WAL files.
+    privateRegular(target, true);
     const directory = fs.statSync(path.dirname(target));
     if (directory.uid !== process.getuid?.() || (directory.mode & 0o077) !== 0) throw new SecurityCoordinationError();
     const filename = target + ".security-lock.sqlite";
@@ -53,7 +55,7 @@ export function withSecurityTransactionLock<T>(business: Database.Database, work
     const connection = mutex;
     const targetHash = createHash("sha256").update(target).digest("hex");
     return connection.transaction(() => {
-      const objects = connection.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all() as Array<{ type: string; name: string; sql: string }>;
+      const objects = connection.prepare("SELECT type,name,sql FROM sqlite_master WHERE substr(name,1,7)<>'sqlite_'").all() as Array<{ type: string; name: string; sql: string }>;
       if (objects.length === 0) {
         connection.exec(ddl);
         connection.prepare("INSERT INTO security_transaction_mutex VALUES (1,?)").run(targetHash);

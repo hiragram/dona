@@ -406,6 +406,16 @@ test("共通lockは再入・不正権限・別用途fileを拒否し、既存dat
     withSecurityTransactionLock(db, () => "next"),
     "next",
   );
+  const alias = filename + ".alias";
+  fs.linkSync(filename, alias);
+  try {
+    assert.throws(
+      () => withSecurityTransactionLock(db, () => null),
+      SecurityCoordinationError,
+    );
+  } finally {
+    fs.unlinkSync(alias);
+  }
   fs.chmodSync(filename, 0o640);
   assert.throws(
     () => withSecurityTransactionLock(db, () => null),
@@ -416,7 +426,7 @@ test("共通lockは再入・不正権限・別用途fileを拒否し、既存dat
   const lockPath = other.filename + ".security-lock.sqlite";
   const foreign = new Database(lockPath);
   foreign.exec(
-    "CREATE TABLE unrelated (id TEXT); INSERT INTO unrelated VALUES ('original')",
+    "CREATE TABLE sqliteXunrelated (id TEXT); INSERT INTO sqliteXunrelated VALUES ('original')",
   );
   foreign.close();
   fs.chmodSync(lockPath, 0o600);
@@ -426,7 +436,7 @@ test("共通lockは再入・不正権限・別用途fileを拒否し、既存dat
   );
   const reopened = new Database(lockPath, { readonly: true });
   try {
-    assert.deepEqual(reopened.prepare("SELECT * FROM unrelated").all(), [
+    assert.deepEqual(reopened.prepare("SELECT * FROM sqliteXunrelated").all(), [
       { id: "original" },
     ]);
   } finally {
