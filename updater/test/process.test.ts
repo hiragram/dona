@@ -48,7 +48,21 @@ test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit 
   assert.equal(result.output_truncated, true);
   assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
-  assert.equal(Buffer.byteLength(result.stdout), 1_024);
+  assert.equal(Buffer.byteLength(result.stdout), 512);
+});
+
+test("ProcessRunner reserves stdout capacity when control stderr reaches its quota", async () => {
+  const script = `
+    process.stderr.write('c'.repeat(4096));
+    process.stdout.write('assertion failed');
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 1_000,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(Buffer.byteLength(result.stderr), 512);
+  assert.equal(result.stdout, "assertion failed");
+  assert.equal(result.output_truncated, true);
 });
 
 test("ProcessRunner prioritizes the unfinished case and cleanup result on timeout", async () => {
@@ -160,12 +174,12 @@ test("ProcessRunner binds the next file nonce after the previous file finishes",
 });
 
 test("ProcessRunner does not report truncation below the configured output limit", async () => {
-  const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stdout.write('x'.repeat(513))"], {
+  const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stdout.write('x'.repeat(511))"], {
     timeoutMs: 1_000,
     outputLimitBytes: 1_024,
   });
   assert.equal(result.output_truncated, false);
-  assert.equal(Buffer.byteLength(result.stdout), 513);
+  assert.equal(Buffer.byteLength(result.stdout), 511);
 });
 
 test("ProcessRunner keeps bounded process metrics and load without raw process data", async () => {

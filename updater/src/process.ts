@@ -36,7 +36,7 @@ export class ProcessRunner {
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
-      let capturedBytes = 0;
+      const streamLimitBytes = Math.floor(options.outputLimitBytes / 2);
       let checkpointBuffer = "";
       let outputCheckpoint: string | undefined;
       let checkpointNonce: string | undefined;
@@ -109,14 +109,13 @@ export class ProcessRunner {
         inspect: boolean,
       ): Buffer<ArrayBufferLike> => {
         if (inspect) inspectCheckpoints(chunk);
-        if (capturedBytes >= options.outputLimitBytes) {
+        if (current.length >= streamLimitBytes) {
           truncated = true;
           return current;
         }
-        const remaining = options.outputLimitBytes - capturedBytes;
+        const remaining = streamLimitBytes - current.length;
         if (chunk.length > remaining) truncated = true;
         const captured = chunk.subarray(0, remaining);
-        capturedBytes += captured.length;
         return Buffer.concat([current, captured]);
       };
       child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk, false)));

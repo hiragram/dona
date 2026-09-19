@@ -74,8 +74,10 @@ describe("job resource config", () => {
     assert.match(runner, /test-reporter-destination=stderr/);
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
     assert.match(reporter, /event\.type === "test:dequeue"/);
-    assert.match(reporter, /event\.type !== "test:complete"/);
-    assert.match(reporter, /identitiesByLocation/);
+    assert.match(reporter, /event\.type === "test:complete"/);
+    assert.match(reporter, /identitiesByExecution/);
+    assert.match(reporter, /event\.data\.testNumber/);
+    assert.match(reporter, /"test:pass"/);
     assert.match(reporter, /path\.isAbsolute\(event\.data\.name\)/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
     assert.match(reporter, /"case-finish"/);
@@ -164,8 +166,7 @@ describe("job resource config", () => {
     fs.writeFileSync(fixture, [
       'import { describe, test } from "node:test";',
       'describe("parallel", { concurrency: true }, () => {',
-      '  test("duplicate", async () => new Promise(() => {}));',
-      '  test("duplicate", async () => new Promise((resolve) => setTimeout(resolve, 50)));',
+      '  for (const index of [0, 1]) test("duplicate", async () => index === 0 ? new Promise(() => {}) : new Promise((resolve) => setTimeout(resolve, 50)));',
       '});',
     ].join("\n"));
     const nonce = "0123456789abcdef0123456789abcdef";
