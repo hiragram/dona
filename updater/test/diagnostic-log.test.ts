@@ -86,6 +86,16 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     const longDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[1]!, 16_384).detail_tail);
     assert.equal(longDetail.includes("private.example"), false);
     assert.equal(longDetail.includes("secret-value"), false);
+
+    const quotedCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-test" });
+    quotedCapture.write("stderr", Buffer.from("password=\""));
+    quotedCapture.write("stderr", Buffer.from("quoted-secret".repeat(500)));
+    quotedCapture.write("stderr", Buffer.from("\" visible-after-secret"));
+    quotedCapture.finish(true);
+    const quotedDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[2]!, 16_384).detail_tail);
+    assert.equal(quotedDetail.includes("quoted-secret"), false);
+    assert.match(quotedDetail, /REDACTED_STREAM/);
+    assert.match(quotedDetail, /visible-after-secret/);
   } finally {
     f.database.close();
   }
@@ -240,6 +250,54 @@ test("write, atomic finalize, and read faults retain the command failure state",
   } finally {
     fsSync.writeSync = originalWrite;
     fsSync.readSync = originalRead;
+    f.database.close();
+  }
+});
+
+test("successful command keeps a recoverable row when partial-file cleanup fails", async () => {
+  const f = await fixture();
+  const originalUnlink = fsSync.unlinkSync;
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test-cleanup" });
+    capture.write("stdout", Buffer.from("successful output"));
+    fsSync.unlinkSync = ((file) => {
+      if (String(file).endsWith(".part")) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      return originalUnlink(file);
+    }) as typeof fsSync.unlinkSync;
+    assert.equal(capture.finish(false), undefined);
+    fsSync.unlinkSync = originalUnlink;
+
+    const pending = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(pending.capture_state, "capturing");
+    assert.equal((await fs.stat(path.join(f.policy.control_root, "diagnostics", "logs", `${pending.log_id}.part`))).isFile(), true);
+
+    f.store.recoverInterruptedCaptures(new Date("2026-09-19T02:00:00.000Z"));
+    const recovered = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(recovered.capture_state, "write_failed");
+    assert.equal(recovered.error_code, "diagnostic_capture_interrupted");
+    assert.equal(recovered.relative_ref, null);
+  } finally {
+    fsSync.unlinkSync = originalUnlink;
+    f.database.close();
+  }
+});
+
+test("read projection verifies the opened descriptor still names the checked inode", async () => {
+  const f = await fixture();
+  const originalFstat = fsSync.fstatSync;
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test-read-race" });
+    capture.write("stderr", Buffer.from("failure"));
+    capture.finish(true);
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    fsSync.fstatSync = ((descriptor: number) => {
+      const stats = originalFstat(descriptor);
+      Object.defineProperty(stats, "ino", { value: stats.ino + 1 });
+      return stats;
+    }) as typeof fsSync.fstatSync;
+    assert.equal(f.store.project(row).capture_state, "read_error");
+  } finally {
+    fsSync.fstatSync = originalFstat;
     f.database.close();
   }
 });

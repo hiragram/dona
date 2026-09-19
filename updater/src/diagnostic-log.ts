@@ -36,6 +36,7 @@ class StreamingRedactor {
   private readonly decoder = new StringDecoder("utf8");
   private pending = "";
   private droppingSensitive = false;
+  private droppingQuote: "\"" | "'" | undefined;
 
   write(chunk: Buffer): string {
     this.pending += this.decoder.write(chunk);
@@ -51,14 +52,19 @@ class StreamingRedactor {
     let output = "";
     while (this.pending.length > 0) {
       if (this.droppingSensitive) {
-        const boundary = this.pending.search(/[\s"'<>]/);
+        const boundary = this.droppingQuote
+          ? this.pending.indexOf(this.droppingQuote)
+          : this.pending.search(/[\s"'<>]/);
         if (boundary < 0) {
-          if (final) this.pending = "";
+          // The whole carried value is sensitive. Drop it immediately so an
+          // unterminated quoted value cannot grow memory without bound.
+          this.pending = "";
           return output;
         }
         output += "[REDACTED_STREAM]";
-        this.pending = this.pending.slice(boundary);
+        this.pending = this.pending.slice(boundary + (this.droppingQuote ? 1 : 0));
         this.droppingSensitive = false;
+        this.droppingQuote = undefined;
         continue;
       }
       if (final) {
@@ -70,15 +76,13 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const assignment = /(?:^|\s)(?:authorization|token|secret|password)\s*[:=]?\s*$/i.exec(safe);
+        const assignment = /(?:^|\s)(?:authorization|token|secret|password)\s*[:=]\s*(["']?)$/i.exec(safe);
         if (assignment?.index !== undefined) {
           output += redactText(safe.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
-          this.pending = safe.slice(assignment.index) + this.pending.slice(lastBoundary + 1);
-          if (this.pending.length <= maxCarryCharacters) return output;
-          output += "[REDACTED_STREAM]";
-          this.pending = "";
+          this.pending = this.pending.slice(lastBoundary + 1);
           this.droppingSensitive = true;
-          return output;
+          this.droppingQuote = assignment[1] === "\"" || assignment[1] === "'" ? assignment[1] : undefined;
+          continue;
         }
         output += redactText(safe, Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(lastBoundary + 1);
@@ -244,8 +248,11 @@ export class DiagnosticLogStore {
         append("stderr", redactors.stderr.finish());
         if (!commandFailed) {
           try { fs.closeSync(descriptor); } catch { /* best effort */ }
-          try { fs.unlinkSync(temporary); } catch { /* best effort */ }
-          try { this.index?.discardDiagnosticLog(logId); } catch { /* diagnostic cleanup is subordinate to command success */ }
+          let removed = false;
+          try { fs.unlinkSync(temporary); removed = true; } catch { /* preserve the index row for singleton recovery */ }
+          if (removed) {
+            try { this.index?.discardDiagnosticLog(logId); } catch { /* diagnostic cleanup is subordinate to command success */ }
+          }
           return undefined;
         }
         let errorCode: string | null = null;
@@ -316,6 +323,11 @@ export class DiagnosticLogStore {
       const start = Math.max(0, stats.size - previewLimitBytes);
       const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
+        const opened = fs.fstatSync(descriptor);
+        if (!opened.isFile() || opened.nlink !== stats.nlink || (opened.mode & 0o7777) !== (stats.mode & 0o7777) ||
+          opened.uid !== stats.uid || opened.dev !== stats.dev || opened.ino !== stats.ino || opened.size !== stats.size) {
+          throw new Error("diagnostic_open_identity_mismatch");
+        }
         const buffer = Buffer.alloc(stats.size - start);
         fs.readSync(descriptor, buffer, 0, buffer.length, start);
         return { ...common, capture_state: row.capture_state, detail_tail: buffer.toString("utf8") };
