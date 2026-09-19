@@ -22,7 +22,9 @@ describe("job resource config", () => {
     assert.throws(() => execFile("/bin/true", {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     const undefinedCallbackChild = execFile("/usr/bin/true", {}, undefined as never);
     const nullCallbackChild = execFile(process.execPath, ["-e", ""], {}, null as never);
-    await Promise.all([undefinedCallbackChild, nullCallbackChild].map((candidate) => new Promise<void>((resolve, reject) => {
+    const undefinedArgsChild = execFile("/usr/bin/true", undefined as never, { env: {} });
+    const nullArgsChild = execFile("/usr/bin/true", null as never, { env: {} });
+    await Promise.all([undefinedCallbackChild, nullCallbackChild, undefinedArgsChild, nullArgsChild].map((candidate) => new Promise<void>((resolve, reject) => {
       candidate.once("error", reject);
       candidate.once("close", () => resolve());
     })));

@@ -142,7 +142,7 @@ const originalExecFile = childProcess.execFile;
 childProcess.execFile = function instrumentedExecFile(file, args, options, callback) {
   const started = performance.now();
   const processClass = classify(file);
-  const hasExplicitCallback = arguments.length >= 4 || (!Array.isArray(args) && arguments.length >= 3);
+  const hasExplicitCallback = arguments.length >= 4 || (args != null && !Array.isArray(args) && arguments.length >= 3);
   const explicitCallback = arguments.length >= 4 ? callback : options;
   const [actualArgs, normalizedOptions] = normalizeArgs(args, options);
   const actualOptions = typeof normalizedOptions === "function" ? undefined : normalizedOptions;
