@@ -6,6 +6,7 @@ import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../a
 import { assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema } from "./schema.js";
+import { applyClockBoundMutation } from "./clock-provenance.js";
 
 export interface ApprovalTransactionProviders {
   clock: ProtectedClockSource;
@@ -63,8 +64,7 @@ export class ApprovalTransaction {
       return this.audit.append(transactionId, this.providers.auditSigningKeyVersion,
         { ...event, occurred_at: mark.effective_utc }, () => {
           requireCurrent(); verifyApprovalSchema(this.db);
-          this.db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run(transactionId, JSON.stringify(mark));
-          const result = mutation(mark);
+          const result = applyClockBoundMutation(this.db, mark, () => mutation(mark));
           requireCurrent();
           verifyApprovalSchema(this.db);
           return result;

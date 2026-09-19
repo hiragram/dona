@@ -198,6 +198,55 @@ function count(db: Database.Database, table: string) {
   return (db.prepare(`SELECT count(*) n FROM ${table}`).get() as { n: number })
     .n;
 }
+test("callbackはprepare済みSQLでも時計予約を捏造できずguardを解除できない", t => {
+  const {db,transaction,anchors}=setup(t);
+  const forged=db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)");
+  transaction.run("tx1",event,()=>{
+    assert.throws(()=>db.prepare("SELECT dona_mutation_guard(?,3)").get(Buffer.alloc(32)),/security_sql_guard_unverified/);
+    assert.throws(()=>forged.run("fake",JSON.stringify({codec_version:1,transaction_id:"fake"})));
+    assert.equal(count(db,"approval_clock_reservations"),1);
+    return null;
+  });
+  assert.equal(anchors.value.sequence,1);
+  assert.equal(db.prepare("SELECT 1 FROM approval_clock_reservations WHERE transaction_id='fake'").get(),undefined);
+});
+
+test("全ledgerの新規rowは過去の時計予約を参照してcommitできない", t => {
+  for(const target of ["requests","decisions","consumes","execution_attempts","notifications","presentation_updates"]){
+    const {db,transaction,anchors}=setup(t);
+    const decision=(clock:string)=>db.prepare("INSERT INTO approval_decisions VALUES ('d1','r1','i1','w1',?,'b1',1,'approve','supervisor','actor1',1,?,?)").run("a".repeat(64),at,clock);
+    const notification=(clock:string)=>db.prepare("INSERT INTO approval_notifications VALUES ('n1','r1','approval_card','sent',1,1,?,1,1,'m1',?)").run("a".repeat(64),clock);
+    transaction.run("old",event,mark=>{
+      if(target!=="requests")insertRequest(db,mark.transaction_id);
+      if(target==="consumes" || target==="execution_attempts")decision(mark.transaction_id);
+      if(target==="presentation_updates")notification(mark.transaction_id);
+    });
+    const tables=["approval_clock_reservations","security_audit_records","approval_requests","approval_decisions","approval_consumes","approval_execution_attempts","approval_notifications","approval_presentation_updates"];
+    const before=tables.map(table=>db.prepare(`SELECT * FROM ${table}`).all());
+    assert.throws(()=>transaction.run("current",event,mark=>{
+      if(target==="requests")insertRequest(db,"old");
+      else if(target==="decisions")decision("old");
+      else if(target==="notifications")notification("old");
+      else if(target==="presentation_updates")db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','m1',2,'pending',0,'old')");
+      else {
+        db.prepare("INSERT INTO approval_consumes VALUES ('c1','r1','d1','approve','a1',?,?)").run(at,target==="consumes"?"old":mark.transaction_id);
+        db.prepare("INSERT INTO approval_execution_attempts VALUES ('a1','r1','c1','claimed',1,?,?,?,NULL,NULL,?)")
+          .run(at,"2026-09-19T00:05:00.000Z","2026-09-20T00:00:00.000Z",target==="execution_attempts"?"old":mark.transaction_id);
+      }
+    }),ApprovalTransactionError);
+    assert.deepEqual(tables.map(table=>db.prepare(`SELECT * FROM ${table}`).all()),before);
+    assert.equal(anchors.value.pending_transaction_id,"current");
+  }
+});
+
+test("既存ledger更新は作成時の時計参照を保ったまま新しい監査に結ぶ", t => {
+  const {db,transaction,audit}=setup(t);
+  transaction.run("old",event,mark=>{insertRequest(db,mark.transaction_id);});
+  transaction.run("current",event,()=>{db.exec("UPDATE approval_requests SET revision=2 WHERE request_id='r1'");});
+  assert.deepEqual(db.prepare("SELECT revision,clock_transaction_id FROM approval_requests").get(),{revision:2,clock_transaction_id:"old"});
+  assert.equal(count(db,"approval_clock_reservations"),2);
+  assert.equal(audit.verify().sequence,2);
+});
 test("clock reservation・request・auditを同じtransactionへ結び、再open後も保持する", (t) => {
   const { db, filename, anchors, marks, transaction } = setup(t);
   const result = transaction.run("tx1", event, (mark) => {

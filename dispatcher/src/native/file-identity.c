@@ -8,16 +8,18 @@
 #include <errno.h>
 SQLITE_EXTENSION_INIT1
 
-typedef struct { sqlite3 *database; int active; unsigned char token[32]; } mutation_guard;
+typedef struct { sqlite3 *database; int active; int clock_read_only; unsigned char token[32]; } mutation_guard;
 
 static int authorize_mutation(void *data, int action, const char *first,
   const char *second, const char *database, const char *source) {
-  (void)data; (void)source;
+  mutation_guard *guard = data;
+  (void)source;
   switch (action) {
     case SQLITE_READ: case SQLITE_SELECT: case SQLITE_RECURSIVE: return SQLITE_OK;
     case SQLITE_INSERT: case SQLITE_UPDATE: case SQLITE_DELETE:
       if (!database || strcmp(database, "main") || !first ||
         !strncmp(first, "sqlite_", 7) || !strncmp(first, "security_audit_", 15)) return SQLITE_DENY;
+      if (guard->clock_read_only && !sqlite3_stricmp(first, "approval_clock_reservations")) return SQLITE_DENY;
       return SQLITE_OK;
     case SQLITE_FUNCTION:
       return second && sqlite3_stricmp(second, "load_extension") && sqlite3_stricmp(second, "dona_publish_mutex") ? SQLITE_OK : SQLITE_DENY;
@@ -65,12 +67,21 @@ static void control_mutation(sqlite3_context *context, int argc, sqlite3_value *
     memcpy(guard->token, token, 32);
     if (sqlite3_set_authorizer(guard->database, authorize_mutation, guard) != SQLITE_OK) goto rejected;
     guard->active = 1;
-  } else if (enabled == 0 && guard->active) {
+  } else if ((enabled == 0 || enabled == 2 || enabled == 3) && guard->active) {
     unsigned int difference = 0;
     for (int i = 0; i < 32; i++) difference |= guard->token[i] ^ token[i];
-    if (difference || sqlite3_set_authorizer(guard->database, 0, 0) != SQLITE_OK) goto rejected;
-    guard->active = 0;
-    memset(guard->token, 0, 32);
+    if (difference) goto rejected;
+    if (enabled == 0) {
+      if (sqlite3_set_authorizer(guard->database, 0, 0) != SQLITE_OK) goto rejected;
+      guard->active = 0;
+      guard->clock_read_only = 0;
+      memset(guard->token, 0, 32);
+    } else {
+      if ((enabled == 2 && guard->clock_read_only) || (enabled == 3 && !guard->clock_read_only)) goto rejected;
+      /* Reinstalling expires statements prepared before the stricter phase. */
+      if (sqlite3_set_authorizer(guard->database, authorize_mutation, guard) != SQLITE_OK) goto rejected;
+      guard->clock_read_only = enabled == 2;
+    }
   } else goto rejected;
   sqlite3_result_int(context, 1);
   return;

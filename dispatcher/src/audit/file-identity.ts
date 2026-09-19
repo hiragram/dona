@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 
 const loaded = new WeakSet<Database.Database>();
+const mutationTokens = new WeakMap<Database.Database, Buffer>();
 const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 /** Fixed, locally built extension only. Neither SQL nor an external request can
@@ -44,6 +45,18 @@ export function withMutationSqlGuard<T>(db: Database.Database, callback: () => T
   const token = randomBytes(32);
   const control = db.prepare("SELECT dona_mutation_guard(?,CAST(? AS INTEGER)) AS ok");
   control.get(token, 1);
+  mutationTokens.set(db, token);
   try { return callback(); }
-  finally { try { control.get(token, 0); } finally { token.fill(0); } }
+  finally { try { control.get(token, 0); } finally { mutationTokens.delete(db); token.fill(0); } }
+}
+
+/** The framework inserts its verified reservation before entering this phase.
+ * User mutation SQL cannot add or change clock rows, including prepared SQL. */
+export function withClockRowsReadOnly<T>(db: Database.Database, callback: () => T): T {
+  const token = mutationTokens.get(db);
+  if (!token) throw new Error("security_sql_guard_unverified");
+  const control = db.prepare("SELECT dona_mutation_guard(?,CAST(? AS INTEGER)) AS ok");
+  control.get(token, 2);
+  try { return callback(); }
+  finally { control.get(token, 3); }
 }
