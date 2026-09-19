@@ -1,0 +1,24 @@
+name: Add new issues to Dona Project
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: add-issue-to-dona-project-${{ github.event.issue.node_id }}
+
+jobs:
+  add-to-project:
+    name: Add issue to Dona Project
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Add issue to project
+        uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
+        with:
+          project-url: https://github.com/users/hiragram/projects/1
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}

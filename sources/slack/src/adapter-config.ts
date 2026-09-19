@@ -15,6 +15,22 @@ export interface SlackAdapterConfig {
   socketModeEnabled: true;
   logLevel: SlackLogLevel;
   buildSha: string;
+  appSchemaWrite: 2 | 3;
+  appSchemaReadMax: 2 | 3;
+}
+
+function appSchemaCompatibility(env: NodeJS.ProcessEnv): { readMax: 2 | 3; write: 2 | 3 } {
+  const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
+  if (!manifestPath) return { readMax: 3, write: 3 };
+  const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as {
+    compatibility?: { app_schema_read_max?: unknown; app_schema_write?: unknown };
+  };
+  const readMax = parsed.compatibility?.app_schema_read_max;
+  const write = parsed.compatibility?.app_schema_write;
+  if ((readMax !== 2 && readMax !== 3) || (write !== 2 && write !== 3) || write > readMax) {
+    throw new Error("DONA release manifest schema compatibility is invalid");
+  }
+  return { readMax, write };
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -48,6 +64,7 @@ function buildSha(env: NodeJS.ProcessEnv): string {
 export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAdapterConfig {
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
   const existing = loadRuntimeConfig(env);
+  const schemaCompatibility = appSchemaCompatibility(env);
   return {
     workspaces: existing.workspaces,
     dispatcherSocketPath: expandHome(
@@ -69,5 +86,7 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     socketModeEnabled: socketModeEnabled(env.SLACK_SOCKET_MODE_ENABLED),
     logLevel: existing.logLevel,
     buildSha: buildSha(env),
+    appSchemaWrite: schemaCompatibility.write,
+    appSchemaReadMax: schemaCompatibility.readMax,
   };
 }

@@ -14,6 +14,7 @@ import { UpdaterClientError } from "./updater-client.js";
 import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
 import { ScheduleError } from "./scheduler/errors.js";
 import {
+  jobKeyPattern,
   parseCancelJobRequest,
   parseCreateJobRequest,
   parseEventEnvelope,
@@ -115,6 +116,11 @@ export interface ApiSchedulerState {
   operationalState(): { running: boolean; last_purge_at: string | null };
 }
 
+export interface ApiJobProgressResolver {
+  resolveDelivery(progressId: string, deliveryToken: string): Record<string, string> | undefined;
+  deliveryDeferred?(progressId: string, deliveryToken: string): boolean;
+}
+
 export class DispatcherApi {
   private server: http.Server | undefined;
   private shuttingDown = false;
@@ -133,10 +139,13 @@ export class DispatcherApi {
     private readonly updates?: ApiUpdateClient,
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
+    private jobProgress?: ApiJobProgressResolver,
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
+
+  disableJobProgress(): void { this.jobProgress = undefined; }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
@@ -222,26 +231,64 @@ export class DispatcherApi {
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
         const health = this.readiness();
+        const appSchema = this.database.schemaCompatibility();
         sendJson(response, health.ready ? 200 : 503, {
           schema_version: 1,
           status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
-          app_schema: dispatcherSchemaCompatibility.write,
-          app_schema_read_min: dispatcherSchemaCompatibility.read_min,
-          app_schema_read_max: dispatcherSchemaCompatibility.read_max,
-          app_schema_write: dispatcherSchemaCompatibility.write,
+          app_schema: appSchema.actual,
+          app_schema_read_min: appSchema.read_min,
+          app_schema_read_max: appSchema.read_max,
+          app_schema_write: appSchema.write,
           config: 1,
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;
       }
+      if (request.method === "GET" && url.pathname === "/v1/internal/job-progress") {
+        if (!(await this.authorizedUpdateRequest(request))) throw new ApiRequestError(403, "forbidden", "Internal authentication failed");
+        const progressId = url.searchParams.get("progress_id") ?? "";
+        const deliveryToken = url.searchParams.get("delivery_token") ?? "";
+        const delivery = this.jobProgress?.resolveDelivery(progressId, deliveryToken);
+        if (!delivery && this.jobProgress?.deliveryDeferred?.(progressId, deliveryToken)) throw new ApiRequestError(425, "progress_deferred", "Progress delivery is waiting for the group seal");
+        if (!delivery) throw new ApiRequestError(404, "progress_not_deliverable", "Progress is not pending delivery");
+        sendJson(response, 200, { schema_version: 1, ...delivery });
+        return;
+      }
       if (request.method === "GET" && /^\/v1\/events\/[^/]+\/terminal$/.test(url.pathname)) {
         const eventId = decodeURIComponent(url.pathname.split("/")[3]!);
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(eventId)) throw new ApiRequestError(400, "invalid_request", "event_id is invalid");
         sendJson(response, 200, { schema_version: 1, event_id: eventId, terminal: this.database.isEventCompleted(eventId) });
+        return;
+      }
+      if (request.method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(url.pathname)) {
+        const sourceEventId = decodeURIComponent(url.pathname.split("/")[3]!);
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        const requestedJobKey = url.searchParams.get("job_key");
+        const jobKey = requestedJobKey?.trim();
+        if (jobKey !== undefined && !jobKeyPattern.test(jobKey)) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is invalid");
+        }
+        const canonicalPayloadSha256 = url.searchParams.get("canonical_payload_sha256") ?? undefined;
+        if (canonicalPayloadSha256 !== undefined && !/^[0-9a-f]{64}$/.test(canonicalPayloadSha256)) {
+          throw new ApiRequestError(400, "invalid_request", "canonical_payload_sha256 is invalid");
+        }
+        if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
+          throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
+        }
+        sendJson(response, 200, {
+          schema_version: 1,
+          source_event_id: sourceEventId,
+          jobs: this.database.listEventJobs(sourceEventId, jobKey),
+          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
+            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
+            : {}),
+        });
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/update-safety") {
@@ -567,12 +614,23 @@ export class DispatcherApi {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
     }
     if (request.method === "POST" && url.pathname === "/v1/jobs") {
-      const input = parseCreateJobRequest(await this.readJson(request));
+      const input = parseCreateJobRequest(await this.readJson(request), true);
       let result;
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
-        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
+        if (error instanceof JobCreationError) {
+          if (error.limitDetails) {
+            this.logger.warn("Job creation rejected by resource limit", {
+              error_code: error.code,
+              resource: error.limitDetails.resource,
+              current_value: error.limitDetails.current,
+              attempted_value: error.limitDetails.attempted,
+              limit_value: error.limitDetails.maximum,
+            });
+          }
+          throw new ApiRequestError(409, error.code, error.message, error.limitDetails);
+        }
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
       }
       this.jobs.wake();
@@ -612,10 +670,18 @@ export class DispatcherApi {
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
-      const sourceEventId=url.searchParams.get("source_event_id");
-      if(!sourceEventId) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
-      try { this.database.assertJobSourceMatchesThread(jobId,sourceEventId); }
-      catch { throw new ApiRequestError(403,"owner_mismatch","Job does not belong to the event owner"); }
+      const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId === null && this.database.getJob(jobId)?.source === "dona_schedule") throw new ApiRequestError(400,"invalid_request","source_event_id is required");
+      if (sourceEventId !== null) {
+        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
+        }
+        try {
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
+        } catch {
+          throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
+        }
+      }
       sendJson(response, 200, { schema_version: 1, job });
       return;
     }

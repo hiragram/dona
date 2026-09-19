@@ -11,6 +11,7 @@ import type {
   CompletionDeliveryResult,
   CompletionLookupResult,
   ReleaseManifest,
+  SchemaRollout,
   UpdateRow,
 } from "./types.js";
 
@@ -25,6 +26,7 @@ export interface GitPort {
     target_reachable: boolean;
     ci_trusted: boolean;
     target_compatibility: Compatibility;
+    target_rollout: SchemaRollout;
   }>;
   stage(targetSha: string, destination: string): Promise<void>;
   verifyStaged(destination: string, targetSha: string): Promise<void>;
@@ -59,6 +61,9 @@ export interface RuntimePort {
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   stopSlack(): Promise<CommandResult>;
   stopDispatcher(): Promise<CommandResult>;
+  migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;
+  appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }>;
+  schemaMigrationCapability(capability: string): Promise<{ ready: boolean; build_sha: string | null }>;
   startDispatcher(): Promise<CommandResult>;
   startSlack(): Promise<CommandResult>;
   waitForMainAgentIdle(): Promise<MainAgentObservation>;

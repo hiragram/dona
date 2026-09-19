@@ -133,10 +133,12 @@ export class SlackSocketAdapter {
     return { quiescing: this.stopping, drained: this.stopping && unsafe.length === 0, in_flight: this.inFlight.size, unsafe_states: unsafe };
   }
 
-  trackOperation<T>(operation: Promise<T>): Promise<T> {
-    const tracked = operation.then(() => undefined, () => undefined);
-    this.inFlight.add(tracked);
-    void tracked.finally(() => this.inFlight.delete(tracked));
+  trackOperation<T>(operation: Promise<T>): Promise<T> { return this.trackExternal(operation); }
+
+  trackExternal<T>(operation: Promise<T>): Promise<T> {
+    const drain = operation.then(() => undefined, () => undefined);
+    this.inFlight.add(drain);
+    void drain.finally(() => this.inFlight.delete(drain));
     return operation;
   }
 

@@ -14,6 +14,8 @@ import {
   type UpdateNotificationPort,
 } from "./update-notification.js";
 import type { SlackReminderConnector } from "./reminder-connector.js";
+import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
+import { SlackApiError } from "./slack-api.js";
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -60,11 +62,14 @@ export interface AdapterHealthState {
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
   trackOperation?<T>(operation: Promise<T>): Promise<T>;
+  trackExternal?<T>(operation: Promise<T>): Promise<T>;
 }
 
 export class SlackHealthServer {
   private server: http.Server | undefined;
   private quiesceOperationId: string | undefined;
+  private readonly progressOperations = new Set<Promise<unknown>>();
+  private progressDrains = 0;
 
   constructor(
     private readonly socketPath: string,
@@ -75,6 +80,9 @@ export class SlackHealthServer {
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
     private readonly reminders?: Pick<SlackReminderConnector, "deliver">,
+    private readonly jobProgress?: SlackJobProgressReporter,
+    private readonly appSchemaWrite: 2 | 3 = 3,
+    private readonly appSchemaReadMax: 2 | 3 = 3,
   ) {}
 
   async start(): Promise<void> {
@@ -208,6 +216,65 @@ export class SlackHealthServer {
       } catch { send(response,409,{schema_version:1,error:{code:"schedule_access_not_confirmed",message:"Current Slack access could not be confirmed"}}); }
       return;
     }
+    if (method === "POST" && pathname === "/v1/internal/job-progress") {
+      if (!this.jobProgress || !this.updateInternalTokenPath) {
+        send(response, 503, { schema_version: 1, error: { code: "reporter_unavailable" } });
+        return;
+      }
+      if(this.progressDrains>0){send(response,429,{schema_version:1,error:{code:"progress_draining"}});return;}
+      let finishAdmission!:()=>void;
+      const admission=new Promise<void>((resolve)=>{finishAdmission=resolve;});
+      this.progressOperations.add(admission);
+      try {
+      if (!(await this.authorized(request))) {
+        send(response, 403, { schema_version: 1, error: { code: "forbidden" } });
+        return;
+      }
+      if (this.adapter.isStopping()) {
+        send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
+        return;
+      }
+      try {
+        const input = parseJobProgressRequest(await this.readJson(request));
+        if (this.adapter.isStopping()) {
+          send(response, 429, { schema_version: 1, error: { code: "shutting_down" } });
+          return;
+        }
+        const operation = this.jobProgress.deliver(input);
+        this.progressOperations.add(operation);
+        void operation.finally(()=>this.progressOperations.delete(operation)).catch(()=>undefined);
+        const result = await (this.adapter.trackExternal?.(operation) ?? operation);
+        send(response, 200, { schema_version: 1, ...result });
+      } catch (error) {
+        this.logger.error("Slack job progress failed", {
+          error_code: "job_progress_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+        const permanentSlackCodes=new Set(["invalid_auth","account_inactive","token_revoked","not_authed","missing_scope","not_allowed_token_type","invalid_arguments","invalid_arg_name","invalid_array_arg","invalid_charset","invalid_form_data","invalid_post_type","channel_not_found","not_in_channel","thread_not_found","method_not_supported_for_channel_type"]);
+        const ambiguousSlackCodes=new Set(["slack_transport_error","slack_http_error","slack_api_error","invalid_slack_response"]);
+        const permanentSlackRejection = error instanceof SlackApiError && permanentSlackCodes.has(error.errorCode);
+        const retryableSlackRejection = error instanceof SlackApiError && !permanentSlackRejection && !ambiguousSlackCodes.has(error.errorCode);
+        const permanentProgressRejection = (error as Error & { progressPermanent?:boolean }).progressPermanent === true;
+        const definitelyUnsent = retryableSlackRejection || (error as Error & { definitelyUnsent?:boolean }).definitelyUnsent === true;
+        send(response, permanentSlackRejection || permanentProgressRejection ? 409 : definitelyUnsent ? 429 : 503, { schema_version: 1,
+          ...(error instanceof SlackApiError && error.retryAfterSeconds !== undefined ? { retry_after_seconds:error.retryAfterSeconds } : {}),
+          error: { code: error instanceof SlackApiError ? error.errorCode : definitelyUnsent ? "progress_not_sent" : "job_progress_failed" } });
+      }
+      } finally {
+        finishAdmission();
+        this.progressOperations.delete(admission);
+      }
+      return;
+    }
+    if (method === "POST" && pathname === "/v1/internal/job-progress/drain") {
+      if (!this.jobProgress || !this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable"}}); return; }
+      this.progressDrains+=1;
+      try {
+        if (!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden"}}); return; }
+        await Promise.allSettled([...this.progressOperations]);
+        send(response,200,{schema_version:1,drained:true}); return;
+      } finally {this.progressDrains-=1;}
+    }
     if (method === "GET" && pathname === "/health/live") {
       send(response, 200, { schema_version: 1, status: "live" });
       return;
@@ -235,10 +302,10 @@ export class SlackHealthServer {
         service: "slack_adapter",
         build_sha: this.buildSha,
         protocol: 1,
-        app_schema: 3,
+        app_schema: this.appSchemaWrite,
         app_schema_read_min: 2,
-        app_schema_read_max: 3,
-        app_schema_write: 3,
+        app_schema_read_max: this.appSchemaReadMax,
+        app_schema_write: this.appSchemaWrite,
         config: 1,
         ...(updateNotificationProtocolReady ? { update_notification_protocol: 1 } : {}),
         workspaces_ready: workspacesReady,

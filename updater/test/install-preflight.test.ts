@@ -10,6 +10,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { CanonicalBuild } from "../src/adapters.js";
+import { ProcessRunner } from "../src/process.js";
+import type { CommandResult } from "../src/types.js";
 import { tempPolicy } from "./helpers.js";
 
 const execute = promisify(execFile);
@@ -162,6 +164,10 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /--upgrade-control/);
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
+  assert.match(source, /control-plane-receipt\.json/);
+  assert.doesNotMatch(source, /\.control-plane-receipt\.json\.tmp/);
+  assert.match(source, /control-plane-receipt\.json\.\$\$\.\$RANDOM\.tmp/);
+  assert.match(source, /dispatcher_v2_to_v3_online_backup_v1/);
   assert.match(source, /updater\.previous\.sqlite3/);
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
@@ -235,6 +241,11 @@ test("an existing immutable release is reusable only with the exact control-plan
       /tree does not match/,
     );
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "export {};\n");
+    await fs.writeFile(manifestPath, JSON.stringify({
+      ...manifest,
+      compatibility: { ...manifest.compatibility, app_schema_write: 2 },
+    }));
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /does not match/);
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, "3".repeat(40)),
       /arguments are invalid/,
@@ -299,6 +310,34 @@ test("stable updater uses separate controller-owned npm config files", async () 
     await fs.unlink(userConfig);
     await fs.symlink("/dev/null", userConfig);
     await assert.rejects(new CanonicalBuild(policy).toolchain(), /npm_config_file_is_not_private_and_empty/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pre-activation command errors preserve timeout diagnostics before bounded output", async () => {
+  const { root, policy } = await tempPolicy();
+  const result: CommandResult = {
+    exit_code: null,
+    stdout: `assertion failed\ntoken=secret-value\n${"x".repeat(2_000)}`,
+    stderr: "control checkpoint stream",
+    timed_out: true,
+    output_truncated: true,
+    output_checkpoint: "file=file-start test/api.test.ts; last_finish=case-finish test/api.test.ts:012345abcdef#1; timeout=test/api.test.ts:fedcba543210#1",
+    exit_signal: "SIGKILL",
+    cleanup_status: "term=group-sent,kill=group-sent,closed=yes",
+  };
+  const runner = { run: async () => result } as unknown as ProcessRunner;
+  try {
+    await assert.rejects(new CanonicalBuild(policy, runner).toolchain(), (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /checkpoint=file=file-start test\/api\.test\.ts; last_finish=case-finish test\/api\.test\.ts:012345abcdef#1; timeout=test\/api\.test\.ts:fedcba543210#1/);
+      assert.match(message, /runner=exit:null,signal:SIGKILL,cleanup:term=group-sent,kill=group-sent,closed=yes/);
+      assert.match(message, /stderr=control checkpoint stream; stdout=assertion failed/);
+      assert.equal(message.includes("secret-value"), false);
+      assert.ok(message.length <= 1_000);
+      return true;
+    });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

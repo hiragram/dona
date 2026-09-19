@@ -77,7 +77,7 @@ function slackReceipt(value: unknown): SlackNotificationReceipt | undefined {
 
 function terminalFence(externalEventId: string): number {
   const value = Number(/:terminal:(\d+)$/.exec(externalEventId)?.[1]);
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error("terminal fence is invalid");
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("terminal fence is invalid");
   return value;
 }
 
@@ -482,7 +482,25 @@ export class UpdateNotificationWorker {
   private async loop(): Promise<void> {
     while (this.running) {
       try {
-        for (const event of this.events.updateEventsNeedingNotification()) this.notifications.ensure(event);
+        for (const event of this.events.updateEventsNeedingNotification()) {
+          try {
+            // Rendering is deterministic validation. A permanently invalid event must not
+            // starve every later terminal notification or poison service readiness.
+            renderUpdateNotification(envelopeFromRow(event));
+          } catch (error) {
+            this.events.quarantineUpdateNotification(
+              event.event_id,
+              "invalid_update_notification",
+              error instanceof Error ? error.message : String(error),
+            );
+            this.logger.error("Invalid update notification was quarantined", {
+              error_code: "invalid_update_notification",
+              event_id: event.event_id,
+            });
+            continue;
+          }
+          this.notifications.ensure(event);
+        }
         const row = this.notifications.nextAvailable();
         if (row) await this.deliver(row);
         this.healthy = true;
@@ -547,11 +565,13 @@ export class UpdateNotificationWorker {
     }
     const row = this.notifications.beginDelivery(candidate.event_id);
     const replyTarget = JSON.parse(row.reply_target_json) as Record<string, unknown>;
+    const payload = JSON.parse(row.payload_json) as { update_status: string };
     const outcome = await this.slack.deliver({
       schema_version: 1,
       notification_id: row.notification_id,
       request_id: row.request_id,
       terminal_fence: row.terminal_fence,
+      terminal_status: payload.update_status,
       workspace_id: replyTarget.workspace_id,
       channel_id: replyTarget.channel_id,
       thread_ts: replyTarget.thread_ts,

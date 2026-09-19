@@ -1,4 +1,5 @@
 import http from "node:http";
+import fs from "node:fs/promises";
 
 export interface DispatcherResponse {
   statusCode: number;
@@ -9,6 +10,7 @@ export interface DispatcherClientOptions {
   socketPath: string;
   connectTimeoutMs: number;
   timeoutMs: number;
+  internalTokenPath?: string;
 }
 
 export class DispatcherClient {
@@ -26,7 +28,20 @@ export class DispatcherClient {
     );
   }
 
-  private request(method: "GET" | "POST", path: string, body?: Buffer): Promise<DispatcherResponse> {
+  async resolveJobProgress(progressId: string, deliveryToken: string): Promise<unknown> {
+    try {
+      const token = this.options.internalTokenPath ? (await fs.readFile(this.options.internalTokenPath, "utf8")).trim() : "";
+      const response = await this.request("GET", `/v1/internal/job-progress?progress_id=${encodeURIComponent(progressId)}&delivery_token=${encodeURIComponent(deliveryToken)}`, undefined, token);
+      if (response.statusCode !== 200) throw Object.assign(new Error(`Dispatcher rejected progress resolution with HTTP ${response.statusCode}`), response.statusCode===403||response.statusCode===425||response.statusCode>=500 ? {progressRetryable:true} : {progressPermanent:true});
+      return JSON.parse(response.body);
+    } catch (error) {
+      const tagged=error as Error & {progressRetryable?:boolean;progressPermanent?:boolean};
+      if(tagged.progressRetryable||tagged.progressPermanent)throw tagged;
+      throw Object.assign(error instanceof Error?error:new Error(String(error)),{progressRetryable:true});
+    }
+  }
+
+  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer: NodeJS.Timeout | undefined;
@@ -45,12 +60,13 @@ export class DispatcherClient {
           socketPath: this.options.socketPath,
           method,
           path,
-          headers: body
-            ? {
+          headers: {
+            ...(body ? {
                 "content-type": "application/json",
                 "content-length": body.length,
-              }
-            : undefined,
+              } : {}),
+            ...(internalToken ? { "x-dona-update-token":internalToken } : {}),
+          },
         },
         (response) => {
           const chunks: Buffer[] = [];

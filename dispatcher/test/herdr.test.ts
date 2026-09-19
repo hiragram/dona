@@ -18,7 +18,7 @@ describe("HerdrProcessClient", () => {
     const executable = path.join(root, "fake-herdr");
     await fs.writeFile(
       executable,
-      "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"result\":{\"agent\":{\"agent_status\":\"idle\"}}}'\n",
+      "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"result\":{\"agent\":{\"agent_name\":\"dona-main\",\"workspace_id\":\"w1\",\"pane_id\":\"p1\",\"agent_session\":{\"kind\":\"id\",\"value\":\"s1\"},\"agent_status\":\"idle\",\"state_change_seq\":7}}}'\n",
       { mode: 0o700 },
     );
     const client = new HerdrProcessClient({
@@ -30,6 +30,8 @@ describe("HerdrProcessClient", () => {
     const result = await client.get();
     assert.equal(result.ok, true);
     assert.equal(result.agentStatus, "idle");
+    assert.equal(result.agentIdentity, '["w1","p1","dona-main","s1"]');
+    assert.equal(result.stateChangeSeq, 7);
   });
 
   test("waits for a state change when submitting a prompt", async () => {
@@ -83,5 +85,23 @@ console.log('{"status":"ok","result":{"agent":{"agent_status":"working"}}}');
       if (previousArgumentsPath === undefined) delete process.env.HERDR_TEST_ARGUMENTS_PATH;
       else process.env.HERDR_TEST_ARGUMENTS_PATH = previousArgumentsPath;
     }
+  });
+
+  test("returns at the command deadline even when Herdr ignores SIGTERM", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-herdr-timeout-"));
+    roots.push(root);
+    const executable = path.join(root, "fake-herdr");
+    await fs.writeFile(executable, "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n", { mode: 0o700 });
+    const client = new HerdrProcessClient({
+      executable,
+      session: "test",
+      agentName: "dona-main",
+      waitTimeoutMs: 100,
+      commandTimeoutMs: 20,
+    });
+    const started = Date.now();
+    const result = await client.get();
+    assert.equal(result.timedOut, true);
+    assert.ok(Date.now() - started < 500);
   });
 });
