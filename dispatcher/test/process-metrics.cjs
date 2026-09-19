@@ -43,6 +43,9 @@ function classify(file) {
 }
 
 function withNonce(options) {
+  if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
+    return options;
+  }
   const baseEnv = options?.env ?? process.env;
   return {
     ...(options ?? {}),

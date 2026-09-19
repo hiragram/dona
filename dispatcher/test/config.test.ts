@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import { describe, test } from "node:test";
@@ -15,6 +15,8 @@ import {
 describe("job resource config", () => {
   test("process計測はchild_process overloadと限定envを維持する", async () => {
     assert.throws(() => spawn(process.execPath, [], { stdio: "invalid" as never }), /stdio/);
+    assert.throws(() => spawnSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFileSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
