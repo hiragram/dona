@@ -97,17 +97,28 @@ export class OidcProtocol {
     catch (error) { if (error instanceof WebBoundaryError) throw error; throw new WebBoundaryError("identity_unavailable"); }
     finally { if (timer) clearTimeout(timer); controller.abort(); }
   }
-  async inspect(accessToken: string, expectedSubject: string, clock: OidcClock): Promise<OnlineToken> {
+  /** Returns IdP token metadata only. The BFF must map the exact issuer/subject
+   * through every retained HMAC index and the current registry before treating
+   * it as a session identity. Raw subject remains in memory, never the store. */
+  async introspect(accessToken: string, clock: OidcClock): Promise<OnlineToken> {
     try {
-      text.parse(accessToken); subject.parse(expectedSubject); const current = monotonicClock(clock);
+      text.parse(accessToken); const current = monotonicClock(clock);
       const input = await this.request("introspection_endpoint", new URLSearchParams({ token: accessToken, token_type_hint: "access_token" }));
       const now = current();
       const state = z.object({ active: z.boolean() }).parse(input);
       if (!state.active) return { active: false };
       const active = z.object({ active: z.literal(true), sub: subject, client_id: z.string(), aud: audience, exp: seconds, token_type: bearerType.optional() }).parse(input);
-      if (!equal(active.sub, expectedSubject) || active.client_id !== this.policy.oidc.client_id
+      if (active.client_id !== this.policy.oidc.client_id
         || !requiredAudience(active.aud, this.policy.oidc.access_token_audience) || active.exp <= now) throw new WebBoundaryError("identity_invalid");
       return { active: true, sub: active.sub, expires_at: active.exp };
+    } catch (error) { if (error instanceof WebBoundaryError) throw error; throw new WebBoundaryError("identity_invalid"); }
+  }
+  async inspect(accessToken: string, expectedSubject: string, clock: OidcClock): Promise<OnlineToken> {
+    try {
+      subject.parse(expectedSubject);
+      const online = await this.introspect(accessToken, clock);
+      if (online.active && !equal(online.sub, expectedSubject)) throw new WebBoundaryError("identity_invalid");
+      return online;
     } catch (error) { if (error instanceof WebBoundaryError) throw error; throw new WebBoundaryError("identity_invalid"); }
   }
   /** Invoke once only AFTER the server durably consumes this cookie-bound login

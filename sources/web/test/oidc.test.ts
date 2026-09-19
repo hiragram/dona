@@ -83,6 +83,28 @@ test("introspection成功をcacheせず各呼出しで状態を取得する", as
   assert.equal((await p.inspect("test-token", "subject-A", () => now)).active, true); active = false;
   assert.deepEqual(await p.inspect("test-token", "subject-A", () => now), { active: false }); assert.equal(calls, 2);
 });
+test("raw subjectを保存せずindex照合へ渡すintrospectionでも固定audienceとclientを要求する", async () => {
+  const f = await fixture({ online: { groups: ["administrators"], email: "fixture@example.test" } });
+  assert.deepEqual(await f.protocol.introspect("test-token", () => now), { active: true, sub: "subject-A", expires_at: now + 300 });
+  for (const online of [{ sub: undefined }, { client_id: undefined }, { aud: undefined }, { exp: undefined },
+    { client_id: "other" }, { aud: "other" }, { exp: now }]) {
+    const invalid = await fixture({ online });
+    await assert.rejects(invalid.protocol.introspect("test-token", () => now), { code: "identity_invalid" });
+    assert.equal(invalid.calls.length, 1);
+  }
+  await assert.rejects(f.protocol.inspect("test-token", "subject-a", () => now), { code: "identity_invalid" });
+});
+test("subject未保存のintrospectionでも毎回online状態と応答後の時計を確認する", async () => {
+  let calls = 0, current = now;
+  const p = new OidcProtocol(fixturePolicy(), { clientSecret: () => fixtureSecret }, { fetch: (async () => {
+    calls++; if (calls === 3) current = now - 1;
+    return json(calls === 2 ? { active: false } : { active: true, sub: "subject-A", client_id: "dona-web", aud: "dona-api", exp: now + 10 });
+  }) as typeof fetch });
+  assert.equal((await p.introspect("test-token", () => current)).active, true);
+  assert.deepEqual(await p.introspect("test-token", () => current), { active: false });
+  await assert.rejects(p.introspect("test-token", () => current), { code: "identity_invalid" });
+  assert.equal(calls, 3);
+});
 test("IdP障害とcredential例外をredactし再送しない", async () => {
   let calls = 0;
   const p = new OidcProtocol(fixturePolicy(), { clientSecret: () => fixtureSecret }, { fetch: (async () => { calls++; throw new Error("test-private-provider-detail"); }) as typeof fetch });

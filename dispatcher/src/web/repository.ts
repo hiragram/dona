@@ -248,6 +248,32 @@ export class WebAuthRepository {
     });
   }
 
+  /** Authenticated BFF preparation only; this projection never enrolls an
+   * identity or confirms that a browser/session may perform an action. */
+  loginContext() {
+    return this.audit.readVerifiedState(verified => {
+      const state = this.load(verified)?.state;
+      if (!state) throw new WebStateError();
+      return { bff_generation: state.bff_generation, retained_subject_key_versions: [...state.retained_subject_key_versions] };
+    });
+  }
+
+  /** Match the complete HMAC inventory against one current verified registry.
+   * OIDC subject stays in BFF memory; groups/email never enter this lookup. */
+  lookupPrincipal(subjectIndexes: WebIndexCandidate[]) {
+    const candidates = indexes(subjectIndexes);
+    return this.audit.readVerifiedState(verified => {
+      const state = this.load(verified)?.state;
+      if (!state || !state.retained_subject_key_versions.length || candidates.length !== state.retained_subject_key_versions.length
+        || state.retained_subject_key_versions.some(version => !candidates.some(value => value.key_version === version))) throw new WebStateError();
+      const matches = new Set(state.aliases.filter(alias => candidates.some(candidate => candidate.key_version === alias.index_key_version
+        && candidate.digest === alias.subject_digest)).map(alias => alias.principal_id));
+      if (matches.size > 1) throw new WebStateError();
+      const principal = state.principals.find(value => matches.has(value.principal_id));
+      return principal ? { principal, bff_generation: state.bff_generation } : null;
+    });
+  }
+
   /** Verified local data only, never online authentication or resource authority.
    * Caller must supply all retained cookie index keys needed by current rows. */
   lookupSession(cookieIndexes: WebIndexCandidate[]) {

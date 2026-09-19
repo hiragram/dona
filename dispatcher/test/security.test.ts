@@ -16,3 +16,4 @@ import "./approval/native-keychain-cas.js";
 import "./approval/used-transactions.js";
 import "./web/session-service.js";
 import "./approval/protected-heads.js";
+import "./web/auth-read-service.js";
