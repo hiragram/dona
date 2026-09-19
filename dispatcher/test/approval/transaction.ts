@@ -24,6 +24,7 @@ import {
   ApprovalTransaction,
   ApprovalTransactionError,
 } from "../../src/approval/transaction.js";
+import { verifyApprovalSchema } from "../../src/approval/schema.js";
 import {
   fixtureKeys,
   fixtureCheckpoint,
@@ -205,7 +206,7 @@ test("clock reservation・request・auditを同じtransactionへ結び、再open
   });
   assert.equal(result, "r1");
   assert.deepEqual(anchors.calls, ["reserve", "finalize"]);
-  const peer = new Database(filename);
+  const peer = openSecurityDatabase(filename);
   try {
     assert.equal(new AuditRepository(peer, anchors, keys).verify().sequence, 1);
     const clock = peer
@@ -795,5 +796,54 @@ test("callable Proxyとtag getterをcallback検査で実行しない", async (t)
       assert.equal(effects, 0); assert.equal(marks.calls, 0); assert.equal(anchors.value.pending_transaction_id, null);
       assert.equal(count(db, "security_audit_records"), 0);
     }
+  }
+});
+
+test("prepare済みSQLもcallback内のtransaction切替・pragma・DDLを実行できない", t => {
+  for (const sql of ["COMMIT", "ROLLBACK", "SAVEPOINT guard_point", "PRAGMA ignore_check_constraints=ON",
+    "PRAGMA recursive_triggers=OFF", "PRAGMA writable_schema=ON",
+    "CREATE TRIGGER inject AFTER INSERT ON ordinary BEGIN UPDATE approval_requests SET state='approved'; END"] ) {
+    for (const mode of (sql.startsWith("PRAGMA") ? ["exec", "prepare"] : ["exec", "prepare", "precompiled"])) {
+      const { db, transaction, anchors } = setup(t);
+      db.exec("CREATE TABLE ordinary(id TEXT)");
+      const statement = mode === "precompiled" ? db.prepare(sql) : undefined;
+      assert.throws(() => transaction.run("guard_tx", event, mark => {
+        insertRequest(db, mark.transaction_id);
+        if (statement) statement.run(); else if (mode === "prepare") db.prepare(sql).run(); else db.exec(sql);
+        db.exec("BEGIN");
+      }), ApprovalTransactionError);
+      assert.equal(db.inTransaction, false);
+      assert.equal(count(db, "approval_requests"), 0);
+      assert.equal(count(db, "security_audit_records"), 0);
+      assert.deepEqual(anchors.calls, ["reserve"]);
+      assert.equal(anchors.value.pending_transaction_id, "guard_tx");
+      assert.equal(db.pragma("ignore_check_constraints", { simple: true }), 0);
+      verifyApprovalSchema(db);
+    }
+  }
+});
+
+test("別tableの非prefix triggerとCHECK無効化はclock予約前に拒否する", t => {
+  for (const kind of ["main", "temp", "checks"] as const) {
+    const { db, transaction, audit, marks, anchors } = setup(t);
+    if (kind === "checks") db.pragma("ignore_check_constraints=ON");
+    else db.exec(`CREATE TABLE ordinary(id TEXT); CREATE ${kind === "temp" ? "TEMP " : ""}TRIGGER inject AFTER INSERT ON ordinary BEGIN UPDATE approval_requests SET state='approved'; END`);
+    assert.throws(() => verifyApprovalSchema(db));
+    assert.throws(() => audit.verify());
+    assert.throws(() => transaction.run("unsafe_schema", event, () => {}));
+    assert.equal(marks.calls, 0); assert.deepEqual(anchors.calls, []);
+  }
+});
+
+test("callbackはSQL guardを別tokenで解除できず監査rowも変更できない", t => {
+  for (const operation of ["disable", "audit_write"] as const) {
+    const { db, transaction, anchors } = setup(t);
+    assert.throws(() => transaction.run("guard_tx", event, mark => {
+      insertRequest(db, mark.transaction_id);
+      if (operation === "disable") db.prepare("SELECT dona_mutation_guard(zeroblob(32),0)").get();
+      else db.exec("DELETE FROM security_audit_records");
+    }));
+    assert.equal(count(db, "approval_requests"), 0); assert.equal(count(db, "security_audit_records"), 0);
+    assert.deepEqual(anchors.calls, ["reserve"]);
   }
 });

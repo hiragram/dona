@@ -1,4 +1,6 @@
 import Database from "better-sqlite3";
+import { loadSecurityExtension, withMutationSqlGuard } from "./file-identity.js";
+import { verifyApprovalSchema } from "../approval/schema.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditCheckpoint, verifyAuditChain,
@@ -54,6 +56,9 @@ export function verifyAuditSchema(db: Database.Database): void {
       try { expected.exec(schemaSql); expectedShape = shape(expected); } finally { expected.close(); }
     }
     if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND substr(name,1,15)!='security_audit_' AND substr(name,1,9)!='approval_'").get()
+      || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new AuditIntegrityError();
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(name,1,9)='approval_' OR substr(tbl_name,1,9)='approval_'").get()) verifyApprovalSchema(db);
     const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
   });
@@ -132,6 +137,7 @@ export class AuditRepository {
     return guard(() => {
       assertSynchronousCallback(mutation);
       if (this.db.inTransaction) throw new AuditIntegrityError();
+      loadSecurityExtension(this.db);
       let reservation: AuditAnchor | undefined;
       const committed = this.db.transaction(() => {
         const current = this.verifyInside();
@@ -152,7 +158,7 @@ export class AuditRepository {
         requireEqual(reservation, this.store.read());
         this.db.prepare("INSERT INTO security_audit_records VALUES (?, ?, ?)")
           .run(record.sequence, transactionId, JSON.stringify(record));
-        const result = mutation();
+        const result = withMutationSqlGuard(this.db, mutation);
         assertSynchronousResult(result);
         // A callback may not modify the audit rows/checkpoint or transaction state.
         if (!this.db.inTransaction) throw new AuditIntegrityError();

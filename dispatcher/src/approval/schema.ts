@@ -156,7 +156,12 @@ export function verifyApprovalSchema(db: Database.Database): void {
   const expected = new Database(":memory:");
   try {
     expected.exec(schemaSql);
-    if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1) throw new ApprovalSchemaError();
+    if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1
+      || db.pragma("ignore_check_constraints", { simple: true }) !== 0) throw new ApprovalSchemaError();
+    const triggers = db.prepare("SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND substr(name,1,9)!='approval_'").all() as Array<{name:string;tbl_name:string;sql:string}>;
+    if (triggers.some(row => row.name !== "security_audit_no_update" || row.tbl_name !== "security_audit_records"
+      || row.sql !== "CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records\n          BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END")) throw new ApprovalSchemaError();
+    if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,9)='approval_' OR substr(tbl_name,1,9)='approval_'").get()) throw new ApprovalSchemaError();
     if (shape(expected) !== shape(db)) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;

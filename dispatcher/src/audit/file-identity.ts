@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 
@@ -8,7 +8,7 @@ const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("h
 
 /** Fixed, locally built extension only. Neither SQL nor an external request can
  * choose a library path. Missing/unsupported/stale builds fail closed. */
-export function verifyOpenDatabaseFile(db: Database.Database): void {
+export function loadSecurityExtension(db: Database.Database): void {
   if (!loaded.has(db)) {
     if (!["darwin", "linux"].includes(process.platform)) throw new Error("security_file_identity_unavailable");
     const manifest = JSON.parse(fs.readFileSync(new URL("../../dist/native/file-identity.json", import.meta.url), "utf8"));
@@ -23,6 +23,21 @@ export function verifyOpenDatabaseFile(db: Database.Database): void {
     db.loadExtension(fileURLToPath(library));
     loaded.add(db);
   }
+}
+export function verifyOpenDatabaseFile(db: Database.Database): void {
+  loadSecurityExtension(db);
   const row = db.prepare("SELECT dona_file_identity_ok() AS ok").get() as { ok: number };
   if (row.ok !== 1) throw new Error("security_file_identity_unverified");
+}
+
+/** Internal SQL guard, not a sandbox for arbitrary JavaScript. Installing the
+ * SQLite authorizer expires previously prepared statements as well. The opaque
+ * per-call token is held only by this closure and never stored in the database. */
+export function withMutationSqlGuard<T>(db: Database.Database, callback: () => T): T {
+  loadSecurityExtension(db);
+  const token = randomBytes(32);
+  const control = db.prepare("SELECT dona_mutation_guard(?,CAST(? AS INTEGER)) AS ok");
+  control.get(token, 1);
+  try { return callback(); }
+  finally { try { control.get(token, 0); } finally { token.fill(0); } }
 }
