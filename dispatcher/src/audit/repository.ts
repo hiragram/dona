@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { assertSynchronousCallback, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditCheckpoint, verifyAuditChain,
   type AuditAnchor, type AuditCheckpoint, type AuditEvent, type AuditKeyLookup, type AuditRecord,
@@ -120,8 +121,10 @@ export class AuditRepository {
   /** mutation must perform synchronous SQL on this same DB connection only.
    * It must not commit, issue external writes, or return deferred work. The returned
    * value is released only after durable finalize and a complete verified reread. */
-  append<T>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => T): { record: AuditRecord; result: T } {
+  append<F extends () => unknown>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: SynchronousCallback<F>): { record: AuditRecord; result: ReturnType<F> };
+  append(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => unknown): { record: AuditRecord; result: unknown } {
     return guard(() => {
+      assertSynchronousCallback(mutation);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       let reservation: AuditAnchor | undefined;
       const committed = this.db.transaction(() => {

@@ -462,7 +462,7 @@ test("lock fileのsymlinkを開かず、deferred callbackを完了扱いしな�
   assert.equal(fs.readFileSync(destination, "utf8"), "original");
   const other = setup(t);
   assert.throws(
-    () => withSecurityTransactionLock(other.db, async () => null),
+    () => withSecurityTransactionLock(other.db, (async () => null) as never),
     SecurityCoordinationError,
   );
   assert.equal(
@@ -580,4 +580,37 @@ test("DB接続前にsymlinkと不正ancestorを拒否し、接続後のinode差�
     withSecurityTransactionLock(db, () => "unchanged"),
     "unchanged",
   );
+});
+
+test("型を消したasync callbackもclockとauditの予約前に実行せず拒否する", async (t) => {
+  const { db, transaction, audit, marks, anchors } = setup(t);
+  let effects = 0;
+  const deferred = async () => {
+    effects++;
+    await Promise.resolve();
+    effects++;
+  };
+  for (const callback of [deferred, deferred.bind(null)]) {
+    assert.throws(
+      () => withSecurityTransactionLock(db, callback as never),
+      SecurityCoordinationError,
+    );
+    assert.throws(
+      () => transaction.run("async_tx", event, callback as never),
+      ApprovalTransactionError,
+    );
+    assert.throws(() =>
+      audit.append(
+        "async_audit",
+        1,
+        { ...event, occurred_at: "2026-09-19T00:00:01.000Z" },
+        callback as never,
+      ),
+    );
+  }
+  await Promise.resolve();
+  assert.equal(effects, 0);
+  assert.equal(marks.calls, 0);
+  assert.deepEqual(anchors.calls, []);
+  assert.equal(audit.verify().sequence, 0);
 });

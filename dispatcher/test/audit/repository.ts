@@ -157,7 +157,7 @@ test("duplicate transaction・時刻巻戻り・outer transactionは外部reserv
 
 test("unknown schema・部分schemaを修復せず、非同期callbackもcommitしない", (t) => {
   const { db, store, repository } = setup(t);
-  assert.throws(() => repository.append("tx_1", 1, event, () => Promise.resolve("late")), AuditIntegrityError);
+  assert.throws(() => repository.append("tx_1", 1, event, (() => Promise.resolve("late")) as never), AuditIntegrityError);
   assert.equal(count(db, "security_audit_records"), 0); assert.equal(store.value.pending_transaction_id, "tx_1");
   db.exec("DROP TABLE security_audit_schema; CREATE TABLE security_audit_schema(version); INSERT INTO security_audit_schema VALUES (2)");
   assert.throws(() => installAuditSchema(db), AuditIntegrityError);

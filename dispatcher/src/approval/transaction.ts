@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { auditEventSchema, type AuditEvent, type AuditKeyLookup } from "../audit/codec.js";
 import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
 import { withSecurityTransactionLock } from "../audit/coordination.js";
+import { assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema } from "./schema.js";
 
@@ -27,12 +28,14 @@ export class ApprovalTransaction {
   constructor(private readonly db: Database.Database, private readonly providers: ApprovalTransactionProviders) {
     this.audit = new AuditRepository(db, providers.auditAnchors, providers.auditKeys);
   }
-  run<T>(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => T): T {
+  run<F extends (mark: Readonly<ClockMark>) => unknown>(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: SynchronousCallback<F>): ReturnType<F>;
+  run(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {
+      assertSynchronousCallback(mutation);
       return withSecurityTransactionLock(this.db, () => this.runInside(transactionId, eventInput, mutation));
     } catch { throw new ApprovalTransactionError(); }
   }
-  private runInside<T>(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => T): T {
+  private runInside(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {
       if (this.db.inTransaction || this.db.pragma("foreign_keys", { simple: true }) !== 1
         || (this.db.pragma("synchronous", { simple: true }) as number) < 2) throw new ApprovalTransactionError();

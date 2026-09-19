@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { assertSynchronousCallback, type SynchronousCallback } from "./synchronous.js";
 
 const active = new Set<string>();
 const opened = new WeakMap<Database.Database, { filename: string; identity: string }>();
@@ -77,10 +78,12 @@ function ensureFile(filename: string): void {
  * Its OS writer lock spans clock reservation through audit finalize, and is
  * released automatically on crash. All users of the shared clock must use it.
  * No transaction is opened on the business DB before the clock reservation. */
-export function withSecurityTransactionLock<T>(business: Database.Database, work: () => T): T {
+export function withSecurityTransactionLock<F extends () => unknown>(business: Database.Database, work: SynchronousCallback<F>): ReturnType<F>;
+export function withSecurityTransactionLock(business: Database.Database, work: () => unknown): unknown {
   let mutex: Database.Database | undefined;
   let owned: string | undefined;
   try {
+    assertSynchronousCallback(work);
     if (!business.open || business.memory || business.readonly || business.inTransaction || !path.isAbsolute(business.name)) throw new SecurityCoordinationError();
     const registration = opened.get(business);
     if (!registration || business.name !== registration.filename
