@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { UpdatePolicy } from "./policy.js";
+import { makeReleaseImmutable, validateNativeClockPath } from "./release-permissions.js";
 import type { ActivationReceipt, ReleaseManifest, UpdateRow } from "./types.js";
 import { canonicalJson, fullSha, parseActivationReceipt, parseReleaseManifest } from "./validation.js";
 
@@ -107,7 +108,7 @@ export class ReleaseStore {
       }
       await this.removeGeneratedTree(stagingRoot, stagingPath);
     }
-    await this.makeImmutable(releasePath);
+    await makeReleaseImmutable(releasePath);
     await fsyncDirectory(this.policy.release_root);
     return releasePath;
   }
@@ -272,6 +273,7 @@ export class ReleaseStore {
   }
 
   private async scanTree(root: string, current: string): Promise<void> {
+    await validateNativeClockPath(root);
     const hardlinks = new Map<string, { expectedLinks: number; paths: string[] }>();
     await this.scanTreeEntry(root, current, hardlinks);
     for (const [inode, observation] of hardlinks) {
@@ -316,17 +318,6 @@ export class ReleaseStore {
       if (observation.expectedLinks !== stats.nlink) throw new Error("staging_owner_permissions_or_hardlink_invalid");
       observation.paths.push(current);
       hardlinks.set(inode, observation);
-    }
-  }
-
-  private async makeImmutable(current: string): Promise<void> {
-    const stats = await fs.lstat(current);
-    if (stats.isSymbolicLink()) return;
-    if (stats.isDirectory()) {
-      for (const child of await fs.readdir(current)) await this.makeImmutable(path.join(current, child));
-      await fs.chmod(current, 0o500);
-    } else if (stats.isFile()) {
-      await fs.chmod(current, 0o400);
     }
   }
 

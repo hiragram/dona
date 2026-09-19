@@ -153,6 +153,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
   assert.match(source, /stable updaterを停止しません/);
   assert.match(source, /updater\.next" -type f -exec chmod 400/);
+  assert.ok(source.includes('"$NODE_PATH" "$FINAL_RELEASE/updater/dist/release-permissions.js" "$FINAL_RELEASE"'));
+  assert.ok(!source.includes('find "$FINAL_RELEASE" -type f -exec chmod 400'));
   assert.match(source, /SELECT COUNT\(\*\) FROM update_requests WHERE state NOT IN/);
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
