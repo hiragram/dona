@@ -725,3 +725,25 @@ test("型を消した通常関数が返すiteratorもtransaction外へ返さな�
     );
   }
 });
+
+test("iterable wrapperの遅延処理を実行せず戻り値とSQL commitを拒否する", (t) => {
+  for (const kind of ["lock", "audit", "approval"] as const) {
+    for (const asynchronous of [false, true]) {
+      const { db, transaction, audit, anchors } = setup(t);
+      let effects = 0;
+      const wrapper = asynchronous
+        ? { async *[Symbol.asyncIterator]() { effects++; yield "later"; } }
+        : { *[Symbol.iterator]() { effects++; yield "later"; } };
+      const callback = () => wrapper;
+      assert.throws(() => kind === "lock"
+        ? withSecurityTransactionLock(db, callback as never)
+        : kind === "audit"
+          ? audit.append("wrapper_tx", 1, { ...event, occurred_at: "2026-09-19T00:00:01.000Z" }, callback as never)
+          : transaction.run("wrapper_tx", event, callback as never));
+      assert.equal(effects, 0);
+      assert.equal(count(db, "approval_clock_reservations"), 0);
+      assert.equal(count(db, "security_audit_records"), 0);
+      assert.equal(anchors.value.pending_transaction_id, kind === "lock" ? null : "wrapper_tx");
+    }
+  }
+});

@@ -18,6 +18,14 @@ function synchronousContracts(
   }));
   withSecurityTransactionLock(db, () => {});
   const ids: string[] = withSecurityTransactionLock(db, () => ["request"]);
+  const asyncIterable: AsyncIterable<string> = { async *[Symbol.asyncIterator]() { yield text; } };
+  const iterable: Iterable<string> = { *[Symbol.iterator]() { yield text; } };
+  // @ts-expect-error an async iterable wrapper also defers work
+  approval.run("tx", event, () => asyncIterable);
+  // @ts-expect-error a synchronous iterable wrapper also defers work
+  audit.append("tx", 1, event, () => iterable);
+  // @ts-expect-error union with an async iterable is deferred
+  withSecurityTransactionLock(db, () => number > 0 ? ids : asyncIterable);
   // @ts-expect-error generator callback must not escape the transaction
   approval.run("tx", event, function* () {
     yield ids;
