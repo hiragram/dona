@@ -1,5 +1,7 @@
 # Web session・route・context契約
 
+Dispatcherの監査付き保存部品は [Web認証状態の保存](web-auth-storage.md) を参照する。
+
 [#141](https://github.com/hiragram/dona/issues/141)の部分実装。[採用ADR](../adr/0002-web-trust-boundary.md)のruntime接続に向けた、BFF側の検証部品を定義する。listener、Dispatcherの権限正本、監査付き保存、one-use consumeはまだ接続していない。
 
 sessionは同じinstance/tenantのcurrent registryとruntime generationへ照合し、principal revoke、identity/authz revision、session state、BFF generationの不一致を拒否する。絶対8時間、idle 30分、access token期限を上限とし、時刻巻戻りを拒否する。roleとscopeは明示した組合せだけを許す。scope eligibilityだけでowner/grantやsupervisor bindingを認可しない。SSE・自動poll・内部再認可はactivityを更新しない。
