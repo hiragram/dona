@@ -142,6 +142,8 @@ const originalExecFile = childProcess.execFile;
 childProcess.execFile = function instrumentedExecFile(file, args, options, callback) {
   const started = performance.now();
   const processClass = classify(file);
+  const hasExplicitCallback = arguments.length >= 4 || (!Array.isArray(args) && arguments.length >= 3);
+  const explicitCallback = arguments.length >= 4 ? callback : options;
   const [actualArgs, normalizedOptions] = normalizeArgs(args, options);
   const actualOptions = typeof normalizedOptions === "function" ? undefined : normalizedOptions;
   const actualCallback = typeof callback === "function" ? callback : typeof options === "function" ? options : typeof args === "function" ? args : undefined;
@@ -149,6 +151,9 @@ childProcess.execFile = function instrumentedExecFile(file, args, options, callb
   totals[processClass].count += 1;
   emit();
   try {
+    if (hasExplicitCallback && typeof explicitCallback !== "function") {
+      return originalExecFile.apply(this, arguments);
+    }
     return originalExecFile.call(this, file, actualArgs, withNonce(actualOptions), (...callbackArgs) => {
       totals[processClass].elapsed += performance.now() - started;
       active = Math.max(0, active - 1);

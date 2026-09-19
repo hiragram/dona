@@ -18,6 +18,8 @@ describe("job resource config", () => {
     assert.throws(() => spawnSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     assert.throws(() => execFileSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     assert.throws(() => execFile("/bin/true", [], 5 as never, () => {}), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", [], {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     const omittedArgs = spawnSync("/usr/bin/env", undefined, {
       env: { ONLY_WITH_OMITTED_ARGS: "yes" },
       encoding: "utf8",
