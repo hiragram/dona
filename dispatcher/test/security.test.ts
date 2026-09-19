@@ -13,3 +13,4 @@ import "./web/ingress-wire.js";
 import "./web/ingress.js";
 import "./approval/keychain-cas.js";
 import "./approval/native-keychain-cas.js";
+import "./approval/used-transactions.js";
