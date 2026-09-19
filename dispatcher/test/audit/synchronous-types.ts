@@ -76,4 +76,11 @@ function preparedContracts(audit:AuditRepository, approval:ApprovalTransaction,e
  audit.appendPrepared('tx',1,()=>({event,resource_digest:null,mutation:function*(){yield result;}}));
  // @ts-expect-error iterator mutation escapes the transaction
  approval.runPrepared('tx',()=>({event,resource_digest:null,mutation:()=>[output].values()}));
+ const stateCount:number=audit.readVerifiedState(state=>state.resource_bindings.length);
+ // @ts-expect-error verified state cannot escape into deferred work
+ audit.readVerifiedState(async state=>state.resource_bindings);
+ // @ts-expect-error iterator escapes the verified read snapshot
+ audit.readVerifiedState(state=>state.resource_bindings.values());
+ // @ts-expect-error nested Promise escapes the verified read snapshot
+ audit.readVerifiedState(()=>({later:Promise.resolve(stateCount)}));
 }

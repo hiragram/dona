@@ -11,3 +11,5 @@
 監査 record v2 は必須の `resource_digest` と非 null の `resource_id` を署名対象へ追加する。v1 と v2 の混在 chain を検証し、未知 version、digest 改変、v1 への差し替えを拒否する。digest は信頼済み repository が作る canonical な業務 metadata の照合用であり、本文・token・private URL を渡さない。署名だけで業務 table との一致を保証するものではない。後続 repository が保存前後の metadata と照合して初めて改変検知へ使える。
 
 request/decision/consume の公開 API、業務 metadata の照合、payload の暗号化・同一 transaction 内の移送と削除・backup 除外、実 provider、runtime migration は引き続き後続実装とする。#16 の whole completion を主張しない。
+
+同じsnapshotのmetadata digest照合とretention後の根拠保持は [状態digestとcheckpoint](audited-resource-checkpoints.md) を参照する。

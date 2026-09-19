@@ -4,7 +4,7 @@ import { types } from "node:util";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "../audit/synchronous.js";
 import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
 import type Database from "better-sqlite3";
-import { auditEventSchema, type AuditEvent, type AuditKeyLookup } from "../audit/codec.js";
+import { auditEventSchema, type AuditEvent, type AuditKeyLookup, type VerifiedAuditState } from "../audit/codec.js";
 import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema, verifyApprovalIntegrity } from "./schema.js";
@@ -50,10 +50,10 @@ export class ApprovalTransaction {
    * actual audit outcome and planned metadata digest before anchor reservation;
    * an ordinary duplicate/conflict should return a denial plan, not throw after
    * reserve. Plaintext and transport proof must never enter resource metadata. */
-  runPrepared<F extends () => unknown>(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+  runPrepared<F extends () => unknown>(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
     event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: SynchronousCallback<F>;
   }): ReturnType<F>;
-  runPrepared(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+  runPrepared(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
     event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
   }): unknown {
     try {
@@ -62,7 +62,7 @@ export class ApprovalTransaction {
     }
     catch (error) { if (error instanceof SecurityCoordinationBusyError) throw new ApprovalTransactionBusyError(); throw new ApprovalTransactionError(); }
   }
-  private runPreparedInside(transactionId: string, prepare: (mark: Readonly<ClockMark>) => {
+  private runPreparedInside(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
     event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
   }): unknown {
     try {
@@ -79,9 +79,9 @@ export class ApprovalTransaction {
           || !(Object.keys(mark) as Array<keyof ClockMark>).every(key => current[key] === mark[key])) throw new ApprovalTransactionError();
       };
       requireCurrent();
-      return this.audit.appendPrepared(transactionId, this.providers.auditSigningKeyVersion, () => {
+      return this.audit.appendPrepared(transactionId, this.providers.auditSigningKeyVersion, state => {
         requireCurrent(); verifyApprovalSchema(this.db);
-        const plan = prepare(mark);
+        const plan = prepare(mark, state);
         if (plan === null || typeof plan !== "object" || types.isProxy(plan)
           || Object.getPrototypeOf(plan) !== Object.prototype) throw new ApprovalTransactionError();
         const descriptors = Object.getOwnPropertyDescriptors(plan);

@@ -1062,3 +1062,26 @@ test("事前計画のgetterとProxyを実行せず予約前に拒否する", t =
     assert.equal(count(db, "security_audit_records"), 0);
   }
 });
+
+test("事前判定は最新commitmentとcurrent clockを共有し検証根拠の変更を拒否する", t => {
+  const { transaction, anchors, audit, db } = setup(t);
+  transaction.runPrepared("state_first", (mark, state) => {
+    assert.deepEqual(state.resource_bindings, []);
+    return { event, resource_digest: "a".repeat(64), mutation: () => insertRequest(db, mark.transaction_id) };
+  });
+  transaction.runPrepared("state_second", (mark, state) => {
+    assert.equal(mark.transaction_id, "state_second");
+    assert.equal(state.anchor.sequence, 1);
+    assert.equal(state.resource_bindings[0]?.resource_digest, "a".repeat(64));
+    assert.ok(Object.isFrozen(state.resource_bindings[0]?.scope));
+    return { event, resource_digest: "b".repeat(64), mutation: () => null };
+  });
+  const calls = anchors.calls.length;
+  assert.throws(() => transaction.runPrepared("state_tamper", (_mark, state) => {
+    state.resource_bindings[0]!.resource_digest = "c".repeat(64);
+    return { event, resource_digest: null, mutation: () => null };
+  }), ApprovalTransactionError);
+  assert.equal(anchors.calls.length, calls);
+  assert.equal(audit.readVerifiedState(state => state.resource_bindings[0]?.resource_digest), "b".repeat(64));
+  assert.equal(count(db, "approval_clock_reservations"), 2);
+});
