@@ -220,6 +220,40 @@ describe("job resource config", () => {
     assert.match(stderr, completedSecond);
   });
 
+  test("Node 20 fallbackで未開始cancelがactive caseを完了扱いしない", async () => {
+    const nonce = "0123456789abcdef0123456789abcdef";
+    process.env.DONA_DISPATCHER_TEST_FILE = "test/fallback.test.ts";
+    process.env.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    try {
+      const { default: createReporter } = await import(`./checkpoint-reporter.mjs?fallback-cancel=${Date.now()}`);
+      const reporter = createReporter();
+      let output = "";
+      reporter.setEncoding("utf8");
+      reporter.on("data", (chunk: string) => { output += chunk; });
+      reporter.write({ type: "test:enqueue", data: { nesting: 0, name: "duplicate", type: "test" } });
+      reporter.write({ type: "test:dequeue", data: { nesting: 0, name: "duplicate", file: "/tmp/fallback.test.mjs" } });
+      reporter.write({ type: "test:enqueue", data: { nesting: 0, name: "duplicate", type: "test" } });
+      reporter.write({
+        type: "test:fail",
+        data: {
+          nesting: 0,
+          name: "duplicate",
+          details: { type: "test", duration_ms: 0, error: { failureType: "cancelledByParent" } },
+        },
+      });
+      reporter.end();
+      await new Promise<void>((resolve, reject) => {
+        reporter.once("end", resolve);
+        reporter.once("error", reject);
+      });
+      assert.match(output, /case-start test\/fallback\.test\.ts:e24a5a32c9b8#1/);
+      assert.doesNotMatch(output, /case-fail/);
+    } finally {
+      delete process.env.DONA_DISPATCHER_TEST_FILE;
+      delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
+    }
+  });
+
   test("file wrapper停止をleaf caseとして記録しない", async () => {
     const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-wrapper-`);
     const fixture = `${temporaryDirectory}/wrapper.test.mjs`;

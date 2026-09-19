@@ -50,7 +50,7 @@ export default function checkpointReporter() {
             output = `\n[dispatcher-test:${nonce}] ${action} ${file}:${digest}#${occurrence} elapsed_ms=${Math.round(event.data.details?.duration_ms ?? 0)}\n`;
           }
         }
-      } else if (!supportsComplete && (event.type === "test:pass" || event.type === "test:fail") && event.data.details?.type !== "suite") {
+      } else if (!supportsComplete && (event.type === "test:pass" || event.type === "test:fail") && event.data.details?.type !== "suite" && event.data.details?.error?.failureType !== "cancelledByParent") {
         const digest = createHash("sha256").update(event.data.name).digest("hex").slice(0, 12);
         const occurrence = (terminals.get(digest) ?? 0) + 1;
         if (occurrence <= (starts.get(digest) ?? 0)) {
