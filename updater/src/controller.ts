@@ -8,24 +8,50 @@ import { redactText } from "./redaction.js";
 import type {
   ApplyRequest,
   CommandResult,
+  CompatibilityTransition,
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
   PlanRequest,
   ReleaseManifest,
+  SchemaRollout,
   RuntimeOperationKind,
   UpdateRow,
 } from "./types.js";
 import { canonicalJson } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
+const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
+const productionV2SourceSha = "7dbaab72e3387f94f6c8a2289a685b90b100d083";
+const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_v1";
+const schemaV3ActivationRollout: SchemaRollout = {
+  schema_version: 1,
+  phase: "activation",
+  database_schema: 3,
+  multi_job_enabled: true,
+  previous_release_sha: productionV2SourceSha,
+  previous_release_contract: "release-compatibility.production-v2.json",
+  required_control_plane_capability: schemaMigrationCapability,
+  migration: {
+    from_schema: 2,
+    to_schema: 3,
+    requires_quiesce: true,
+    requires_drain: true,
+    backup: "sqlite_online_backup",
+    restore_open_test: true,
+  },
+};
 interface TerminalObservation {
   status: "succeeded" | "rolled_back";
   activeSha: string;
 }
 
-function compatible(previous: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
-  return previous.protocol === target.protocol && previous.config === target.config &&
+export function releaseCompatibilityMatches(
+  previous: ReleaseManifest["compatibility"],
+  target: ReleaseManifest["compatibility"],
+): boolean {
+  return previous.rollback_safe && target.rollback_safe &&
+    previous.protocol === target.protocol && previous.config === target.config &&
     previous.app_schema_write >= target.app_schema_read_min && previous.app_schema_write <= target.app_schema_read_max &&
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
 }
@@ -43,6 +69,32 @@ function resultSucceeded(result: { exit_code: number | null; timed_out: boolean 
 function mainAgentMatches(agent: MainAgentObservation): boolean {
   return agent.exists && agent.name === "dona-main" && agent.kind === "codex" && agent.session_id !== null &&
     agent.interactive_ready && agent.matches_release && agent.status !== null && agent.status !== "unknown";
+}
+
+function rolloutMatchesTargetCompatibility(
+  rollout: SchemaRollout,
+  compatibility: ReleaseManifest["compatibility"],
+  transition?: UpdatePolicy["compatibility_transitions"][number],
+): boolean {
+  if (compatibility.app_schema_write === 3) {
+    const expected = transition ? {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: transition.from_sha,
+      previous_release_contract: transition.previous_release_contract,
+      required_control_plane_capability: transition.required_control_plane_capability,
+    } : schemaV3ActivationRollout;
+    const legacyExpected = {
+      ...schemaV3ActivationRollout,
+      previous_release_sha: schemaV3BridgeSha,
+      previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    };
+    return canonicalJson(rollout) === canonicalJson(expected) ||
+      (!transition && canonicalJson(rollout) === canonicalJson(legacyExpected));
+  }
+  return rollout.database_schema === 2 && !rollout.multi_job_enabled && rollout.phase !== "activation" &&
+    Array.isArray(rollout.capabilities) && rollout.migration === undefined &&
+    rollout.previous_release_sha === undefined && rollout.previous_release_contract === undefined &&
+    rollout.required_control_plane_capability === undefined;
 }
 
 export class UpdateController {
@@ -70,8 +122,17 @@ export class UpdateController {
     ]);
     if (git.current_sha !== current.sha || !git.target_reachable) throw new Error("target_is_not_fast_forward_from_current");
     if (!git.ci_trusted) throw new Error("target_does_not_pass_fixed_ci_trust_gate");
-    if (!policyCompatible(this.policy.compatibility, git.target_compatibility)) {
+    const transition = this.policy.compatibility_transitions.find((candidate) =>
+      candidate.from_sha === current.sha &&
+      canonicalJson(candidate.from) === canonicalJson(current.compatibility) &&
+      canonicalJson(candidate.to) === canonicalJson(git.target_compatibility) &&
+      candidate.required_control_plane_capability === git.target_rollout.required_control_plane_capability
+    );
+    if (canonicalJson(git.target_compatibility) !== canonicalJson(this.policy.compatibility) && !transition) {
       throw new Error("target_compatibility_does_not_match_the_approved_policy_version");
+    }
+    if (!rolloutMatchesTargetCompatibility(git.target_rollout, git.target_compatibility, transition)) {
+      throw new Error("target_schema_rollout_does_not_match_target_compatibility");
     }
     if (git.target_sha === current.sha) throw new Error("current_release_is_already_at_fixed_branch_tip");
     const targetManifest: ReleaseManifest = {
@@ -85,8 +146,20 @@ export class UpdateController {
       built_at: this.clock.now().toISOString(),
       compatibility: git.target_compatibility,
     };
-    if (!compatible(current.compatibility, targetManifest.compatibility)) throw new Error("target_is_not_rollback_compatible_with_current_release");
-    const rollbackCompatible = current.compatibility.rollback_safe && targetManifest.compatibility.rollback_safe;
+    const rollbackCompatible = releaseCompatibilityMatches(current.compatibility, targetManifest.compatibility);
+    if (!rollbackCompatible && !transition) throw new Error("target_is_not_rollback_compatible_with_current_release");
+    if (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3 &&
+      !transition && current.sha !== schemaV3BridgeSha) {
+      throw new Error("schema_activation_bridge_identity_unverified");
+    }
+    let controlPlane: { ready: boolean; build_sha: string | null } | undefined;
+    if (transition || (current.compatibility.app_schema_write === 2 && targetManifest.compatibility.app_schema_write === 3)) {
+      const capability = transition?.required_control_plane_capability ?? schemaMigrationCapability;
+      controlPlane = await this.runtime.schemaMigrationCapability(capability);
+      if (!controlPlane.ready || controlPlane.build_sha !== git.target_sha) {
+        throw new Error("stable_updater_exact_target_schema_migration_capability_required");
+      }
+    }
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,
@@ -94,13 +167,20 @@ export class UpdateController {
       policy_version: this.policy.policy_version,
       compatibility: targetManifest.compatibility,
       rollback_compatible: rollbackCompatible,
+      ...(transition ? { compatibility_transition: transition } : {}),
     }, this.clock.now());
     return {
       schema_version: 1,
       request_id: result.row.request_id,
       duplicate: result.duplicate,
       plan: result.plan,
-      preflight: { storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable },
+      preflight: {
+        storage, toolchain, ci_trusted: git.ci_trusted, fast_forward: git.target_reachable,
+        ...(controlPlane ? {
+          control_plane_capability: transition?.required_control_plane_capability ?? git.target_rollout.required_control_plane_capability,
+          schema_migration_control_plane_sha: controlPlane.build_sha,
+        } : {}),
+      },
     };
   }
 
@@ -230,9 +310,11 @@ export class UpdateController {
     }
     const observation = await this.releases.observe();
     const expectedRelease = observation.current_sha ? path.join(this.policy.release_root, observation.current_sha) : this.policy.current_pointer;
-    const [dispatcherHealth, slackHealth, mainAgent] = await Promise.all([
+    const [dispatcherHealth, slackHealth, mainAgent, activeManifest] = await Promise.all([
       this.runtime.dispatcherHealth(), this.runtime.slackHealth(), this.runtime.mainAgentStatus(expectedRelease),
+      observation.current_sha ? this.releases.releaseManifest(observation.current_sha) : Promise.resolve(null),
     ]);
+    const targetCompatibility = JSON.parse(claimed.compatibility_json) as ReleaseManifest["compatibility"];
     if (
       observation.current_sha === claimed.target_sha &&
       observation.previous_sha === claimed.current_sha &&
@@ -241,8 +323,8 @@ export class UpdateController {
       observation.receipt.to_sha === claimed.target_sha &&
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
-      this.healthMatches(dispatcherHealth, claimed.target_sha, false) &&
-      this.healthMatches(slackHealth, claimed.target_sha, true) &&
+      this.healthMatches(dispatcherHealth, claimed.target_sha, false, targetCompatibility) &&
+      this.healthMatches(slackHealth, claimed.target_sha, true, targetCompatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) &&
       this.mainAgentMatchesReceipt(claimed, mainAgent)
     ) {
@@ -255,8 +337,9 @@ export class UpdateController {
       observation.receipt.to_sha === claimed.current_sha &&
       observation.receipt.fence <= claimed.fence &&
       observation.receipt.generation === claimed.activation_generation &&
-      this.healthMatches(dispatcherHealth, claimed.current_sha, false) &&
-      this.healthMatches(slackHealth, claimed.current_sha, true) &&
+      activeManifest !== null &&
+      this.healthMatches(dispatcherHealth, claimed.current_sha, false, activeManifest.compatibility) &&
+      this.healthMatches(slackHealth, claimed.current_sha, true, activeManifest.compatibility) &&
       this.notificationReporterReady(dispatcherHealth, slackHealth) && mainAgentMatches(mainAgent)
     ) {
       this.database.terminal(claimed.request_id, claimed.fence, "rolled_back", "reconciled_previous_health", {}, this.clock.now());
@@ -344,8 +427,17 @@ export class UpdateController {
 
   private async runClaimed(initial: UpdateRow): Promise<void> {
     let row = initial;
+    const targetCompatibility = JSON.parse(initial.compatibility_json) as ReleaseManifest["compatibility"];
+    const persistedTransition = initial.transition_json
+      ? JSON.parse(initial.transition_json) as CompatibilityTransition
+      : undefined;
     let mainAgentPaneId = this.database.runtimeOperation(row.request_id, "stop_main_agent")?.target_ref;
     this.assertLease(row);
+    if (persistedTransition && !this.policy.compatibility_transitions.some((candidate) =>
+      canonicalJson(candidate) === canonicalJson(persistedTransition))) {
+      this.needsReview(row, "approved_transition_no_longer_matches_policy");
+      return;
+    }
     if (row.state === "rolling_back") {
       await this.resumeRollback(row);
       return;
@@ -403,7 +495,10 @@ export class UpdateController {
     }
     if (row.state === "quiescing") {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
-      const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
+      const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
+      const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
+      const persistedRecovery = this.database.runtimeOperation(row.request_id, "start_previous_main_agent") ??
+        this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
         let evidence: Record<string, unknown> = {};
@@ -422,17 +517,30 @@ export class UpdateController {
         );
         return;
       }
-      // Quiesce is keyed by the stable request ID and is idempotent. Re-observe it
-      // after every controller restart in case either ingress service also restarted.
-      const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+      // Reboot can restart a previously stopped launchd service. Re-observe each
+      // service independently: live services must drain again, while an unavailable
+      // UDS is accepted as stopped only when this request has durable stop evidence.
+      const slackHealth = await this.runtime.slackHealth();
       this.assertLease(row);
-      if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-        throw new Error("slack_adapter_drain_incomplete");
+      if (slackHealth.live) {
+        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+          throw new Error("slack_adapter_drain_incomplete");
+        }
+      } else if (persistedSlackStop?.phase !== "observed") {
+        throw new Error("slack_adapter_current_state_unverified");
       }
-      const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+      const dispatcherHealth = await this.runtime.dispatcherHealth();
       this.assertLease(row);
-      if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-        throw new Error("dispatcher_drain_incomplete");
+      if (dispatcherHealth.live) {
+        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+        this.assertLease(row);
+        if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+          throw new Error("dispatcher_drain_incomplete");
+        }
+      } else if (persistedDispatcherStop?.phase !== "observed") {
+        throw new Error("dispatcher_current_state_unverified");
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();
@@ -496,6 +604,61 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
       ))) return;
+      const previousManifest = await this.releases.readCurrentManifest();
+      const previousCompatibility = previousManifest.compatibility;
+      if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
+        const approvedTransition = persistedTransition?.from_sha === previousManifest.sha &&
+          previousManifest.sha === row.current_sha &&
+          canonicalJson(persistedTransition.from) === canonicalJson(previousCompatibility) &&
+          canonicalJson(persistedTransition.to) === canonicalJson(targetCompatibility)
+          ? persistedTransition
+          : undefined;
+        const legacyExactBridge = previousManifest.sha === schemaV3BridgeSha && previousManifest.sha === row.current_sha;
+        if (!approvedTransition && !legacyExactBridge) {
+          this.needsReview(row, "schema_activation_bridge_identity_unverified");
+          return;
+        }
+        const capability = approvedTransition?.required_control_plane_capability ?? schemaMigrationCapability;
+        const controlPlane = await this.runtime.schemaMigrationCapability(capability);
+        this.assertLease(row);
+        if (!controlPlane.ready || controlPlane.build_sha !== row.target_sha) {
+          await this.restoreQuiescedServices(row, "stable_updater_schema_migration_capability_unverified");
+          return;
+        }
+        const migration = await this.runtime.migrateAppSchema(
+          row.request_id, row.target_sha, previousCompatibility, targetCompatibility,
+        );
+        this.assertLease(row);
+        if (migration.timed_out || migration.output_truncated || migration.exit_code !== 0) {
+          // A non-zero exit without a timeout is a definitive command
+          // rejection, but the database outcome still needs direct proof.
+          // Restore the v2-only runtime only after verifying the live database
+          // is healthy and remains at the exact previous schema.
+          // Timeout/null-exit and truncated-success outcomes remain ambiguous:
+          // the database may already be v3, and restarting a v2-only runtime
+          // would be unsafe.
+          if (!migration.timed_out && migration.exit_code !== null && migration.exit_code !== 0) {
+            let schemaState: Awaited<ReturnType<RuntimePort["appSchemaState"]>> | undefined;
+            try {
+              schemaState = await this.runtime.appSchemaState();
+              this.assertLease(row);
+            } catch {
+              // Missing read-back is not evidence that the old runtime is safe.
+            }
+            if (schemaState?.user_version === previousCompatibility.app_schema_write &&
+              schemaState.integrity_ok && schemaState.foreign_key_violations === 0) {
+              await this.restoreQuiescedServices(row, "app_schema_migration_rejected");
+              return;
+            }
+            this.needsReview(row, "app_schema_migration_state_unverified", undefined, {
+              ...(schemaState ? { app_schema: schemaState } : {}),
+            });
+            return;
+          }
+          this.needsReview(row, "app_schema_migration_unverified");
+          return;
+        }
+      }
       row = this.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced", {}, this.clock.now());
     }
     if (row.state === "activating") {
@@ -523,6 +686,7 @@ export class UpdateController {
       }
       const dispatcherStart = await this.ensureServiceStarted(
         row, "start_target_dispatcher", "dispatcher", row.target_sha, () => this.runtime.startDispatcher(),
+        targetCompatibility,
       );
       if (dispatcherStart === "deferred") return;
       if (dispatcherStart === "wrong_sha") {
@@ -531,6 +695,7 @@ export class UpdateController {
       }
       const slackStart = await this.ensureServiceStarted(
         row, "start_target_slack", "slack_adapter", row.target_sha, () => this.runtime.startSlack(),
+        targetCompatibility,
       );
       if (slackStart === "deferred") return;
       if (slackStart === "wrong_sha") {
@@ -562,8 +727,8 @@ export class UpdateController {
         await this.rollback(row, "slack_wrong_target_sha", {});
         return;
       }
-      if (!this.healthMatches(dispatcherHealth, row.target_sha, false) ||
-        !this.healthMatches(slackHealth, row.target_sha, true) ||
+      if (!this.healthMatches(dispatcherHealth, row.target_sha, false, targetCompatibility) ||
+        !this.healthMatches(slackHealth, row.target_sha, true, targetCompatibility) ||
         !this.notificationReporterReady(dispatcherHealth, slackHealth) ||
         !this.mainAgentMatchesReceipt(row, mainAgent)) {
         this.deferOrReview(row, "ambiguous_runtime_observation", "Target runtime has not reached the exact verified state");
@@ -605,6 +770,13 @@ export class UpdateController {
 
   private async resumeRollback(row: UpdateRow, knownPaneId?: string): Promise<void> {
     this.assertLease(row);
+    const previousManifest = await this.releases.releaseManifest(row.current_sha);
+    this.assertLease(row);
+    if (!previousManifest) {
+      this.needsReview(row, "rollback_previous_release_manifest_missing");
+      return;
+    }
+    const previousCompatibility = previousManifest.compatibility;
     let observation = await this.releases.observe();
     let receipt = observation.receipt;
     const pointerAlreadyRolledBack = observation.current_sha === row.current_sha &&
@@ -694,6 +866,7 @@ export class UpdateController {
     if (!(await this.ensurePreviousMainAgentStarted(row, paneId, previousSessionId))) return;
     const dispatcherStart = await this.ensureServiceStarted(
       row, "start_previous_dispatcher", "dispatcher", row.current_sha, () => this.runtime.startDispatcher(),
+      previousCompatibility,
     );
     if (dispatcherStart !== "started") {
       if (dispatcherStart === "wrong_sha") this.needsReview(row, "rollback_dispatcher_wrong_sha");
@@ -701,6 +874,7 @@ export class UpdateController {
     }
     const slackStart = await this.ensureServiceStarted(
       row, "start_previous_slack", "slack_adapter", row.current_sha, () => this.runtime.startSlack(),
+      previousCompatibility,
     );
     if (slackStart !== "started") {
       if (slackStart === "wrong_sha") this.needsReview(row, "rollback_slack_wrong_sha");
@@ -717,8 +891,8 @@ export class UpdateController {
       pointerFinal.receipt?.request_id !== row.request_id || pointerFinal.receipt.from_sha !== row.target_sha ||
       pointerFinal.receipt.to_sha !== row.current_sha || pointerFinal.receipt.generation !== row.activation_generation ||
       pointerFinal.receipt.fence > row.fence ||
-      !this.healthMatches(dispatcherFinal, row.current_sha, false) ||
-      !this.healthMatches(slackFinal, row.current_sha, true) ||
+      !this.healthMatches(dispatcherFinal, row.current_sha, false, previousCompatibility) ||
+      !this.healthMatches(slackFinal, row.current_sha, true, previousCompatibility) ||
       !this.mainAgentMatchesOperation(row, "start_previous_main_agent", row.current_sha, mainFinal)) {
       this.deferOrReview(row, "rollback_previous_health_failed", "Previous runtime has not reached the exact verified state");
       return;
@@ -732,12 +906,16 @@ export class UpdateController {
     }, this.clock.now());
   }
 
-  private async waitForHealth(service: HealthSnapshot["service"], sha: string): Promise<HealthSnapshot> {
+  private async waitForHealth(
+    service: HealthSnapshot["service"],
+    sha: string,
+    compatibility: ReleaseManifest["compatibility"],
+  ): Promise<HealthSnapshot> {
     const deadline = Date.now() + this.policy.timeouts.health_ms;
     let latest: HealthSnapshot;
     do {
       latest = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
-      if (this.healthMatches(latest, sha, service === "slack_adapter")) return latest;
+      if (this.healthMatches(latest, sha, service === "slack_adapter", compatibility)) return latest;
       if (latest.live && latest.build_sha && latest.build_sha !== sha) return latest;
       await new Promise((resolve) => setTimeout(resolve, 100));
     } while (Date.now() < deadline);
@@ -770,13 +948,14 @@ export class UpdateController {
     const activeSha = observation.current_sha;
     if (!activeSha) return undefined;
     const activeRelease = path.join(this.policy.release_root, activeSha);
-    const [dispatcherHealth, slackHealth, mainAgent] = await Promise.all([
+    const [dispatcherHealth, slackHealth, mainAgent, activeManifest] = await Promise.all([
       this.runtime.dispatcherHealth(),
       this.runtime.slackHealth(),
       this.runtime.mainAgentStatus(activeRelease),
+      this.releases.releaseManifest(activeSha),
     ]);
-    if (!this.healthMatches(dispatcherHealth, activeSha, false) ||
-      !this.healthMatches(slackHealth, activeSha, true)) return undefined;
+    if (!activeManifest || !this.healthMatches(dispatcherHealth, activeSha, false, activeManifest.compatibility) ||
+      !this.healthMatches(slackHealth, activeSha, true, activeManifest.compatibility)) return undefined;
 
     const captured = this.database.runtimeOperation(row.request_id, "legacy_confirmation");
     if (captured?.phase === "observed") {
@@ -913,6 +1092,10 @@ export class UpdateController {
     }
     if (existing?.phase === "rejected") {
       this.needsReview(row, "rollback_main_agent_stop_rejected");
+      return undefined;
+    }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
       return undefined;
     }
     if (existing) {
@@ -1077,6 +1260,10 @@ export class UpdateController {
       this.needsReview(row, `${kind}_rejected`, `The persisted ${kind} operation was definitively rejected`);
       return false;
     }
+    if (existing?.phase === "prepared") {
+      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
+      return false;
+    }
     if (existing) {
       const health = await this.waitForStopped(service);
       this.assertLease(row);
@@ -1196,6 +1383,7 @@ export class UpdateController {
     service: HealthSnapshot["service"],
     sha: string,
     execute: () => Promise<CommandResult>,
+    compatibility: ReleaseManifest["compatibility"],
   ): Promise<"started" | "deferred" | "wrong_sha"> {
     const existing = this.database.runtimeOperation(row.request_id, kind);
     if (existing && (existing.target_ref !== service || existing.expected_sha !== sha)) {
@@ -1207,10 +1395,10 @@ export class UpdateController {
       return "deferred";
     }
     if (existing) {
-      const health = await this.waitForHealth(service, sha);
+      const health = await this.waitForHealth(service, sha, compatibility);
       this.assertLease(row);
       if (health.live && health.build_sha && health.build_sha !== sha) return "wrong_sha";
-      if (this.healthMatches(health, sha, service === "slack_adapter")) {
+      if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
         this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
         return "started";
       }
@@ -1221,7 +1409,7 @@ export class UpdateController {
     const before = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
     this.assertLease(row);
     if (before.live && before.build_sha && before.build_sha !== sha) return "wrong_sha";
-    if (this.healthMatches(before, sha, service === "slack_adapter")) {
+    if (this.healthMatches(before, sha, service === "slack_adapter", compatibility)) {
       this.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, sha, null, {}, this.clock.now());
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health: before }, this.clock.now());
       return "started";
@@ -1246,10 +1434,10 @@ export class UpdateController {
       return "deferred";
     }
     this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "accepted", null, { exit_code: result.exit_code }, this.clock.now());
-    const health = await this.waitForHealth(service, sha);
+    const health = await this.waitForHealth(service, sha, compatibility);
     this.assertLease(row);
     if (health.live && health.build_sha && health.build_sha !== sha) return "wrong_sha";
-    if (this.healthMatches(health, sha, service === "slack_adapter")) {
+    if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
       return "started";
     }
@@ -1257,13 +1445,37 @@ export class UpdateController {
     return "deferred";
   }
 
-  private healthMatches(health: HealthSnapshot, sha: string, requireWorkspaces: boolean): boolean {
-    return health.ready && health.build_sha === sha && health.protocol === this.policy.compatibility.protocol &&
-      health.app_schema === this.policy.compatibility.app_schema_write && health.config === this.policy.compatibility.config &&
+  private healthMatches(
+    health: HealthSnapshot,
+    sha: string,
+    requireWorkspaces: boolean,
+    compatibility: ReleaseManifest["compatibility"],
+  ): boolean {
+    const rangeAbsent = health.app_schema_read_min === undefined && health.app_schema_read_max === undefined &&
+      health.app_schema_write === undefined;
+    const rangeMatches = health.app_schema_read_min === compatibility.app_schema_read_min &&
+      health.app_schema_read_max === compatibility.app_schema_read_max &&
+      health.app_schema_write === compatibility.app_schema_write;
+    const legacySingleSchemaProjection = compatibility.app_schema_read_min === compatibility.app_schema_read_max &&
+      compatibility.app_schema_write === compatibility.app_schema_read_min && rangeAbsent;
+    const actualSchemaReadable = health.app_schema !== null &&
+      health.app_schema >= compatibility.app_schema_read_min &&
+      health.app_schema <= compatibility.app_schema_read_max;
+    return health.ready && health.build_sha === sha && health.protocol === compatibility.protocol &&
+      actualSchemaReadable && health.config === compatibility.config &&
+      (legacySingleSchemaProjection || rangeMatches) &&
       (!requireWorkspaces || health.workspaces_ready === true);
   }
 
   private async restoreQuiescedServices(row: UpdateRow, causeCode: string): Promise<void> {
+    const stoppedMainAgent = this.database.runtimeOperation(row.request_id, "stop_main_agent");
+    if (stoppedMainAgent?.phase === "observed") {
+      if (!stoppedMainAgent.target_ref || !(await this.ensurePreviousMainAgentStarted(
+        row,
+        stoppedMainAgent.target_ref,
+        stoppedMainAgent.previous_session_id ?? undefined,
+      ))) return;
+    }
     if (!(await this.restartQuiescedService(
       row,
       "restart_current_dispatcher",
@@ -1278,16 +1490,57 @@ export class UpdateController {
       causeCode,
       () => this.runtime.startSlack(),
     ))) return;
-    const [pointer, mainAgent] = await Promise.all([
+    let [pointer, initialMainAgent] = await Promise.all([
       this.releases.observe(),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha)),
     ]);
     this.assertLease(row);
-    if (pointer.current_sha !== row.current_sha || !mainAgentMatches(mainAgent)) {
+    let mainAgent = initialMainAgent;
+    let mainAgentVerified = mainAgentMatches(initialMainAgent);
+    let servicesVerified = true;
+    let recoveryHealth: { dispatcher: HealthSnapshot; slack_adapter: HealthSnapshot } | undefined;
+    let settledMainAgent: MainAgentObservation | undefined;
+    const retryableMainAgentObservation = initialMainAgent.exists &&
+      initialMainAgent.name === this.policy.main_agent.name && initialMainAgent.kind === "codex" &&
+      initialMainAgent.matches_release && initialMainAgent.pane_id !== null && initialMainAgent.session_id !== null;
+    if (pointer.current_sha === row.current_sha && !mainAgentVerified && retryableMainAgentObservation) {
+      // Herdr can briefly report the just-finished dona-main turn as non-interactive.
+      // Reuse its bounded idle wait before treating an otherwise restored runtime as ambiguous.
+      const settled = await this.runtime.waitForMainAgentIdle();
+      settledMainAgent = settled;
+      this.assertLease(row);
+      const observed = await this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha));
+      this.assertLease(row);
+      const sameSettledIdentity = settled.pane_id !== null && settled.session_id !== null &&
+        settled.pane_id === observed.pane_id && settled.session_id === observed.session_id;
+      mainAgent = observed;
+      mainAgentVerified = sameSettledIdentity && mainAgentMatches(observed);
+      const [currentPointer, dispatcherHealth, slackHealth, currentManifest] = await Promise.all([
+        this.releases.observe(),
+        this.runtime.dispatcherHealth(),
+        this.runtime.slackHealth(),
+        this.releases.releaseManifest(row.current_sha),
+      ]);
+      this.assertLease(row);
+      pointer = currentPointer;
+      recoveryHealth = { dispatcher: dispatcherHealth, slack_adapter: slackHealth };
+      servicesVerified = currentManifest !== null &&
+        this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
+        this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility) &&
+        this.notificationReporterReady(dispatcherHealth, slackHealth);
+    }
+    if (pointer.current_sha !== row.current_sha || !servicesVerified || !mainAgentVerified) {
       this.needsReview(
         row,
         "quiesce_recovery_runtime_mismatch",
         `Update stopped before pointer mutation (${causeCode}), but the exact current pointer and main-agent runtime were not verified`,
+        {
+          cause_code: causeCode,
+          pointer: { current_sha: pointer.current_sha, previous_sha: pointer.previous_sha },
+          main_agent: this.mainAgentAuditObservation(mainAgent),
+          ...(settledMainAgent ? { settled_main_agent: this.mainAgentAuditObservation(settledMainAgent) } : {}),
+          ...(recoveryHealth ? { services: recoveryHealth } : {}),
+        },
       );
       return;
     }
@@ -1376,9 +1629,19 @@ export class UpdateController {
         exit_code: result.exit_code,
       }, this.clock.now());
     }
-    const health = await this.waitForHealth(service, row.current_sha);
+    const currentManifest = await this.releases.releaseManifest(row.current_sha);
     this.assertLease(row);
-    if (!this.healthMatches(health, row.current_sha, service === "slack_adapter")) {
+    if (!currentManifest) {
+      this.needsReview(
+        row,
+        `${codePrefix}_release_manifest_missing`,
+        `Update stopped before main-agent mutation (${causeCode}), but the current release manifest was not found`,
+      );
+      return false;
+    }
+    const health = await this.waitForHealth(service, row.current_sha, currentManifest.compatibility);
+    this.assertLease(row);
+    if (!this.healthMatches(health, row.current_sha, service === "slack_adapter", currentManifest.compatibility)) {
       this.needsReview(
         row,
         `${codePrefix}_health_failed`,
@@ -1402,11 +1665,26 @@ export class UpdateController {
     row: UpdateRow,
     code: string,
     message = "External command or runtime acceptance could not be proven; no blind retry was attempted",
+    details: Record<string, unknown> = {},
   ): void {
     this.database.terminal(row.request_id, row.fence, "needs_review", code, {
       last_error_code: code,
       last_error_message: message,
-    }, this.clock.now());
+    }, this.clock.now(), details);
+  }
+
+  private mainAgentAuditObservation(agent: MainAgentObservation): Record<string, unknown> {
+    return {
+      exists: agent.exists,
+      name: agent.name,
+      kind: agent.kind,
+      pane_id: agent.pane_id,
+      status: agent.status,
+      interactive_ready: agent.interactive_ready,
+      session_id: agent.session_id,
+      matches_release: agent.matches_release,
+      error_code: agent.error_code,
+    };
   }
 
   private assertLease(row: UpdateRow): void {
@@ -1465,15 +1743,16 @@ export class UpdateController {
   private async currentRuntimeVerified(row: UpdateRow): Promise<boolean> {
     try {
       const release = path.join(this.policy.release_root, row.current_sha);
-      const [pointer, dispatcherHealth, slackHealth, mainAgent] = await Promise.all([
+      const [pointer, dispatcherHealth, slackHealth, mainAgent, currentManifest] = await Promise.all([
         this.releases.observe(),
         this.runtime.dispatcherHealth(),
         this.runtime.slackHealth(),
         this.runtime.mainAgentStatus(release),
+        this.releases.releaseManifest(row.current_sha),
       ]);
-      return pointer.current_sha === row.current_sha &&
-        this.healthMatches(dispatcherHealth, row.current_sha, false) &&
-        this.healthMatches(slackHealth, row.current_sha, true) &&
+      return currentManifest !== null && pointer.current_sha === row.current_sha &&
+        this.healthMatches(dispatcherHealth, row.current_sha, false, currentManifest.compatibility) &&
+        this.healthMatches(slackHealth, row.current_sha, true, currentManifest.compatibility) &&
         mainAgentMatches(mainAgent);
     } catch {
       return false;

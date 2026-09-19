@@ -4,7 +4,7 @@ import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
 import type { AgentStatus, HerdrCommandResult } from "./herdr.js";
-import { workspaceFromJob } from "./job-prompt.js";
+import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
 import type { JobRow } from "./types.js";
 
 export interface PreparedJobRuntime {
@@ -17,9 +17,10 @@ export class PreparedWorkspaceCleanupError extends Error {
 }
 
 export interface JobAgentRuntime {
+  disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
-  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
@@ -33,7 +34,7 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[]=[]): string[] {
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true): string[] {
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
@@ -41,6 +42,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
     ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
     : ["--add-dir", resultDirectory];
+  if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {
@@ -104,14 +106,38 @@ function findAgentStatus(input: unknown): AgentStatus | undefined {
   return undefined;
 }
 
+function findAgentSessionId(input: unknown): string | undefined {
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const session = record.agent_session;
+  if (session !== null && typeof session === "object") {
+    const sessionRecord = session as Record<string, unknown>;
+    if (sessionRecord.kind === "id" && typeof sessionRecord.value === "string") return sessionRecord.value;
+  }
+  for (const value of Object.values(record)) {
+    const nested = findAgentSessionId(value);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
 function resultFromProcess(base: Omit<HerdrCommandResult, "errorCode" | "agentStatus">): HerdrCommandResult {
   const parsed = parseJson(base.ok ? base.stdout : base.stderr || base.stdout);
   const error = findValue(parsed, ["error_code", "code"]);
   const agentStatus = findAgentStatus(parsed);
+  const workspaceId = findValue(parsed, ["workspace_id"]);
+  const paneId = findValue(parsed, ["pane_id"]);
+  const agentName = findValue(parsed, ["agent_name", "name"]);
+  const agentSessionId = findAgentSessionId(parsed);
+  const sequence = findValue(parsed, ["state_change_seq"]);
   return {
     ...base,
     ...(typeof error === "string" ? { errorCode: error } : {}),
     ...(agentStatus ? { agentStatus } : {}),
+    ...(agentSessionId === undefined ? {} : {
+      agentIdentity: JSON.stringify([workspaceId ?? null, paneId ?? null, agentName ?? null, agentSessionId]),
+    }),
+    ...(Number.isSafeInteger(sequence) && Number(sequence) >= 0 ? { stateChangeSeq: Number(sequence) } : {}),
   };
 }
 
@@ -120,9 +146,11 @@ function runProcess(
   args: string[],
   timeoutMs: number,
   signal?: AbortSignal,
+  settleBeforeClose = false,
+  stdin = "",
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -135,16 +163,22 @@ function runProcess(
       signal?.removeEventListener("abort", abort);
       resolve(resultFromProcess(base));
     };
-    const kill = (): void => {
-      if (!child.killed) child.kill("SIGTERM");
+    const terminate = (): void => {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      forceKill.unref();
     };
     const abort = (): void => {
       aborted = true;
-      kill();
+      terminate();
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      kill();
+      terminate();
+      if (settleBeforeClose) finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
     }, timeoutMs);
     timer.unref();
     signal?.addEventListener("abort", abort, { once: true });
@@ -155,6 +189,11 @@ function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 1_048_576) stderr += chunk.toString("utf8");
     });
+    child.stdin.on("error", (error) => {
+      stderr = error.message;
+      terminate();
+      finish({ ok: false, stdout, stderr, exitCode: child.exitCode, timedOut, aborted });
+    });
     child.once("error", (error) => {
       stderr = error.message;
       finish({ ok: false, stdout, stderr, exitCode: null, timedOut, aborted });
@@ -162,12 +201,73 @@ function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
+    child.stdin.end(stdin);
+  });
+}
+
+function resolveCommitPrefix(
+  executable: string,
+  args: string[],
+  prefix: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; candidates: string[]; stderr: string; timedOut: boolean; aborted: boolean }> {
+  return new Promise((resolve) => {
+    const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const candidates = new Set<string>();
+    let remainder = "";
+    let stderr = "";
+    let timedOut = false;
+    let aborted = false;
+    let settled = false;
+    const inspect = (line: string): void => {
+      const objectId = line.split(" ", 1)[0] ?? "";
+      if (candidates.size < 2 && /^[0-9a-f]{40,64}$/i.test(objectId) && objectId.toLowerCase().startsWith(prefix.toLowerCase())) {
+        candidates.add(objectId);
+      }
+    };
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (remainder) inspect(remainder);
+      resolve({ ok: ok && !timedOut && !aborted, candidates: [...candidates], stderr, timedOut, aborted });
+    };
+    const terminate = (): void => {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      const forceKill = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      forceKill.unref();
+    };
+    const abort = (): void => { aborted = true; terminate(); };
+    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
+    timer.unref();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    child.stdout.on("data", (chunk: Buffer) => {
+      const lines = `${remainder}${chunk.toString("utf8")}`.split("\n");
+      remainder = lines.pop() ?? "";
+      for (const line of lines) inspect(line);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < 2_000) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => { stderr = error.message; finish(false); });
+    child.once("close", (code) => finish(code === 0));
   });
 }
 
 function commandError(label: string, result: HerdrCommandResult): Error {
   const detail = (result.stderr || result.stdout || "command failed").trim().slice(0, 2_000);
   const error = new Error(`${label}: ${detail}`);
+  (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
+  return error;
+}
+
+function safeCommandError(label: string, result: Pick<HerdrCommandResult, "timedOut"> & Partial<Pick<HerdrCommandResult, "errorCode">>): Error {
+  const error = new Error(label);
   (error as Error & { code?: string }).code = result.errorCode ?? (result.timedOut ? "command_timeout" : "command_failed");
   return error;
 }
@@ -200,7 +300,8 @@ async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> 
 }
 
 export class HerdrJobAgentRuntime implements JobAgentRuntime {
-  constructor(private readonly config: DispatcherConfig) {}
+  constructor(private readonly config: DispatcherConfig, private progressEnabled = true) {}
+  disableProgress(): void { this.progressEnabled = false; }
 
   async prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime> {
     const workspace = workspaceFromJob(row);
@@ -211,9 +312,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const resultDirectory=path.dirname(row.result_path);
     await fs.mkdir(resultDirectory, { recursive: true, mode: 0o700 });
     await fs.chmod(resultDirectory, 0o700);
+    if (this.progressEnabled && row.source !== "dona_schedule") {
+      await fs.mkdir(path.dirname(jobProgressPath(row)), { recursive: true, mode: 0o700 });
+      await fs.chmod(path.dirname(jobProgressPath(row)), 0o700);
+    }
 
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
+      if (workspace.kind === "github") {
+        await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
+      }
       const parsed = parseJson(existingAgent.stdout);
       const workspaceId = findValue(parsed, ["workspace_id"]);
       const paneId = findValue(parsed, ["pane_id"]);
@@ -251,7 +359,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config,disabledMcpServers),
+          "--", ...codexAgentArguments(row, this.config,disabledMcpServers, this.progressEnabled),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,
@@ -268,11 +376,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
-  get(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
-    return this.herdr(["agent", "get", agentName], this.config.jobCommandTimeoutMs, signal);
+  get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal, true);
   }
 
-  prompt(agentName: string, text: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    const statusTimeoutMs = timeoutMs ?? this.config.jobCommandTimeoutMs;
     return this.herdr([
       "agent", "prompt", agentName, text,
       "--wait",
@@ -280,8 +389,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--until", "idle",
       "--until", "done",
       "--until", "blocked",
-      "--timeout", String(this.config.jobCommandTimeoutMs),
-    ], this.config.jobCommandTimeoutMs + 5_000, signal);
+      "--timeout", String(statusTimeoutMs),
+    ], statusTimeoutMs + 5_000, signal);
   }
 
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
@@ -314,12 +423,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return closed.ok ? closed : { ...closed, ok: true };
   }
 
-  private herdr(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrCommandResult> {
+  private herdr(
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+    settleBeforeClose = false,
+  ): Promise<HerdrCommandResult> {
     return runProcess(
       this.config.herdrPath,
       ["--session", this.config.herdrSession, ...args],
       timeoutMs,
       signal,
+      settleBeforeClose,
     );
   }
 
@@ -367,56 +482,413 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (normalizedRepository(origin.stdout) !== repository.toLowerCase()) {
       throw new Error(`Existing repository origin does not match ${repository}`);
     }
-    const fetched = await runProcess(
-      this.config.gitPath,
-      ["-C", repositoryPath, "fetch", "--prune", "origin"],
-      120_000,
-      signal,
-    );
-    if (!fetched.ok) throw commandError("Git fetch failed", fetched);
-
-    let baseRef = requestedBaseRef;
-    if (!baseRef) {
-      const viewed = await runProcess(
-        this.config.ghPath,
-        ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-        this.config.jobCommandTimeoutMs,
-        signal,
-      );
-      if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
-      baseRef = `origin/${viewed.stdout.trim()}`;
-    } else {
-      const local = await runProcess(
-        this.config.gitPath,
-        ["-C", repositoryPath, "rev-parse", "--verify", `${baseRef}^{commit}`],
-        this.config.jobCommandTimeoutMs,
-        signal,
-      );
-      if (!local.ok) {
-        const remoteBase = `origin/${baseRef}`;
-        const remote = await runProcess(
-          this.config.gitPath,
-          ["-C", repositoryPath, "rev-parse", "--verify", `${remoteBase}^{commit}`],
-          this.config.jobCommandTimeoutMs,
-          signal,
-        );
-        if (!remote.ok) throw commandError(`Git base ref ${baseRef} was not found`, remote);
-        baseRef = remoteBase;
-      }
-    }
     if (await exists(path.join(row.workspace_path, ".git"))) {
+      await this.verifyExistingWorktreeIdentity(row, repositoryPath, signal);
       return this.herdr([
         "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
-    return this.herdr([
+    const persistedBaseRef = `refs/dona/bases/${row.job_id}`;
+    const persistedBase = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "rev-parse", "--verify", `${persistedBaseRef}^{commit}`],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const persistedBaseSha = persistedBase.stdout.trim();
+    if (persistedBase.ok && /^[0-9a-f]{40,64}$/i.test(persistedBaseSha)) {
+      const created = await this.herdr([
+        "worktree", "create",
+        "--cwd", repositoryPath,
+        "--branch", `dona/${row.job_id}`,
+        "--base", persistedBaseSha,
+        "--path", row.workspace_path,
+        "--label", row.agent_name,
+        "--no-focus",
+      ], 120_000, signal);
+      if (!created.ok) throw commandError("Herdr worktree creation failed", created);
+      await this.verifyWorktreeIdentity(row, repositoryPath, persistedBaseSha, signal);
+      return created;
+    }
+    let baseBranch = requestedBaseRef;
+    const upstream = baseBranch?.match(/^(.*?)@\{(upstream|u|push)\}$/i) ?? undefined;
+    const upstreamKind = upstream?.[2]?.toLowerCase();
+    if (baseBranch === "origin" || baseBranch === "origin/HEAD") {
+      const sameNameTag = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--exit-code", "--refs", "--tags", "origin", `refs/tags/${baseBranch}`],
+        120_000,
+        signal,
+      );
+      if (sameNameTag.ok && sameNameTag.stdout.trim()) {
+        throw new Error(`GitHub base ref ${baseBranch} is ambiguous with a remote tag`);
+      }
+      if (!sameNameTag.ok && sameNameTag.exitCode !== 2) {
+        throw safeCommandError("Git remote tag ambiguity check failed", sameNameTag);
+      }
+    }
+    const usesDefaultBranch = !baseBranch || baseBranch === "@" || baseBranch === "HEAD" || baseBranch === "FETCH_HEAD" || baseBranch === "origin"
+      || baseBranch === "origin/HEAD" || baseBranch === "remotes/origin/HEAD" || baseBranch === "refs/remotes/origin/HEAD"
+      || (upstream !== undefined && !upstream[1]);
+    if (usesDefaultBranch) {
+      const viewed = await runProcess(
+        this.config.ghPath,
+        ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        120_000,
+        signal,
+      );
+      if (!viewed.ok || !viewed.stdout.trim()) throw commandError("GitHub default branch lookup failed", viewed);
+      baseBranch = `refs/heads/${viewed.stdout.trim()}`;
+    } else if (upstream) {
+      const branchName = upstream[1];
+      const [trackedRemote, trackedMerge] = await Promise.all([
+        runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "config", "--get", `branch.${branchName}.remote`],
+          this.config.jobCommandTimeoutMs,
+          signal,
+        ),
+        runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "config", "--get-all", `branch.${branchName}.merge`],
+          this.config.jobCommandTimeoutMs,
+          signal,
+        ),
+      ]);
+      const mergeRef = trackedMerge.stdout.trim().split("\n")[0] ?? "";
+      if (upstreamKind !== "push") {
+        if (!trackedRemote.ok || trackedRemote.stdout.trim() !== "origin" || !trackedMerge.ok || !mergeRef.startsWith("refs/heads/")) {
+          throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
+        }
+        baseBranch = mergeRef;
+      } else {
+        const [branchPushRemote, defaultPushRemote, pushDefault, configuredPush] = await Promise.all([
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get", `branch.${branchName}.pushRemote`],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get", "remote.pushDefault"],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get", "push.default"],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+          runProcess(
+            this.config.gitPath,
+            ["-C", repositoryPath, "config", "--get-all", "remote.origin.push"],
+            this.config.jobCommandTimeoutMs,
+            signal,
+          ),
+        ]);
+        const pushRemote = branchPushRemote.ok && branchPushRemote.stdout.trim()
+          ? branchPushRemote.stdout.trim()
+          : defaultPushRemote.ok && defaultPushRemote.stdout.trim()
+            ? defaultPushRemote.stdout.trim()
+            : trackedRemote.ok && trackedRemote.stdout.trim()
+              ? trackedRemote.stdout.trim()
+              : "origin";
+        const mode = pushDefault.ok && pushDefault.stdout.trim() ? pushDefault.stdout.trim() : "simple";
+        if (pushRemote !== "origin" || configuredPush.ok) {
+          throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
+        }
+        if ((mode === "upstream" || mode === "tracking") && trackedRemote.ok && trackedRemote.stdout.trim() === pushRemote
+          && trackedMerge.ok && mergeRef.startsWith("refs/heads/")) baseBranch = mergeRef;
+        else if (mode === "current") baseBranch = `refs/heads/${branchName}`;
+        else if (mode === "matching") baseBranch = `refs/heads/${branchName}`;
+        else if (mode === "simple" && trackedRemote.ok && trackedMerge.ok && trackedRemote.stdout.trim() === pushRemote && mergeRef === `refs/heads/${branchName}`) {
+          baseBranch = mergeRef;
+        } else {
+          throw new Error(`GitHub base ref ${baseBranch} does not resolve to an origin branch`);
+        }
+      }
+    }
+    if (!baseBranch) throw new Error("GitHub base ref could not be resolved");
+    if (baseBranch.startsWith("origin/") && baseBranch !== "origin/HEAD") {
+      const branchName = baseBranch.slice("origin/".length);
+      const advertised = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--refs", "origin", `refs/heads/${branchName}`, `refs/tags/${baseBranch}`],
+        120_000,
+        signal,
+      );
+      if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
+      const advertisedRefs = advertised.stdout.trim().split("\n").map((line) => line.split("\t")[1]).filter(Boolean);
+      const hasBranch = advertisedRefs.includes(`refs/heads/${branchName}`);
+      const hasTag = advertisedRefs.includes(`refs/tags/${baseBranch}`);
+      if (hasBranch && hasTag) throw new Error(`Git remote base ref ${baseBranch} is ambiguous`);
+      if (hasTag) baseBranch = `refs/tags/${baseBranch}`;
+      else if (hasBranch) baseBranch = `refs/heads/${branchName}`;
+      else throw new Error(`Git remote base ref ${baseBranch} was not found`);
+    }
+    const explicitTag = baseBranch.startsWith("refs/tags/")
+      ? baseBranch
+      : baseBranch.startsWith("tags/")
+        ? `refs/${baseBranch}`
+        : undefined;
+    const explicitBranch = baseBranch.startsWith("refs/heads/")
+      ? baseBranch.slice("refs/heads/".length)
+      : baseBranch.startsWith("heads/")
+        ? baseBranch.slice("heads/".length)
+      : baseBranch.startsWith("refs/remotes/origin/")
+        ? baseBranch.slice("refs/remotes/origin/".length)
+        : baseBranch.startsWith("remotes/origin/")
+          ? baseBranch.slice("remotes/origin/".length)
+        : baseBranch.startsWith("origin/")
+          ? baseBranch.slice("origin/".length)
+          : undefined;
+    let sourceRef: string;
+    let fetchedRef: string;
+    if (explicitTag) {
+      sourceRef = explicitTag;
+      fetchedRef = `refs/dona/bases/${row.job_id}`;
+    } else if (explicitBranch) {
+      sourceRef = `refs/heads/${explicitBranch}`;
+      fetchedRef = `refs/dona/bases/${row.job_id}`;
+    } else {
+      const checked = await runProcess(
+        this.config.gitPath,
+        ["check-ref-format", "--branch", baseBranch],
+        120_000,
+        signal,
+      );
+      if (!checked.ok) throw new Error("GitHub base ref name is invalid");
+      const advertised = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "ls-remote", "--refs", "origin", `refs/heads/${baseBranch}`, `refs/tags/${baseBranch}`],
+        120_000,
+        signal,
+      );
+      if (!advertised.ok) throw safeCommandError(`Git remote base ref ${baseBranch} could not be inspected`, advertised);
+      const advertisedRefs = advertised.stdout.trim().split("\n").map((line) => line.split("\t")[1]).filter(Boolean);
+      const hasBranch = advertisedRefs.includes(`refs/heads/${baseBranch}`);
+      const hasTag = advertisedRefs.includes(`refs/tags/${baseBranch}`);
+      if (hasBranch && hasTag) throw new Error(`Git remote base ref ${baseBranch} is ambiguous`);
+      let resolvedObject: string | undefined;
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseBranch)) {
+        try {
+          resolvedObject = await this.resolveRemoteCommit(repositoryPath, baseBranch, row, signal);
+        } catch (error) {
+          if (!(error instanceof Error && error.message === `Git remote commit ${baseBranch} was not uniquely resolved` && (hasBranch || hasTag))) {
+            throw error;
+          }
+        }
+      }
+      if (resolvedObject) {
+        sourceRef = resolvedObject;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else if (hasBranch) {
+        sourceRef = `refs/heads/${baseBranch}`;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else if (hasTag) {
+        sourceRef = `refs/tags/${baseBranch}`;
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else if (/^[0-9a-f]{4,64}$/i.test(baseBranch)) {
+        sourceRef = await this.resolveRemoteCommit(repositoryPath, baseBranch, row, signal);
+        fetchedRef = `refs/dona/bases/${row.job_id}`;
+      } else {
+        throw new Error(`Git remote base ref ${baseBranch} was not found`);
+      }
+    }
+    const refspec = `+${sourceRef}:${fetchedRef}`;
+    const fetched = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "fetch", "--refmap=", "--prune", "origin", refspec],
+      120_000,
+      signal,
+    );
+    if (!fetched.ok) throw safeCommandError(`Git fetch failed for ref ${baseBranch}`, fetched);
+    const resolved = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "rev-parse", "--verify", `${fetchedRef}^{commit}`],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const baseSha = resolved.stdout.trim();
+    if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
+      throw safeCommandError(`Git remote base ref ${baseBranch} was not found`, resolved);
+    }
+    const created = await this.herdr([
       "worktree", "create",
       "--cwd", repositoryPath,
       "--branch", `dona/${row.job_id}`,
-      "--base", baseRef,
+      "--base", baseSha,
       "--path", row.workspace_path,
       "--label", row.agent_name,
       "--no-focus",
     ], 120_000, signal);
+    if (!created.ok) throw commandError("Herdr worktree creation failed", created);
+    await this.verifyWorktreeIdentity(row, repositoryPath, baseSha, signal);
+    return created;
+  }
+
+  private async verifyExistingGitHubWorktree(
+    row: JobRow,
+    repository: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const [owner, repo] = repository.split("/") as [string, string];
+    const repositoryPath = path.join(this.config.jobsWorkspaceRoot, "github", owner, repo, "repository");
+    const origin = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "remote", "get-url", "origin"],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    if (!origin.ok || normalizedRepository(origin.stdout) !== repository.toLowerCase()) {
+      throw new Error(`Existing repository origin does not match ${repository}`);
+    }
+    await this.verifyExistingWorktreeIdentity(row, repositoryPath, signal);
+  }
+
+  private async verifyExistingWorktreeIdentity(
+    row: JobRow,
+    repositoryPath: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const baseRef = `refs/dona/bases/${row.job_id}`;
+    let resolved = await runProcess(
+      this.config.gitPath,
+      ["-C", repositoryPath, "rev-parse", "--verify", `${baseRef}^{commit}`],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    let expectedSha = resolved.stdout.trim();
+    let migrateLegacyRef = false;
+    if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
+      const legacyRef = `refs/heads/dona/${row.job_id}`;
+      resolved = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--verify", `${legacyRef}^{commit}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      expectedSha = resolved.stdout.trim();
+      migrateLegacyRef = true;
+    }
+    if (!resolved.ok || !/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
+      throw safeCommandError(`Existing job branch dona/${row.job_id} could not be resolved`, resolved);
+    }
+    await this.verifyWorktreeIdentity(row, repositoryPath, expectedSha, signal);
+    if (migrateLegacyRef) {
+      const persisted = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "update-ref", baseRef, expectedSha],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      if (!persisted.ok) throw safeCommandError("Existing job base identity could not be migrated", persisted);
+    }
+  }
+
+  private async resolveRemoteCommit(
+    repositoryPath: string,
+    baseRef: string,
+    row: JobRow,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const objectNamespace = `refs/dona/objects/${row.job_id}`;
+    try {
+      const fetchedObjects = await runProcess(
+        this.config.gitPath,
+        [
+          "-C", repositoryPath, "fetch", "--refmap=", "--prune", "origin",
+          `+refs/heads/*:${objectNamespace}/heads/*`,
+          `+refs/tags/*:${objectNamespace}/tags/*`,
+        ],
+        120_000,
+        signal,
+      );
+      if (!fetchedObjects.ok) throw safeCommandError(`Git remote commit ${baseRef} could not be fetched`, fetchedObjects);
+      const remoteObjects = await resolveCommitPrefix(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-list", "--objects", `--glob=${objectNamespace}/*`],
+        baseRef,
+        120_000,
+        signal,
+      );
+      if (!remoteObjects.ok) throw safeCommandError("Git remote commit candidates could not be inspected", remoteObjects);
+      const candidates = remoteObjects.candidates;
+      if (candidates.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(candidates[0] ?? "")) {
+        throw new Error(`Git remote commit ${baseRef} was not uniquely resolved`);
+      }
+      const peeled = await runProcess(
+        this.config.gitPath,
+        ["-C", repositoryPath, "rev-parse", "--verify", `${candidates[0]}^{commit}`],
+        this.config.jobCommandTimeoutMs,
+        signal,
+      );
+      const commit = peeled.stdout.trim();
+      if (!peeled.ok || !/^[0-9a-f]{40,64}$/i.test(commit)) {
+        throw new Error(`Git remote commit ${baseRef} does not identify a commit`);
+      }
+      return commit;
+    } finally {
+      while (true) {
+        const listedRefs = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "for-each-ref", "--count=100", "--format=%(refname)", objectNamespace],
+          this.config.jobCommandTimeoutMs,
+        );
+        if (!listedRefs.ok) throw safeCommandError("Git temporary ref inspection failed", listedRefs);
+        const temporaryRefs = listedRefs.stdout.trim().split("\n").filter(Boolean);
+        if (temporaryRefs.length === 0) break;
+        const deleted = await runProcess(
+          this.config.gitPath,
+          ["-C", repositoryPath, "update-ref", "--stdin"],
+          this.config.jobCommandTimeoutMs,
+          undefined,
+          false,
+          temporaryRefs.map((temporaryRef) => `delete ${temporaryRef}\n`).join(""),
+        );
+        if (!deleted.ok) throw safeCommandError("Git temporary ref cleanup failed", deleted);
+      }
+    }
+  }
+
+  private async verifyWorktreeIdentity(
+    row: JobRow,
+    repositoryPath: string,
+    expectedSha: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const head = await runProcess(
+      this.config.gitPath,
+      ["-C", row.workspace_path, "rev-parse", "--verify", "HEAD^{commit}"],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const actualSha = head.stdout.trim();
+    if (!head.ok || actualSha !== expectedSha) {
+      throw new Error(`Git worktree HEAD mismatch for dona/${row.job_id}: expected ${expectedSha}, got ${actualSha || "unresolved"}`);
+    }
+    const branch = await runProcess(
+      this.config.gitPath,
+      ["-C", row.workspace_path, "symbolic-ref", "--quiet", "HEAD"],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const expectedBranch = `refs/heads/dona/${row.job_id}`;
+    if (!branch.ok || branch.stdout.trim() !== expectedBranch) {
+      throw new Error(`Git worktree branch mismatch for dona/${row.job_id}`);
+    }
+    const commonDir = await runProcess(
+      this.config.gitPath,
+      ["-C", row.workspace_path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      this.config.jobCommandTimeoutMs,
+      signal,
+    );
+    const actualCommonDir = commonDir.ok ? await fs.realpath(commonDir.stdout.trim()).catch(() => "") : "";
+    const expectedCommonDir = await fs.realpath(path.join(repositoryPath, ".git")).catch(() => "");
+    if (!actualCommonDir || actualCommonDir !== expectedCommonDir) {
+      throw new Error(`Git worktree repository mismatch for dona/${row.job_id}`);
+    }
   }
 }

@@ -124,16 +124,17 @@ for (const tamper of ["result_id", "run_job", "run_event", "job_source"] as cons
   });
 }
 
-for (const outcome of ["completed", "failed", "blocked", "missing", "invalid"] as const) {
-  test(`UDSから通常二件とscheduled一件を委任しsupervisorで${outcome}を回収する`, async () => {
+for (const schema of ["fresh","v2"] as const) for (const outcome of ["completed", "failed", "blocked", "missing", "invalid"] as const) {
+  test(`${schema} DBのUDSから通常二件とscheduled一件を委任しsupervisorで${outcome}を回収する`, async () => {
     const now = Math.floor(Date.now() / 1000) * 1000;
-    const h = new SchedulerIntegrationHarness(new Date(now - 120_000).toISOString().replace(".000Z", "Z"));
+    const h = new SchedulerIntegrationHarness(new Date(now - 120_000).toISOString().replace(".000Z", "Z"),schema);
     const { root, config } = await tempConfig();
     let api: DispatcherApi | undefined; let supervisor: JobSupervisor | undefined;
     const jobs: JobRow[] = [];
     try {
       const due = new Date(now - 60_000).toISOString().replace(".000Z", "Z");
-      const runId = h.materialize("public", h.input("work.read_only", false, due), due);
+      const scheduledObjective = "  inspect repository read-only  ";
+      const runId = h.materialize("public", {...h.input("work.read_only", false, due),content:scheduledObjective}, due);
       const eventId = h.repo.getRun(runId)!.event_id!;
       const ordinary = h.database.enqueue(eventEnvelope("public-regular")).row;
       for (const id of [ordinary.event_id, eventId]) { h.database.beginDispatch(id, path.join(root, `${id}.json`)); h.database.markWaiting(id); }
@@ -161,8 +162,9 @@ for (const outcome of ["completed", "failed", "blocked", "missing", "invalid"] a
         const created = await client.createJob({ source_event_id: ordinary.event_id, job_key, objective: "通常の調査", workspace: { kind: "scratch" } }) as { job: { job_id: string } };
         jobs.push(h.database.getJob(created.job.job_id)!);
       }
-      const created = await client.createJob({ source_event_id: eventId, objective: "inspect repository read-only", workspace: { kind: "scratch" } }) as { job: { job_id: string } };
+      const created = await client.createJob({ source_event_id: eventId, objective: scheduledObjective, workspace: { kind: "scratch" } }) as { job: { job_id: string } };
       jobs.push(h.database.getJob(created.job.job_id)!);
+      assert.equal(jobs[2]!.objective,scheduledObjective);
       for (const id of [ordinary.event_id, eventId]) h.database.saveCompleted(id, { schema_version: 1, event_id: id, status: "completed", completed_at: new Date().toISOString() }, path.join(root, `${id}.json`));
       await supervisor.start();
       await waitFor(() => jobs.every(job => h.database.getJob(job.job_id)?.completion_event_id != null));

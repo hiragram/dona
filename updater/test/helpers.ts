@@ -6,7 +6,7 @@ import type { UpdatePolicy } from "../src/policy.js";
 import type { ReleaseManifest } from "../src/types.js";
 import { canonicalJson } from "../src/validation.js";
 
-export const currentSha = "1".repeat(40);
+export const currentSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 export const targetSha = "2".repeat(40);
 export const olderSha = "0".repeat(40);
 
@@ -55,6 +55,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
         app_schema_write: 2,
         rollback_safe: true,
       },
+      compatibility_transitions: [],
     },
   };
 }

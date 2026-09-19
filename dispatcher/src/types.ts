@@ -27,6 +27,12 @@ export const jobStatuses = [
 
 export type JobStatus = (typeof jobStatuses)[number];
 
+export const jobGroupNotificationModes = ["grouped", "legacy"] as const;
+
+export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
+
+export type JobGroupTransition = "progress" | "attention" | "all_terminal";
+
 export interface EventEnvelope {
   schema_version: 1;
   source: "slack" | "dona_job" | "dona_update" | "dona_schedule";
@@ -50,7 +56,11 @@ export interface CreateJobRequest {
   workspace: JobWorkspace;
 }
 
-export interface CanonicalJobPayload { objective: string; workspace: JobWorkspace; }
+export interface CanonicalJobPayload {
+  objective: string;
+  workspace: JobWorkspace;
+}
+
 
 export interface SteerJobRequest {
   source_event_id: string;
@@ -154,12 +164,6 @@ export interface JobRow {
   updated_at: string;
 }
 
-export interface CreateJobResult {
-  row: JobRow;
-  outcome: "created" | "reused";
-  duplicate: boolean;
-}
-
 export interface JobGroupRow {
   source_event_id: string;
   sealed_at: string | null;
@@ -183,7 +187,35 @@ export interface JobGroupSnapshot {
   transition: JobGroupTransition;
 }
 
+export interface CreateJobResult {
+  row: JobRow;
+  outcome: "created" | "reused";
+  duplicate: boolean;
+}
 
-export const jobGroupNotificationModes = ["legacy", "grouped"] as const;
-export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
-export type JobGroupTransition = "progress" | "attention" | "all_terminal";
+export interface EventJobProjection {
+  job_id: string;
+  job_key: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  last_error_code: string | null;
+  result_summary: string | null;
+}
+
+export type EventJobReconciliation = "not_found" | "matched" | "conflict" | "unverified_legacy";
+
+export const jobProgressPhases = [
+  "preparing", "implementing", "testing", "reviewing", "waiting_ci", "reconciling",
+] as const;
+export type JobProgressPhase = (typeof jobProgressPhases)[number];
+
+export interface JobProgressEnvelope {
+  schema_version: 1;
+  job_id: string;
+  sequence: number;
+  phase: JobProgressPhase;
+  safe_summary: string;
+  updated_at: string;
+}

@@ -1,12 +1,35 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import { describe, test } from "node:test";
 
 import { parsePolicy } from "../src/policy.js";
 import { redactText } from "../src/redaction.js";
-import { parseApplyRequest, parsePlanRequest } from "../src/validation.js";
+import { parseApplyRequest, parseCompatibilityMetadata, parsePlanRequest } from "../src/validation.js";
 import { tempPolicy } from "./helpers.js";
 
 describe("fixed self-update surface", () => {
+  test("publishes the dispatcher v2/v3 read range and schema-v3 write target", async () => {
+    const metadata = parseCompatibilityMetadata(JSON.parse(
+      await fs.readFile(new URL("../../config/release-compatibility.json", import.meta.url), "utf8"),
+    ));
+    assert.deepEqual(metadata, {
+      protocol: 1,
+      config: 1,
+      app_schema_read_min: 2,
+      app_schema_read_max: 3,
+      app_schema_write: 3,
+      rollback_safe: true,
+    });
+    const examplePolicy = JSON.parse(
+      await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),
+    ) as { compatibility: unknown; compatibility_transitions: unknown };
+    assert.deepEqual(examplePolicy.compatibility, metadata);
+    const transitionFile = JSON.parse(
+      await fs.readFile(new URL("../../config/update-compatibility-transitions.json", import.meta.url), "utf8"),
+    ) as { transitions: unknown };
+    assert.deepEqual(examplePolicy.compatibility_transitions, transitionFile.transitions);
+  });
+
   test("does not accept repository, ref, path, command, npm flags, launchctl args, or environment", () => {
     const base = {
       source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
@@ -33,6 +56,31 @@ describe("fixed self-update surface", () => {
       assert.throws(() => parsePolicy({ ...policy, config_root: "/tmp/unrelated-config" }), /fixed base/);
       assert.throws(() => parsePolicy({ ...policy, main_agent: { ...policy.main_agent, session: "other" } }), /main_agent/);
       assert.throws(() => parsePolicy({ ...policy, executables: { ...policy.executables, herdr: "herdr" } }), /absolute/);
+      assert.deepEqual(parsePolicy(policy).compatibility_transitions, []);
+      const transition = {
+        from_sha: "1".repeat(40),
+        from: policy.compatibility,
+        to: { ...policy.compatibility, app_schema_read_max: 3, app_schema_write: 3 },
+        previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+      };
+      assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [transition] }).compatibility_transitions, [transition]);
+      assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{ ...transition, required_control_plane_capability: "invalid-capability" }],
+      }), /capability is invalid/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{ ...transition, from: { ...transition.from, protocol: 2 } }],
+      }), /not a supported v2 to v3 migration/);
+      assert.throws(() => parsePolicy({
+        ...policy,
+        compatibility_transitions: [{
+          ...transition,
+          from: { ...transition.from, app_schema_read_max: 3, app_schema_write: 3 },
+        }],
+      }), /not a supported v2 to v3 migration/);
     } finally {
       const fs = await import("node:fs/promises");
       await fs.rm(root, { recursive: true, force: true });

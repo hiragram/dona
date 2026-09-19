@@ -6,12 +6,12 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
-import { DispatcherDatabase } from "../../src/database.js";
+import { DispatcherDatabase, migrateDispatcherDatabase } from "../../src/database.js";
 import type { Logger } from "../../src/logger.js";
 import { FakeClock } from "../../src/scheduler/clock.js";
 import { ScheduleApiService } from "../../src/scheduler/api.js";
 import { ReminderPublisher, type ReminderDelivery, type SlackReminderCommand } from "../../src/scheduler/reminder-publisher.js";
-import type { Actor, RevisionInput } from "../../src/scheduler/repository.js";
+import type { Actor, RevisionInput, SchedulerRepository } from "../../src/scheduler/repository.js";
 import { SchedulerService } from "../../src/scheduler/service.js";
 
 export const integrationLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -92,15 +92,28 @@ export class FakeJobRuntime {
 export class SchedulerIntegrationHarness {
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), "dona-scheduler-gate-"));
   readonly filename = path.join(this.root, "dispatcher.sqlite");
-  readonly database = new DispatcherDatabase(this.filename);
-  readonly raw = new Database(this.filename);
+  readonly database: DispatcherDatabase;
+  readonly raw: Database.Database;
   readonly clock: FakeClock;
-  readonly repo = this.database.scheduler.withCodecs({ recurrence: value => value, policy: value => value });
+  readonly repo: SchedulerRepository;
   readonly fault = new FaultInjector();
   readonly scheduleIds = new Map<string, string>();
   private readonly policy = fs.readFileSync(new URL("../../../docs/adr/fixtures/scheduler-v1/policy.json", import.meta.url), "utf8");
 
-  constructor(at = "2026-09-05T00:00:00Z") { this.clock = new FakeClock(at); }
+  constructor(at = "2026-09-05T00:00:00Z", schema: "fresh" | "v2" = "fresh") {
+    if (schema === "v2") {
+      const legacy = new Database(this.filename);
+      try {
+        legacy.exec(fs.readFileSync(new URL("../fixtures/schema-v2.sql",import.meta.url),"utf8"));
+        migrateDispatcherDatabase(legacy,()=>{},false,3);
+        assert.equal(legacy.pragma("user_version",{simple:true}),3);
+      } finally { legacy.close(); }
+    }
+    this.database = new DispatcherDatabase(this.filename);
+    this.raw = new Database(this.filename);
+    this.repo = this.database.scheduler.withCodecs({recurrence:value=>value,policy:value=>value});
+    this.clock = new FakeClock(at);
+  }
   close(): void { this.raw.close(); this.database.close(); fs.rmSync(this.root, { recursive: true, force: true }); }
 
   input(action: "slack.reminder.post" | "work.read_only", recurring: boolean, due: string): RevisionInput {

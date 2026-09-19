@@ -3,20 +3,22 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { UpdateController } from "../src/controller.js";
+import { releaseCompatibilityMatches, UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
 import type {
   CommandResult,
+  Compatibility,
   CompletionDeliveryResult,
   CompletionLookupResult,
   DrainSnapshot,
   HealthSnapshot,
   MainAgentObservation,
   OutboxRow,
+  SchemaRollout,
 } from "../src/types.js";
-import { currentSha, installPointers, logger, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -25,8 +27,190 @@ const sourceEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRV";
 const approvalEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRW";
 const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
 const ok: CommandResult = { exit_code: 0, stdout: "", stderr: "", timed_out: false, output_truncated: false };
+const activationRollout: SchemaRollout = {
+  schema_version: 1,
+  phase: "activation",
+  database_schema: 3,
+  multi_job_enabled: true,
+  previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
+  previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  migration: {
+    from_schema: 2,
+    to_schema: 3,
+    requires_quiesce: true,
+    requires_drain: true,
+    backup: "sqlite_online_backup",
+    restore_open_test: true,
+  },
+};
+
+test("requires a v2/v3 compatibility bridge before a schema-v3 writing release", () => {
+  const schemaV2 = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const bridge = { ...schemaV2, app_schema_read_max: 3 };
+  const schemaV3 = { ...bridge, app_schema_write: 3 };
+  assert.equal(releaseCompatibilityMatches(schemaV2, schemaV3), false);
+  assert.equal(releaseCompatibilityMatches(schemaV2, bridge), true);
+  assert.equal(releaseCompatibilityMatches(bridge, schemaV3), true);
+  assert.equal(releaseCompatibilityMatches(schemaV3, bridge), true);
+});
+
+test("refuses schema-v3 planning without an exact stable updater migration capability receipt", async () => {
+  const f = await fixture();
+  const bridgeCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const activationCompatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["schema_v3_read", "schema_v3_backup_restore"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_target_compatibility/,
+  );
+  f.git.targetRollout = activationRollout;
+  f.runtime.schemaMigrationReady = false;
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = "3".repeat(40);
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /stable_updater_exact_target_schema_migration_capability_required/,
+  );
+  assert.equal(f.database.list().length, 0);
+  f.database.close();
+});
+
+test("非互換transitionはrollback不可と提示しtarget異常時に旧runtimeを再起動しない", async () => {
+  const f = await fixture();
+  const sourceCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const targetCompatibility: Compatibility = {
+    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3,
+  };
+  f.policy.compatibility = sourceCompatibility;
+  f.policy.compatibility_transitions = [{
+    from_sha: currentSha,
+    from: sourceCompatibility,
+    to: targetCompatibility,
+    previous_release_contract: "release-compatibility.v2-v3-bridge.json",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  }];
+  f.git.targetCompatibility = targetCompatibility;
+  f.git.targetRollout = { ...activationRollout, previous_release_sha: currentSha };
+  f.runtime.schemaMigrationReady = true;
+  f.runtime.schemaMigrationBuildSha = targetSha;
+
+  const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+  assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, false);
+  assert.deepEqual(
+    (result.plan as { compatibility_transition: unknown }).compatibility_transition,
+    f.policy.compatibility_transitions[0],
+  );
+  const preflight = result.preflight as Record<string, unknown>;
+  assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
+  assert.equal(preflight.schema_migration_control_plane_sha, targetSha);
+  f.build.compatibility = targetCompatibility;
+  f.runtime.setHealthCompatibility(currentSha,sourceCompatibility);
+  f.runtime.setHealthCompatibility(targetSha,targetCompatibility);
+  const migrate=f.runtime.migrateAppSchema.bind(f.runtime);
+  f.runtime.migrateAppSchema=async()=>{const result=await migrate();f.runtime.actualAppSchema=3;return result;};
+  f.runtime.wrongSlackOnce = true;
+  const plan=result.plan as {plan_id:string;plan_hash:string};
+  f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,plan_id:plan.plan_id,plan_hash:plan.plan_hash,approval_id:"explicit-nonrollback-transition"});
+  f.dispatcher.terminal=true;
+  await f.controller.processNext();
+  const row=f.database.get(result.request_id as string)!;
+  assert.equal(row.rollback_compatible,0);
+  assert.equal(row.state,"needs_review");
+  assert.equal(row.last_error_code,"rollback_not_safe_or_circuit_open");
+  assert.equal(f.runtime.calls.filter(call=>call==="migrateAppSchema").length,1);
+  assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`),false);
+  assert.equal((await f.store.observe()).current_sha,targetSha);
+  const calls=[...f.runtime.calls];
+  await f.controller.processNext();
+  assert.deepEqual(f.runtime.calls,calls);
+  f.database.close();
+});
+
+test("does not require the v2 to v3 migration capability for a rollback-compatible write v3 to v2 plan", async () => {
+  const f = await fixture();
+  const targetCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  const currentCompatibility: Compatibility = { ...targetCompatibility, app_schema_write: 3 };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: currentCompatibility })}\n`);
+  f.policy.compatibility = targetCompatibility;
+  f.git.targetCompatibility = targetCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1, phase: "compatibility", database_schema: 2,
+    multi_job_enabled: false, capabilities: ["schema_v3_read"],
+  };
+  f.runtime.schemaMigrationReady = false;
+
+  const result = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+  assert.equal((result.plan as { rollback_compatible: boolean }).rollback_compatible, true);
+  assert.equal("control_plane_capability" in (result.preflight as Record<string, unknown>), false);
+  f.database.close();
+});
+
+test("validates the post-activation rollout contract on schema-v3 to schema-v3 plans", async () => {
+  const f = await fixture();
+  const activationCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+    app_schema_write: 3, rollback_safe: true,
+  };
+  await fs.writeFile(path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+    `${JSON.stringify({ ...manifest(currentSha), compatibility: activationCompatibility })}\n`);
+  f.policy.compatibility = activationCompatibility;
+  f.git.targetCompatibility = activationCompatibility;
+  f.git.targetRollout = {
+    schema_version: 1,
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
+  };
+  await assert.rejects(
+    f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+    /target_schema_rollout_does_not_match_target_compatibility/,
+  );
+  f.git.targetRollout = activationRollout;
+  await assert.doesNotReject(f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }));
+  f.database.close();
+});
 
 class FakeGit implements GitPort {
+  targetCompatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
+  targetRollout: SchemaRollout = {
+    schema_version: 1,
+    phase: "compatibility_bootstrap",
+    database_schema: 2,
+    multi_job_enabled: false,
+    capabilities: ["safe_read_max_widening_planner"],
+  };
   constructor(readonly target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
     return {
@@ -34,7 +218,8 @@ class FakeGit implements GitPort {
       target_sha: this.target,
       target_reachable: this.reachable,
       ci_trusted: true,
-      target_compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+      target_compatibility: this.targetCompatibility,
+      target_rollout: this.targetRollout,
     };
   }
   async stage(target: string, destination: string) {
@@ -46,6 +231,10 @@ class FakeGit implements GitPort {
 
 class FakeBuild implements BuildPort {
   fail = false;
+  compatibility: Compatibility = {
+    protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
+    app_schema_write: 2, rollback_safe: true,
+  };
   async toolchain() { return { node_version: process.versions.node, npm_version: "11.0.0" }; }
   async buildRelease() {
     if (this.fail) throw new Error("canonical tests failed");
@@ -53,7 +242,7 @@ class FakeBuild implements BuildPort {
       lock_hashes: { dispatcher: "a".repeat(64), "sources/slack": "b".repeat(64), updater: "c".repeat(64) },
       node_version: process.versions.node,
       npm_version: "11.0.0",
-      compatibility: { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true },
+      compatibility: this.compatibility,
     };
   }
 }
@@ -77,16 +266,39 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   readonly calls: string[] = [];
+  schemaMigrationReady = true;
+  schemaMigrationBuildSha = targetSha;
+  migrationResult: CommandResult = ok;
+  appSchemaStateResult = { user_version: 2, integrity_ok: true, foreign_key_violations: 0 };
+  async schemaMigrationCapability(capability: string) {
+    this.calls.push("schemaMigrationCapability");
+    return {
+      ready: this.schemaMigrationReady && capability === "dispatcher_v2_to_v3_online_backup_v1",
+      build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null,
+    };
+  }
+  async migrateAppSchema() { this.calls.push("migrateAppSchema"); return this.migrationResult; }
+  async appSchemaState() { this.calls.push("appSchemaState"); return this.appSchemaStateResult; }
   wrongTargetOnce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
   mainObserveStatus: MainAgentObservation["status"] = "idle";
+  mainObserveStatuses: Array<MainAgentObservation["status"]> = [];
+  mainNonInteractiveOnObserveCall: number | undefined;
+  rotateMainAgentSessionOnObserveCall: number | undefined;
+  private mainObserveCallCount = 0;
+  afterMainWait: ((call: number) => Promise<void>) | undefined;
+  private mainWaitCallCount = 0;
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   previousMainStartUnknownOnce = false;
+  mainAgentSessionGeneration = 0;
+  rotateMainAgentSessionOnStart = false;
   notificationProtocolReady = true;
+  actualAppSchema = 2;
   afterSlackStart: (() => Promise<void>) | undefined;
+  private readonly healthCompatibility = new Map<string, Compatibility>();
   private mainAgentExists = true;
   private dispatcherLive = true;
   private slackLive = true;
@@ -100,6 +312,10 @@ class FakeRuntime implements RuntimePort {
     this.mainAgentExists = false;
     this.dispatcherLive = false;
     this.slackLive = false;
+  }
+  simulateDispatcherStopped(): void { this.dispatcherLive = false; }
+  setHealthCompatibility(sha: string, compatibility: Compatibility): void {
+    this.healthCompatibility.set(sha, compatibility);
   }
   async quiesceSlack(): Promise<DrainSnapshot> { this.calls.push("quiesceSlack"); return { service: "slack_adapter", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
   async quiesceDispatcher(): Promise<DrainSnapshot> { this.calls.push("quiesceDispatcher"); return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
@@ -122,6 +338,8 @@ class FakeRuntime implements RuntimePort {
   }
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
     this.calls.push("waitForMainAgentIdle");
+    this.mainWaitCallCount += 1;
+    await this.afterMainWait?.(this.mainWaitCallCount);
     return this.mainAgent(this.mainAgentSha, this.mainWaitStatus);
   }
   async stopMainAgent(expected: MainAgentObservation) {
@@ -160,10 +378,17 @@ class FakeRuntime implements RuntimePort {
     }
     this.mainAgentExists = true;
     this.mainAgentSha = path.basename(releasePath);
+    if (this.rotateMainAgentSessionOnStart) this.mainAgentSessionGeneration += 1;
     return { outcome: "started" as const, observation: this.mainAgent(this.mainAgentSha, "idle", releasePath), error_code: null };
   }
   async mainAgentStatus(releasePath: string): Promise<MainAgentObservation> {
-    return this.mainAgent(this.mainAgentSha, this.mainObserveStatus, releasePath);
+    this.mainObserveCallCount += 1;
+    if (this.rotateMainAgentSessionOnObserveCall === this.mainObserveCallCount) this.mainAgentSessionGeneration += 1;
+    const observation = this.mainAgent(this.mainAgentSha, this.mainObserveStatuses.shift() ?? this.mainObserveStatus, releasePath);
+    if (this.mainNonInteractiveOnObserveCall === this.mainObserveCallCount) {
+      return { ...observation, interactive_ready: false };
+    }
+    return observation;
   }
   async dispatcherHealth(): Promise<HealthSnapshot> {
     if (!this.dispatcherLive) return this.health("dispatcher", null, false, false);
@@ -184,14 +409,20 @@ class FakeRuntime implements RuntimePort {
     return { ...this.health("slack_adapter", current, true), workspaces_ready: true };
   }
   private health(service: HealthSnapshot["service"], sha: string | null, ready: boolean, live = true): HealthSnapshot {
+    const compatibility = sha ? this.healthCompatibility.get(sha) : undefined;
     return {
       service,
       live,
       ready,
       build_sha: live ? sha ?? this.policySha() : null,
       protocol: live ? 1 : null,
-      app_schema: live ? 2 : null,
+      app_schema: live ? this.actualAppSchema : null,
       config: live ? 1 : null,
+      ...(live && compatibility ? {
+        app_schema_read_min: compatibility.app_schema_read_min,
+        app_schema_read_max: compatibility.app_schema_read_max,
+        app_schema_write: compatibility.app_schema_write,
+      } : {}),
       ...(live && this.notificationProtocolReady ? { update_notification_protocol: 1 } : {}),
     };
   }
@@ -205,7 +436,9 @@ class FakeRuntime implements RuntimePort {
       status: this.mainAgentExists ? status : null,
       interactive_ready: this.mainAgentExists,
       working_directory: this.mainAgentExists ? workingDirectory : null,
-      session_id: this.mainAgentExists ? `session-${sha}` : null,
+      session_id: this.mainAgentExists
+        ? `session-${sha}${this.mainAgentSessionGeneration === 0 ? "" : `-${this.mainAgentSessionGeneration}`}`
+        : null,
       matches_release: this.mainAgentExists && expectedRelease !== undefined && workingDirectory === expectedRelease,
       error_code: null,
     };
@@ -220,14 +453,15 @@ async function fixture(policyVersion = "2026-09-03.2") {
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
   const store = new ReleaseStore(policy);
   const dispatcher = new FakeDispatcher();
+  const git = new FakeGit();
   const build = new FakeBuild();
   const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
   let now = new Date("2026-09-02T00:00:00.000Z");
-  const controller = new UpdateController(database, policy, new FakeGit(), build, store, runtime, dispatcher, logger, {
+  const controller = new UpdateController(database, policy, git, build, store, runtime, dispatcher, logger, {
     now: () => new Date(now),
   }, "controller-test");
   return {
-    policy, database, store, dispatcher, build, runtime, controller,
+    policy, database, store, dispatcher, git, build, runtime, controller,
     advance: (milliseconds: number) => { now = new Date(now.getTime() + milliseconds); },
   };
 }
@@ -275,6 +509,44 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
+  test("validates target health against the compatibility persisted in the approved plan", async () => {
+    const f = await fixture();
+    const schemaV2Compatibility = { ...f.policy.compatibility };
+    const bridgeCompatibility: Compatibility = {
+      ...schemaV2Compatibility,
+      app_schema_read_max: 3,
+    };
+    f.policy.compatibility = bridgeCompatibility;
+    f.git.targetCompatibility = bridgeCompatibility;
+    f.build.compatibility = bridgeCompatibility;
+    f.runtime.setHealthCompatibility(targetSha, bridgeCompatibility);
+
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-bridge",
+    });
+    f.dispatcher.terminal = true;
+
+    // A restarted controller may load a different current policy, but target
+    // runtime evidence stays bound to the compatibility persisted in the plan.
+    f.policy.compatibility = schemaV2Compatibility;
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "succeeded", JSON.stringify({
+      error: row.last_error_code,
+      calls: f.runtime.calls,
+      operations: f.database.runtimeOperations(row.request_id),
+    }));
+    assert.deepEqual(JSON.parse(row.compatibility_json), bridgeCompatibility);
+    f.database.close();
+  });
+
   test("performs one compatible rollback only for a proven wrong target SHA", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -319,6 +591,212 @@ describe("UpdateController isolated end-to-end", () => {
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
       `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
+    f.database.close();
+  });
+
+  test("validates rollback health against the previous release manifest compatibility", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    f.runtime.setHealthCompatibility(targetSha, schemaV3Compatibility);
+    f.runtime.actualAppSchema = 3;
+
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-schema-v3-rollback",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+
+    await f.controller.processNext();
+
+    assert.equal(f.database.get(planned.request_id as string)?.state, "rolled_back");
+    assert.equal(f.runtime.calls.filter((call) => call === "migrateAppSchema").length, 1);
+    assert.ok(f.runtime.calls.indexOf("stopDispatcher") < f.runtime.calls.indexOf("migrateAppSchema"));
+    assert.ok(f.runtime.calls.indexOf("migrateAppSchema") < f.runtime.calls.indexOf(`startMainAgent:${targetSha}`));
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+
+  test("restores the stopped current main agent when migration capability changes before activation", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-capability-changed",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.schemaMigrationReady = false;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "stable_updater_schema_migration_capability_unverified");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-3), [
+      `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("restores the exact current runtime after a definitively rejected schema migration", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-rejected",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: 1, stdout: "", stderr: "migration_rejected", timed_out: false, output_truncated: false,
+    };
+    f.runtime.rotateMainAgentSessionOnStart = true;
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "app_schema_migration_rejected");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-5), [
+      "migrateAppSchema", "appSchemaState", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+    ]);
+    f.database.close();
+  });
+
+  test("does not restart a v2 runtime when schema migration acceptance is unknown", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-timeout",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: null, stdout: "", stderr: "", timed_out: true, output_truncated: false,
+    };
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "app_schema_migration_unverified");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-1), ["migrateAppSchema"]);
+    f.database.close();
+  });
+
+  test("does not restart a v2-only runtime after rejection when the database is already schema v3", async () => {
+    const f = await fixture();
+    const bridgeCompatibility: Compatibility = {
+      protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 3,
+      app_schema_write: 2, rollback_safe: true,
+    };
+    const schemaV3Compatibility: Compatibility = { ...bridgeCompatibility, app_schema_write: 3 };
+    await fs.writeFile(
+      path.join(f.policy.release_root, currentSha, "release-manifest.json"),
+      `${JSON.stringify({ ...manifest(currentSha), compatibility: bridgeCompatibility })}\n`,
+    );
+    f.policy.compatibility = schemaV3Compatibility;
+    f.git.targetCompatibility = schemaV3Compatibility;
+    f.git.targetRollout = activationRollout;
+    f.build.compatibility = schemaV3Compatibility;
+    f.runtime.setHealthCompatibility(currentSha, bridgeCompatibility);
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-migration-rejected-after-write",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.migrationResult = {
+      exit_code: 1, stdout: "", stderr: "receipt_publication_failed", timed_out: false, output_truncated: false,
+    };
+    f.runtime.appSchemaStateResult = { user_version: 3, integrity_ok: true, foreign_key_violations: 0 };
+
+    await f.controller.processNext();
+
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "app_schema_migration_state_unverified");
+    assert.deepEqual(f.runtime.calls.slice(-2), ["migrateAppSchema", "appSchemaState"]);
     f.database.close();
   });
 
@@ -482,6 +960,145 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls, [
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack",
     ]);
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, unknown>;
+    assert.deepEqual(details.pointer, { current_sha: currentSha, previous_sha: olderSha });
+    assert.equal((details.main_agent as Record<string, unknown>).matches_release, false);
+    assert.equal("working_directory" in (details.main_agent as Record<string, unknown>), false);
+    f.database.close();
+  });
+
+  test("re-observes a transiently non-interactive current main agent before terminal recovery", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-transient-main-agent",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "main_agent_not_idle");
+    assert.equal(row.observed_active_sha, currentSha);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls, [
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "startDispatcher", "startSlack", "waitForMainAgentIdle",
+    ]);
+    f.database.close();
+  });
+
+  test("fails closed when the current pointer changes during recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-pointer-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call !== 2) return;
+      await fs.unlink(f.policy.current_pointer);
+      await fs.symlink(path.join(f.policy.release_root, targetSha), f.policy.current_pointer);
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
+    assert.equal(row.observed_active_sha, null);
+    f.database.close();
+  });
+
+  test("fails closed when current service health is lost during recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-health-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call === 2) f.runtime.simulateDispatcherStopped();
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
+    assert.equal(row.observed_active_sha, null);
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, unknown>;
+    const services = details.services as Record<string, Record<string, unknown>>;
+    assert.ok(services.dispatcher);
+    assert.ok(services.slack_adapter);
+    assert.equal(services.dispatcher.live, false);
+    assert.equal(services.slack_adapter.ready, true);
+    f.database.close();
+  });
+
+  test("audits both main-agent identities when the session changes after recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-session-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.rotateMainAgentSessionOnObserveCall = 3;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    const audit = f.database.auditRows(row.request_id).at(-1)!;
+    const details = JSON.parse(audit.details_json as string) as Record<string, Record<string, unknown>>;
+    assert.equal(details.settled_main_agent?.session_id, `session-${currentSha}`);
+    assert.equal(details.main_agent?.session_id, `session-${currentSha}-1`);
+    f.database.close();
+  });
+
+  test("requires notification protocol readiness after recovery wait", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-recovery-notification-race",
+    });
+    f.dispatcher.terminal = true;
+    f.runtime.mainWaitStatus = "working";
+    f.runtime.mainNonInteractiveOnObserveCall = 2;
+    f.runtime.afterMainWait = async (call) => {
+      if (call === 2) f.runtime.notificationProtocolReady = false;
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_runtime_mismatch");
     f.database.close();
   });
 
@@ -682,6 +1299,7 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: false,
       target_compatibility: policy.compatibility,
+      target_rollout: untrustedGit.targetRollout,
     });
     const untrusted = new UpdateController(database, policy, untrustedGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(untrusted.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /ci_trust_gate/);
@@ -692,23 +1310,22 @@ describe("UpdateController isolated end-to-end", () => {
       target_reachable: true,
       ci_trusted: true,
       target_compatibility: { ...policy.compatibility, protocol: 2 },
+      target_rollout: incompatibleGit.targetRollout,
     });
     const incompatible = new UpdateController(database, policy, incompatibleGit, new FakeBuild(), store, runtime, dispatcher, logger);
     await assert.rejects(incompatible.plan({ source_event_id: sourceEventId, reply_target: replyTarget }), /approved_policy/);
     database.close();
   });
 
-  test("plans an explicitly approved non-rollback release without enabling automatic rollback", async () => {
+  test("rejects a non-rollback release without an exact approved compatibility transition", async () => {
     const {root,policy}=await tempPolicy(); roots.push(root);
     await installPointers(policy);
     const database=new UpdateDatabase(path.join(policy.control_root,"updater.sqlite3"));
     const store=new ReleaseStore(policy),dispatcher=new FakeDispatcher(),runtime=new FakeRuntime(store,()=>currentSha,policy.release_root);
     const git=new FakeGit();
-    git.refresh=async current=>({current_sha:current,target_sha:targetSha,target_reachable:true,ci_trusted:true,target_compatibility:{...policy.compatibility,rollback_safe:false}});
+    git.refresh=async current=>({current_sha:current,target_sha:targetSha,target_reachable:true,ci_trusted:true,target_rollout:git.targetRollout,target_compatibility:{...policy.compatibility,rollback_safe:false}});
     const controller=new UpdateController(database,policy,git,new FakeBuild(),store,runtime,dispatcher,logger);
-    const planned=await controller.plan({source_event_id:sourceEventId,reply_target:replyTarget});
-    assert.equal((planned.plan as {rollback_compatible:boolean}).rollback_compatible,false);
-    assert.equal(database.get(planned.request_id as string)?.rollback_compatible,0);
+    await assert.rejects(controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_compatibility_does_not_match_the_approved_policy_version/);
     database.close();
   });
 

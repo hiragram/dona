@@ -36,6 +36,25 @@ export interface Compatibility {
   rollback_safe: boolean;
 }
 
+export interface SchemaRollout {
+  schema_version: 1;
+  phase: string;
+  database_schema: number;
+  multi_job_enabled: boolean;
+  capabilities?: string[];
+  previous_release_sha?: string;
+  previous_release_contract?: string;
+  required_control_plane_capability?: string;
+  migration?: {
+    from_schema: number;
+    to_schema: number;
+    requires_quiesce: boolean;
+    requires_drain: boolean;
+    backup: string;
+    restore_open_test: boolean;
+  };
+}
+
 export interface ReplyTarget {
   kind: "slack_thread";
   workspace_id: string;
@@ -85,7 +104,16 @@ export interface UpdatePlan {
   previous_sha: string | null;
   compatibility: Compatibility;
   rollback_compatible: boolean;
+  compatibility_transition: CompatibilityTransition | null;
   created_at: string;
+}
+
+export interface CompatibilityTransition {
+  from_sha: string;
+  from: Compatibility;
+  to: Compatibility;
+  previous_release_contract: string;
+  required_control_plane_capability: string;
 }
 
 export interface UpdateRow {
@@ -100,6 +128,7 @@ export interface UpdateRow {
   plan_hash: string;
   policy_version: string;
   compatibility_json: string;
+  transition_json?: string | null;
   rollback_compatible: number;
   approval_id: string | null;
   approval_event_id: string | null;
@@ -194,6 +223,9 @@ export interface HealthSnapshot {
   build_sha: string | null;
   protocol: number | null;
   app_schema: number | null;
+  app_schema_read_min?: number;
+  app_schema_read_max?: number;
+  app_schema_write?: number;
   config: number | null;
   update_notification_protocol?: number;
   workspaces_ready?: boolean;
@@ -240,6 +272,9 @@ export interface CommandResult {
   stderr: string;
   timed_out: boolean;
   output_truncated: boolean;
+  output_checkpoint?: string;
+  exit_signal?: NodeJS.Signals;
+  cleanup_status?: string;
 }
 
 export interface ActivationReceipt {

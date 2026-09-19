@@ -35,9 +35,19 @@ const values = {
   LOG_ROOT: path.join(base, "logs"),
   INSTALL_SHA: sha,
 };
-const compatibilityFile = JSON.parse(fs.readFileSync(path.join(repository, "config", "release-compatibility.json"), "utf8"));
+const compatibilityFile = JSON.parse(fs.readFileSync(
+  path.join(repository, "config", "release-compatibility.json"),
+  "utf8",
+));
 if (compatibilityFile.schema_version !== 1) throw new Error("Unsupported release compatibility schema");
 const { schema_version: _compatibilitySchema, ...compatibility } = compatibilityFile;
+const transitionFile = JSON.parse(fs.readFileSync(
+  path.join(repository, "config", "update-compatibility-transitions.json"),
+  "utf8",
+));
+if (transitionFile.schema_version !== 1 || !Array.isArray(transitionFile.transitions)) {
+  throw new Error("Unsupported compatibility transition schema");
+}
 
 const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
@@ -77,5 +87,6 @@ const policy = {
   required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
   require_verified_signature: false,
   compatibility,
+  compatibility_transitions: transitionFile.transitions,
 };
 fs.writeFileSync(path.join(destination, "policy.json"), `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 });

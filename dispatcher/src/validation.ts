@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+
 import { z } from "zod";
 
 import type {
@@ -6,9 +7,9 @@ import type {
   CanonicalJobPayload,
   CreateJobRequest,
   EventEnvelope,
+  JobWorkspace,
   JobResultEnvelope,
   ResultEnvelope,
-  JobWorkspace,
   SteerJobRequest,
 } from "./types.js";
 
@@ -18,7 +19,10 @@ const utcRfc3339 = z
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/, "must be UTC RFC 3339")
   .refine((value) => !Number.isNaN(Date.parse(value)), "must be a valid timestamp");
 
+export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 export const legacyJobKey = "legacy-default";
+export const jobObjectiveCharacterMax = 100_000;
+export const jobObjectiveUtf8ByteMax = jobObjectiveCharacterMax * 4;
 const jobCreationMetadataKey = "__dona_job_creation";
 const jobResourceMetadataKey = "__dona_job_resource";
 
@@ -66,7 +70,25 @@ const updateEventEnvelopeSchema = z
   .strict()
   .refine((value) => value.subject.request_id === value.payload.request_id, "request_id mismatch")
   .refine((value) => value.external_event_id.startsWith(`update:${value.payload.request_id}:terminal:`), "external_event_id mismatch")
-  .refine((value) => value.type === `update_${value.payload.update_status}`, "type/status mismatch");
+  .refine((value) => value.type === `update_${value.payload.update_status}`, "type/status mismatch")
+  .superRefine((value, context) => {
+    const fence = Number(/:terminal:(\d+)$/.exec(value.external_event_id)?.[1]);
+    if (!Number.isSafeInteger(fence)) {
+      context.addIssue({ code: "custom", message: "terminal fence is invalid", path: ["external_event_id"] });
+      return;
+    }
+    if (fence === 0 && (
+      value.payload.update_status !== "cancelled" ||
+      value.payload.active_sha !== null ||
+      value.payload.error?.code !== "cancelled_by_operator"
+    )) {
+      context.addIssue({
+        code: "custom",
+        message: "terminal fence 0 is reserved for an unclaimed operator cancellation",
+        path: ["external_event_id"],
+      });
+    }
+  });
 
 const scheduleEventEnvelopeSchema = z.object({
   schema_version: z.literal(1),
@@ -103,6 +125,7 @@ const resultEnvelopeSchema = z
 
 const repository = z
   .string()
+  .trim()
   .regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/, "must be owner/repo");
 const gitRef = z
   .string()
@@ -115,10 +138,25 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("scratch") }).strip(),
   z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
 ]);
+const jobCreationMetadataSchema = z.object({
+  canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+const jobResourceMetadataSchema = z.object({
+  objective_utf8_bytes: z.number().int().positive().max(jobObjectiveUtf8ByteMax),
+}).strict();
+
 const createJobSchema = z.object({
   source_event_id: z.string().trim().min(1),
-  job_key: z.string().trim().regex(/^[a-z0-9](?:[a-z0-9._-]{0,63})$/).refine(value=>value!==legacyJobKey).optional(),
-  objective: z.string().min(1).max(100_000).refine(value=>value.trim().length>0,"must contain non-whitespace content"),
+  job_key: z
+    .string()
+    .trim()
+    .regex(jobKeyPattern, "must be 1-64 lowercase key characters")
+    .refine((value) => value !== legacyJobKey, `${legacyJobKey} is reserved and must be omitted`)
+    .optional(),
+  objective: z.string().trim().min(1).refine(
+    (value) => Array.from(value).length <= jobObjectiveCharacterMax,
+    `must be at most ${jobObjectiveCharacterMax} characters`,
+  ),
   workspace: jobWorkspaceSchema,
 }).strip();
 
@@ -203,16 +241,55 @@ function parseWithSchema<T>(schema: z.ZodType, input: unknown): T {
   return parsed.data as T;
 }
 
-export function parseCreateJobRequest(input: unknown): CreateJobRequest {
-  return parseWithSchema<CreateJobRequest>(createJobSchema, input);
+export function parseCreateJobRequest(input: unknown, preserveObjective = false): CreateJobRequest {
+  const parsed = parseWithSchema<CreateJobRequest>(createJobSchema, input);
+  if (preserveObjective) parsed.objective = (input as {objective:string}).objective;
+  return parsed;
 }
 
-export function canonicalJobPayload(request:CreateJobRequest):CanonicalJobPayload { return {objective:request.objective,workspace:request.workspace}; }
-export function canonicalJobPayloadSha256(request:CreateJobRequest):string { return createHash("sha256").update(stableStringify(canonicalJobPayload(request))).digest("hex"); }
-export function serializeJobWorkspace(workspace:JobWorkspace,payloadSha:string,objectiveBytes:number):string { return stableStringify({...workspace,[jobCreationMetadataKey]:{canonical_payload_sha256:payloadSha},[jobResourceMetadataKey]:{objective_utf8_bytes:objectiveBytes}}); }
-export function jobCreationPayloadSha256FromWorkspace(input:unknown):string|undefined { if(!input||typeof input!=="object"||Array.isArray(input))return undefined; const value=(input as Record<string,unknown>)[jobCreationMetadataKey]; if(!value||typeof value!=="object"||Array.isArray(value))return undefined; const sha=(value as Record<string,unknown>).canonical_payload_sha256; return typeof sha==="string"&&/^[0-9a-f]{64}$/.test(sha)?sha:undefined; }
+export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayload {
+  return { objective: request.objective, workspace: request.workspace };
+}
 
-export function jobCreationObjectiveBytesFromWorkspace(input:unknown):number|undefined { const value=(input&&typeof input==="object"&&!Array.isArray(input))?(input as Record<string,unknown>)[jobResourceMetadataKey]:undefined; const bytes=value&&typeof value==="object"&&!Array.isArray(value)?(value as Record<string,unknown>).objective_utf8_bytes:undefined; return typeof bytes==="number"&&Number.isSafeInteger(bytes)&&bytes>0?bytes:undefined; }
+export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
+  return createHash("sha256")
+    .update(stableStringify(canonicalJobPayload(request)))
+    .digest("hex");
+}
+
+export function serializeJobWorkspace(
+  workspace: JobWorkspace,
+  canonicalPayloadSha256: string,
+  objectiveUtf8Bytes?: number,
+): string {
+  return stableStringify({
+    ...workspace,
+    [jobCreationMetadataKey]: { canonical_payload_sha256: canonicalPayloadSha256 },
+    ...(objectiveUtf8Bytes === undefined
+      ? {}
+      : { [jobResourceMetadataKey]: { objective_utf8_bytes: objectiveUtf8Bytes } }),
+  });
+}
+
+export function parseJobWorkspace(input: unknown): JobWorkspace {
+  return parseWithSchema<JobWorkspace>(jobWorkspaceSchema, input);
+}
+
+export function jobCreationPayloadSha256FromWorkspace(input: unknown): string | undefined {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const parsed = jobCreationMetadataSchema.safeParse(
+    (input as Record<string, unknown>)[jobCreationMetadataKey],
+  );
+  return parsed.success ? parsed.data.canonical_payload_sha256 : undefined;
+}
+
+export function jobCreationObjectiveBytesFromWorkspace(input: unknown): number | undefined {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const parsed = jobResourceMetadataSchema.safeParse(
+    (input as Record<string, unknown>)[jobResourceMetadataKey],
+  );
+  return parsed.success ? parsed.data.objective_utf8_bytes : undefined;
+}
 
 export function parseSteerJobRequest(input: unknown): SteerJobRequest {
   return parseWithSchema<SteerJobRequest>(steerJobSchema, input);
@@ -237,8 +314,4 @@ export function stableStringify(value: unknown): string {
     return `{${entries.join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
-}
-
-export function parseJobWorkspace(input: unknown): JobWorkspace {
-  return parseWithSchema<JobWorkspace>(jobWorkspaceSchema, input);
 }

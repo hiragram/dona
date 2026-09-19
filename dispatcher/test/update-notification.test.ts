@@ -22,7 +22,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-function updateEnvelope(status: "succeeded" | "needs_review" = "succeeded", fence = 1): EventEnvelope {
+type TerminalStatus = "succeeded" | "failed" | "rolled_back" | "needs_review" | "cancelled";
+
+function updateEnvelope(status: TerminalStatus = "succeeded", fence = 1): EventEnvelope {
   const requestId = "upd_01m1es03xy5cf8d9pm5cwx4srv";
   return {
     schema_version: 1,
@@ -40,8 +42,14 @@ function updateEnvelope(status: "succeeded" | "needs_review" = "succeeded", fenc
       plan_hash: "a".repeat(64),
       policy_version: "2026-09-03.2",
       rollback_compatible: true,
-      active_sha: status === "succeeded" ? "2".repeat(40) : null,
-      error: status === "needs_review" ? { code: "ambiguous_runtime_observation", message: null } : null,
+      active_sha: status === "succeeded" ? "2".repeat(40) : status === "rolled_back" ? "1".repeat(40) : null,
+      error: status === "needs_review"
+        ? { code: "ambiguous_runtime_observation", message: null }
+        : status === "cancelled"
+          ? { code: "cancelled_by_operator", message: null }
+          : status === "failed"
+            ? { code: "activation_failed", message: null }
+            : null,
     },
     reply_target: {
       kind: "slack_thread",
@@ -84,11 +92,106 @@ describe("UpdateNotificationWorker", () => {
     const invalid = updateEnvelope();
     invalid.payload.active_sha = "1".repeat(40);
     assert.throws(() => renderUpdateNotification(invalid), /confirmed active SHA/);
-    const cancelled = updateEnvelope("needs_review");
-    cancelled.type = "update_cancelled";
-    cancelled.payload.update_status = "cancelled";
-    cancelled.payload.error = { code: "cancelled_by_operator", message: null };
-    assert.match(renderUpdateNotification(cancelled).text, /稼働SHAの確認を伴わない/);
+    const cancelled = updateEnvelope("cancelled", 0);
+    const cancelledRendered = renderUpdateNotification(cancelled);
+    assert.equal(cancelledRendered.terminalFence, 0);
+    assert.match(cancelledRendered.text, /稼働SHAの確認を伴わない/);
+    for (const invalid of ["succeeded", "failed", "rolled_back", "needs_review"] as const) {
+      assert.throws(() => renderUpdateNotification(updateEnvelope(invalid, 0)), /unclaimed operator cancellation/);
+    }
+    const mismatched = updateEnvelope("cancelled", 0);
+    mismatched.payload.error = { code: "cancellation_after_external_mutation", message: null };
+    assert.throws(() => renderUpdateNotification(mismatched), /unclaimed operator cancellation/);
+  });
+
+  test("reports an unclaimed fence-zero cancellation once and preserves it across restart", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const events = new DispatcherDatabase(config.databasePath);
+    const notifications = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+    const first = events.enqueue(updateEnvelope("cancelled", 0));
+    const duplicate = events.enqueue(updateEnvelope("cancelled", 0));
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.row.event_id, first.row.event_id);
+    let calls = 0;
+    const slack: SlackNotificationPort = {
+      async deliver(input) {
+        calls += 1;
+        return {
+          outcome: "reported",
+          receipt: {
+            notification_id: input.notification_id as string,
+            workspace_id: input.workspace_id as string,
+            channel_id: input.channel_id as string,
+            thread_ts: input.thread_ts as string,
+            message_ts: "1788390700.384280",
+            post_status: "created",
+            session_status: "active",
+          },
+        };
+      },
+    };
+    const firstWorker = new UpdateNotificationWorker(events, notifications, slack, config, logger);
+    firstWorker.start();
+    await waitFor(() => events.get(first.row.event_id)?.status === "completed");
+    await firstWorker.stop();
+    const restarted = new UpdateNotificationWorker(events, notifications, slack, config, logger);
+    restarted.start();
+    await new Promise((resolve) => setTimeout(resolve, config.queuePollMs * 2));
+    await restarted.stop();
+    assert.equal(calls, 1);
+    assert.equal(notifications.get(first.row.event_id)?.terminal_fence, 0);
+    assert.equal(notifications.get(first.row.event_id)?.status, "reported");
+    events.close();
+    notifications.close();
+  });
+
+  test("quarantines a legacy invalid fence-zero event without blocking later notifications or readiness", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const events = new DispatcherDatabase(config.databasePath);
+    const notifications = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
+    const poisoned = events.enqueue(updateEnvelope("succeeded", 1)).row;
+    const laterEnvelope = updateEnvelope("cancelled", 0);
+    laterEnvelope.payload.request_id = "upd_01m1es03xy5cf8d9pm5cwx4srw";
+    laterEnvelope.subject.request_id = laterEnvelope.payload.request_id;
+    laterEnvelope.external_event_id = `update:${laterEnvelope.payload.request_id}:terminal:0`;
+    const later = events.enqueue(laterEnvelope).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE events SET external_event_id = ?, payload_json = ?, event_type = ? WHERE event_id = ?").run(
+      updateEnvelope("succeeded", 0).external_event_id,
+      JSON.stringify(updateEnvelope("succeeded", 0).payload),
+      "update_succeeded",
+      poisoned.event_id,
+    );
+    raw.close();
+    let calls = 0;
+    const worker = new UpdateNotificationWorker(events, notifications, {
+      async deliver(input) {
+        calls += 1;
+        return {
+          outcome: "reported",
+          receipt: {
+            notification_id: input.notification_id as string,
+            workspace_id: input.workspace_id as string,
+            channel_id: input.channel_id as string,
+            thread_ts: input.thread_ts as string,
+            message_ts: "1788390700.384281",
+            post_status: "created",
+            session_status: "active",
+          },
+        };
+      },
+    }, config, logger);
+    worker.start();
+    await waitFor(() => events.get(later.event_id)?.status === "completed");
+    assert.equal(events.get(poisoned.event_id)?.status, "dead_letter");
+    assert.equal(events.get(poisoned.event_id)?.last_error_code, "invalid_update_notification");
+    assert.equal(worker.isHealthy(), true);
+    assert.equal(calls, 1);
+    await worker.stop();
+    events.close();
+    notifications.close();
   });
 
   test("reports dona_update without sending it to the serial main-agent queue and publishes a Result Envelope", async () => {
