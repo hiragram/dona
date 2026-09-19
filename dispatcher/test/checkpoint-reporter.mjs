@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import path from "node:path";
 import process from "node:process";
 
 const file = process.env.DONA_DISPATCHER_TEST_FILE;
@@ -12,7 +11,7 @@ export default async function* checkpointReporter(source) {
   delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
   const startOccurrences = new Map();
   const identitiesByExecution = new Map();
-  const leafOrdinals = new Map();
+  const siblingOrdinals = new Map();
   const terminalOccurrences = new Map();
   const queuedTypes = new Map();
   let supportsComplete = false;
@@ -37,18 +36,19 @@ export default async function* checkpointReporter(source) {
       const types = queuedTypes.get(key) ?? [];
       const type = types.shift();
       if (types.length === 0) queuedTypes.delete(key);
+      const isFileWrapper = type === "test" && event.data.nesting === 0 && event.data.name === event.data.file;
+      if (isFileWrapper) continue;
+      const testNumber = (siblingOrdinals.get(event.data.nesting) ?? 0) + 1;
+      siblingOrdinals.set(event.data.nesting, testNumber);
       if (type === "suite") {
-        leafOrdinals.set(event.data.nesting + 1, 0);
+        siblingOrdinals.set(event.data.nesting + 1, 0);
         continue;
       }
       if (type !== "test") continue;
-      if (path.isAbsolute(event.data.name)) continue;
       const digest = createHash("sha256").update(event.data.name).digest("hex").slice(0, 12);
       const occurrence = (startOccurrences.get(digest) ?? 0) + 1;
       startOccurrences.set(digest, occurrence);
       const location = `${event.data.file}:${event.data.line}:${event.data.column}`;
-      const testNumber = (leafOrdinals.get(event.data.nesting) ?? 0) + 1;
-      leafOrdinals.set(event.data.nesting, testNumber);
       identitiesByExecution.set(`${location}:${testNumber}`, `${digest}#${occurrence}`);
       yield `\n[dispatcher-test:${nonce}] case-start ${file}:${digest}#${occurrence}\n`;
       continue;

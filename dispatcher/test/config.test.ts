@@ -78,7 +78,7 @@ describe("job resource config", () => {
     assert.match(reporter, /identitiesByExecution/);
     assert.match(reporter, /event\.data\.testNumber/);
     assert.match(reporter, /"test:pass"/);
-    assert.match(reporter, /path\.isAbsolute\(event\.data\.name\)/);
+    assert.match(reporter, /event\.data\.nesting === 0 && event\.data\.name === event\.data\.file/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
     assert.match(reporter, /"case-finish"/);
     assert.match(reporter, /`\\n\[dispatcher-test:\$\{nonce\}\]/);
@@ -112,7 +112,7 @@ describe("job resource config", () => {
     const fixture = `${temporaryDirectory}/pending.test.mjs`;
     fs.writeFileSync(fixture, [
       'import test from "node:test";',
-      'test("pending forever", async () => new Promise(() => {}));',
+      'test("/tmp/real-case", async () => new Promise(() => {}));',
     ].join("\n"));
     const nonce = "0123456789abcdef0123456789abcdef";
     const reporter = fileURLToPath(new URL("./checkpoint-reporter.mjs", import.meta.url));
@@ -137,7 +137,7 @@ describe("job resource config", () => {
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const caseStartPattern = /\[dispatcher-test:[a-f0-9]{32}\] case-start test\/pending\.test\.ts:[a-f0-9]{12}#1/;
+    const caseStartPattern = /\[dispatcher-test:[a-f0-9]{32}\] case-start test\/pending\.test\.ts:78b3a018be04#1/;
     try {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("case-start marker was not emitted")), 2_000);
@@ -251,6 +251,40 @@ describe("job resource config", () => {
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
     assert.doesNotMatch(stderr, /case-start/);
+  });
+
+  test("suite後のleafをsibling testNumberへ対応付ける", () => {
+    const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-sibling-`);
+    const fixture = `${temporaryDirectory}/sibling.test.mjs`;
+    fs.writeFileSync(fixture, [
+      'import { describe, test } from "node:test";',
+      'describe("empty suite", () => {});',
+      'test("after suite", () => {});',
+    ].join("\n"));
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const reporter = fileURLToPath(new URL("./checkpoint-reporter.mjs", import.meta.url));
+    const childEnvironment = { ...process.env };
+    for (const name of Object.keys(childEnvironment)) {
+      if (name.startsWith("NODE_TEST_")) delete childEnvironment[name];
+    }
+    delete childEnvironment.NODE_OPTIONS;
+    delete childEnvironment.DONA_PROCESS_METRICS_NONCE;
+    delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
+    childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/sibling.test.ts";
+    childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    try {
+      const result = spawnSync(process.execPath, [
+        "--test",
+        `--test-reporter=${reporter}`,
+        "--test-reporter-destination=stderr",
+        fixture,
+      ], { env: childEnvironment, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stderr, /case-start test\/sibling\.test\.ts:8b23e8e9336e#1/);
+      assert.match(result.stderr, /case-finish test\/sibling\.test\.ts:8b23e8e9336e#1/);
+    } finally {
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   test("expands documented home-relative paths consistently", () => {
