@@ -25,7 +25,7 @@ export const auditEventSchema = z.strictObject({
     "web_login", "web_logout", "web_authorize", "web_command", "retention",
   ]),
   operation: z.enum([
-    "web.login.v1", "web.logout.v1", "web.job_list.v1", "web.job_read.v1", "web.job_submit.v1",
+    "web.login.v1", "web.logout.v1", "web.session.v1", "web.job_list.v1", "web.job_read.v1", "web.job_submit.v1",
     "web.job_cancel.v1", "web.receipt_read.v1", "web.sse_subscribe.v1", "web.approval_list.v1",
     "web.approval_read.v1", "approval.approve.v1", "approval.reject.v1", "approval.cancel.v1",
     "approval.consume.v1", "slack.post_thread_reply.v1", "binding.change.v1", "policy.change.v1",

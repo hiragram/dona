@@ -1,3 +1,5 @@
+import { assertSynchronousCallback } from "../audit/synchronous.js";
+import { prepareSessionIngress, type WebContextKeyLookup, type SessionIngressResult } from "./ingress.js";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { AuditRepository } from "../audit/repository.js";
@@ -14,10 +16,10 @@ const resourceId = "web_auth_state";
 const indexSchema = z.strictObject({ key_version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER), digest: z.string().regex(/^[a-f0-9]{64}$/) });
 const indexesSchema = z.array(indexSchema).max(128).refine(rows => new Set(rows.map(row => row.key_version)).size === rows.length);
 export type WebIndexCandidate = z.infer<typeof indexSchema>;
-export type WebStoreResult = { status: "denied"; reason: AuditEvent["reason"] }
+export type WebStoreResult = SessionIngressResult | { status: "denied"; reason: AuditEvent["reason"] }
   | { status: "succeeded"; kind: "initialized" | "restarted" | "login_created" | "session_created" | "revoked" | "expired"; generation: number }
   | { status: "succeeded"; kind: "login_consumed"; login: StoredWebLogin; payload: StoredWebPayload; receipt_id: string };
-type Plan = { next: WebAuthState | undefined; payloads: StoredWebPayload[]; result: WebStoreResult; principal?: RegistryPrincipal };
+type Plan = { next: WebAuthState | undefined; payloads: StoredWebPayload[]; result: WebStoreResult; principal?: RegistryPrincipal; session_ref?:string|null };
 type Loaded = ReturnType<typeof encodeWebAuthState> | undefined;
 const deny = (next: WebAuthState | undefined, reason: AuditEvent["reason"]): Plan => ({ next, payloads: [], result: { status: "denied", reason } });
 const references = (state: WebAuthState | undefined): Map<string, StoredWebLogin | StoredWebSession> => new Map<string, StoredWebLogin | StoredWebSession>([
@@ -37,8 +39,9 @@ export class WebAuthRepository {
   private readonly audit: AuditRepository;
   private readonly transaction: ApprovalTransaction;
   private readonly scope: WebStateScope;
-  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: WebStateScope) {
+  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: WebStateScope, private readonly contextKeys?: WebContextKeyLookup) {
     try { this.scope = webStateScopeSchema.parse(scope); } catch { throw new WebStateError(); }
+    if (contextKeys !== undefined) assertSynchronousCallback(contextKeys);
     verifyWebAuthSchema(db);
     this.transaction = new ApprovalTransaction(db, providers);
     this.audit = new AuditRepository(db, providers.auditAnchors, providers.auditKeys);
@@ -65,7 +68,7 @@ export class WebAuthRepository {
     if (encodeWebPayload(value).canonical !== row.payload_json) throw new WebStateError();
     return verifyWebPayload(value, owner);
   }
-  private commit(transactionId: string, operation: "web.login.v1" | "web.logout.v1" | "policy.change.v1",
+  private commit(transactionId: string, operation: "web.login.v1" | "web.logout.v1" | "policy.change.v1" | "web.session.v1",
     sessionRef: string | null, prepare: (state: WebAuthState | undefined, mark: Readonly<ClockMark>) => Plan): WebStoreResult {
     return this.transaction.runPrepared(transactionId, (mark, verified) => {
       const loaded = this.load(verified), before = loaded?.state;
@@ -93,13 +96,14 @@ export class WebAuthRepository {
       const event: Omit<AuditEvent, "occurred_at"> = {
         scope: this.scope, actor: plan.principal ? { kind: "principal", id: plan.principal.principal_id }
           : operation === "policy.change.v1" ? { kind: "system", id: "web_auth_broker" } : { kind: "unauthenticated", id: null },
-        action: operation === "web.login.v1" ? "web_login" : operation === "web.logout.v1" ? "web_logout" : "policy_change",
-        operation, resource_id: resourceId, outcome: plan.result.status,
-        reason: plan.result.status === "denied" ? plan.result.reason : "none", session_ref: sessionRef,
+        action: operation === "web.login.v1" ? "web_login" : operation === "web.logout.v1" ? "web_logout" : operation === "web.session.v1" ? "web_authorize" : "policy_change",
+        operation, resource_id: operation === "web.session.v1" ? plan.session_ref ?? resourceId : resourceId, outcome: plan.result.status,
+        reason: plan.result.status === "denied" ? plan.result.reason : "none", session_ref: plan.session_ref ?? sessionRef,
         receipt_id: transactionId, attempt_id: null, policy_revision: plan.principal ? 1 : 0,
         binding_revision: plan.principal?.identity_binding_revision ?? 0, authz_revision: plan.principal?.authz_revision ?? 0,
       };
-      return { event, resource_digest: after?.digest ?? null, mutation: () => {
+      const update = operation === "web.session.v1" && after ? {resource_commitments:[{scope:this.scope,resource_id:resourceId,resource_digest:after.digest}]} : {resource_digest:after?.digest ?? null};
+      return { event, ...update, mutation: () => {
         if (after && after.canonical !== loaded?.canonical) {
           if (loaded) this.db.prepare("UPDATE web_auth_state SET state_json=? WHERE instance_id=? AND tenant_id=?")
             .run(after.canonical, this.scope.instance_id, this.scope.tenant_id);
@@ -118,6 +122,22 @@ export class WebAuthRepository {
         for (const ref of added.keys()) this.payload(newRefs.get(ref)!);
         return plan.result;
       } };
+    });
+  }
+
+  /** Internal session confirmation only. A returned principal is not a job or
+   * approval capability. This call never extends idle activity. */
+  verifySessionIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array):WebStoreResult {
+    const keys=this.contextKeys;
+    return this.commit(transactionId,"web.session.v1",null,(state,mark)=>{
+      if(!state)return deny(state,"deployment_invalid");
+      if(!keys)return deny(state,"identity_unavailable");
+      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,keys);
+      if(plan.result.status==="succeeded"){
+        const session=state.sessions.find(row=>row.state.session_ref===plan.session_ref);
+        if(!session)throw new WebStateError();this.payload(session);
+      }
+      return {next:plan.next,result:plan.result,payloads:[],session_ref:plan.session_ref,...(plan.principal?{principal:plan.principal}:{})};
     });
   }
 
