@@ -2317,3 +2317,28 @@ test("長期停止のcompact skipと直近occurrence物化はatomicかつidempot
   assert.equal(audit.length, 1); assert.deepEqual(JSON.parse(audit[0]!.after_json).compact_skip, { ...skipped, reason: "misfire" });
   assert.throws(() => repo.materialize("s1", 1, due, next, wake, actor), /invalid_occurrence/);
 });
+
+for(const offset of [59_000,60_000,61_000]) test(`通知時刻とauthorization expiryの境界 ${offset}`,()=>{
+  const {repo,dispatcher,raw,filename}=setup();const objective="期限境界";
+  const expiry=new Date(Date.parse(due)+60_000).toISOString().replace(".000Z","Z");const authorizedAt=new Date(Date.parse(due)+58_000).toISOString().replace(".000Z","Z");
+  repo.create("notify_expiry",{...input,expires_at:expiry,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("notify_expiry",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));dispatcher.beginJobDispatch(job.job_id,new Date(due));dispatcher.markJobRunning(job.job_id,new Date(due));
+  dispatcher.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:due},job.result_path,new Date(due));
+  const eventId=dispatcher.getJob(job.job_id)!.completion_event_id!;const resultPath=path.join(path.dirname(filename),`${eventId}.json`);
+  dispatcher.beginDispatch(eventId,resultPath,new Date(authorizedAt));
+  assert.equal(dispatcher.jobNotificationState(job.job_id).notification_authorization_phase,"none");
+  dispatcher.authorizeJobNotification(eventId,new Date(authorizedAt));
+  assert.equal(dispatcher.jobNotificationState(job.job_id).notification_authorization_phase,"preflight");
+  dispatcher.authorizeJobNotification(eventId,new Date(authorizedAt),{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:authorizedAt,nonce:"expiry_nonce"});
+  assert.equal(dispatcher.jobNotificationState(job.job_id).notification_authorization_phase,"write");
+  const bodySha=createHash("sha256").update("完了").digest("hex");const postedAt=new Date(Date.parse(due)+offset).toISOString().replace(".000Z","Z");
+  dispatcher.saveCompleted(eventId,{schema_version:1,event_id:eventId,status:"completed",actions:[
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true},
+    {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
+    {tool:"dona_dispatcher.authorize_job_notification",event_id:eventId,authorized:true,access_receipt_verified:true},
+    {tool:"dona_slack.post_message",event_id:eventId,workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
+  ],completed_at:postedAt},resultPath,new Date(postedAt),deliveryEvidence(eventId,bodySha,"2.000001","1.000001",postedAt));
+  assert.equal(dispatcher.jobNotificationState(job.job_id).notification_state,offset<60_000?"accepted":"needs_review");
+});

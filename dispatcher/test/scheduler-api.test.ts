@@ -268,3 +268,18 @@ test("古いrecurrence anchorをcreate時に拒否し本文上限をcode point�
   assert.equal(created.duplicate, false);
   database.close();
 });
+
+test("run historyはruntime identityを含まないallowlist投影を返す",async()=>{
+  const {config,database,first,api}=await fixture();
+  const created=api.create({source_event_id:first.event_id,idempotency_key:"safe-history",definition:definition()});
+  const id=(created.schedule as {schedule_id:string}).schedule_id;
+  const raw=new Database(config.databasePath);
+  raw.prepare(`INSERT INTO schedule_runs(run_id,schedule_id,revision,occurrence_key,scheduled_for,status,reason,event_id,job_id,created_at)
+    VALUES('run_00000000-0000-0000-0000-000000000001',?,1,'private_occurrence','2026-09-02T00:00:00Z','skipped','misfire',NULL,NULL,'2026-09-02T00:00:00Z')`).run(id);
+  raw.close();
+  const history=api.history(id,first.event_id,1);
+  assert.deepEqual(Object.keys(history.runs[0]!).sort(),["created_at","reason","revision","scheduled_for","started_at","status","terminal_at"]);
+  assert.equal(history.runs[0]!.status,"misfired");assert.equal(JSON.stringify(history.runs).includes("private_occurrence"),false);
+  assert.equal(api.history(id,first.event_id,1,history.next_cursor!).runs.length,0);
+  database.close();
+});

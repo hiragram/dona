@@ -94,7 +94,7 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
   const project = (value: unknown) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const row = value as Record<string, unknown>;
-    const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id"];
+    const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id", "notification_state", "notification_authorization_phase"];
     if (includeResult) keys.push("result_json");
     return {
       ...Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]])),
@@ -263,9 +263,9 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("authorize_job_notification", {
     title:"Authorize scheduled job notification",
-    description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。",
+    description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。応答不明時は再試行せずget_job_statusのnotification_authorization_phaseをread-only照合し、人間のreconcileへ送ります。",
     inputSchema:{event_id:eventId,access_receipt:z.string().min(32).max(2_000).optional()},
-    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
   },async({event_id,access_receipt})=>{
     try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id,access_receipt)); }
     catch(error){return failure(error,logger,"authorize_job_notification");}
