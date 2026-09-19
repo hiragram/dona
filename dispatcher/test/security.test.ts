@@ -18,3 +18,4 @@ import "./web/session-service.js";
 import "./approval/protected-heads.js";
 import "./web/auth-read-service.js";
 import "./web/auth-write-service.js";
+import "./web/internal-gateway.js";
