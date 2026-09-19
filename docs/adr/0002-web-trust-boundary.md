@@ -60,7 +60,9 @@ Webは `browser -> Web Adapter / BFF -> Dispatcher -> 既存worker / scheduler /
 
 roleは加算的だが、scopeとresource predicateの両方を要求する。`requester` は `job:submit` / `job:read:own` / `job:cancel:own`、`observer` は明示resource grantへの `job:read:granted` のみ、`supervisor` はbinding済みworkspaceの `approval:read:bound` / `approval:decide:bound` のみ。supervisorに全job read/cancelを暗黙付与しない。`operator` はbrowser roleではなくlocal保守identityであり、通常sessionからprincipal作成・role変更・binding変更はできない。
 
-submitは既存workerへの依頼受付だけを許す。任意の外部write権限、host credential、shell実行許可を増やさず、承認対象operationのlegacy bypassが遮断されない限り、その作用を起こすWeb job実行を `safe_off` にする。job cancelはown jobへの既存cancel receiptであり、すでに開始済み外部作用の取消ではない。
+`job:submit` のMVP job kindは `analysis.read_only.v1` だけとし、自由文からjob kind/capabilityを増やせない。入力は認可済みresourceのserver生成read-only snapshot、capabilityはそのsnapshot読取と専用scratchへのResult生成だけ。既存workerを起動する際にOS sandboxでnetwork、任意shell/child process、snapshot外のfile、Git/GitHub/Slack/MCPなどのambient credentialと汎用write toolを遮断する。モデル推論に必要な通信だけはtrusted runtime側の固定inference brokerを通し、workerへprovider credentialや汎用network proxyを公開しない。brokerは固定model endpointへの推論だけを許し、任意URL/tool/外部作用への中継を拒否する。credentialを含むhome/environment/configを継承しない。これはLLMへの禁止文ではなくworker起動profileの決定論的enforcementであり、証明できるprofileが既存runtimeに接続されるまでWeb job admission全体を `safe_off` とする。
+
+外部作用を起こすjob kind、commit/push/PR作成、任意command、未知capabilityは `job_kind_unsupported` で拒否する。allowlist拡大には全downstream effectの分類、typed gateway/approval/実行直前認可、ambient credential遮断のnegative testとADR改訂が必要で、既存workerの通常権限をそのまま継承しない。read-only jobが生成した提案も実行許可にはならない。Web approval inboxは既存coreのrequestを別の認可境界で扱い、read-only workerにexecutor権限を渡さない。job cancelはown jobへの既存cancel receiptであり、すでに開始済み外部作用の取消ではない。
 
 全read/write、artifact取得、list pagination、SSE、receipt lookupはcurrent principalとscopeを再認可する。`job:read:own` はpersisted ownerと一致する行のみ。明示grantはresource IDとrevisionへ結合し、grant revocationを再確認する。tenant内でも他principalの存在・件数・cursorを返さない。Slack等からの既存jobをWebへ一括公開しない。cross-transport mappingと明示grantがなければ見えない。
 
@@ -70,9 +72,17 @@ submitは既存workerへの依頼受付だけを許す。任意の外部write権
 2. login transactionはCSPRNG state/nonce/verifierをserver側に保存し5分・一回限り。短命HttpOnly/Secure/SameSite=Laxのlogin cookieへbindし、callbackはcode flowのGETだけを例外としてstate/nonceで検証する。return先は固定same-origin path allowlist。callback後にqueryを消した303へ進み、code/tokenをlogしない。
 3. login後は256-bit以上のrandom session cookieへrotateし、古いsession/login transactionを無効化する。cookie名 `__Host-dona_session`、`Secure; HttpOnly; SameSite=Strict; Path=/`、Domainなし。JWT/localStorage/sessionStorage/URL bearerを使わない。server DBにはcookieのkeyed digestのみ保存する。
 4. sessionは絶対8時間、idle 30分、どちらか早い方で失効し延長不可。SSE/自動pollをactivityに数えない。access token期限も上限とし、refresh token/offline accessは要求・保存しない。再login時は再rotateする。
-5. IdPは認証済みRFC 7662 introspectionで `active` とsubject/client/audience/expiryを照合でき、account disable/revokeをactive状態へ反映するproviderを必須とする。BFFの各認可判定前（SSE各batchと15秒ごとのheartbeatも含む）にonline検証し、positive cacheは使わない。非対応providerはdeployment不可。inactiveはsession revoke、timeout/unavailableは503でread/writeともfail closedし、SSEを閉じる。別identityへfallbackしない。
-6. logoutはCSRF保護POSTでdurable revokeしてcookie削除。principal/role/credential/bindingのrevokeはrevisionをtransactionalに進め、全該当session/challengeを無効化する。既存connectionも次のbatchを送る前に確認する。IdP logoutだけをDona logout成功としない。
+5. IdPは認証済みRFC 7662 introspectionで `active` とsubject/client/audience/expiryを照合でき、account disable/revokeをactive状態へ反映するproviderを必須とする。BFFの各認可判定前（SSE各batchと15秒ごとのheartbeatも含む）にonline検証し、positive cacheは使わない。非対応providerはdeployment不可。inactiveはsession revoke、timeout/unavailableは503でresource read/writeともfail closedし、SSEを閉じる。次項のlocal logoutだけは権限縮小の例外とし、別identityへfallbackしない。
+6. logoutはCSRF保護POSTでdurable revokeしてcookie削除。IdP introspectionは不要とし、IdP timeout/inactive時でもlocal cookie digest・session binding・exact Origin・CSRFを検証できれば、そのsessionだけをrevokeする。期限切れ/既失効sessionへの同じ操作は冪等に204とするが、scope付与や別session操作へ一般化しない。revokeとauditのdurable commit後に成功を返す。DB障害ではcookieを消してもdurable revoke成功とはせず503を返し、local operatorによる復旧/失効を必要とする。principal/role/credential/bindingのrevokeはrevisionをtransactionalに進め、全該当session/challengeを無効化する。既存connectionも次のbatchを送る前に確認する。IdP logoutだけをDona logout成功としない。
 7. BFFとDispatcherは同一host、owner-only UDS、専用service credentialで相互の役割を固定する。browserに汎用Dispatcher/MCP credentialを渡さない。DispatcherはBFFだけが作る短命10秒・audience固定・nonce一回限り・method/route/body digest/identity revision結合の認証contextを検証し、local current registryを再認可する。tokenはinternal transportだけで使い永続Resultに残さない。BFFはdecisionを自分で承認済みにせず、WebAuthn proofをcoreで再検証する。
+
+### Queue・consume・外部call直前の再認可
+
+入口の10秒contextをdurableな実行capabilityとして保存しない。DispatcherはWeb ownerの `instance_id/tenant_id/principal_id/session_ref/session_generation` とregistry revisionをevent/job/requestへ保存する。BFFはsession/token storeをdurable保持し、Dispatcher専用の認証済みUDS `revalidate_web_authorization` を提供する。worker/browserからは呼べず、任意session/URLを照合させない。
+
+Dispatcherはqueueからのjob起動・resume、Web requesterまたはWeb approverを持つapprovalのdecision/consume、executorの外部call直前にこのAPIを呼ぶ。入力はpersisted identity、exact job/request/attempt ID、operation/action digest、stage、current revision、Dispatcher生成nonce。BFFは対応するsessionの存在・generation・idle/絶対/token expiry・revokeを再読し、そのaccess tokenでonline introspectionを実行する。clientからtokenを受けず、workerへtokenも渡さない。成功proofはaudience=Dispatcher、上記全入力・checked_at・10秒以内のexpiryへbindした署名付き一回限り証明とする。Dispatcherは同じstage/nonceに対して署名・期限・local revisionをtransactionで検証/consumeしてから当該gateを進め、外部callまでに期限を越えたproofは使用しない。未使用proofも別stageやattemptへ転用できない。
+
+BFF/IdP unavailable、token消失、session expiry/revoke、proof不明では起動/resume/consume/callをしない。approvalは既存coreの `needs_review` へ収束させ、未起動/resume前jobは `failed` とsafe error `execution_authorization_unavailable` をdurable記録し、自動retryしない。再loginで古いjob/requestのsession bindingを置換せず、利用者による新規依頼/再承認が必要。一時unavailableであってもこの失敗を自動再開せず、`acceptance_unknown`も再実行しない。Web requesterとWeb approverの両方がある場合は双方を照合する。別transportのidentityはそのtransportの既存再認可contractを使い、Web proofで代用しない。
 
 オンライン照合とlocal revokeが直前認可に成功した後の外部IdP側変更は分散系のraceとして残る。local revokeとcommand/decision/claimは同じDispatcher transactionのrevisionで順序付け、execution直前も再認可する。既に外部callに入った作用は自動rollbackしない。IdP障害時の可用性よりfail closedを選ぶ。
 
@@ -101,7 +111,7 @@ Web approval credentialはIdP loginと独立した、hardware保護・non-backup
 1. Brokerがcurrent request、visibility、binding、policy、typed immutable actionの安全なprojectionを生成する。web presentationは `transport=web`、request ID、presentation revision、audience principal、action hashへのbindingを持つdurable recordにする。coreのdelivery/presentation contractで `synchronized sent` 相当を検証できる状態になるまでdecision不可。ブラウザに届いたというACKだけでapprovedにしない。
 2. UIはoperation、exact target、許可済みexact draft/mention、risk、expiry、opaque action IDをliteral表示する。既存ADRが非表示とするcontent MAC/internal semantic hashは表示しない。Issueのhash表示要求は安全な**表示用plan fingerprint**で満たす: canonicalな非秘密projection（opaque action ID、operation、許可済みtarget、risk、expiry、presentation revision）のSHA-256。本文/PII/credential由来digestを含めず、内部hashとは別field `display_fingerprint` とする。fingerprintも権限確認済みinboxだけへ表示し、MCPの最小projectionを拡張しない。
 3. approve/rejectごとにCSPRNG challengeを生成し、DBへ `challenge_digest, request_id, decision, action_hash, display_fingerprint, presentation_revision, principal_id, session_ref, instance_id, tenant_id, workspace_id, supervisor_binding_revision, credential_id, policy_revision, expires_at` をimmutable保存する。TTL 2分、request expiry以内、同一requestのactive challengeは一つ。一般的な「5分間昇格session」は発行しない。
-4. coreのverified Web transport endpointはsignature、challenge、RP ID hash、exact origin、type、user presence/verification、credential binding/revocation、non-backup属性を検証する。counterの後退/clone疑いも拒否する。session/CSRF/IdP、requesterのcurrent権限、supervisor visibility、instance/workspace、request/action hash、presentation/credential/policy revision、expiryを再検証し、challenge consume・decision・receipt・stable `dona_approval` outboxを同一transactionで一回だけcommitする。署名はserver保存challengeを介してexact action/decisionへ結合される。browserのhashを正本にしない。
+4. coreのverified Web transport endpointはsignature、challenge、RP ID hash、exact origin、type、user presence/verification、credential binding/revocation、non-backup属性を検証する。登録credentialごとにdurableな最大 `signCount` を保持し、保存値または受信値の一方でも非zeroなら受信値が保存値より大きいことを必須とする。非zero保存値以下（0への巻戻しを含む）はclone疑いとして `credential_counter_invalid` で拒否し、credentialをrevokeして未使用challengeを失効させる。両方0のcounter非対応credentialはallowlistの登録証明がある場合だけ許可し、counterによるclone検知を主張しない。成功時のcounter更新もchallenge consume/decisionと同じtransactionでCASする。session/CSRF/IdP、requesterのcurrent権限、supervisor visibility、instance/workspace、request/action hash、presentation/credential/policy revision、expiryを再検証し、challenge consume・decision・receipt・stable `dona_approval` outboxを同一transactionで一回だけcommitする。署名はserver保存challengeを介してexact action/decisionへ結合される。browserのhashを正本にしない。
 5. receiptは内部にdecision ID、request/action hash、principal/approver binding、proof key version、presentation、decision、expiryを保存する。UIへはopaque receipt ID、state、時刻だけを返す。receipt IDをbearer capabilityにせず、lookupも同じowner/approver scopeで認可する。
 6. `approved`、`consumed`、execution attempt/resultを分離する。decision TTL 15分、consume TTL 5分と、時刻/boot/restore規則は既存ADRのまま。consume時・外部call直前のTOCTOU、requester/approver revocation、one-shot、cancel/expiry競合、typed allowlistを既存coreが強制する。checkpointやresumeは#23のdurable pathだけを使い、元turnを保持しない。
 
@@ -113,8 +123,8 @@ Web approval credentialはIdP loginと独立した、hardware保護・non-backup
 | --- | --- | --- |
 | protected identity registry | instance/tenant/principal、issuer+sub、role/scope、revision、credential公開鍵/登録証明 | issuer/sub、credential IDは一般UI/SSE/logへ出さない。表示名/emailは認可に使わず既定で保存しない |
 | session store | cookie keyed digest、session_ref、principal、世代、issued/idle/absolute expiry、revoked_at、暗号化access token | cookie/token/CSRF/nonce/verifier/署名rawは出力禁止。失効時token削除 |
-| Web Event | `source=web`、instance/tenant/principal、identity/authz revision、非bearersession_ref、server event ID、command key digest、認可時刻 | payloadにclient identityを混ぜない。source discriminant/versionはdownstreamで追加 |
-| job / command receipt | immutable owner instance/tenant/principal、source event、authorization revision、stable command slot/key digest、canonical payload digest | workerへ最小owner contextのみ。secretやraw idempotency keyをResultへ渡さない |
+| Web Event | `source=web`、instance/tenant/principal、identity/authz revision、非bearer session_ref/session_generation、server event ID、command key digest、認可時刻 | payloadにclient identityを混ぜない。source discriminant/versionはdownstreamで追加 |
+| job / command receipt | immutable owner instance/tenant/principal、source event、session_ref/session_generation、authorization revision、stable command slot/key digest、canonical payload digest | workerへ最小owner contextのみ。secretやraw idempotency keyをResultへ渡さない |
 | approval / attempt | 上節のhash、requesterとapproverを別field、workspace/binding/policy/credential revision、decision/consume/attempt ID | 安全なprojectionだけ。raw typed plan、content MAC、私的context、access tokenは不可 |
 | audit | sequence、UTC、instance/tenant、actor principalまたは未認証、actor kind、session_ref、role/scope revision、action、resource opaque ID、outcome/error、receipt/attempt、policy/binding revision、key version、previous MAC | 認証失敗のclient申告actorはtrusted actor fieldへ入れない。URL、IP全文、UA、email、本文、token、hash原文は通常logへ出さない |
 
@@ -126,7 +136,7 @@ private contextの閲覧権限はsupervisor roleだけでは得られない。Sl
 
 BFF restartはdurable session revoke/expiryを再読するまでreadyにしない。login transactionと未使用step-up challengeは全失効し、表示・command結果はDispatcher receiptから再取得する。通常process restartでsessionを継続する場合も同一bootとcontinuous clock/UTC high-water markを検証し、経過不明・boot変更・鍵不明・DB restoreではsession全失効。単なるcookie署名一致では復旧しない。
 
-approval one-shot/expiry/auditはADR 0001の外部anchorまで照合する。外部write前にdurable fenceを保存し、`executing`復旧は`acceptance_unknown`、`claimed`はcurrent preconditionを再検証する。時刻証明不能・restore payload欠落時の`needs_review`とpayload削除を上書きしない。DB/audit/IdP unavailableでは新しいread/writeを止め、過去の画面を成功状態へ更新しない。audit append失敗もsecurity decisionをcommitしない。
+approval one-shot/expiry/auditはADR 0001の外部anchorまで照合する。外部write前にdurable fenceを保存し、`executing`復旧は`acceptance_unknown`、`claimed`はcurrent preconditionを再検証する。時刻証明不能・restore payload欠落時の`needs_review`とpayload削除を上書きしない。IdP unavailableではlocal logout以外の新しいread/writeを止め、DB/audit unavailableではlogoutを含むdurable成功を主張せず、過去の画面を成功状態へ更新しない。audit append失敗もsecurity decisionをcommitしない。
 
 Web schemaはversion付き追加migrationとし、既存Slack/job ownerをWeb default ownerへbackfillしない。unknown versionは起動拒否する。複数tenantへ進むときはinstanceとtenantを同義の文字列にせず、複合foreign keyとall-query isolation testを先に導入する。IdP/origin/credential変更はpending/challenge/session失効を伴う明示maintenanceとする。rollbackはWeb ingress/decisionを無効化し、receipt/consume/auditを保全する。古いbinaryが読めないDBを起動したり、snapshot復元で承認を再利用したりしない。
 
@@ -134,8 +144,8 @@ Web schemaはversion付き追加migrationとし、既存Slack/job ownerをWeb de
 
 未決定のsecurity fallbackは残さない。以下は本ADRで決めたcontractを実装・検証する作業であり、このPRのruntime実装ではない。
 
-- [ ] 認証runtime: versioned registry/session/revocation schema、OIDC+introspection provider適合試験、cookie/CSRF/proxy、WebAuthn登録/検証、local二者bootstrap/recoveryを実装する。
-- [ ] Event/command API: `source=web`、verified owner context、BFF専用UDS authorization、typed submit/cancel、command key/payload mismatch/receiptを追加する。自由文からidentityを採用しない。
+- [ ] 認証runtime: versioned registry/session/revocation schema、OIDC+introspection provider適合試験、cookie/CSRF/proxy、WebAuthn登録/counter CAS検証、IdP不要のlocal logout、Dispatcher専用session再認可API、local二者bootstrap/recoveryを実装する。
+- [ ] Event/command API: `source=web`、verified owner context、BFF専用UDS authorization、typed submit/cancel、read-only job kind/capability allowlistとsandbox profile、command key/payload mismatch/receiptを追加する。自由文からidentityを採用しない。
 - [ ] read/SSE: 全query/artifact/cursor/receiptへowner/grant predicate、revoke後のbatch停止、restart snapshot、安全なprojectionを実装する。
 - [ ] UI: session expiry/relogin、unknown時のread-only reconcile、literal Result、approval exact target/draft/fingerprint/expiry表示と一回限りceremonyを実装する。
 - [ ] approval inbox: #18/#23とADR 0001採用版を再照合し、Web presentation/proof/receiptを既存broker/one-shot/outboxへ結合する。既存MVP allowlist外を拒否する。

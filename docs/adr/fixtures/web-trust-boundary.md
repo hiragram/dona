@@ -12,7 +12,7 @@
 | --- | --- | --- | --- | --- |
 | P01 | 未認証 | list/submit | 401 `session_invalid` | なし |
 | P02 | a requester | own job_a read | 200、safe projection | なし |
-| P03 | a requester | submit、current認可あり | 202、durable event/receipt一件 | 受付のみ。作用は別gate |
+| P03 | a requester | `analysis.read_only.v1` submit、current認可/profile gate成功 | 202、durable event/receipt一件 | 隔離snapshot解析のみ、外部writeなし |
 | P04 | a requester | own job_a cancel | 202、既存cancel receipt | cancel requestのみ。外部作用rollbackなし |
 | P05 | a requester | job_b read/cancel/receipt | 404 `resource_not_visible` | なし |
 | P06 | b observer | explicit grantのjob_a read | 200 | なし |
@@ -26,7 +26,9 @@
 | P14 | a+s両role | 他人のjob cancel | 404 `resource_not_visible` | なし |
 | P15 | operatorを名乗るheader | role/binding変更API | 403 `scope_denied`、browser APIなし | なし |
 | P16 | s + valid step-up | self-update/production/high-risk | 422 `operation_unsupported` | なし |
-| P17 | a requester | approval対象writeを含むjob、bypass未遮断 | 503 `execution_safe_off` | なし |
+| P17 | a requester | read-only profile未接続のWeb submit | 503 `execution_safe_off` | なし |
+| P18 | a requester | commit/push/PR作成、任意shell/未知job kindをsubmit | 422 `job_kind_unsupported` | なし |
+| P19 | a requester | read-only jobからnetwork/credential/外部file/write toolへ到達 | sandbox/capability deny、job failed | external call 0、host secret読取0 |
 
 全拒否は本文やcandidate IDをechoせず、認証済みactorまたは未認証、operation、safe error code、sequenceをauditへ残す。resource認可を通らないIDはauditにもraw転載せず、bounded keyed referenceにする。
 
@@ -58,13 +60,16 @@
 | F05 | valid session、CSRF欠落/不一致/Originなし/null/別port | 403 `csrf_invalid` または `origin_invalid` | writeなし、deny |
 | F06 | state/nonce/PKCE/issuer/audience不一致のcallback | 401 `identity_invalid`、login transaction無効 | session発行なし |
 | F07 | login前cookieを固定してcallback | successなら新cookieのみ有効 | old session revoke、一回限り |
-| F08 | IdP timeout、既存sessionあり | 503 `identity_unavailable`、SSE閉鎖 | read/writeなし、別identityなし |
+| F08 | IdP timeout、既存sessionあり、resource API | 503 `identity_unavailable`、SSE閉鎖 | resource read/writeなし、別identityなし |
 | F09 | IdP introspection inactive/subject/client不一致 | 401 `session_revoked` / `identity_invalid` | session revoke、deny |
 | F10 | HTML/script/credential/private URLを含むResult | allowlist projection、literal text/redaction | script/fetchなし、raw値をlogしない |
 | F11 | 別principalのreceipt key/cursorを推測 | 404 `resource_not_visible` | read/controlなし |
 | F12 | 8時間/idle30分/token expiryの最小期限超過 | 401 `session_expired` | 延長なし、SSE/pollで延命しない |
 | F13 | cookie valid、authz revision stale | 401 `session_revoked` | transactionのcurrent revision優先 |
 | F14 | 未認証headerのactor/email | 401 `identity_invalid` | trusted actor=null、PII raw記録なし |
+| F15 | IdP timeout/inactive、valid local session/Origin/CSRFでlogout | 204、durable revoke+audit、cookie削除 | IdP復旧後も旧cookie拒否 |
+| F16 | F15でCSRF/Origin不正 | 403 `csrf_invalid` / `origin_invalid` | revokeなし、権限昇格なし |
+| F17 | logout中DB/audit commit失敗 | 503 `durability_unavailable` | cookie削除だけをdurable revoke成功にしない |
 
 ## Approval・receipt・restart fixture
 
@@ -95,9 +100,17 @@
 | A21 | valid step-up、self-update plan/hashあり | 422 `operation_unsupported` | apply/updater呼出数0 |
 | A22 | #18/#23またはbypass gate未達 | 503 `approval_safe_off` | broker実行接続なし |
 | A23 | hardware登録のattestation検証不能 / local二者不足 | `credential_registration_denied` | binding/credential変更なし |
+| A24 | 保存signCount=7、受信7/6/0のvalid signature | 403 `credential_counter_invalid`、credential revoke/deny audit | decision/outbox/consume追加0 |
+| A25 | counter保存7→受信8の2 challengeが競合 | counter CASのwinner一件、stale loser拒否 | 同じcounterでdecision二件を作らない |
+| A26 | 保存/受信counter=0、登録allowlistの非対応credential | 他proof成立時のみ許可、clone検知済みとは扱わない | challenge一回限りは保持 |
+| A27 | Web event受付10秒後にIdP disable、queue起動 | internal revalidation inactiveでjob failed | worker起動/外部call0 |
+| A28 | approve後・consume前にWeb requesterまたはapproverのIdP revoke | `needs_review`、decisionを実行許可として使わない | consume/外部call0 |
+| A29 | consume後・外部call前にBFF/IdP unavailable、session token欠落/期限切れ | `needs_review`、stage proof発行なし | 外部call0、tokenをworkerへ渡さない |
+| A30 | proofのnonce/stage/action/attempt差替え、再使用、10秒超過 | `authorization_proof_invalid` | gate進行/外部call0 |
+| A31 | BFF restart後durable session再読、同じstageを再認可 | current IdP activeと同一bindingを再確認した一回限りproofだけ許可 | 旧proof/unknown attemptは再実行しない |
 
 ## 下流testの判定方法
 
-FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challengeを一つずつ改変する。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断を検証する。
+FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challenge/counterを一つずつ改変する。worker profileはnetwork、shell、ambient credential、snapshot外fileへの実際の到達を否定testし、prompt文の存在だけを隔離証拠にしない。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断を検証する。
 
 provider適合試験はaccount disableがintrospectionへ反映されることを独立確認し、署名済tokenがvalidというfixtureだけでrevocationを証明しない。live provider/production作用はこの文書PRでは実施しない。
