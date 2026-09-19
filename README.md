@@ -58,6 +58,10 @@ Herdrの`dona`セッション内には、事前に`dona-main`という名前のC
 
 updater自身はroutine updateの対象外です。stable updater/policy/schemaの更新には、非terminal requestを拒否し、旧DBとfilesをbackupして新旧version healthを照合する`./scripts/install-self-update.sh --upgrade-control`をmaintenance windowで使います。app DB schema migrationとGitHub repository settings変更は対象外です。
 
+## Web Adapterの設計
+
+[Web trust boundary ADR](./docs/adr/0002-web-trust-boundary.md)と[decision / deployment fixture](./docs/adr/fixtures/web-trust-boundary.md)に、identity・tenant・session・approvalの契約を記載しています。設計成果物であり、Web runtimeやapproval実行の有効化ではありません。
+
 ## 全体検証
 
 ```sh
