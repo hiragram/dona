@@ -14,19 +14,21 @@ const checkpointReporter = path.resolve("test", "checkpoint-reporter.mjs");
 const processMetrics = path.resolve("test", "process-metrics.cjs");
 const forwardedArguments = process.argv.slice(2);
 const failureOutputLimitBytes = 64 * 1024;
+const failureStreamLimitBytes = failureOutputLimitBytes / 2;
 
 function appendFailureOutput(current, chunk) {
   const combined = Buffer.concat([current, chunk]);
-  return combined.length <= failureOutputLimitBytes
+  return combined.length <= failureStreamLimitBytes
     ? combined
-    : combined.subarray(combined.length - failureOutputLimitBytes);
+    : combined.subarray(combined.length - failureStreamLimitBytes);
 }
 
 for (const name of testFiles) {
   const relative = path.posix.join("test", name);
   const startedAt = performance.now();
   process.stdout.write(`[dispatcher-test] start ${relative}\n`);
-  let failureOutput = Buffer.alloc(0);
+  let failureStdout = Buffer.alloc(0);
+  let failureStderr = Buffer.alloc(0);
   const checkpointNonce = randomBytes(16).toString("hex");
   const startLoad = os.loadavg()[0] / Math.max(1, os.cpus().length);
   process.stderr.write(`[dispatcher-test:${checkpointNonce}] file-start ${relative} load=${startLoad.toFixed(3)}\n`);
@@ -52,10 +54,10 @@ for (const name of testFiles) {
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout.on("data", (chunk) => {
-      failureOutput = appendFailureOutput(failureOutput, chunk);
+      failureStdout = appendFailureOutput(failureStdout, chunk);
     });
     child.stderr.on("data", (chunk) => {
-      failureOutput = appendFailureOutput(failureOutput, chunk);
+      failureStderr = appendFailureOutput(failureStderr, chunk);
       process.stderr.write(chunk);
     });
     child.once("error", reject);
@@ -64,7 +66,8 @@ for (const name of testFiles) {
   if (exitCode !== 0) {
     process.stderr.write(`[dispatcher-test:${checkpointNonce}] file-fail ${relative} elapsed_ms=${Math.round(performance.now() - startedAt)} load=${(os.loadavg()[0] / Math.max(1, os.cpus().length)).toFixed(3)}\n`);
     process.stderr.write(`[dispatcher-test] failed ${relative} elapsed_ms=${Math.round(performance.now() - startedAt)}\n`);
-    if (failureOutput.length > 0) process.stderr.write(failureOutput);
+    if (failureStdout.length > 0) process.stdout.write(failureStdout);
+    if (failureStderr.length > 0) process.stderr.write(failureStderr);
     process.exitCode = exitCode;
     break;
   }

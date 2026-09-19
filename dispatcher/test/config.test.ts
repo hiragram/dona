@@ -74,8 +74,9 @@ describe("job resource config", () => {
     assert.match(runner, /test-reporter-destination=stderr/);
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
     assert.match(reporter, /event\.type === "test:dequeue"/);
-    assert.match(reporter, /terminalOccurrences/);
-    assert.match(reporter, /event\.data\.details\?\.type === "suite"/);
+    assert.match(reporter, /event\.type !== "test:complete"/);
+    assert.match(reporter, /identitiesByLocation/);
+    assert.match(reporter, /path\.isAbsolute\(event\.data\.name\)/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
     assert.match(reporter, /"case-finish"/);
     assert.match(reporter, /`\\n\[dispatcher-test:\$\{nonce\}\]/);
@@ -93,6 +94,9 @@ describe("job resource config", () => {
     assert.ok(metrics.indexOf('name.includes("fake-git")') < metrics.indexOf('name.endsWith(".mjs")'));
     assert.match(reporter, /event\.type === "test:stderr"/);
     assert.match(reporter, /metrics scope=2/);
+    assert.match(runner, /failureStdout/);
+    assert.match(runner, /process\.stdout\.write\(failureStdout\)/);
+    assert.match(runner, /process\.stderr\.write\(failureStderr\)/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
     const markerBytes = fs.readdirSync(new URL("./", import.meta.url))
       .filter((name) => name.endsWith(".test.ts"))
@@ -154,14 +158,14 @@ describe("job resource config", () => {
     assert.match(stderr, caseStartPattern);
   });
 
-  test("同名並列testのterminalを開始順occurrenceへ対応付ける", async () => {
+  test("同名並列testのterminalを実行位置のoccurrenceへ対応付ける", async () => {
     const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-occurrence-`);
     const fixture = `${temporaryDirectory}/parallel.test.mjs`;
     fs.writeFileSync(fixture, [
       'import { describe, test } from "node:test";',
       'describe("parallel", { concurrency: true }, () => {',
-      '  test("duplicate", async () => new Promise((resolve) => setTimeout(resolve, 50)));',
       '  test("duplicate", async () => new Promise(() => {}));',
+      '  test("duplicate", async () => new Promise((resolve) => setTimeout(resolve, 50)));',
       '});',
     ].join("\n"));
     const nonce = "0123456789abcdef0123456789abcdef";
@@ -186,12 +190,12 @@ describe("job resource config", () => {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     const digest = "e24a5a32c9b8";
-    const completedFirst = new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#1`);
+    const completedSecond = new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#2`);
     try {
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("first terminal marker was not emitted")), 2_000);
+        const timeout = setTimeout(() => reject(new Error("second terminal marker was not emitted")), 2_000);
         child.stderr.on("data", () => {
-          if (!completedFirst.test(stderr)) return;
+          if (!completedSecond.test(stderr)) return;
           clearTimeout(timeout);
           resolve();
         });
@@ -207,8 +211,45 @@ describe("job resource config", () => {
     }
     assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#1`));
     assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#2`));
-    assert.match(stderr, completedFirst);
-    assert.doesNotMatch(stderr, new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#2`));
+    assert.doesNotMatch(stderr, new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#1`));
+    assert.match(stderr, completedSecond);
+  });
+
+  test("file wrapper停止をleaf caseとして記録しない", async () => {
+    const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-wrapper-`);
+    const fixture = `${temporaryDirectory}/wrapper.test.mjs`;
+    fs.writeFileSync(fixture, "await new Promise(() => {});\n");
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const reporter = fileURLToPath(new URL("./checkpoint-reporter.mjs", import.meta.url));
+    const childEnvironment = { ...process.env };
+    for (const name of Object.keys(childEnvironment)) {
+      if (name.startsWith("NODE_TEST_")) delete childEnvironment[name];
+    }
+    delete childEnvironment.NODE_OPTIONS;
+    delete childEnvironment.DONA_PROCESS_METRICS_NONCE;
+    delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
+    childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/wrapper.test.ts";
+    childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    let stderr = "";
+    const child = spawn(process.execPath, [
+      "--test",
+      `--test-reporter=${reporter}`,
+      "--test-reporter-destination=stderr",
+      fixture,
+    ], { env: childEnvironment, stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        child.kill("SIGKILL");
+        await closed;
+      }
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+    assert.doesNotMatch(stderr, /case-start/);
   });
 
   test("expands documented home-relative paths consistently", () => {
