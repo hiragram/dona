@@ -238,3 +238,7 @@ export function stableStringify(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
+
+export function parseJobWorkspace(input: unknown): JobWorkspace {
+  return parseWithSchema<JobWorkspace>(jobWorkspaceSchema, input);
+}
