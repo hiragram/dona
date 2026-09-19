@@ -34,4 +34,4 @@ provider側には、planのnodeをimmutableな補助storeへdurableに公開し�
 
 独立した再帰実装によるroot再計算、追加順序に依存しないroot、過去IDの再使用拒否、補助snapshotの巻戻し、経路上の全nodeの欠落・byte改変、scope変更、canonical wire、同期callback、読取とplan容量の上限をfixtureで検証する。
 
-この差分は永続node store、保護head CASとのadapter、認証付きnative broker、operator provisioningを実装しない。実Keychainやproductionでの予約・復旧の検証結果ではなく、#16全体の完了条件は残る。
+永続node storeと保護head CASとのadapterは[保護headと使用済みIDの接続](protected-head-adapters.md)を参照する。認証付きnative brokerとoperator provisioningは未接続であり、実Keychainやproductionでの予約・復旧の検証結果ではない。#16全体の完了条件は残る。
