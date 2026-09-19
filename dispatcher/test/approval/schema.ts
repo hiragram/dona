@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../../src/database.js";
@@ -499,11 +500,13 @@ test(
     const barrier = new SharedArrayBuffer(4);
     const gate = new Int32Array(barrier);
     const modulePath = createRequire(import.meta.url).resolve("better-sqlite3");
+    const extensionPath = fileURLToPath(new URL("../../dist/native/file-identity" + (process.platform === "darwin" ? ".dylib" : ".so"), import.meta.url));
     const source = `
     const { parentPort, workerData } = require('node:worker_threads');
     const Database = require(workerData.modulePath);
     const db = new Database(workerData.filename);
-    db.pragma('foreign_keys=ON'); db.pragma('busy_timeout=2000');
+    db.loadExtension(workerData.extensionPath);
+    db.pragma('foreign_keys=ON'); db.pragma('recursive_triggers=ON'); db.pragma('busy_timeout=2000');
     const gate = new Int32Array(workerData.barrier);
     parentPort.postMessage('ready');
     while (Atomics.load(gate,0)===0) Atomics.wait(gate,0,0,2000);
@@ -521,7 +524,7 @@ test(
       () =>
         new Worker(source, {
           eval: true,
-          workerData: { filename, barrier, modulePath },
+          workerData: { filename, barrier, modulePath, extensionPath },
         }),
     );
     t.after(async () => {

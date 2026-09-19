@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { loadSecurityExtension } from "../audit/file-identity.js";
 
 export class ApprovalSchemaError extends Error {
   constructor() { super("approval_schema_unverified"); this.name = "ApprovalSchemaError"; }
@@ -184,7 +185,11 @@ const schemaSql = `
           BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
         CREATE TRIGGER approval_clock_no_delete BEFORE DELETE ON approval_clock_reservations
           BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
-`;
+` + ["requests", "decisions", "consumes", "execution_attempts", "notifications", "presentation_updates"].map(name => `
+        CREATE TRIGGER approval_${name}_clock_provenance BEFORE INSERT ON approval_${name}
+          WHEN dona_clock_reference(NEW.clock_transaction_id) IS NOT 1
+          BEGIN SELECT RAISE(ABORT,'approval_clock_provenance_unverified'); END;
+`).join("");
 
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
@@ -214,6 +219,7 @@ export function verifyApprovalSchema(db: Database.Database): void {
  * This installer never provisions bindings, credentials, clocks or audit roots. */
 export function installApprovalSchema(db: Database.Database): void {
   try {
+    loadSecurityExtension(db);
     if (db.inTransaction || db.pragma("foreign_keys", { simple: true }) !== 1
       || db.pragma("encoding", { simple: true }) !== "UTF-8") throw new ApprovalSchemaError();
     db.pragma("recursive_triggers = ON");

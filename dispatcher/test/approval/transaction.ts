@@ -247,6 +247,28 @@ test("既存ledger更新は作成時の時計参照を保ったまま新しい�
   assert.equal(count(db,"approval_clock_reservations"),2);
   assert.equal(audit.verify().sequence,2);
 });
+
+test("蓄積したledgerでも予約不一致をINSERT時点で拒否し明示rowidでも迂回できない", t => {
+  const {db,transaction,audit}=setup(t);
+  transaction.run("history",event,mark=>{
+    insertRequest(db,mark.transaction_id);
+    const row=db.prepare("SELECT * FROM approval_requests WHERE request_id='r1'").get() as Record<string,unknown>;
+    const fields=Object.keys(row);
+    const insert=db.prepare(`INSERT INTO approval_requests (${fields.join(",")}) VALUES (${fields.map(()=>"?").join(",")})`);
+    for(let n=2;n<=1500;n++)insert.run(...fields.map(field=>field==="request_id"?"history"+n:field==="creation_key"?n.toString(16).padStart(64,"0"):row[field]));
+  });
+  const row=db.prepare("SELECT * FROM approval_requests WHERE request_id='r1'").get() as Record<string,unknown>;
+  const fields=Object.keys(row);
+  const insert=db.prepare(`INSERT INTO approval_requests (rowid,${fields.join(",")}) VALUES (?,${fields.map(()=>"?").join(",")})`);
+  transaction.run("current",event,mark=>{
+    const values=(clock:string)=>fields.map(field=>field==="request_id"?"new":field==="creation_key"?"f".repeat(64):field==="clock_transaction_id"?clock:row[field]);
+    assert.throws(()=>insert.run(-1,...values("history")),/approval_clock_provenance_unverified/);
+    assert.equal(count(db,"approval_requests"),1500);
+    insert.run(-2,...values(mark.transaction_id));
+  });
+  assert.equal(count(db,"approval_requests"),1501);
+  assert.equal(audit.verify().sequence,2);
+});
 test("clock reservation・request・auditを同じtransactionへ結び、再open後も保持する", (t) => {
   const { db, filename, anchors, marks, transaction } = setup(t);
   const result = transaction.run("tx1", event, (mark) => {

@@ -8,7 +8,32 @@
 #include <errno.h>
 SQLITE_EXTENSION_INIT1
 
-typedef struct { sqlite3 *database; int active; int clock_read_only; unsigned char token[32]; } mutation_guard;
+typedef struct {
+  sqlite3 *database; int references; int active; int clock_read_only;
+  unsigned char token[32]; char clock_transaction[129];
+} mutation_guard;
+
+static void release_guard(void *value) {
+  mutation_guard *guard = value;
+  if (--guard->references == 0) { memset(guard, 0, sizeof(*guard)); sqlite3_free(guard); }
+}
+
+/* A read-only predicate for exact, schema-verified BEFORE INSERT triggers.
+ * Bare schema fixtures may insert outside a security transaction; an active
+ * audited mutation must bind every new ledger row to its current reservation. */
+static void clock_reference(sqlite3_context *context, int argc, sqlite3_value **argv) {
+  mutation_guard *guard = sqlite3_user_data(context);
+  (void)argc;
+  if (!guard->active) { sqlite3_result_int(context, 1); return; }
+  if (!guard->clock_read_only || sqlite3_value_type(argv[0]) != SQLITE_TEXT) {
+    sqlite3_result_int(context, 0); return;
+  }
+  const char *value = (const char *)sqlite3_value_text(argv[0]);
+  int length = sqlite3_value_bytes(argv[0]);
+  sqlite3_result_int(context, value && length > 0 && length <= 128 &&
+    (size_t)length == strlen(guard->clock_transaction) &&
+    !memcmp(value, guard->clock_transaction, (size_t)length));
+}
 
 static int authorize_mutation(void *data, int action, const char *first,
   const char *second, const char *database, const char *source) {
@@ -57,8 +82,7 @@ failed:
 
 static void control_mutation(sqlite3_context *context, int argc, sqlite3_value **argv) {
   mutation_guard *guard = sqlite3_user_data(context);
-  (void)argc;
-  if (sqlite3_value_type(argv[0]) != SQLITE_BLOB || sqlite3_value_bytes(argv[0]) != 32 ||
+  if (argc < 2 || argc > 3 || sqlite3_value_type(argv[0]) != SQLITE_BLOB || sqlite3_value_bytes(argv[0]) != 32 ||
       sqlite3_value_type(argv[1]) != SQLITE_INTEGER) goto rejected;
   sqlite3_int64 enabled = sqlite3_value_int64(argv[1]);
   const unsigned char *token = sqlite3_value_blob(argv[0]);
@@ -75,12 +99,27 @@ static void control_mutation(sqlite3_context *context, int argc, sqlite3_value *
       if (sqlite3_set_authorizer(guard->database, 0, 0) != SQLITE_OK) goto rejected;
       guard->active = 0;
       guard->clock_read_only = 0;
+      memset(guard->clock_transaction, 0, sizeof(guard->clock_transaction));
       memset(guard->token, 0, 32);
     } else {
       if ((enabled == 2 && guard->clock_read_only) || (enabled == 3 && !guard->clock_read_only)) goto rejected;
+      if (enabled == 2) {
+        if (argc != 3 || sqlite3_value_type(argv[2]) != SQLITE_TEXT) goto rejected;
+        const unsigned char *value = sqlite3_value_text(argv[2]);
+        int length = sqlite3_value_bytes(argv[2]);
+        if (!value || length < 1 || length > 128) goto rejected;
+        for (int i = 0; i < length; i++) {
+          unsigned char c = value[i];
+          if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-')) goto rejected;
+        }
+        memcpy(guard->clock_transaction, value, (size_t)length);
+        guard->clock_transaction[length] = 0;
+      }
       /* Reinstalling expires statements prepared before the stricter phase. */
       if (sqlite3_set_authorizer(guard->database, authorize_mutation, guard) != SQLITE_OK) goto rejected;
       guard->clock_read_only = enabled == 2;
+      if (enabled == 3) memset(guard->clock_transaction, 0, sizeof(guard->clock_transaction));
     }
   } else goto rejected;
   sqlite3_result_int(context, 1);
@@ -116,6 +155,10 @@ int sqlite3_extension_init(sqlite3 *database, char **error, const sqlite3_api_ro
   if (!guard) return SQLITE_NOMEM;
   memset(guard, 0, sizeof(*guard));
   guard->database = database;
-  return sqlite3_create_function_v2(database, "dona_mutation_guard", 2,
-    SQLITE_UTF8 | SQLITE_DIRECTONLY, guard, control_mutation, 0, 0, sqlite3_free);
+  guard->references = 2;
+  status = sqlite3_create_function_v2(database, "dona_clock_reference", 1,
+    SQLITE_UTF8 | SQLITE_INNOCUOUS, guard, clock_reference, 0, 0, release_guard);
+  if (status != SQLITE_OK) { release_guard(guard); return status; }
+  return sqlite3_create_function_v2(database, "dona_mutation_guard", -1,
+    SQLITE_UTF8 | SQLITE_DIRECTONLY, guard, control_mutation, 0, 0, release_guard);
 }

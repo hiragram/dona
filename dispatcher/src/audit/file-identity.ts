@@ -52,11 +52,11 @@ export function withMutationSqlGuard<T>(db: Database.Database, callback: () => T
 
 /** The framework inserts its verified reservation before entering this phase.
  * User mutation SQL cannot add or change clock rows, including prepared SQL. */
-export function withClockRowsReadOnly<T>(db: Database.Database, callback: () => T): T {
+export function withClockRowsReadOnly<T>(db: Database.Database, transactionId: string, callback: () => T): T {
   const token = mutationTokens.get(db);
   if (!token) throw new Error("security_sql_guard_unverified");
-  const control = db.prepare("SELECT dona_mutation_guard(?,CAST(? AS INTEGER)) AS ok");
-  control.get(token, 2);
+  const control = db.prepare("SELECT dona_mutation_guard(?,CAST(? AS INTEGER),?) AS ok");
+  control.get(token, 2, transactionId);
   try { return callback(); }
-  finally { control.get(token, 3); }
+  finally { control.get(token, 3, null); }
 }
