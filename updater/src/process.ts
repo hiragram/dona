@@ -44,7 +44,7 @@ export class ProcessRunner {
       let fileState: string | undefined;
       let lastFinished: string | undefined;
       let metrics: string | undefined;
-      const unfinishedCases = new Set<string>();
+      const unfinishedCases = new Map<string, number>();
       let timedOut = false;
       let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
@@ -57,7 +57,8 @@ export class ProcessRunner {
           outputCheckpoint = timeoutCheckpoint;
           return;
         }
-        const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
+        const pending = [...unfinishedCases].at(-1);
+        const unfinished = pending ? `${pending[0]}#${pending[1]}` : currentFile ?? "none";
         outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}${metrics ? `; ${metrics}` : ""}`;
       };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
@@ -95,9 +96,12 @@ export class ProcessRunner {
           const action = testMatch?.[2];
           const identity = testMatch?.[3];
           if (!nonce || nonce !== checkpointNonce || !action || !identity) continue;
-          if (action === "case-start") unfinishedCases.add(identity);
+          const group = identity.replace(/#\d+$/, "");
+          if (action === "case-start") unfinishedCases.set(group, (unfinishedCases.get(group) ?? 0) + 1);
           else {
-            unfinishedCases.delete(identity);
+            const remaining = (unfinishedCases.get(group) ?? 0) - 1;
+            if (remaining > 0) unfinishedCases.set(group, remaining);
+            else unfinishedCases.delete(group);
             lastFinished = `${action} ${identity}${testMatch[4] ? ` elapsed_ms=${testMatch[4]}` : ""}`;
           }
           refreshCheckpoint();
@@ -152,7 +156,8 @@ export class ProcessRunner {
       };
       const timer = setTimeout(() => {
         timedOut = true;
-        const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
+        const pending = [...unfinishedCases].at(-1);
+        const unfinished = pending ? `${pending[0]}#${pending[1]}` : currentFile ?? "none";
         timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}${metrics ? `; ${metrics}` : ""}`;
         outputCheckpoint = timeoutCheckpoint;
         termOutcome = signalGroup("SIGTERM");

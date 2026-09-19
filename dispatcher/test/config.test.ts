@@ -75,8 +75,7 @@ describe("job resource config", () => {
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
     assert.match(reporter, /event\.type === "test:dequeue"/);
     assert.match(reporter, /event\.type === "test:complete"/);
-    assert.match(reporter, /identitiesByExecution/);
-    assert.match(reporter, /event\.data\.testNumber/);
+    assert.match(reporter, /completedEvents/);
     assert.match(reporter, /"test:pass"/);
     assert.match(reporter, /event\.data\.nesting === 0 && event\.data\.name === event\.data\.file/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
@@ -160,7 +159,7 @@ describe("job resource config", () => {
     assert.match(stderr, caseStartPattern);
   });
 
-  test("同名並列testのterminalを実行位置のoccurrenceへ対応付ける", async () => {
+  test("同名並列testのterminalをactive countへ対応付ける", async () => {
     const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-occurrence-`);
     const fixture = `${temporaryDirectory}/parallel.test.mjs`;
     fs.writeFileSync(fixture, [
@@ -191,7 +190,7 @@ describe("job resource config", () => {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     const digest = "e24a5a32c9b8";
-    const completedSecond = new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#2`);
+    const completedSecond = new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#1`);
     try {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("second terminal marker was not emitted")), 2_000);
@@ -212,7 +211,6 @@ describe("job resource config", () => {
     }
     assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#1`));
     assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#2`));
-    assert.doesNotMatch(stderr, new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#1`));
     assert.match(stderr, completedSecond);
   });
 
@@ -253,7 +251,7 @@ describe("job resource config", () => {
     assert.doesNotMatch(stderr, /case-start/);
   });
 
-  test("suite後のleafをsibling testNumberへ対応付ける", () => {
+  test("suite後のleaf terminalも記録する", () => {
     const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-sibling-`);
     const fixture = `${temporaryDirectory}/sibling.test.mjs`;
     fs.writeFileSync(fixture, [

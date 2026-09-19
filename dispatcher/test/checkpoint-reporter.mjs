@@ -10,9 +10,8 @@ if (!file || !/^test\/[A-Za-z0-9._-]+\.test\.ts$/.test(file) || !nonce || !/^[a-
 export default async function* checkpointReporter(source) {
   delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
   const startOccurrences = new Map();
-  const identitiesByExecution = new Map();
-  const siblingOrdinals = new Map();
   const terminalOccurrences = new Map();
+  const completedEvents = new Set();
   const queuedTypes = new Map();
   let supportsComplete = false;
   for await (const event of source) {
@@ -38,31 +37,25 @@ export default async function* checkpointReporter(source) {
       if (types.length === 0) queuedTypes.delete(key);
       const isFileWrapper = type === "test" && event.data.nesting === 0 && event.data.name === event.data.file;
       if (isFileWrapper) continue;
-      const testNumber = (siblingOrdinals.get(event.data.nesting) ?? 0) + 1;
-      siblingOrdinals.set(event.data.nesting, testNumber);
-      if (type === "suite") {
-        siblingOrdinals.set(event.data.nesting + 1, 0);
-        continue;
-      }
       if (type !== "test") continue;
       const digest = createHash("sha256").update(event.data.name).digest("hex").slice(0, 12);
       const occurrence = (startOccurrences.get(digest) ?? 0) + 1;
       startOccurrences.set(digest, occurrence);
-      const location = `${event.data.file}:${event.data.line}:${event.data.column}`;
-      identitiesByExecution.set(`${location}:${testNumber}`, `${digest}#${occurrence}`);
       yield `\n[dispatcher-test:${nonce}] case-start ${file}:${digest}#${occurrence}\n`;
       continue;
     }
     if (event.type === "test:complete" && event.data.details?.type === "test") {
       supportsComplete = true;
-      const location = `${event.data.file}:${event.data.line}:${event.data.column}`;
-      const execution = `${location}:${event.data.testNumber}`;
-      const identity = identitiesByExecution.get(execution);
-      identitiesByExecution.delete(execution);
-      if (!identity) continue;
+      const completion = `${event.data.file}:${event.data.line}:${event.data.column}:${event.data.testNumber}:${event.data.details.duration_ms}:${event.data.details.passed}`;
+      if (completedEvents.has(completion)) continue;
+      completedEvents.add(completion);
+      const digest = createHash("sha256").update(event.data.name).digest("hex").slice(0, 12);
+      const occurrence = (terminalOccurrences.get(digest) ?? 0) + 1;
+      if (occurrence > (startOccurrences.get(digest) ?? 0)) continue;
+      terminalOccurrences.set(digest, occurrence);
       const action = event.data.details?.passed ? "case-finish" : "case-fail";
       const elapsed = Math.round(event.data.details?.duration_ms ?? 0);
-      yield `\n[dispatcher-test:${nonce}] ${action} ${file}:${identity} elapsed_ms=${elapsed}\n`;
+      yield `\n[dispatcher-test:${nonce}] ${action} ${file}:${digest}#${occurrence} elapsed_ms=${elapsed}\n`;
       continue;
     }
     if (supportsComplete || (event.type !== "test:pass" && event.type !== "test:fail")) continue;
