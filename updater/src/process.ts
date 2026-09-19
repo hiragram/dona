@@ -148,6 +148,7 @@ export class ProcessRunner {
       child.stdout.on("data", (chunk: Buffer) => { writeDiagnostic("stdout", chunk); stdout = append(stdout, chunk, false); rebalance(); });
       child.stderr.on("data", (chunk: Buffer) => { writeDiagnostic("stderr", chunk); stderr = append(stderr, chunk, true); rebalance(); });
       let hardKillTimer: NodeJS.Timeout | undefined;
+      let cleanupPollTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null = null;
       const finish = (): void => {
@@ -180,6 +181,28 @@ export class ProcessRunner {
         }
         return child.kill(signal) ? "child-sent" : "unavailable";
       };
+      const finishAfterGroupCleanup = (): void => {
+        if (!child.pid) { finish(); return; }
+        const deadline = Date.now() + 1_000;
+        const poll = (): void => {
+          try {
+            process.kill(-child.pid!, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+              cleanupPollTimer = undefined;
+              finish();
+              return;
+            }
+          }
+          if (Date.now() >= deadline) {
+            cleanupPollTimer = undefined;
+            finish();
+            return;
+          }
+          cleanupPollTimer = setTimeout(poll, 20);
+        };
+        poll();
+      };
       const timer = setTimeout(() => {
         timedOut = true;
         const pending = [...unfinishedCases].at(-1);
@@ -190,13 +213,14 @@ export class ProcessRunner {
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
-          finish();
+          finishAfterGroupCleanup();
         }, 1_000);
       }, options.timeoutMs);
       timer.unref();
       child.once("error", (error) => {
         clearTimeout(timer);
         if (hardKillTimer) clearTimeout(hardKillTimer);
+        if (cleanupPollTimer) clearTimeout(cleanupPollTimer);
         if (settled) return;
         settled = true;
         const diagnosticLog = finishDiagnostic(true);
@@ -215,7 +239,7 @@ export class ProcessRunner {
         clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
-        if (!hardKillTimer) finish();
+        if (!hardKillTimer && !cleanupPollTimer) finish();
       });
     });
   }
