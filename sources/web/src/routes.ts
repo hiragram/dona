@@ -28,6 +28,12 @@ const definitions: readonly Definition[] = [
   {id:"approval_decision",method:"POST",pattern:/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})\/decision$/,resourceKind:"approval",gate:"approval_step_up",capability:"approval",activity:"user_command"},
 ];
 export class WebRouteError extends Error {constructor(){super("web_route_invalid");this.name="WebRouteError";}}
+/** Validates the shape of a signed route binding; this does not authorize it. */
+export function matchesRouteBinding(routeId:string,method:string,resource:WebRoute["resource"]):boolean {
+  const definition=definitions.find(value=>value.id===routeId && value.method===method);
+  return definition!==undefined && (definition.resourceKind===undefined ? resource===null
+    : resource!==null && resource.kind===definition.resourceKind && /^[A-Za-z0-9_-]{1,128}$/.test(resource.id));
+}
 /** Pass the raw request target BEFORE URL normalization. Only the OIDC callback
  * permits a query, which its dedicated parser must validate without logging. */
 export function matchWebRoute(method:unknown,target:unknown):WebRoute {

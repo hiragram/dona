@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
+import { matchWebRoute, matchesRouteBinding } from "./routes.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const revision = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
@@ -11,7 +12,9 @@ export const contextIdentitySchema = z.strictObject({
   identity_binding_revision:revision, authz_revision:revision, bff_generation:revision,
 });
 export type ContextIdentity = z.infer<typeof contextIdentitySchema>;
-const requestSchema = z.strictObject({ method:z.enum(["GET","POST"]), route_id:id, body_digest:digest });
+const requestSchema = z.strictObject({ method:z.enum(["GET","POST"]), route_id:id, body_digest:digest,
+  resource:z.strictObject({kind:z.enum(["job","approval"]),id}).nullable(),
+}).refine(value => matchesRouteBinding(value.route_id,value.method,value.resource));
 export type ContextRequest = z.infer<typeof requestSchema>;
 const claimsSchema = z.strictObject({
   codec_version:z.literal(1), audience:z.literal("dona.dispatcher.web-ingress"),
@@ -45,6 +48,12 @@ function decode(value:string):Buffer {
 export function requestBodyDigest(bytes:Uint8Array):string {
   return guard(()=>{if(!(bytes instanceof Uint8Array) || bytes.byteLength>65536)throw new ContextError();
     return createHash("sha256").update(bytes).digest("hex");});
+}
+/** Both peers derive the binding independently from the actual raw request
+ * target and body, before URL normalization or resource authorization. */
+export function ingressContextRequest(method:unknown,target:unknown,body:Uint8Array):ContextRequest {
+  return guard(()=>{const route=matchWebRoute(method,target);
+    return requestSchema.parse({method:route.method,route_id:route.id,resource:route.resource,body_digest:requestBodyDigest(body)});});
 }
 /** Caller supplies a freshly introspected, current verified session and a protected
  * clock. route_id comes from a fixed local route table, never a browser header. */

@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {signIngressContext,verifyIngressContext,requestBodyDigest,ContextError,type ContextKey,type ContextIdentity} from "../src/context.js";
+import {signIngressContext,verifyIngressContext,requestBodyDigest,ingressContextRequest,ContextError,type ContextKey,type ContextIdentity} from "../src/context.js";
 const key:ContextKey={purpose:"web_ingress_context",version:1,state:"active",activated_at:"2026-09-01T00:00:00.000Z",signing_expires_at:"2026-10-01T00:00:00.000Z",secret:Buffer.alloc(32,11)};
 const identity:ContextIdentity={instance_id:"i",tenant_id:"t",principal_id:"p",session_ref:"s",session_generation:1,principal_revoke_generation:1,identity_binding_revision:1,authz_revision:1,bff_generation:1};
-const request={method:"POST" as const,route_id:"job_submit",body_digest:requestBodyDigest(Buffer.from("{}"))};
+const request=ingressContextRequest("POST","/api/jobs",Buffer.from("{}"));
 const now="2026-09-19T00:00:00.000Z",end="2026-09-19T01:00:00.000Z";
 function issue(){return signIngressContext(identity,request,key,now,end);}
 test("contextは10秒とsession期限へ上限を設けnonceを毎回生成する",()=>{
@@ -42,4 +42,20 @@ test("不正encodingと過大入力をsecretを含まない共通errorへ落と�
  }
  assert.throws(()=>requestBodyDigest(Buffer.alloc(65537)),ContextError);
  assert.equal(requestBodyDigest(Buffer.from("a")),requestBodyDigest(Buffer.from("a")));
+});
+
+test("同じ権限とbodyでも動的routeのresourceを差し替えられない",()=>{
+ for(const [a,b] of [["/api/jobs/a/cancel","/api/jobs/b/cancel"],
+   ["/api/approvals/a/decision","/api/approvals/b/decision"]]){
+  const expected=ingressContextRequest("POST",a,Buffer.from("{}"));
+  const token=signIngressContext(identity,expected,key,now,end);
+  assert.deepEqual(verifyIngressContext(token,key,identity,expected,now).request,expected);
+  assert.throws(()=>verifyIngressContext(token,key,identity,ingressContextRequest("POST",b,Buffer.from("{}")),now),ContextError);
+  for(const resource of [null,{kind:"job" as const,id:"b"},{kind:"approval" as const,id:"b"}])
+   assert.throws(()=>verifyIngressContext(token,key,identity,{...expected,resource},now),ContextError);
+  assert.throws(()=>signIngressContext(identity,{...expected,resource:null},key,now,end),ContextError);
+ }
+ assert.throws(()=>signIngressContext(identity,{...request,resource:{kind:"job",id:"a"}},key,now,end),ContextError);
+ for(const target of ["/api/jobs/%61/cancel","/api/jobs/a/cancel?x=1","/api/jobs/a/../b/cancel"])
+  assert.throws(()=>ingressContextRequest("POST",target,Buffer.from("{}")),ContextError);
 });
