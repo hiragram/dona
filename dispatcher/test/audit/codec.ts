@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  AuditIntegrityError, signAuditCheckpoint, signAuditRecord, verifyAuditChain, verifyAuditRecord,
+  AuditIntegrityError, signAuditCheckpoint, signAuditRecord, verifyAuditChain, verifyAuditRecord, verifyAuditState, signAuditRetentionCheckpoint,
   type AuditAnchor, type AuditEvent, type AuditKey, type AuditRecord,
 } from "../../src/audit/codec.js";
 
@@ -161,4 +161,43 @@ test("scope変更のauthz revisionと具体的な拒否operation・safe errorを
   }
   assert.equal(signatures.size, 15);
   assert.throws(() => record(1, "0".repeat(64), { ...event, operation: "https://private.example" } as never), AuditIntegrityError);
+});
+
+function boundRecord(sequence:number,previous:string,resource:string,value:string,scopeValue=event.scope):AuditRecord {
+ return signAuditRecord({codec_version:2,chain_id:"chain_1",sequence,transaction_id:`bound_${sequence}`,previous_mac:previous,key_version:1,
+  event:{...event,resource_id:resource,scope:scopeValue},resource_digest:value.repeat(64)},lookup);
+}
+const retainSigning={chain_id:"chain_1",transaction_id:"retained_1",key_version:1,signed_at:at};
+test("retentionがscopeごとの集約rootを引き継ぎ後続recordで更新する",()=>{
+ const a=boundRecord(1,"0".repeat(64),"web_state","a"),b=boundRecord(2,a.mac,"approval_state","b"),c=boundRecord(3,b.mac,"web_state","c");
+ const original=verifyAuditState(genesis(),[a,b,c],anchor([a,b,c]),lookup);
+ const cp=signAuditRetentionCheckpoint(retainSigning,lookup,genesis(),[a,b,c],anchor([a,b,c]),2);
+ assert.equal(cp.codec_version,2);
+ if(cp.codec_version!==2)assert.fail();
+ assert.equal(cp.resource_bindings.find(value=>value.resource_id==="web_state")?.resource_digest,"a".repeat(64));
+ const nextAnchor={...anchor([a,b,c]),checkpoint_mac:cp.mac};
+ assert.deepEqual(verifyAuditState(cp,[c],nextAnchor,lookup).resource_bindings,original.resource_bindings);
+ const cp2=signAuditRetentionCheckpoint({...retainSigning,transaction_id:"retained_2"},lookup,cp,[c],nextAnchor,3);
+ assert.deepEqual(verifyAuditState(cp2,[],{...nextAnchor,checkpoint_mac:cp2.mac},lookup).resource_bindings,original.resource_bindings);
+});
+test("commitmentの改変・欠落・差替えと未検証suffixを拒否する",()=>{
+ const a=boundRecord(1,"0".repeat(64),"web_state","a"),b=boundRecord(2,a.mac,"web_state","b",{instance_id:"other",tenant_id:"tenant_1"});
+ const tail=anchor([a,b]);const cp=signAuditRetentionCheckpoint(retainSigning,lookup,genesis(),[a,b],tail,2);
+ if(cp.codec_version!==2)assert.fail();
+ assert.equal(cp.resource_bindings.length,2);
+ for(const bindings of [[],[cp.resource_bindings[0]],[...cp.resource_bindings].reverse(),
+  cp.resource_bindings.map(value=>({...value,resource_digest:"c".repeat(64)}))]){
+  assert.throws(()=>verifyAuditState({...cp,resource_bindings:bindings},[],{...tail,checkpoint_mac:cp.mac},lookup),AuditIntegrityError);
+ }
+ assert.throws(()=>signAuditRetentionCheckpoint(retainSigning,lookup,genesis(),[a,{...b,resource_digest:"c".repeat(64)}],tail,1),AuditIntegrityError);
+ for(const through of [0,3,1.5])assert.throws(()=>signAuditRetentionCheckpoint(retainSigning,lookup,genesis(),[a,b],tail,through),AuditIntegrityError);
+});
+test("集約rootの件数を制限し同一rootの更新では増やさない",()=>{
+ const records:AuditRecord[]=[];let previous="0".repeat(64);
+ for(let n=1;n<=64;n++){const next=boundRecord(n,previous,`aggregate_${n}`,"a");records.push(next);previous=next.mac;}
+ assert.equal(verifyAuditState(genesis(),records,anchor(records),lookup).resource_bindings.length,64);
+ const update=boundRecord(65,previous,"aggregate_1","b");
+ assert.equal(verifyAuditState(genesis(),[...records,update],anchor([...records,update]),lookup).resource_bindings.length,64);
+ const extra=boundRecord(65,previous,"aggregate_65","b");
+ assert.throws(()=>verifyAuditState(genesis(),[...records,extra],anchor([...records,extra]),lookup),AuditIntegrityError);
 });

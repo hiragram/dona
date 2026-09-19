@@ -85,7 +85,19 @@ const checkpointBodySchema = z.strictObject({
   signed_at: utc,
   key_version: integer.min(1),
 });
-const checkpointSchema = checkpointBodySchema.extend({ mac: digest });
+// Resource digests bind bounded aggregate metadata roots, not individual jobs or
+// lifetime principal entries. Exceeding this bound fails before anchor reserve.
+export const maximumAuditResourceRoots = 64;
+const resourceBindingSchema = z.strictObject({
+  scope, resource_id: opaqueId, sequence: integer.min(1), resource_digest: digest,
+});
+export type AuditResourceBinding = z.infer<typeof resourceBindingSchema>;
+const checkpointBodyV2Schema = checkpointBodySchema.extend({
+  codec_version: z.literal(2), resource_bindings: z.array(resourceBindingSchema).max(maximumAuditResourceRoots),
+});
+const checkpointSchema = z.discriminatedUnion("codec_version", [
+  checkpointBodySchema.extend({ mac: digest }), checkpointBodyV2Schema.extend({ mac: digest }),
+]);
 export type AuditCheckpoint = z.infer<typeof checkpointSchema>;
 
 export const auditAnchorSchema = z.strictObject({
@@ -177,7 +189,18 @@ export function verifyAuditRecord(input: unknown, lookup: AuditKeyLookup): Audit
   });
 }
 
-function checkCheckpointBoundary(body: Omit<AuditCheckpoint, "mac">): void {
+function resourceKey(binding: Pick<AuditResourceBinding, "scope" | "resource_id">): string {
+  return JSON.stringify([binding.scope.instance_id, binding.scope.tenant_id, binding.resource_id]);
+}
+function checkCheckpointBoundary(body: z.infer<typeof checkpointBodySchema> | z.infer<typeof checkpointBodyV2Schema>): void {
+  if (body.codec_version === 2) {
+    let previous: string | undefined;
+    for (const binding of body.resource_bindings) {
+      const key = resourceKey(binding);
+      if (binding.sequence > body.sequence || (previous !== undefined && key <= previous)) throw new AuditIntegrityError();
+      previous = key;
+    }
+  }
   if (body.sequence === 0) {
     if (body.through_mac !== zeroMac || body.through_occurred_at !== null) throw new AuditIntegrityError();
   } else if (body.through_occurred_at === null || Date.parse(body.through_occurred_at) > Date.parse(body.signed_at)) {
@@ -205,40 +228,89 @@ export function signAuditCheckpoint(input: AuditCheckpointSigningInput, lookup: 
   });
 }
 
-// `anchor` must be a fresh integrity-verified read from the DB/backup-external CAS store.
-// A DB row or cached anchor cannot be used as this trust root.
-export function verifyAuditChain(
-  checkpointInput: unknown,
-  records: Iterable<unknown>,
-  anchorInput: unknown,
-  lookup: AuditKeyLookup,
-): AuditAnchor {
-  return protect(() => {
-    const checkpoint = checkpointSchema.parse(checkpointInput);
-    const anchor = auditAnchorSchema.parse(anchorInput);
-    const { mac: checkpointMac, ...checkpointBody } = checkpoint;
-    checkCheckpointBoundary(checkpointBody);
-    const checkpointKey = checkedKey(lookup, checkpoint.key_version);
-    const signedAt = Date.parse(checkpoint.signed_at);
-    if (signedAt < Date.parse(checkpointKey.activated_at) || signedAt >= Date.parse(checkpointKey.signing_expires_at)) throw new AuditIntegrityError();
-    if (anchor.pending_transaction_id !== null || checkpoint.chain_id !== anchor.chain_id
-      || !sameMac(checkpointMac, anchor.checkpoint_mac)
-      || !sameMac(checkpointMac, mac(checkpointKey, "checkpoint", checkpointBody))
-      || (checkpoint.sequence === 0 && checkpoint.through_mac !== zeroMac)) throw new AuditIntegrityError();
-    let sequence = checkpoint.sequence;
-    let previousMac = checkpoint.through_mac;
-    let lastTime = Date.parse(checkpoint.through_occurred_at ?? checkpoint.signed_at);
-    for (const input of records) {
-      const record = verifyAuditRecord(input, lookup);
-      const at = Date.parse(record.event.occurred_at);
-      if (record.chain_id !== anchor.chain_id || sequence === Number.MAX_SAFE_INTEGER
-        || record.sequence !== sequence + 1 || !sameMac(record.previous_mac, previousMac)
-        || at < lastTime) throw new AuditIntegrityError();
-      sequence = record.sequence;
-      previousMac = record.mac;
-      lastTime = at;
+export interface VerifiedAuditState {
+  anchor: AuditAnchor;
+  resource_bindings: AuditResourceBinding[];
+}
+function sortedBindings(bindings: Map<string, AuditResourceBinding>): AuditResourceBinding[] {
+  return [...bindings.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, value]) => value);
+}
+
+// Internal traversal validates the entire chain before releasing either current
+// metadata roots or a captured retention boundary. A boundary is never trusted
+// merely because its record has a valid standalone MAC.
+function verifyState(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
+  lookup: AuditKeyLookup, throughSequence?: number): VerifiedAuditState & {
+    boundary: AuditRecord | undefined; retained_bindings: AuditResourceBinding[] | undefined;
+  } {
+  const checkpoint = checkpointSchema.parse(checkpointInput);
+  const anchor = auditAnchorSchema.parse(anchorInput);
+  const { mac: checkpointMac, ...checkpointBody } = checkpoint;
+  checkCheckpointBoundary(checkpointBody);
+  const checkpointKey = checkedKey(lookup, checkpoint.key_version);
+  const signedAt = Date.parse(checkpoint.signed_at);
+  if (signedAt < Date.parse(checkpointKey.activated_at) || signedAt >= Date.parse(checkpointKey.signing_expires_at)) throw new AuditIntegrityError();
+  if (anchor.pending_transaction_id !== null || checkpoint.chain_id !== anchor.chain_id
+    || !sameMac(checkpointMac, anchor.checkpoint_mac)
+    || !sameMac(checkpointMac, mac(checkpointKey, "checkpoint", checkpointBody))) throw new AuditIntegrityError();
+  if (throughSequence !== undefined && (!Number.isSafeInteger(throughSequence)
+    || throughSequence <= checkpoint.sequence || throughSequence > anchor.sequence)) throw new AuditIntegrityError();
+  const bindings = new Map<string, AuditResourceBinding>();
+  if (checkpoint.codec_version === 2) for (const binding of checkpoint.resource_bindings) bindings.set(resourceKey(binding), binding);
+  let sequence = checkpoint.sequence;
+  let previousMac = checkpoint.through_mac;
+  let lastTime = Date.parse(checkpoint.through_occurred_at ?? checkpoint.signed_at);
+  let boundary: AuditRecord | undefined;
+  let retained_bindings: AuditResourceBinding[] | undefined;
+  for (const input of records) {
+    const record = verifyAuditRecord(input, lookup);
+    const at = Date.parse(record.event.occurred_at);
+    if (record.chain_id !== anchor.chain_id || sequence === Number.MAX_SAFE_INTEGER
+      || record.sequence !== sequence + 1 || !sameMac(record.previous_mac, previousMac)
+      || at < lastTime) throw new AuditIntegrityError();
+    sequence = record.sequence; previousMac = record.mac; lastTime = at;
+    if (record.codec_version === 2) {
+      const binding = resourceBindingSchema.parse({ scope: record.event.scope, resource_id: record.event.resource_id,
+        sequence: record.sequence, resource_digest: record.resource_digest });
+      bindings.set(resourceKey(binding), binding);
+      if (bindings.size > maximumAuditResourceRoots) throw new AuditIntegrityError();
     }
-    if (sequence !== anchor.sequence || !sameMac(previousMac, anchor.mac)) throw new AuditIntegrityError();
-    return anchor;
+    if (record.sequence === throughSequence) { boundary = record; retained_bindings = sortedBindings(bindings); }
+  }
+  if (sequence !== anchor.sequence || !sameMac(previousMac, anchor.mac)) throw new AuditIntegrityError();
+  if (throughSequence !== undefined && (!boundary || !retained_bindings)) throw new AuditIntegrityError();
+  return { anchor, resource_bindings: sortedBindings(bindings), boundary, retained_bindings };
+}
+
+/** The anchor must be a fresh integrity-verified DB/backup-external CAS read.
+ * Returns metadata commitments only; callers must compare actual canonical state
+ * from the same verified database snapshot before authorizing any decision. */
+export function verifyAuditState(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
+  lookup: AuditKeyLookup): VerifiedAuditState {
+  return protect(() => { const { anchor, resource_bindings } = verifyState(checkpointInput, records, anchorInput, lookup);
+    return { anchor, resource_bindings }; });
+}
+export function verifyAuditChain(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
+  lookup: AuditKeyLookup): AuditAnchor {
+  return verifyAuditState(checkpointInput, records, anchorInput, lookup).anchor;
+}
+
+/** Retention carries the latest aggregate roots at the removed boundary, derived
+ * only after complete verification to the current external anchor. Existing
+ * records retain their original bytes/MACs. This does not perform retention CAS
+ * or authorize retention; the repository enforces age and durable publication. */
+export function signAuditRetentionCheckpoint(input: Omit<AuditCheckpointSigningInput, "codec_version">,
+  lookup: AuditKeyLookup, checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
+  throughSequence: number): AuditCheckpoint {
+  return protect(() => {
+    const signing = checkpointSigningSchema.omit({ codec_version: true }).parse(input);
+    const state = verifyState(checkpointInput, records, anchorInput, lookup, throughSequence);
+    const boundary = state.boundary!;
+    if (signing.chain_id !== state.anchor.chain_id) throw new AuditIntegrityError();
+    const body = checkpointBodyV2Schema.parse({ ...signing, codec_version: 2,
+      sequence: boundary.sequence, through_mac: boundary.mac, through_occurred_at: boundary.event.occurred_at,
+      resource_bindings: state.retained_bindings });
+    checkCheckpointBoundary(body);
+    return { ...body, mac: mac(checkedKey(lookup, body.key_version, body.signed_at), "checkpoint", body) };
   });
 }

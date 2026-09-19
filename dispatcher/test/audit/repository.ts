@@ -439,3 +439,80 @@ test("事前prepareしたwriteも検証付きreadで実行できない", t => {
   assert.equal(count(db, "decisions"), 0); assert.deepEqual(store.calls, []);
   assert.equal(repository.verify().sequence, 0);
 });
+
+test("v1 schemaの拡張は既存の監査データとanchorを保持する",t=>{
+ const {db,repository,store}=setup(t);repository.append("prior",1,event,()=>{});
+ const before=db.prepare("SELECT * FROM security_audit_checkpoint").all(),rows=db.prepare("SELECT * FROM security_audit_records").all();
+ db.exec(`DROP TABLE security_audit_checkpoint;
+ CREATE TABLE security_audit_checkpoint ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), transaction_id TEXT,
+ checkpoint_json TEXT NOT NULL CHECK (length(checkpoint_json) <= 4096) );
+ DROP TABLE security_audit_schema;
+ CREATE TABLE security_audit_schema (version INTEGER PRIMARY KEY CHECK (version = 1)); INSERT INTO security_audit_schema VALUES (1);`);
+ const old=before[0] as {singleton:number;transaction_id:string|null;checkpoint_json:string};
+ db.prepare("INSERT INTO security_audit_checkpoint VALUES (?,?,?)").run(old.singleton,old.transaction_id,old.checkpoint_json);
+ const anchored=store.read();assert.throws(()=>repository.verify(),AuditIntegrityError);
+ installAuditSchema(db);assert.equal(repository.verify().sequence,1);
+ assert.deepEqual(db.prepare("SELECT * FROM security_audit_checkpoint").all(),before);
+ assert.deepEqual(db.prepare("SELECT * FROM security_audit_records").all(),rows);assert.deepEqual(store.read(),anchored);
+ assert.deepEqual(db.prepare("SELECT version FROM security_audit_schema").all(),[{version:2}]);
+ installAuditSchema(db);assert.deepEqual(store.read(),anchored);
+});
+test("同じsnapshotのcommitmentをreadと事前更新判定へ渡し業務row差替えを検出する",t=>{
+ const {db,repository}=setup(t);
+ repository.appendPrepared("first",1,state=>{
+  assert.deepEqual(state.resource_bindings,[]);
+  return {event,resource_digest:"a".repeat(64),mutation:()=>{db.prepare("INSERT INTO decisions VALUES (?,?)").run("request_1","a".repeat(64));return null;}};
+ });
+ const read=()=>repository.readVerifiedState(state=>{
+  const root=state.resource_bindings.find(value=>value.resource_id==="request_1" && value.scope.instance_id==="instance_1" && value.scope.tenant_id==="tenant_1");
+  const row=db.prepare("SELECT state FROM decisions WHERE id='request_1'").get() as {state:string}|undefined;
+  if(root?.resource_digest!==row?.state || !root || !row)throw new Error("metadata_unverified");
+  return row.state;
+ });
+ assert.equal(read(),"a".repeat(64));
+ repository.appendPrepared("second",1,state=>{
+  assert.equal(state.resource_bindings[0]?.resource_digest,"a".repeat(64));
+  return {event,resource_digest:"b".repeat(64),mutation:()=>{db.prepare("UPDATE decisions SET state=?").run("b".repeat(64));return null;}};
+ });
+ assert.equal(read(),"b".repeat(64));db.prepare("UPDATE decisions SET state=?").run("a".repeat(64));
+ assert.throws(read,AuditIntegrityError);db.exec("DELETE FROM decisions");assert.throws(read,AuditIntegrityError);
+});
+test("v2 recordをすべてretentionしてもmetadataの照合根拠を保持する",t=>{
+ const {db,repository,store}=setup(t);
+ repository.appendPrepared("first",1,()=>({event,resource_digest:"a".repeat(64),mutation:()=>null}));
+ repository.appendPrepared("second",1,()=>({event:{...event,resource_id:"second_resource"},resource_digest:"b".repeat(64),mutation:()=>null}));
+ const before=repository.readVerifiedState(state=>state.resource_bindings);
+ const retained=retentionRepository(db,store);
+ retained.retain("retention_first",2,1,"2027-11-01T00:00:00.000Z");
+ assert.equal(count(db,"security_audit_records"),1);
+ assert.deepEqual(retained.readVerifiedState(state=>state.resource_bindings),before);
+ retained.retain("retention_second",2,2,"2027-11-01T00:00:00.000Z");
+ assert.equal(count(db,"security_audit_records"),0);
+ assert.deepEqual(retained.readVerifiedState(state=>state.resource_bindings),before);
+ const saved=db.prepare("SELECT checkpoint_json FROM security_audit_checkpoint").get() as {checkpoint_json:string};
+ const cp=JSON.parse(saved.checkpoint_json);cp.resource_bindings.pop();
+ db.prepare("UPDATE security_audit_checkpoint SET checkpoint_json=?").run(JSON.stringify(cp));
+ assert.throws(()=>retained.readVerifiedState(state=>state),AuditIntegrityError);
+});
+test("state readerのwrite・非同期・transaction切替えを拒否する",t=>{
+ const {repository,db,store}=setup(t);
+ assert.throws(()=>repository.readVerifiedState(()=>{db.exec("INSERT INTO decisions VALUES ('bad','bad')");}),AuditIntegrityError);
+ assert.throws(()=>repository.readVerifiedState((async()=>true) as never),AuditIntegrityError);
+ assert.throws(()=>repository.readVerifiedState(()=>{db.exec("COMMIT");}),AuditIntegrityError);
+ assert.equal(count(db,"decisions"),0);assert.deepEqual(store.calls,[]);
+});
+
+test("集約rootの容量超過は予約前に拒否し最大長rootをcheckpointに保持する",t=>{
+ const {repository,db,store}=setup(t);
+ for(let i=0;i<64;i++)repository.appendPrepared(`root_${i}`,1,()=>({
+  event:{...event,scope:{instance_id:"i".repeat(128),tenant_id:"t".repeat(128)},resource_id:String(i).padStart(128,"r")},
+  resource_digest:"a".repeat(64),mutation:()=>null}));
+ const calls=store.calls.length;
+ assert.throws(()=>repository.appendPrepared("overflow",1,()=>({event:{...event,resource_id:"overflow"},resource_digest:"b".repeat(64),mutation:()=>null})),AuditIntegrityError);
+ assert.equal(store.calls.length,calls);assert.equal(store.value.pending_transaction_id,null);
+ const retained=retentionRepository(db,store);retained.retain("large_retention",2,64,"2027-11-01T00:00:00.000Z");
+ const row=db.prepare("SELECT checkpoint_json FROM security_audit_checkpoint").get() as {checkpoint_json:string};
+ assert.ok(Buffer.byteLength(row.checkpoint_json)>4096);assert.ok(Buffer.byteLength(row.checkpoint_json)<65536);
+ assert.equal(retained.readVerifiedState(state=>state.resource_bindings.length),64);
+ assert.equal(count(db,"security_audit_records"),0);
+});
