@@ -331,6 +331,7 @@ test(
     fs.writeFileSync(filename, "", { mode: 0o600, flag: "wx" });
     const db = openSecurityDatabase(filename);
     db.pragma("journal_mode=WAL");
+    db.pragma("synchronous=FULL");
     db.pragma("foreign_keys=ON");
     installAuditSchema(db);
     installApprovalSchema(db);
@@ -920,4 +921,15 @@ test("mutexのexclusive renameは既存fileを置換せずcallbackから呼べ�
   fs.writeFileSync(source,"another",{mode:0o600});
   assert.throws(()=>transaction.run("rename_in_callback",event,()=>{db.prepare("SELECT DONA_PUBLISH_MUTEX(?,?)").get(source,filename+".forbidden");}));
   assert.equal(fs.existsSync(filename+".forbidden"),false);assert.equal(fs.readFileSync(source,"utf8"),"another");
+});
+
+
+test("非WAL journal modeはclockとaudit予約前に拒否し設定を変更しない", t => {
+  for(const mode of ["OFF","MEMORY","DELETE","TRUNCATE","PERSIST"]) {
+    const {db,transaction,marks,anchors}=setup(t);db.unsafeMode(true);db.pragma("journal_mode="+mode);
+    assert.throws(()=>transaction.run("bad_journal",event,()=>{}),ApprovalTransactionError);
+    assert.equal(db.pragma("journal_mode",{simple:true}),mode.toLowerCase());
+    assert.equal(marks.calls,0);assert.deepEqual(anchors.calls,[]);
+    assert.equal(count(db,"approval_clock_reservations"),0);assert.equal(count(db,"security_audit_records"),0);
+  }
 });

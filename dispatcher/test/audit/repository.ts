@@ -49,7 +49,7 @@ function setup(t: { after(fn: () => void): void }, existing = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-repository-"));
   const filename = path.join(root, "dispatcher.sqlite");
   if (existing) new DispatcherDatabase(filename).close();
-  const db = new Database(filename); db.pragma("journal_mode = WAL"); db.pragma("foreign_keys = ON");
+  const db = new Database(filename); db.pragma("synchronous=FULL"); db.pragma("journal_mode = WAL"); db.pragma("foreign_keys = ON");
   const version = db.pragma("user_version", { simple: true });
   installAuditSchema(db);
   db.exec("CREATE TABLE decisions (id TEXT PRIMARY KEY, state TEXT NOT NULL)");
@@ -72,7 +72,7 @@ test("cleanと既存Dispatcher DBへopt-in schemaを追加し、再openでも正
     assert.equal(response.result, "receipt_1");
     assert.deepEqual(store.calls, ["reserve", "finalize"]);
     assert.equal(store.value.pending_transaction_id, null);
-    const reopened = new Database(filename);
+    const reopened = new Database(filename); reopened.pragma("synchronous=FULL");
     try {
       installAuditSchema(reopened);
       assert.equal(new AuditRepository(reopened, store, keys).verify().sequence, 1);
@@ -135,7 +135,7 @@ test("DB commit後のfinalize失敗・応答喪失を成功にせず、read-only
 
 test("別connectionからstale anchor・DB restore・レコード欠落を拒否する", (t) => {
   const { db, filename, store, repository } = setup(t);
-  const second = new Database(filename);
+  const second = new Database(filename); second.pragma("synchronous=FULL");
   try {
     const peer = new AuditRepository(second, store, keys);
     const genesis = store.read();
@@ -259,7 +259,7 @@ test("checkpoint確定後の削除失敗は検証可能なprefixを残し、明�
 
 test("finalize直後の別connection appendを直列化し、確定済み業務更新を失敗扱いしない", (t) => {
   const { db, filename, store, repository } = setup(t);
-  const otherDb = new Database(filename); otherDb.pragma("busy_timeout = 0");
+  const otherDb = new Database(filename); otherDb.pragma("synchronous=FULL"); otherDb.pragma("busy_timeout = 0");
   try {
     const other = new AuditRepository(otherDb, store, keys);
     const finalize = store.finalize.bind(store);
@@ -325,5 +325,16 @@ test("大文字TEMP tableにchainを複製してもdurable auditの代用にで�
     assert.throws(()=>repository.append("shadow_tx",1,event,()=>{}),AuditIntegrityError);
     assert.deepEqual(store.calls,[]);
     assert.equal((db.prepare("SELECT count(*) AS n FROM main.security_audit_records").get() as {n:number}).n,0);
+  }
+});
+
+
+test("共通auditの更新もjournal・同期設定不足なら予約前に拒否する",t=>{
+  for(const pragma of ["journal_mode=OFF","journal_mode=MEMORY","journal_mode=DELETE","synchronous=NORMAL"]) {
+    const {db,repository,store}=setup(t);db.unsafeMode(true);db.pragma(pragma);
+    assert.throws(()=>repository.append("bad_durability",1,event,()=>{}),AuditIntegrityError);
+    assert.throws(()=>repository.retain("bad_retention",1,1,"2027-11-01T00:00:00.000Z"),AuditIntegrityError);
+    assert.throws(()=>repository.pruneRetainedPrefix(),AuditIntegrityError);
+    assert.deepEqual(store.calls,[]);assert.equal(repository.verify().sequence,0);
   }
 });

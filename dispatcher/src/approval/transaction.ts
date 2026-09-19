@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { assertSecurityDurability } from "../audit/durability.js";
 import { auditEventSchema, type AuditEvent, type AuditKeyLookup } from "../audit/codec.js";
 import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
 import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
@@ -45,6 +46,7 @@ export class ApprovalTransaction {
   }
   private runInside(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction || this.db.pragma("foreign_keys", { simple: true }) !== 1
         || (this.db.pragma("synchronous", { simple: true }) as number) < 2) throw new ApprovalTransactionError();
       const event = auditEventSchema.omit({ occurred_at: true }).parse(eventInput);

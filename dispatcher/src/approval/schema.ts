@@ -107,6 +107,14 @@ const schemaSql = `
           WHERE state IN ('dispatching','acceptance_unknown');
         CREATE TRIGGER approval_clock_immutable BEFORE UPDATE ON approval_clock_reservations
           BEGIN SELECT RAISE(ABORT,'approval_clock_immutable'); END;
+        CREATE TRIGGER approval_request_revision_monotonic BEFORE UPDATE OF revision ON approval_requests
+          WHEN NEW.revision < OLD.revision BEGIN SELECT RAISE(ABORT,'approval_revision_rollback'); END;
+        CREATE TRIGGER approval_attempt_fence_monotonic BEFORE UPDATE OF fence ON approval_execution_attempts
+          WHEN NEW.fence < OLD.fence BEGIN SELECT RAISE(ABORT,'approval_fence_rollback'); END;
+        CREATE TRIGGER approval_notification_fence_monotonic BEFORE UPDATE OF fence ON approval_notifications
+          WHEN NEW.fence < OLD.fence BEGIN SELECT RAISE(ABORT,'approval_fence_rollback'); END;
+        CREATE TRIGGER approval_update_fence_monotonic BEFORE UPDATE OF fence ON approval_presentation_updates
+          WHEN NEW.fence < OLD.fence BEGIN SELECT RAISE(ABORT,'approval_fence_rollback'); END;
         CREATE TRIGGER approval_request_immutable BEFORE UPDATE OF request_id,instance_id,workspace_id,creation_key,snapshot_json,
           semantic_hash,binding_id,binding_revision,policy_revision,model_version,created_at,expires_at,clock_transaction_id ON approval_requests
           BEGIN SELECT RAISE(ABORT,'approval_request_immutable'); END;

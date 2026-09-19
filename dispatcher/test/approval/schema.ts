@@ -633,3 +633,20 @@ test("大文字小文字を変えたTEMP承認tableもshadowとして拒否す�
     assert.throws(()=>verifyApprovalSchema(db),ApprovalSchemaError); assert.throws(()=>installApprovalSchema(db),ApprovalSchemaError);
   }
 });
+
+
+test("fenceとrequest revisionは巻き戻らず古いgenerationのCASを復活させない", t => {
+  const {db}=setup(t);request(db);decide(db);db.transaction(()=>consume(db))();notification(db,"n1");
+  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1'");
+  db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',1,'tx_1')");
+  for(const table of ["approval_execution_attempts","approval_notifications","approval_presentation_updates"]) {
+    db.exec(`UPDATE ${table} SET fence=2`);
+    assert.throws(()=>db.exec(`UPDATE ${table} SET fence=1`),/approval_fence_rollback/);
+    assert.equal(db.prepare(`UPDATE ${table} SET fence=2 WHERE fence=1`).run().changes,0);
+    db.exec(`UPDATE ${table} SET fence=3`);
+    assert.deepEqual(db.prepare(`SELECT fence FROM ${table}`).all(),[{fence:3}]);
+  }
+  db.exec("UPDATE approval_requests SET revision=2");
+  assert.throws(()=>db.exec("UPDATE approval_requests SET revision=1"),/approval_revision_rollback/);
+  assert.equal(db.prepare("UPDATE approval_requests SET revision=2 WHERE revision=1").run().changes,0);
+});

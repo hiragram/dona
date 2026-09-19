@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { assertSecurityDurability } from "./durability.js";
 import { loadSecurityExtension, withMutationSqlGuard } from "./file-identity.js";
 import { verifyApprovalSchema } from "../approval/schema.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
@@ -108,6 +109,7 @@ export class AuditRepository {
    * trust-root creation, reset, repair, or automatic restore occurs here. */
   initialize(checkpoint: AuditCheckpoint): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       this.db.transaction(() => {
         this.assertSchema();
@@ -135,6 +137,7 @@ export class AuditRepository {
   append<F extends () => unknown>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: SynchronousCallback<F>): { record: AuditRecord; result: ReturnType<F> };
   append(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => unknown): { record: AuditRecord; result: unknown } {
     return guard(() => {
+      assertSecurityDurability(this.db);
       assertSynchronousCallback(mutation);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       loadSecurityExtension(this.db);
@@ -159,6 +162,7 @@ export class AuditRepository {
         this.db.prepare("INSERT INTO security_audit_records VALUES (?, ?, ?)")
           .run(record.sequence, transactionId, JSON.stringify(record));
         const result = withMutationSqlGuard(this.db, mutation);
+        assertSecurityDurability(this.db);
         assertSynchronousResult(result);
         // A callback may not modify the audit rows/checkpoint or transaction state.
         if (!this.db.inTransaction) throw new AuditIntegrityError();
@@ -187,6 +191,7 @@ export class AuditRepository {
    * keeps at least 400 days and does not retire verification keys or backups. */
   retain(transactionId: string, keyVersion: number, throughSequence: number, effectiveNow: string): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction || !Number.isSafeInteger(throughSequence) || throughSequence < 1) throw new AuditIntegrityError();
       const now = Date.parse(effectiveNow);
       if (!Number.isFinite(now) || new Date(now).toISOString() !== effectiveNow) throw new AuditIntegrityError();
@@ -227,6 +232,7 @@ export class AuditRepository {
    * This never finalizes or retries an ambiguous external write. */
   pruneRetainedPrefix(): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       this.db.transaction(() => {
         const anchor = this.verifyInside();
