@@ -12,6 +12,7 @@ stable updater -> immutable release -> ordered restart -> dona_update completion
 
 - [`dispatcher/`](./dispatcher/README.md): 永続キュー、`dona-main`への直列投入、バックグラウンドJob supervisor、別プロセスのstdio MCP
 - [`sources/slack/`](./sources/slack/README.md): Socket Mode Adapterと、同じKeychain認証を使う別プロセスのstdio MCP
+- [`sources/web/`](./sources/web/README.md): 実装中のWeb認証・session保護部品。listenerと監査付きsession保存は後続で接続
 - [`updater/`](./updater/README.md): 更新対象から独立したstable controller、専用SQLite/outbox、immutable release、activation/rollback
 
 Slack AdapterはHerdrやSQLiteを直接操作しません。Dispatcherからエージェントへの入口は一方向です。エージェントがSlack操作を選んだ場合は、別プロセスのDona Slack MCPを使います。
@@ -67,3 +68,5 @@ updater自身はroutine updateの対象外です。stable updater/policy/schema�
 ```sh
 npm run verify
 ```
+
+Web認証部品の検証は `npm --prefix sources/web ci` の後、rootの `npm run verify:web` で行う。この段階では開発launcherやrelease manifestへWeb serviceを接続せず、通常の `npm run dev` は既存serviceだけを起動する。
