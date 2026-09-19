@@ -29,6 +29,10 @@
 | P17 | a requester | read-only profile未接続のWeb submit | 503 `execution_safe_off` | なし |
 | P18 | a requester | commit/push/PR作成、任意shell/未知job kindをsubmit | 422 `job_kind_unsupported` | なし |
 | P19 | a requester | read-only jobからnetwork/credential/外部file/write toolへ到達 | sandbox/capability deny、job failed | external call 0、host secret読取0 |
+| P20 | a requester | 一意commandを繰り返しprincipal/global nonterminal slot超過 | 429 `quota_exceeded` | 新event/worker 0、同keyは元receipt |
+| P21 | a requester | token/day、disk、retained metadata枠のいずれか超過 | 429 `quota_exceeded`、単体oversizeは413 | 起動/推論送信0 |
+| P22 | a requester | restart、日跨ぎ、clock rollback、cleanup失敗 | reservation保持、当日枠再予約、時刻不明はfail closed | reset/refundで上限回避不可 |
+| P23 | a requester | jobの15分/30,000 token/32 MiB超過、inference応答不明 | runtime/broker停止、unknown最大token debit維持 | 追加callなし、disk削除前予約解放なし |
 
 全拒否は本文やcandidate IDをechoせず、認証済みactorまたは未認証、operation、safe error code、sequenceをauditへ残す。resource認可を通らないIDはauditにもraw転載せず、bounded keyed referenceにする。
 
@@ -75,6 +79,10 @@
 | F20 | private API/receipt/artifactを取得後logout・別principalに切替、同じURL取得 | 全response no-store、proxy cacheなし、304なし、current認可 | 前principalのresponse再利用0 |
 | F21 | history/bfcache復帰、offlineまたはsession revoke | private viewを隠し再認可失敗表示、in-memory/cache storage再表示なし | 前principal情報非表示 |
 | F22 | IdP障害中にpage reload後logout | local専用CSRF取得と失効状態readがIdP不要で利用可能 | 同一cookie/Originのみ、他resource公開なし |
+| F23 | callback queryにcode/state、同origin完了pageへ303 | redirect response自身のno-referrer、次requestにRefererなし | BFF/proxy access log/traceにquery/code/state/header 0 |
+| F24 | requester+observerがgrant経由snapshotをsubmit後、queue中にgrant revoke | manifestの全source revision照合でjob failed | worker起動/inference送信0 |
+| F25 | resume前/source改訂後、混在snapshotの一sourceのみgrant失効 | snapshot invalidate、暗黙再生成なし | worker/resume 0、Result非表示 |
+| F26 | running中またはResult保存後にsource grant revoke | broker送信前permit失効、job停止、Result read拒否 | 新規推論/private Result公開0、既送信分を取消成功としない |
 
 ## Approval・receipt・restart fixture
 
@@ -118,6 +126,6 @@
 
 ## 下流testの判定方法
 
-FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challenge/counterを一つずつ改変する。worker profileはnetwork、shell、ambient credential、snapshot外fileへの実際の到達を否定testし、prompt文の存在だけを隔離証拠にしない。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断、Strict cookieのcross-site callback後遷移、artifact直接navigation、logout/principal切替/history復帰時のcache不使用、不可視文字を含む承認表示を検証する。
+FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challenge/counterを一つずつ改変する。worker profileはnetwork、shell、ambient credential、snapshot外fileへの実際の到達を否定testし、prompt文の存在だけを隔離証拠にしない。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断、Strict cookieのcross-site callback後遷移、artifact直接navigation、logout/principal切替/history復帰時のcache不使用、不可視文字を含む承認表示を検証する。quota testは一意Web Eventの並列submit、UTC日跨ぎ、broker timeout/restart、disk cleanup失敗を使い、受付数・予約/実消費・外部call数をassertする。snapshot testは一つだけ失効した混在grantと、queue/resume/inference/Result各stageでのrevokeを含める。
 
 provider適合試験はaccount disableがintrospectionへ反映されることを独立確認し、署名済tokenがvalidというfixtureだけでrevocationを証明しない。live provider/production作用はこの文書PRでは実施しない。
