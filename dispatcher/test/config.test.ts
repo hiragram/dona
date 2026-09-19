@@ -17,6 +17,13 @@ describe("job resource config", () => {
     assert.throws(() => spawn(process.execPath, [], { stdio: "invalid" as never }), /stdio/);
     assert.throws(() => spawnSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     assert.throws(() => execFileSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", [], 5 as never, () => {}), { code: "ERR_INVALID_ARG_TYPE" });
+    const omittedArgs = spawnSync("/usr/bin/env", undefined, {
+      env: { ONLY_WITH_OMITTED_ARGS: "yes" },
+      encoding: "utf8",
+    });
+    assert.match(String(omittedArgs.stdout), /^ONLY_WITH_OMITTED_ARGS=yes$/m);
+    assert.doesNotMatch(String(omittedArgs.stdout), /^HOME=/m);
     const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");

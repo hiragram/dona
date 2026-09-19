@@ -57,6 +57,12 @@ function withNonce(options) {
   };
 }
 
+function normalizeArgs(args, options) {
+  if (Array.isArray(args)) return [args, options];
+  if (args === undefined || args === null) return [[], options];
+  return [[], args];
+}
+
 function emit() {
   if (emitted >= markerLimit) return;
   const started = process.hrtime.bigint();
@@ -72,8 +78,7 @@ const originalSpawn = childProcess.spawn;
 childProcess.spawn = function instrumentedSpawn(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
-  const actualArgs = Array.isArray(args) ? args : [];
-  const actualOptions = Array.isArray(args) ? options : args;
+  const [actualArgs, actualOptions] = normalizeArgs(args, options);
   active += 1;
   totals[processClass].count += 1;
   emit();
@@ -97,8 +102,7 @@ const originalSpawnSync = childProcess.spawnSync;
 childProcess.spawnSync = function instrumentedSpawnSync(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
-  const actualArgs = Array.isArray(args) ? args : [];
-  const actualOptions = Array.isArray(args) ? options : args;
+  const [actualArgs, actualOptions] = normalizeArgs(args, options);
   active += 1;
   totals[processClass].count += 1;
   emit();
@@ -114,8 +118,7 @@ childProcess.spawnSync = function instrumentedSpawnSync(file, args, options) {
 const originalFork = childProcess.fork;
 childProcess.fork = function instrumentedFork(modulePath, args, options) {
   const started = performance.now();
-  const actualArgs = Array.isArray(args) ? args : [];
-  const actualOptions = Array.isArray(args) ? options : args;
+  const [actualArgs, actualOptions] = normalizeArgs(args, options);
   active += 1;
   totals.node.count += 1;
   emit();
@@ -139,10 +142,8 @@ const originalExecFile = childProcess.execFile;
 childProcess.execFile = function instrumentedExecFile(file, args, options, callback) {
   const started = performance.now();
   const processClass = classify(file);
-  const actualArgs = Array.isArray(args) ? args : [];
-  const actualOptions = Array.isArray(args)
-    ? (typeof options === "object" ? options : undefined)
-    : (typeof args === "object" ? args : undefined);
+  const [actualArgs, normalizedOptions] = normalizeArgs(args, options);
+  const actualOptions = typeof normalizedOptions === "function" ? undefined : normalizedOptions;
   const actualCallback = typeof callback === "function" ? callback : typeof options === "function" ? options : typeof args === "function" ? args : undefined;
   active += 1;
   totals[processClass].count += 1;
@@ -181,8 +182,7 @@ const originalExecFileSync = childProcess.execFileSync;
 childProcess.execFileSync = function instrumentedExecFileSync(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
-  const actualArgs = Array.isArray(args) ? args : [];
-  const actualOptions = Array.isArray(args) ? options : args;
+  const [actualArgs, actualOptions] = normalizeArgs(args, options);
   active += 1;
   totals[processClass].count += 1;
   emit();
