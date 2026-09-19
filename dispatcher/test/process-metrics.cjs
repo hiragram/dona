@@ -68,7 +68,14 @@ childProcess.spawn = function instrumentedSpawn(file, args, options) {
   active += 1;
   totals[processClass].count += 1;
   emit();
-  const child = originalSpawn.call(this, file, actualArgs, withNonce(actualOptions));
+  let child;
+  try {
+    child = originalSpawn.call(this, file, actualArgs, withNonce(actualOptions));
+  } catch (error) {
+    active = Math.max(0, active - 1);
+    emit();
+    throw error;
+  }
   child.once("close", () => {
     totals[processClass].elapsed += performance.now() - started;
     active = Math.max(0, active - 1);
@@ -103,7 +110,14 @@ childProcess.fork = function instrumentedFork(modulePath, args, options) {
   active += 1;
   totals.node.count += 1;
   emit();
-  const child = originalFork.call(this, modulePath, actualArgs, withNonce(actualOptions));
+  let child;
+  try {
+    child = originalFork.call(this, modulePath, actualArgs, withNonce(actualOptions));
+  } catch (error) {
+    active = Math.max(0, active - 1);
+    emit();
+    throw error;
+  }
   child.once("close", () => {
     totals.node.elapsed += performance.now() - started;
     active = Math.max(0, active - 1);
@@ -124,12 +138,18 @@ childProcess.execFile = function instrumentedExecFile(file, args, options, callb
   active += 1;
   totals[processClass].count += 1;
   emit();
-  return originalExecFile.call(this, file, actualArgs, withNonce(actualOptions), (...callbackArgs) => {
-    totals[processClass].elapsed += performance.now() - started;
+  try {
+    return originalExecFile.call(this, file, actualArgs, withNonce(actualOptions), (...callbackArgs) => {
+      totals[processClass].elapsed += performance.now() - started;
+      active = Math.max(0, active - 1);
+      emit();
+      actualCallback?.(...callbackArgs);
+    });
+  } catch (error) {
     active = Math.max(0, active - 1);
     emit();
-    actualCallback?.(...callbackArgs);
-  });
+    throw error;
+  }
 };
 childProcess.execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => {
   let child;

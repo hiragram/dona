@@ -14,6 +14,7 @@ import {
 
 describe("job resource config", () => {
   test("process計測はchild_process overloadと限定envを維持する", async () => {
+    assert.throws(() => spawn(process.execPath, [], { stdio: "invalid" as never }), /stdio/);
     const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
