@@ -33,8 +33,8 @@ local macOSの全検証とGitHub CIを区別する。Linux CIではUpdaterのmac
 
 ## 最終統合reviewで確認した安全境界
 
-- scheduled workerはCodexのpermission profileでfilesystem rootをdenyにし、platformの最小実行ファイル、Codex実行ファイル、当該jobのResult directoryだけを許可する。network、MCP、apps/plugins/browser、memory、shell snapshotを無効にし、shellへ親の環境変数を継承しない。scratchやホスト設定・credentialを入力資料として自動公開しない。
-- 起動前に実効permission contextを検査し、OS sandboxで隣接canaryとsymlink経由の読み取り拒否・Resultへの読み書きを確認する。CLIが未対応、余分なgrant、probe失敗、既存agentの権限identity不明では開始しない。`workspace-write`という名称だけをread隔離の証拠にしない。仕様は[Codex permissions](https://learn.chatgpt.com/docs/permissions)を参照する。
+- scheduled workerはCodexのpermission profileでfilesystem rootをdenyにし、platformの最小実行ファイル、Codex実行ファイル、検証した当該scratch workspaceのread、当該jobのResult directoryのread/writeだけを許可する。network、MCP、apps/plugins/browser、memory、shell snapshotを無効にし、shellへ親の環境変数を継承しない。検証したscratch以外のホスト設定・credentialを入力資料として公開しない。
+- 起動前に実効permission contextを検査し、OS sandboxで隣接canaryとsymlink経由の読み取り拒否、workspaceのread成功・write拒否、Resultへの読み書きを確認する。CLIが未対応、余分なgrant、probe失敗、既存agentの権限identity不明では開始しない。`workspace-write`という名称だけをread隔離の証拠にしない。仕様は[Codex permissions](https://learn.chatgpt.com/docs/permissions)を参照する。
 - 通知のverified `posted_at`はrun revisionのauthorization expiryより前でなければならない。認可時刻から120秒以内でもexpiry以降ならacceptedにせずneeds_reviewを維持する。
 - 二段階通知認可は非idempotentである。応答不明では再呼出しせず、owner確認付き`get_job_status`の`notification_state`と`notification_authorization_phase`を読み、明示reconcileへ送る。phaseの読み取りだけでは投稿権限を再発行しない。
 - Slack内部のdelivery確認・session settlement・access確認はbody受信中を含めdrain対象へ登録し、quiesce後は新規provider操作を拒否する。

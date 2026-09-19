@@ -41,7 +41,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
   const args = row.source==="dona_schedule"
-    ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+    ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
     : ["--add-dir", resultDirectory];
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
@@ -322,8 +322,11 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     let executablePaths:string[]=[];
     if(row.source==="dona_schedule") {
       if(workspace.kind!=="scratch") throw new Error("Scheduled sandbox requires a scratch workspace");
+      await fs.mkdir(row.workspace_path,{recursive:true,mode:0o700});
+      const workspaceStat=await fs.lstat(row.workspace_path);
+      if(!workspaceStat.isDirectory()||workspaceStat.isSymbolicLink()) throw new Error("Scheduled workspace must be a real directory");
       executablePaths=await scheduledExecutablePaths(this.config.codexPath);
-      await verifyScheduledSandbox(resultDirectory,executablePaths,this.config.jobCommandTimeoutMs,
+      await verifyScheduledSandbox(resultDirectory,executablePaths,row.workspace_path,this.config.jobCommandTimeoutMs,
         (executable,args,timeout)=>runProcess(executable,args,timeout,signal));
     }
     const existingAgent = await this.get(row.agent_name, signal);
