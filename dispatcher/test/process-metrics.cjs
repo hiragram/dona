@@ -37,11 +37,11 @@ function classify(file) {
 }
 
 function withNonce(options) {
+  const baseEnv = options?.env ?? process.env;
   return {
     ...(options ?? {}),
     env: {
-      ...process.env,
-      ...(options?.env ?? {}),
+      ...baseEnv,
       DONA_CHECKPOINT_REPORTER_NONCE: nonce,
       DONA_PROCESS_METRICS_NONCE: nonce,
     },
@@ -63,10 +63,12 @@ const originalSpawn = childProcess.spawn;
 childProcess.spawn = function instrumentedSpawn(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
+  const actualArgs = Array.isArray(args) ? args : [];
+  const actualOptions = Array.isArray(args) ? options : args;
   active += 1;
   totals[processClass].count += 1;
   emit();
-  const child = originalSpawn.call(this, file, args, withNonce(options));
+  const child = originalSpawn.call(this, file, actualArgs, withNonce(actualOptions));
   child.once("close", () => {
     totals[processClass].elapsed += performance.now() - started;
     active = Math.max(0, active - 1);
@@ -129,17 +131,22 @@ childProcess.execFile = function instrumentedExecFile(file, args, options, callb
     actualCallback?.(...callbackArgs);
   });
 };
-childProcess.execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => new Promise((resolve, reject) => {
-  childProcess.execFile(file, args, options, (error, stdout, stderr) => {
-    if (error) {
-      error.stdout = stdout;
-      error.stderr = stderr;
-      reject(error);
-      return;
-    }
-    resolve({ stdout, stderr });
+childProcess.execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => {
+  let child;
+  const promise = new Promise((resolve, reject) => {
+    child = childProcess.execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
   });
-});
+  promise.child = child;
+  return promise;
+};
 
 const originalExecFileSync = childProcess.execFileSync;
 childProcess.execFileSync = function instrumentedExecFileSync(file, args, options) {

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import { describe, test } from "node:test";
+import { promisify } from "node:util";
 
 import {
   jobResourceDefaults,
@@ -11,6 +13,23 @@ import {
 } from "../src/config.js";
 
 describe("job resource config", () => {
+  test("process計測はchild_process overloadと限定envを維持する", async () => {
+    const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    assert.match(output, /^ONLY_FOR_CHILD=yes$/m);
+    assert.doesNotMatch(output, /^HOME=/m);
+
+    const promise = promisify(execFile)(process.execPath, ["-e", ""]);
+    assert.ok("child" in promise);
+    await promise;
+  });
+
   test("pre-activationでもDispatcher test fileを逐次実行する", () => {
     assert.equal(process.env.DONA_CHECKPOINT_REPORTER_NONCE, undefined);
     const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
