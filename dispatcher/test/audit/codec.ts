@@ -201,3 +201,17 @@ test("集約rootの件数を制限し同一rootの更新では増やさない",(
  const extra=boundRecord(65,previous,"aggregate_65","b");
  assert.throws(()=>verifyAuditState(genesis(),[...records,extra],anchor([...records,extra]),lookup),AuditIntegrityError);
 });
+
+test("非genesisのv1 checkpointを完全な状態root集合とみなさない",()=>{
+ const first=boundRecord(1,"0".repeat(64),"lost_root","a");
+ const second=boundRecord(2,first.mac,"new_root","b");
+ const legacy=signAuditCheckpoint({codec_version:1,...retainSigning},lookup,first);
+ const tail={...anchor([first,second]),checkpoint_mac:legacy.mac};
+ assert.deepEqual(verifyAuditChain(legacy,[second],tail,lookup),tail);
+ assert.throws(()=>verifyAuditState(legacy,[second],tail,lookup),AuditIntegrityError);
+ assert.throws(()=>signAuditRetentionCheckpoint({...retainSigning,transaction_id:"next_retention"},lookup,legacy,[second],tail,2),AuditIntegrityError);
+ // Even a legacy prefix known by this fixture to contain only v1 records has no
+ // signed inventory proving the absence of older resource roots.
+ const ordinary=record();const prior=signAuditCheckpoint({codec_version:1,...retainSigning},lookup,ordinary);
+ assert.throws(()=>verifyAuditState(prior,[],{...anchor([ordinary]),checkpoint_mac:prior.mac},lookup),AuditIntegrityError);
+});

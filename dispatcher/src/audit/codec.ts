@@ -240,10 +240,14 @@ function sortedBindings(bindings: Map<string, AuditResourceBinding>): AuditResou
 // metadata roots or a captured retention boundary. A boundary is never trusted
 // merely because its record has a valid standalone MAC.
 function verifyState(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
-  lookup: AuditKeyLookup, throughSequence?: number): VerifiedAuditState & {
+  lookup: AuditKeyLookup, options: { throughSequence?: number; requireResourceCompleteness: boolean }): VerifiedAuditState & {
     boundary: AuditRecord | undefined; retained_bindings: AuditResourceBinding[] | undefined;
   } {
   const checkpoint = checkpointSchema.parse(checkpointInput);
+  // A legacy retained prefix may have removed v2 roots without recording them.
+  // Even an otherwise valid chain cannot establish that these roots are absent.
+  if (options.requireResourceCompleteness && checkpoint.codec_version === 1 && checkpoint.sequence !== 0) throw new AuditIntegrityError();
+  const throughSequence = options.throughSequence;
   const anchor = auditAnchorSchema.parse(anchorInput);
   const { mac: checkpointMac, ...checkpointBody } = checkpoint;
   checkCheckpointBoundary(checkpointBody);
@@ -287,12 +291,12 @@ function verifyState(checkpointInput: unknown, records: Iterable<unknown>, ancho
  * from the same verified database snapshot before authorizing any decision. */
 export function verifyAuditState(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
   lookup: AuditKeyLookup): VerifiedAuditState {
-  return protect(() => { const { anchor, resource_bindings } = verifyState(checkpointInput, records, anchorInput, lookup);
+  return protect(() => { const { anchor, resource_bindings } = verifyState(checkpointInput, records, anchorInput, lookup, { requireResourceCompleteness: true });
     return { anchor, resource_bindings }; });
 }
 export function verifyAuditChain(checkpointInput: unknown, records: Iterable<unknown>, anchorInput: unknown,
   lookup: AuditKeyLookup): AuditAnchor {
-  return verifyAuditState(checkpointInput, records, anchorInput, lookup).anchor;
+  return protect(() => verifyState(checkpointInput, records, anchorInput, lookup, { requireResourceCompleteness: false }).anchor);
 }
 
 /** Retention carries the latest aggregate roots at the removed boundary, derived
@@ -304,7 +308,7 @@ export function signAuditRetentionCheckpoint(input: Omit<AuditCheckpointSigningI
   throughSequence: number): AuditCheckpoint {
   return protect(() => {
     const signing = checkpointSigningSchema.omit({ codec_version: true }).parse(input);
-    const state = verifyState(checkpointInput, records, anchorInput, lookup, throughSequence);
+    const state = verifyState(checkpointInput, records, anchorInput, lookup, { throughSequence, requireResourceCompleteness: true });
     const boundary = state.boundary!;
     if (signing.chain_id !== state.anchor.chain_id) throw new AuditIntegrityError();
     const body = checkpointBodyV2Schema.parse({ ...signing, codec_version: 2,

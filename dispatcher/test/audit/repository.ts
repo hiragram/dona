@@ -516,3 +516,21 @@ test("集約rootの容量超過は予約前に拒否し最大長rootをcheckpoin
  assert.equal(retained.readVerifiedState(state=>state.resource_bindings.length),64);
  assert.equal(count(db,"security_audit_records"),0);
 });
+
+test("旧版retentionでrootが失われたDBでは読取と更新とcheckpoint変換を予約前に拒否する",t=>{
+ const {repository,db,store}=setup(t);
+ const first=repository.appendPrepared("before_retention",1,()=>({event,resource_digest:"a".repeat(64),mutation:()=>null}));
+ repository.append("after_retention",1,event,()=>null);
+ const legacy=signAuditCheckpoint({codec_version:1,chain_id:"shared_1",transaction_id:"legacy_retention",signed_at:at,key_version:1},keys,first.record);
+ // A fully finalized historical retention, not an incomplete current write.
+ db.prepare("UPDATE security_audit_checkpoint SET transaction_id=?,checkpoint_json=?").run("legacy_retention",JSON.stringify(legacy));
+ db.prepare("DELETE FROM security_audit_records WHERE sequence=1").run();
+ store.value={...store.value,checkpoint_mac:legacy.mac};
+ assert.equal(repository.verify().sequence,2);
+ const before=store.read(),calls=store.calls.length;let readers=0,planners=0;
+ assert.throws(()=>repository.readVerifiedState(()=>{readers++;return null;}),AuditIntegrityError);
+ assert.throws(()=>repository.appendPrepared("unsafe_continue",1,()=>{planners++;return {event,resource_digest:null,mutation:()=>null};}),AuditIntegrityError);
+ assert.throws(()=>retentionRepository(db,store).retain("unsafe_conversion",2,2,"2027-11-01T00:00:00.000Z"),AuditIntegrityError);
+ assert.equal(readers,0);assert.equal(planners,0);assert.equal(store.calls.length,calls);assert.deepEqual(store.read(),before);
+ assert.equal(count(db,"security_audit_records"),1);
+});

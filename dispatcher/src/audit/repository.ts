@@ -137,7 +137,13 @@ export class AuditRepository {
     requireEqual(verified.anchor, this.store.read());
     return verified;
   }
-  private verifyInside(): AuditAnchor { return this.verifyStateInside().anchor; }
+  private verifyInside(): AuditAnchor {
+    this.assertSchema();
+    const before = auditAnchorSchema.parse(this.store.read());
+    const verified = verifyAuditChain(this.checkpoint(), this.records(), before, this.keys);
+    requireEqual(verified, this.store.read());
+    return verified;
+  }
 
   /** Only installs an already provisioned, externally anchored genesis. No key or
    * trust-root creation, reset, repair, or automatic restore occurs here. */
