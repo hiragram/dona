@@ -410,6 +410,13 @@ test("decision event outboxは安定したevent identityで重複を防ぎ、外
   db.exec(
     "UPDATE approval_event_outbox SET state='delivered',delivered_at='2026-09-19T00:02:00.000Z'",
   );
+  for (const sql of [
+    "UPDATE approval_event_outbox SET state='pending',delivered_at=NULL",
+    "UPDATE approval_event_outbox SET delivered_at='2026-09-19T00:03:00.000Z'",
+    "UPDATE approval_event_outbox SET delivered_at=NULL",
+  ]) assert.throws(() => db.exec(sql), /approval_event_delivery_immutable/);
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM approval_event_outbox WHERE state='pending'").get(), { n: 0 });
+  db.exec("UPDATE approval_event_outbox SET state='delivered',delivered_at='2026-09-19T00:02:00.000Z'");
 });
 
 test(

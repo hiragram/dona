@@ -136,6 +136,9 @@ const schemaSql = `
           BEGIN SELECT RAISE(ABORT,'approval_message_identity_immutable'); END;
         CREATE TRIGGER approval_event_identity_immutable BEFORE UPDATE OF event_id,decision_id,kind ON approval_event_outbox
           BEGIN SELECT RAISE(ABORT,'approval_event_identity_immutable'); END;
+        CREATE TRIGGER approval_event_delivery_immutable BEFORE UPDATE OF state,delivered_at ON approval_event_outbox
+          WHEN OLD.state='delivered' AND (NEW.state!='delivered' OR NEW.delivered_at IS NOT OLD.delivered_at)
+          BEGIN SELECT RAISE(ABORT,'approval_event_delivery_immutable'); END;
         CREATE TRIGGER approval_update_identity_immutable BEFORE UPDATE OF update_id,notification_attempt_id,message_ref,
           desired_revision,clock_transaction_id ON approval_presentation_updates
           BEGIN SELECT RAISE(ABORT,'approval_update_identity_immutable'); END;

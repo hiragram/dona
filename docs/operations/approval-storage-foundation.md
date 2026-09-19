@@ -47,3 +47,5 @@ Slack SocketやWebAuthnのraw proofはadapter内で検証・durable inboxへ保�
 request/decision/consumeの公開repository API、暗号化payloadの移送・削除・backup除外、restore/retention、binding/policy、実clock/CAS/key provider、service・executor接続は未実装。既存のSQLite全体backupへpayload tableを追加してはいけない。WALでは複数のATTACH database全体のcommitは原子的ではないため、別payload DBへの移送を同一transactionの保証に使わない。[SQLite公式資料](https://sqlite.org/wal.html)
 
 この部分実装のtest成功を、Issue全体、実IdP/WebAuthn/browser、productionの完了証拠とは扱わない。外部実行のsafe_offは維持する。
+
+送信済みevent outboxはpendingへ戻せず、確定したdelivered_atも変更できない。同じ確定値のread-backと冪等な同値更新だけを許容し、復旧時も再配送対象へ戻さない。
