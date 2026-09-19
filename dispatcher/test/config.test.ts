@@ -58,6 +58,13 @@ describe("job resource config", () => {
     assert.equal(packageJson.scripts?.test, "node test/run-tests.mjs");
     const runner = fs.readFileSync(new URL("./run-tests.mjs", import.meta.url), "utf8");
     assert.match(runner, /--test-concurrency=1/);
+    assert.match(runner, /\[dispatcher-test\] start/);
+    assert.match(runner, /failureOutputLimitBytes = 64 \* 1024/);
+    assert.match(runner, /stdio: \["ignore", "pipe", "pipe"\]/);
+    assert.match(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /elapsed_ms=/);
+    assert.match(runner, /process\.exitCode = exitCode/);
+    assert.doesNotMatch(runner, /process\.exit\(exitCode\)/);
     assert.match(runner, /\[dispatcher-test:\$\{checkpointNonce\}\] file-start/);
     assert.match(runner, /\[dispatcher-test:\$\{checkpointNonce\}\] file-finish/);
     assert.match(runner, /checkpoint-reporter\.mjs/);
@@ -82,6 +89,11 @@ describe("job resource config", () => {
     assert.match(reporter, /event\.type === "test:stderr"/);
     assert.match(reporter, /metrics scope=2/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
+    const markerBytes = fs.readdirSync(new URL("./", import.meta.url))
+      .filter((name) => name.endsWith(".test.ts"))
+      .sort()
+      .reduce((total, name) => total + Buffer.byteLength(`[dispatcher-test] start test/${name}\n`), 0);
+    assert.ok(markerBytes <= 800, `start markers exceed the legacy diagnostic budget: ${markerBytes}`);
   });
 
   test("expands documented home-relative paths consistently", () => {

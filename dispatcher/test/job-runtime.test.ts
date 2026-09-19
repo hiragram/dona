@@ -259,11 +259,14 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 let githubTemplateRoot: string | undefined;
 let githubTemplateBare: string | undefined;
+let githubTemplateSeed: string | undefined;
+let githubTemplateRepository: string | undefined;
 
 before(async () => {
   githubTemplateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "dona-github-fixture-template-"));
   githubTemplateBare = path.join(githubTemplateRoot, "origin.git");
   const seed = path.join(githubTemplateRoot, "seed");
+  const repository = path.join(githubTemplateRoot, "repository");
   await exec("git", ["init", "--bare", githubTemplateBare]);
   await exec("git", ["init", "-b", "main", seed]);
   await git(seed, "config", "user.email", "test@example.com");
@@ -282,6 +285,11 @@ before(async () => {
   await fs.writeFile(path.join(seed, "state.txt"), "C\n");
   await git(seed, "commit", "-am", "C");
   await git(seed, "push", "origin", "HEAD:refs/heads/race-source");
+  await exec("git", ["clone", "--shared", githubTemplateBare, repository]);
+  await git(repository, "remote", "set-url", "origin", "https://github.com/owner/repo.git");
+  await git(repository, "branch", "feature/test", "origin/feature/test");
+  githubTemplateSeed = seed;
+  githubTemplateRepository = repository;
 });
 
 after(async () => {
@@ -298,27 +306,23 @@ async function githubFixture(options: { mismatchedWorktreeHead?: boolean } = {})
   seedPath: string;
 }> {
   const { root, config } = await tempConfig(); roots.push(root);
-  assert.ok(githubTemplateBare, "GitHub fixture template must be initialized");
+  assert.ok(githubTemplateBare && githubTemplateSeed && githubTemplateRepository, "GitHub fixture template must be initialized");
   const bare = path.join(root, "origin.git");
   const seed = path.join(root, "seed");
   const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
-  // Clone the immutable object template into case-local repositories. Refs,
-  // configs, worktrees, and logs remain isolated while commit construction is
-  // paid once per test-file run instead of once per provisioning case.
-  await exec("git", ["clone", "--bare", "--shared", githubTemplateBare, bare]);
-  await exec("git", ["clone", "--shared", bare, seed]);
-  await git(seed, "config", "user.email", "test@example.com");
-  await git(seed, "config", "user.name", "Test");
-  await git(seed, "checkout", "feature/test");
-  const featureSha = await git(seed, "rev-parse", "HEAD");
-  const raceSha = await git(seed, "rev-parse", "refs/remotes/origin/race-source");
-  // Preserve the original race fixture: the local source branch has advanced
-  // to C while origin/feature/test still points at the fetched B commit.
-  await git(seed, "reset", "--hard", raceSha);
+  // Copy the immutable template state in-process. Each case still owns its
+  // refs, configs, worktrees, database, and logs, but does not pay for three
+  // Git process trees before the behavior under test starts.
+  await fs.cp(githubTemplateBare, bare, { recursive: true });
+  await fs.cp(githubTemplateSeed, seed, { recursive: true });
   await fs.mkdir(path.dirname(repositoryPath), { recursive: true });
-  await exec("git", ["clone", "--shared", bare, repositoryPath]);
-  await git(repositoryPath, "remote", "set-url", "origin", "https://github.com/owner/repo.git");
-  await git(repositoryPath, "branch", "feature/test", "origin/feature/test");
+  await fs.cp(githubTemplateRepository, repositoryPath, { recursive: true });
+  const seedConfigPath = path.join(seed, ".git", "config");
+  const seedConfig = await fs.readFile(seedConfigPath, "utf8");
+  assert.match(seedConfig, new RegExp(githubTemplateBare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  await fs.writeFile(seedConfigPath, seedConfig.replaceAll(githubTemplateBare, bare));
+  const featureSha = await git(seed, "rev-parse", "refs/remotes/origin/feature/test");
+  const raceSha = await git(seed, "rev-parse", "refs/remotes/origin/race-source");
 
 
   const logPath = path.join(root, "herdr-calls.jsonl");
@@ -350,19 +354,19 @@ process.exit(2);
 `, { mode: 0o700 });
   const fakeGh = path.join(root, "fake-gh.mjs");
   await fs.writeFile(fakeGh, "#!/usr/bin/env node\nprocess.stdout.write('main\\n');\n", { mode: 0o700 });
-  const fakeGit = path.join(root, "fake-git.mjs");
-  await fs.writeFile(fakeGit, `#!/usr/bin/env node
-import { spawnSync } from "node:child_process";
-const args = process.argv.slice(2);
-if (args.includes("remote") && args.includes("get-url")) {
-  process.stdout.write("https://github.com/owner/repo.git\\n");
-  process.exit(0);
-}
-const fetchIndex = args.indexOf("fetch");
-const remoteIndex = args.findIndex((arg, index) => index > 1 && arg === "origin");
-if (remoteIndex >= 0) args[remoteIndex] = ${JSON.stringify(bare)};
-const result = spawnSync("git", args, { stdio: "inherit" });
-process.exit(result.status ?? 2);
+  const fakeGit = path.join(root, "fake-git");
+  await fs.writeFile(fakeGit, `#!/bin/bash
+args=("$@")
+for ((index = 0; index < \${#args[@]}; index++)); do
+  if [[ "\${args[index]}" == "remote" && "\${args[index + 1]:-}" == "get-url" ]]; then
+    printf '%s\\n' 'https://github.com/owner/repo.git'
+    exit 0
+  fi
+  if ((index > 1)) && [[ "\${args[index]}" == "origin" ]]; then
+    args[index]=${JSON.stringify(bare)}
+  fi
+done
+exec /usr/bin/git "\${args[@]}"
 `, { mode: 0o700 });
   config.herdrPath = fakeHerdr;
   config.ghPath = fakeGh;
