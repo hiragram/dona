@@ -1,8 +1,9 @@
+import { verifyOpenDatabaseFile } from "./file-identity.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import { assertSynchronousCallback, type SynchronousCallback } from "./synchronous.js";
+import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 
 const active = new Set<string>();
 const opened = new WeakMap<Database.Database, { filename: string; identity: string }>();
@@ -48,6 +49,7 @@ export function openSecurityDatabase(filename: string): Database.Database {
     const identity = databasePathIdentity(filename);
     db = new Database(filename, { fileMustExist: true });
     if (databasePathIdentity(filename) !== identity) throw new SecurityCoordinationError();
+    verifyOpenDatabaseFile(db);
     opened.set(db, { filename, identity });
     return db;
   } catch {
@@ -88,6 +90,7 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
     const registration = opened.get(business);
     if (!registration || business.name !== registration.filename
       || databasePathIdentity(registration.filename) !== registration.identity) throw new SecurityCoordinationError();
+    verifyOpenDatabaseFile(business);
     const target = registration.filename;
     const filename = target + ".security-lock.sqlite";
     if (active.has(filename)) throw new SecurityCoordinationError();
@@ -107,9 +110,10 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
       const rows = connection.prepare("SELECT singleton,target_hash FROM security_transaction_mutex").all() as Array<{ singleton: number; target_hash: string }>;
       if (rows.length !== 1 || rows[0]?.singleton !== 1 || rows[0]?.target_hash !== targetHash) throw new SecurityCoordinationError();
       if (databasePathIdentity(target) !== registration.identity) throw new SecurityCoordinationError();
+      verifyOpenDatabaseFile(connection);
+      verifyOpenDatabaseFile(business);
       const result = work();
-      if (result !== null && (typeof result === "object" || typeof result === "function")
-        && typeof (result as { then?: unknown }).then === "function") throw new SecurityCoordinationError();
+      assertSynchronousResult(result);
       return result;
     }).immediate();
   } catch { throw new SecurityCoordinationError(); }

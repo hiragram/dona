@@ -590,7 +590,24 @@ test("型を消したasync callbackもclockとauditの予約前に実行せず�
     await Promise.resolve();
     effects++;
   };
-  for (const callback of [deferred, deferred.bind(null)]) {
+  const generator = function* () {
+    effects++;
+    yield null;
+    effects++;
+  };
+  const asyncGenerator = async function* () {
+    effects++;
+    yield null;
+    effects++;
+  };
+  for (const callback of [
+    deferred,
+    deferred.bind(null),
+    generator,
+    generator.bind(null),
+    asyncGenerator,
+    asyncGenerator.bind(null),
+  ]) {
     assert.throws(
       () => withSecurityTransactionLock(db, callback as never),
       SecurityCoordinationError,
@@ -613,4 +630,98 @@ test("型を消したasync callbackもclockとauditの予約前に実行せず�
   assert.equal(marks.calls, 0);
   assert.deepEqual(anchors.calls, []);
   assert.equal(audit.verify().sequence, 0);
+});
+
+test("pathnameが元へ戻るABAでも開いたSQLite fileの不一致を拒否する", (t) => {
+  const dir = fs.mkdtempSync(
+    path.join(fs.realpathSync(os.homedir()), ".dona-approval-aba-"),
+  );
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const filename = path.join(dir, "a.sqlite");
+  const second = path.join(dir, "b.sqlite");
+  const moved = path.join(dir, "a.moved");
+  for (const [file, marker] of [
+    [filename, "A"],
+    [second, "B"],
+  ] as const) {
+    const connection = new Database(file);
+    try {
+      connection.exec("CREATE TABLE marker(value TEXT)");
+      connection.prepare("INSERT INTO marker VALUES (?)").run(marker);
+    } finally {
+      connection.close();
+    }
+    fs.chmodSync(file, 0o600);
+  }
+  let phase = 0;
+  const original = fs.lstatSync;
+  const mocked = t.mock.method(fs, "lstatSync", ((
+    ...args: Parameters<typeof fs.lstatSync>
+  ) => {
+    if (phase === 1 && args[0] === filename) {
+      fs.renameSync(filename, second);
+      fs.renameSync(moved, filename);
+      phase = 2;
+    }
+    const result = original(...args);
+    if (phase === 0 && args[0] === path.parse(filename).root) {
+      fs.renameSync(filename, moved);
+      fs.renameSync(second, filename);
+      phase = 1;
+    }
+    return result;
+  }) as typeof fs.lstatSync);
+  try {
+    assert.throws(
+      () => openSecurityDatabase(filename),
+      SecurityCoordinationError,
+    );
+  } finally {
+    mocked.mock.restore();
+    if (phase === 1) {
+      fs.renameSync(filename, second);
+      fs.renameSync(moved, filename);
+    }
+  }
+  assert.equal(phase, 2);
+  const accepted = openSecurityDatabase(filename);
+  try {
+    assert.deepEqual(accepted.prepare("SELECT value FROM marker").get(), {
+      value: "A",
+    });
+  } finally {
+    accepted.close();
+  }
+});
+
+test("型を消した通常関数が返すiteratorもtransaction外へ返さない", (t) => {
+  for (const kind of ["lock", "audit", "approval"] as const) {
+    const { db, transaction, audit, marks, anchors } = setup(t);
+    let effects = 0;
+    const callback = () =>
+      (function* () {
+        effects++;
+        yield "later";
+      })();
+    assert.throws(() =>
+      kind === "lock"
+        ? withSecurityTransactionLock(db, callback as never)
+        : kind === "audit"
+          ? audit.append(
+              "iterator_tx",
+              1,
+              { ...event, occurred_at: "2026-09-19T00:00:01.000Z" },
+              callback as never,
+            )
+          : transaction.run("iterator_tx", event, callback as never),
+    );
+    assert.equal(effects, 0);
+    assert.equal(count(db, "approval_clock_reservations"), 0);
+    assert.equal(count(db, "security_audit_records"), 0);
+    assert.equal(marks.calls, kind === "approval" ? 1 : 0);
+    assert.equal(
+      anchors.value.pending_transaction_id,
+      kind === "lock" ? null : "iterator_tx",
+    );
+  }
 });

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { assertSynchronousCallback, type SynchronousCallback } from "./synchronous.js";
+import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditCheckpoint, verifyAuditChain,
   type AuditAnchor, type AuditCheckpoint, type AuditEvent, type AuditKeyLookup, type AuditRecord,
@@ -147,8 +147,7 @@ export class AuditRepository {
         this.db.prepare("INSERT INTO security_audit_records VALUES (?, ?, ?)")
           .run(record.sequence, transactionId, JSON.stringify(record));
         const result = mutation();
-        if (result !== null && (typeof result === "object" || typeof result === "function")
-          && typeof (result as { then?: unknown }).then === "function") throw new AuditIntegrityError();
+        assertSynchronousResult(result);
         // A callback may not modify the audit rows/checkpoint or transaction state.
         if (!this.db.inTransaction) throw new AuditIntegrityError();
         const expected = { ...proposed, pending_transaction_id: null };

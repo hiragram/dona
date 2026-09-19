@@ -80,7 +80,7 @@ const schemaSql = `
           fence INTEGER NOT NULL CHECK(fence>=0), message_ref TEXT,
           clock_transaction_id TEXT NOT NULL REFERENCES approval_clock_reservations(transaction_id),
           CHECK(state IN ('pending','aborted') OR fence>0),
-          CHECK(state<>'sent' OR message_ref IS NOT NULL),
+          CHECK((state='sent' AND message_ref IS NOT NULL) OR (state<>'sent' AND message_ref IS NULL)),
           UNIQUE(request_id,kind), UNIQUE(notification_attempt_id,request_id),
           UNIQUE(notification_attempt_id,message_ref), UNIQUE(message_ref)
         );
@@ -150,7 +150,7 @@ const schemaSql = `
 `;
 
 function shape(db: Database.Database): string {
-  return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(tbl_name,1,9)='approval_' ORDER BY type,name").all());
+  return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(name,1,9)='approval_' OR substr(tbl_name,1,9)='approval_' ORDER BY type,name").all());
 }
 export function verifyApprovalSchema(db: Database.Database): void {
   const expected = new Database(":memory:");

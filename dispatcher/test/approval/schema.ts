@@ -10,6 +10,7 @@ import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../../src/database.js";
 import {
   installApprovalSchema,
+  verifyApprovalSchema,
   ApprovalSchemaError,
 } from "../../src/approval/schema.js";
 
@@ -510,4 +511,60 @@ test("異なるnotificationによる同じmessageの所有を拒否する", (t) 
     "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message2' WHERE notification_attempt_id='n2'",
   );
   assert.deepEqual(db.pragma("foreign_key_check"), []);
+});
+
+test("sent以外のnotificationはmessageを確定できず子updateも作れない", (t) => {
+  const { db } = setup(t);
+  request(db);
+  notification(db, "n1");
+  for (const state of [
+    "pending",
+    "dispatching",
+    "failed",
+    "acceptance_unknown",
+    "needs_review",
+    "aborted",
+  ]) {
+    assert.throws(() =>
+      db
+        .prepare(
+          "UPDATE approval_notifications SET state=?,fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+        )
+        .run(state),
+    );
+  }
+  assert.throws(() =>
+    db.exec(
+      "INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'dispatching',1,'tx_1')",
+    ),
+  );
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+  );
+  db.exec(
+    "INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'dispatching',1,'tx_1')",
+  );
+});
+
+test("別tableに付いたapproval名のtriggerとindexも未知schemaとして拒否する", (t) => {
+  for (const kind of ["trigger", "index"]) {
+    const { db } = setup(t);
+    request(db);
+    db.exec("CREATE TABLE existing_events (id TEXT)");
+    db.exec(
+      kind === "trigger"
+        ? "CREATE TRIGGER approval_inject AFTER INSERT ON existing_events BEGIN UPDATE approval_requests SET state='approved'; END"
+        : "CREATE INDEX approval_foreign_index ON existing_events(id)",
+    );
+    assert.throws(() => verifyApprovalSchema(db), ApprovalSchemaError);
+    assert.throws(() => installApprovalSchema(db), ApprovalSchemaError);
+    assert.equal(
+      (
+        db.prepare("SELECT state FROM approval_requests").get() as {
+          state: string;
+        }
+      ).state,
+      "sent",
+    );
+  }
 });

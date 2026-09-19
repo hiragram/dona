@@ -17,6 +17,19 @@ function synchronousContracts(
     id: "request",
   }));
   withSecurityTransactionLock(db, () => {});
+  const ids: string[] = withSecurityTransactionLock(db, () => ["request"]);
+  // @ts-expect-error generator callback must not escape the transaction
+  approval.run("tx", event, function* () {
+    yield ids;
+  });
+  // @ts-expect-error async generator is deferred work
+  audit.append("tx", 1, event, async function* () {
+    yield number;
+  });
+  // @ts-expect-error a returned iterator is deferred work
+  withSecurityTransactionLock(db, () => ids.values());
+  // @ts-expect-error a returned callable is deferred work
+  withSecurityTransactionLock(db, () => () => number);
   // @ts-expect-error async callback must be rejected before it can run
   withSecurityTransactionLock(db, async () => number);
   // @ts-expect-error an explicit void type must not accept an async callback
