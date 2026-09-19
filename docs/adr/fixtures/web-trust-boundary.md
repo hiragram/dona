@@ -62,14 +62,19 @@
 | F07 | login前cookieを固定してcallback | successなら新cookieのみ有効 | old session revoke、一回限り |
 | F08 | IdP timeout、既存sessionあり、resource API | 503 `identity_unavailable`、SSE閉鎖 | resource read/writeなし、別identityなし |
 | F09 | IdP introspection inactive/subject/client不一致 | 401 `session_revoked` / `identity_invalid` | session revoke、deny |
-| F10 | HTML/script/credential/private URLを含むResult | allowlist projection、literal text/redaction | script/fetchなし、raw値をlogしない |
+| F10 | HTML/script/credential/private URLを含むResult | allowlist projection、literal text/redaction。raw HTML/SVGへの直接navigationもattachment/octet-stream/nosniff/CSP強制 | script/fetchなし、same-origin API呼出0、raw値をlogしない |
 | F11 | 別principalのreceipt key/cursorを推測 | 404 `resource_not_visible` | read/controlなし |
 | F12 | 8時間/idle30分/token expiryの最小期限超過 | 401 `session_expired` | 延長なし、SSE/pollで延命しない |
 | F13 | cookie valid、authz revision stale | 401 `session_revoked` | transactionのcurrent revision優先 |
 | F14 | 未認証headerのactor/email | 401 `identity_invalid` | trusted actor=null、PII raw記録なし |
 | F15 | IdP timeout/inactive、valid local session/Origin/CSRFでlogout | 204、durable revoke+audit、cookie削除 | IdP復旧後も旧cookie拒否 |
 | F16 | F15でCSRF/Origin不正 | 403 `csrf_invalid` / `origin_invalid` | revokeなし、権限昇格なし |
-| F17 | logout中DB/audit commit失敗 | 503 `durability_unavailable` | cookie削除だけをdurable revoke成功にしない |
+| F17 | logout中DB/audit commit失敗 | 503 `durability_unavailable`、cookie保持・削除Set-Cookieなし | durable revoke read-back成功後だけ削除 |
+| F18 | logoutでcommit応答喪失 | cookie保持、local失効状態GETでread-only reconcile | 自動再POSTなし、確定したrevoke後だけcookie削除 |
+| F19 | IdPからStrict cookie発行→cross-site 303、redirectにcookieが付かないbrowser | cookie不要の固定案内200→利用者の新しいsame-site link navigation | dashboardで認証成功、手動reload不要、案内にprivate情報なし |
+| F20 | private API/receipt/artifactを取得後logout・別principalに切替、同じURL取得 | 全response no-store、proxy cacheなし、304なし、current認可 | 前principalのresponse再利用0 |
+| F21 | history/bfcache復帰、offlineまたはsession revoke | private viewを隠し再認可失敗表示、in-memory/cache storage再表示なし | 前principal情報非表示 |
+| F22 | IdP障害中にpage reload後logout | local専用CSRF取得と失効状態readがIdP不要で利用可能 | 同一cookie/Originのみ、他resource公開なし |
 
 ## Approval・receipt・restart fixture
 
@@ -108,9 +113,11 @@
 | A29 | consume後・外部call前にBFF/IdP unavailable、session token欠落/期限切れ | `needs_review`、stage proof発行なし | 外部call0、tokenをworkerへ渡さない |
 | A30 | proofのnonce/stage/action/attempt差替え、再使用、10秒超過 | `authorization_proof_invalid` | gate進行/外部call0 |
 | A31 | BFF restart後durable session再読、同じstageを再認可 | current IdP activeと同一bindingを再確認した一回限りproofだけ許可 | 旧proof/unknown attemptは再実行しない |
+| A32 | draft/target/mentionにU+202E、U+2066、U+200B、U+034F、variation selector、LF/TAB | 可視escape codecで表示し、decode後UTF-8がtyped payloadとexact一致 | bidi再解釈/strip/normalizeなし、署名は元actionだけにbind |
+| A33 | literalなbackslash-u列と実control文字、display codec version変更、不正UTF-8 | backslash escapeで区別。version変更はchallenge失効、不正UTF-8はpresentation拒否 | 表示とbyte列不一致でdecision/outbox追加0 |
 
 ## 下流testの判定方法
 
-FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challenge/counterを一つずつ改変する。worker profileはnetwork、shell、ambient credential、snapshot外fileへの実際の到達を否定testし、prompt文の存在だけを隔離証拠にしない。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断を検証する。
+FakeClock、固定IdP response、登録済みtest公開鍵、in-memory browserではなくdurable storeを再openするfault harnessを使う。成功caseは一意receipt/owner/sequence、否定caseはsafe error/auditと外部call数0、競合caseはwinner一件、unknown caseは追加attempt/送信0をassertする。WebAuthnは実credentialをrepoへ置かずtest keyで署名し、RP/origin/UV/challenge/counterを一つずつ改変する。worker profileはnetwork、shell、ambient credential、snapshot外fileへの実際の到達を否定testし、prompt文の存在だけを隔離証拠にしない。browser E2Eではframe、CSRF、cookie flag、SSE cross-principal、再login/切断、Strict cookieのcross-site callback後遷移、artifact直接navigation、logout/principal切替/history復帰時のcache不使用、不可視文字を含む承認表示を検証する。
 
 provider適合試験はaccount disableがintrospectionへ反映されることを独立確認し、署名済tokenがvalidというfixtureだけでrevocationを証明しない。live provider/production作用はこの文書PRでは実施しない。
