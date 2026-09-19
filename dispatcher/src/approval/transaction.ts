@@ -56,6 +56,7 @@ export class ApprovalTransaction {
           this.db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run(transactionId, JSON.stringify(mark));
           const result = mutation(mark);
           requireCurrent();
+          verifyApprovalSchema(this.db);
           return result;
         }).result;
     } catch { throw new ApprovalTransactionError(); }

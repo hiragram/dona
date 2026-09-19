@@ -51,3 +51,11 @@ function synchronousContracts(
   // @ts-expect-error union with a Promise is not synchronous
   withSecurityTransactionLock(db, () => (number > 0 ? 1 : Promise.resolve(1)));
 }
+
+function nestedContracts(db: Database.Database, audit: AuditRepository, event: AuditEvent) {
+  const result: { rows: Array<{ id: string }> } = withSecurityTransactionLock(db, () => ({ rows: [{ id: "safe" }] }));
+  // @ts-expect-error callbacks inside arrays are deferred results
+  withSecurityTransactionLock(db, () => [() => result]);
+  // @ts-expect-error promises inside records and arrays are deferred results
+  audit.append("nested", 1, event, () => ({ rows: [{ later: [Promise.resolve(result)] }] }));
+}

@@ -12,15 +12,15 @@ export class SecurityCoordinationError extends Error {
   constructor() { super("security_transaction_coordination_failed"); this.name = "SecurityCoordinationError"; }
 }
 
-function privateRegular(filename: string, singleLink = false): void {
+function privateRegular(filename: string): void {
   const info = fs.lstatSync(filename);
   if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0
-    || (singleLink && info.nlink !== 1)) throw new SecurityCoordinationError();
+    || info.nlink !== 1) throw new SecurityCoordinationError();
 }
 
 function databasePathIdentity(filename: string): string {
   if (!path.isAbsolute(filename) || path.normalize(filename) !== filename) throw new SecurityCoordinationError();
-  privateRegular(filename, true);
+  privateRegular(filename);
   const file = fs.lstatSync(filename);
   const parts: Array<[string, number, number]> = [[filename, file.dev, file.ino]];
   let directory = path.dirname(filename);
@@ -48,6 +48,7 @@ export function openSecurityDatabase(filename: string): Database.Database {
   try {
     const identity = databasePathIdentity(filename);
     db = new Database(filename, { fileMustExist: true });
+    db.pragma("recursive_triggers = ON");
     if (databasePathIdentity(filename) !== identity) throw new SecurityCoordinationError();
     verifyOpenDatabaseFile(db);
     opened.set(db, { filename, identity });
@@ -96,10 +97,15 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
     if (active.has(filename)) throw new SecurityCoordinationError();
     active.add(filename); owned = filename;
     ensureFile(filename);
-    mutex = new Database(filename, { timeout: 2000 });
+    const mutexIdentity = databasePathIdentity(filename);
+    mutex = new Database(filename, { timeout: 2000, fileMustExist: true });
     const connection = mutex;
+    if (databasePathIdentity(filename) !== mutexIdentity) throw new SecurityCoordinationError();
+    verifyOpenDatabaseFile(connection);
     const targetHash = createHash("sha256").update(target).digest("hex");
     return connection.transaction(() => {
+      if (databasePathIdentity(filename) !== mutexIdentity) throw new SecurityCoordinationError();
+      verifyOpenDatabaseFile(connection);
       const objects = connection.prepare("SELECT type,name,sql FROM sqlite_master WHERE substr(name,1,7)<>'sqlite_'").all() as Array<{ type: string; name: string; sql: string }>;
       if (objects.length === 0) {
         connection.exec(ddl);

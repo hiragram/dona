@@ -156,6 +156,8 @@ export function verifyApprovalSchema(db: Database.Database): void {
   const expected = new Database(":memory:");
   try {
     expected.exec(schemaSql);
+    if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1) throw new ApprovalSchemaError();
+    if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,9)='approval_' OR substr(tbl_name,1,9)='approval_'").get()) throw new ApprovalSchemaError();
     if (shape(expected) !== shape(db)) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== 1) throw new ApprovalSchemaError();
@@ -170,6 +172,7 @@ export function verifyApprovalSchema(db: Database.Database): void {
 export function installApprovalSchema(db: Database.Database): void {
   try {
     if (db.inTransaction || db.pragma("foreign_keys", { simple: true }) !== 1) throw new ApprovalSchemaError();
+    db.pragma("recursive_triggers = ON");
     db.transaction(() => {
       const prior = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_schema'").get();
       if (prior) {

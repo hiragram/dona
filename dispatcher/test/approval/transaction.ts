@@ -747,3 +747,34 @@ test("iterable wrapperの遅延処理を実行せず戻り値とSQL commitを拒
     }
   }
 });
+
+test("配列・record内の遅延値とgetter/proxyを実行せず拒否する", (t) => {
+  for (const kind of ["lock", "audit", "approval"] as const) {
+    for (const deferred of ["function", "promise", "getter", "proxy", "cycle"] as const) {
+      const { db, transaction, audit } = setup(t); let effects = 0;
+      const bad = deferred === "function" ? () => { effects++; }
+        : deferred === "promise" ? Promise.resolve("already-resolved")
+          : deferred === "getter" ? Object.defineProperty({}, "value", { get() { effects++; return "later"; } })
+            : deferred === "proxy" ? new Proxy({}, { ownKeys() { effects++; return []; } }) : [];
+      if (deferred === "cycle") (bad as unknown[]).push(bad);
+      const callback = () => ({ rows: [{ nested: [bad] }] });
+      assert.throws(() => kind === "lock" ? withSecurityTransactionLock(db, callback as never)
+        : kind === "audit" ? audit.append("nested_tx", 1, { ...event, occurred_at: "2026-09-19T00:00:01.000Z" }, callback as never)
+          : transaction.run("nested_tx", event, callback as never));
+      assert.equal(effects, 0);
+      assert.equal(count(db, "approval_clock_reservations"), 0); assert.equal(count(db, "security_audit_records"), 0);
+    }
+  }
+  const { db } = setup(t);
+  assert.deepEqual(withSecurityTransactionLock(db, () => ({ rows: [{ id: "plain", counts: [1, 2] }] })), { rows: [{ id: "plain", counts: [1, 2] }] });
+});
+
+test("mutex pathのhardlinkへ初期化SQLを書かない", (t) => {
+  const { db, transaction, marks, anchors } = setup(t);
+  const victim = db.name + ".unrelated";
+  const lock = db.name + ".security-lock.sqlite";
+  fs.writeFileSync(victim, "", { mode: 0o600 }); fs.linkSync(victim, lock);
+  assert.throws(() => transaction.run("hardlink_mutex", event, () => {}));
+  assert.equal(fs.statSync(victim).size, 0); assert.equal(fs.statSync(lock).nlink, 2);
+  assert.equal(marks.calls, 0); assert.equal(anchors.value.pending_transaction_id, null);
+});

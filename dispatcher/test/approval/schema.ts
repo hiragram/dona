@@ -568,3 +568,31 @@ test("別tableに付いたapproval名のtriggerとindexも未知schemaとして�
     );
   }
 });
+
+test("REPLACEによるimmutable ledgerの削除・再挿入を拒否する", (t) => {
+  const { db } = setup(t); request(db); decide(db);
+  db.transaction(() => consume(db)).immediate(); notification(db, "n1");
+  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("INSERT INTO approval_event_outbox VALUES ('e1','d_r1','dona_approval.decision.v1','pending',NULL)");
+  db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',2,'pending',0,'tx_1')");
+  assert.equal(db.pragma("recursive_triggers", { simple: true }), 1);
+  for (const table of ["approval_clock_reservations", "approval_requests", "approval_decisions", "approval_consumes", "approval_execution_attempts", "approval_notifications", "approval_event_outbox", "approval_presentation_updates"]) {
+    const before = db.prepare(`SELECT * FROM ${table}`).all();
+    assert.throws(() => db.exec(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`), /approval_retention_not_authorized/);
+    assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), before);
+  }
+  db.pragma("recursive_triggers=OFF");
+  assert.throws(() => verifyApprovalSchema(db), ApprovalSchemaError);
+});
+
+test("TEMP schemaの承認table・trigger・indexも検証対象にする", (t) => {
+  for (const ddl of [
+    "CREATE TEMP TRIGGER approval_inject AFTER INSERT ON approval_requests BEGIN UPDATE approval_requests SET state='needs_review'; END",
+    "CREATE TEMP TABLE approval_shadow(value TEXT)",
+    "CREATE TEMP TABLE unrelated(value TEXT); CREATE INDEX temp.approval_inject ON unrelated(value)",
+  ]) {
+    const { db } = setup(t); db.exec(ddl);
+    assert.throws(() => verifyApprovalSchema(db), ApprovalSchemaError);
+    assert.throws(() => installApprovalSchema(db), ApprovalSchemaError);
+  }
+});
