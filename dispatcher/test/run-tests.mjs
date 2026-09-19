@@ -20,6 +20,7 @@ function appendFailureOutput(current, chunk) {
 
 for (const name of testFiles) {
   const relative = path.posix.join("test", name);
+  const startedAt = performance.now();
   process.stdout.write(`[dispatcher-test] start ${relative}\n`);
   let failureOutput = Buffer.alloc(0);
   const exitCode = await new Promise((resolve, reject) => {
@@ -37,9 +38,10 @@ for (const name of testFiles) {
     child.once("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
   });
   if (exitCode !== 0) {
-    process.stderr.write(`[dispatcher-test] failed ${relative}\n`);
+    process.stderr.write(`[dispatcher-test] failed ${relative} elapsed_ms=${Math.round(performance.now() - startedAt)}\n`);
     if (failureOutput.length > 0) process.stderr.write(failureOutput);
     process.exitCode = exitCode;
     break;
   }
+  process.stdout.write(`[dispatcher-test] complete ${relative} elapsed_ms=${Math.round(performance.now() - startedAt)}\n`);
 }

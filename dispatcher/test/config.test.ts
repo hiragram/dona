@@ -21,7 +21,8 @@ describe("job resource config", () => {
     assert.match(runner, /\[dispatcher-test\] start/);
     assert.match(runner, /failureOutputLimitBytes = 64 \* 1024/);
     assert.match(runner, /stdio: \["ignore", "pipe", "pipe"\]/);
-    assert.doesNotMatch(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /\[dispatcher-test\] complete/);
+    assert.match(runner, /elapsed_ms=/);
     assert.match(runner, /process\.exitCode = exitCode/);
     assert.doesNotMatch(runner, /process\.exit\(exitCode\)/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
@@ -29,7 +30,7 @@ describe("job resource config", () => {
       .filter((name) => name.endsWith(".test.ts"))
       .sort()
       .reduce((total, name) => total + Buffer.byteLength(`[dispatcher-test] start test/${name}\n`), 0);
-    assert.ok(markerBytes <= 800, `checkpoint markers exceed the legacy diagnostic budget: ${markerBytes}`);
+    assert.ok(markerBytes <= 800, `start markers exceed the legacy diagnostic budget: ${markerBytes}`);
   });
 
   test("expands documented home-relative paths consistently", () => {
