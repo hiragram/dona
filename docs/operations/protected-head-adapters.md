@@ -30,6 +30,8 @@ audit reserveはpendingのない現在anchorに対し、同一chainでsequence�
 
 schemaはversion row、node table、UPDATE/DELETE拒否triggerの固定DDLを検証する。nodeはdigestとcanonical base64だけを保存し、長さ・header・位置prefix・SHA-256を検証する。stageはwriter lockと単一transaction内で全件を照合する。同一bytesの再stageは許すが、異なるbytesの置換をしない。不正な長さの保存値はSQLでNULLへ変換してからJS側で拒否する。
 
+専用接続にはTEMP objectを許可しない。constructorだけでなくmigration・read・stage時にも検査し、table/viewによるshadowやTEMP triggerを拒否する。永続tableの参照とDMLは`main.`で修飾し、接続終了時に失われるnodeを根拠に保護headを更新しない。
+
 rootのauthorityはDB外の保護headだけに置く。補助DBを古いsnapshotへ戻したときは必要nodeの欠落で停止する。nodeの削除、GC、backup/recovery、ledger世代の交換は実装しない。1予約あたり最大257 nodeの追加があり、本番容量・性能の検証は別途必要となる。
 
 ## 検証と残る接続

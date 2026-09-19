@@ -64,6 +64,39 @@ test("SQLite node storeは初期化・immutable stage・再openを検証する",
   finally { reopened.close(); }
 });
 
+test("TEMP shadowやtriggerをCAS前に拒否し再open後も元headを検証できる", t => {
+  for (const sql of [
+    "CREATE TEMP TABLE used_transaction_node_schema AS SELECT * FROM main.used_transaction_node_schema; CREATE TEMP TABLE used_transaction_nodes AS SELECT * FROM main.used_transaction_nodes",
+    "CREATE TEMP VIEW used_transaction_nodes AS SELECT * FROM main.used_transaction_nodes",
+    "CREATE TEMP TRIGGER temporary_insert AFTER INSERT ON main.used_transaction_nodes BEGIN SELECT 1; END",
+  ]) {
+    const f = fixture(t), store = new ProtectedClockMarks(clockScope, f.port, f.nodes);
+    const plan = prepareUsedTransactionInsert(clockScope, JSON.parse(f.port.current.value).used_root, "shadowed", digest => f.nodes.read(digest));
+    f.db.exec(sql);
+    assert.throws(() => new SqliteUsedTransactionNodes(f.db), UsedTransactionStoreError);
+    assert.throws(() => installUsedTransactionNodeSchema(f.db), UsedTransactionStoreError);
+    assert.throws(() => f.nodes.read(f.initialNodes[0]!.digest), UsedTransactionStoreError);
+    assert.throws(() => f.nodes.stage(plan.nodes), UsedTransactionStoreError);
+    assert.throws(() => store.reserve(initial, next(initial, "shadowed")), ProtectedHeadError);
+    assert.equal(f.port.writes, 0);
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM main.used_transaction_nodes").get() as { n: number }).n, 257);
+    f.db.close(); const reopened = openSecurityDatabase(f.filename); reopened.pragma("synchronous=FULL");
+    try {
+      const restored = new ProtectedClockMarks(clockScope, f.port, new SqliteUsedTransactionNodes(reopened));
+      assert.deepEqual(restored.read(), initial);
+      assert.equal(restored.reserve(initial, next(initial, "durable")).transaction_id, "durable");
+    } finally { reopened.close(); }
+  }
+  const f = fixture(t);
+  const lateShadow: ImmutableUsedTransactionNodes = { read: digest => f.nodes.read(digest), stage: nodes => {
+    f.db.exec("CREATE TEMP TABLE used_transaction_nodes AS SELECT * FROM main.used_transaction_nodes");
+    return f.nodes.stage(nodes);
+  } };
+  const store = new ProtectedClockMarks(clockScope, f.port, lateShadow);
+  assert.throws(() => store.reserve(initial, next(initial, "late_shadow")), ProtectedHeadError);
+  assert.equal(f.port.writes, 0);
+});
+
 test("clock headとused rootを同じCASで進め初期IDを含む過去IDを拒否する", t => {
   const f = fixture(t), store = new ProtectedClockMarks(clockScope, f.port, f.nodes);
   assert.deepEqual(store.read(), initial);

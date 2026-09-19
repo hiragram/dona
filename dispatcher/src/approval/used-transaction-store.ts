@@ -25,12 +25,17 @@ const statements = [
 ];
 function guard<T>(operation: () => T): T { try { return operation(); } catch { throw new UsedTransactionStoreError(); } }
 function objects(db: Database.Database): string[] {
-  return (db.prepare("SELECT sql FROM sqlite_master WHERE substr(name,1,7)<>'sqlite_' LIMIT 5").all() as Array<{ sql: string }>).map(row => row.sql).sort();
+  return (db.prepare("SELECT sql FROM main.sqlite_master WHERE substr(name,1,7)<>'sqlite_' LIMIT 5").all() as Array<{ sql: string }>).map(row => row.sql).sort();
+}
+function rejectTemporaryObjects(db: Database.Database): void {
+  // This dedicated store never needs TEMP tables, views or triggers. Reject
+  // them before migration/read/stage, including changes on an existing handle.
+  if (db.prepare("SELECT 1 FROM temp.sqlite_master LIMIT 1").get()) throw new UsedTransactionStoreError();
 }
 function verify(db: Database.Database): void {
-  assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+  assertSecurityDurability(db); verifyOpenDatabaseFile(db); rejectTemporaryObjects(db);
   if (JSON.stringify(objects(db)) !== JSON.stringify([...statements].sort())) throw new UsedTransactionStoreError();
-  const rows = db.prepare("SELECT singleton,version FROM used_transaction_node_schema LIMIT 2").all() as Array<{ singleton: number; version: number }>;
+  const rows = db.prepare("SELECT singleton,version FROM main.used_transaction_node_schema LIMIT 2").all() as Array<{ singleton: number; version: number }>;
   if (rows.length !== 1 || rows[0]!.singleton !== 1 || rows[0]!.version !== 1) throw new UsedTransactionStoreError();
 }
 function node(input: unknown): UsedTransactionNode {
@@ -45,7 +50,7 @@ function node(input: unknown): UsedTransactionNode {
 function readNode(db: Database.Database, digest: string): string | undefined {
   // Keep malformed oversized persisted values out of the JS process. Missing
   // and present-but-invalid remain distinct, including after hostile DB edits.
-  const row = db.prepare("SELECT CASE WHEN typeof(wire)='text' AND length(CAST(wire AS BLOB)) IN (92,176) THEN wire ELSE NULL END AS wire FROM used_transaction_nodes WHERE digest=?")
+  const row = db.prepare("SELECT CASE WHEN typeof(wire)='text' AND length(CAST(wire AS BLOB)) IN (92,176) THEN wire ELSE NULL END AS wire FROM main.used_transaction_nodes WHERE digest=?")
     .get(digest) as { wire: string | null } | undefined;
   if (!row) return undefined;
   return node({ digest, wire: row.wire }).wire;
@@ -55,10 +60,10 @@ function readNode(db: Database.Database, digest: string): string | undefined {
  * the file, schema, a protected head or an empty-root authority. */
 export function installUsedTransactionNodeSchema(db: Database.Database): void {
   guard(() => withSecurityTransactionLock(db, () => db.transaction(() => {
-    assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+    assertSecurityDurability(db); verifyOpenDatabaseFile(db); rejectTemporaryObjects(db);
     if (objects(db).length === 0) {
       for (const sql of statements) db.exec(sql);
-      db.prepare("INSERT INTO used_transaction_node_schema VALUES (1,1)").run();
+      db.prepare("INSERT INTO main.used_transaction_node_schema VALUES (1,1)").run();
     }
     verify(db); return undefined;
   }).immediate()));
@@ -84,7 +89,7 @@ export class SqliteUsedTransactionNodes implements ImmutableUsedTransactionNodes
       if (new Set(nodes.map(value => value.digest)).size !== nodes.length) throw new UsedTransactionStoreError();
       return withSecurityTransactionLock(this.db, () => this.db.transaction(() => {
         verify(this.db);
-        const insert = this.db.prepare("INSERT INTO used_transaction_nodes(digest,wire) VALUES (?,?)");
+        const insert = this.db.prepare("INSERT INTO main.used_transaction_nodes(digest,wire) VALUES (?,?)");
         for (const value of nodes) {
           const existing = readNode(this.db, value.digest);
           if (existing === undefined) insert.run(value.digest, value.wire);
