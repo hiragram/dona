@@ -36,34 +36,108 @@ export class ProcessRunner {
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
-      let capturedBytes = 0;
       let checkpointBuffer = "";
       let outputCheckpoint: string | undefined;
+      let checkpointNonce: string | undefined;
+      let currentFile: string | undefined;
+      let fileState: string | undefined;
+      let lastFinished: string | undefined;
+      let metrics: string | undefined;
+      const unfinishedCases = new Map<string, number>();
       let timedOut = false;
+      let timeoutCheckpoint: string | undefined;
+      let termOutcome = "not-sent";
+      let killOutcome = "not-sent";
+      const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)(?: elapsed_ms=(\d{1,9}))?(?: load=(\d+\.\d{3}))?$/;
+      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)(?: elapsed_ms=(\d{1,9}))?$/;
+      const metricsMarker = /^\[dispatcher-test:([a-f0-9]{32})\] metrics scope=2;(node=\d+\/\d+,git=\d+\/\d+,shell=\d+\/\d+,other=\d+\/\d+;active=\d+;overhead_us=\d+)$/;
+      const refreshCheckpoint = (): void => {
+        if (timeoutCheckpoint) {
+          outputCheckpoint = timeoutCheckpoint;
+          return;
+        }
+        const pending = [...unfinishedCases].at(-1);
+        const unfinished = pending ? `${pending[0]}#${pending[1]}` : currentFile ?? "none";
+        outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}${metrics ? `; ${metrics}` : ""}`;
+      };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
-        checkpointBuffer = (checkpointBuffer + chunk.toString("utf8")).slice(-512);
-        for (const match of checkpointBuffer.matchAll(/\[dispatcher-test\] (?:start|complete|failed) test\/[A-Za-z0-9._-]+\.test\.ts/g)) {
-          outputCheckpoint = match[0];
+        const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
+        checkpointBuffer = (lines.pop() ?? "").slice(-256);
+        for (const line of lines) {
+          const metricsMatch = metricsMarker.exec(line);
+          if (metricsMatch && metricsMatch[1] === checkpointNonce) {
+            metrics = `metrics=${metricsMatch[2]}`;
+            refreshCheckpoint();
+            continue;
+          }
+          const fileMatch = marker.exec(line);
+          if (fileMatch) {
+            const nonce = fileMatch[1];
+            const action = fileMatch[2];
+            const identity = fileMatch[3];
+            if (!nonce || !action || !identity) continue;
+            if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
+            if (nonce !== checkpointNonce) continue;
+            if (action === "file-start") metrics = undefined;
+            fileState = `${action} ${identity}${fileMatch[4] ? ` elapsed_ms=${fileMatch[4]}` : ""}${fileMatch[5] ? ` load=${fileMatch[5]}` : ""}`;
+            if (action === "file-start") currentFile = identity;
+            else {
+              if (!lastFinished) lastFinished = fileState;
+              currentFile = undefined;
+              unfinishedCases.clear();
+              checkpointNonce = undefined;
+            }
+            refreshCheckpoint();
+            continue;
+          }
+          const testMatch = caseMarker.exec(line);
+          const nonce = testMatch?.[1];
+          const action = testMatch?.[2];
+          const identity = testMatch?.[3];
+          if (!nonce || nonce !== checkpointNonce || !action || !identity) continue;
+          const group = identity.replace(/#\d+$/, "");
+          if (action === "case-start") unfinishedCases.set(group, (unfinishedCases.get(group) ?? 0) + 1);
+          else {
+            const remaining = (unfinishedCases.get(group) ?? 0) - 1;
+            if (remaining > 0) unfinishedCases.set(group, remaining);
+            else unfinishedCases.delete(group);
+            lastFinished = `${action} ${identity}${testMatch[4] ? ` elapsed_ms=${testMatch[4]}` : ""}`;
+          }
+          refreshCheckpoint();
         }
       };
-      const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
-        inspectCheckpoints(chunk);
-        if (capturedBytes >= options.outputLimitBytes) {
+      const append = (
+        current: Buffer<ArrayBufferLike>,
+        chunk: Buffer<ArrayBufferLike>,
+        inspect: boolean,
+      ): Buffer<ArrayBufferLike> => {
+        if (inspect) inspectCheckpoints(chunk);
+        if (current.length >= options.outputLimitBytes) {
           truncated = true;
           return current;
         }
-        const remaining = options.outputLimitBytes - capturedBytes;
+        const remaining = options.outputLimitBytes - current.length;
         if (chunk.length > remaining) truncated = true;
         const captured = chunk.subarray(0, remaining);
-        capturedBytes += captured.length;
         return Buffer.concat([current, captured]);
       };
-      child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk)));
-      child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
+      const rebalance = (): void => {
+        const overflow = stdout.length + stderr.length - options.outputLimitBytes;
+        if (overflow <= 0) return;
+        truncated = true;
+        if (stdout.length >= stderr.length) stdout = stdout.subarray(Math.min(overflow, stdout.length));
+        else stderr = stderr.subarray(Math.min(overflow, stderr.length));
+      };
+      child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk, false); rebalance(); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk, true); rebalance(); });
       let hardKillTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
+      let exitSignal: NodeJS.Signals | null = null;
       const finish = (): void => {
         if (closedCode === undefined) return;
+        const cleanupStatus = timedOut
+          ? `term=${termOutcome},kill=${killOutcome},closed=yes`
+          : "term=not-sent,kill=not-sent,closed=yes";
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -71,24 +145,30 @@ export class ProcessRunner {
           timed_out: timedOut,
           output_truncated: truncated,
           ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
+          ...(exitSignal ? { exit_signal: exitSignal } : {}),
+          cleanup_status: cleanupStatus,
         });
       };
-      const signalGroup = (signal: NodeJS.Signals): void => {
+      const signalGroup = (signal: NodeJS.Signals): string => {
         if (child.pid) {
           try {
             process.kill(-child.pid, signal);
-            return;
+            return "group-sent";
           } catch {
             // Fall back to the direct child when process groups are unavailable.
           }
         }
-        child.kill(signal);
+        return child.kill(signal) ? "child-sent" : "unavailable";
       };
       const timer = setTimeout(() => {
         timedOut = true;
-        signalGroup("SIGTERM");
+        const pending = [...unfinishedCases].at(-1);
+        const unfinished = pending ? `${pending[0]}#${pending[1]}` : currentFile ?? "none";
+        timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}${metrics ? `; ${metrics}` : ""}`;
+        outputCheckpoint = timeoutCheckpoint;
+        termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
-          signalGroup("SIGKILL");
+          killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
           finish();
         }, 1_000);
@@ -99,9 +179,10 @@ export class ProcessRunner {
         if (hardKillTimer) clearTimeout(hardKillTimer);
         reject(error);
       });
-      child.once("close", (code) => {
+      child.once("close", (code, signal) => {
         clearTimeout(timer);
         closedCode = code;
+        exitSignal = signal;
         if (!hardKillTimer) finish();
       });
     });
