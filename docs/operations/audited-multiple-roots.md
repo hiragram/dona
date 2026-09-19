@@ -1,6 +1,6 @@
 # 複数状態の原子的監査commitment
 
-Web ingressの一回nonceと、job/approvalの業務状態は、同じsecurity transactionで確定する必要がある。record v3は監査eventの実resource IDを保持したまま、固定scopeとresource IDで識別する複数のaggregate rootを署名する。
+Web ingressの一回nonceと、job/approvalの業務状態は、同じsecurity transactionで確定する必要がある。record v3は監査eventの実resource IDを必須とし、固定scopeとresource IDで識別する複数のaggregate rootを署名する。eventのresource IDがnullの計画はanchor予約前に拒否する。
 
 各commitmentはscope、resource_id、resource_digestだけを持ち、canonical key順の一意な配列とする。空配列、重複、順序違い、未知fieldを拒否する。全chainで保持するaggregate rootは従来どおり64件以下であり、principal/session/jobごとにrootを増やさない。recordのcanonical UTF-8表現が既存SQLite containerの8192 byteを超える場合は、anchor予約前に拒否する。容量のために原子的更新を別transactionへ分割しない。
 

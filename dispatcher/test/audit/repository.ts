@@ -87,6 +87,7 @@ test("複数rootの途中SQL失敗では全業務行と監査をrollbackし未�
 test("曖昧なroot計画・container超過・65個目のrootをanchor予約前に拒否する",t=>{
  const root={scope:event.scope,resource_id:"root",resource_digest:"a".repeat(64)};
  for(const plan of [
+  {event:{...event,resource_id:null},resource_commitments:[root],mutation:()=>{assert.fail("missing target must fail before mutation");}},
   {event,resource_digest:null,resource_commitments:[root],mutation:()=>null},
   {event,resource_commitments:[root,root],mutation:()=>null},
   {event,resource_commitments:[],mutation:()=>null},

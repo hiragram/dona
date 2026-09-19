@@ -28,6 +28,11 @@ function anchor(records: AuditRecord[]): AuditAnchor {
 }
 const multiRoots=[{scope:event.scope,resource_id:"jobs",resource_digest:"a".repeat(64)},
  {scope:event.scope,resource_id:"web_auth_state",resource_digest:"b".repeat(64)}];
+test("複数root形式では実resource IDの欠落を拒否し従来のrootなし監査を維持する",()=>{
+ const body={chain_id:"chain_1",sequence:1,transaction_id:"multi",previous_mac:"0".repeat(64),key_version:1,event:{...event,resource_id:null}};
+ assert.throws(()=>signAuditRecord({codec_version:3,...body,resource_commitments:multiRoots},lookup));
+ assert.equal(signAuditRecord({codec_version:1,...body},lookup).event.resource_id,null);
+});
 test("v3の複数rootは一つの実resource eventへ結びretention後も保持する",()=>{
  const current=signAuditRecord({codec_version:3,chain_id:"chain_1",sequence:1,transaction_id:"multi",previous_mac:"0".repeat(64),key_version:1,event,resource_commitments:multiRoots},lookup);
  const tail=anchor([current]);assert.equal(current.event.resource_id,"job_1");

@@ -75,7 +75,8 @@ const recordBodyV1Schema = z.strictObject({
 });
 const recordBodyV2Schema = recordBodyV1Schema.extend({ codec_version: z.literal(2), resource_digest: digest,
   event: auditEventSchema.refine(event => event.resource_id !== null) });
-const recordBodyV3Schema = recordBodyV1Schema.extend({ codec_version: z.literal(3), resource_commitments: commitmentsSchema });
+const recordBodyV3Schema = recordBodyV1Schema.extend({ codec_version: z.literal(3), resource_commitments: commitmentsSchema,
+  event: auditEventSchema.refine(event => event.resource_id !== null) });
 const recordBodySchema = z.discriminatedUnion("codec_version", [recordBodyV1Schema, recordBodyV2Schema, recordBodyV3Schema]);
 const recordSchema = z.discriminatedUnion("codec_version", [
   recordBodyV1Schema.extend({ record_digest: digest, mac: digest }),
