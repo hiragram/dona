@@ -180,7 +180,7 @@ describe("DispatcherApi", () => {
     const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}?source_event_id=${accepted.body.event_id}`);
     assert.equal(shown.status, 200);
     assert.equal((shown.body.job as Record<string, unknown>).source_event_id, accepted.body.event_id);
-    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}`)).status,200);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}`)).status,400);
     const otherEnvelope=eventEnvelope("Ev-job-api-other");
     otherEnvelope.reply_target!.thread_ts="1756722031.000001";
     otherEnvelope.subject.thread_ts="1756722031.000001";

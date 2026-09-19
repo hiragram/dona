@@ -755,7 +755,7 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("enforces canonical objective UTF-8 bytes without counting queued steer text", async () => {
+  test("作成payloadを保持しqueued steerにも独立した実サイズ上限を適用する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath, {
@@ -771,7 +771,9 @@ describe("DispatcherDatabase", () => {
     };
     const first = database.createJob(firstRequest, config.jobsWorkspaceRoot, config.jobResultsDir);
     const followUp = database.enqueue(eventEnvelope("Ev-job-byte-steer")).row;
-    database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "追加条件".repeat(100));
+    const beforeSteer=database.getJob(first.row.job_id);
+    assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id, followUp.event_id, "追加条件".repeat(100)), error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
+    assert.deepEqual(database.getJob(first.row.job_id),beforeSteer);
     database.createJob({
       ...firstRequest,
       job_key: "unicode.two",
@@ -1219,23 +1221,40 @@ describe("DispatcherDatabase", () => {
       (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded");
     assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[first.row.job_id,other.row.job_id,second.row.job_id]);
     const followUp=database.enqueue(eventEnvelope("Ev-owner-aware-follow-up")).row;
-    assert.match(database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)).objective,/DONA_FOLLOW_UP/);
+    assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)),error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
     database.beginJobPreparation(first.row.job_id);
     assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[other.row.job_id,second.row.job_id]);
     assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
     database.close();
   });
 
-  test("queued steer後も作成時objective byteで後続job admissionを制限する",async()=>{
+  test("queued steerの実サイズも後続job admissionへ算入し作成payloadは保持する",async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:3,jobObjectiveTotalMaxBytes:100});
     const event=database.enqueue(eventEnvelope("Ev-steer-admission-bytes")).row;
     const first=database.createJob({source_event_id:event.event_id,job_key:"first",objective:"a",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
     const followUp=database.enqueue(eventEnvelope("Ev-steer-admission-bytes-follow-up")).row;
     database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50));
-    assert.equal(database.createJob({source_event_id:event.event_id,job_key:"second",objective:"c".repeat(20),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"created");
+    const accepted = database.getJob(first.job_id)!;
+    assert.deepEqual(database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50)),accepted);
+    const later = database.enqueue(eventEnvelope("Ev-steer-admission-bytes-later")).row;
+    assert.throws(()=>database.appendQueuedJobInstruction(first.job_id,later.event_id,"c"),error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
+    assert.deepEqual(database.getJob(first.job_id)!,accepted);
+    assert.throws(()=>database.createJob({source_event_id:event.event_id,job_key:"second",objective:"c".repeat(20),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
+    assert.equal(database.createJob({source_event_id:event.event_id,job_key:"first",objective:"a",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row.job_id,first.job_id);
     assert.throws(()=>database.createJob({source_event_id:event.event_id,job_key:"third",objective:"c".repeat(80),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir),
       (error)=>error instanceof JobCreationError&&error.code==="job_group_limit_exceeded"&&error.limitDetails?.resource==="objective_utf8_bytes_per_event");
+    database.close();
+  });
+
+  test("queued steer rejects oversized effective objectives without changing receipt",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const event=database.enqueue(eventEnvelope("Ev-steer-character-limit")).row;
+    const job=database.createJob({source_event_id:event.event_id,objective:"a".repeat(99_999),workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const followUp=database.enqueue(eventEnvelope("Ev-steer-character-follow-up")).row;
+    assert.throws(()=>database.appendQueuedJobInstruction(job.job_id,followUp.event_id,"b"),/Effective job objective character limit/);
+    assert.deepEqual(database.getJob(job.job_id),job);
     database.close();
   });
 

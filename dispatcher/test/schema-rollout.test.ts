@@ -304,4 +304,33 @@ test("a failed post-migration check rolls the source back to v2", async () => {
   assert.equal(reopened.pragma("user_version", { simple: true }), 2);
   assert.equal(reopened.prepare("SELECT name FROM sqlite_master WHERE name='job_groups'").get(), undefined);
   reopened.close();
+  const changed = new Database(databasePath);
+  const at = new Date().toISOString();
+  changed.prepare(`INSERT INTO events (event_id,schema_version,source,external_event_id,event_type,occurred_at,
+    subject_json,payload_json,status,available_at,created_at,updated_at)
+    VALUES ('evt_after_failed_migration',1,'slack','Ev-after-failure','message',?,'{}','{}','queued',?,?,?)`).run(at,at,at,at);
+  changed.close();
+  const backupPath = path.join(root,"backup.sqlite3");
+  const receiptPath = path.join(root,"receipt.json");
+  const retried = await runRolloutCli(databasePath,backupPath,receiptPath);
+  assert.equal(retried.exit,0,retried.stderr);
+  const archives = (await fs.readdir(root)).filter(name=>name.startsWith("backup.sqlite3.stale."));
+  assert.equal(archives.length,1);
+  const archived = new Database(path.join(root,archives[0]!),{readonly:true});
+  assert.equal((archived.prepare("SELECT COUNT(*) AS n FROM events").get() as {n:number}).n,0);
+  archived.close();
+  const freshBackup = new Database(backupPath,{readonly:true});
+  const migrated = new Database(databasePath,{readonly:true});
+  assert.equal((freshBackup.prepare("SELECT COUNT(*) AS n FROM events").get() as {n:number}).n,1);
+  assertReceiptMatchesDatabases(JSON.parse(retried.stdout),migrated,freshBackup);
+  freshBackup.close(); migrated.close();
+  // A receipt plus changed v2 content is ambiguous and must never refresh the backup.
+  await fs.copyFile(backupPath,databasePath);
+  const restored = new Database(databasePath);
+  restored.prepare("UPDATE events SET payload_json='{} ' WHERE event_id='evt_after_failed_migration'").run();
+  restored.close();
+  const ambiguous = await runRolloutCli(databasePath,backupPath,receiptPath);
+  assert.notEqual(ambiguous.exit,0);
+  assert.match(ambiguous.stderr,/schema_backup_content_mismatch/);
+  assert.equal((await fs.readdir(root)).filter(name=>name.startsWith("backup.sqlite3.stale.")).length,1);
 });

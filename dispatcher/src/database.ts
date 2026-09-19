@@ -31,7 +31,7 @@ import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEvent
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
-  legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
+  jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -629,6 +629,8 @@ export class DispatcherDatabase {
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
         const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
+        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
 
@@ -1062,17 +1064,25 @@ export class DispatcherDatabase {
   }
 
   appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
-    this.assertJobSourceMatchesThread(jobId, sourceEventId);
-    this.assertJobSteerAllowed(jobId);
-    if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
-    const row = this.getJobRequired(jobId);
-    if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
-    if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
-    this.db.prepare(`
-      UPDATE jobs SET objective = objective || ?, steer_event_id = ?, steer_state = 'accepted', updated_at = ?
-      WHERE job_id = ?
-    `).run(`\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`, sourceEventId, nowUtc(), jobId);
-    return this.getJobRequired(jobId);
+    return this.db.transaction(() => {
+      this.assertJobSourceMatchesThread(jobId, sourceEventId);
+      this.assertJobSteerAllowed(jobId);
+      if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
+      const row = this.getJobRequired(jobId);
+      if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
+      if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
+      const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
+      const objective = row.objective + addition;
+      if ([...objective].length > jobObjectiveCharacterMax) throw new Error("Effective job objective character limit exceeded");
+      const siblings = this.db.prepare("SELECT objective FROM jobs WHERE source_event_id=?").all(row.source_event_id) as Array<{objective:string}>;
+      const current = siblings.reduce((sum,job)=>sum+Buffer.byteLength(job.objective,"utf8"),0);
+      const attempted = current + Buffer.byteLength(addition,"utf8");
+      const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
+      if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
+      this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
+        .run(objective,sourceEventId,nowUtc(),jobId);
+      return this.getJobRequired(jobId);
+    }).immediate();
   }
 
   beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {

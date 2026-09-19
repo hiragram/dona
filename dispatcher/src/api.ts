@@ -673,7 +673,7 @@ export class DispatcherApi {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
       const sourceEventId = url.searchParams.get("source_event_id");
-      if (sourceEventId === null && this.database.getJob(jobId)?.source === "dona_schedule") throw new ApiRequestError(400,"invalid_request","source_event_id is required");
+      if (sourceEventId === null) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
       if (sourceEventId !== null) {
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
           throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
