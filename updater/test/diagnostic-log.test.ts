@@ -105,6 +105,21 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(spacedDetail.includes("secret-token"), false);
     assert.equal(spacedDetail.includes("alpha beta"), false);
     assert.match(spacedDetail, /REDACTED_STREAM/);
+
+    const escapedCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-build-escaped" });
+    escapedCapture.write("stderr", Buffer.from('password="alpha\\"secret-tail" visible-after-escaped'));
+    escapedCapture.finish(true);
+    const escapedDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[4]!, 16_384).detail_tail);
+    assert.equal(escapedDetail.includes("secret-tail"), false);
+    assert.match(escapedDetail, /visible-after-escaped/);
+
+    const partialCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-build-partial" });
+    partialCapture.write("stderr", Buffer.from(`password${" ".repeat(5_000)}`));
+    partialCapture.write("stderr", Buffer.from("secret-after-long-carry\nvisible-after-line"));
+    partialCapture.finish(true);
+    const partialDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[5]!, 16_384).detail_tail);
+    assert.equal(partialDetail.includes("secret-after-long-carry"), false);
+    assert.match(partialDetail, /visible-after-line/);
   } finally {
     f.database.close();
   }
@@ -239,6 +254,23 @@ test("write, atomic finalize, and read faults retain the command failure state",
     fsSync.writeSync = originalWrite;
     assert.equal(writeCapture.finish(true)?.error_code, "diagnostic_write_failed");
 
+    const shortWriteCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-short-write" });
+    let firstWrite = true;
+    fsSync.writeSync = ((descriptor: number, buffer: Uint8Array, offset?: number, length?: number) => {
+      const selectedOffset = offset ?? 0;
+      const selectedLength = length ?? buffer.byteLength;
+      const writeLength = firstWrite ? Math.max(1, Math.floor(selectedLength / 2)) : selectedLength;
+      firstWrite = false;
+      return originalWrite(descriptor, buffer, selectedOffset, writeLength);
+    }) as typeof fsSync.writeSync;
+    shortWriteCapture.write("stderr", Buffer.from("original command failure after short write"));
+    fsSync.writeSync = originalWrite;
+    const shortWrite = shortWriteCapture.finish(true)!;
+    assert.equal(shortWrite.capture_state, "complete");
+    const shortWriteDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[1]!, shortWrite.byte_size).detail_tail);
+    assert.match(shortWriteDetail, /original command failure after short/);
+    assert.match(shortWriteDetail, /write/);
+
     const finalizeCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-finalize" });
     finalizeCapture.write("stderr", Buffer.from("failure"));
     const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
@@ -254,7 +286,7 @@ test("write, atomic finalize, and read faults retain the command failure state",
     assert.equal(f.store.project(readable).capture_state, "read_error");
     fsSync.readSync = originalRead;
     assert.deepEqual(f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state), [
-      "write_failed", "write_failed", "complete",
+      "write_failed", "complete", "write_failed", "complete",
     ]);
   } finally {
     fsSync.writeSync = originalWrite;

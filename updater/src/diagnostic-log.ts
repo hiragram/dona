@@ -37,6 +37,7 @@ class StreamingRedactor {
   private pending = "";
   private droppingSensitive = false;
   private droppingQuote: "\"" | "'" | undefined;
+  private quoteBackslashParity = false;
 
   write(chunk: Buffer): string {
     this.pending += this.decoder.write(chunk);
@@ -53,7 +54,7 @@ class StreamingRedactor {
     while (this.pending.length > 0) {
       if (this.droppingSensitive) {
         const boundary = this.droppingQuote
-          ? this.pending.indexOf(this.droppingQuote)
+          ? this.findClosingQuote(this.droppingQuote)
           : this.pending.search(/[\r\n]/);
         if (boundary < 0) {
           // The whole carried value is sensitive. Drop it immediately so an
@@ -65,6 +66,7 @@ class StreamingRedactor {
         this.pending = this.pending.slice(boundary + (this.droppingQuote ? 1 : 0));
         this.droppingSensitive = false;
         this.droppingQuote = undefined;
+        this.quoteBackslashParity = false;
         continue;
       }
       const assignment = /\b(?:authorization|token|secret|password)\s*[:=]\s*(["']?)/i.exec(this.pending);
@@ -88,6 +90,12 @@ class StreamingRedactor {
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
+          if (this.pending.length > maxCarryCharacters) {
+            output += "[REDACTED_STREAM]";
+            this.pending = "";
+            this.droppingSensitive = true;
+            this.droppingQuote = undefined;
+          }
           return output;
         }
         output += redactText(safe, Number.MAX_SAFE_INTEGER);
@@ -107,6 +115,17 @@ class StreamingRedactor {
       this.pending = this.pending.slice(emitLength);
     }
     return output;
+  }
+
+  private findClosingQuote(quote: "\"" | "'"): number {
+    let escaped = this.quoteBackslashParity;
+    for (let index = 0; index < this.pending.length; index += 1) {
+      const character = this.pending[index]!;
+      if (character === quote && !escaped) return index;
+      escaped = character === "\\" ? !escaped : false;
+    }
+    this.quoteBackslashParity = escaped;
+    return -1;
   }
 }
 
@@ -236,8 +255,13 @@ export class DiagnosticLogStore {
         if (remaining <= 0) { truncated = true; break; }
         const selected = encoded.subarray(0, remaining);
         try {
-          fs.writeSync(descriptor, selected);
-          bytes += selected.length;
+          let written = 0;
+          while (written < selected.length) {
+            const count = fs.writeSync(descriptor, selected, written, selected.length - written);
+            if (count <= 0) throw new Error("diagnostic_short_write");
+            written += count;
+            bytes += count;
+          }
           if (selected.length < encoded.length) truncated = true;
         } catch {
           writeFailed = true;
