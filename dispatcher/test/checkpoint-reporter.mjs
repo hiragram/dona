@@ -28,7 +28,7 @@ export default async function* checkpointReporter(source) {
       queuedTypes.set(key, types);
       continue;
     }
-    if (event.type === "test:start") {
+    if (event.type === "test:dequeue") {
       const types = queuedTypes.get(key) ?? [];
       const type = types.shift();
       if (types.length === 0) queuedTypes.delete(key);
