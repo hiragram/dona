@@ -13,12 +13,11 @@ const key: AuditKey = {
 const lookup = (version: number) => version === 1 ? key : undefined;
 const event: AuditEvent = {
   occurred_at: at, scope: { instance_id: "instance_1", tenant_id: "tenant_1" },
-  actor: { kind: "principal", id: "principal_1" }, action: "web_authorize", resource_id: "job_1",
+  actor: { kind: "principal", id: "principal_1" }, action: "web_authorize", operation: "web.job_read.v1", resource_id: "job_1",
   outcome: "denied", reason: "unauthorized", session_ref: "session_1", receipt_id: null,
-  attempt_id: null, policy_revision: 1, binding_revision: 1, role_revision: 1,
+  attempt_id: null, policy_revision: 1, binding_revision: 1, authz_revision: 1,
 };
-const genesis = () => signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", sequence: 0,
-  through_mac: "0".repeat(64), through_occurred_at: null, signed_at: at, key_version: 1 }, lookup);
+const genesis = () => signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", transaction_id: "genesis_1", signed_at: at, key_version: 1 }, lookup);
 function record(sequence = 1, previous_mac = "0".repeat(64), input = event, version = 1): AuditRecord {
   return signAuditRecord({ codec_version: 1, chain_id: "chain_1", sequence,
     transaction_id: `tx_${sequence}`, previous_mac, key_version: version, event: input }, lookup);
@@ -33,7 +32,7 @@ test("監査レコードはfield順序に依存せず、JSON保存を越えて�
   const reordered = Object.fromEntries(Object.entries(event).reverse()) as AuditEvent;
   assert.deepEqual(record(1, "0".repeat(64), reordered), original);
   assert.deepEqual(verifyAuditRecord(JSON.parse(JSON.stringify(original)), lookup), original);
-  assert.equal(original.record_digest, "241bac0fa6441921e2e9138ab060aaf629e858caa2f7e63bf81dc566c198dceb");
+  assert.equal(original.record_digest, "18b1cc7ae291e6e1f0d865eefefe3903e91f158d3c8a129f8e12a408e5763822");
 });
 
 test("共有chainはgenesisからDB外anchorまで連続している必要がある", () => {
@@ -87,8 +86,7 @@ test("rotation済み鍵は検証専用で、欠落・revoked・異用途の鍵�
 
 test("signed retention checkpointとanchorが一致するときだけprefixを省略できる", () => {
   const first = record(); const second = record(2, first.mac);
-  const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", sequence: 1,
-    through_mac: first.mac, through_occurred_at: at, signed_at: at, key_version: 1 }, lookup);
+  const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", transaction_id: "retention_1", signed_at: at, key_version: 1 }, lookup, first);
   const tail = { ...anchor([first, second]), checkpoint_mac: checkpoint.mac };
   assert.deepEqual(verifyAuditChain(checkpoint, [second], tail, lookup), tail);
   assert.throws(() => verifyAuditChain(checkpoint, [second], anchor([first, second]), lookup), AuditIntegrityError);
@@ -119,12 +117,48 @@ test("鍵rotationを跨ぐchainとretention後の時刻境界を検証する", (
   const second = signAuditRecord({ codec_version: 1, chain_id: "chain_1", sequence: 2,
     transaction_id: "tx_2", previous_mac: first.mac, key_version: 2, event }, rotated);
   assert.deepEqual(verifyAuditChain(genesis(), [first, second], anchor([first, second]), rotated), anchor([first, second]));
-  const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", sequence: 1,
-    through_mac: first.mac, through_occurred_at: at, signed_at: at, key_version: 2 }, rotated);
+  const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "chain_1", transaction_id: "retention_1", signed_at: at, key_version: 2 }, rotated, first);
   const older = signAuditRecord({ codec_version: 1, chain_id: "chain_1", sequence: 2,
     transaction_id: "tx_2", previous_mac: first.mac, key_version: 2,
     event: { ...event, occurred_at: "2026-09-18T00:00:00.000Z" } }, rotated);
   assert.throws(() => verifyAuditChain(checkpoint, [older], {
     ...anchor([first, older]), checkpoint_mac: checkpoint.mac,
   }, rotated), AuditIntegrityError);
+});
+
+// Keep one canonical audit suite within the bounded pre-activation marker budget.
+import "./audit/repository.js";
+
+test("checkpoint境界はMAC検証済みrecordから導出し、独立した時刻・sequenceを受け付けない", () => {
+  const boundary = record();
+  const signing = { codec_version: 1 as const, chain_id: "chain_1", transaction_id: "retention_1", key_version: 1, signed_at: at };
+  const checkpoint = signAuditCheckpoint(signing, lookup, boundary);
+  assert.equal(checkpoint.sequence, boundary.sequence);
+  assert.equal(checkpoint.through_mac, boundary.mac);
+  assert.equal(checkpoint.through_occurred_at, boundary.event.occurred_at);
+  assert.throws(() => signAuditCheckpoint({ ...signing, through_occurred_at: "2026-09-18T00:00:00.000Z" } as never, lookup, boundary), AuditIntegrityError);
+  assert.throws(() => signAuditCheckpoint(signing, lookup, { ...boundary, event: { ...event, occurred_at: "2026-09-18T00:00:00.000Z" } }), AuditIntegrityError);
+  assert.throws(() => signAuditCheckpoint({ ...signing, chain_id: "other" }, lookup, boundary), AuditIntegrityError);
+  const older = record(2, boundary.mac, { ...event, occurred_at: "2026-09-18T00:00:00.000Z" });
+  assert.throws(() => verifyAuditChain(checkpoint, [older], { ...anchor([boundary, older]), checkpoint_mac: checkpoint.mac }, lookup), AuditIntegrityError);
+  const preGenesis = record(1, "0".repeat(64), { ...event, occurred_at: "2026-09-18T00:00:00.000Z" });
+  assert.throws(() => verifyAuditChain(genesis(), [preGenesis], anchor([preGenesis]), lookup), AuditIntegrityError);
+});
+
+test("scope変更のauthz revisionと具体的な拒否operation・safe errorを署名して保存する", () => {
+  const original = record();
+  const revised = record(1, "0".repeat(64), { ...event, authz_revision: 2 });
+  assert.notEqual(original.mac, revised.mac);
+  assert.throws(() => verifyAuditRecord({ ...original, event: { ...event, authz_revision: 2 } }, lookup), AuditIntegrityError);
+  const signatures = new Set<string>();
+  for (const operation of ["web.job_read.v1", "web.job_submit.v1", "web.job_cancel.v1"] as const) {
+    for (const reason of ["csrf_invalid", "origin_invalid", "scope_denied", "cookie_ambiguous", "authorization_proof_invalid"] as const) {
+      const denied = record(1, "0".repeat(64), { ...event, actor: { kind: "unauthenticated", id: null }, resource_id: null, operation, reason });
+      const restored = verifyAuditRecord(JSON.parse(JSON.stringify(denied)), lookup);
+      assert.equal(restored.event.operation, operation); assert.equal(restored.event.reason, reason);
+      signatures.add(restored.mac);
+    }
+  }
+  assert.equal(signatures.size, 15);
+  assert.throws(() => record(1, "0".repeat(64), { ...event, operation: "https://private.example" } as never), AuditIntegrityError);
 });

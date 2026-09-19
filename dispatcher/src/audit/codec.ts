@@ -24,19 +24,34 @@ export const auditEventSchema = z.strictObject({
     "approval_delivery", "binding_change", "policy_change", "identity_change",
     "web_login", "web_logout", "web_authorize", "web_command", "retention",
   ]),
+  operation: z.enum([
+    "web.login.v1", "web.logout.v1", "web.job_list.v1", "web.job_read.v1", "web.job_submit.v1",
+    "web.job_cancel.v1", "web.receipt_read.v1", "web.sse_subscribe.v1", "web.approval_list.v1",
+    "web.approval_read.v1", "approval.approve.v1", "approval.reject.v1", "approval.cancel.v1",
+    "approval.consume.v1", "slack.post_thread_reply.v1", "binding.change.v1", "policy.change.v1",
+    "identity.change.v1", "credential.change.v1", "audit.retain.v1", "unsupported",
+  ]),
   resource_id: opaqueId.nullable(),
   outcome: z.enum(["allowed", "denied", "pending", "succeeded", "failed", "acceptance_unknown", "needs_review"]),
   reason: z.enum([
     "none", "unauthenticated", "unauthorized", "expired", "revoked", "identity_mismatch",
     "scope_mismatch", "revision_mismatch", "snapshot_mismatch", "already_consumed",
     "invalid_input", "unavailable", "clock_anomaly", "response_lost", "integrity_failure",
+    "session_invalid", "resource_not_visible", "scope_denied", "operation_unsupported",
+    "execution_safe_off", "job_kind_unsupported", "quota_exceeded", "deployment_invalid",
+    "origin_invalid", "csrf_invalid", "step_up_required", "session_revoked", "session_expired",
+    "identity_invalid", "identity_unavailable", "durability_unavailable", "cookie_ambiguous", "cookie_invalid",
+    "challenge_consumed", "action_binding_mismatch", "presentation_stale", "proof_invalid",
+    "binding_revoked", "approval_expired", "decision_conflict", "consume_expired", "idempotency_conflict",
+    "audit_integrity_failed", "approval_safe_off", "credential_registration_denied",
+    "credential_counter_invalid", "authorization_proof_invalid",
   ]),
   session_ref: opaqueId.nullable(),
   receipt_id: opaqueId.nullable(),
   attempt_id: opaqueId.nullable(),
   policy_revision: integer,
   binding_revision: integer,
-  role_revision: integer,
+  authz_revision: integer,
 });
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 
@@ -55,6 +70,7 @@ export type AuditRecord = z.infer<typeof recordSchema>;
 const checkpointBodySchema = z.strictObject({
   codec_version: z.literal(1),
   chain_id: opaqueId,
+  transaction_id: opaqueId,
   // The checkpoint authenticates the last removed record (zero at genesis).
   sequence: integer,
   through_mac: digest,
@@ -164,9 +180,19 @@ function checkCheckpointBoundary(body: Omit<AuditCheckpoint, "mac">): void {
 
 // Provisioning/retention must independently authorize and CAS-anchor this checkpoint.
 // This function only signs bytes; it does not initialize or change the trusted anchor.
-export function signAuditCheckpoint(input: Omit<AuditCheckpoint, "mac">, lookup: AuditKeyLookup): AuditCheckpoint {
+const checkpointSigningSchema = checkpointBodySchema.pick({
+  codec_version: true, chain_id: true, transaction_id: true, key_version: true, signed_at: true,
+});
+export type AuditCheckpointSigningInput = z.infer<typeof checkpointSigningSchema>;
+
+export function signAuditCheckpoint(input: AuditCheckpointSigningInput, lookup: AuditKeyLookup, boundaryInput?: unknown): AuditCheckpoint {
   return protect(() => {
-    const body = checkpointBodySchema.parse(input);
+    const signing = checkpointSigningSchema.parse(input);
+    const boundary = boundaryInput === undefined ? undefined : verifyAuditRecord(boundaryInput, lookup);
+    if (boundary && boundary.chain_id !== signing.chain_id) throw new AuditIntegrityError();
+    // Never accept independently supplied sequence/MAC/time for a retained prefix.
+    const body = checkpointBodySchema.parse({ ...signing, sequence: boundary?.sequence ?? 0,
+      through_mac: boundary?.mac ?? zeroMac, through_occurred_at: boundary?.event.occurred_at ?? null });
     checkCheckpointBoundary(body);
     return { ...body, mac: mac(checkedKey(lookup, body.key_version, body.signed_at), "checkpoint", body) };
   });
@@ -194,7 +220,7 @@ export function verifyAuditChain(
       || (checkpoint.sequence === 0 && checkpoint.through_mac !== zeroMac)) throw new AuditIntegrityError();
     let sequence = checkpoint.sequence;
     let previousMac = checkpoint.through_mac;
-    let lastTime = checkpoint.through_occurred_at === null ? -Infinity : Date.parse(checkpoint.through_occurred_at);
+    let lastTime = Date.parse(checkpoint.through_occurred_at ?? checkpoint.signed_at);
     for (const input of records) {
       const record = verifyAuditRecord(input, lookup);
       const at = Date.parse(record.event.occurred_at);
