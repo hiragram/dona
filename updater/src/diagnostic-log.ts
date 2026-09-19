@@ -21,6 +21,8 @@ export interface DiagnosticLogIndex {
   finalizeDiagnosticLog(capture: DiagnosticLogCapture): void;
   discardDiagnosticLog(logId: string): void;
   diagnosticLogs(requestId: string): DiagnosticLogRow[];
+  capturingDiagnosticLogs(): DiagnosticLogRow[];
+  interruptDiagnosticLog(logId: string, errorCode: string, at?: Date): void;
   diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[];
   markDiagnosticPurged(logId: string, at?: Date): void;
 }
@@ -83,8 +85,10 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return output;
-      if (/^(?:xapp|xox[abp]|ghp|github_pat)[-_]|^https?:\/\/|^\/(?:Users|home|private|var\/folders|tmp)\/|^(?:authorization|token|secret|password)\s*[:=]/i.test(this.pending)) {
-        this.pending = "";
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|\b(?:authorization|token|secret|password)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      if (sensitive?.index !== undefined) {
+        output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
+        this.pending = this.pending.slice(sensitive.index);
         this.droppingSensitive = true;
         continue;
       }
@@ -112,6 +116,51 @@ export class DiagnosticLogStore {
   ) {
     this.root = path.join(controlRoot, "diagnostics");
     this.logsRoot = path.join(this.root, "logs");
+  }
+
+  recoverInterruptedCaptures(at = new Date()): void {
+    if (!this.index) return;
+    for (const row of this.index.capturingDiagnosticLogs()) {
+      let errorCode = "diagnostic_capture_interrupted";
+      try {
+        if (!logIdentifier.test(row.log_id) || row.relative_ref !== `logs/${row.log_id}.log`) {
+          throw new Error("diagnostic_reference_invalid");
+        }
+        const temporary = path.join(this.logsRoot, `${row.log_id}.part`);
+        const finalPath = path.join(this.logsRoot, `${row.log_id}.log`);
+        let entries: Array<{ path: string; stats: fs.Stats }> = [];
+        try {
+          this.assertPrivateDirectory(this.root);
+          this.assertPrivateDirectory(this.logsRoot);
+          entries = [temporary, finalPath].flatMap((candidate) => {
+            try { return [{ path: candidate, stats: fs.lstatSync(candidate) }]; }
+            catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+              throw error;
+            }
+          });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        for (const entry of entries) {
+          if (!entry.stats.isFile() || entry.stats.isSymbolicLink() || (entry.stats.mode & 0o077) !== 0 ||
+            entry.stats.uid !== process.getuid?.()) throw new Error("diagnostic_recovery_file_unsafe");
+        }
+        if (entries.length === 1 && entries[0]!.stats.nlink !== 1) throw new Error("diagnostic_recovery_link_unsafe");
+        if (entries.length === 2) {
+          const [first, second] = entries;
+          if (first!.stats.nlink !== 2 || second!.stats.nlink !== 2 ||
+            first!.stats.dev !== second!.stats.dev || first!.stats.ino !== second!.stats.ino) {
+            throw new Error("diagnostic_recovery_link_unsafe");
+          }
+        }
+        for (const entry of entries) fs.unlinkSync(entry.path);
+      } catch {
+        errorCode = "diagnostic_recovery_cleanup_failed";
+      }
+      try { this.index.interruptDiagnosticLog(row.log_id, errorCode, at); }
+      catch { /* recovery is diagnostic-only and must not prevent service startup */ }
+    }
   }
 
   start(identity: DiagnosticLogIdentity, at = new Date()): DiagnosticCaptureSession {

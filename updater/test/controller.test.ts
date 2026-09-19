@@ -5,6 +5,7 @@ import { afterEach, describe, test } from "node:test";
 
 import { releaseCompatibilityMatches, UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
+import { DiagnosticLogStore } from "../src/diagnostic-log.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "../src/ports.js";
 import { ReleaseStore } from "../src/release-store.js";
 import type {
@@ -866,6 +867,37 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.restart_attempts, 0);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, []);
+    f.database.close();
+  });
+
+  test("periodic service maintenance purges expired diagnostic logs without a new failure", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    const requestId = planned.request_id as string;
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-retention",
+    });
+    const claimed = f.database.claim(requestId, "retention-test", f.policy.timeouts.lease_ms, new Date("2026-09-02T00:00:00.000Z"))!;
+    const diagnostics = new DiagnosticLogStore(f.policy.control_root, f.policy.diagnostic_log_limit_bytes, f.database);
+    const capture = diagnostics.start({ request_id: requestId, attempt: claimed.attempt, step: "updater:npm-test" },
+      new Date("2026-09-02T00:00:00.000Z"));
+    capture.write("stderr", Buffer.from("failure"));
+    capture.finish(true);
+    f.database.terminal(requestId, claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "test failed",
+    }, new Date("2026-09-02T00:00:00.000Z"));
+
+    f.controller.maintainDiagnostics();
+    assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
+    f.advance(40 * 86_400_000);
+    f.controller.maintainDiagnostics();
+    assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();
   });
 

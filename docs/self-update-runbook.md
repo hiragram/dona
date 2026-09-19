@@ -43,8 +43,8 @@ pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit
 - 既定のper-log上限は8 MiB、aggregate上限は64 MiB、retentionは14日です。上限後もcommand監視とSIGTERM→1秒grace→SIGKILL cleanupは継続します。
 - `get_self_update_status`の`diagnostics`は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを返します。private absolute pathは返しません。
 - token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
-- temp fileのまま停止したcaptureは次回DB open時に`write_failed`へ落とし、final file不在やsize不一致を`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
-- retentionはterminal requestだけを古い順に対象とし、active captureとnon-terminal requestを削除しません。purge後もDB recordと元byte sizeを保持します。
+- temp fileのまま停止したcaptureは、Updater API socketを取得して単一writerであることを確認したservice起動時だけ安全性を再検証して回収し、`write_failed`へ落とします。read-only CLIによるDB openはactive captureを変更しません。final file不在やsize不一致も`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
+- retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
 
 この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
 

@@ -79,6 +79,13 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(detail.includes("/Users/example"), false);
     assert.match(detail, /REDACTED/);
     assert.match(detail, /前半🙂/);
+
+    const longCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-build" });
+    longCapture.write("stderr", Buffer.from(`${"x".repeat(5_000)}fetch(https://private.example/signed?token=secret-value`));
+    longCapture.finish(true);
+    const longDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[1]!, 16_384).detail_tail);
+    assert.equal(longDetail.includes("private.example"), false);
+    assert.equal(longDetail.includes("secret-value"), false);
   } finally {
     f.database.close();
   }
@@ -322,34 +329,44 @@ test("an unavailable diagnostic index never prevents or rewrites the command res
   assert.equal(result.diagnostic_log, undefined);
 });
 
-test("reopen marks an interrupted capture write_failed instead of complete", async () => {
+test("a read-only database open does not interrupt another process capture", async () => {
   const f = await fixture();
   const databasePath = path.join(f.policy.control_root, "updater.sqlite3");
   try {
-    f.database.reserveDiagnosticLog({
-      request_id: f.claimed.request_id,
-      attempt: f.claimed.attempt,
-      step: "updater:npm-typecheck",
-      log_id: "log_01m2y000000000000000000001",
-      relative_ref: "logs/log_01m2y000000000000000000001.log",
-      byte_size: 0,
-      capture_state: "write_failed",
-      error_code: null,
-      created_at: "2026-09-19T00:00:00.000Z",
-      finalized_at: "2026-09-19T00:00:00.000Z",
-    });
-    f.database.close();
-    const reopened = new UpdateDatabase(databasePath);
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-typecheck" });
+    capture.write("stderr", Buffer.from("active failure detail"));
+    const reader = new UpdateDatabase(databasePath);
     try {
-      const row = reopened.diagnosticLogs(f.claimed.request_id)[0]!;
-      assert.equal(row.capture_state, "write_failed");
-      assert.equal(row.error_code, "diagnostic_capture_interrupted");
-      assert.equal(row.relative_ref, null);
+      assert.equal(reader.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "capturing");
     } finally {
-      reopened.close();
+      reader.close();
     }
-  } catch (error) {
-    try { f.database.close(); } catch { /* already closed */ }
-    throw error;
+    assert.equal(capture.finish(true)?.capture_state, "complete");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("singleton startup recovers interrupted rows and removes their bounded partial files", async () => {
+  const f = await fixture();
+  const databasePath = path.join(f.policy.control_root, "updater.sqlite3");
+  const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-typecheck" });
+  capture.write("stderr", Buffer.from("partial failure detail"));
+  const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+  const partialPath = path.join(f.policy.control_root, "diagnostics", "logs", `${row.log_id}.part`);
+  assert.equal((await fs.stat(partialPath)).isFile(), true);
+  f.database.close();
+  const reopened = new UpdateDatabase(databasePath);
+  try {
+    const recoveryStore = new DiagnosticLogStore(f.policy.control_root, f.policy.diagnostic_log_limit_bytes, reopened);
+    recoveryStore.recoverInterruptedCaptures(new Date("2026-09-19T01:00:00.000Z"));
+    const recovered = reopened.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(recovered.capture_state, "write_failed");
+    assert.equal(recovered.error_code, "diagnostic_capture_interrupted");
+    assert.equal(recovered.relative_ref, null);
+    await assert.rejects(fs.stat(partialPath), { code: "ENOENT" });
+  } finally {
+    reopened.close();
+    capture.finish(false);
   }
 });

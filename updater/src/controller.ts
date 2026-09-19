@@ -99,6 +99,7 @@ function rolloutMatchesTargetCompatibility(
 }
 
 export class UpdateController {
+  private nextDiagnosticRetentionAt = 0;
   constructor(
     private readonly database: UpdateDatabase,
     private readonly policy: UpdatePolicy,
@@ -232,6 +233,24 @@ export class UpdateController {
       notification_state: this.notificationState(this.database.outboxFor(requestId)),
       observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth, main_agent: mainAgent },
     };
+  }
+
+  maintainDiagnostics(): void {
+    const now = this.clock.now();
+    if (now.getTime() < this.nextDiagnosticRetentionAt) return;
+    this.nextDiagnosticRetentionAt = now.getTime() + 60_000;
+    try {
+      this.diagnostics.enforceRetention(
+        now,
+        this.policy.diagnostic_retention_days,
+        this.policy.diagnostic_aggregate_limit_bytes,
+      );
+    } catch (error) {
+      this.logger.warn("Diagnostic retention sweep failed", {
+        error_code: "diagnostic_retention_failed",
+        error_message: redactText(error instanceof Error ? error.message : String(error), 500),
+      });
+    }
   }
 
   async doctor(): Promise<Record<string, unknown>> {

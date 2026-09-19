@@ -271,9 +271,6 @@ export class UpdateDatabase {
       CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
       PRAGMA user_version = 5;
     `);
-    this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'write_failed', relative_ref = NULL,
-      byte_size = 0, error_code = 'diagnostic_capture_interrupted', finalized_at = COALESCE(finalized_at, ?)
-      WHERE capture_state = 'capturing'`).run(new Date().toISOString());
   }
 
   close(): void {
@@ -317,6 +314,18 @@ export class UpdateDatabase {
   diagnosticLogs(requestId: string): DiagnosticLogRow[] {
     return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
       .all(requestId) as DiagnosticLogRow[];
+  }
+
+  capturingDiagnosticLogs(): DiagnosticLogRow[] {
+    return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE capture_state = 'capturing' ORDER BY created_at, log_id")
+      .all() as DiagnosticLogRow[];
+  }
+
+  interruptDiagnosticLog(logId: string, errorCode: string, at = new Date()): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'write_failed', relative_ref = NULL,
+      byte_size = 0, error_code = ?, finalized_at = ? WHERE log_id = ? AND capture_state = 'capturing'`)
+      .run(errorCode, at.toISOString(), logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_interrupt_state_mismatch");
   }
 
   diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[] {

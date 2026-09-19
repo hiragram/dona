@@ -33,7 +33,6 @@ async function main(): Promise<void> {
   const logger = createLogger();
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
   const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database);
-  diagnostics.enforceRetention(new Date(), policy.diagnostic_retention_days, policy.diagnostic_aggregate_limit_bytes);
   const releases = new ReleaseStore(policy);
   const controller = new UpdateController(
     database,
@@ -74,8 +73,10 @@ async function main(): Promise<void> {
     if (command !== "serve" || process.argv.length !== 3) usage();
     const service = new UpdateService(controller, logger);
     const api = new UpdaterApi(path.join(policy.control_root, "updater.sock"), controller, database, service, logger);
-    service.start();
     await api.start();
+    diagnostics.recoverInterruptedCaptures();
+    controller.maintainDiagnostics();
+    service.start();
     await new Promise<void>((resolve, reject) => {
       let stopping = false;
       const stop = async (signal: NodeJS.Signals): Promise<void> => {
