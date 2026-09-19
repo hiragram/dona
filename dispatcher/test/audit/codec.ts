@@ -26,6 +26,40 @@ function anchor(records: AuditRecord[]): AuditAnchor {
   return { chain_id: "chain_1", sequence: records.length, mac: records.at(-1)?.mac ?? "0".repeat(64),
     checkpoint_mac: genesis().mac, pending_transaction_id: null };
 }
+const multiRoots=[{scope:event.scope,resource_id:"jobs",resource_digest:"a".repeat(64)},
+ {scope:event.scope,resource_id:"web_auth_state",resource_digest:"b".repeat(64)}];
+test("v3の複数rootは一つの実resource eventへ結びretention後も保持する",()=>{
+ const current=signAuditRecord({codec_version:3,chain_id:"chain_1",sequence:1,transaction_id:"multi",previous_mac:"0".repeat(64),key_version:1,event,resource_commitments:multiRoots},lookup);
+ const tail=anchor([current]);assert.equal(current.event.resource_id,"job_1");
+ const expected=multiRoots.map(root=>({...root,sequence:1}));
+ assert.deepEqual(verifyAuditState(genesis(),[current],tail,lookup).resource_bindings,expected);
+ const checkpoint=signAuditRetentionCheckpoint({chain_id:"chain_1",transaction_id:"retention",signed_at:at,key_version:1},lookup,genesis(),[current],tail,1);
+ assert.deepEqual(verifyAuditState(checkpoint,[],{...tail,checkpoint_mac:checkpoint.mac},lookup).resource_bindings,expected);
+ for(const root of [{...multiRoots[0]!,resource_digest:"c".repeat(64)},
+  {...multiRoots[0]!,scope:{...event.scope,tenant_id:"other"}}])
+  assert.throws(()=>verifyAuditRecord({...current,resource_commitments:[root,multiRoots[1]]},lookup));
+});
+test("v1・v2・v3混在chainで更新したrootだけを進め削除境界の全rootを保持する",()=>{
+ const first=record();
+ const second=signAuditRecord({codec_version:2,chain_id:"chain_1",sequence:2,transaction_id:"single",previous_mac:first.mac,key_version:1,
+  event:{...event,resource_id:"jobs"},resource_digest:"c".repeat(64)},lookup);
+ const third=signAuditRecord({codec_version:3,chain_id:"chain_1",sequence:3,transaction_id:"multi",previous_mac:second.mac,key_version:1,event,resource_commitments:multiRoots},lookup);
+ const fourth=signAuditRecord({codec_version:2,chain_id:"chain_1",sequence:4,transaction_id:"single_again",previous_mac:third.mac,key_version:1,
+  event:{...event,resource_id:"jobs"},resource_digest:"d".repeat(64)},lookup);
+ const records=[first,second,third,fourth],tail=anchor(records);
+ const checkpoint=signAuditRetentionCheckpoint({chain_id:"chain_1",transaction_id:"retention",signed_at:at,key_version:1},lookup,genesis(),records,tail,3);
+ assert.equal(checkpoint.codec_version,2);
+ if(checkpoint.codec_version!==2)assert.fail();
+ assert.deepEqual(checkpoint.resource_bindings,multiRoots.map(root=>({...root,sequence:3})));
+ const expected=[{...multiRoots[0]!,resource_digest:"d".repeat(64),sequence:4},{...multiRoots[1]!,sequence:3}];
+ assert.deepEqual(verifyAuditState(genesis(),records,tail,lookup).resource_bindings,expected);
+ assert.deepEqual(verifyAuditState(checkpoint,[fourth],{...tail,checkpoint_mac:checkpoint.mac},lookup).resource_bindings,expected);
+});
+test("v3の空root・重複・順序違い・container超過を署名前に拒否する",()=>{
+ for(const resource_commitments of [[],[multiRoots[0],multiRoots[0]],[...multiRoots].reverse(),
+  Array.from({length:64},(_,i)=>({scope:{instance_id:"i".repeat(128),tenant_id:"t".repeat(128)},resource_id:"r"+String(i).padStart(3,"0")+"r".repeat(120),resource_digest:"a".repeat(64)}))])
+  assert.throws(()=>signAuditRecord({codec_version:3,chain_id:"chain_1",sequence:1,transaction_id:"multi",previous_mac:"0".repeat(64),key_version:1,event,resource_commitments} as never,lookup));
+});
 
 test("監査レコードはfield順序に依存せず、JSON保存を越えて検証できる", () => {
   const original = record();

@@ -198,6 +198,25 @@ function count(db: Database.Database, table: string) {
   return (db.prepare(`SELECT count(*) n FROM ${table}`).get() as { n: number })
     .n;
 }
+test("複数rootの計画を現在clockと単一監査transactionへ結合する",t=>{
+ const {db,transaction,audit,anchors}=setup(t);
+ const roots=[{scope:event.scope,resource_id:"approval_state",resource_digest:"a".repeat(64)},
+  {scope:event.scope,resource_id:"web_auth_state",resource_digest:"b".repeat(64)}];
+ const result=transaction.runPrepared("multi_root",(mark,state)=>{
+  assert.equal(state.anchor.sequence,0);assert.ok(Object.isFrozen(state));
+  return {event,resource_commitments:roots,mutation:()=>{insertRequest(db,mark.transaction_id);return "created";}};
+ });
+ assert.equal(result,"created");assert.equal(count(db,"approval_requests"),1);assert.equal(count(db,"approval_clock_reservations"),1);
+ assert.deepEqual(audit.readVerifiedState(state=>state.resource_bindings),roots.map(root=>({...root,sequence:1})));
+ assert.deepEqual(anchors.calls,["reserve","finalize"]);
+});
+test("複数rootでも非同期prepareとmutationを本体実行前に拒否する",async t=>{
+ const {transaction,anchors}=setup(t);let effects=0;
+ const resource_commitments=[{scope:event.scope,resource_id:"root",resource_digest:"a".repeat(64)}];
+ assert.throws(()=>transaction.runPrepared("async_prepare",(async()=>{effects++;return {event,resource_commitments,mutation:()=>null};}) as never));
+ assert.throws(()=>transaction.runPrepared("async_mutation",(()=>({event,resource_commitments,mutation:async()=>{effects++;await Promise.resolve();effects++;}})) as never));
+ await Promise.resolve();assert.equal(effects,0);assert.deepEqual(anchors.calls,[]);
+});
 test("transaction接続のadmissionで既存FK破損をclock予約前に拒否する", t => {
   const {db,anchors,marks}=setup(t);
   db.pragma("foreign_keys=OFF");

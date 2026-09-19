@@ -6,7 +6,7 @@ import { verifyApprovalSchema } from "../approval/schema.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditRetentionCheckpoint, verifyAuditChain, verifyAuditState,
-  type AuditAnchor, type AuditCheckpoint, type AuditEvent, type AuditKeyLookup, type AuditRecord, type VerifiedAuditState,
+  type AuditAnchor, type AuditCheckpoint, type AuditEvent, type AuditKeyLookup, type AuditRecord, type VerifiedAuditState, type AuditResourceCommitment,
 } from "./codec.js";
 
 /** Protected, rollback-resistant store outside the Dispatcher DB and its backups.
@@ -20,6 +20,11 @@ export interface AuditAnchorStore {
   reserve(expected: AuditAnchor, proposed: AuditAnchor): AuditAnchor;
   finalize(reservation: AuditAnchor): AuditAnchor;
 }
+
+export type AuditResourceUpdate =
+  | { resource_digest: string | null; resource_commitments?: never }
+  | { resource_commitments: AuditResourceCommitment[]; resource_digest?: never };
+export type AuditPreparedPlan<E, M> = AuditResourceUpdate & { event: E; mutation: M };
 
 const schemaVersion = 2;
 function guard<T>(operation: () => T): T {
@@ -234,9 +239,9 @@ export class AuditRepository {
    * audited denial instead of throwing after reservation and stranding the chain.
    * prepare has the same synchronous-read-only contract as readVerified. */
   appendPrepared<F extends () => unknown>(transactionId: string, keyVersion: number,
-    prepare: (state: VerifiedAuditState) => { event: AuditEvent; resource_digest: string | null; mutation: SynchronousCallback<F> }): { record: AuditRecord; result: ReturnType<F> };
+    prepare: (state: VerifiedAuditState) => AuditPreparedPlan<AuditEvent, SynchronousCallback<F>>): { record: AuditRecord; result: ReturnType<F> };
   appendPrepared(transactionId: string, keyVersion: number,
-    prepare: (state: VerifiedAuditState) => { event: AuditEvent; resource_digest: string | null; mutation: () => unknown }): { record: AuditRecord; result: unknown } {
+    prepare: (state: VerifiedAuditState) => AuditPreparedPlan<AuditEvent, () => unknown>): { record: AuditRecord; result: unknown } {
     return guard(() => {
       assertSynchronousCallback(prepare);
       assertSecurityDurability(this.db);
@@ -246,24 +251,28 @@ export class AuditRepository {
       const committed = this.db.transaction(() => {
         const verified = this.verifyStateInside();
         const current = verified.anchor;
-        const { event, resource_digest, mutation } = this.readOnly(() => prepare(freezeState(verified)), plan => {
+        const plan = this.readOnly(() => prepare(freezeState(verified)), plan => {
           // Plans stay inside this transaction. Only their explicitly named
           // mutation may be callable; no accessor or deferred data is admitted.
           if (plan === null || typeof plan !== "object" || types.isProxy(plan)
             || Object.getPrototypeOf(plan) !== Object.prototype) throw new AuditIntegrityError();
           const descriptors = Object.getOwnPropertyDescriptors(plan);
-          if (Reflect.ownKeys(descriptors).length !== 3 || !["event", "resource_digest", "mutation"].every(name => {
+          const resourceField = Object.hasOwn(descriptors, "resource_commitments") ? "resource_commitments" : "resource_digest";
+          if (Reflect.ownKeys(descriptors).length !== 3 || !["event", resourceField, "mutation"].every(name => {
             const descriptor = descriptors[name]; return descriptor !== undefined && "value" in descriptor;
           })) throw new AuditIntegrityError();
           assertSynchronousCallback(descriptors.mutation!.value);
-          assertSynchronousResult({ event: descriptors.event!.value, resource_digest: descriptors.resource_digest!.value });
+          assertSynchronousResult({ event: descriptors.event!.value, resources: descriptors[resourceField]!.value });
         });
+        const { event, mutation } = plan;
         assertSynchronousCallback(mutation);
         if (this.db.prepare("SELECT 1 FROM security_audit_records WHERE transaction_id=?").get(transactionId)) throw new AuditIntegrityError();
         const body = { chain_id: current.chain_id, sequence: current.sequence + 1,
           transaction_id: transactionId, previous_mac: current.mac, key_version: keyVersion, event };
-        const record = signAuditRecord(resource_digest === null ? { codec_version: 1, ...body }
-          : { codec_version: 2, resource_digest, ...body }, this.keys);
+        const record = signAuditRecord("resource_commitments" in plan
+          ? { codec_version: 3, resource_commitments: plan.resource_commitments, ...body }
+          : plan.resource_digest === null ? { codec_version: 1, ...body }
+            : { codec_version: 2, resource_digest: plan.resource_digest, ...body }, this.keys);
         // Verify ordering, key state and record input before the first external write.
         const existing = this.records();
         const extended = function* () { yield* existing; yield record; };

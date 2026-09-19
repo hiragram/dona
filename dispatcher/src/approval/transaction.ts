@@ -5,7 +5,7 @@ import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCal
 import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
 import type Database from "better-sqlite3";
 import { auditEventSchema, type AuditEvent, type AuditKeyLookup, type VerifiedAuditState } from "../audit/codec.js";
-import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
+import { AuditRepository, type AuditAnchorStore, type AuditPreparedPlan } from "../audit/repository.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema, verifyApprovalIntegrity } from "./schema.js";
 
@@ -50,21 +50,15 @@ export class ApprovalTransaction {
    * actual audit outcome and planned metadata digest before anchor reservation;
    * an ordinary duplicate/conflict should return a denial plan, not throw after
    * reserve. Plaintext and transport proof must never enter resource metadata. */
-  runPrepared<F extends () => unknown>(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
-    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: SynchronousCallback<F>;
-  }): ReturnType<F>;
-  runPrepared(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
-    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
-  }): unknown {
+  runPrepared<F extends () => unknown>(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => AuditPreparedPlan<Omit<AuditEvent, "occurred_at">, SynchronousCallback<F>>): ReturnType<F>;
+  runPrepared(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => AuditPreparedPlan<Omit<AuditEvent, "occurred_at">, () => unknown>): unknown {
     try {
       assertSynchronousCallback(prepare);
       return withSecurityTransactionLock(this.db, () => this.runPreparedInside(transactionId, prepare), this.providers.lockWaitTimeoutMs);
     }
     catch (error) { if (error instanceof SecurityCoordinationBusyError) throw new ApprovalTransactionBusyError(); throw new ApprovalTransactionError(); }
   }
-  private runPreparedInside(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => {
-    event: Omit<AuditEvent, "occurred_at">; resource_digest: string | null; mutation: () => unknown;
-  }): unknown {
+  private runPreparedInside(transactionId: string, prepare: (mark: Readonly<ClockMark>, state: VerifiedAuditState) => AuditPreparedPlan<Omit<AuditEvent, "occurred_at">, () => unknown>): unknown {
     try {
       assertSecurityDurability(this.db);
       if (this.db.inTransaction || this.db.pragma("foreign_keys", { simple: true }) !== 1
@@ -85,13 +79,15 @@ export class ApprovalTransaction {
         if (plan === null || typeof plan !== "object" || types.isProxy(plan)
           || Object.getPrototypeOf(plan) !== Object.prototype) throw new ApprovalTransactionError();
         const descriptors = Object.getOwnPropertyDescriptors(plan);
-        if (Reflect.ownKeys(descriptors).length !== 3 || !["event", "resource_digest", "mutation"].every(name => {
+        const resourceField = Object.hasOwn(descriptors, "resource_commitments") ? "resource_commitments" : "resource_digest";
+        if (Reflect.ownKeys(descriptors).length !== 3 || !["event", resourceField, "mutation"].every(name => {
           const descriptor = descriptors[name]; return descriptor !== undefined && "value" in descriptor;
         })) throw new ApprovalTransactionError();
         assertSynchronousCallback(descriptors.mutation!.value);
-        assertSynchronousResult({ event: descriptors.event!.value, resource_digest: descriptors.resource_digest!.value });
+        assertSynchronousResult({ event: descriptors.event!.value, resources: descriptors[resourceField]!.value });
         const event = auditEventSchema.omit({ occurred_at: true }).parse(plan.event);
-        return { event: { ...event, occurred_at: mark.effective_utc }, resource_digest: plan.resource_digest,
+        const update = "resource_commitments" in plan ? { resource_commitments: plan.resource_commitments } : { resource_digest: plan.resource_digest };
+        return { event: { ...event, occurred_at: mark.effective_utc }, ...update,
           mutation: () => {
             requireCurrent();
             const result = applyClockBoundMutation(this.db, mark, plan.mutation); requireCurrent(); verifyApprovalSchema(this.db); return result;

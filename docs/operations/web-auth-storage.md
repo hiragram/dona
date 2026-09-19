@@ -25,4 +25,4 @@ metadataは4 MiB、principalは1,024件、subject aliasは16,384件、sessionは
 
 fixtureのregistry seedは、認可済みのregistryが既に存在する場合を作るテスト準備である。実operator承認・初期登録・変更・復旧・key lifecycleの実装や証拠ではない。productionへ向けた登録APIや承認済みflagは追加していない。
 
-認証済みUDS、BFF listener、real credential/CAS provider、runtime migration/readiness、起動時の失効hook、backupからのpayload除外、principalの管理操作、activity更新、ingress nonceと業務判断の原子的接続は後続である。複数の状態rootを同時に更新する業務gateには共通監査の複数commitment対応も必要となる。nonceだけを先に消費し、別transactionで業務更新して原子的認可と扱ってはならない。実IdP、WebAuthn、browser、productionの検証は行っておらず、#141をこの保存層だけで完了扱いしない。
+認証済みUDS、BFF listener、real credential/CAS provider、runtime migration/readiness、起動時の失効hook、backupからのpayload除外、principalの管理操作、activity更新、ingress nonceと業務判断の原子的接続は後続である。複数の状態rootを同時に更新する業務gateは、[共通監査の複数commitment](audited-multiple-roots.md)へ結合する。nonceだけを先に消費し、別transactionで業務更新して原子的認可と扱ってはならない。実IdP、WebAuthn、browser、productionの検証は行っておらず、#141をこの保存層だけで完了扱いしない。

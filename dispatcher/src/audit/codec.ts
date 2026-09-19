@@ -55,6 +55,15 @@ export const auditEventSchema = z.strictObject({
 });
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 
+// Bounded aggregate metadata roots, not individual jobs or lifetime identities.
+// Root inventory and encoded record capacity are separate pre-reservation limits.
+export const maximumAuditResourceRoots = 64;
+export const maximumAuditRecordBytes = 8192;
+const resourceCommitmentSchema = z.strictObject({ scope, resource_id: opaqueId, resource_digest: digest });
+export type AuditResourceCommitment = z.infer<typeof resourceCommitmentSchema>;
+const commitmentsSchema = z.array(resourceCommitmentSchema).min(1).max(maximumAuditResourceRoots)
+  .refine(values => values.every((value, index) => index === 0 || resourceKey(value) > resourceKey(values[index - 1]!)));
+
 const recordBodyV1Schema = z.strictObject({
   codec_version: z.literal(1),
   chain_id: opaqueId,
@@ -66,10 +75,12 @@ const recordBodyV1Schema = z.strictObject({
 });
 const recordBodyV2Schema = recordBodyV1Schema.extend({ codec_version: z.literal(2), resource_digest: digest,
   event: auditEventSchema.refine(event => event.resource_id !== null) });
-const recordBodySchema = z.discriminatedUnion("codec_version", [recordBodyV1Schema, recordBodyV2Schema]);
+const recordBodyV3Schema = recordBodyV1Schema.extend({ codec_version: z.literal(3), resource_commitments: commitmentsSchema });
+const recordBodySchema = z.discriminatedUnion("codec_version", [recordBodyV1Schema, recordBodyV2Schema, recordBodyV3Schema]);
 const recordSchema = z.discriminatedUnion("codec_version", [
   recordBodyV1Schema.extend({ record_digest: digest, mac: digest }),
   recordBodyV2Schema.extend({ record_digest: digest, mac: digest }),
+  recordBodyV3Schema.extend({ record_digest: digest, mac: digest }),
 ]);
 export type AuditRecordSigningInput = z.infer<typeof recordBodySchema>;
 export type AuditRecord = z.infer<typeof recordSchema>;
@@ -85,9 +96,6 @@ const checkpointBodySchema = z.strictObject({
   signed_at: utc,
   key_version: integer.min(1),
 });
-// Resource digests bind bounded aggregate metadata roots, not individual jobs or
-// lifetime principal entries. Exceeding this bound fails before anchor reserve.
-export const maximumAuditResourceRoots = 64;
 const resourceBindingSchema = z.strictObject({
   scope, resource_id: opaqueId, sequence: integer.min(1), resource_digest: digest,
 });
@@ -170,13 +178,16 @@ export function signAuditRecord(input: AuditRecordSigningInput, lookup: AuditKey
     const body = recordBodySchema.parse(input);
     const key = checkedKey(lookup, body.key_version, body.event.occurred_at);
     const record_digest = createHash("sha256").update(canonical(body), "utf8").digest("hex");
-    return { ...body, record_digest, mac: mac(key, "record", { ...body, record_digest }) };
+    const record = { ...body, record_digest, mac: mac(key, "record", { ...body, record_digest }) };
+    if (Buffer.byteLength(canonical(record), "utf8") > maximumAuditRecordBytes) throw new AuditIntegrityError();
+    return record;
   });
 }
 
 export function verifyAuditRecord(input: unknown, lookup: AuditKeyLookup): AuditRecord {
   return protect(() => {
     const record = recordSchema.parse(input);
+    if (Buffer.byteLength(canonical(record), "utf8") > maximumAuditRecordBytes) throw new AuditIntegrityError();
     const { mac: storedMac, record_digest: storedDigest, ...body } = record;
     const key = checkedKey(lookup, body.key_version);
     const at = Date.parse(body.event.occurred_at);
@@ -273,9 +284,10 @@ function verifyState(checkpointInput: unknown, records: Iterable<unknown>, ancho
       || record.sequence !== sequence + 1 || !sameMac(record.previous_mac, previousMac)
       || at < lastTime) throw new AuditIntegrityError();
     sequence = record.sequence; previousMac = record.mac; lastTime = at;
-    if (record.codec_version === 2) {
-      const binding = resourceBindingSchema.parse({ scope: record.event.scope, resource_id: record.event.resource_id,
-        sequence: record.sequence, resource_digest: record.resource_digest });
+    const updates = record.codec_version === 3 ? record.resource_commitments : record.codec_version === 2
+      ? [{ scope: record.event.scope, resource_id: record.event.resource_id, resource_digest: record.resource_digest }] : [];
+    for (const update of updates) {
+      const binding = resourceBindingSchema.parse({ ...update, sequence: record.sequence });
       bindings.set(resourceKey(binding), binding);
       if (bindings.size > maximumAuditResourceRoots) throw new AuditIntegrityError();
     }

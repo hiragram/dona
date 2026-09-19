@@ -61,6 +61,45 @@ function setup(t: { after(fn: () => void): void }, existing = false) {
 const count = (db: Database.Database, table: "decisions" | "security_audit_records") =>
   (db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
 
+test("複数の業務rootを単一監査recordへ結びeventの実resourceを保持する",t=>{
+ const {db,repository,store}=setup(t);
+ const roots=[{scope:event.scope,resource_id:"jobs",resource_digest:"a".repeat(64)},
+  {scope:event.scope,resource_id:"web_auth_state",resource_digest:"b".repeat(64)}];
+ const result=repository.appendPrepared("atomic_roots",1,()=>({event,resource_commitments:roots,mutation:()=>{
+  db.exec("INSERT INTO decisions VALUES ('job','created'),('nonce','consumed')");return "committed";
+ }}));
+ assert.equal(result.result,"committed");assert.equal(result.record.codec_version,3);assert.equal(result.record.event.resource_id,"request_1");
+ assert.deepEqual(store.calls,["reserve","finalize"]);assert.equal(count(db,"decisions"),2);
+ assert.deepEqual(repository.readVerifiedState(state=>state.resource_bindings),roots.map(root=>({...root,sequence:1})));
+ const peer=new Database(db.name);peer.pragma("synchronous=FULL");
+ try{assert.deepEqual(new AuditRepository(peer,store,keys).readVerifiedState(state=>state.resource_bindings),roots.map(root=>({...root,sequence:1})));}finally{peer.close();}
+});
+test("複数rootの途中SQL失敗では全業務行と監査をrollbackし未確定anchorを保持する",t=>{
+ const {db,repository,store}=setup(t);
+ assert.throws(()=>repository.appendPrepared("atomic_failure",1,()=>({event,resource_commitments:[
+  {scope:event.scope,resource_id:"jobs",resource_digest:"a".repeat(64)},
+  {scope:event.scope,resource_id:"web_auth_state",resource_digest:"b".repeat(64)}],mutation:()=>{
+   db.exec("INSERT INTO decisions VALUES ('job','created')");throw Error("fixture second write failed");
+  }})));
+ assert.equal(count(db,"decisions"),0);assert.equal(count(db,"security_audit_records"),0);
+ assert.equal(store.value.pending_transaction_id,"atomic_failure");assert.deepEqual(store.calls,["reserve"]);
+});
+test("曖昧なroot計画・container超過・65個目のrootをanchor予約前に拒否する",t=>{
+ const root={scope:event.scope,resource_id:"root",resource_digest:"a".repeat(64)};
+ for(const plan of [
+  {event,resource_digest:null,resource_commitments:[root],mutation:()=>null},
+  {event,resource_commitments:[root,root],mutation:()=>null},
+  {event,resource_commitments:[],mutation:()=>null},
+  {event,get resource_commitments(){throw Error("getter must not run");},mutation:()=>null},
+  {event,resource_commitments:Array.from({length:64},(_,i)=>({...root,resource_id:"r"+String(i).padStart(3,"0")+"r".repeat(120),scope:{instance_id:"i".repeat(128),tenant_id:"t".repeat(128)}})),mutation:()=>null},
+ ]){const {repository,store}=setup(t);assert.throws(()=>repository.appendPrepared("bad_plan",1,(()=>plan) as never));assert.deepEqual(store.calls,[]);}
+ const {repository,store}=setup(t);
+ for(let i=0;i<64;i++)repository.appendPrepared("root_"+i,1,()=>({event:{...event,resource_id:"root_"+i},resource_digest:"a".repeat(64),mutation:()=>null}));
+ const before=store.calls.length;
+ assert.throws(()=>repository.appendPrepared("overflow",1,()=>({event,resource_commitments:[root],mutation:()=>null})));
+ assert.equal(store.calls.length,before);assert.equal(repository.verify().sequence,64);
+});
+
 test("cleanと既存Dispatcher DBへopt-in schemaを追加し、再openでも正本を保持する", (t) => {
   for (const existing of [false, true]) {
     const { db, filename, store, repository, version } = setup(t, existing);
