@@ -205,7 +205,10 @@ export class DiagnosticLogStore {
           }
         }
         for (const entry of entries) fs.unlinkSync(entry.path);
-        if (entries.length > 0) this.fsyncLogsDirectory();
+        // The files may already be absent because a previous cleanup unlinked
+        // them but failed before its directory fsync. Make that absence durable
+        // before dropping the DB reference in every case.
+        this.fsyncLogsDirectory();
       } catch {
         // Keep the bound row intact so a later singleton startup can retry;
         // never turn an unremoved managed file into an unreferenced orphan.
@@ -332,11 +335,14 @@ export class DiagnosticLogStore {
         try {
           if (writeFailed) throw new Error("write");
           fs.fsyncSync(descriptor);
-          fs.closeSync(descriptor);
+          const writtenStats = fs.fstatSync(descriptor);
           const temporaryStats = fs.lstatSync(temporary);
-          if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() || temporaryStats.nlink !== 1 ||
-            (temporaryStats.mode & 0o077) !== 0 || temporaryStats.uid !== process.getuid?.() ||
-            temporaryStats.size !== bytes || fs.existsSync(finalPath)) {
+          if (!writtenStats.isFile() || writtenStats.nlink !== 1 || (writtenStats.mode & 0o077) !== 0 ||
+            writtenStats.uid !== process.getuid?.() || writtenStats.size !== bytes ||
+            !temporaryStats.isFile() || temporaryStats.isSymbolicLink() || temporaryStats.nlink !== writtenStats.nlink ||
+            temporaryStats.mode !== writtenStats.mode || temporaryStats.uid !== writtenStats.uid ||
+            temporaryStats.size !== writtenStats.size || temporaryStats.dev !== writtenStats.dev ||
+            temporaryStats.ino !== writtenStats.ino || fs.existsSync(finalPath)) {
             throw new Error("unsafe_finalize");
           }
           this.assertPrivateDirectory(this.root);
@@ -347,6 +353,7 @@ export class DiagnosticLogStore {
           published = true;
           fs.unlinkSync(temporary);
           fs.chmodSync(finalPath, 0o600);
+          fs.closeSync(descriptor);
           this.fsyncLogsDirectory();
         } catch {
           errorCode = writeFailed ? "diagnostic_write_failed" : "diagnostic_finalize_failed";

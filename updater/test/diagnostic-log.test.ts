@@ -426,6 +426,31 @@ test("failed post-publish metadata update removes the final file before dropping
   }
 });
 
+test("finalize rejects a path swapped away from the descriptor used for redacted writes", async () => {
+  const f = await fixture();
+  let displacedPath: string | undefined;
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-path-swap" });
+    capture.write("stderr", Buffer.from("failure"));
+    const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
+    const part = (await fs.readdir(logsRoot)).find((entry) => entry.endsWith(".part"))!;
+    const partPath = path.join(logsRoot, part);
+    displacedPath = `${partPath}.displaced`;
+    await fs.rename(partPath, displacedPath);
+    const displaced = await fs.stat(displacedPath);
+    await fs.writeFile(partPath, Buffer.alloc(displaced.size, 0x78), { mode: 0o600, flag: "wx" });
+
+    const failed = capture.finish(true)!;
+    assert.equal(failed.error_code, "diagnostic_finalize_failed");
+    assert.equal(failed.relative_ref, null);
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "write_failed");
+    assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry === `${failed.log_id}.log`), []);
+  } finally {
+    if (displacedPath) await fs.rm(displacedPath, { force: true });
+    f.database.close();
+  }
+});
+
 test("successful command keeps a recoverable row when partial-file cleanup fails", async () => {
   const f = await fixture();
   const originalUnlink = fsSync.unlinkSync;
@@ -686,6 +711,36 @@ test("singleton startup recovers interrupted rows and removes their bounded part
     await assert.rejects(fs.stat(partialPath), { code: "ENOENT" });
   } finally {
     reopened.close();
+    capture.finish(false);
+  }
+});
+
+test("singleton recovery fsyncs an already absent capture before dropping its DB reference", async () => {
+  const f = await fixture();
+  const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-recovery-missing" });
+  capture.write("stderr", Buffer.from("partial failure detail"));
+  const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+  const partialPath = path.join(f.policy.control_root, "diagnostics", "logs", `${row.log_id}.part`);
+  await fs.unlink(partialPath);
+  const syncStore = f.store as unknown as { fsyncLogsDirectory(): void };
+  const originalFsync = syncStore.fsyncLogsDirectory.bind(f.store);
+  const originalInterrupt = f.database.interruptDiagnosticLog.bind(f.database);
+  const events: string[] = [];
+  try {
+    syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
+    f.database.interruptDiagnosticLog = ((logId, errorCode, at) => {
+      events.push("interrupt");
+      return originalInterrupt(logId, errorCode, at);
+    }) as typeof f.database.interruptDiagnosticLog;
+    f.store.recoverInterruptedCaptures(new Date("2026-09-19T01:30:00.000Z"));
+    assert.deepEqual(events, ["fsync", "interrupt"]);
+    const recovered = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(recovered.capture_state, "write_failed");
+    assert.equal(recovered.relative_ref, null);
+  } finally {
+    syncStore.fsyncLogsDirectory = originalFsync;
+    f.database.interruptDiagnosticLog = originalInterrupt;
+    f.database.close();
     capture.finish(false);
   }
 });
