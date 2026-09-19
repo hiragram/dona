@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import { describe, test } from "node:test";
+import { promisify } from "node:util";
 
 import {
   jobResourceDefaults,
@@ -11,6 +13,43 @@ import {
 } from "../src/config.js";
 
 describe("job resource config", () => {
+  test("process計測はchild_process overloadと限定envを維持する", async () => {
+    assert.throws(() => spawn(process.execPath, [], { stdio: "invalid" as never }), /stdio/);
+    assert.throws(() => spawnSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFileSync("/bin/true", [], 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", [], 5 as never, () => {}), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", [], {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    assert.throws(() => execFile("/bin/true", {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    const undefinedCallbackChild = execFile("/usr/bin/true", {}, undefined as never);
+    const nullCallbackChild = execFile(process.execPath, ["-e", ""], {}, null as never);
+    const undefinedArgsChild = execFile("/usr/bin/true", undefined as never, { env: {} });
+    const nullArgsChild = execFile("/usr/bin/true", null as never, { env: {} });
+    await Promise.all([undefinedCallbackChild, nullCallbackChild, undefinedArgsChild, nullArgsChild].map((candidate) => new Promise<void>((resolve, reject) => {
+      candidate.once("error", reject);
+      candidate.once("close", () => resolve());
+    })));
+    const omittedArgs = spawnSync("/usr/bin/env", undefined, {
+      env: { ONLY_WITH_OMITTED_ARGS: "yes" },
+      encoding: "utf8",
+    });
+    assert.match(String(omittedArgs.stdout), /^ONLY_WITH_OMITTED_ARGS=yes$/m);
+    assert.doesNotMatch(String(omittedArgs.stdout), /^HOME=/m);
+    const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    assert.match(output, /^ONLY_FOR_CHILD=yes$/m);
+    assert.doesNotMatch(output, /^HOME=/m);
+
+    const promise = promisify(execFile)(process.execPath, ["-e", ""]);
+    assert.ok("child" in promise);
+    await promise;
+  });
+
   test("pre-activationでもDispatcher test fileを逐次実行する", () => {
     assert.equal(process.env.DONA_CHECKPOINT_REPORTER_NONCE, undefined);
     const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -30,6 +69,19 @@ describe("job resource config", () => {
     assert.match(reporter, /"case-finish"/);
     assert.match(reporter, /`\\n\[dispatcher-test:\$\{nonce\}\]/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
+    assert.match(runner, /process-metrics\.cjs/);
+    const metrics = fs.readFileSync(new URL("./process-metrics.cjs", import.meta.url), "utf8");
+    assert.match(metrics, /const markerLimit = 2048/);
+    assert.match(metrics, /\["node", "git", "shell", "other"\]/);
+    assert.match(metrics, /childProcess\.fork = function instrumentedFork/);
+    assert.match(metrics, /active \+= 1;[\s\S]*originalSpawnSync/);
+    assert.match(runner, /--require=\$\{JSON\.stringify\(processMetrics\)\}/);
+    assert.match(runner, /DONA_ORIGINAL_NODE_OPTIONS: process\.env\.NODE_OPTIONS/);
+    assert.match(metrics, /process\.env\.NODE_OPTIONS = originalNodeOptions/);
+    assert.ok(metrics.indexOf('name.includes("fake-git")') < metrics.indexOf('name.endsWith(".mjs")'));
+    assert.match(reporter, /event\.type === "test:stderr"/);
+    assert.match(reporter, /metrics scope=2/);
+    assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
   });
 
   test("expands documented home-relative paths consistently", () => {

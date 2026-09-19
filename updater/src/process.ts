@@ -43,25 +43,33 @@ export class ProcessRunner {
       let currentFile: string | undefined;
       let fileState: string | undefined;
       let lastFinished: string | undefined;
+      let metrics: string | undefined;
       const unfinishedCases = new Set<string>();
       let timedOut = false;
       let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
-      const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)$/;
-      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)$/;
+      const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)(?: elapsed_ms=(\d{1,9}))?(?: load=(\d+\.\d{3}))?$/;
+      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)(?: elapsed_ms=(\d{1,9}))?$/;
+      const metricsMarker = /^\[dispatcher-test:([a-f0-9]{32})\] metrics scope=2;(node=\d+\/\d+,git=\d+\/\d+,shell=\d+\/\d+,other=\d+\/\d+;active=\d+;overhead_us=\d+)$/;
       const refreshCheckpoint = (): void => {
         if (timeoutCheckpoint) {
           outputCheckpoint = timeoutCheckpoint;
           return;
         }
         const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
-        outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}`;
+        outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}${metrics ? `; ${metrics}` : ""}`;
       };
       const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
         const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
         checkpointBuffer = (lines.pop() ?? "").slice(-256);
         for (const line of lines) {
+          const metricsMatch = metricsMarker.exec(line);
+          if (metricsMatch && metricsMatch[1] === checkpointNonce) {
+            metrics = `metrics=${metricsMatch[2]}`;
+            refreshCheckpoint();
+            continue;
+          }
           const fileMatch = marker.exec(line);
           if (fileMatch) {
             const nonce = fileMatch[1];
@@ -70,7 +78,8 @@ export class ProcessRunner {
             if (!nonce || !action || !identity) continue;
             if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
             if (nonce !== checkpointNonce) continue;
-            fileState = `${action} ${identity}`;
+            if (action === "file-start") metrics = undefined;
+            fileState = `${action} ${identity}${fileMatch[4] ? ` elapsed_ms=${fileMatch[4]}` : ""}${fileMatch[5] ? ` load=${fileMatch[5]}` : ""}`;
             if (action === "file-start") currentFile = identity;
             else {
               if (!lastFinished) lastFinished = fileState;
@@ -89,7 +98,7 @@ export class ProcessRunner {
           if (action === "case-start") unfinishedCases.add(identity);
           else {
             unfinishedCases.delete(identity);
-            lastFinished = `${action} ${identity}`;
+            lastFinished = `${action} ${identity}${testMatch[4] ? ` elapsed_ms=${testMatch[4]}` : ""}`;
           }
           refreshCheckpoint();
         }
@@ -145,7 +154,7 @@ export class ProcessRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         const unfinished = [...unfinishedCases].at(-1) ?? currentFile ?? "none";
-        timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}`;
+        timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}${metrics ? `; ${metrics}` : ""}`;
         outputCheckpoint = timeoutCheckpoint;
         termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
