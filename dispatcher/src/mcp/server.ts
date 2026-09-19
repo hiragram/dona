@@ -106,7 +106,7 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
-    ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.jobs.length >= 100 } : {}),
+    ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.truncated === true || response.jobs.length > 100 } : {}),
   };
 }
 

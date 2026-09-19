@@ -657,9 +657,11 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: this.database.listThreadJobs(workspaceId, channelId, threadTs),
+        jobs: candidates.slice(0,100),
+        truncated: candidates.length > 100,
       });
       return;
     }

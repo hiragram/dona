@@ -595,7 +595,7 @@ export class DispatcherDatabase {
         const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
         if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
         const exactLegacyPayload=existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
-        if(stored===undefined&&!exactLegacyPayload&&(jobKey!==legacyJobKey||binding.owner.kind==="schedule"))
+        if(stored===undefined&&!exactLegacyPayload)
           throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
         if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
         if(binding.owner.kind==="schedule") {

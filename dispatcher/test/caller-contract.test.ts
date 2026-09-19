@@ -240,3 +240,21 @@ test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisi
     assert.equal(f.database.scheduler.get(schedule_id)?.state,"cancelled");
   } finally { await f.close(); }
 });
+
+
+test("実DBからMCPまで99件・100件・101件の候補を正確に区別する", async () => {
+  const f = await fixture();
+  try {
+    const thread = {workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456"};
+    for (let i=0;i<101;i++) {
+      const source=f.database.enqueue(eventEnvelope(`candidate-${i}`)).row;
+      f.database.createJob({source_event_id:source.event_id,objective:"確認",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir);
+      if (i>=98) {
+        const result=await f.call("list_thread_jobs",thread);
+        assert.equal(result.error,undefined);
+        assert.equal(result.data.jobs.length,Math.min(i+1,100));
+        assert.equal(result.data.truncated,i===100);
+      }
+    }
+  } finally { await f.close(); }
+});

@@ -96,7 +96,7 @@ test("refuses schema-v3 planning without an exact stable updater migration capab
   f.database.close();
 });
 
-test("plans an explicitly approved compatibility transition from the installed production contract", async () => {
+test("非互換transitionはrollback不可と提示しtarget異常時に旧runtimeを再起動しない", async () => {
   const f = await fixture();
   const sourceCompatibility: Compatibility = {
     protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2,
@@ -127,6 +127,26 @@ test("plans an explicitly approved compatibility transition from the installed p
   const preflight = result.preflight as Record<string, unknown>;
   assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
   assert.equal(preflight.schema_migration_control_plane_sha, targetSha);
+  f.build.compatibility = targetCompatibility;
+  f.runtime.setHealthCompatibility(currentSha,sourceCompatibility);
+  f.runtime.setHealthCompatibility(targetSha,targetCompatibility);
+  const migrate=f.runtime.migrateAppSchema.bind(f.runtime);
+  f.runtime.migrateAppSchema=async()=>{const result=await migrate();f.runtime.actualAppSchema=3;return result;};
+  f.runtime.wrongSlackOnce = true;
+  const plan=result.plan as {plan_id:string;plan_hash:string};
+  f.controller.apply({source_event_id:approvalEventId,reply_target:replyTarget,plan_id:plan.plan_id,plan_hash:plan.plan_hash,approval_id:"explicit-nonrollback-transition"});
+  f.dispatcher.terminal=true;
+  await f.controller.processNext();
+  const row=f.database.get(result.request_id as string)!;
+  assert.equal(row.rollback_compatible,0);
+  assert.equal(row.state,"needs_review");
+  assert.equal(row.last_error_code,"rollback_not_safe_or_circuit_open");
+  assert.equal(f.runtime.calls.filter(call=>call==="migrateAppSchema").length,1);
+  assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`),false);
+  assert.equal((await f.store.observe()).current_sha,targetSha);
+  const calls=[...f.runtime.calls];
+  await f.controller.processNext();
+  assert.deepEqual(f.runtime.calls,calls);
   f.database.close();
 });
 

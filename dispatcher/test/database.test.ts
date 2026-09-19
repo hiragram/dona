@@ -364,7 +364,7 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
-  test("keeps migrated v2 jobs reusable without inventing an immutable payload fingerprint", async () => {
+  test("移行したv2 jobのpayloadを推測せず不一致reuseを拒否する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -378,13 +378,15 @@ describe("DispatcherDatabase", () => {
       database.reconcileEventJob("evt-source-queued", "legacy-default", "0".repeat(64)),
       "unverified_legacy",
     );
-    const reused = database.createJob({
-      source_event_id: "evt-source-queued",
-      objective: "objective-queued",
-      workspace: { kind: "scratch" },
-    }, config.jobsWorkspaceRoot, config.jobResultsDir);
-    assert.equal(reused.outcome, "reused");
-    assert.equal(reused.row.job_id, "job-queued");
+    const before = database.getJob("job-queued");
+    for (const workspace of [{kind:"scratch" as const},{kind:"github" as const,repository:"owner/repo"}]) {
+      assert.throws(() => database.createJob({
+        source_event_id: "evt-source-queued", objective: "objective-queued", workspace,
+      }, config.jobsWorkspaceRoot, config.jobResultsDir),
+      error => error instanceof JobCreationError && error.code === "job_idempotency_conflict");
+    }
+    assert.deepEqual(database.getJob("job-queued"),before);
+    assert.equal(database.reconcileEventJob("evt-source-queued","legacy-default","0".repeat(64)),"unverified_legacy");
     database.close();
   });
 
