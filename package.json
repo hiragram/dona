@@ -13,6 +13,7 @@
     "test:skills": "node --test test/*.test.mjs .agents/skills/github-issue-decomposition/tests/*.test.mjs",
     "typecheck": "npm --prefix dispatcher run typecheck && npm --prefix sources/slack run typecheck && npm --prefix updater run typecheck",
     "build": "npm --prefix dispatcher run build && npm --prefix sources/slack run build && npm --prefix updater run build",
-    "verify": "npm test && npm run typecheck && npm run build"
+    "verify": "npm test && npm run typecheck && npm run build",
+    "verify:web": "npm --prefix sources/web test && npm --prefix sources/web run typecheck && npm --prefix sources/web run build"
   }
 }
