@@ -35,6 +35,7 @@ describe("job resource config", () => {
     });
     assert.match(String(omittedArgs.stdout), /^ONLY_WITH_OMITTED_ARGS=yes$/m);
     assert.doesNotMatch(String(omittedArgs.stdout), /^HOME=/m);
+    assert.doesNotMatch(String(omittedArgs.stdout), /^DONA_/m);
     const child = spawn("/usr/bin/env", { env: { ONLY_FOR_CHILD: "yes" }, stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
@@ -45,6 +46,7 @@ describe("job resource config", () => {
     });
     assert.match(output, /^ONLY_FOR_CHILD=yes$/m);
     assert.doesNotMatch(output, /^HOME=/m);
+    assert.doesNotMatch(output, /^DONA_/m);
 
     const promise = promisify(execFile)(process.execPath, ["-e", ""]);
     assert.ok("child" in promise);
@@ -72,6 +74,7 @@ describe("job resource config", () => {
     assert.match(runner, /test-reporter-destination=stderr/);
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
     assert.match(reporter, /event\.type === "test:dequeue"/);
+    assert.match(reporter, /terminalOccurrences/);
     assert.match(reporter, /event\.data\.details\?\.type === "suite"/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
     assert.match(reporter, /"case-finish"/);
@@ -86,6 +89,7 @@ describe("job resource config", () => {
     assert.match(runner, /--require=\$\{JSON\.stringify\(processMetrics\)\}/);
     assert.match(runner, /DONA_ORIGINAL_NODE_OPTIONS: process\.env\.NODE_OPTIONS/);
     assert.match(metrics, /process\.env\.NODE_OPTIONS = originalNodeOptions/);
+    assert.match(metrics, /if \(scope >= 2\) return options/);
     assert.ok(metrics.indexOf('name.includes("fake-git")') < metrics.indexOf('name.endsWith(".mjs")'));
     assert.match(reporter, /event\.type === "test:stderr"/);
     assert.match(reporter, /metrics scope=2/);
@@ -148,6 +152,63 @@ describe("job resource config", () => {
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
     assert.match(stderr, caseStartPattern);
+  });
+
+  test("同名並列testのterminalを開始順occurrenceへ対応付ける", async () => {
+    const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-occurrence-`);
+    const fixture = `${temporaryDirectory}/parallel.test.mjs`;
+    fs.writeFileSync(fixture, [
+      'import { describe, test } from "node:test";',
+      'describe("parallel", { concurrency: true }, () => {',
+      '  test("duplicate", async () => new Promise((resolve) => setTimeout(resolve, 50)));',
+      '  test("duplicate", async () => new Promise(() => {}));',
+      '});',
+    ].join("\n"));
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const reporter = fileURLToPath(new URL("./checkpoint-reporter.mjs", import.meta.url));
+    const childEnvironment = { ...process.env };
+    for (const name of Object.keys(childEnvironment)) {
+      if (name.startsWith("NODE_TEST_")) delete childEnvironment[name];
+    }
+    delete childEnvironment.NODE_OPTIONS;
+    delete childEnvironment.DONA_PROCESS_METRICS_NONCE;
+    delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
+    childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/parallel.test.ts";
+    childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    let stderr = "";
+    const child = spawn(process.execPath, [
+      "--test",
+      "--test-concurrency=1",
+      `--test-reporter=${reporter}`,
+      "--test-reporter-destination=stderr",
+      fixture,
+    ], { env: childEnvironment, stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const digest = "e24a5a32c9b8";
+    const completedFirst = new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#1`);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("first terminal marker was not emitted")), 2_000);
+        child.stderr.on("data", () => {
+          if (!completedFirst.test(stderr)) return;
+          clearTimeout(timeout);
+          resolve();
+        });
+        child.once("error", reject);
+      });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        child.kill("SIGKILL");
+        await closed;
+      }
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+    assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#1`));
+    assert.match(stderr, new RegExp(`case-start test/parallel\\.test\\.ts:${digest}#2`));
+    assert.match(stderr, completedFirst);
+    assert.doesNotMatch(stderr, new RegExp(`case-finish test/parallel\\.test\\.ts:${digest}#2`));
   });
 
   test("expands documented home-relative paths consistently", () => {

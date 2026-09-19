@@ -43,6 +43,7 @@ function classify(file) {
 }
 
 function withNonce(options) {
+  if (scope >= 2) return options;
   if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
     return options;
   }
