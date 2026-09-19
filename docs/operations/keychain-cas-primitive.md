@@ -1,0 +1,17 @@
+# 内部Keychain CAS library
+
+`DonaKeychainCasProcessRequest`は、事前にprovisionされた単一head itemを読み取り、条件付きで更新するmacOS内部libraryである。`main`、汎用CLI、公開IPC endpoint、Nodeからのspawn wrapperは持たない。library自体に権限を与えて別processへ貸し出す設計にしない。Data Protection Keychainへのaccessはhost processのmain executableのentitlementに依存することを、[Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)で確認している。
+
+将来の専用native brokerは、OSが認証したcaller identity、現在のpolicyとscope、必要なoperator authorizationを検証してから呼び出す必要がある。外部requestのraw JSONをこのfunctionへそのまま転送しない。`access_group`やinstance/purposeの文字列は検索対象を指定する値であり、operator本人性や操作許可の証拠ではない。[Keychain access group](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)への所属はOSに検証させ、libraryに必要なentitlementを持たないhostへのfallbackを作らない。
+
+wireはcanonical JSON、用途はaudit anchor・clock mark・binding generation・policy generationの固定集合とする。instanceごとの固定service、専用access group、Data Protection Keychain、ThisDeviceOnly、同期対象外のitemを要求する。`LAContext.interactionNotAllowed`を設定し、[認証context](https://developer.apple.com/documentation/security/ksecuseauthenticationcontext)経由でユーザー対話を禁止する。初期provision、itemの自動再作成、Keychainの選択変更、legacy file Keychainへのfallbackは行わない。
+
+readは最大2件だけを取得し、0件、複数件、型やservice/group/protection/synchronizable属性の不一致を拒否する。CASはcurrent valueとexpected bytesを比較し、accountの単調revisionを検索条件に、次revisionとvalueを一度だけ同時更新する。最大revisionで停止し、更新後readbackがproposedと一致しなければ成功を返さない。既知の事前不一致と、OSの失敗・応答不明を区別し、後者を自動再試行しない。
+
+このCAS方式の根拠は、[Apple公開sourceの固定commit](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/keychain/securityd/SecItemDb.c)で、属性検索と更新が排他的transaction内にあることである。これは公開実装からの推論であり、対象OSにおけるlive concurrencyや障害復旧を検証したことにはならない。readの2件上限はSDKの`kSecMatchLimit`が定義するCFNumberの最大件数を使用する。
+
+入力は32 KiB、valueは8192 byte、出力は16 KiB以内。未知・重複field、非canonicalなJSON/base64、数値型やscopeの不正をOS呼出前に拒否する。errorには内容、OSの詳細error、credentialやpathを含めない。libraryの同期OS呼出にtimeoutやprocess隔離を与える責務は将来のbrokerにあり、raw library callだけでboundedなruntime動作を保証しない。
+
+buildはmacOSだけでdylibを生成し、source/header/binaryのhashとplatform/archをmanifestへ保存する。通常fileとして公開され、owner executeは付与しない。Linux向けnative providerはまだなく、別storeを同等の保護と称して代用しない。fixture用mainはtest directoryに置き、SecItem関数をmockへ置換したbinaryにだけlinkする。testは実SecItem関数の未解決symbolがないことも検査し、実Keychainの登録・読取・更新を行わない。
+
+head CASだけでは過去transaction IDの一回性を証明できない。既存`ClockMarkStore`と`AuditAnchorStore`へ接続するには、DB rollback後も検証できるused-ID ledgerとrecovery contractが必要である。このlibraryをそれらの完成実装と扱わない。署名済みbroker、caller認証、二者operator proof/provision、retained-key lifecycle、実provider検証、runtime/readinessへの接続は未完了であり、#16全体の完了条件は残る。
