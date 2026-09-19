@@ -1,0 +1,41 @@
+# 保護headと使用済みIDの接続
+
+`ProtectedClockMarks`と`ProtectedAuditAnchors`は、既存のclock/audit repository契約を、domain stateと使用済みtransaction IDのrootを含む単一CASへ接続する。補助nodeは専用SQLite DBに永続化する。保護領域への認証付きOS brokerは別途必要であり、このmoduleは通常DBやmemoryを保護headの代替にするproviderを提供しない。
+
+## 更新の順序
+
+保護headはcodec version、用途、instance・ledger・purposeのscope、used root、最後に予約したID、domain stateを含むcanonical JSONで、最大8 KiBとする。portのrevisionは1以上のsafe integerで、CASではexpected revisionと全bytesを比較する。上限到達時は更新しない。
+
+clockの現在IDだけでなくauditの初期IDも、事前に永続化したused treeへ含める。readは最後の予約IDのmembershipを毎回検証する。missing head、empty root、異なるscope、非canonical wire、補助DBの欠落を新規初期化の理由にしない。`encodeProtectedHead`はcodecであり、初期化の権限や成功を与えない。
+
+予約は次の順序で行う。
+
+1. 現在の保護headとused treeを読み、呼出元のexpected stateと全fieldを照合する。
+2. 新しいIDの未使用を検証し、最大257 nodeのinsert planを作る。
+3. 専用SQLite DBへ全nodeをimmutableにcommit・read-backし、新しいrootでmembershipを確認する。
+4. 保護headを再読して途中の変更を拒否する。
+5. domain stateとused rootを一つのCASで更新し、revisionの増加、全bytes、保護headとmembershipの再読を確認する。
+
+補助nodeのstage、CAS、read-backのいずれかが失敗または不明なら停止し、自動再試行しない。CAS前に残ったorphan nodeは予約の証拠ではない。CAS後の応答喪失は予約が進んだ可能性を持つため、使用済みIDやrootを戻さない。
+
+## domainの制約
+
+clockはprevious IDの一致、IDの一回性、同一boot、continuous timeの単調増加、UTCの進行がcontinuous経過以上であることを検証する。OS時刻の認証とdrift制約は既存の`ProtectedClockSource`、`advanceClockMark`、`reserveClockMark`を通す責務であり、任意の時刻値をこのadapterだけで認証できるわけではない。reboot時の自動再初期化は提供しない。
+
+audit reserveはpendingのない現在anchorに対し、同一chainでsequenceを1進めるappend、またはsequenceと最終MACを維持してcheckpoint MACを変えるretentionだけを受け付ける。どちらも新しい予約IDを消費する。finalizeは全fieldが一致するpending anchorだけを対象とし、pendingを消す以外のstate、used root、最後の予約IDを維持する。DB commitとanchor finalizeの接続・障害時の停止は既存の`AuditRepository`とapproval transactionが行う。
+
+## 専用補助DB
+
+`SqliteUsedTransactionNodes`は既存のowner-only DB、native file identity、WALとFULL/EXTRAのdurabilityを要求する。constructorはfileやschemaを作らない。`installUsedTransactionNodeSchema`も明示的な空DBのmigrationだけを行い、保護headを初期化しない。
+
+schemaはversion row、node table、UPDATE/DELETE拒否triggerの固定DDLを検証する。nodeはdigestとcanonical base64だけを保存し、長さ・header・位置prefix・SHA-256を検証する。stageはwriter lockと単一transaction内で全件を照合する。同一bytesの再stageは許すが、異なるbytesの置換をしない。不正な長さの保存値はSQLでNULLへ変換してからJS側で拒否する。
+
+専用接続にはTEMP objectを許可しない。constructorだけでなくmigration・read・stage時にも検査し、table/viewによるshadowやTEMP triggerを拒否する。永続tableの参照とDMLは`main.`で修飾し、接続終了時に失われるnodeを根拠に保護headを更新しない。
+
+rootのauthorityはDB外の保護headだけに置く。補助DBを古いsnapshotへ戻したときは必要nodeの欠落で停止する。nodeの削除、GC、backup/recovery、ledger世代の交換は実装しない。1予約あたり最大257 nodeの追加があり、本番容量・性能の検証は別途必要となる。
+
+## 検証と残る接続
+
+実SQLiteを用いてimmutable stage、再open、過去IDと初期IDの再使用拒否、retention、stale state、CAS受理前後・応答・read-backの障害、補助DB巻戻しを検証する。既存のWeb repositoryとaudit transactionを接続するfixtureでは、anchor reserve応答喪失時に業務DBをcommitせず、pendingが後続処理を停止することを確認する。保護headのportは明示的なfault fixtureであり、OSのrollback耐性を証明するものではない。
+
+認証付きnative broker、Keychain接続、operator provisioning、recovery、実Keychain・productionでの検証は残る。#16のpublic repositoryや鍵lifecycleなどの残要件も、この部分実装では完了扱いにしない。

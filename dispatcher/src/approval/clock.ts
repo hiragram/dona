@@ -25,6 +25,9 @@ export class ApprovalClockError extends Error {
 function guard<T>(operation: () => T): T {
   try { return operation(); } catch { throw new ApprovalClockError(); }
 }
+/** Canonical domain validation only; the provider must separately authenticate
+ * the observation, protected head, and one-shot transaction reservation. */
+export function parseClockMark(input: unknown): ClockMark { return guard(() => markSchema.parse(input)); }
 function equal(a: ClockMark, b: ClockMark): boolean {
   return (Object.keys(a) as Array<keyof ClockMark>).every((key) => a[key] === b[key]);
 }
