@@ -103,13 +103,18 @@ test("reserve失敗・受理不明ではdecisionとauditをwriteせずblind retr
 test("audit insertとdecision mutationの失敗は両方rollbackしreservationを残す", (t) => {
   for (const failAudit of [false, true]) {
     const { db, store, repository } = setup(t);
-    if (failAudit) db.exec("CREATE TRIGGER fail_audit BEFORE INSERT ON security_audit_records BEGIN SELECT RAISE(ABORT, 'injected'); END");
+    const prepare = db.prepare.bind(db); let failures = 0;
+    if (failAudit) t.mock.method(db, "prepare", ((sql: string) => {
+      if (sql.startsWith("INSERT INTO security_audit_records")) { failures++; throw new Error("injected SQL prepare failure"); }
+      return prepare(sql);
+    }) as typeof db.prepare);
     assert.throws(() => repository.append("tx_1", 1, event, () => {
       db.exec("INSERT INTO decisions VALUES ('request_1','approved')");
       throw new Error("private mutation error");
     }), AuditIntegrityError);
     assert.equal(count(db, "decisions"), 0); assert.equal(count(db, "security_audit_records"), 0);
     assert.equal(store.value.pending_transaction_id, "tx_1"); assert.deepEqual(store.calls, ["reserve"]);
+    assert.equal(failures, failAudit ? 1 : 0);
     assert.throws(() => repository.verify(), AuditIntegrityError);
   }
 });
@@ -238,11 +243,15 @@ test("checkpoint確定後の削除失敗は検証可能なprefixを残し、明�
   const { db, store, repository } = setup(t);
   repository.append("tx_1", 1, event, () => {});
   const retention = retentionRepository(db, store);
-  db.exec("CREATE TRIGGER fail_delete BEFORE DELETE ON security_audit_records BEGIN SELECT RAISE(ABORT, 'injected'); END");
+  const prepare = db.prepare.bind(db); let failures = 0;
+  const injected = t.mock.method(db, "prepare", ((sql: string) => {
+    if (sql.startsWith("DELETE FROM security_audit_records")) { failures++; throw new Error("injected SQL prepare failure"); }
+    return prepare(sql);
+  }) as typeof db.prepare);
   assert.throws(() => retention.retain("retention_1", 2, 1, "2027-11-01T00:00:00.000Z"), AuditIntegrityError);
   assert.equal(store.value.pending_transaction_id, null);
   assert.equal(count(db, "security_audit_records"), 1); assert.equal(retention.verify().sequence, 1);
-  db.exec("DROP TRIGGER fail_delete");
+  assert.equal(failures, 1); injected.mock.restore();
   retention.pruneRetainedPrefix();
   assert.equal(count(db, "security_audit_records"), 0);
   assert.deepEqual(store.calls, ["reserve", "finalize", "reserve", "finalize"]);
@@ -274,4 +283,36 @@ test("finalize直後の別connection appendを直列化し、確定済み業務�
     other.append("tx_after", 1, event, () => {});
     assert.equal(repository.verify().sequence, 2);
   } finally { otherDb.close(); }
+});
+
+test("mutationが監査schemaを変更したら業務SQLとDDLをrollbackしanchorをfinalizeしない", t => {
+  for (const sql of [
+    "DROP TRIGGER security_audit_no_update",
+    "CREATE INDEX security_audit_extra ON decisions(id)",
+    "CREATE TEMP TRIGGER injected AFTER INSERT ON security_audit_records BEGIN SELECT 1; END",
+  ]) {
+    const { db, repository, store } = setup(t);
+    assert.throws(() => repository.append("shape_tx", 1, event, () => {
+      db.exec("INSERT INTO decisions VALUES ('request_1','approved')"); db.exec(sql);
+    }), AuditIntegrityError);
+    assert.equal(count(db, "decisions"), 0); assert.equal(count(db, "security_audit_records"), 0);
+    assert.deepEqual(store.calls, ["reserve"]); assert.equal(store.value.pending_transaction_id, "shape_tx");
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='security_audit_no_update'").get());
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_temp_master WHERE name='injected'").get(), undefined);
+  }
+});
+
+test("監査schemaの欠落・未知object・TEMP shadowをverifyとinstallerで拒否する", t => {
+  for (const sql of [
+    "DROP TRIGGER security_audit_no_update",
+    "CREATE INDEX security_audit_extra ON decisions(id)",
+    "CREATE TEMP TRIGGER injected AFTER INSERT ON security_audit_records BEGIN SELECT 1; END",
+    "CREATE TEMP TABLE security_audit_schema(version INTEGER); INSERT INTO temp.security_audit_schema VALUES (1)",
+  ]) {
+    const { db, repository, store } = setup(t); db.exec(sql);
+    assert.throws(() => repository.verify(), AuditIntegrityError);
+    assert.throws(() => installAuditSchema(db), AuditIntegrityError);
+    assert.throws(() => repository.append("shape_tx", 1, event, () => {}), AuditIntegrityError);
+    assert.deepEqual(store.calls, []);
+  }
 });

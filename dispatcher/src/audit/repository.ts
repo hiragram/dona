@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditCheckpoint, verifyAuditChain,
@@ -28,24 +28,7 @@ function requireEqual(left: AuditAnchor, right: AuditAnchor): void {
   if (!equal(auditAnchorSchema.parse(left), auditAnchorSchema.parse(right))) throw new AuditIntegrityError();
 }
 
-/** Opt-in schema only; callers must introduce Dispatcher compatibility/migration
- * and protected-store provisioning before connecting this to the runtime. */
-export function installAuditSchema(db: Database.Database): void {
-  guard(() => {
-    if (db.inTransaction) throw new AuditIntegrityError();
-    db.transaction(() => {
-      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='security_audit_schema'").get();
-      if (exists) {
-        const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
-        if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
-        // Never repair a partly missing schema into an apparently new chain.
-        db.prepare("SELECT sequence, transaction_id, record_json FROM security_audit_records LIMIT 0").all();
-        db.prepare("SELECT singleton, transaction_id, checkpoint_json FROM security_audit_checkpoint LIMIT 0").all();
-        return;
-      }
-      const remnants = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('security_audit_records','security_audit_checkpoint')").all();
-      if (remnants.length) throw new AuditIntegrityError();
-      db.exec(`
+const schemaSql = `
         CREATE TABLE security_audit_schema (version INTEGER PRIMARY KEY CHECK (version = 1));
         INSERT INTO security_audit_schema VALUES (1);
         CREATE TABLE security_audit_checkpoint (
@@ -60,7 +43,33 @@ export function installAuditSchema(db: Database.Database): void {
         );
         CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records
           BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END;
-      `);
+`;
+const shapeQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_' ORDER BY type,name";
+function shape(db: Database.Database): string { return JSON.stringify(db.prepare(shapeQuery).all()); }
+let expectedShape: string | undefined;
+export function verifyAuditSchema(db: Database.Database): void {
+  guard(() => {
+    if (expectedShape === undefined) {
+      const expected = new Database(":memory:");
+      try { expected.exec(schemaSql); expectedShape = shape(expected); } finally { expected.close(); }
+    }
+    if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+    const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
+    if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
+  });
+}
+
+/** Opt-in schema only; callers must introduce Dispatcher compatibility/migration
+ * and protected-store provisioning before connecting this to the runtime. */
+export function installAuditSchema(db: Database.Database): void {
+  guard(() => {
+    if (db.inTransaction) throw new AuditIntegrityError();
+    db.transaction(() => {
+      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='security_audit_schema'").get();
+      if (exists) { verifyAuditSchema(db); return; }
+      if (db.prepare(shapeQuery).get() || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+      db.exec(schemaSql);
+      verifyAuditSchema(db);
     }).immediate();
   });
 }
@@ -81,10 +90,7 @@ export class AuditRepository {
       yield record;
     }
   }
-  private assertSchema(): void {
-    const versions = this.db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
-    if (versions.length !== 1 || versions[0]?.version !== schemaVersion) throw new AuditIntegrityError();
-  }
+  private assertSchema(): void { verifyAuditSchema(this.db); }
   private verifyInside(): AuditAnchor {
     this.assertSchema();
     const before = auditAnchorSchema.parse(this.store.read());
@@ -150,6 +156,7 @@ export class AuditRepository {
         assertSynchronousResult(result);
         // A callback may not modify the audit rows/checkpoint or transaction state.
         if (!this.db.inTransaction) throw new AuditIntegrityError();
+        this.assertSchema();
         const expected = { ...proposed, pending_transaction_id: null };
         verifyAuditChain(this.checkpoint(), this.records(), expected, this.keys);
         requireEqual(reservation, this.store.read());

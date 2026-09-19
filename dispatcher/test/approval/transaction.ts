@@ -778,3 +778,22 @@ test("mutex pathのhardlinkへ初期化SQLを書かない", (t) => {
   assert.equal(fs.statSync(victim).size, 0); assert.equal(fs.statSync(lock).nlink, 2);
   assert.equal(marks.calls, 0); assert.equal(anchors.value.pending_transaction_id, null);
 });
+
+test("callable Proxyとtag getterをcallback検査で実行しない", async (t) => {
+  for (const kind of ["lock", "audit", "approval"] as const) {
+    for (const disguise of ["proxy", "getter", "prototype_proxy"] as const) {
+      const { db, transaction, audit, marks, anchors } = setup(t); let effects = 0;
+      const asynchronous = async () => { effects++; await Promise.resolve(); effects++; };
+      const callback = disguise === "proxy" ? new Proxy(asynchronous, { get() { effects++; return "Function"; }, apply() { effects++; return asynchronous(); } })
+        : () => { effects++; };
+      if (disguise === "getter") Object.defineProperty(callback, Symbol.toStringTag, { get() { effects++; return "Function"; } });
+      if (disguise === "prototype_proxy") Object.setPrototypeOf(callback, new Proxy(Function.prototype, { get() { effects++; return "Function"; } }));
+      assert.throws(() => kind === "lock" ? withSecurityTransactionLock(db, callback as never)
+        : kind === "audit" ? audit.append("proxy_tx", 1, { ...event, occurred_at: "2026-09-19T00:00:01.000Z" }, callback as never)
+          : transaction.run("proxy_tx", event, callback as never));
+      await Promise.resolve();
+      assert.equal(effects, 0); assert.equal(marks.calls, 0); assert.equal(anchors.value.pending_transaction_id, null);
+      assert.equal(count(db, "security_audit_records"), 0);
+    }
+  }
+});

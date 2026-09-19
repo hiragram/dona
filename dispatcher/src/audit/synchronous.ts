@@ -15,9 +15,20 @@ export type SynchronousCallback<F extends (...args: never[]) => unknown> = F &
 /** Defense for untyped callers; this is not a sandbox for arbitrary JavaScript.
  * Ordinary functions must still never schedule deferred or external work. */
 export function assertSynchronousCallback(value: unknown): void {
-  if (typeof value !== "function" || types.isAsyncFunction(value) || types.isGeneratorFunction(value)
-    || ["[object AsyncFunction]", "[object GeneratorFunction]", "[object AsyncGeneratorFunction]"].includes(Object.prototype.toString.call(value))) {
+  if (typeof value !== "function" || types.isProxy(value) || types.isAsyncFunction(value) || types.isGeneratorFunction(value)) {
     throw new Error("synchronous_callback_required");
+  }
+  // Inspect descriptors rather than reading Symbol.toStringTag: even a normal
+  // function can have a getter, or a Proxy in its prototype chain.
+  let current: object | null = value;
+  let depth = 0;
+  while (current !== null) {
+    if (++depth > 16 || types.isProxy(current)) throw new Error("synchronous_callback_required");
+    const tag = Object.getOwnPropertyDescriptor(current, Symbol.toStringTag);
+    if (tag && (!("value" in tag) || ["AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"].includes(tag.value))) {
+      throw new Error("synchronous_callback_required");
+    }
+    current = Object.getPrototypeOf(current);
   }
 }
 

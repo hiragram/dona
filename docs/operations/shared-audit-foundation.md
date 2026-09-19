@@ -30,3 +30,5 @@ retentionは保護clockの有効時刻で400日境界を検査し、checkpoint�
 - clock、binding/policy generation、payloadのrestore整合性は専用の保護contractで検証する。audit codecだけでそれらのcontinuityを保証したとみなさない。
 
 #141のWeb認証と#145のapproval接続は、この共有基盤の完成と対応するruntime gateを必要とする。unit fixtureは実IdP、WebAuthn、browser、credential store、productionの実証とは区別する。
+
+監査schemaはversion行だけでなく、table/index/triggerの正規形と関連するTEMP objectも確認する。installerは既存の欠落・未知objectを修復せず、read/append/retentionと業務mutation後にも照合する。DDL自体はversion 1の定義を維持する。
