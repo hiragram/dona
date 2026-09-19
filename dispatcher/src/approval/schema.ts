@@ -194,10 +194,16 @@ const schemaSql = `
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
 }
+let expectedShape: string | undefined;
+/** Hot-path schema and connection checks only. Row-level foreign keys are
+ * enforced by SQLite statements/commit, not a repeated historical row scan. */
 export function verifyApprovalSchema(db: Database.Database): void {
-  const expected = new Database(":memory:");
   try {
-    expected.exec(schemaSql);
+    if (expectedShape === undefined) {
+      const expected = new Database(":memory:");
+      try { expected.exec(schemaSql); expectedShape = shape(expected); }
+      finally { expected.close(); }
+    }
     if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1
       || db.pragma("ignore_check_constraints", { simple: true }) !== 0
       || db.pragma("encoding", { simple: true }) !== "UTF-8") throw new ApprovalSchemaError();
@@ -206,12 +212,24 @@ export function verifyApprovalSchema(db: Database.Database): void {
       || row.sql !== "CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records\n          BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END")) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) throw new ApprovalSchemaError();
-    if (shape(expected) !== shape(db)) throw new ApprovalSchemaError();
+    if (expectedShape !== shape(db)) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== 1) throw new ApprovalSchemaError();
-    if ((db.pragma("foreign_key_check") as unknown[]).length) throw new ApprovalSchemaError();
   } catch { throw new ApprovalSchemaError(); }
-  finally { expected.close(); }
+}
+
+function verifyIntegrityInside(db: Database.Database): void {
+  verifyApprovalSchema(db);
+  if (db.prepare("PRAGMA main.foreign_key_check").get()) throw new ApprovalSchemaError();
+}
+
+/** Full historical foreign-key inspection for connection admission and offline
+ * restore/reconcile. It does not authenticate business rows or repair anything. */
+export function verifyApprovalIntegrity(db: Database.Database): void {
+  try {
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    db.transaction(() => verifyIntegrityInside(db))();
+  } catch { throw new ApprovalSchemaError(); }
 }
 
 /** Opt-in durable metadata only. Runtime migration, authenticated broker and the
@@ -226,12 +244,12 @@ export function installApprovalSchema(db: Database.Database): void {
     db.transaction(() => {
       const prior = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_schema'").get();
       if (prior) {
-        verifyApprovalSchema(db);
+        verifyIntegrityInside(db);
         return;
       }
       if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) throw new ApprovalSchemaError();
       db.exec(schemaSql);
-      verifyApprovalSchema(db);
+      verifyIntegrityInside(db);
     }).immediate();
   } catch { throw new ApprovalSchemaError(); }
 }

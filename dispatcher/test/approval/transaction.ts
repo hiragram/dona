@@ -198,6 +198,30 @@ function count(db: Database.Database, table: string) {
   return (db.prepare(`SELECT count(*) n FROM ${table}`).get() as { n: number })
     .n;
 }
+test("transaction接続のadmissionで既存FK破損をclock予約前に拒否する", t => {
+  const {db,anchors,marks}=setup(t);
+  db.pragma("foreign_keys=OFF");
+  db.exec("INSERT INTO approval_event_outbox VALUES ('orphan','missing','dona_approval.decision.v1','pending',NULL)");
+  db.pragma("foreign_keys=ON");
+  assert.throws(()=>new ApprovalTransaction(db,{
+    clock:{observe:()=>{throw new Error("must not read clock");}},clockMarks:marks,auditAnchors:anchors,
+    auditKeys:keys,auditSigningKeyVersion:1,maximumClockDriftMs:1000,
+  }),ApprovalTransactionError);
+  assert.equal(marks.calls,0);assert.deepEqual(anchors.calls,[]);
+});
+test("通常transactionのdeferred FK違反はcommitで全体をrollbackしfinalizeしない", t => {
+  const {db,transaction,anchors}=setup(t);let callbackCompleted=false;
+  assert.throws(()=>transaction.run("missing_attempt",event,mark=>{
+    insertRequest(db,mark.transaction_id);
+    db.prepare("INSERT INTO approval_decisions VALUES ('d1','r1','i1','w1',?,'b1',1,'approve','supervisor','actor1',1,?,?)").run("a".repeat(64),at,mark.transaction_id);
+    db.prepare("INSERT INTO approval_consumes VALUES ('c1','r1','d1','approve','a1',?,?)").run(at,mark.transaction_id);
+    callbackCompleted=true;return "not released";
+  }),ApprovalTransactionError);
+  assert.equal(callbackCompleted,true);
+  for(const table of ["approval_requests","approval_decisions","approval_consumes","approval_clock_reservations","security_audit_records"])
+    assert.equal(count(db,table),0);
+  assert.deepEqual(anchors.calls,["reserve"]);assert.equal(anchors.value.pending_transaction_id,"missing_attempt");
+});
 test("callbackはprepare済みSQLでも時計予約を捏造できずguardを解除できない", t => {
   const {db,transaction,anchors}=setup(t);
   const forged=db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)");

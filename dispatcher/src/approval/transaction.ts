@@ -5,7 +5,7 @@ import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
 import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
 import { assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
-import { verifyApprovalSchema } from "./schema.js";
+import { verifyApprovalSchema, verifyApprovalIntegrity } from "./schema.js";
 import { applyClockBoundMutation } from "./clock-provenance.js";
 
 export interface ApprovalTransactionProviders {
@@ -33,6 +33,7 @@ export class ApprovalTransactionBusyError extends Error {
 export class ApprovalTransaction {
   private readonly audit: AuditRepository;
   constructor(private readonly db: Database.Database, private readonly providers: ApprovalTransactionProviders) {
+    try { verifyApprovalIntegrity(db); } catch { throw new ApprovalTransactionError(); }
     this.audit = new AuditRepository(db, providers.auditAnchors, providers.auditKeys);
   }
   run<F extends (mark: Readonly<ClockMark>) => unknown>(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: SynchronousCallback<F>): ReturnType<F>;

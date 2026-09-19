@@ -12,8 +12,20 @@ import { DispatcherDatabase } from "../../src/database.js";
 import {
   installApprovalSchema,
   verifyApprovalSchema,
+  verifyApprovalIntegrity,
   ApprovalSchemaError,
 } from "../../src/approval/schema.js";
+
+test("起動とoffline整合性検査は既存の外部キー破損を修復せず拒否する", t => {
+  const {db}=setup(t);
+  db.pragma("foreign_keys=OFF");
+  db.exec("INSERT INTO approval_event_outbox VALUES ('orphan','missing','dona_approval.decision.v1','pending',NULL)");
+  db.pragma("foreign_keys=ON");
+  verifyApprovalSchema(db);
+  assert.throws(()=>verifyApprovalIntegrity(db),ApprovalSchemaError);
+  assert.throws(()=>installApprovalSchema(db),ApprovalSchemaError);
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM approval_event_outbox").get(),{n:1});
+});
 
 test("terminal requestを古いwriterが再承認・再消費可能状態へ戻せない", t => {
   const {db}=setup(t);
