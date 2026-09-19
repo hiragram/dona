@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +32,7 @@ import {
 } from "./fixtures/transaction-store.js";
 import {
   withSecurityTransactionLock,
+  openSecurityDatabase,
   SecurityCoordinationError,
 } from "../../src/audit/coordination.js";
 
@@ -134,10 +136,12 @@ const event: Omit<AuditEvent, "occurred_at"> = {
   authz_revision: 1,
 };
 function setup(t: { after(fn: () => void): void }) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-transaction-"));
+  const dir = fs.mkdtempSync(
+    path.join(fs.realpathSync(os.homedir()), ".dona-approval-transaction-"),
+  );
   const filename = path.join(dir, "fixture.sqlite");
-  const db = new Database(filename);
-  fs.chmodSync(filename, 0o600);
+  fs.writeFileSync(filename, "", { mode: 0o600, flag: "wx" });
+  const db = openSecurityDatabase(filename);
   db.pragma("journal_mode=WAL");
   db.pragma("foreign_keys=ON");
   db.pragma("synchronous=FULL");
@@ -315,11 +319,13 @@ test(
   "独立workerの並行runをclock予約前からaudit finalizeまで直列化する",
   { timeout: 5000 },
   async (t) => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "approval-race-"));
+    const directory = fs.mkdtempSync(
+      path.join(fs.realpathSync(os.homedir()), ".dona-approval-race-"),
+    );
     const filename = path.join(directory, "dispatcher.sqlite");
     const storeFile = path.join(directory, "fixture-store.sqlite");
-    const db = new Database(filename);
-    fs.chmodSync(filename, 0o600);
+    fs.writeFileSync(filename, "", { mode: 0o600, flag: "wx" });
+    const db = openSecurityDatabase(filename);
     db.pragma("journal_mode=WAL");
     db.pragma("foreign_keys=ON");
     installAuditSchema(db);
@@ -490,3 +496,88 @@ test(
     assert.equal(count(db, "approval_requests"), 1);
   },
 );
+
+test("DB接続前にsymlinkと不正ancestorを拒否し、接続後のinode差替えも検出する", (t) => {
+  const { db, filename } = setup(t);
+  const dir = path.dirname(filename);
+  const fileLink = filename + ".symlink";
+  fs.symlinkSync(filename, fileLink);
+  assert.throws(
+    () => openSecurityDatabase(fileLink),
+    SecurityCoordinationError,
+  );
+  const linked = new Database(fileLink);
+  try {
+    const other = setup(t);
+    fs.unlinkSync(fileLink);
+    fs.symlinkSync(other.filename, fileLink);
+    assert.throws(
+      () => withSecurityTransactionLock(linked, () => null),
+      SecurityCoordinationError,
+    );
+  } finally {
+    linked.close();
+    fs.unlinkSync(fileLink);
+  }
+  const directoryLink = dir + ".symlink";
+  fs.symlinkSync(dir, directoryLink);
+  try {
+    assert.throws(
+      () =>
+        openSecurityDatabase(path.join(directoryLink, path.basename(filename))),
+      SecurityCoordinationError,
+    );
+  } finally {
+    fs.unlinkSync(directoryLink);
+  }
+  fs.chmodSync(dir, 0o777);
+  try {
+    assert.throws(
+      () => openSecurityDatabase(filename),
+      SecurityCoordinationError,
+    );
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+  const unsafeAncestor = path.join(dir, "writable");
+  const privateChild = path.join(unsafeAncestor, "private");
+  fs.mkdirSync(unsafeAncestor);
+  fs.chmodSync(unsafeAncestor, 0o777);
+  fs.mkdirSync(privateChild, { mode: 0o700 });
+  const nestedFile = path.join(privateChild, "fixture.sqlite");
+  fs.writeFileSync(nestedFile, "", { mode: 0o600, flag: "wx" });
+  assert.throws(
+    () => openSecurityDatabase(nestedFile),
+    SecurityCoordinationError,
+  );
+  const plain = new Database(filename);
+  try {
+    assert.throws(
+      () => withSecurityTransactionLock(plain, () => null),
+      SecurityCoordinationError,
+    );
+  } finally {
+    plain.close();
+  }
+  const moved = filename + ".original";
+  fs.renameSync(filename, moved);
+  fs.writeFileSync(filename, "", { mode: 0o600, flag: "wx" });
+  let ran = false;
+  try {
+    assert.throws(
+      () =>
+        withSecurityTransactionLock(db, () => {
+          ran = true;
+        }),
+      SecurityCoordinationError,
+    );
+  } finally {
+    fs.unlinkSync(filename);
+    fs.renameSync(moved, filename);
+  }
+  assert.equal(ran, false);
+  assert.equal(
+    withSecurityTransactionLock(db, () => "unchanged"),
+    "unchanged",
+  );
+});

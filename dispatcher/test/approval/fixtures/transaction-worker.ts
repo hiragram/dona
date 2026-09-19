@@ -1,6 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { createHash } from "node:crypto";
-import Database from "better-sqlite3";
+import { openSecurityDatabase } from "../../../src/audit/coordination.js";
 import { ApprovalTransaction } from "../../../src/approval/transaction.js";
 import { fixtureKeys, openFixtureStores } from "./transaction-store.js";
 const input = workerData as {
@@ -9,7 +9,7 @@ const input = workerData as {
   ordinal: number;
   barrier: SharedArrayBuffer;
 };
-const db = new Database(input.database);
+const db = openSecurityDatabase(input.database);
 db.pragma("foreign_keys=ON");
 db.pragma("synchronous=FULL");
 const stores = openFixtureStores(input.store, () => {

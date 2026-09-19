@@ -82,7 +82,7 @@ const schemaSql = `
           CHECK(state IN ('pending','aborted') OR fence>0),
           CHECK(state<>'sent' OR message_ref IS NOT NULL),
           UNIQUE(request_id,kind), UNIQUE(notification_attempt_id,request_id),
-          UNIQUE(notification_attempt_id,message_ref)
+          UNIQUE(notification_attempt_id,message_ref), UNIQUE(message_ref)
         );
         CREATE INDEX approval_notification_dispatch ON approval_notifications(state);
         CREATE TABLE approval_event_outbox (

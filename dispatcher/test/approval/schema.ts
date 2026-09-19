@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -484,3 +485,29 @@ test(
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   },
 );
+
+test("異なるnotificationによる同じmessageの所有を拒否する", (t) => {
+  const { db } = setup(t);
+  request(db);
+  request(db, "r2");
+  notification(db, "n1");
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+  );
+  const insert = db.prepare(
+    "INSERT INTO approval_notifications VALUES ('n2','r2','approval_card','sent',1,1,?,1,1,'message1','tx_1')",
+  );
+  assert.throws(() => insert.run("b".repeat(64)));
+  db.prepare(
+    "INSERT INTO approval_notifications VALUES ('n2','r2','approval_card','pending',1,1,?,1,0,NULL,'tx_1')",
+  ).run("b".repeat(64));
+  assert.throws(() =>
+    db.exec(
+      "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n2'",
+    ),
+  );
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message2' WHERE notification_attempt_id='n2'",
+  );
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
+});
