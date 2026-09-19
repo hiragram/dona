@@ -7,7 +7,10 @@ const { syncBuiltinESMExports } = require("node:module");
 const scope = Number(process.env.DONA_PROCESS_METRICS_SCOPE ?? "0");
 const nonce = process.env.DONA_PROCESS_METRICS_NONCE;
 if (!nonce && scope > 2) {
-  delete process.env.NODE_OPTIONS;
+  const originalNodeOptions = process.env.DONA_ORIGINAL_NODE_OPTIONS;
+  delete process.env.DONA_ORIGINAL_NODE_OPTIONS;
+  if (originalNodeOptions) process.env.NODE_OPTIONS = originalNodeOptions;
+  else delete process.env.NODE_OPTIONS;
   return;
 }
 if (!nonce || !/^[a-f0-9]{32}$/.test(nonce)) {
@@ -17,9 +20,12 @@ if (!nonce || !/^[a-f0-9]{32}$/.test(nonce)) {
 process.env.DONA_PROCESS_METRICS_SCOPE = String(scope + 1);
 if (scope >= 2) {
   globalThis[Symbol.for("dona.checkpoint-nonce")] = nonce;
+  const originalNodeOptions = process.env.DONA_ORIGINAL_NODE_OPTIONS;
   delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
   delete process.env.DONA_PROCESS_METRICS_NONCE;
-  delete process.env.NODE_OPTIONS;
+  delete process.env.DONA_ORIGINAL_NODE_OPTIONS;
+  if (originalNodeOptions) process.env.NODE_OPTIONS = originalNodeOptions;
+  else delete process.env.NODE_OPTIONS;
 }
 
 const totals = Object.fromEntries(["node", "git", "shell", "other"].map((name) => [name, { count: 0, elapsed: 0 }]));

@@ -57,6 +57,8 @@ describe("job resource config", () => {
     assert.match(metrics, /childProcess\.fork = function instrumentedFork/);
     assert.match(metrics, /active \+= 1;[\s\S]*originalSpawnSync/);
     assert.match(runner, /--require=\$\{JSON\.stringify\(processMetrics\)\}/);
+    assert.match(runner, /DONA_ORIGINAL_NODE_OPTIONS: process\.env\.NODE_OPTIONS/);
+    assert.match(metrics, /process\.env\.NODE_OPTIONS = originalNodeOptions/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
   });
 

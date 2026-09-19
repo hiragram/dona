@@ -36,6 +36,7 @@ for (const name of testFiles) {
         DONA_DISPATCHER_TEST_FILE: relative,
         DONA_CHECKPOINT_REPORTER_NONCE: checkpointNonce,
         DONA_PROCESS_METRICS_NONCE: checkpointNonce,
+        DONA_ORIGINAL_NODE_OPTIONS: process.env.NODE_OPTIONS ?? "",
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ""}--require=${JSON.stringify(processMetrics)}`,
       },
       stdio: "inherit",
