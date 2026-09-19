@@ -69,9 +69,17 @@ export function abortPendingDelivery(request: RequestState, delivery: DeliverySt
   if (!undecided.has(request) && delivery === "pending") return "aborted";
   return delivery;
 }
-export function recoverDelivery(delivery: DeliveryState): DeliveryState {
-  if (!["pending", "dispatching", "sent", "failed", "acceptance_unknown", "needs_review", "aborted"].includes(delivery)) throw new ApprovalTransitionError();
-  return delivery === "dispatching" ? "acceptance_unknown" : delivery;
+/** Persist the pair in one transaction; recovering only the attempt leaves a
+ * delivery_pending request unable to reconcile its now-unknown delivery. */
+export function recoverDelivery(request: RequestState, delivery: DeliveryState): { request: RequestState; delivery: DeliveryState } {
+  checkRequest(request); checkDelivery(delivery);
+  if (delivery === "dispatching") return settleDelivery(request, delivery, "acceptance_unknown");
+  if (undecided.has(request)) {
+    const expected = delivery === "pending" ? "delivery_pending" : delivery === "sent" ? "sent"
+      : delivery === "acceptance_unknown" ? "delivery_unknown" : null;
+    if (request !== expected) throw new ApprovalTransitionError();
+  }
+  return { request, delivery: abortPendingDelivery(request, delivery) };
 }
 export function transitionExecution(current: ExecutionState, next: ExecutionState): ExecutionState {
   const transitions: Record<ExecutionState, readonly ExecutionState[]> = {

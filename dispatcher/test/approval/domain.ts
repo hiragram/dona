@@ -46,7 +46,7 @@ test("cancel・expire・invalidation後の遅延配送はrequestをsentへ戻さ
 });
 
 test("配送・実行の受理不明は再送可能な状態へ戻らない", () => {
-  assert.equal(recoverDelivery("dispatching"), "acceptance_unknown");
+  assert.deepEqual(recoverDelivery("delivery_pending", "dispatching"), { request: "delivery_unknown", delivery: "acceptance_unknown" });
   assert.throws(() => claimDelivery("delivery_unknown", "acceptance_unknown"), ApprovalTransitionError);
   assert.throws(() => settleDelivery("delivery_unknown", "acceptance_unknown", "failed"), ApprovalTransitionError);
   assert.equal(recoverExecution("executing", true).state, "acceptance_unknown");
@@ -58,6 +58,20 @@ test("配送・実行の受理不明は再送可能な状態へ戻らない", ()
     assert.equal(result.state, "needs_review"); assert.equal(result.delete_payload, true);
     assert.equal(result.record_unknown, current === "executing");
   }
+});
+
+test("配送復旧はrequestとattemptを同時にunknownへ進め、照合後もterminalを復活させない", () => {
+  const recovered = recoverDelivery("delivery_pending", "dispatching");
+  assert.deepEqual(recoverDelivery(recovered.request, recovered.delivery), recovered);
+  assert.deepEqual(settleDelivery(recovered.request, recovered.delivery, "sent"), { request: "sent", delivery: "sent" });
+  assert.throws(() => recordDecision(recovered.request, recovered.delivery, "approve"), ApprovalTransitionError);
+  for (const terminal of ["cancelled", "expired", "needs_review"] as const) {
+    const late = recoverDelivery(terminal, "dispatching");
+    assert.deepEqual(late, { request: terminal, delivery: "acceptance_unknown" });
+    assert.deepEqual(settleDelivery(late.request, late.delivery, "sent"), { request: terminal, delivery: "sent" });
+    assert.deepEqual(recoverDelivery(terminal, "pending"), { request: terminal, delivery: "aborted" });
+  }
+  assert.throws(() => recoverDelivery("delivery_pending", "acceptance_unknown"), ApprovalTransitionError);
 });
 
 test("unknown stateと不整合なrequest/delivery pairはfail closed", () => {
