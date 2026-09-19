@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
@@ -48,6 +49,9 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 
 export class UpdaterApi {
   private server: http.Server | undefined;
+  private readonly writerToken = randomUUID();
+  private writerLeaseHeld = false;
+  private ownsSocket = false;
 
   constructor(
     private readonly socketPath: string,
@@ -59,36 +63,65 @@ export class UpdaterApi {
   ) {}
 
   async start(): Promise<void> {
-    await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(this.socketPath), 0o700);
+    this.database.acquireWriterLease(this.writerToken);
+    this.writerLeaseHeld = true;
     try {
-      await fs.lstat(this.socketPath);
-      if (await socketAlive(this.socketPath)) throw new Error(`Another updater is listening on ${this.socketPath}`);
-      await fs.unlink(this.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    this.server = http.createServer((request, response) => void this.handle(request, response));
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => reject(error);
-      this.server!.once("error", onError);
-      this.server!.listen(this.socketPath, () => {
-        this.server!.off("error", onError);
-        resolve();
+      await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
+      await fs.chmod(path.dirname(this.socketPath), 0o700);
+      try {
+        await fs.lstat(this.socketPath);
+        if (await socketAlive(this.socketPath)) throw new Error(`Another updater is listening on ${this.socketPath}`);
+        await fs.unlink(this.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      this.server = http.createServer((request, response) => void this.handle(request, response));
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => reject(error);
+        this.server!.once("error", onError);
+        this.server!.listen(this.socketPath, () => {
+          this.server!.off("error", onError);
+          this.ownsSocket = true;
+          resolve();
+        });
       });
-    });
-    await fs.chmod(this.socketPath, 0o600);
+      await fs.chmod(this.socketPath, 0o600);
+    } catch (error) {
+      if (this.ownsSocket && this.server) {
+        try { await new Promise<void>((resolve) => this.server!.close(() => resolve())); } catch { /* best effort */ }
+        try { await fs.unlink(this.socketPath); } catch { /* best effort */ }
+      }
+      this.server = undefined;
+      this.ownsSocket = false;
+      this.releaseWriterLease();
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
-    if (this.server) {
+    if (this.server && this.ownsSocket) {
       await new Promise<void>((resolve, reject) => this.server!.close((error) => error ? reject(error) : resolve()));
       this.server = undefined;
+      this.ownsSocket = false;
+      try {
+        await fs.unlink(this.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
+    this.releaseWriterLease();
+  }
+
+  private releaseWriterLease(): void {
+    if (!this.writerLeaseHeld) return;
     try {
-      await fs.unlink(this.socketPath);
+      this.database.releaseWriterLease(this.writerToken);
+      this.writerLeaseHeld = false;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.logger.warn("Updater writer lease release failed", {
+        error_code: "updater_writer_lease_release_failed",
+        error_message: redactText(error instanceof Error ? error.message : String(error)),
+      });
     }
   }
 

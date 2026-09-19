@@ -62,3 +62,23 @@ test("Updater version health requires both the service loop and writable persist
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("atomic writer lease prevents a second server from unlinking the active socket", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-writer-"));
+  const socketPath = path.join(root, "updater.sock");
+  const database = new UpdateDatabase(path.join(root, "updater.sqlite3"));
+  const service = { isRunning: () => true, wake() {} };
+  const first = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database, service, logger);
+  const second = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database, service, logger);
+  try {
+    await first.start();
+    await assert.rejects(second.start(), /updater_writer_already_active/);
+    await second.stop();
+    assert.equal((await request(socketPath)).status, 200);
+  } finally {
+    await first.stop();
+    await second.stop();
+    database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

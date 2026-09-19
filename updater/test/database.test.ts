@@ -43,7 +43,7 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
-  test("atomically migrates the released schema 1 database through schema 5", async () => {
+  test("atomically migrates the released schema 1 database through schema 6", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -72,7 +72,8 @@ describe("UpdateDatabase", () => {
     assert.ok(outboxColumns.some((column) => column.name === "superseded_by_outbox_id"));
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_operations'").get());
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'").get());
-    assert.equal(migrated.pragma("user_version", { simple: true }), 5);
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'updater_writer_lease'").get());
+    assert.equal(migrated.pragma("user_version", { simple: true }), 6);
     migrated.close();
   });
 

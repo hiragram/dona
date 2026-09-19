@@ -82,8 +82,8 @@ async function main(): Promise<void> {
         stopping = true;
         logger.info("Updater shutdown started", { signal });
         try {
-          await api.stop();
           await service.stop();
+          await api.stop();
           resolve();
         } catch (error) {
           reject(error);

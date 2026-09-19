@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 
 import { DiagnosticLogStore } from "../src/diagnostic-log.js";
 import { UpdateDatabase } from "../src/database.js";
 import { ProcessRunner } from "../src/process.js";
 import { currentSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
+describe("DiagnosticLogStore", { concurrency: false }, () => {
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
 
@@ -146,6 +147,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(npmAuthDetail.includes("supersecret"), false);
     assert.match(npmAuthDetail, /REDACTED_STREAM/);
     assert.match(npmAuthDetail, /visible-after-auth/);
+
+    const middleSecretCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:aws-auth" });
+    middleSecretCapture.write("stderr", Buffer.from("AWS_SECRET_"));
+    middleSecretCapture.write("stderr", Buffer.from("ACCESS_KEY=cloud-secret\nvisible-after-cloud-auth"));
+    middleSecretCapture.finish(true);
+    const middleSecretDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[9]!, 16_384).detail_tail);
+    assert.equal(middleSecretDetail.includes("cloud-secret"), false);
+    assert.match(middleSecretDetail, /REDACTED_STREAM/);
+    assert.match(middleSecretDetail, /visible-after-cloud-auth/);
   } finally {
     f.database.close();
   }
@@ -517,7 +527,8 @@ test("aggregate retention keeps the newest bounded set and records older logs as
 
 test("retention fsyncs a removed directory entry before marking its row purged", async () => {
   const f = await fixture();
-  const originalFsync = fsSync.fsyncSync;
+  const syncStore = f.store as unknown as { fsyncLogsDirectory(): void };
+  const originalFsync = syncStore.fsyncLogsDirectory.bind(f.store);
   const originalMark = f.database.markDiagnosticPurged.bind(f.database);
   const events: string[] = [];
   try {
@@ -528,14 +539,35 @@ test("retention fsyncs a removed directory entry before marking its row purged",
       last_error_code: "pre_activation_failed",
       last_error_message: "build failed",
     });
-    fsSync.fsyncSync = ((descriptor) => { events.push("fsync"); return originalFsync(descriptor); }) as typeof fsSync.fsyncSync;
+    syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
     f.database.markDiagnosticPurged = ((logId, at) => { events.push("mark"); return originalMark(logId, at); }) as typeof f.database.markDiagnosticPurged;
     f.store.enforceRetention(new Date("2999-01-01T00:00:00Z"), 1, 1);
     assert.deepEqual(events, ["fsync", "mark"]);
     assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "purged");
   } finally {
-    fsSync.fsyncSync = originalFsync;
+    syncStore.fsyncLogsDirectory = originalFsync;
     f.database.markDiagnosticPurged = originalMark;
+    f.database.close();
+  }
+});
+
+test("successful capture fsyncs its removed partial before discarding the row", async () => {
+  const f = await fixture();
+  const syncStore = f.store as unknown as { fsyncLogsDirectory(): void };
+  const originalFsync = syncStore.fsyncLogsDirectory.bind(f.store);
+  const originalDiscard = f.database.discardDiagnosticLog.bind(f.database);
+  const events: string[] = [];
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-success" });
+    capture.write("stdout", Buffer.from("success"));
+    syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
+    f.database.discardDiagnosticLog = ((logId) => { events.push("discard"); return originalDiscard(logId); }) as typeof f.database.discardDiagnosticLog;
+    assert.equal(capture.finish(false), undefined);
+    assert.deepEqual(events, ["fsync", "discard"]);
+    assert.deepEqual(f.database.diagnosticLogs(f.claimed.request_id), []);
+  } finally {
+    syncStore.fsyncLogsDirectory = originalFsync;
+    f.database.discardDiagnosticLog = originalDiscard;
     f.database.close();
   }
 });
@@ -596,4 +628,5 @@ test("singleton startup recovers interrupted rows and removes their bounded part
     reopened.close();
     capture.finish(false);
   }
+});
 });

@@ -103,7 +103,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 5) throw new Error(`Updater database schema ${version} is newer than supported schema 5`);
+    if (version > 6) throw new Error(`Updater database schema ${version} is newer than supported schema 6`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -200,6 +200,12 @@ export class UpdateDatabase {
         purged_at     TEXT
       );
       CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
+      CREATE TABLE updater_writer_lease (
+        singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner_token  TEXT NOT NULL,
+        owner_pid    INTEGER NOT NULL,
+        acquired_at  TEXT NOT NULL
+      );
       CREATE TABLE runtime_operations (
         operation_id        TEXT PRIMARY KEY,
         request_id          TEXT NOT NULL REFERENCES update_requests(request_id),
@@ -215,7 +221,7 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 5;
+      PRAGMA user_version = 6;
     `);
     if (version === 1) migrate(`
       ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
@@ -271,6 +277,15 @@ export class UpdateDatabase {
       CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
       PRAGMA user_version = 5;
     `);
+    if (version >= 1 && version <= 5) migrate(`
+      CREATE TABLE updater_writer_lease (
+        singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner_token  TEXT NOT NULL,
+        owner_pid    INTEGER NOT NULL,
+        acquired_at  TEXT NOT NULL
+      );
+      PRAGMA user_version = 6;
+    `);
   }
 
   close(): void {
@@ -284,6 +299,36 @@ export class UpdateDatabase {
   assertReadableWritable(): void {
     this.db.prepare("SELECT 1").get();
     this.db.prepare("UPDATE update_requests SET state = state WHERE 0").run();
+  }
+
+  acquireWriterLease(ownerToken: string, ownerPid = process.pid, at = new Date()): void {
+    if (!/^[0-9a-f-]{36}$/.test(ownerToken) || !Number.isSafeInteger(ownerPid) || ownerPid < 1) {
+      throw new Error("updater_writer_identity_invalid");
+    }
+    this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT owner_token, owner_pid FROM updater_writer_lease WHERE singleton = 1")
+        .get() as { owner_token: string; owner_pid: number } | undefined;
+      if (!existing) {
+        this.db.prepare(`INSERT INTO updater_writer_lease(singleton, owner_token, owner_pid, acquired_at)
+          VALUES (1, ?, ?, ?)`).run(ownerToken, ownerPid, at.toISOString());
+        return;
+      }
+      if (existing.owner_token === ownerToken && existing.owner_pid === ownerPid) return;
+      let alive = true;
+      try { process.kill(existing.owner_pid, 0); }
+      catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+      if (alive) throw new Error("updater_writer_already_active");
+      const changed = this.db.prepare(`UPDATE updater_writer_lease
+        SET owner_token = ?, owner_pid = ?, acquired_at = ? WHERE singleton = 1 AND owner_token = ? AND owner_pid = ?`)
+        .run(ownerToken, ownerPid, at.toISOString(), existing.owner_token, existing.owner_pid).changes;
+      if (changed !== 1) throw new Error("updater_writer_lease_conflict");
+    })();
+  }
+
+  releaseWriterLease(ownerToken: string): void {
+    const changed = this.db.prepare("DELETE FROM updater_writer_lease WHERE singleton = 1 AND owner_token = ?")
+      .run(ownerToken).changes;
+    if (changed !== 1) throw new Error("updater_writer_lease_mismatch");
   }
 
   reserveDiagnosticLog(capture: DiagnosticLogCapture): void {

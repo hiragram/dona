@@ -69,7 +69,7 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*[:=]\s*(["']?)/i
+      const assignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*[:=]\s*(["']?)/i
         .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
@@ -96,7 +96,7 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
@@ -113,7 +113,7 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return output;
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -306,7 +306,10 @@ export class DiagnosticLogStore {
           let removed = false;
           try { fs.unlinkSync(temporary); removed = true; } catch { /* preserve the index row for singleton recovery */ }
           if (removed) {
-            try { this.index?.discardDiagnosticLog(logId); } catch { /* diagnostic cleanup is subordinate to command success */ }
+            try {
+              this.fsyncLogsDirectory();
+              this.index?.discardDiagnosticLog(logId);
+            } catch { /* preserve the index row for singleton recovery */ }
           }
           return undefined;
         }
@@ -331,8 +334,7 @@ export class DiagnosticLogStore {
           published = true;
           fs.unlinkSync(temporary);
           fs.chmodSync(finalPath, 0o600);
-          const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
-          try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+          this.fsyncLogsDirectory();
         } catch {
           errorCode = writeFailed ? "diagnostic_write_failed" : "diagnostic_finalize_failed";
           try { fs.closeSync(descriptor); } catch { /* already closed */ }
@@ -424,8 +426,7 @@ export class DiagnosticLogStore {
       }
       if (removed) {
         try {
-          const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
-          try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+          this.fsyncLogsDirectory();
         } catch {
           // Keep the durable reference so a later maintenance pass can
           // reconcile the unlink before marking the row as purged.
@@ -440,6 +441,11 @@ export class DiagnosticLogStore {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.assertPrivateDirectory(directory);
     fs.chmodSync(directory, 0o700);
+  }
+
+  private fsyncLogsDirectory(): void {
+    const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   }
 
   private cleanupFailedFinalize(temporary: string, finalPath: string, published: boolean): void {
