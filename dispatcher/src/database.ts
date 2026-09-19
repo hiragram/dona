@@ -723,7 +723,7 @@ export class DispatcherDatabase {
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
-          AND (g.notification_mode='legacy' OR g.sealed_at IS NOT NULL)
+          AND (g.notification_mode='legacy' OR (g.sealed_at IS NOT NULL AND g.all_terminal_event_id IS NULL))
           AND (j.completion_event_id IS NULL OR (g.notification_mode='grouped'
             AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
@@ -976,7 +976,26 @@ export class DispatcherDatabase {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
     this.db.transaction(()=>{
-      if(row.completion_event_id) {
+      if(readEventJobBinding(this.db, row.source_event_id)?.owner.kind === "slack_thread") {
+        const group = this.getJobGroup(row.source_event_id);
+        const eventIds = new Set([row.completion_event_id, group?.attention_event_id, group?.all_terminal_event_id]);
+        for (const eventId of eventIds) {
+          if (!eventId) continue;
+          const previous = this.getRequired(eventId);
+          if (["queued", "retryable_failed"].includes(previous.status)) {
+            this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=?")
+              .run(nowUtc(),nowUtc(),previous.event_id);
+            this.db.prepare(`UPDATE job_groups SET
+              attention_event_id=CASE WHEN attention_event_id=? THEN NULL ELSE attention_event_id END,
+              all_terminal_event_id=CASE WHEN all_terminal_event_id=? THEN NULL ELSE all_terminal_event_id END
+              WHERE source_event_id=?`).run(previous.event_id,previous.event_id,row.source_event_id);
+            this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE source_event_id=? AND completion_event_id=?")
+              .run(row.source_event_id, previous.event_id);
+          } else if (previous.status !== "completed") {
+            throw new Error("prior_notification_requires_reconciliation");
+          }
+        }
+      } else if(row.completion_event_id) {
         const prior=this.db.prepare("SELECT notification_state,notification_authorization_phase FROM job_completion_results WHERE notification_event_id=?")
           .get(row.completion_event_id) as {notification_state:string;notification_authorization_phase:string}|undefined;
         if(prior?.notification_state==="pending"&&prior.notification_authorization_phase==="none") {
@@ -986,6 +1005,8 @@ export class DispatcherDatabase {
           this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(row.completion_event_id);
         } else if(prior&&! ["none","accepted"].includes(prior.notification_state)) throw new Error("prior_notification_requires_reconciliation");
       }
+      this.db.prepare("UPDATE job_groups SET all_terminal_event_id=NULL WHERE source_event_id=?")
+        .run(row.source_event_id);
       this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
     }).immediate();
     return this.getJobRequired(jobId);
@@ -1020,6 +1041,15 @@ export class DispatcherDatabase {
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const timestamp = at.toISOString();
       let group = this.getJobGroupRequired(job.source_event_id);
+      if (group.notification_mode === "grouped" && group.all_terminal_event_id) {
+        const existing = this.getRequired(group.all_terminal_event_id);
+        if (!job.completion_event_id) {
+          this.db.prepare("UPDATE jobs SET completion_event_id=?,updated_at=? WHERE job_id=?")
+            .run(existing.event_id, timestamp, jobId);
+          notificationHook("job_linked");
+        }
+        return { row: existing, duplicate: true, payloadMismatch: false };
+      }
       if (job.completion_event_id) {
         const existing = this.get(job.completion_event_id);
         if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);

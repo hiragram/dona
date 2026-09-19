@@ -177,3 +177,52 @@ for (const outcome of ["completed", "failed", "blocked", "missing", "invalid"] a
     } finally { await supervisor?.stop(); await api?.stop(); h.close(); await fs.rm(root, { recursive: true, force: true }); }
   });
 }
+
+test("all_terminalをclaimした後は同じ走査の残りjobと再走査から追加通知を作らない", () => {
+  const h = new SchedulerIntegrationHarness();
+  try {
+    const { jobs } = regularJobs(h);
+    for (const job of jobs) {
+      h.raw.prepare("UPDATE jobs SET available_at=? WHERE job_id=?").run(new Date(h.clock.now()).toISOString(), job.job_id);
+      running(h, job); h.database.saveJobResult(job.job_id, result(job, h.clock.now()), job.result_path, new Date(h.clock.now()));
+    }
+    const snapshot = h.database.listJobsNeedingNotification(); assert.equal(snapshot.length, 2);
+    const first = h.database.enqueueJobNotification(snapshot[0]!.job_id);
+    const stale = h.database.enqueueJobNotification(snapshot[1]!.job_id);
+    assert.equal(stale.row.event_id, first.row.event_id); assert.equal(stale.duplicate, true);
+    assert.deepEqual(h.database.listJobsNeedingNotification(), []);
+    assert.equal(h.raw.prepare("SELECT count(*) FROM events WHERE source='dona_job'").pluck().get(), 1);
+  } finally { h.close(); }
+});
+
+for (const grouped of [true, false]) test(`通常${grouped ? "group" : "legacy"}のqueued attentionは取消時に無効化する`, () => {
+  const h = new SchedulerIntegrationHarness();
+  try {
+    const { source, jobs } = regularJobs(h); const job = jobs[0]!;
+    if (!grouped) h.raw.prepare("UPDATE job_groups SET notification_mode='legacy' WHERE source_event_id=?").run(source.event_id);
+    h.raw.prepare("UPDATE jobs SET available_at=? WHERE job_id=?").run(new Date(h.clock.now()).toISOString(), job.job_id);
+    running(h, job); h.database.markJobBlocked(job.job_id, "入力待ち");
+    const attention = h.database.enqueueJobNotification(job.job_id);
+    h.database.beginJobCancellation(job.job_id, source.event_id);
+    assert.equal(h.database.get(attention.row.event_id)?.last_error_code, "job_result_superseded");
+    assert.equal(h.database.get(attention.row.event_id)?.status, "completed");
+    h.database.markJobCancelled(job.job_id, "中止");
+    h.database.enqueueJobNotification(job.job_id);
+    assert.equal(h.database.get(attention.row.event_id)?.status, "completed");
+    assert.notEqual(h.database.getJob(job.job_id)?.completion_event_id, attention.row.event_id);
+  } finally { h.close(); }
+});
+
+test("通常attentionの投稿中は取消を曖昧なまま進めずreconcileを要求する", () => {
+  const h = new SchedulerIntegrationHarness();
+  try {
+    const { source, jobs } = regularJobs(h); const job = jobs[0]!;
+    h.raw.prepare("UPDATE jobs SET available_at=? WHERE job_id=?").run(new Date(h.clock.now()).toISOString(), job.job_id);
+    running(h, job); h.database.markJobBlocked(job.job_id, "入力待ち");
+    const attention = h.database.enqueueJobNotification(job.job_id);
+    h.database.beginDispatch(attention.row.event_id, path.join(h.root,"notice.json"));
+    assert.throws(() => h.database.beginJobCancellation(job.job_id, source.event_id), /reconciliation/);
+    assert.equal(h.database.getJob(job.job_id)?.status, "blocked");
+    assert.equal(h.database.get(attention.row.event_id)?.status, "dispatching");
+  } finally { h.close(); }
+});
