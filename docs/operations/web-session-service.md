@@ -1,0 +1,27 @@
+# Web session確認の専用UDS
+
+`WebSessionService`とBFFの`WebSessionClient`は、現在のsessionを確認する専用の通信境界である。固定の`POST /v1/web/session/verify`だけを扱い、渡せるbrowser routeはempty bodyの`GET /`と`GET /api/session`だけとする。login、registry変更、job、approvalの汎用proxyにはしない。
+
+## 認証と監査
+
+service credentialは`web_bff_service`用途の32 byte secret、version、instance/tenant、active/verification-only/revoked、90日以内のsigning期間を持つ。runtimeは`web_ingress_context`とは別のkey/refを供給する必要がある。secretそのものを通信へ含めず、requestの固定method/path、body digest、scope、credential version、32 byte nonce、最大10秒の有効期間をHMACへ結ぶ。responseにも別のdomain prefixを使い、元requestのproof digest・body digest・nonceと結果を署名する。他requestのresponseや偽socketの未署名応答を採用しない。
+
+このcredentialが証明するのはBFF serviceとしての接続であり、principalの操作許可ではない。Dispatcherは`WebAuthRepository.verifySessionIngress`で現在のsession、identity revision、context key、対象route、期限を照合する。nonce消費と監査のfinalizeが成功した後だけprincipalを返す。再送したcontextは、同じnonceが確定済みなので拒否する。session確認ではidle期限を延長しない。
+
+serviceのinstance/tenantとrepositoryの構築scopeが異なる場合は、listenerを作る前に拒否する。返したprincipalはsession確認結果であり、jobやapprovalのcapabilityではない。後続routeには、それぞれのfresh contextとresourceごとの認可が引き続き必要である。
+
+## 通信と失敗時の扱い
+
+serverは専用UDSだけをbindする。socketのparentはcanonicalでowner-onlyの0700、socketはowner-onlyの0600とし、既存pathを自動削除・上書きしない。clientも送信前と応答の採用前にsocketの属性とidentityを確認する。credentialや保護providerのprovisioning、directory作成、stale socketの運用処理はこのmoduleの責務ではない。
+
+request/responseは16 KiB以内、request headerは4 KiB以内、接続は最大32、1接続1requestとする。固定Host、content type、Content-Length、Connectionを検証し、duplicate/未知header、chunked body、query付きpath、CONNECT/upgradeを拒否する。bodyを最後まで受け取るまでrepositoryを呼ばない。
+
+通信deadlineは最大5秒で、部分送受信が続いても延長しない。[Node HTTP](https://nodejs.org/api/http.html)と[Unix domain socket](https://nodejs.org/api/net.html)を使用し、clientはAgentを再利用せず、redirectやPOSTの自動再試行を行わない。同期のkey/clock/repository provider自体をこのtimerで強制中断できるわけではないため、runtime側でboundedなproviderを供給する必要がある。処理後にdeadlineを越えていた場合も成功responseを採用しない。
+
+timeout、接続切断、MAC不一致、監査anchorの結果不明は`web_service_unverified`で停止する。接続が失われたことをbusiness transactionの取消として扱わず、確定済みnonceを戻さない。HTTP POSTが失敗しても同じ操作を暗黙に再送しない。serviceはrequest/responseや低水準errorをlogへ書かない。
+
+## 検証と未接続部分
+
+BFF clientの実UDS fixtureと、file-backed SQLiteの実Web repositoryに接続するDispatcher service fixtureを、それぞれのpackageで検証する。両者が共有する公開golden wireは、production実装とは独立したHMAC計算で作成し、双方のcodecと照合する。正常確認、再送、header/proof/response改変、scope不一致、anchor応答喪失、dribbling、不完全request、socket属性を確認する。
+
+fixtureのcredentialはテスト専用の公開値であり、実credentialを作成・使用しない。OS保護store、実IdP、ブラウザlogin、TLS frontend、BFF起動時のepoch確定、installer、runtime readinessへの接続はまだ行っていない。importでlistenerを起動せず、既存DispatcherのAPIやproduction設定も変更しない。#141全体の完了条件は残る。

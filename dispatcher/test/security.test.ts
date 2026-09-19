@@ -14,3 +14,4 @@ import "./web/ingress.js";
 import "./approval/keychain-cas.js";
 import "./approval/native-keychain-cas.js";
 import "./approval/used-transactions.js";
+import "./web/session-service.js";

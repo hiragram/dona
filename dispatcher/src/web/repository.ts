@@ -47,6 +47,9 @@ export class WebAuthRepository {
     this.audit = new AuditRepository(db, providers.auditAnchors, providers.auditKeys);
   }
 
+  /** Construction-time alignment only; this is not a current identity proof. */
+  configuredScope(): Readonly<WebStateScope> { return Object.freeze({ ...this.scope }); }
+
   private load(verified: VerifiedAuditState): Loaded {
     verifyWebAuthSchema(this.db);
     const binding = verified.resource_bindings.find(value => value.scope.instance_id === this.scope.instance_id
