@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { auditEventSchema, type AuditEvent, type AuditKeyLookup } from "../audit/codec.js";
 import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
-import { withSecurityTransactionLock } from "../audit/coordination.js";
+import { withSecurityTransactionLock, SecurityCoordinationBusyError } from "../audit/coordination.js";
 import { assertSynchronousCallback, type SynchronousCallback } from "../audit/synchronous.js";
 import { reserveClockMark, type ClockMark, type ClockMarkStore, type ProtectedClockSource } from "./clock.js";
 import { verifyApprovalSchema } from "./schema.js";
@@ -13,9 +13,14 @@ export interface ApprovalTransactionProviders {
   auditKeys: AuditKeyLookup;
   auditSigningKeyVersion: number;
   maximumClockDriftMs: number;
+  /** Local operational admission wait, 0..30,000 ms. No automatic retry. */
+  lockWaitTimeoutMs?: number;
 }
 export class ApprovalTransactionError extends Error {
   constructor() { super("approval_transaction_unverified"); this.name = "ApprovalTransactionError"; }
+}
+export class ApprovalTransactionBusyError extends Error {
+  constructor() { super("approval_transaction_busy"); this.name = "ApprovalTransactionBusyError"; }
 }
 
 /** Internal repository boundary, not an approval API. The broker must authenticate
@@ -32,8 +37,11 @@ export class ApprovalTransaction {
   run(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {
       assertSynchronousCallback(mutation);
-      return withSecurityTransactionLock(this.db, () => this.runInside(transactionId, eventInput, mutation));
-    } catch { throw new ApprovalTransactionError(); }
+      return withSecurityTransactionLock(this.db, () => this.runInside(transactionId, eventInput, mutation), this.providers.lockWaitTimeoutMs);
+    } catch (error) {
+      if (error instanceof SecurityCoordinationBusyError) throw new ApprovalTransactionBusyError();
+      throw new ApprovalTransactionError();
+    }
   }
   private runInside(transactionId: string, eventInput: Omit<AuditEvent, "occurred_at">, mutation: (mark: Readonly<ClockMark>) => unknown): unknown {
     try {

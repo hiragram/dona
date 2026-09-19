@@ -23,6 +23,7 @@ import { installApprovalSchema } from "../../src/approval/schema.js";
 import {
   ApprovalTransaction,
   ApprovalTransactionError,
+  ApprovalTransactionBusyError,
 } from "../../src/approval/transaction.js";
 import { verifyApprovalSchema } from "../../src/approval/schema.js";
 import {
@@ -136,7 +137,7 @@ const event: Omit<AuditEvent, "occurred_at"> = {
   binding_revision: 1,
   authz_revision: 1,
 };
-function setup(t: { after(fn: () => void): void }) {
+function setup(t: { after(fn: () => void): void }, lockWaitTimeoutMs?: number) {
   const dir = fs.mkdtempSync(
     path.join(fs.realpathSync(os.homedir()), ".dona-approval-transaction-"),
   );
@@ -165,6 +166,7 @@ function setup(t: { after(fn: () => void): void }) {
     auditKeys: keys,
     auditSigningKeyVersion: 1,
     maximumClockDriftMs: 1000,
+    ...(lockWaitTimeoutMs === undefined ? {} : { lockWaitTimeoutMs }),
   });
   t.after(() => {
     db.close();
@@ -845,5 +847,50 @@ test("callbackはSQL guardを別tokenで解除できず監査rowも変更でき�
     }));
     assert.equal(count(db, "approval_requests"), 0); assert.equal(count(db, "security_audit_records"), 0);
     assert.deepEqual(anchors.calls, ["reserve"]);
+  }
+});
+
+
+async function holdPeerMutex(t: { after(fn: () => unknown): void }, filename: string, milliseconds: number) {
+  const child = fork(new URL("./fixtures/coordination-hold.mjs", import.meta.url), [filename, String(milliseconds)],
+    { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+  t.after(async () => { if (child.exitCode === null) child.kill(); await exited; });
+  await Promise.race([
+    new Promise<void>(resolve => child.once("message", message => { assert.deepEqual(message, { kind: "locked" }); resolve(); })),
+    exited.then(() => { throw new Error("fixture_exited_before_lock"); }),
+  ]);
+  return { child, exited };
+}
+
+test("設定した待機期限内なら2秒を超える先行transactionの完了後に実行する", { timeout: 10000 }, async t => {
+  const { db, filename, transaction, anchors, marks } = setup(t, 5000);
+  const peer = await holdPeerMutex(t, filename, 2600);
+  const started = performance.now();
+  transaction.run("after_slow_peer", event, mark => insertRequest(db, mark.transaction_id));
+  assert.ok(performance.now() - started >= 2000);
+  assert.deepEqual(anchors.calls, ["reserve", "finalize"]); assert.equal(marks.calls, 1);
+  assert.equal(count(db, "approval_requests"), 1); assert.equal(await peer.exited, 0);
+});
+
+test("mutex取得前のbusyは予約0件として区別し、取得後のbusyを再試行可能にしない", { timeout: 10000 }, async t => {
+  const { db, filename, transaction, anchors, marks } = setup(t, 10);
+  const peer = await holdPeerMutex(t, filename, 5000);
+  assert.throws(() => transaction.run("busy_then_retry", event, () => {}), ApprovalTransactionBusyError);
+  assert.deepEqual(anchors.calls, []); assert.equal(marks.calls, 0);
+  assert.equal(count(db, "security_audit_records"), 0);
+  peer.child.kill(); await peer.exited;
+  transaction.run("busy_then_retry", event, mark => insertRequest(db, mark.transaction_id));
+  assert.deepEqual(anchors.calls, ["reserve", "finalize"]);
+  const other = setup(t, 10);
+  assert.throws(() => other.transaction.run("inner_busy", event, () => { throw Object.assign(new Error("fixture"), { code: "SQLITE_BUSY" }); }), ApprovalTransactionError);
+  assert.deepEqual(other.anchors.calls, ["reserve"]); assert.equal(other.anchors.value.pending_transaction_id, "inner_busy");
+});
+
+test("不正または過大な待機期限はclock予約前に拒否する", t => {
+  for (const wait of [-1, 0.5, 30001, Number.NaN, Infinity]) {
+    const { transaction, anchors, marks } = setup(t, wait);
+    assert.throws(() => transaction.run("invalid_wait", event, () => {}), ApprovalTransactionError);
+    assert.deepEqual(anchors.calls, []); assert.equal(marks.calls, 0);
   }
 });

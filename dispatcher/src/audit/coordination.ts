@@ -11,6 +11,11 @@ const ddl = "CREATE TABLE security_transaction_mutex (singleton INTEGER PRIMARY 
 export class SecurityCoordinationError extends Error {
   constructor() { super("security_transaction_coordination_failed"); this.name = "SecurityCoordinationError"; }
 }
+/** The mutex was never acquired and the callback was never entered. Unlike an
+ * integrity/commit error, this is a known pre-reservation admission conflict. */
+export class SecurityCoordinationBusyError extends Error {
+  constructor() { super("security_transaction_busy"); this.name = "SecurityCoordinationBusyError"; }
+}
 
 function privateRegular(filename: string): void {
   const info = fs.lstatSync(filename);
@@ -81,11 +86,14 @@ function ensureFile(filename: string): void {
  * Its OS writer lock spans clock reservation through audit finalize, and is
  * released automatically on crash. All users of the shared clock must use it.
  * No transaction is opened on the business DB before the clock reservation. */
-export function withSecurityTransactionLock<F extends () => unknown>(business: Database.Database, work: SynchronousCallback<F>): ReturnType<F>;
-export function withSecurityTransactionLock(business: Database.Database, work: () => unknown): unknown {
+export function withSecurityTransactionLock<F extends () => unknown>(business: Database.Database, work: SynchronousCallback<F>, waitTimeoutMs?: number): ReturnType<F>;
+export function withSecurityTransactionLock(business: Database.Database, work: () => unknown, waitTimeoutMs = 2000): unknown {
   let mutex: Database.Database | undefined;
   let owned: string | undefined;
+  let awaitingLock = false;
+  let acquired = false;
   try {
+    if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 0 || waitTimeoutMs > 30000) throw new SecurityCoordinationError();
     assertSynchronousCallback(work);
     if (!business.open || business.memory || business.readonly || business.inTransaction || !path.isAbsolute(business.name)) throw new SecurityCoordinationError();
     const registration = opened.get(business);
@@ -98,12 +106,14 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
     active.add(filename); owned = filename;
     ensureFile(filename);
     const mutexIdentity = databasePathIdentity(filename);
-    mutex = new Database(filename, { timeout: 2000, fileMustExist: true });
+    mutex = new Database(filename, { timeout: waitTimeoutMs, fileMustExist: true });
     const connection = mutex;
     if (databasePathIdentity(filename) !== mutexIdentity) throw new SecurityCoordinationError();
     verifyOpenDatabaseFile(connection);
     const targetHash = createHash("sha256").update(target).digest("hex");
+    awaitingLock = true;
     return connection.transaction(() => {
+      acquired = true;
       if (databasePathIdentity(filename) !== mutexIdentity) throw new SecurityCoordinationError();
       verifyOpenDatabaseFile(connection);
       const objects = connection.prepare("SELECT type,name,sql FROM sqlite_master WHERE substr(name,1,7)<>'sqlite_'").all() as Array<{ type: string; name: string; sql: string }>;
@@ -122,7 +132,10 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
       assertSynchronousResult(result);
       return result;
     }).immediate();
-  } catch { throw new SecurityCoordinationError(); }
+  } catch (error) {
+    if (awaitingLock && !acquired && (error as { code?: unknown })?.code === "SQLITE_BUSY") throw new SecurityCoordinationBusyError();
+    throw new SecurityCoordinationError();
+  }
   finally {
     try { mutex?.close(); }
     catch { throw new SecurityCoordinationError(); }
