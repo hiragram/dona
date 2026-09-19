@@ -1,0 +1,171 @@
+{
+  "fixture_only": true,
+  "now": "2026-09-19T00:00:01.000Z",
+  "cookie": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE",
+  "login_cookie": "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjI",
+  "session_binding": {
+    "instance_id": "instance",
+    "tenant_id": "tenant",
+    "principal_id": "principal",
+    "session_ref": "session",
+    "session_generation": 1,
+    "identity_binding_revision": 1,
+    "authz_revision": 1,
+    "issued_at": "2026-09-19T00:00:01.000Z",
+    "expires_at": "2026-09-19T08:00:01.000Z"
+  },
+  "session": {
+    "state": {
+      "codec_version": 1,
+      "instance_id": "instance",
+      "tenant_id": "tenant",
+      "principal_id": "principal",
+      "session_ref": "session",
+      "state": "active",
+      "session_generation": 1,
+      "principal_revoke_generation": 1,
+      "identity_binding_revision": 1,
+      "authz_revision": 1,
+      "bff_generation": 1,
+      "authenticated_at": "2026-09-19T00:00:01.000Z",
+      "expires_at": "2026-09-19T08:00:01.000Z",
+      "access_token_expires_at": "2026-09-19T08:00:01.000Z",
+      "last_activity_at": "2026-09-19T00:00:01.000Z"
+    },
+    "cookie_key_version": 1,
+    "cookie_digest": "7022650302f7298e594b0df9d21604a1c2c0a191a27e08ec0b849dc3fc8abc02",
+    "csrf_key_version": 1,
+    "token_key_version": 1,
+    "payload_ref": "session_payload",
+    "payload_digest": "602dfb22913479ec6ae9758763c9b64554f18d2f5d09d66531eae39a9d1a6822"
+  },
+  "payload": {
+    "codec_version": 1,
+    "purpose": "web_access_token",
+    "payload_ref": "session_payload",
+    "binding_digest": "9a916bd9a4a7892ace07794cc0ace0b3f333b9b19fc42ed3ebe343b17c2a7cac",
+    "envelope": {
+      "codec_version": 1,
+      "key_version": 1,
+      "sealed_at": "2026-09-19T00:00:01.000Z",
+      "nonce": "0X_zLNimGiBnwzRW",
+      "ciphertext": "p-GiJDzsdzRIUvyjtFi-SNf0q6I",
+      "tag": "FkvXA-0Phi18ZkLBBetO1w"
+    }
+  },
+  "login": {
+    "binding": {
+      "instance_id": "instance",
+      "tenant_id": "tenant",
+      "login_ref": "login",
+      "bff_generation": 1,
+      "cookie_key_version": 1,
+      "cookie_digest": "97dc81b41a0e23a10dde228ee7fe90ae685b2077539ad28923f5f8159113144e",
+      "created_at": "2026-09-19T00:00:01.000Z",
+      "expires_at": "2026-09-19T00:05:01.000Z"
+    },
+    "payload_ref": "login_payload",
+    "payload_digest": "e3fe5ec49e0e3ff8104f74831e02fe1529b6d65efd44a2433efc9bea34cca1fa",
+    "key_version": 1,
+    "previous_session_ref": null
+  },
+  "login_payload": {
+    "codec_version": 1,
+    "purpose": "web_login_transaction",
+    "payload_ref": "login_payload",
+    "binding_digest": "a39da40f87d3c99de980fea62a117c43e6452a4a5f9bf5122eb634b622533e3a",
+    "envelope": {
+      "codec_version": 1,
+      "key_version": 1,
+      "sealed_at": "2026-09-19T00:00:01.000Z",
+      "nonce": "tHH0n5ksfpiSoBsh",
+      "ciphertext": "w03QoGBgtr7-eRcwnf6vq-5SkwWlmLvvm_00Uro8adJWi37APWcEm-JIAh8R4zIRBzyLOxTHkWutCszN1J9tS45NhuMLCfIPE5uzoCw8et5Re0PCD6HcY1qvlwsYwKjHx9Uf-oWLRhOeo2PKFN7oVc7sxOARQzwkdrEeOkGa6iAlA0LZlFIZsHrXd91c9dg3h63QLC5qSNHQkl6v6vVBNz5A2H0-JsVpGWcK6nGb1aXPFttkMeLcS2kZyE3Amm0SDQJ2STs1oIpqnxqHMxGcet-9iG6L-w",
+      "tag": "fv6WpXjoLBPZejEQKftAuQ"
+    }
+  },
+  "login_plaintext": {
+    "state": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE",
+    "nonce": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+    "verifier": "REREREREREREREREREREREREREREREREREREREREREQ",
+    "created_at": 1789776001,
+    "expires_at": 1789776301
+  },
+  "principal": {
+    "codec_version": 1,
+    "instance_id": "instance",
+    "tenant_id": "tenant",
+    "principal_id": "principal",
+    "state": "active",
+    "revoke_generation": 1,
+    "identity_binding_revision": 1,
+    "authz_revision": 1,
+    "role_ids": [
+      "requester"
+    ],
+    "scopes": [
+      "job:submit",
+      "job:read:own",
+      "job:cancel:own"
+    ]
+  },
+  "session_cases": [
+    {
+      "principal": {
+        "tenant_id": "other"
+      },
+      "reason": "identity_mismatch"
+    },
+    {
+      "session": {
+        "principal_id": "other"
+      },
+      "reason": "identity_mismatch"
+    },
+    {
+      "principal": {
+        "state": "revoked"
+      },
+      "reason": "session_revoked"
+    },
+    {
+      "session": {
+        "state": "revoked"
+      },
+      "reason": "session_revoked"
+    },
+    {
+      "runtime": {
+        "bff_generation": 2
+      },
+      "reason": "session_revoked"
+    },
+    {
+      "principal": {
+        "authz_revision": 2
+      },
+      "reason": "revision_mismatch"
+    },
+    {
+      "principal": {
+        "identity_binding_revision": 2
+      },
+      "reason": "revision_mismatch"
+    },
+    {
+      "now": "2026-09-19T00:00:00.000Z",
+      "reason": "clock_anomaly"
+    },
+    {
+      "now": "2026-09-19T00:30:01.000Z",
+      "reason": "session_expired"
+    },
+    {
+      "principal": {
+        "role_ids": [
+          "operator"
+        ]
+      },
+      "reason": "session_invalid"
+    }
+  ]
+}

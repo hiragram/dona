@@ -1,0 +1,28 @@
+# Web認証状態の監査付き保存
+
+`dispatcher/src/web/`はDispatcher内部の保存層であり、browser向けAPIや認可完了の証明ではない。`WebAuthRepository`は同じSQLite connectionから共通監査repositoryとprotected clock transactionを構築する。BFFから渡すOIDC由来のsubject index、cookie index、暗号化payloadは、後続の認証済みUDS brokerで検証してから利用する。clientがheaderやbodyで指定した値をそのまま渡してはならない。
+
+## 保存と照合
+
+`web_auth_state`に、固定instance/tenantのregistry、保持するsubject index、session、login、消費receipt、nonce参照のmetadataをcanonical JSONとして保存する。現在のdigestを共通監査の`web_auth_state` resourceへ署名し、read・更新計画では同じSQLite snapshotの実metadataとcommitmentを照合する。旧値への差替え、行の欠落、scope不一致、schema変更を拒否する。独自のWeb audit sequenceは持たず、[共通checkpoint](audited-resource-checkpoints.md)でretention後も根拠を保持する。
+
+access tokenとloginの秘密はBFFの既存AES-GCM helperで暗号化し、`web_auth_payloads`へ別保存する。metadataはpayloadの参照とdigestだけを保持する。payloadは用途、owner binding、key version、nonce/tag/ciphertextのcanonical encodingへ結び、改変・欠落・owner差替えを拒否する。metadataとpayloadの作成・削除は同じ監査transactionで行い、外部anchorのfinalizeと検証が終わるまで結果を返さない。DB commit後の応答喪失は成功へ変換せず、同じ操作を自動再送しない。
+
+metadataは4 MiB、principalは1,024件、subject aliasは16,384件、sessionは2,048件、pending loginと消費receiptは各512件、nonce参照は2,048件を上限とする。principalとsubject aliasは自動削除しない。容量不足はfail closedであり、保持indexを捨てて空きを作る理由にはしない。生のissuer/subject、token、cookie、秘密鍵、表示名や自由記述をmetadataへ保存しない。
+
+## 操作契約
+
+- `initialize`は既存の共通監査rootに結ぶ空metadataだけを作る。principal、role、credential、subject key、信頼rootを自動作成しない。
+- `createLogin`は5分のlogin bindingと暗号化payloadを保存する。BFFは開始requestのsession cookieがない場合だけ明示的な`null`を渡し、ある場合は保持keyによる全index候補を渡す。repositoryが旧sessionを照合し、置換対象をloginと消費receiptへ保存する。client指定のsession IDを置換対象にしない。`consumeLogin`はcookie bindingと期限を確認し、payloadを削除した上でBFFへ返す。token交換は消費結果の確定後にだけ行う。
+- 消費時に最大10秒、かつ元のlogin期限を越えないreceiptを残す。`createSession`はこのreceipt、全保持subject keyのindex、単一の既存principal、current revision・generation・期限を照合し、receiptを一回だけ消費する。新sessionの作成と同じtransactionで置換対象の旧sessionを失効させ、旧payloadとnonceを削除する。OIDC失敗後に同じ交換や消費を再送しない。
+- `lookupSession`は監査済みのlocal dataを返すだけで、online introspectionやresource認可を代行しない。現存rowに必要なcookie key versionの欠落と曖昧な複数一致を拒否する。BFFでは実keyの用途・状態・完全な保持inventoryも検証する。
+- `revokeSession`は同じcookie bindingを確認し、IdPへ接続せず失効metadataとpayload削除を確定する。BFFのOrigin、Fetch Metadata、CSRF確認は別途必須である。確定のreadback後にだけcookieを消す。
+- `restart`は共有BFF世代を進め、旧session・pending login・消費receiptを失効させる。`expire`はprotected clockで期限を確認し、期限切れsessionのsecretを削除して失効させる。session IDとcookie digestのtombstoneは絶対期限から24時間後まで保持し、進行中のloginが置換対象として参照している間も削除しない。短命login・receiptは期限後に削除する。両操作はruntime hookへまだ接続していない。
+
+## 検証と残る接続
+
+固定fixtureはBFFの実暗号化helperで生成し、両packageで暗号化形式、cookie index、sessionの拒否条件を検証する。fixture内のkey素材やtokenはテスト専用で、実credentialではない。SQLiteの別connection・再open、一回消費、旧metadataへの差替え、ciphertext改変、audit予約・finalizeの失敗と応答喪失、途中のSQL失敗、local revoke、世代更新、expiry、schema改変を検証する。
+
+fixtureのregistry seedは、認可済みのregistryが既に存在する場合を作るテスト準備である。実operator承認・初期登録・変更・復旧・key lifecycleの実装や証拠ではない。productionへ向けた登録APIや承認済みflagは追加していない。
+
+認証済みUDS、BFF listener、real credential/CAS provider、runtime migration/readiness、起動時の失効hook、backupからのpayload除外、principalの管理操作、activity更新、ingress nonceと業務判断の原子的接続は後続である。複数の状態rootを同時に更新する業務gateには共通監査の複数commitment対応も必要となる。nonceだけを先に消費し、別transactionで業務更新して原子的認可と扱ってはならない。実IdP、WebAuthn、browser、productionの検証は行っておらず、#141をこの保存層だけで完了扱いしない。

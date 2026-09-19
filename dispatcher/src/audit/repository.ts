@@ -238,6 +238,7 @@ export class AuditRepository {
   appendPrepared(transactionId: string, keyVersion: number,
     prepare: (state: VerifiedAuditState) => { event: AuditEvent; resource_digest: string | null; mutation: () => unknown }): { record: AuditRecord; result: unknown } {
     return guard(() => {
+      assertSynchronousCallback(prepare);
       assertSecurityDurability(this.db);
       if (this.db.inTransaction || this.db.readonly || this.db.pragma("query_only", { simple: true }) !== 0) throw new AuditIntegrityError();
       loadSecurityExtension(this.db);
