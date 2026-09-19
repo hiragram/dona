@@ -49,7 +49,7 @@ function setup(t: { after(fn: () => void): void }, existing = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-repository-"));
   const filename = path.join(root, "dispatcher.sqlite");
   if (existing) new DispatcherDatabase(filename).close();
-  const db = new Database(filename); db.pragma("journal_mode = WAL"); db.pragma("foreign_keys = ON");
+  const db = new Database(filename); db.pragma("synchronous=FULL"); db.pragma("journal_mode = WAL"); db.pragma("foreign_keys = ON");
   const version = db.pragma("user_version", { simple: true });
   installAuditSchema(db);
   db.exec("CREATE TABLE decisions (id TEXT PRIMARY KEY, state TEXT NOT NULL)");
@@ -72,7 +72,7 @@ test("cleanと既存Dispatcher DBへopt-in schemaを追加し、再openでも正
     assert.equal(response.result, "receipt_1");
     assert.deepEqual(store.calls, ["reserve", "finalize"]);
     assert.equal(store.value.pending_transaction_id, null);
-    const reopened = new Database(filename);
+    const reopened = new Database(filename); reopened.pragma("synchronous=FULL");
     try {
       installAuditSchema(reopened);
       assert.equal(new AuditRepository(reopened, store, keys).verify().sequence, 1);
@@ -103,13 +103,18 @@ test("reserve失敗・受理不明ではdecisionとauditをwriteせずblind retr
 test("audit insertとdecision mutationの失敗は両方rollbackしreservationを残す", (t) => {
   for (const failAudit of [false, true]) {
     const { db, store, repository } = setup(t);
-    if (failAudit) db.exec("CREATE TRIGGER fail_audit BEFORE INSERT ON security_audit_records BEGIN SELECT RAISE(ABORT, 'injected'); END");
+    const prepare = db.prepare.bind(db); let failures = 0;
+    if (failAudit) t.mock.method(db, "prepare", ((sql: string) => {
+      if (sql.startsWith("INSERT INTO security_audit_records")) { failures++; throw new Error("injected SQL prepare failure"); }
+      return prepare(sql);
+    }) as typeof db.prepare);
     assert.throws(() => repository.append("tx_1", 1, event, () => {
       db.exec("INSERT INTO decisions VALUES ('request_1','approved')");
       throw new Error("private mutation error");
     }), AuditIntegrityError);
     assert.equal(count(db, "decisions"), 0); assert.equal(count(db, "security_audit_records"), 0);
     assert.equal(store.value.pending_transaction_id, "tx_1"); assert.deepEqual(store.calls, ["reserve"]);
+    assert.equal(failures, failAudit ? 1 : 0);
     assert.throws(() => repository.verify(), AuditIntegrityError);
   }
 });
@@ -130,7 +135,7 @@ test("DB commit後のfinalize失敗・応答喪失を成功にせず、read-only
 
 test("別connectionからstale anchor・DB restore・レコード欠落を拒否する", (t) => {
   const { db, filename, store, repository } = setup(t);
-  const second = new Database(filename);
+  const second = new Database(filename); second.pragma("synchronous=FULL");
   try {
     const peer = new AuditRepository(second, store, keys);
     const genesis = store.read();
@@ -157,7 +162,7 @@ test("duplicate transaction・時刻巻戻り・outer transactionは外部reserv
 
 test("unknown schema・部分schemaを修復せず、非同期callbackもcommitしない", (t) => {
   const { db, store, repository } = setup(t);
-  assert.throws(() => repository.append("tx_1", 1, event, () => Promise.resolve("late")), AuditIntegrityError);
+  assert.throws(() => repository.append("tx_1", 1, event, (() => Promise.resolve("late")) as never), AuditIntegrityError);
   assert.equal(count(db, "security_audit_records"), 0); assert.equal(store.value.pending_transaction_id, "tx_1");
   db.exec("DROP TABLE security_audit_schema; CREATE TABLE security_audit_schema(version); INSERT INTO security_audit_schema VALUES (2)");
   assert.throws(() => installAuditSchema(db), AuditIntegrityError);
@@ -238,11 +243,15 @@ test("checkpoint確定後の削除失敗は検証可能なprefixを残し、明�
   const { db, store, repository } = setup(t);
   repository.append("tx_1", 1, event, () => {});
   const retention = retentionRepository(db, store);
-  db.exec("CREATE TRIGGER fail_delete BEFORE DELETE ON security_audit_records BEGIN SELECT RAISE(ABORT, 'injected'); END");
+  const prepare = db.prepare.bind(db); let failures = 0;
+  const injected = t.mock.method(db, "prepare", ((sql: string) => {
+    if (sql.startsWith("DELETE FROM security_audit_records")) { failures++; throw new Error("injected SQL prepare failure"); }
+    return prepare(sql);
+  }) as typeof db.prepare);
   assert.throws(() => retention.retain("retention_1", 2, 1, "2027-11-01T00:00:00.000Z"), AuditIntegrityError);
   assert.equal(store.value.pending_transaction_id, null);
   assert.equal(count(db, "security_audit_records"), 1); assert.equal(retention.verify().sequence, 1);
-  db.exec("DROP TRIGGER fail_delete");
+  assert.equal(failures, 1); injected.mock.restore();
   retention.pruneRetainedPrefix();
   assert.equal(count(db, "security_audit_records"), 0);
   assert.deepEqual(store.calls, ["reserve", "finalize", "reserve", "finalize"]);
@@ -250,7 +259,7 @@ test("checkpoint確定後の削除失敗は検証可能なprefixを残し、明�
 
 test("finalize直後の別connection appendを直列化し、確定済み業務更新を失敗扱いしない", (t) => {
   const { db, filename, store, repository } = setup(t);
-  const otherDb = new Database(filename); otherDb.pragma("busy_timeout = 0");
+  const otherDb = new Database(filename); otherDb.pragma("synchronous=FULL"); otherDb.pragma("busy_timeout = 0");
   try {
     const other = new AuditRepository(otherDb, store, keys);
     const finalize = store.finalize.bind(store);
@@ -274,4 +283,58 @@ test("finalize直後の別connection appendを直列化し、確定済み業務�
     other.append("tx_after", 1, event, () => {});
     assert.equal(repository.verify().sequence, 2);
   } finally { otherDb.close(); }
+});
+
+test("mutationが監査schemaを変更したら業務SQLとDDLをrollbackしanchorをfinalizeしない", t => {
+  for (const sql of [
+    "DROP TRIGGER security_audit_no_update",
+    "CREATE INDEX security_audit_extra ON decisions(id)",
+    "CREATE TEMP TRIGGER injected AFTER INSERT ON security_audit_records BEGIN SELECT 1; END",
+  ]) {
+    const { db, repository, store } = setup(t);
+    assert.throws(() => repository.append("shape_tx", 1, event, () => {
+      db.exec("INSERT INTO decisions VALUES ('request_1','approved')"); db.exec(sql);
+    }), AuditIntegrityError);
+    assert.equal(count(db, "decisions"), 0); assert.equal(count(db, "security_audit_records"), 0);
+    assert.deepEqual(store.calls, ["reserve"]); assert.equal(store.value.pending_transaction_id, "shape_tx");
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='security_audit_no_update'").get());
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_temp_master WHERE name='injected'").get(), undefined);
+  }
+});
+
+test("監査schemaの欠落・未知object・TEMP shadowをverifyとinstallerで拒否する", t => {
+  for (const sql of [
+    "DROP TRIGGER security_audit_no_update",
+    "CREATE INDEX security_audit_extra ON decisions(id)",
+    "CREATE TEMP TRIGGER injected AFTER INSERT ON security_audit_records BEGIN SELECT 1; END",
+    "CREATE TEMP TABLE security_audit_schema(version INTEGER); INSERT INTO temp.security_audit_schema VALUES (1)",
+  ]) {
+    const { db, repository, store } = setup(t); db.exec(sql);
+    assert.throws(() => repository.verify(), AuditIntegrityError);
+    assert.throws(() => installAuditSchema(db), AuditIntegrityError);
+    assert.throws(() => repository.append("shape_tx", 1, event, () => {}), AuditIntegrityError);
+    assert.deepEqual(store.calls, []);
+  }
+});
+
+
+test("大文字TEMP tableにchainを複製してもdurable auditの代用にできない", t => {
+  for(const name of ["SECURITY_AUDIT_RECORDS","Security_Audit_Checkpoint","SECURITY_AUDIT_SCHEMA"]) {
+    const {db,repository,store}=setup(t);db.exec(`CREATE TEMP TABLE ${name} AS SELECT * FROM main.${name}`);
+    assert.throws(()=>repository.verify(),AuditIntegrityError);assert.throws(()=>installAuditSchema(db),AuditIntegrityError);
+    assert.throws(()=>repository.append("shadow_tx",1,event,()=>{}),AuditIntegrityError);
+    assert.deepEqual(store.calls,[]);
+    assert.equal((db.prepare("SELECT count(*) AS n FROM main.security_audit_records").get() as {n:number}).n,0);
+  }
+});
+
+
+test("共通auditの更新もjournal・同期設定不足なら予約前に拒否する",t=>{
+  for(const pragma of ["journal_mode=OFF","journal_mode=MEMORY","journal_mode=DELETE","synchronous=NORMAL"]) {
+    const {db,repository,store}=setup(t);db.unsafeMode(true);db.pragma(pragma);
+    assert.throws(()=>repository.append("bad_durability",1,event,()=>{}),AuditIntegrityError);
+    assert.throws(()=>repository.retain("bad_retention",1,1,"2027-11-01T00:00:00.000Z"),AuditIntegrityError);
+    assert.throws(()=>repository.pruneRetainedPrefix(),AuditIntegrityError);
+    assert.deepEqual(store.calls,[]);assert.equal(repository.verify().sequence,0);
+  }
 });

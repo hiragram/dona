@@ -12,7 +12,7 @@
     "dona-dispatcher-mcp": "dist/mcp/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build-sqlite-identity.mjs && tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts serve",
     "start": "node dist/cli.js serve",
     "test": "node test/run-tests.mjs",

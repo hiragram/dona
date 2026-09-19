@@ -1,4 +1,8 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
+import { assertSecurityDurability } from "./durability.js";
+import { loadSecurityExtension, withMutationSqlGuard } from "./file-identity.js";
+import { verifyApprovalSchema } from "../approval/schema.js";
+import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "./synchronous.js";
 import {
   AuditIntegrityError, auditAnchorSchema, signAuditRecord, signAuditCheckpoint, verifyAuditChain,
   type AuditAnchor, type AuditCheckpoint, type AuditEvent, type AuditKeyLookup, type AuditRecord,
@@ -27,24 +31,7 @@ function requireEqual(left: AuditAnchor, right: AuditAnchor): void {
   if (!equal(auditAnchorSchema.parse(left), auditAnchorSchema.parse(right))) throw new AuditIntegrityError();
 }
 
-/** Opt-in schema only; callers must introduce Dispatcher compatibility/migration
- * and protected-store provisioning before connecting this to the runtime. */
-export function installAuditSchema(db: Database.Database): void {
-  guard(() => {
-    if (db.inTransaction) throw new AuditIntegrityError();
-    db.transaction(() => {
-      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='security_audit_schema'").get();
-      if (exists) {
-        const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
-        if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
-        // Never repair a partly missing schema into an apparently new chain.
-        db.prepare("SELECT sequence, transaction_id, record_json FROM security_audit_records LIMIT 0").all();
-        db.prepare("SELECT singleton, transaction_id, checkpoint_json FROM security_audit_checkpoint LIMIT 0").all();
-        return;
-      }
-      const remnants = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('security_audit_records','security_audit_checkpoint')").all();
-      if (remnants.length) throw new AuditIntegrityError();
-      db.exec(`
+const schemaSql = `
         CREATE TABLE security_audit_schema (version INTEGER PRIMARY KEY CHECK (version = 1));
         INSERT INTO security_audit_schema VALUES (1);
         CREATE TABLE security_audit_checkpoint (
@@ -59,7 +46,36 @@ export function installAuditSchema(db: Database.Database): void {
         );
         CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records
           BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END;
-      `);
+`;
+const shapeQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_' ORDER BY type,name";
+function shape(db: Database.Database): string { return JSON.stringify(db.prepare(shapeQuery).all()); }
+let expectedShape: string | undefined;
+export function verifyAuditSchema(db: Database.Database): void {
+  guard(() => {
+    if (expectedShape === undefined) {
+      const expected = new Database(":memory:");
+      try { expected.exec(schemaSql); expectedShape = shape(expected); } finally { expected.close(); }
+    }
+    if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,15)!='security_audit_' AND substr(lower(name),1,9)!='approval_'").get()
+      || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new AuditIntegrityError();
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) verifyApprovalSchema(db);
+    const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
+    if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
+  });
+}
+
+/** Opt-in schema only; callers must introduce Dispatcher compatibility/migration
+ * and protected-store provisioning before connecting this to the runtime. */
+export function installAuditSchema(db: Database.Database): void {
+  guard(() => {
+    if (db.inTransaction) throw new AuditIntegrityError();
+    db.transaction(() => {
+      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='security_audit_schema'").get();
+      if (exists) { verifyAuditSchema(db); return; }
+      if (db.prepare(shapeQuery).get() || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+      db.exec(schemaSql);
+      verifyAuditSchema(db);
     }).immediate();
   });
 }
@@ -80,10 +96,7 @@ export class AuditRepository {
       yield record;
     }
   }
-  private assertSchema(): void {
-    const versions = this.db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
-    if (versions.length !== 1 || versions[0]?.version !== schemaVersion) throw new AuditIntegrityError();
-  }
+  private assertSchema(): void { verifyAuditSchema(this.db); }
   private verifyInside(): AuditAnchor {
     this.assertSchema();
     const before = auditAnchorSchema.parse(this.store.read());
@@ -96,6 +109,7 @@ export class AuditRepository {
    * trust-root creation, reset, repair, or automatic restore occurs here. */
   initialize(checkpoint: AuditCheckpoint): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       this.db.transaction(() => {
         this.assertSchema();
@@ -120,9 +134,13 @@ export class AuditRepository {
   /** mutation must perform synchronous SQL on this same DB connection only.
    * It must not commit, issue external writes, or return deferred work. The returned
    * value is released only after durable finalize and a complete verified reread. */
-  append<T>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => T): { record: AuditRecord; result: T } {
+  append<F extends () => unknown>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: SynchronousCallback<F>): { record: AuditRecord; result: ReturnType<F> };
+  append(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => unknown): { record: AuditRecord; result: unknown } {
     return guard(() => {
+      assertSecurityDurability(this.db);
+      assertSynchronousCallback(mutation);
       if (this.db.inTransaction) throw new AuditIntegrityError();
+      loadSecurityExtension(this.db);
       let reservation: AuditAnchor | undefined;
       const committed = this.db.transaction(() => {
         const current = this.verifyInside();
@@ -143,11 +161,12 @@ export class AuditRepository {
         requireEqual(reservation, this.store.read());
         this.db.prepare("INSERT INTO security_audit_records VALUES (?, ?, ?)")
           .run(record.sequence, transactionId, JSON.stringify(record));
-        const result = mutation();
-        if (result !== null && (typeof result === "object" || typeof result === "function")
-          && typeof (result as { then?: unknown }).then === "function") throw new AuditIntegrityError();
+        const result = withMutationSqlGuard(this.db, mutation);
+        assertSecurityDurability(this.db);
+        assertSynchronousResult(result);
         // A callback may not modify the audit rows/checkpoint or transaction state.
         if (!this.db.inTransaction) throw new AuditIntegrityError();
+        this.assertSchema();
         const expected = { ...proposed, pending_transaction_id: null };
         verifyAuditChain(this.checkpoint(), this.records(), expected, this.keys);
         requireEqual(reservation, this.store.read());
@@ -172,6 +191,7 @@ export class AuditRepository {
    * keeps at least 400 days and does not retire verification keys or backups. */
   retain(transactionId: string, keyVersion: number, throughSequence: number, effectiveNow: string): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction || !Number.isSafeInteger(throughSequence) || throughSequence < 1) throw new AuditIntegrityError();
       const now = Date.parse(effectiveNow);
       if (!Number.isFinite(now) || new Date(now).toISOString() !== effectiveNow) throw new AuditIntegrityError();
@@ -212,6 +232,7 @@ export class AuditRepository {
    * This never finalizes or retries an ambiguous external write. */
   pruneRetainedPrefix(): void {
     guard(() => {
+      assertSecurityDurability(this.db);
       if (this.db.inTransaction) throw new AuditIntegrityError();
       this.db.transaction(() => {
         const anchor = this.verifyInside();
