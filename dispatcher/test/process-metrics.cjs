@@ -1,0 +1,133 @@
+const childProcess = require("node:child_process");
+const path = require("node:path");
+const process = require("node:process");
+const { performance } = require("node:perf_hooks");
+const { syncBuiltinESMExports } = require("node:module");
+
+const scope = Number(process.env.DONA_PROCESS_METRICS_SCOPE ?? "0");
+const nonce = process.env.DONA_PROCESS_METRICS_NONCE;
+if (!nonce && scope > 2) {
+  delete process.env.NODE_OPTIONS;
+  return;
+}
+if (!nonce || !/^[a-f0-9]{32}$/.test(nonce)) {
+  throw new Error("DONA_PROCESS_METRICS_NONCE must be a bounded nonce");
+}
+
+process.env.DONA_PROCESS_METRICS_SCOPE = String(scope + 1);
+if (scope >= 2) {
+  globalThis[Symbol.for("dona.checkpoint-nonce")] = nonce;
+  delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
+  delete process.env.DONA_PROCESS_METRICS_NONCE;
+  delete process.env.NODE_OPTIONS;
+}
+
+const totals = Object.fromEntries(["node", "git", "shell", "other"].map((name) => [name, { count: 0, elapsed: 0 }]));
+let active = 0;
+let overheadNs = 0n;
+let emitted = 0;
+const markerLimit = 2048;
+
+function classify(file) {
+  const name = path.basename(String(file)).toLowerCase();
+  if (name === "node" || name === "tsx" || name.endsWith(".mjs") || name.endsWith(".cjs")) return "node";
+  if (name === "git" || name.includes("fake-git")) return "git";
+  if (["sh", "bash", "zsh"].includes(name)) return "shell";
+  return "other";
+}
+
+function withNonce(options) {
+  return {
+    ...(options ?? {}),
+    env: {
+      ...process.env,
+      ...(options?.env ?? {}),
+      DONA_CHECKPOINT_REPORTER_NONCE: nonce,
+      DONA_PROCESS_METRICS_NONCE: nonce,
+    },
+  };
+}
+
+function emit() {
+  if (emitted >= markerLimit) return;
+  const started = process.hrtime.bigint();
+  const fields = ["node", "git", "shell", "other"]
+    .map((name) => `${name}=${totals[name].count}/${Math.round(totals[name].elapsed)}`)
+    .join(",");
+  process.stderr.write(`[dispatcher-test:${nonce}] metrics scope=${scope};${fields};active=${active};overhead_us=${Number(overheadNs / 1000n)}\n`);
+  emitted += 1;
+  overheadNs += process.hrtime.bigint() - started;
+}
+
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function instrumentedSpawn(file, args, options) {
+  const started = performance.now();
+  const processClass = classify(file);
+  active += 1;
+  totals[processClass].count += 1;
+  emit();
+  const child = originalSpawn.call(this, file, args, withNonce(options));
+  child.once("close", () => {
+    totals[processClass].elapsed += performance.now() - started;
+    active = Math.max(0, active - 1);
+    emit();
+  });
+  return child;
+};
+
+const originalSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = function instrumentedSpawnSync(file, args, options) {
+  const started = performance.now();
+  const processClass = classify(file);
+  const result = originalSpawnSync.call(this, file, args, withNonce(options));
+  totals[processClass].count += 1;
+  totals[processClass].elapsed += performance.now() - started;
+  emit();
+  return result;
+};
+
+const originalExecFile = childProcess.execFile;
+childProcess.execFile = function instrumentedExecFile(file, args, options, callback) {
+  const started = performance.now();
+  const processClass = classify(file);
+  const actualArgs = Array.isArray(args) ? args : [];
+  const actualOptions = Array.isArray(args)
+    ? (typeof options === "object" ? options : undefined)
+    : (typeof args === "object" ? args : undefined);
+  const actualCallback = typeof callback === "function" ? callback : typeof options === "function" ? options : typeof args === "function" ? args : undefined;
+  active += 1;
+  totals[processClass].count += 1;
+  emit();
+  return originalExecFile.call(this, file, actualArgs, withNonce(actualOptions), (...callbackArgs) => {
+    totals[processClass].elapsed += performance.now() - started;
+    active = Math.max(0, active - 1);
+    emit();
+    actualCallback?.(...callbackArgs);
+  });
+};
+childProcess.execFile[Symbol.for("nodejs.util.promisify.custom")] = (file, args, options) => new Promise((resolve, reject) => {
+  childProcess.execFile(file, args, options, (error, stdout, stderr) => {
+    if (error) {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+      return;
+    }
+    resolve({ stdout, stderr });
+  });
+});
+
+const originalExecFileSync = childProcess.execFileSync;
+childProcess.execFileSync = function instrumentedExecFileSync(file, args, options) {
+  const started = performance.now();
+  const processClass = classify(file);
+  try {
+    return originalExecFileSync.call(this, file, args, withNonce(options));
+  } finally {
+    totals[processClass].count += 1;
+    totals[processClass].elapsed += performance.now() - started;
+    emit();
+  }
+};
+
+syncBuiltinESMExports();

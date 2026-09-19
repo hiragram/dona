@@ -167,3 +167,24 @@ test("ProcessRunner does not report truncation below the configured output limit
   assert.equal(result.output_truncated, false);
   assert.equal(Buffer.byteLength(result.stdout), 513);
 });
+
+test("ProcessRunner keeps bounded process metrics and load without raw process data", async () => {
+  const nonce = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const script = `
+    process.stderr.write('[dispatcher-test:${nonce}] file-start test/job-runtime.test.ts load=0.625\\n');
+    process.stderr.write('[dispatcher-test:${nonce}] metrics scope=2;node=2/41,git=17/931,shell=1/8,other=0/0;active=3;overhead_us=72\\n');
+    process.stderr.write('[dispatcher-test:${nonce}] case-start test/job-runtime.test.ts:012345abcdef#1\\n');
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(
+    result.output_checkpoint,
+    "file=file-start test/job-runtime.test.ts load=0.625; last_finish=none; timeout=test/job-runtime.test.ts:012345abcdef#1; metrics=node=2/41,git=17/931,shell=1/8,other=0/0;active=3;overhead_us=72",
+  );
+  assert.equal(result.output_checkpoint.includes("pid="), false);
+  assert.equal(Buffer.byteLength(result.output_checkpoint), 192);
+});

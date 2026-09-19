@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 
 const file = process.env.DONA_DISPATCHER_TEST_FILE;
-const nonce = process.env.DONA_CHECKPOINT_REPORTER_NONCE;
-delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
+const nonce = process.env.DONA_CHECKPOINT_REPORTER_NONCE ?? globalThis[Symbol.for("dona.checkpoint-nonce")];
 if (!file || !/^test\/[A-Za-z0-9._-]+\.test\.ts$/.test(file) || !nonce || !/^[a-f0-9]{32}$/.test(nonce)) {
   throw new Error("DONA_DISPATCHER_TEST_FILE must be a repository-relative test file");
 }
 
 export default async function* checkpointReporter(source) {
+  delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
   const occurrences = new Map();
   const queuedTypes = new Map();
   for await (const event of source) {
@@ -36,6 +36,8 @@ export default async function* checkpointReporter(source) {
     const occurrence = occurrences.get(digest);
     if (!occurrence) continue;
     const action = event.type === "test:pass" ? "case-finish" : "case-fail";
-    yield `\n[dispatcher-test:${nonce}] ${action} ${file}:${digest}#${occurrence}\n`;
+    const identity = `${digest}#${occurrence}`;
+    const elapsed = Math.round(event.data.details?.duration_ms ?? 0);
+    yield `\n[dispatcher-test:${nonce}] ${action} ${file}:${identity} elapsed_ms=${elapsed}\n`;
   }
 }

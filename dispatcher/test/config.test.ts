@@ -30,6 +30,11 @@ describe("job resource config", () => {
     assert.match(reporter, /"case-finish"/);
     assert.match(reporter, /`\\n\[dispatcher-test:\$\{nonce\}\]/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
+    assert.match(runner, /process-metrics\.cjs/);
+    const metrics = fs.readFileSync(new URL("./process-metrics.cjs", import.meta.url), "utf8");
+    assert.match(metrics, /const markerLimit = 2048/);
+    assert.match(metrics, /\["node", "git", "shell", "other"\]/);
+    assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
   });
 
   test("expands documented home-relative paths consistently", () => {
