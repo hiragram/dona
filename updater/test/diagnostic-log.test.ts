@@ -156,6 +156,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(middleSecretDetail.includes("cloud-secret"), false);
     assert.match(middleSecretDetail, /REDACTED_STREAM/);
     assert.match(middleSecretDetail, /visible-after-cloud-auth/);
+
+    const jsonCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:json-auth" });
+    jsonCapture.write("stderr", Buffer.from('{"to'));
+    jsonCapture.write("stderr", Buffer.from('ken":"json-secret"}\nvisible-after-json'));
+    jsonCapture.finish(true);
+    const jsonDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[10]!, 16_384).detail_tail);
+    assert.equal(jsonDetail.includes("json-secret"), false, jsonDetail);
+    assert.match(jsonDetail, /REDACTED_STREAM/);
+    assert.match(jsonDetail, /visible-after-json/);
   } finally {
     f.database.close();
   }
@@ -352,7 +361,7 @@ test("open validation failure closes its descriptor and removes the managed part
     fsSync.fstatSync = originalFstat;
     fsSync.closeSync = originalClose;
     assert.equal(capture.finish(true)?.error_code, "diagnostic_open_failed");
-    assert.equal(closeCalls, 1);
+    assert.equal(closeCalls, 2);
     const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
     assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry.endsWith(".part")), []);
     const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
@@ -618,7 +627,17 @@ test("singleton startup recovers interrupted rows and removes their bounded part
   const reopened = new UpdateDatabase(databasePath);
   try {
     const recoveryStore = new DiagnosticLogStore(f.policy.control_root, f.policy.diagnostic_log_limit_bytes, reopened);
+    const syncStore = recoveryStore as unknown as { fsyncLogsDirectory(): void };
+    const originalFsync = syncStore.fsyncLogsDirectory.bind(recoveryStore);
+    const originalInterrupt = reopened.interruptDiagnosticLog.bind(reopened);
+    const events: string[] = [];
+    syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
+    reopened.interruptDiagnosticLog = ((logId, errorCode, at) => {
+      events.push("interrupt");
+      return originalInterrupt(logId, errorCode, at);
+    }) as typeof reopened.interruptDiagnosticLog;
     recoveryStore.recoverInterruptedCaptures(new Date("2026-09-19T01:00:00.000Z"));
+    assert.deepEqual(events, ["fsync", "interrupt"]);
     const recovered = reopened.diagnosticLogs(f.claimed.request_id)[0]!;
     assert.equal(recovered.capture_state, "write_failed");
     assert.equal(recovered.error_code, "diagnostic_capture_interrupted");

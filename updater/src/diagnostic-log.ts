@@ -69,7 +69,7 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*[:=]\s*(["']?)/i
+      const assignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*)\s*[:=]\s*(["']?)/i
         .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
@@ -92,11 +92,23 @@ class StreamingRedactor {
         this.pending = "";
         return output;
       }
+      const partialQuotedKey = /(?:^|[^a-z0-9_])["'][a-z0-9_]*$/i.exec(this.pending);
+      if (partialQuotedKey?.index !== undefined) {
+        output += redactText(this.pending.slice(0, partialQuotedKey.index), Number.MAX_SAFE_INTEGER);
+        this.pending = this.pending.slice(partialQuotedKey.index);
+        if (this.pending.length > maxCarryCharacters) {
+          output += "[REDACTED_STREAM]";
+          this.pending = "";
+          this.droppingSensitive = true;
+          this.droppingQuote = undefined;
+        }
+        return output;
+      }
       let lastBoundary = -1;
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*)\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
@@ -113,7 +125,7 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return output;
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)[a-z0-9_]*)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -193,6 +205,7 @@ export class DiagnosticLogStore {
           }
         }
         for (const entry of entries) fs.unlinkSync(entry.path);
+        if (entries.length > 0) this.fsyncLogsDirectory();
       } catch {
         // Keep the bound row intact so a later singleton startup can retry;
         // never turn an unremoved managed file into an unreferenced orphan.
@@ -470,6 +483,7 @@ export class DiagnosticLogStore {
       }
     }
     for (const entry of entries) fs.unlinkSync(entry.path);
+    if (entries.length > 0) this.fsyncLogsDirectory();
   }
 
   private assertPrivateDirectory(directory: string): void {
