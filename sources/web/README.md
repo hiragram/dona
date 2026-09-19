@@ -45,3 +45,5 @@ session rotation・durable revoke・restart失効、subject tombstone/key lifecy
 OIDCのexchangeとinspectは、保護時計を都度再読するcallbackを必須とする。通信後の時刻でiat/expを検証し、通信中の発行・失効・時計巻戻りを判定する。client時刻や未検証wall clockへfallbackせず、最終のdurable認可gateでも再確認する。
 
 login transactionのstate・nonce・PKCE verifierはweb_login_transaction専用keyで暗号化し、cookie keyed digestとそのkey version、instance/tenant、login ref、BFF generation、5分の期限へbindする。serverは監査付きtransactionで一回消費と保存secret削除を確定してから復号・token交換する。暗号化helper自体はreplayを防がず、durable consumeを代替しない。受理不明をtoken交換の再試行へ流さない。
+
+Web session・固定route・ingress contextの追加契約は [運用文書](../../docs/operations/web-session-contracts.md) を参照する。監査付き保存・実listenerへの接続は後続であり、このpackageだけで認可を完了しない。
