@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 
 import type { UpdatePolicy } from "./policy.js";
@@ -17,6 +18,16 @@ async function fsyncDirectory(directory: string): Promise<void> {
 function inside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function isNativeClock(root: string, candidate: string): boolean {
+  return path.relative(root, candidate) === path.join("dispatcher", "dist", "native", "security-clock");
+}
+
+function assertNativeClockFile(stats: Stats): void {
+  if (!stats.isFile() || stats.nlink !== 1 || (stats.mode & 0o100) === 0) {
+    throw new Error("native_clock_release_invalid");
+  }
 }
 
 async function writeAtomic(filePath: string, body: string, mode = 0o600): Promise<void> {
@@ -294,6 +305,7 @@ export class ReleaseStore {
     hardlinks: Map<string, { expectedLinks: number; paths: string[] }>,
   ): Promise<void> {
     const stats = await fs.lstat(current);
+    if (isNativeClock(root, current)) assertNativeClockFile(stats);
     if (stats.isSymbolicLink()) {
       const resolved = await fs.realpath(current);
       const realRoot = await fs.realpath(root);
@@ -319,14 +331,16 @@ export class ReleaseStore {
     }
   }
 
-  private async makeImmutable(current: string): Promise<void> {
+  private async makeImmutable(current: string, root = current): Promise<void> {
     const stats = await fs.lstat(current);
+    const nativeClock = isNativeClock(root, current);
+    if (nativeClock) assertNativeClockFile(stats);
     if (stats.isSymbolicLink()) return;
     if (stats.isDirectory()) {
-      for (const child of await fs.readdir(current)) await this.makeImmutable(path.join(current, child));
+      for (const child of await fs.readdir(current)) await this.makeImmutable(path.join(current, child), root);
       await fs.chmod(current, 0o500);
     } else if (stats.isFile()) {
-      await fs.chmod(current, 0o400);
+      await fs.chmod(current, nativeClock ? 0o500 : 0o400);
     }
   }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -25,6 +26,46 @@ function row(): UpdateRow {
 }
 
 describe("ReleaseStore", () => {
+  test("公開後も固定clock helperだけowner executeを保持する", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const store = new ReleaseStore(policy);
+    const staging = await store.prepareStaging(row().request_id, 1);
+    const relative = path.join("dispatcher", "dist", "native", "security-clock");
+    await fs.mkdir(path.dirname(path.join(staging, relative)), { recursive: true, mode: 0o700 });
+    // 公開権限のfixture。実OS clockの内容はDispatcherのnative testで検証する。
+    await fs.writeFile(path.join(staging, relative), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await fs.writeFile(path.join(staging, "other-executable"), "fixture", { mode: 0o700 });
+    const release = await store.publish(staging, manifest(targetSha));
+    const helper = path.join(release, relative);
+    assert.equal((await fs.stat(helper)).mode & 0o777, 0o500);
+    assert.equal((await fs.stat(path.dirname(helper))).mode & 0o777, 0o500);
+    assert.equal((await fs.stat(path.join(release, "other-executable"))).mode & 0o777, 0o400);
+    const result = spawnSync(helper, [], { timeout: 2000, maxBuffer: 1024, env: {}, shell: false });
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 0);
+  });
+
+  test("clock helperの別名linkや非実行fileを公開前に拒否する", async () => {
+    for (const kind of ["symlink", "hardlink", "non-executable", "directory"] as const) {
+      const { root, policy } = await tempPolicy();
+      roots.push(root);
+      const store = new ReleaseStore(policy);
+      const staging = await store.prepareStaging(row().request_id, 1);
+      const helper = path.join(staging, "dispatcher", "dist", "native", "security-clock");
+      await fs.mkdir(path.dirname(helper), { recursive: true, mode: 0o700 });
+      const target = path.join(staging, "target");
+      await fs.writeFile(target, "fixture", { mode: 0o700 });
+      if (kind === "symlink") await fs.symlink(target, helper);
+      if (kind === "hardlink") await fs.link(target, helper);
+      if (kind === "non-executable") await fs.writeFile(helper, "fixture", { mode: 0o600 });
+      if (kind === "directory") await fs.mkdir(helper);
+      await assert.rejects(store.publish(staging, manifest(targetSha)), /native_clock_release_invalid/);
+      await assert.rejects(fs.stat(path.join(policy.release_root, targetSha)), { code: "ENOENT" });
+    }
+  });
+
   test("publishes an immutable release and atomically activates and rolls it back", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
