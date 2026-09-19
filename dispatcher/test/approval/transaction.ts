@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
+import { fork } from "node:child_process";
 import Database from "better-sqlite3";
 import {
   AuditRepository,
@@ -21,6 +23,16 @@ import {
   ApprovalTransaction,
   ApprovalTransactionError,
 } from "../../src/approval/transaction.js";
+import {
+  fixtureKeys,
+  fixtureCheckpoint,
+  initializeFixtureStore,
+  openFixtureStores,
+} from "./fixtures/transaction-store.js";
+import {
+  withSecurityTransactionLock,
+  SecurityCoordinationError,
+} from "../../src/audit/coordination.js";
 
 // Deliberately test-only stores, without production durability or credentials.
 const key: AuditKey = {
@@ -125,6 +137,7 @@ function setup(t: { after(fn: () => void): void }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-transaction-"));
   const filename = path.join(dir, "fixture.sqlite");
   const db = new Database(filename);
+  fs.chmodSync(filename, 0o600);
   db.pragma("journal_mode=WAL");
   db.pragma("foreign_keys=ON");
   db.pragma("synchronous=FULL");
@@ -297,3 +310,173 @@ test("業務mutation中のclock driftではrollbackしaudit reservationを保持
   assert.equal(count(db, "approval_requests"), 0);
   assert.equal(anchors.value.pending_transaction_id, "tx1");
 });
+
+test(
+  "独立workerの並行runをclock予約前からaudit finalizeまで直列化する",
+  { timeout: 5000 },
+  async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "approval-race-"));
+    const filename = path.join(directory, "dispatcher.sqlite");
+    const storeFile = path.join(directory, "fixture-store.sqlite");
+    const db = new Database(filename);
+    fs.chmodSync(filename, 0o600);
+    db.pragma("journal_mode=WAL");
+    db.pragma("foreign_keys=ON");
+    installAuditSchema(db);
+    installApprovalSchema(db);
+    initializeFixtureStore(storeFile);
+    const stores = openFixtureStores(storeFile);
+    const audit = new AuditRepository(db, stores.anchors, fixtureKeys);
+    audit.initialize(fixtureCheckpoint);
+    const barrier = new SharedArrayBuffer(4);
+    const gate = new Int32Array(barrier);
+    const workers = [1, 2].map(
+      (ordinal) =>
+        new Worker(
+          new URL("./fixtures/transaction-worker.mjs", import.meta.url),
+          {
+            workerData: {
+              database: filename,
+              store: storeFile,
+              ordinal,
+              barrier,
+            },
+          },
+        ),
+    );
+    t.after(async () => {
+      await Promise.all(workers.map((worker) => worker.terminate()));
+      stores.close();
+      db.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
+    let ready = 0;
+    const clockViews: Array<{ sequence: number; pending: string | null }> = [];
+    const results = await Promise.all(
+      workers.map(
+        (worker) =>
+          new Promise<{ success: boolean; error?: string }>(
+            (resolve, reject) => {
+              let result: { success: boolean; error?: string } | undefined;
+              worker.on("error", reject);
+              worker.on("message", (message) => {
+                if (message.kind === "ready" && ++ready === 2) {
+                  Atomics.store(gate, 0, 1);
+                  Atomics.notify(gate, 0, 2);
+                } else if (message.kind === "clock") clockViews.push(message);
+                else if (message.kind === "done") result = message;
+              });
+              worker.on("exit", (code) => {
+                if (code === 0 && result) resolve(result);
+                else reject(new Error("fixture_worker_incomplete"));
+              });
+            },
+          ),
+      ),
+    );
+    assert.equal(
+      results.every((result) => result.success),
+      true,
+      JSON.stringify(results),
+    );
+    assert.deepEqual(clockViews.map((view) => view.sequence).sort(), [0, 1]);
+    assert.equal(
+      clockViews.every((view) => view.pending === null),
+      true,
+    );
+    assert.equal(audit.verify().sequence, 2);
+    assert.equal(count(db, "approval_requests"), 2);
+    assert.equal(count(db, "approval_clock_reservations"), 2);
+    assert.equal(
+      fs.statSync(filename + ".security-lock.sqlite").mode & 0o777,
+      0o600,
+    );
+  },
+);
+
+test("共通lockは再入・不正権限・別用途fileを拒否し、既存dataを上書きしない", (t) => {
+  const { db, filename } = setup(t);
+  withSecurityTransactionLock(db, () => {
+    assert.throws(
+      () => withSecurityTransactionLock(db, () => null),
+      SecurityCoordinationError,
+    );
+  });
+  assert.equal(
+    withSecurityTransactionLock(db, () => "next"),
+    "next",
+  );
+  fs.chmodSync(filename, 0o640);
+  assert.throws(
+    () => withSecurityTransactionLock(db, () => null),
+    SecurityCoordinationError,
+  );
+  fs.chmodSync(filename, 0o600);
+  const other = setup(t);
+  const lockPath = other.filename + ".security-lock.sqlite";
+  const foreign = new Database(lockPath);
+  foreign.exec(
+    "CREATE TABLE unrelated (id TEXT); INSERT INTO unrelated VALUES ('original')",
+  );
+  foreign.close();
+  fs.chmodSync(lockPath, 0o600);
+  assert.throws(
+    () => withSecurityTransactionLock(other.db, () => null),
+    SecurityCoordinationError,
+  );
+  const reopened = new Database(lockPath, { readonly: true });
+  try {
+    assert.deepEqual(reopened.prepare("SELECT * FROM unrelated").all(), [
+      { id: "original" },
+    ]);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("lock fileのsymlinkを開かず、deferred callbackを完了扱いしない", (t) => {
+  const { db, filename } = setup(t);
+  const destination = path.join(path.dirname(filename), "unrelated.txt");
+  fs.writeFileSync(destination, "original", { mode: 0o600 });
+  fs.symlinkSync(destination, filename + ".security-lock.sqlite");
+  assert.throws(
+    () => withSecurityTransactionLock(db, () => null),
+    SecurityCoordinationError,
+  );
+  assert.equal(fs.readFileSync(destination, "utf8"), "original");
+  const other = setup(t);
+  assert.throws(
+    () => withSecurityTransactionLock(other.db, async () => null),
+    SecurityCoordinationError,
+  );
+  assert.equal(
+    withSecurityTransactionLock(other.db, () => "next"),
+    "next",
+  );
+});
+
+test(
+  "lock保持processが終了しても手動file削除なしで次のtransactionを開始できる",
+  { timeout: 5000 },
+  async (t) => {
+    const { db, filename, transaction, audit } = setup(t);
+    const child = fork(
+      new URL("./fixtures/coordination-crash.mjs", import.meta.url),
+      [filename],
+      { execArgv: [], stdio: "ignore" },
+    );
+    t.after(() => {
+      if (child.exitCode === null) child.kill();
+    });
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    assert.equal(code, 79);
+    transaction.run("after_crash", event, (mark) =>
+      insertRequest(db, mark.transaction_id),
+    );
+    assert.equal(audit.verify().sequence, 1);
+    assert.equal(count(db, "approval_requests"), 1);
+  },
+);

@@ -81,7 +81,8 @@ const schemaSql = `
           clock_transaction_id TEXT NOT NULL REFERENCES approval_clock_reservations(transaction_id),
           CHECK(state IN ('pending','aborted') OR fence>0),
           CHECK(state<>'sent' OR message_ref IS NOT NULL),
-          UNIQUE(request_id,kind), UNIQUE(notification_attempt_id,request_id)
+          UNIQUE(request_id,kind), UNIQUE(notification_attempt_id,request_id),
+          UNIQUE(notification_attempt_id,message_ref)
         );
         CREATE INDEX approval_notification_dispatch ON approval_notifications(state);
         CREATE TABLE approval_event_outbox (
@@ -93,11 +94,13 @@ const schemaSql = `
         CREATE INDEX approval_event_dispatch ON approval_event_outbox(state);
         CREATE TABLE approval_presentation_updates (
           update_id TEXT PRIMARY KEY NOT NULL,
-          notification_attempt_id TEXT NOT NULL REFERENCES approval_notifications(notification_attempt_id),
+          notification_attempt_id TEXT NOT NULL,
           message_ref TEXT NOT NULL, desired_revision INTEGER NOT NULL CHECK(desired_revision>0),
           state TEXT NOT NULL CHECK(state IN ('pending','dispatching','succeeded','failed','acceptance_unknown','needs_review','aborted')),
           fence INTEGER NOT NULL CHECK(fence>=0),
           clock_transaction_id TEXT NOT NULL REFERENCES approval_clock_reservations(transaction_id),
+          CHECK(state IN ('pending','aborted') OR fence>0),
+          FOREIGN KEY(notification_attempt_id,message_ref) REFERENCES approval_notifications(notification_attempt_id,message_ref),
           UNIQUE(notification_attempt_id,desired_revision)
         );
         CREATE UNIQUE INDEX approval_one_message_write ON approval_presentation_updates(message_ref)
@@ -107,6 +110,9 @@ const schemaSql = `
         CREATE TRIGGER approval_request_immutable BEFORE UPDATE OF request_id,instance_id,workspace_id,creation_key,snapshot_json,
           semantic_hash,binding_id,binding_revision,policy_revision,model_version,created_at,expires_at ON approval_requests
           BEGIN SELECT RAISE(ABORT,'approval_request_immutable'); END;
+        CREATE TRIGGER approval_consume_expiry_immutable BEFORE UPDATE OF consume_expires_at ON approval_requests
+          WHEN OLD.consume_expires_at IS NOT NULL AND NEW.consume_expires_at IS NOT OLD.consume_expires_at
+          BEGIN SELECT RAISE(ABORT,'approval_consume_expiry_immutable'); END;
         CREATE TRIGGER approval_decision_immutable BEFORE UPDATE ON approval_decisions
           BEGIN SELECT RAISE(ABORT,'approval_decision_immutable'); END;
         CREATE TRIGGER approval_consume_immutable BEFORE UPDATE ON approval_consumes
@@ -125,6 +131,22 @@ const schemaSql = `
         CREATE TRIGGER approval_update_identity_immutable BEFORE UPDATE OF update_id,notification_attempt_id,message_ref,
           desired_revision ON approval_presentation_updates
           BEGIN SELECT RAISE(ABORT,'approval_update_identity_immutable'); END;
+        CREATE TRIGGER approval_request_no_delete BEFORE DELETE ON approval_requests
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_decision_no_delete BEFORE DELETE ON approval_decisions
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_consume_no_delete BEFORE DELETE ON approval_consumes
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_attempt_no_delete BEFORE DELETE ON approval_execution_attempts
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_notification_no_delete BEFORE DELETE ON approval_notifications
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_event_no_delete BEFORE DELETE ON approval_event_outbox
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_update_no_delete BEFORE DELETE ON approval_presentation_updates
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+        CREATE TRIGGER approval_clock_no_delete BEFORE DELETE ON approval_clock_reservations
+          BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
 `;
 
 function shape(db: Database.Database): string {

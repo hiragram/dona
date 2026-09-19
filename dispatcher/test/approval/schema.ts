@@ -256,6 +256,9 @@ test("受理不明のmessage更新が確定するまで後続writeをfenceする
   const { db } = setup(t);
   request(db);
   notification(db, "n1");
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+  );
   const insert = db.prepare(
     "INSERT INTO approval_presentation_updates VALUES (?,'n1','message1',?, ?,1,'tx_1')",
   );
@@ -280,6 +283,94 @@ test("受理不明のmessage更新が確定するまで後続writeをfenceする
   db.exec(
     "UPDATE approval_presentation_updates SET state='dispatching' WHERE update_id='u2'",
   );
+});
+
+test("presentationは親の確定messageへ結び、外部call前の正のfenceを要求する", (t) => {
+  const { db } = setup(t);
+  request(db);
+  notification(db, "n1");
+  const insert = db.prepare(
+    "INSERT INTO approval_presentation_updates VALUES (?,'n1',?,1,'pending',0,'tx_1')",
+  );
+  assert.throws(() => insert.run("unknown_parent", "message1"));
+  db.exec(
+    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+  );
+  request(db, "r2");
+  db.prepare(
+    "INSERT INTO approval_notifications VALUES ('n2','r2','approval_card','sent',1,1,?,1,1,'message2','tx_1')",
+  ).run("b".repeat(64));
+  assert.throws(() => insert.run("wrong_parent", "message2"));
+  insert.run("u1", "message1");
+  for (const state of ["dispatching", "acceptance_unknown"]) {
+    assert.throws(() =>
+      db
+        .prepare(
+          "UPDATE approval_presentation_updates SET state=? WHERE update_id='u1'",
+        )
+        .run(state),
+    );
+  }
+  db.exec(
+    "UPDATE approval_presentation_updates SET state='dispatching',fence=1 WHERE update_id='u1'",
+  );
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
+});
+
+test("設定済みconsume期限は延長もNULLへの差戻しもできない", (t) => {
+  const { db } = setup(t);
+  request(db);
+  decide(db);
+  const update = db.prepare(
+    "UPDATE approval_requests SET consume_expires_at=? WHERE request_id='r1'",
+  );
+  update.run("2026-09-19T00:06:00.000Z");
+  update.run("2026-09-19T00:06:00.000Z");
+  assert.throws(() => update.run("2026-09-20T00:06:00.000Z"));
+  assert.throws(() => update.run(null));
+  assert.equal(
+    (
+      db.prepare("SELECT consume_expires_at FROM approval_requests").get() as {
+        consume_expires_at: string;
+      }
+    ).consume_expires_at,
+    "2026-09-19T00:06:00.000Z",
+  );
+});
+
+test("retention未認可のledger削除でconsumeとattemptを再利用できない", (t) => {
+  const { db } = setup(t);
+  request(db);
+  decide(db);
+  db.transaction(() => consume(db)).immediate();
+  assert.throws(() =>
+    db
+      .transaction(() => {
+        db.exec(
+          "DELETE FROM approval_consumes; DELETE FROM approval_execution_attempts",
+        );
+      })
+      .immediate(),
+  );
+  for (const table of [
+    "approval_consumes",
+    "approval_execution_attempts",
+    "approval_decisions",
+    "approval_requests",
+    "approval_clock_reservations",
+  ]) {
+    assert.throws(() => db.exec(`DELETE FROM ${table}`));
+  }
+  assert.throws(() => db.transaction(() => consume(db)).immediate());
+  assert.equal(
+    (
+      db
+        .prepare("SELECT count(*) n FROM approval_execution_attempts")
+        .get() as { n: number }
+    ).n,
+    1,
+  );
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
 });
 test("immutable source・clock・decisionの差替えと存在しないreservation参照を拒否する", (t) => {
   const { db } = setup(t);
