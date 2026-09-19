@@ -283,6 +283,29 @@ test("spawn failure is durable and retention never purges a non-terminal capture
   }
 });
 
+test("aggregate retention keeps the newest bounded set and records older logs as purged", async () => {
+  const f = await fixture();
+  try {
+    for (const step of ["dispatcher:npm-ci", "dispatcher:npm-test", "dispatcher:npm-build"]) {
+      const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step });
+      capture.write("stderr", Buffer.from(`failure-${step}`));
+      capture.finish(true);
+    }
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "build failed",
+    });
+    const before = f.database.diagnosticLogs(f.claimed.request_id);
+    const largestSingleLog = Math.max(...before.map(({ byte_size }) => byte_size));
+    f.store.enforceRetention(new Date(), 9_999, largestSingleLog);
+    const states = f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state);
+    assert.equal(states.filter((state) => state === "complete").length, 1);
+    assert.equal(states.filter((state) => state === "purged").length, 2);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("an unavailable diagnostic index never prevents or rewrites the command result", async () => {
   const throwingStore = {
     start() { throw new Error("diagnostic index unavailable"); },
