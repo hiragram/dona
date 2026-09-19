@@ -596,3 +596,40 @@ test("TEMP schemaの承認table・trigger・indexも検証対象にする", (t) 
     assert.throws(() => installApprovalSchema(db), ApprovalSchemaError);
   }
 });
+
+
+test("request・attempt・notification・presentationのclock参照を差し替えない", t => {
+  const { db } = setup(t); request(db); decide(db); db.transaction(()=>consume(db))(); notification(db,"n1");
+  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',0,'tx_1')");
+  db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run("tx_2",JSON.stringify({codec_version:1,transaction_id:"tx_2"}));
+  for (const table of ["approval_requests","approval_execution_attempts","approval_notifications","approval_presentation_updates"]) {
+    assert.throws(()=>db.exec(`UPDATE ${table} SET clock_transaction_id='tx_2'`));
+    assert.deepEqual(db.prepare(`SELECT DISTINCT clock_transaction_id FROM ${table}`).all(),[{clock_transaction_id:"tx_1"}]);
+  }
+});
+
+test("全承認tableをSTRICTにしfractional revision・key version・fenceを拒否する", t => {
+  const { db } = setup(t); request(db); decide(db); db.transaction(()=>consume(db))(); notification(db,"n1");
+  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',0,'tx_1')");
+  const tables=(db.pragma("table_list") as Array<{schema:string;name:string;strict:number}>).filter(row=>row.schema==="main" && row.name.startsWith("approval_"));
+  assert.equal(tables.length,9); assert.ok(tables.every(table=>table.strict===1));
+  for(const table of tables.filter(table=>table.name!=="approval_schema")) {
+    const columns=db.pragma(`table_info(${table.name})`) as Array<{name:string;type:string}>;
+    for(const column of columns.filter(column=>column.type==="INTEGER")) {
+      const values=columns.map(value=>value.name===column.name ? "0.5" : value.name).join(",");
+      assert.throws(()=>db.exec(`INSERT INTO ${table.name} SELECT ${values} FROM ${table.name} LIMIT 1`),
+        error=>(error as {code:string}).code==="SQLITE_CONSTRAINT_DATATYPE",table.name+"."+column.name);
+    }
+  }
+  for(const table of ["approval_execution_attempts","approval_notifications","approval_presentation_updates"])
+    assert.throws(()=>db.exec(`UPDATE ${table} SET fence=9007199254740992`));
+});
+
+test("大文字小文字を変えたTEMP承認tableもshadowとして拒否する", t => {
+  for(const name of ["APPROVAL_SCHEMA","Approval_Requests","APPROVAL_CLOCK_RESERVATIONS"]) {
+    const { db }=setup(t); db.exec(`CREATE TEMP TABLE ${name} AS SELECT * FROM main.${name}`);
+    assert.throws(()=>verifyApprovalSchema(db),ApprovalSchemaError); assert.throws(()=>installApprovalSchema(db),ApprovalSchemaError);
+  }
+});

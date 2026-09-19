@@ -30,6 +30,12 @@ export function verifyOpenDatabaseFile(db: Database.Database): void {
   if (row.ok !== 1) throw new Error("security_file_identity_unverified");
 }
 
+export function publishMutexFile(db: Database.Database, source: string, target: string): void {
+  loadSecurityExtension(db);
+  const row = db.prepare("SELECT dona_publish_mutex(?,?) AS published").get(source, target) as { published: number };
+  if (row.published !== 0 && row.published !== 1) throw new Error("security_mutex_publish_failed");
+}
+
 /** Internal SQL guard, not a sandbox for arbitrary JavaScript. Installing the
  * SQLite authorizer expires previously prepared statements as well. The opaque
  * per-call token is held only by this closure and never stored in the database. */

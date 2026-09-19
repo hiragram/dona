@@ -1,4 +1,4 @@
-import { verifyOpenDatabaseFile } from "./file-identity.js";
+import { verifyOpenDatabaseFile, publishMutexFile } from "./file-identity.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -66,7 +66,7 @@ export function openSecurityDatabase(filename: string): Database.Database {
 
 /** Publish an owner-only empty file without ever opening/closing an extra fd on
  * the published SQLite inode while another connection may hold POSIX locks. */
-function ensureFile(filename: string): void {
+function ensureFile(business: Database.Database, filename: string): void {
   try { fs.lstatSync(filename); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -74,9 +74,8 @@ function ensureFile(filename: string): void {
     const fd = fs.openSync(temporary, "wx", 0o600);
     fs.closeSync(fd);
     try {
-      try { fs.linkSync(temporary, filename); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    } finally { fs.unlinkSync(temporary); }
+      publishMutexFile(business, temporary, filename);
+    } finally { fs.rmSync(temporary, { force: true }); }
   }
   privateRegular(filename);
 }
@@ -104,7 +103,7 @@ export function withSecurityTransactionLock(business: Database.Database, work: (
     const filename = target + ".security-lock.sqlite";
     if (active.has(filename)) throw new SecurityCoordinationError();
     active.add(filename); owned = filename;
-    ensureFile(filename);
+    ensureFile(business, filename);
     const mutexIdentity = databasePathIdentity(filename);
     mutex = new Database(filename, { timeout: waitTimeoutMs, fileMustExist: true });
     const connection = mutex;

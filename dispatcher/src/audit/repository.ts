@@ -46,7 +46,7 @@ const schemaSql = `
         CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records
           BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END;
 `;
-const shapeQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_' ORDER BY type,name";
+const shapeQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_' ORDER BY type,name";
 function shape(db: Database.Database): string { return JSON.stringify(db.prepare(shapeQuery).all()); }
 let expectedShape: string | undefined;
 export function verifyAuditSchema(db: Database.Database): void {
@@ -55,10 +55,10 @@ export function verifyAuditSchema(db: Database.Database): void {
       const expected = new Database(":memory:");
       try { expected.exec(schemaSql); expectedShape = shape(expected); } finally { expected.close(); }
     }
-    if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_'").get()) throw new AuditIntegrityError();
-    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND substr(name,1,15)!='security_audit_' AND substr(name,1,9)!='approval_'").get()
+    if (shape(db) !== expectedShape || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,15)!='security_audit_' AND substr(lower(name),1,9)!='approval_'").get()
       || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new AuditIntegrityError();
-    if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(name,1,9)='approval_' OR substr(tbl_name,1,9)='approval_'").get()) verifyApprovalSchema(db);
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) verifyApprovalSchema(db);
     const rows = db.prepare("SELECT version FROM security_audit_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== schemaVersion) throw new AuditIntegrityError();
   });
@@ -72,7 +72,7 @@ export function installAuditSchema(db: Database.Database): void {
     db.transaction(() => {
       const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='security_audit_schema'").get();
       if (exists) { verifyAuditSchema(db); return; }
-      if (db.prepare(shapeQuery).get() || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(name,1,15)='security_audit_' OR substr(tbl_name,1,15)='security_audit_'").get()) throw new AuditIntegrityError();
+      if (db.prepare(shapeQuery).get() || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,15)='security_audit_' OR substr(lower(tbl_name),1,15)='security_audit_'").get()) throw new AuditIntegrityError();
       db.exec(schemaSql);
       verifyAuditSchema(db);
     }).immediate();

@@ -1,5 +1,11 @@
+#ifdef __linux__
+#define _GNU_SOURCE
+#endif
 #include "sqlite3ext.h"
 #include <string.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <errno.h>
 SQLITE_EXTENSION_INIT1
 
 typedef struct { sqlite3 *database; int active; unsigned char token[32]; } mutation_guard;
@@ -14,7 +20,7 @@ static int authorize_mutation(void *data, int action, const char *first,
         !strncmp(first, "sqlite_", 7) || !strncmp(first, "security_audit_", 15)) return SQLITE_DENY;
       return SQLITE_OK;
     case SQLITE_FUNCTION:
-      return second && strcmp(second, "load_extension") ? SQLITE_OK : SQLITE_DENY;
+      return second && sqlite3_stricmp(second, "load_extension") && sqlite3_stricmp(second, "dona_publish_mutex") ? SQLITE_OK : SQLITE_DENY;
     case SQLITE_PRAGMA:
       /* Only the fixed read-only checks used by the repository are permitted. */
       return !second && first && (!strcmp(first, "foreign_keys") ||
@@ -22,6 +28,29 @@ static int authorize_mutation(void *data, int action, const char *first,
         !strcmp(first, "ignore_check_constraints")) ? SQLITE_OK : SQLITE_DENY;
     default: return SQLITE_DENY;
   }
+}
+
+/* Publish a CLOSED private staging file without a hardlink interval and without
+ * replacing an existing inode. Never fall back to ordinary replacing rename. */
+static void publish_mutex(sqlite3_context *context, int argc, sqlite3_value **argv) {
+  (void)argc;
+  if (sqlite3_value_type(argv[0]) != SQLITE_TEXT || sqlite3_value_type(argv[1]) != SQLITE_TEXT) goto failed;
+  const char *source = (const char *)sqlite3_value_text(argv[0]);
+  const char *target = (const char *)sqlite3_value_text(argv[1]);
+  if (!source || !target || strlen(source) != (size_t)sqlite3_value_bytes(argv[0]) ||
+      strlen(target) != (size_t)sqlite3_value_bytes(argv[1])) goto failed;
+  int status;
+#ifdef __APPLE__
+  status = renamex_np(source, target, RENAME_EXCL);
+#elif defined(__linux__)
+  status = renameat2(AT_FDCWD, source, AT_FDCWD, target, RENAME_NOREPLACE);
+#else
+  goto failed;
+#endif
+  if (status == 0) { sqlite3_result_int(context, 1); return; }
+  if (errno == EEXIST) { sqlite3_result_int(context, 0); return; }
+failed:
+  sqlite3_result_error(context, "security_mutex_publish_failed", -1);
 }
 
 static void control_mutation(sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -68,6 +97,9 @@ int sqlite3_extension_init(sqlite3 *database, char **error, const sqlite3_api_ro
   SQLITE_EXTENSION_INIT2(api);
   int status = sqlite3_create_function(database, "dona_file_identity_ok", 0,
     SQLITE_UTF8 | SQLITE_DIRECTONLY, 0, file_identity_ok, 0, 0);
+  if (status != SQLITE_OK) return status;
+  status = sqlite3_create_function(database, "dona_publish_mutex", 2,
+    SQLITE_UTF8 | SQLITE_DIRECTONLY, 0, publish_mutex, 0, 0);
   if (status != SQLITE_OK) return status;
   mutation_guard *guard = sqlite3_malloc(sizeof(*guard));
   if (!guard) return SQLITE_NOMEM;

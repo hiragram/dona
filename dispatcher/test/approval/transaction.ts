@@ -1,3 +1,4 @@
+import { publishMutexFile } from "../../src/audit/file-identity.js";
 import assert from "node:assert/strict";
 
 import fs from "node:fs";
@@ -893,4 +894,30 @@ test("不正または過大な待機期限はclock予約前に拒否する", t =
     assert.throws(() => transaction.run("invalid_wait", event, () => {}), ApprovalTransactionError);
     assert.deepEqual(anchors.calls, []); assert.equal(marks.calls, 0);
   }
+});
+
+
+test("mutex公開の直前・直後にprocessが終了しても次processが再取得できる", {timeout:10000}, async t => {
+  for(const phase of ["before","after"]) {
+    const {db,filename,transaction}=setup(t);
+    const child=fork(new URL("./fixtures/coordination-publication-crash.mjs",import.meta.url),[filename,phase],{execArgv:[],stdio:"ignore"});
+    t.after(()=>{if(child.exitCode===null)child.kill();});
+    const code=await new Promise<number|null>((resolve,reject)=>{child.once("error",reject);child.once("exit",resolve);});
+    assert.equal(code,phase==="before"?80:81);
+    const lock=filename+".security-lock.sqlite";
+    if(phase==="after")assert.equal(fs.statSync(lock).nlink,1);
+    transaction.run("after_publication_crash",event,mark=>insertRequest(db,mark.transaction_id));
+    assert.equal(fs.statSync(lock).nlink,1);assert.equal(count(db,"approval_requests"),1);
+  }
+});
+
+test("mutexのexclusive renameは既存fileを置換せずcallbackから呼べない",t=>{
+  const {db,filename,transaction}=setup(t);
+  const source=filename+".stage";const target=filename+".target";
+  fs.writeFileSync(source,"stage",{mode:0o600});fs.writeFileSync(target,"original",{mode:0o600});
+  publishMutexFile(db,source,target);assert.equal(fs.readFileSync(target,"utf8"),"original");assert.equal(fs.readFileSync(source,"utf8"),"stage");
+  const fresh=filename+".fresh";publishMutexFile(db,source,fresh);assert.equal(fs.existsSync(source),false);assert.equal(fs.statSync(fresh).nlink,1);
+  fs.writeFileSync(source,"another",{mode:0o600});
+  assert.throws(()=>transaction.run("rename_in_callback",event,()=>{db.prepare("SELECT DONA_PUBLISH_MUTEX(?,?)").get(source,filename+".forbidden");}));
+  assert.equal(fs.existsSync(filename+".forbidden"),false);assert.equal(fs.readFileSync(source,"utf8"),"another");
 });

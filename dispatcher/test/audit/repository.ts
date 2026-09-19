@@ -316,3 +316,14 @@ test("監査schemaの欠落・未知object・TEMP shadowをverifyとinstallerで
     assert.deepEqual(store.calls, []);
   }
 });
+
+
+test("大文字TEMP tableにchainを複製してもdurable auditの代用にできない", t => {
+  for(const name of ["SECURITY_AUDIT_RECORDS","Security_Audit_Checkpoint","SECURITY_AUDIT_SCHEMA"]) {
+    const {db,repository,store}=setup(t);db.exec(`CREATE TEMP TABLE ${name} AS SELECT * FROM main.${name}`);
+    assert.throws(()=>repository.verify(),AuditIntegrityError);assert.throws(()=>installAuditSchema(db),AuditIntegrityError);
+    assert.throws(()=>repository.append("shadow_tx",1,event,()=>{}),AuditIntegrityError);
+    assert.deepEqual(store.calls,[]);
+    assert.equal((db.prepare("SELECT count(*) AS n FROM main.security_audit_records").get() as {n:number}).n,0);
+  }
+});
