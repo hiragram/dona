@@ -1,0 +1,7 @@
+{
+  "extends": "../sources/web/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["../sources/web/node_modules/@types"]
+  },
+  "include": ["./web-*.test.ts"]
+}
