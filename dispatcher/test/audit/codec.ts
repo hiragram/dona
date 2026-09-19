@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   AuditIntegrityError, signAuditCheckpoint, signAuditRecord, verifyAuditChain, verifyAuditRecord,
   type AuditAnchor, type AuditEvent, type AuditKey, type AuditRecord,
-} from "../src/audit/codec.js";
+} from "../../src/audit/codec.js";
 
 const at = "2026-09-19T00:00:00.000Z";
 const key: AuditKey = {
@@ -127,7 +127,7 @@ test("鍵rotationを跨ぐchainとretention後の時刻境界を検証する", (
 });
 
 // Keep one canonical audit suite within the bounded pre-activation marker budget.
-import "./audit/repository.js";
+import "./repository.js";
 
 test("checkpoint境界はMAC検証済みrecordから導出し、独立した時刻・sequenceを受け付けない", () => {
   const boundary = record();
