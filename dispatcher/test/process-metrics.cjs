@@ -151,7 +151,7 @@ childProcess.execFile = function instrumentedExecFile(file, args, options, callb
   totals[processClass].count += 1;
   emit();
   try {
-    if (hasExplicitCallback && typeof explicitCallback !== "function") {
+    if (hasExplicitCallback && explicitCallback != null && typeof explicitCallback !== "function") {
       return originalExecFile.apply(this, arguments);
     }
     return originalExecFile.call(this, file, actualArgs, withNonce(actualOptions), (...callbackArgs) => {

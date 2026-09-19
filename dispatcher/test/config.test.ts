@@ -20,6 +20,12 @@ describe("job resource config", () => {
     assert.throws(() => execFile("/bin/true", [], 5 as never, () => {}), { code: "ERR_INVALID_ARG_TYPE" });
     assert.throws(() => execFile("/bin/true", [], {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
     assert.throws(() => execFile("/bin/true", {}, 5 as never), { code: "ERR_INVALID_ARG_TYPE" });
+    const undefinedCallbackChild = execFile("/usr/bin/true", {}, undefined as never);
+    const nullCallbackChild = execFile(process.execPath, ["-e", ""], {}, null as never);
+    await Promise.all([undefinedCallbackChild, nullCallbackChild].map((candidate) => new Promise<void>((resolve, reject) => {
+      candidate.once("error", reject);
+      candidate.once("close", () => resolve());
+    })));
     const omittedArgs = spawnSync("/usr/bin/env", undefined, {
       env: { ONLY_WITH_OMITTED_ARGS: "yes" },
       encoding: "utf8",
