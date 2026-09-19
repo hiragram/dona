@@ -49,3 +49,7 @@ request/decision/consumeの公開repository API、暗号化payloadの移送・�
 この部分実装のtest成功を、Issue全体、実IdP/WebAuthn/browser、productionの完了証拠とは扱わない。外部実行のsafe_offは維持する。
 
 送信済みevent outboxはpendingへ戻せず、確定したdelivered_atも変更できない。同じ確定値のread-backと冪等な同値更新だけを許容し、復旧時も再配送対象へ戻さない。
+
+requestのterminal状態を作業中へ戻せない。execution・notification・presentationは許可された前向き遷移だけを受け付け、acceptance_unknownから再claim・再配送へ戻れない。executionは確定後のreceipt/failure code変更も拒否する。経過不明時のneeds_review収束は許容する。snapshot上限はUTF-8の256KiBとしてSQLite BLOB lengthで検証する。
+
+byte上限の前提を固定するため、承認schemaはUTF-8 databaseだけを受け付ける。UTF-16 databaseを暗黙変換せず、既存tableを維持してinstallerを拒否する。callback中のencoding pragmaは読み取りだけ許可し、設定変更を許可しない。

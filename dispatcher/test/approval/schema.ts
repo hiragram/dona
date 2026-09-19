@@ -14,6 +14,76 @@ import {
   ApprovalSchemaError,
 } from "../../src/approval/schema.js";
 
+test("terminal requestを古いwriterが再承認・再消費可能状態へ戻せない", t => {
+  const {db}=setup(t);
+  for(const state of ["rejected","cancelled","expired","delivery_failed","consumed","execution_cancelled","consume_expired","needs_review"]){
+    request(db,state);db.prepare("UPDATE approval_requests SET state=? WHERE request_id=?").run(state,state);
+    for(const next of ["requested","sent","approved"])
+      assert.throws(()=>db.prepare("UPDATE approval_requests SET state=?,revision=revision+1 WHERE request_id=?").run(next,state),/approval_request_terminal/);
+    db.prepare("UPDATE approval_requests SET state=? WHERE request_id=?").run(state,state);
+  }
+});
+test("attemptの受理不明とterminalから再claimできず確定receiptも差替えできない", t => {
+  const {db}=setup(t);
+  for(const state of ["succeeded","failed","needs_review","acceptance_unknown"]){
+    request(db,state);decide(db,state);db.transaction(()=>consume(db,state)).immediate();
+    db.prepare("UPDATE approval_execution_attempts SET state='executing' WHERE request_id=?").run(state);
+    db.prepare("UPDATE approval_execution_attempts SET state=?,receipt_ref='receipt',failure_code='bounded_reason' WHERE request_id=?").run(state,state);
+    for(const next of ["claimed","executing"])
+      assert.throws(()=>db.prepare("UPDATE approval_execution_attempts SET state=?,fence=fence+1 WHERE request_id=?").run(next,state),/approval_execution_transition/);
+    if(state!=="acceptance_unknown"){
+      assert.throws(()=>db.prepare("UPDATE approval_execution_attempts SET receipt_ref='different' WHERE request_id=?").run(state),/approval_execution_result_immutable/);
+      assert.throws(()=>db.prepare("UPDATE approval_execution_attempts SET failure_code=NULL WHERE request_id=?").run(state),/approval_execution_result_immutable/);
+    } else db.prepare("UPDATE approval_execution_attempts SET state='succeeded' WHERE request_id=?").run(state);
+  }
+});
+test("受理不明と確定したnotificationは再配送へ戻せない", t => {
+  for(const state of ["sent","failed","needs_review","aborted","acceptance_unknown"]){
+    const {db}=setup(t);request(db);notification(db,"n1");
+    if(state!=="aborted")db.exec("UPDATE approval_notifications SET state='dispatching',fence=1");
+    db.prepare("UPDATE approval_notifications SET state=?,message_ref=?").run(state,state==="sent"?"message":null);
+    for(const next of ["pending","dispatching"])
+      assert.throws(()=>db.prepare("UPDATE approval_notifications SET state=?,message_ref=NULL,fence=fence+1").run(next));
+    if(state==="acceptance_unknown")db.exec("UPDATE approval_notifications SET state='sent',message_ref='message'");
+  }
+});
+test("受理不明とterminal presentationを同じ更新slotで再送できない", t => {
+  for(const state of ["succeeded","failed","needs_review","aborted","acceptance_unknown"]){
+    const {db}=setup(t);request(db);notification(db,"n1");
+    db.exec("UPDATE approval_notifications SET state='dispatching',fence=1; UPDATE approval_notifications SET state='sent',message_ref='message'");
+    db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message',2,'pending',0,'tx_1')");
+    if(state!=="aborted")db.exec("UPDATE approval_presentation_updates SET state='dispatching',fence=1");
+    db.prepare("UPDATE approval_presentation_updates SET state=?").run(state);
+    for(const next of ["pending","dispatching"])
+      assert.throws(()=>db.prepare("UPDATE approval_presentation_updates SET state=?,fence=fence+1").run(next),/approval_presentation_transition/);
+    if(state==="acceptance_unknown")db.exec("UPDATE approval_presentation_updates SET state='succeeded'");
+  }
+});
+test("snapshotの保存上限は多byte文字でも256KiBを越えない", t => {
+  const {db}=setup(t);request(db);
+  const original=db.prepare("SELECT * FROM approval_requests").get() as Record<string,unknown>;
+  const columns=Object.keys(original);
+  const insert=db.prepare(`INSERT INTO approval_requests (${columns.join(',')}) VALUES (${columns.map(name=>'@'+name).join(',')})`);
+  for(const [id,padding,allowed] of [["ascii","a".repeat(200000),true],["emoji","😀".repeat(200000),false]] as const){
+    const snapshot=JSON.stringify({...JSON.parse(original.snapshot_json as string),padding});
+    assert.equal(Buffer.byteLength(snapshot)<=262144,allowed);
+    const value={...original,request_id:id,creation_key:id.padEnd(64,"0"),snapshot_json:snapshot};
+    if(allowed)insert.run(value);else assert.throws(()=>insert.run(value),/CHECK constraint failed/);
+  }
+});
+
+test("UTF-16 databaseをUTF-8のbyte上限として受け付けない", t => {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"approval-encoding-"));
+  const db=new Database(path.join(directory,"fixture.sqlite"));
+  t.after(()=>{db.close();fs.rmSync(directory,{recursive:true,force:true});});
+  db.pragma("encoding='UTF-16le'");db.pragma("foreign_keys=ON");
+  db.exec("CREATE TABLE original(id INTEGER); INSERT INTO original VALUES(1)");
+  assert.throws(()=>installApprovalSchema(db),ApprovalSchemaError);
+  assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE name='approval_schema'").get(),undefined);
+  assert.deepEqual(db.prepare("SELECT id FROM original").get(),{id:1});
+  assert.equal(db.pragma("encoding",{simple:true}),"UTF-16le");
+});
+
 function setup(t: { after(fn: () => void): void }, existing = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "approval-schema-"));
   const filename = path.join(root, "fixture.sqlite");
@@ -221,7 +291,7 @@ test("受理不明でもnotificationのcreation keyを維持し、pending notice
   request(db);
   notification(db, "n1");
   db.exec(
-    "UPDATE approval_notifications SET state='acceptance_unknown',fence=1 WHERE notification_attempt_id='n1'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='acceptance_unknown',fence=1 WHERE notification_attempt_id='n1'",
   );
   assert.throws(() =>
     db.exec(
@@ -259,7 +329,7 @@ test("受理不明のmessage更新が確定するまで後続writeをfenceする
   request(db);
   notification(db, "n1");
   db.exec(
-    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
   );
   const insert = db.prepare(
     "INSERT INTO approval_presentation_updates VALUES (?,'n1','message1',?, ?,1,'tx_1')",
@@ -296,7 +366,7 @@ test("presentationは親の確定messageへ結び、外部call前の正のfence�
   );
   assert.throws(() => insert.run("unknown_parent", "message1"));
   db.exec(
-    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
   );
   request(db, "r2");
   db.prepare(
@@ -500,7 +570,7 @@ test("異なるnotificationによる同じmessageの所有を拒否する", (t) 
   request(db, "r2");
   notification(db, "n1");
   db.exec(
-    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
   );
   const insert = db.prepare(
     "INSERT INTO approval_notifications VALUES ('n2','r2','approval_card','sent',1,1,?,1,1,'message1','tx_1')",
@@ -511,11 +581,11 @@ test("異なるnotificationによる同じmessageの所有を拒否する", (t) 
   ).run("b".repeat(64));
   assert.throws(() =>
     db.exec(
-      "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n2'",
+      "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n2'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n2'",
     ),
   );
   db.exec(
-    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message2' WHERE notification_attempt_id='n2'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n2'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message2' WHERE notification_attempt_id='n2'",
   );
   assert.deepEqual(db.pragma("foreign_key_check"), []);
 });
@@ -546,7 +616,7 @@ test("sent以外のnotificationはmessageを確定できず子updateも作れな
     ),
   );
   db.exec(
-    "UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
+    "UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'",
   );
   db.exec(
     "INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'dispatching',1,'tx_1')",
@@ -579,7 +649,7 @@ test("別tableに付いたapproval名のtriggerとindexも未知schemaとして�
 test("REPLACEによるimmutable ledgerの削除・再挿入を拒否する", (t) => {
   const { db } = setup(t); request(db); decide(db);
   db.transaction(() => consume(db)).immediate(); notification(db, "n1");
-  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
   db.exec("INSERT INTO approval_event_outbox VALUES ('e1','d_r1','dona_approval.decision.v1','pending',NULL)");
   db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',2,'pending',0,'tx_1')");
   assert.equal(db.pragma("recursive_triggers", { simple: true }), 1);
@@ -607,7 +677,7 @@ test("TEMP schemaの承認table・trigger・indexも検証対象にする", (t) 
 
 test("request・attempt・notification・presentationのclock参照を差し替えない", t => {
   const { db } = setup(t); request(db); decide(db); db.transaction(()=>consume(db))(); notification(db,"n1");
-  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
   db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',0,'tx_1')");
   db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run("tx_2",JSON.stringify({codec_version:1,transaction_id:"tx_2"}));
   for (const table of ["approval_requests","approval_execution_attempts","approval_notifications","approval_presentation_updates"]) {
@@ -618,7 +688,7 @@ test("request・attempt・notification・presentationのclock参照を差し替�
 
 test("全承認tableをSTRICTにしfractional revision・key version・fenceを拒否する", t => {
   const { db } = setup(t); request(db); decide(db); db.transaction(()=>consume(db))(); notification(db,"n1");
-  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
+  db.exec("UPDATE approval_notifications SET state='dispatching',fence=1 WHERE notification_attempt_id='n1'; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1' WHERE notification_attempt_id='n1'");
   db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',0,'tx_1')");
   const tables=(db.pragma("table_list") as Array<{schema:string;name:string;strict:number}>).filter(row=>row.schema==="main" && row.name.startsWith("approval_"));
   assert.equal(tables.length,9); assert.ok(tables.every(table=>table.strict===1));
@@ -644,7 +714,7 @@ test("大文字小文字を変えたTEMP承認tableもshadowとして拒否す�
 
 test("fenceとrequest revisionは巻き戻らず古いgenerationのCASを復活させない", t => {
   const {db}=setup(t);request(db);decide(db);db.transaction(()=>consume(db))();notification(db,"n1");
-  db.exec("UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1'");
+  db.exec("UPDATE approval_notifications SET state='dispatching',fence=1; UPDATE approval_notifications SET state='sent',fence=1,message_ref='message1'");
   db.exec("INSERT INTO approval_presentation_updates VALUES ('u1','n1','message1',1,'pending',1,'tx_1')");
   for(const table of ["approval_execution_attempts","approval_notifications","approval_presentation_updates"]) {
     db.exec(`UPDATE ${table} SET fence=2`);

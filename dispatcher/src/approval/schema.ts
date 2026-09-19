@@ -16,7 +16,7 @@ const schemaSql = `
           request_id TEXT PRIMARY KEY NOT NULL,
           instance_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
           creation_key TEXT NOT NULL UNIQUE CHECK(length(creation_key)=64),
-          snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json) AND length(snapshot_json)<=262144),
+          snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json) AND length(CAST(snapshot_json AS BLOB))<=262144),
           semantic_hash TEXT NOT NULL CHECK(length(semantic_hash)=64),
           binding_id TEXT NOT NULL, binding_revision INTEGER NOT NULL CHECK(binding_revision>0 AND binding_revision<=9007199254740991),
           policy_revision INTEGER NOT NULL CHECK(policy_revision>0 AND policy_revision<=9007199254740991), model_version TEXT NOT NULL CHECK(length(model_version)<=128),
@@ -139,6 +139,32 @@ const schemaSql = `
         CREATE TRIGGER approval_event_delivery_immutable BEFORE UPDATE OF state,delivered_at ON approval_event_outbox
           WHEN OLD.state='delivered' AND (NEW.state!='delivered' OR NEW.delivered_at IS NOT OLD.delivered_at)
           BEGIN SELECT RAISE(ABORT,'approval_event_delivery_immutable'); END;
+        CREATE TRIGGER approval_request_terminal BEFORE UPDATE OF state ON approval_requests
+          WHEN OLD.state IN ('rejected','cancelled','expired','delivery_failed','consumed','execution_cancelled','consume_expired','needs_review')
+            AND NEW.state IS NOT OLD.state
+          BEGIN SELECT RAISE(ABORT,'approval_request_terminal'); END;
+        CREATE TRIGGER approval_execution_transition BEFORE UPDATE OF state ON approval_execution_attempts
+          WHEN NEW.state IS NOT OLD.state AND NOT (
+            (OLD.state='claimed' AND NEW.state IN ('executing','needs_review')) OR
+            (OLD.state='executing' AND NEW.state IN ('succeeded','failed','acceptance_unknown','needs_review')) OR
+            (OLD.state='acceptance_unknown' AND NEW.state IN ('succeeded','failed','needs_review')))
+          BEGIN SELECT RAISE(ABORT,'approval_execution_transition'); END;
+        CREATE TRIGGER approval_execution_result_immutable BEFORE UPDATE OF receipt_ref,failure_code ON approval_execution_attempts
+          WHEN OLD.state IN ('succeeded','failed','needs_review')
+            AND (NEW.receipt_ref IS NOT OLD.receipt_ref OR NEW.failure_code IS NOT OLD.failure_code)
+          BEGIN SELECT RAISE(ABORT,'approval_execution_result_immutable'); END;
+        CREATE TRIGGER approval_notification_transition BEFORE UPDATE OF state ON approval_notifications
+          WHEN NEW.state IS NOT OLD.state AND NOT (
+            (OLD.state='pending' AND NEW.state IN ('dispatching','aborted','needs_review')) OR
+            (OLD.state='dispatching' AND NEW.state IN ('sent','failed','acceptance_unknown','needs_review')) OR
+            (OLD.state='acceptance_unknown' AND NEW.state IN ('sent','needs_review')))
+          BEGIN SELECT RAISE(ABORT,'approval_notification_transition'); END;
+        CREATE TRIGGER approval_presentation_transition BEFORE UPDATE OF state ON approval_presentation_updates
+          WHEN NEW.state IS NOT OLD.state AND NOT (
+            (OLD.state='pending' AND NEW.state IN ('dispatching','aborted','needs_review')) OR
+            (OLD.state='dispatching' AND NEW.state IN ('succeeded','failed','acceptance_unknown','needs_review')) OR
+            (OLD.state='acceptance_unknown' AND NEW.state IN ('succeeded','failed','needs_review')))
+          BEGIN SELECT RAISE(ABORT,'approval_presentation_transition'); END;
         CREATE TRIGGER approval_update_identity_immutable BEFORE UPDATE OF update_id,notification_attempt_id,message_ref,
           desired_revision,clock_transaction_id ON approval_presentation_updates
           BEGIN SELECT RAISE(ABORT,'approval_update_identity_immutable'); END;
@@ -168,7 +194,8 @@ export function verifyApprovalSchema(db: Database.Database): void {
   try {
     expected.exec(schemaSql);
     if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1
-      || db.pragma("ignore_check_constraints", { simple: true }) !== 0) throw new ApprovalSchemaError();
+      || db.pragma("ignore_check_constraints", { simple: true }) !== 0
+      || db.pragma("encoding", { simple: true }) !== "UTF-8") throw new ApprovalSchemaError();
     const triggers = db.prepare("SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND substr(lower(name),1,9)!='approval_'").all() as Array<{name:string;tbl_name:string;sql:string}>;
     if (triggers.some(row => row.name !== "security_audit_no_update" || row.tbl_name !== "security_audit_records"
       || row.sql !== "CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records\n          BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END")) throw new ApprovalSchemaError();
@@ -187,7 +214,8 @@ export function verifyApprovalSchema(db: Database.Database): void {
  * This installer never provisions bindings, credentials, clocks or audit roots. */
 export function installApprovalSchema(db: Database.Database): void {
   try {
-    if (db.inTransaction || db.pragma("foreign_keys", { simple: true }) !== 1) throw new ApprovalSchemaError();
+    if (db.inTransaction || db.pragma("foreign_keys", { simple: true }) !== 1
+      || db.pragma("encoding", { simple: true }) !== "UTF-8") throw new ApprovalSchemaError();
     db.pragma("recursive_triggers = ON");
     db.transaction(() => {
       const prior = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_schema'").get();
