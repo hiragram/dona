@@ -129,6 +129,14 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(environmentDetail.includes("github-secret"), false);
     assert.equal(environmentDetail.includes("human-secret"), false);
     assert.match(environmentDetail, /visible/);
+
+    const pathCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-path" });
+    pathCapture.write("stderr", Buffer.from("failed at /Users/alice/Library/Application "));
+    pathCapture.write("stderr", Buffer.from("Support/Dona/private.log\nvisible-after-path"));
+    pathCapture.finish(true);
+    const pathDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[7]!, 16_384).detail_tail);
+    assert.equal(pathDetail.includes("Support/Dona"), false);
+    assert.match(pathDetail, /visible-after-path/);
   } finally {
     f.database.close();
   }
@@ -300,6 +308,31 @@ test("write, atomic finalize, and read faults retain the command failure state",
   } finally {
     fsSync.writeSync = originalWrite;
     fsSync.readSync = originalRead;
+    f.database.close();
+  }
+});
+
+test("open validation failure closes its descriptor and removes the managed partial file", async () => {
+  const f = await fixture();
+  const originalFstat = fsSync.fstatSync;
+  const originalClose = fsSync.closeSync;
+  let closeCalls = 0;
+  try {
+    fsSync.fstatSync = (() => { throw Object.assign(new Error("fstat"), { code: "EIO" }); }) as typeof fsSync.fstatSync;
+    fsSync.closeSync = ((descriptor) => { closeCalls += 1; return originalClose(descriptor); }) as typeof fsSync.closeSync;
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-open-validation" });
+    fsSync.fstatSync = originalFstat;
+    fsSync.closeSync = originalClose;
+    assert.equal(capture.finish(true)?.error_code, "diagnostic_open_failed");
+    assert.equal(closeCalls, 1);
+    const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
+    assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry.endsWith(".part")), []);
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(row.capture_state, "write_failed");
+    assert.equal(row.relative_ref, null);
+  } finally {
+    fsSync.fstatSync = originalFstat;
+    fsSync.closeSync = originalClose;
     f.database.close();
   }
 });

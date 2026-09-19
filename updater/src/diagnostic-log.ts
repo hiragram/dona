@@ -78,6 +78,15 @@ class StreamingRedactor {
         this.droppingQuote = assignment[1] === "\"" || assignment[1] === "'" ? assignment[1] : undefined;
         continue;
       }
+      const localPath = /\/(?:Users|home|private|var\/folders|tmp)\//i.exec(this.pending);
+      if (localPath?.index !== undefined) {
+        output += redactText(this.pending.slice(0, localPath.index), Number.MAX_SAFE_INTEGER);
+        output += "[REDACTED_STREAM]";
+        this.pending = this.pending.slice(localPath.index + localPath[0].length);
+        this.droppingSensitive = true;
+        this.droppingQuote = undefined;
+        continue;
+      }
       if (final) {
         output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
         this.pending = "";
@@ -224,7 +233,7 @@ export class DiagnosticLogStore {
     }
     const temporary = path.join(this.logsRoot, `${logId}.part`);
     const finalPath = path.join(this.logsRoot, `${logId}.log`);
-    let descriptor: number;
+    let descriptor = -1;
     try {
       descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
       const opened = fs.fstatSync(descriptor);
@@ -232,11 +241,25 @@ export class DiagnosticLogStore {
         throw new Error("diagnostic_temp_not_private");
       }
     } catch {
-      const failed = { ...initial, relative_ref: null, error_code: "diagnostic_open_failed" };
+      let recoveryRequired = descriptor >= 0;
+      if (descriptor >= 0) {
+        try { fs.closeSync(descriptor); recoveryRequired = false; } catch { /* preserve the row and file for singleton recovery */ }
+        if (!recoveryRequired) {
+          try { this.cleanupFailedFinalize(temporary, finalPath, false); }
+          catch { recoveryRequired = true; }
+        }
+      }
+      const failed = {
+        ...initial,
+        relative_ref: recoveryRequired ? relativeRef : null,
+        error_code: "diagnostic_open_failed",
+      };
       return { write() {}, finish: (commandFailed) => {
         try {
-          if (commandFailed) this.index?.finalizeDiagnosticLog(failed);
-          else this.index?.discardDiagnosticLog(logId);
+          if (!recoveryRequired) {
+            if (commandFailed) this.index?.finalizeDiagnosticLog(failed);
+            else this.index?.discardDiagnosticLog(logId);
+          }
         } catch { /* diagnostic failure must not hide command outcome */ }
         return commandFailed ? failed : undefined;
       } };
