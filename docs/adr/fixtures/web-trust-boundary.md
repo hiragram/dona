@@ -83,6 +83,10 @@
 | F24 | requester+observerがgrant経由snapshotをsubmit後、queue中にgrant revoke | manifestの全source revision照合でjob failed | worker起動/inference送信0 |
 | F25 | resume前/source改訂後、混在snapshotの一sourceのみgrant失効 | snapshot invalidate、暗黙再生成なし | worker/resume 0、Result非表示 |
 | F26 | running中またはResult保存後にsource grant revoke | broker送信前permit失効、job停止、Result read拒否 | 新規推論/private Result公開0、既送信分を取消成功としない |
+| F27 | sibling hostがloginのparent-domain cookieを植える | __Host-dona_login・Path=/・Domainなしをbrowser/server設定で強制 | 植えたidentityでcallback成功しない |
+| F28 | login/session同名cookieを二つ送る（同値/異値）、malformed cookie | 400 `cookie_ambiguous` / `cookie_invalid` | cookie選択/session発行なし、raw header非記録 |
+| F29 | raw subject削除後に同じissuer/subを再登録、新index keyへrotation | tombstone lookupで同principal/revoke/quotaを継承、local再承認必須 | 新principal割当/quota resetなし |
+| F30 | 旧identity index key欠落/失効/漏えい、複数digest一致、anchor不一致 | identity registration fail closed | 新IDで再登録を迂回しない |
 
 ## Approval・receipt・restart fixture
 
