@@ -75,7 +75,7 @@ describe("job resource config", () => {
     const reporter = fs.readFileSync(new URL("./checkpoint-reporter.mjs", import.meta.url), "utf8");
     assert.match(reporter, /event\.type === "test:dequeue"/);
     assert.match(reporter, /event\.type === "test:complete"/);
-    assert.match(reporter, /completedEvents/);
+    assert.match(reporter, /completed = new Set/);
     assert.match(reporter, /"test:pass"/);
     assert.match(reporter, /event\.data\.nesting === 0 && event\.data\.name === event\.data\.file/);
     assert.match(reporter, /\[dispatcher-test:\$\{nonce\}\] case-start/);
@@ -124,6 +124,9 @@ describe("job resource config", () => {
     delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
     childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/pending.test.ts";
     childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_SCOPE = "2";
+    childEnvironment.NODE_OPTIONS = `--require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`;
     let stderr = "";
     const child = spawn(process.execPath, [
       "--test",
@@ -179,6 +182,9 @@ describe("job resource config", () => {
     delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
     childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/parallel.test.ts";
     childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_SCOPE = "2";
+    childEnvironment.NODE_OPTIONS = `--require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`;
     let stderr = "";
     const child = spawn(process.execPath, [
       "--test",
@@ -229,6 +235,9 @@ describe("job resource config", () => {
     delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
     childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/wrapper.test.ts";
     childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_SCOPE = "2";
+    childEnvironment.NODE_OPTIONS = `--require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`;
     let stderr = "";
     const child = spawn(process.execPath, [
       "--test",
@@ -270,6 +279,9 @@ describe("job resource config", () => {
     delete childEnvironment.DONA_ORIGINAL_NODE_OPTIONS;
     childEnvironment.DONA_DISPATCHER_TEST_FILE = "test/sibling.test.ts";
     childEnvironment.DONA_CHECKPOINT_REPORTER_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_NONCE = nonce;
+    childEnvironment.DONA_PROCESS_METRICS_SCOPE = "2";
+    childEnvironment.NODE_OPTIONS = `--require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`;
     try {
       const result = spawnSync(process.execPath, [
         "--test",

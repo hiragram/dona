@@ -36,7 +36,6 @@ export class ProcessRunner {
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
-      const streamLimitBytes = Math.floor(options.outputLimitBytes / 2);
       let checkpointBuffer = "";
       let outputCheckpoint: string | undefined;
       let checkpointNonce: string | undefined;
@@ -113,17 +112,24 @@ export class ProcessRunner {
         inspect: boolean,
       ): Buffer<ArrayBufferLike> => {
         if (inspect) inspectCheckpoints(chunk);
-        if (current.length >= streamLimitBytes) {
+        if (current.length >= options.outputLimitBytes) {
           truncated = true;
           return current;
         }
-        const remaining = streamLimitBytes - current.length;
+        const remaining = options.outputLimitBytes - current.length;
         if (chunk.length > remaining) truncated = true;
         const captured = chunk.subarray(0, remaining);
         return Buffer.concat([current, captured]);
       };
-      child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk, false)));
-      child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk, true)));
+      const rebalance = (): void => {
+        const overflow = stdout.length + stderr.length - options.outputLimitBytes;
+        if (overflow <= 0) return;
+        truncated = true;
+        if (stdout.length >= stderr.length) stdout = stdout.subarray(Math.min(overflow, stdout.length));
+        else stderr = stderr.subarray(Math.min(overflow, stderr.length));
+      };
+      child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk, false); rebalance(); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk, true); rebalance(); });
       let hardKillTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null = null;
