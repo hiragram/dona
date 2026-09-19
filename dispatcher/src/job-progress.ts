@@ -135,6 +135,7 @@ export class JobProgressCoordinator {
   constructor(private readonly jobs: DispatcherDatabase, private readonly store: JobProgressStore,
     private readonly config: DispatcherConfig, private readonly logger: Logger) {}
   async ingest(row: JobRow): Promise<void> {
+    if (row.source === "dona_schedule") { this.store.terminal(row.job_id); return; }
     if (terminalStatuses.has(row.status)) {
       this.invalidProgressWarnings.delete(row.job_id);
       const siblings=this.jobs.listEventJobs(row.source_event_id);
@@ -193,7 +194,7 @@ export class JobProgressCoordinator {
   async report(): Promise<void> {
     const progress = this.store.pending(); if (!progress) return;
     const job = this.jobs.getJob(progress.job_id);
-    if (!job || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
+    if (!job || job.source === "dona_schedule" || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) { this.store.terminal(progress.job_id); return; }
     const workspaceAvailableAt=this.store.workspaceAvailableAt(job.workspace_id);
     if(workspaceAvailableAt&&workspaceAvailableAt.getTime()>Date.now()){
       let after="";for(;;){const batch=this.jobs.listNonterminalWorkspaceJobIds(job.workspace_id,after,500);this.store.deferJobs(batch,workspaceAvailableAt);if(batch.length<500)break;after=batch.at(-1)!;}return;
@@ -268,7 +269,7 @@ export class JobProgressCoordinator {
     const progress = this.store.get(match[1]!);
     const job = this.jobs.getJob(match[1]!);
     if (this.deliveryClaims.get(progressId) !== deliveryToken || !progress || progress.status !== "delivering" || progress.sequence !== Number(match[2]) || !job ||
-      terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) return undefined;
+      job.source === "dona_schedule" || terminalStatuses.has(job.status) || !job.workspace_id || !job.channel_id || !job.thread_ts) return undefined;
     const siblings = this.jobs.listEventJobs(job.source_event_id);
     const group = this.jobs.getJobGroup(job.source_event_id);
     if (group?.notification_mode === "grouped" && (!group.sealed_at || group.attention_event_id !== null)) return undefined;
@@ -280,7 +281,7 @@ export class JobProgressCoordinator {
   deliveryDeferred(progressId:string, deliveryToken:string):boolean {
     const match = /^(job_[0-9a-z]+):(\d+)$/.exec(progressId); if(!match)return false;
     const progress=this.store.get(match[1]!); const job=this.jobs.getJob(match[1]!);
-    if(this.deliveryClaims.get(progressId)!==deliveryToken||!progress||progress.status!=="delivering"||progress.sequence!==Number(match[2])||!job)return false;
+    if(this.deliveryClaims.get(progressId)!==deliveryToken||!progress||progress.status!=="delivering"||progress.sequence!==Number(match[2])||!job||job.source === "dona_schedule")return false;
     const group=this.jobs.getJobGroup(job.source_event_id);
     return group?.notification_mode==="grouped"&&!group.sealed_at&&group.attention_event_id===null;
   }

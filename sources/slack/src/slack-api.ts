@@ -18,6 +18,7 @@ export interface SlackWorkspaceIdentity {
 
 export interface SlackThreadMessage {
   ts: string;
+  subtype?: string;
   threadTs?: string;
   userId?: string;
   botId?: string;
@@ -58,6 +59,9 @@ export interface SlackChannel {
   topic?: string;
   purpose?: string;
   memberCount?: number;
+  isIm?: boolean;
+  isMpim?: boolean;
+  userId?: string;
 }
 
 export interface SlackChannelPage {
@@ -123,6 +127,7 @@ export interface SlackApiClient {
   authenticate(): Promise<SlackWorkspaceIdentity>;
   listChannels(limit: number, cursor?: string): Promise<SlackChannelPage>;
   getChannel(channelId: string): Promise<SlackChannel>;
+  hasChannelMember?(channelId: string, userId: string): Promise<boolean>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
@@ -134,6 +139,8 @@ export interface SlackApiClient {
     threadTs?: string;
     replyBroadcast: boolean;
     identityBlockId?: string;
+    mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult>;
   setAgentSessionStatus(input: {
     channelId: string;
@@ -174,6 +181,9 @@ function channelFromResponse(channel: {
   topic?: { value?: string };
   purpose?: { value?: string };
   num_members?: number;
+  is_im?: boolean;
+  is_mpim?: boolean;
+  user?: string;
 }): SlackChannel {
   return {
     id: nonEmpty(channel.id, "channel.id"),
@@ -185,6 +195,9 @@ function channelFromResponse(channel: {
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
+    ...(channel.is_im !== undefined ? { isIm: channel.is_im } : {}),
+    ...(channel.is_mpim !== undefined ? { isMpim: channel.is_mpim } : {}),
+    ...(channel.user ? { userId: channel.user } : {}),
   };
 }
 
@@ -370,6 +383,18 @@ export class SlackWebApiClient implements SlackApiClient {
     return channelFromResponse(response.channel);
   }
 
+  async hasChannelMember(channelId: string, userId: string): Promise<boolean> {
+    let cursor: string | undefined;
+    const deadline = Date.now() + 90_000;
+    do {
+      if (Date.now() >= deadline) throw new SlackApiError("membership_scan_timeout", "Slack channel membership scan exceeded its execution deadline", 5);
+      const response = await callSlack(() => this.client.conversations.members({ channel: channelId, limit: 999, ...(cursor ? { cursor } : {}) }));
+      if ((response.members ?? []).includes(userId)) return true;
+      cursor = optionalCursor(response.response_metadata?.next_cursor);
+    } while (cursor);
+    return false;
+  }
+
   async listUsers(limit: number, cursor?: string): Promise<SlackUserPage> {
     const response = await callSlack(() =>
       this.client.users.list({
@@ -408,6 +433,7 @@ export class SlackWebApiClient implements SlackApiClient {
         return [
           {
             ts: message.ts,
+            ...((message as {subtype?:unknown}).subtype ? { subtype: String((message as {subtype?:unknown}).subtype) } : {}),
             ...(message.thread_ts ? { threadTs: message.thread_ts } : {}),
             ...(message.user ? { userId: message.user } : {}),
             ...(message.bot_id ? { botId: message.bot_id } : {}),
@@ -581,18 +607,21 @@ export class SlackWebApiClient implements SlackApiClient {
     threadTs?: string;
     replyBroadcast: boolean;
     identityBlockId?: string;
+    mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult> {
     const base = {
       channel: input.channelId,
       text: input.text,
-      mrkdwn: true as const,
+      mrkdwn: input.mrkdwn ?? true,
+      ...(input.parse ? { parse: input.parse } : {}),
       unfurl_links: false,
       unfurl_media: false,
       ...(input.identityBlockId ? {
         blocks: [{
           type: "section" as const,
           block_id: input.identityBlockId,
-          text: { type: "mrkdwn" as const, text: input.text },
+          text: input.mrkdwn === false ? { type: "plain_text" as const, text: input.text } : { type: "mrkdwn" as const, text: input.text },
         }],
       } : {}),
     };

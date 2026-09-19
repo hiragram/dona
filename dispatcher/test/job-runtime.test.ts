@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 
 import { DispatcherDatabase } from "../src/database.js";
 import { buildJobPrompt } from "../src/job-prompt.js";
-import { codexAgentArguments, HerdrJobAgentRuntime } from "../src/job-runtime.js";
+import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory, PreparedWorkspaceCleanupError } from "../src/job-runtime.js";
+import { scheduledPermissionArguments } from "../src/scheduled-sandbox.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -19,6 +20,12 @@ afterEach(async () => {
 });
 
 describe("Codex background agent arguments", () => {
+  test("rejects missing or malformed scheduled MCP identities", () => {
+    assert.deepEqual(parseScheduledMcpInventory([{name:"slack"},{name:"github_1"}]),["slack","github_1"]);
+    for(const inventory of [[{}],[{name:undefined}],[{name:""}],[{name:"bad.name"}],null])
+      assert.throws(()=>parseScheduledMcpInventory(inventory),/MCP (?:inventory|identity) was invalid/);
+  });
+
   test("promptだけに専用status timeoutを渡し汎用command timeoutを維持する", async () => {
     const { root, config: baseConfig } = await tempConfig(); roots.push(root);
     const capturePath = path.join(root, "prompt-argv.json");
@@ -46,7 +53,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-runtime-no-progress")).row;
     const job = database.createJob({ source_event_id:source.event_id, objective:"調査する", workspace:{ kind:"scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
-    const args = codexAgentArguments(job, config, false);
+    const args = codexAgentArguments(job, config, [], false);
     assert.equal(args.includes(path.dirname(job.workspace_path)), false);
     const prompt = buildJobPrompt(job, false);
     assert.equal(prompt.includes("progress_path"), false);
@@ -71,7 +78,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     const repositoryPath = `${config.jobsWorkspaceRoot}/github/reirei-lab/boatrace/repository`;
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
@@ -92,10 +99,19 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", config.jobResultsDir, "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
+    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
     assert.equal(args[5]!.match(/trust_level/g)?.length, 1);
     assert.equal(args[5]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[5]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
+    assert.doesNotMatch(buildJobPrompt({...job,source:"dona_schedule"}), /progress_path|工程が変わるたび/);
+    const scheduledOverride=`projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" }, ${JSON.stringify(path.dirname(job.result_path))} = { trust_level = "trusted" } }`;
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,[],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","-c",scheduledOverride,
+    ]);
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","-c",scheduledOverride,
+    ]);
     database.close();
   });
 
@@ -141,7 +157,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
 
     assert.deepEqual(codexAgentArguments(job, config), [
       "--add-dir",
-      config.jobResultsDir,
+      path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
@@ -164,6 +180,10 @@ if (args.includes("get")) {
 }
 if (args.includes("workspace") && args.includes("create")) {
   process.stdout.write(JSON.stringify({ result: { workspace_id: "w1", pane_id: "w1:p1" } }));
+  process.exit(0);
+}
+if (args.includes("pane") && args.includes("run")) {
+  process.stdout.write(JSON.stringify({ result: { ok: true } }));
   process.exit(0);
 }
 if (args.includes("agent") && args.includes("start")) {
@@ -193,7 +213,7 @@ process.exit(1);
       "--pane", "w1:p1",
       "--timeout", String(config.jobAgentStartTimeoutMs),
       "--",
-      "--add-dir", config.jobResultsDir,
+      "--add-dir", path.dirname(job.result_path),
       "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -250,6 +270,68 @@ process.exit(2);
     assert.equal(job.agent_name, job.job_id);
     assert.match(job.agent_name, /enhc$/);
     database.close();
+  });
+
+  test("terminal scheduled scratch workspaceをHerdr close後に削除する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const capturePath=path.join(root,"cleanup-argv.json");
+    const executable=path.join(root,"fake-herdr-cleanup.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-scheduled-cleanup")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await fs.mkdir(job.workspace_path,{recursive:true});
+    await fs.writeFile(path.join(job.workspace_path,"artifact"),"temporary");
+    const runtime=new HerdrJobAgentRuntime({...config,herdrPath:executable});
+    const cleaned=await runtime.cleanup!({...job,source:"dona_schedule",herdr_workspace_id:"w7"});
+    assert.equal(cleaned.ok,true,JSON.stringify(cleaned));
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"workspace","close","w7"]);
+    await assert.rejects(fs.access(job.workspace_path),{code:"ENOENT"});
+    database.close();
+  });
+
+  test("agent start失敗後のworkspace close失敗はIDとscratch workspaceを保持する", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const executable=path.join(root,"fake-herdr-start-cleanup-failure.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+const args=process.argv.slice(2);
+if(args[2]==="agent"&&args[3]==="get")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="create"){
+  console.log(JSON.stringify({status:"ok",result:{workspace:{workspace_id:"w9"},root_pane:{pane_id:"w9:p1"}}}));
+  process.exit(0);
+}
+if(args[2]==="agent"&&args[3]==="start")process.exit(1);
+if(args[2]==="workspace"&&args[3]==="close")process.exit(1);
+process.exit(2);
+`,{mode:0o700});
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-start-cleanup-failure")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    await assert.rejects(
+      new HerdrJobAgentRuntime({...config,herdrPath:executable}).prepare(job),
+      (error:unknown)=>error instanceof PreparedWorkspaceCleanupError&&error.herdrWorkspaceId==="w9"&&error.herdrPaneId==="w9:p1",
+    );
+    assert.equal((await fs.stat(job.workspace_path)).isDirectory(),true);
+    database.close();
+  });
+
+  test("legacy agent closeをagent identityへ固定する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const capturePath=path.join(root,"agent-close-argv.json"),executable=path.join(root,"fake-herdr-agent-close.mjs");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({status:"ok"}));
+`,{mode:0o700});
+    const result=await new HerdrJobAgentRuntime({...config,herdrPath:executable}).closeAgent("job_01m1legacyagent000000enhc");
+    assert.equal(result.ok,true);
+    assert.deepEqual(JSON.parse(await fs.readFile(capturePath,"utf8")),["--session",config.herdrSession,"agent","close","job_01m1legacyagent000000enhc"]);
   });
 });
 

@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { scheduledExecutablePaths, scheduledPermissionArguments, verifyScheduledSandbox } from "./scheduled-sandbox.js";
+
 import type { DispatcherConfig } from "./config.js";
 import type { AgentStatus, HerdrCommandResult } from "./herdr.js";
 import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
@@ -12,6 +14,10 @@ export interface PreparedJobRuntime {
   herdrPaneId: string;
 }
 
+export class PreparedWorkspaceCleanupError extends Error {
+  constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
+}
+
 export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
@@ -19,6 +25,8 @@ export interface JobAgentRuntime {
   prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
+  closeAgent?(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult>;
+  cleanup?(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult>;
 }
 
 function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void {
@@ -28,14 +36,20 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, progressEnabled = true): string[] {
-  const args = ["--add-dir", config.jobResultsDir];
-  if (progressEnabled) args.push("--add-dir", path.dirname(jobProgressPath(row)));
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = []): string[] {
+  const resultDirectory=path.dirname(row.result_path);
+  const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
+  if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
+  const args = row.source==="dona_schedule"
+    ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+        ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
+    : ["--add-dir", resultDirectory];
+  if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {
     assertScratchWorkspacePath(row, config);
-    trustedPaths = [row.workspace_path];
+    trustedPaths = row.source==="dona_schedule" ? [row.workspace_path,resultDirectory] : [row.workspace_path];
   } else {
     const [owner, repo] = workspace.repository.split("/") as [string, string];
     const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", owner, repo, "repository");
@@ -46,6 +60,17 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, progr
     .join(", ");
   args.push("-c", `projects = { ${projects} }`);
   return args;
+}
+
+export function parseScheduledMcpInventory(value:unknown):string[] {
+  if(!Array.isArray(value)) throw new Error("Scheduled Codex MCP inventory was invalid");
+  return value.map(item=>{
+    if(item===null||typeof item!=="object"||Array.isArray(item)||!Object.hasOwn(item,"name")||typeof (item as {name?:unknown}).name!=="string"||!(item as {name:string}).name)
+      throw new Error("Scheduled Codex MCP identity was invalid");
+    const name=(item as {name:string}).name;
+    if(!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Scheduled Codex MCP identity was invalid");
+    return name;
+  });
 }
 
 function parseJson(value: string): unknown {
@@ -286,15 +311,27 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
     await fs.mkdir(this.config.jobsWorkspaceRoot, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.jobsWorkspaceRoot, 0o700);
-    await fs.mkdir(this.config.jobResultsDir, { recursive: true, mode: 0o700 });
-    await fs.chmod(this.config.jobResultsDir, 0o700);
-    if (this.progressEnabled) {
+    const resultDirectory=path.dirname(row.result_path);
+    await fs.mkdir(resultDirectory, { recursive: true, mode: 0o700 });
+    await fs.chmod(resultDirectory, 0o700);
+    if (this.progressEnabled && row.source !== "dona_schedule") {
       await fs.mkdir(path.dirname(jobProgressPath(row)), { recursive: true, mode: 0o700 });
       await fs.chmod(path.dirname(jobProgressPath(row)), 0o700);
     }
 
+    let executablePaths:string[]=[];
+    if(row.source==="dona_schedule") {
+      if(workspace.kind!=="scratch") throw new Error("Scheduled sandbox requires a scratch workspace");
+      await fs.mkdir(row.workspace_path,{recursive:true,mode:0o700});
+      const workspaceStat=await fs.lstat(row.workspace_path);
+      if(!workspaceStat.isDirectory()||workspaceStat.isSymbolicLink()) throw new Error("Scheduled workspace must be a real directory");
+      executablePaths=await scheduledExecutablePaths(this.config.codexPath);
+      await verifyScheduledSandbox(resultDirectory,executablePaths,row.workspace_path,this.config.jobCommandTimeoutMs,
+        (executable,args,timeout)=>runProcess(executable,args,timeout,signal));
+    }
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
+      if(row.source==="dona_schedule") throw new Error("Existing scheduled agent permission identity cannot be verified");
       if (workspace.kind === "github") {
         await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
       }
@@ -304,6 +341,14 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (workspaceId !== undefined && paneId !== undefined) {
         return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
       }
+    }
+
+    let disabledMcpServers:string[]=[];
+    if(row.source==="dona_schedule") {
+      const listed=await runProcess(this.config.codexPath,["mcp","list","--json"],this.config.jobCommandTimeoutMs,signal);
+      if(!listed.ok) throw commandError("Scheduled Codex MCP inventory failed",listed);
+      const inventory=parseJson(listed.stdout);
+      disabledMcpServers=parseScheduledMcpInventory(inventory);
     }
 
     const created = workspace.kind === "scratch"
@@ -327,7 +372,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config, this.progressEnabled),
+          "--", ...codexAgentArguments(row, this.config,disabledMcpServers, this.progressEnabled,executablePaths),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,
@@ -335,7 +380,12 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if (started.ok || started.errorCode !== "agent_pane_busy" || Date.now() >= deadline || signal?.aborted) break;
       await delay(200, signal);
     } while (true);
-    if (!started?.ok) throw commandError("Herdr agent start failed", started!);
+    if (!started?.ok) {
+      const closed=await this.herdr(["workspace","close",String(workspaceId)],this.config.jobCommandTimeoutMs+5_000).catch(()=>undefined);
+      if(!closed?.ok)throw new PreparedWorkspaceCleanupError("Herdr workspace cleanup failed after agent start failure",String(workspaceId),String(paneId));
+      if(workspace.kind==="scratch")await fs.rm(row.workspace_path,{recursive:true,force:true});
+      throw commandError("Herdr agent start failed", started!);
+    }
     return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
   }
 
@@ -368,6 +418,22 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
     return this.herdr(["agent", "send-keys", agentName, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
+  }
+
+  closeAgent(agentName:string,signal?:AbortSignal):Promise<HerdrCommandResult> {
+    return this.herdr(["agent","close",agentName],this.config.jobCommandTimeoutMs+5_000,signal);
+  }
+
+  async cleanup(row: JobRow, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    const workspace = workspaceFromJob(row);
+    if (row.source !== "dona_schedule" || workspace.kind !== "scratch" || !row.herdr_workspace_id) {
+      throw new Error("Only terminal scheduled scratch jobs can be cleaned up");
+    }
+    assertScratchWorkspacePath(row, this.config);
+    const closed = await this.herdr(["workspace", "close", row.herdr_workspace_id], this.config.jobCommandTimeoutMs + 5_000, signal);
+    if (!closed.ok && !["workspace_not_found", "not_found"].includes(closed.errorCode ?? "")) return closed;
+    await fs.rm(row.workspace_path, { recursive: true, force: true });
+    return closed.ok ? closed : { ...closed, ok: true };
   }
 
   private herdr(

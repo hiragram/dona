@@ -56,6 +56,12 @@ export function releaseCompatibilityMatches(
     target.app_schema_write >= previous.app_schema_read_min && target.app_schema_write <= previous.app_schema_read_max;
 }
 
+function policyCompatible(policy: ReleaseManifest["compatibility"], target: ReleaseManifest["compatibility"]): boolean {
+  const { rollback_safe: _policyRollback, ...approved } = policy;
+  const { rollback_safe: _targetRollback, ...candidate } = target;
+  return canonicalJson(approved) === canonicalJson(candidate);
+}
+
 function resultSucceeded(result: { exit_code: number | null; timed_out: boolean }): boolean {
   return result.exit_code === 0 && !result.timed_out;
 }

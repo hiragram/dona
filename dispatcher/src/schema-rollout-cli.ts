@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import Database from "better-sqlite3";
 
 import {
   assertReceiptMatchesDatabases,
+  assertSchemaActivationSafe,
   contentSnapshot,
   countSnapshot,
   migrateV2ToV3WithBackup,
@@ -34,7 +36,9 @@ async function main(): Promise<void> {
   await fs.mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(backupPath), 0o700);
   let reuseVerifiedBackup = false;
-  if (await optionalRegularFile(receiptPath, "schema_rollout_receipt")) try {
+  let archiveStaleBackup = false;
+  const hasReceipt = await optionalRegularFile(receiptPath, "schema_rollout_receipt");
+  if (hasReceipt) try {
     const existing = JSON.parse(await fs.readFile(receiptPath, "utf8")) as MigrationReceipt;
     if (existing.schema_version !== 1 || existing.from_schema !== 2 || existing.to_schema !== 3 ||
       existing.rollback?.backup_restore_opened !== true) throw new Error("schema_rollout_receipt_invalid");
@@ -70,9 +74,11 @@ async function main(): Promise<void> {
         verifyDatabase(backup, 2);
         if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(countSnapshot(migrated)) ||
           JSON.stringify(contentSnapshot(backup)) !== JSON.stringify(contentSnapshot(migrated))) {
-          throw new Error("schema_backup_content_mismatch");
+          if (hasReceipt) throw new Error("schema_backup_content_mismatch");
+          assertSchemaActivationSafe(previous,target,2);
+          archiveStaleBackup = true;
         }
-        reuseVerifiedBackup = true;
+        reuseVerifiedBackup = !archiveStaleBackup;
       } else {
         verifyDatabase(migrated, 3);
         verifyDatabase(backup, 2);
@@ -109,6 +115,11 @@ async function main(): Promise<void> {
       migrated.close();
       backup.close();
     }
+  }
+  if (archiveStaleBackup) {
+    // Keep the failed attempt's evidence; only an unreceipted, healthy v2 pair can refresh.
+    if (await optionalRegularFile(receiptPath,"schema_rollout_receipt")) throw new Error("schema_rollout_receipt_appeared");
+    await fs.rename(backupPath,`${backupPath}.stale.${randomUUID()}`);
   }
   const receipt = await migrateV2ToV3WithBackup({
     databasePath,

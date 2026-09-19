@@ -1,16 +1,18 @@
 import fs from "node:fs/promises";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { JobCreationError, type DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, JobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
+import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
+import { ScheduleError } from "./scheduler/errors.js";
 import {
   jobKeyPattern,
   parseCancelJobRequest,
@@ -23,9 +25,20 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
+  const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
+  return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
+    const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
+  });request.setTimeout(timeoutMs,()=>request.destroy(new Error("schedule_access_confirmation_timeout")));request.once("error",reject);request.end(encoded);});
+}
+export function scheduleAccessConfirmationTimeout(issuedAt:string,now=Date.now()):number {
+  const remaining=Date.parse(issuedAt)+120_000-now-1_000;
+  if(!Number.isFinite(remaining)||remaining<=0) throw new Error("schedule_access_receipt_expired");
+  return Math.min(140_000,remaining);
+}
 class PersistenceUnavailableError extends Error {}
 class ApiRequestError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string, readonly details?:Record<string,unknown>) {
     super(message);
   }
 }
@@ -39,8 +52,8 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.end(encoded);
 }
 
-function errorBody(code: string, message: string): unknown {
-  return { schema_version: 1, error: { code, message } };
+function errorBody(code: string, message: string, details?:Record<string,unknown>): unknown {
+  return { schema_version: 1, error: { code, message, ...(details?{details}:{}) } };
 }
 
 async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
@@ -99,6 +112,9 @@ export interface ApiUpdateClient {
 export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
+export interface ApiSchedulerState {
+  operationalState(): { running: boolean; last_purge_at: string | null };
+}
 
 export interface ApiJobProgressResolver {
   resolveDelivery(progressId: string, deliveryToken: string): Record<string, string> | undefined;
@@ -112,6 +128,7 @@ export class DispatcherApi {
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
+  private readonly schedules: ScheduleApiService;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -123,7 +140,10 @@ export class DispatcherApi {
     private readonly quiesceController?: ApiQuiesceController,
     private readonly updateNotifications?: ApiWorkerState,
     private jobProgress?: ApiJobProgressResolver,
-  ) {}
+    scheduleNow: () => Date = () => new Date(),
+    wakeScheduler: () => void = () => {},
+    private readonly schedulerState?: ApiSchedulerState,
+  ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
 
@@ -160,14 +180,30 @@ export class DispatcherApi {
     this.shuttingDown = true;
   }
 
+  private readiness(): { ready: boolean; scheduler: Record<string, unknown> } {
+    let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
+      (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
+    let operations: ReturnType<DispatcherDatabase["scheduler"]["operationalSnapshot"]> | undefined;
+    try {
+      this.database.assertReadableWritable();
+      operations = this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
+    } catch { ready = false; }
+    const scheduler = this.schedulerState?.operationalState();
+    ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
+      operations.stale_claims === 0 && operations.retention_overdue === 0;
+    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations } };
+  }
+
   async stop(): Promise<void> {
     this.beginShutdown();
-    if (this.server) {
+    const ownsSocket = this.server?.listening === true;
+    if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
       });
-      this.server = undefined;
     }
+    this.server = undefined;
+    if (!ownsSocket) return;
     try {
       await fs.unlink(this.config.socketPath);
     } catch (error) {
@@ -184,28 +220,21 @@ export class DispatcherApi {
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
-          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
-        try {
-          this.database.assertReadableWritable();
-        } catch {
-          ready = false;
-        }
-        sendJson(response, ready ? 200 : 503, { schema_version: 1, status: ready ? "ready" : "not_ready" });
+        const health = this.readiness();
+        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/metrics/scheduler") {
+        sendJson(response, 200, { schema_version: 1,
+          scheduler: this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z")) });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/version") {
-        let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
-          (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
-        try {
-          this.database.assertReadableWritable();
-        } catch {
-          ready = false;
-        }
+        const health = this.readiness();
         const appSchema = this.database.schemaCompatibility();
-        sendJson(response, ready ? 200 : 503, {
+        sendJson(response, health.ready ? 200 : 503, {
           schema_version: 1,
-          status: ready ? "ready" : "not_ready",
+          status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
           protocol: 1,
@@ -214,6 +243,7 @@ export class DispatcherApi {
           app_schema_read_max: appSchema.read_max,
           app_schema_write: appSchema.write,
           config: 1,
+          scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;
@@ -328,8 +358,65 @@ export class DispatcherApi {
         await this.handleSelfUpdate(request, response, url);
         return;
       }
+      const notificationAuthorization=/^\/v1\/job-notifications\/([^/]+)\/authorize$/.exec(url.pathname);
+      if(request.method==="POST"&&notificationAuthorization) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting notification authorization while quiescing");
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try {
+          let decoded:Record<string,unknown>|undefined;
+          if(body.receipt!==undefined) {
+            const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt),[payload,signature,...extra]=receipt.split(".");
+            if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+            const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+            if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+            const claimed=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+            const eventId=decodeURIComponent(notificationAuthorization[1]!); if(claimed.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
+            const issuedAt=String(claimed.issued_at??""),nonce=String(claimed.nonce??"");
+            if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
+            const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(claimed.workspace_id??""),channel_id:String(claimed.channel_id??""),user_id:String(claimed.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
+            decoded={...confirmed,issued_at:issuedAt,nonce};
+          }
+          sendJson(response,200,{schema_version:1,...this.database.authorizeJobNotification(decodeURIComponent(notificationAuthorization[1]!),new Date(),decoded?{workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??""),issued_at:String(decoded.issued_at??""),nonce:String(decoded.nonce??""),channel_kind:String(decoded.channel_kind??""),channel_user_id:decoded.channel_user_id===null?null:String(decoded.channel_user_id??"")}:undefined)});
+        }
+        catch(error) { throw new ApiRequestError(409,"notification_not_authorized",error instanceof Error?error.message:String(error)); }
+        return;
+      }
+      const scheduledAccess=/^\/v1\/scheduled-jobs\/([^/]+)\/access$/.exec(url.pathname);
+      if(request.method==="POST"&&scheduledAccess) {
+        if(this.shuttingDown) throw new ApiRequestError(503,"shutting_down","Dispatcher is not accepting scheduled access writes while quiescing");
+        const body=await this.readJson(request) as Record<string,unknown>;
+        try {
+          const token=await readPrivateToken(this.config.updateInternalTokenPath),receipt=String(body.receipt??""),[payload,signature,...extra]=receipt.split(".");
+          if(!token||!payload||!signature||extra.length) throw new Error("invalid_schedule_access_receipt");
+          const expected=createHmac("sha256",token).update(payload).digest(),actual=Buffer.from(signature,"base64url");
+          if(expected.length!==actual.length||!timingSafeEqual(expected,actual)) throw new Error("invalid_schedule_access_receipt");
+          const decoded=JSON.parse(Buffer.from(payload,"base64url").toString("utf8")) as Record<string,unknown>;
+          const eventId=decodeURIComponent(scheduledAccess[1]!); if(decoded.event_id!==eventId) throw new Error("schedule_access_receipt_mismatch");
+          const issuedAt=String(decoded.issued_at??""),nonce=String(decoded.nonce??"");
+          if(!Number.isFinite(Date.parse(issuedAt))||!nonce) throw new Error("invalid_schedule_access_receipt");
+          const confirmed=await confirmScheduleAccess(this.config.slackAdapterSocketPath,token,{event_id:eventId,workspace_id:String(decoded.workspace_id??""),channel_id:String(decoded.channel_id??""),user_id:String(decoded.user_id??"")},scheduleAccessConfirmationTimeout(issuedAt));
+          sendJson(response,200,{schema_version:1,...this.database.recordScheduleJobAccess(eventId,{workspace_id:String(confirmed.workspace_id??""),channel_id:String(confirmed.channel_id??""),user_id:String(confirmed.user_id??""),issued_at:issuedAt,nonce})});
+        }
+        catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
+        return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
+        return;
+      }
+      if (url.pathname === "/v1/schedules/preview" || url.pathname === "/v1/schedules" || url.pathname.startsWith("/v1/schedules/")) {
+        try {
+          await this.handleSchedules(request, response, url);
+        } catch (error) {
+          if (error instanceof ScheduleApiError) throw error;
+          if (error instanceof ScheduleError) throw new ScheduleApiError(400, error.code);
+          if (error instanceof Error && error.name === "ZodError") throw new ScheduleApiError(400, "invalid_request", "Schedule request is invalid");
+          const code = error instanceof Error ? error.message : "";
+          if (["invalid_limit", "invalid_identity", "schedule_not_found", "unauthorized", "revision_conflict"].includes(code)) {
+            throw new ScheduleApiError(code === "schedule_not_found" ? 404 : code === "unauthorized" ? 403 : code === "revision_conflict" ? 409 : 400, code);
+          }
+          throw error;
+        }
         return;
       }
       if (request.method !== "POST" || url.pathname !== "/v1/events") {
@@ -386,7 +473,11 @@ export class DispatcherApi {
         });
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
+        sendJson(response, error.status, errorBody(error.code, error.message,error.details));
+      } else if (error instanceof ScheduleApiError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
+      } else if (error instanceof Error && error.name === "ZodError") {
+        sendJson(response, 400, errorBody("invalid_request", "Schedule request is invalid"));
       } else if (error instanceof UpdaterClientError) {
         this.logger.warn("Updater request rejected", {
           error_code: error.code,
@@ -523,7 +614,7 @@ export class DispatcherApi {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
     }
     if (request.method === "POST" && url.pathname === "/v1/jobs") {
-      const input = parseCreateJobRequest(await this.readJson(request));
+      const input = parseCreateJobRequest(await this.readJson(request), true);
       let result;
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
@@ -538,7 +629,7 @@ export class DispatcherApi {
               limit_value: error.limitDetails.maximum,
             });
           }
-          throw new ApiRequestError(409, error.code, error.message);
+          throw new ApiRequestError(409, error.code, error.message, error.limitDetails);
         }
         throw new ApiRequestError(400, "invalid_job", error instanceof Error ? error.message : String(error));
       }
@@ -552,15 +643,25 @@ export class DispatcherApi {
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(sourceEventId){
+        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId).map(
+          ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+            ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}))});}
+        catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
+        return;
+      }
       const workspaceId = url.searchParams.get("workspace_id");
       const channelId = url.searchParams.get("channel_id");
       const threadTs = url.searchParams.get("thread_ts");
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: this.database.listThreadJobs(workspaceId, channelId, threadTs),
+        jobs: candidates.slice(0,100),
+        truncated: candidates.length > 100,
       });
       return;
     }
@@ -572,17 +673,18 @@ export class DispatcherApi {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
       const sourceEventId = url.searchParams.get("source_event_id");
+      if (sourceEventId === null) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
       if (sourceEventId !== null) {
         if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
           throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
         }
         try {
-          this.database.assertJobSourceMatchesThread(jobId, sourceEventId, true);
+          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
         } catch {
           throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
         }
       }
-      sendJson(response, 200, { schema_version: 1, job });
+      sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
       return;
     }
     if (request.method === "POST" && action === "steer") {
@@ -591,6 +693,7 @@ export class DispatcherApi {
         const result = await this.jobs.steer(jobId, input.source_event_id, input.instruction);
         sendJson(response, 200, { schema_version: 1, duplicate: result.duplicate, job: result.row });
       } catch (error) {
+        if(error instanceof JobCreationError) throw new ApiRequestError(409,error.code,error.message,error.limitDetails);
         throw new ApiRequestError(409, "job_steer_failed", error instanceof Error ? error.message : String(error));
       }
       return;
@@ -606,6 +709,27 @@ export class DispatcherApi {
       return;
     }
     throw new ApiRequestError(404, "not_found", "Route not found");
+  }
+
+  private async handleSchedules(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    if (this.shuttingDown && request.method !== "GET") throw new ScheduleApiError(503, "shutting_down");
+    if (request.method === "POST" && url.pathname === "/v1/schedules/preview") { sendJson(response, 200, this.schedules.preview(await this.readJson(request))); return; }
+    if (request.method === "POST" && url.pathname === "/v1/schedules") { const result = this.schedules.create(await this.readJson(request)); sendJson(response, result.duplicate ? 200 : 201, result); return; }
+    const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+    if (request.method === "GET" && url.pathname === "/v1/schedules") {
+      const limit = Number(url.searchParams.get("limit") ?? 50); sendJson(response, 200, this.schedules.list(sourceEventId, limit, url.searchParams.get("cursor") ?? undefined)); return;
+    }
+    const match = /^\/v1\/schedules\/([^/]+)(?:\/(pause|resume|cancel|runs))?$/.exec(url.pathname);
+    if (!match) throw new ScheduleApiError(404, "not_found");
+    let scheduleId: string;
+    try { scheduleId = decodeURIComponent(match[1]!); }
+    catch (error) { if (error instanceof URIError) throw new ScheduleApiError(400, "invalid_schedule_id"); throw error; }
+    const action = match[2];
+    if (request.method === "GET" && !action) { sendJson(response, 200, this.schedules.get(scheduleId, sourceEventId)); return; }
+    if (request.method === "GET" && action === "runs") { const limit = Number(url.searchParams.get("limit") ?? 50); sendJson(response, 200, this.schedules.history(scheduleId, sourceEventId, limit, url.searchParams.get("cursor") ?? undefined)); return; }
+    if (request.method === "PATCH" && !action) { sendJson(response, 200, this.schedules.update(scheduleId, await this.readJson(request))); return; }
+    if (request.method === "POST" && (action === "pause" || action === "resume" || action === "cancel")) { sendJson(response, 200, this.schedules.transition(scheduleId, action, await this.readJson(request))); return; }
+    throw new ScheduleApiError(404, "not_found");
   }
 
   private async readJson(request: IncomingMessage): Promise<unknown> {

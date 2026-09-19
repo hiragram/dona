@@ -71,6 +71,14 @@ function assertContract(source, label, patterns) {
   }
 }
 
+test("scheduled Slack確認のMCP timeoutはadapter scan期限を上回る", async () => {
+  const config=await read(".codex/config.toml");
+  const section=config.match(/\[mcp_servers\.dona_dispatcher\]([\s\S]*?)(?=\n\[|$)/)?.[1];
+  assert.ok(section,"dona_dispatcher MCP設定が必要です");
+  const timeout=Number(section.match(/tool_timeout_sec\s*=\s*(\d+)/)?.[1]);
+  assert.ok(timeout>95,"dona_dispatcher tool timeoutは95秒のlive access照合より長くします");
+});
+
 test("implicit invocation metadataとrouting boundaryが整合する", async () => {
   const [skill, openaiYaml] = await Promise.all([
     read(".agents/skills/code-submission-review-cycle/SKILL.md"),

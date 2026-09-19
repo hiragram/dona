@@ -8,9 +8,12 @@ import type { DispatcherClient } from "./dispatcher-client.js";
 import type { SlackLogger } from "./logger.js";
 import {
   parseUpdateNotificationRequest,
+  parseJobDeliveryConfirmationRequest,
+  parseJobSessionSettlementRequest,
   UpdateNotificationPermanentError,
   type UpdateNotificationPort,
 } from "./update-notification.js";
+import type { SlackReminderConnector } from "./reminder-connector.js";
 import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
 import { SlackApiError } from "./slack-api.js";
 
@@ -58,6 +61,7 @@ export interface AdapterHealthState {
   connectionStates(): Record<string, string>;
   quiesce(): Promise<void>;
   drainStatus(): { quiescing: boolean; drained: boolean; in_flight: number; unsafe_states: string[] };
+  trackOperation?<T>(operation: Promise<T>): Promise<T>;
   trackExternal?<T>(operation: Promise<T>): Promise<T>;
 }
 
@@ -75,6 +79,7 @@ export class SlackHealthServer {
     private readonly buildSha = process.env.DONA_BUILD_SHA ?? "development",
     private readonly updateNotifications?: UpdateNotificationPort,
     private readonly updateInternalTokenPath?: string,
+    private readonly reminders?: Pick<SlackReminderConnector, "deliver">,
     private readonly jobProgress?: SlackJobProgressReporter,
     private readonly appSchemaWrite: 2 | 3 = 3,
     private readonly appSchemaReadMax: 2 | 3 = 3,
@@ -123,6 +128,12 @@ export class SlackHealthServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "";
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (method === "POST" && (pathname === "/v1/internal/slack-reminders/preflight" || pathname === "/v1/internal/slack-reminders")) {
+      const operation = this.handleReminder(request, response, pathname.endsWith("/preflight"));
+      if (this.adapter.trackOperation) await this.adapter.trackOperation(operation);
+      else await operation;
+      return;
+    }
     if (method === "POST" && pathname === "/v1/internal/update-notifications") {
       if (!this.updateNotifications || !this.updateInternalTokenPath) {
         send(response, 503, {
@@ -167,6 +178,12 @@ export class SlackHealthServer {
           },
         });
       }
+      return;
+    }
+    if(method==="POST"&&["/v1/internal/job-delivery-confirmations","/v1/internal/job-session-settlements","/v1/internal/schedule-access-confirmations"].includes(pathname)) {
+      const operation=this.handleScheduledInternal(request,response,pathname);
+      if(this.adapter.trackOperation) await this.adapter.trackOperation(operation);
+      else await operation;
       return;
     }
     if (method === "POST" && pathname === "/v1/internal/job-progress") {
@@ -300,10 +317,86 @@ export class SlackHealthServer {
       this.quiesceOperationId = input.operation_id;
       await this.adapter.quiesce();
       const status = this.adapter.drainStatus();
-      send(response, status.drained ? 200 : 409, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
+      send(response, status.drained ? 200 : 202, { schema_version: 1, protocol: 1, service: "slack_adapter", ...status });
       return;
     }
     send(response, 404, { schema_version: 1, error: { code: "not_found", message: "Route not found" } });
+  }
+
+  private rejectStopping(response:ServerResponse):boolean {
+    if(!this.adapter.isStopping()) return false;
+    send(response,503,{schema_version:1,error:{code:"shutting_down",message:"Slack Adapter is stopping"}});
+    return true;
+  }
+
+  private async handleScheduledInternal(request:IncomingMessage,response:ServerResponse,pathname:string):Promise<void> {
+    if(this.rejectStopping(response)) return;
+    const method=request.method;
+    if(method==="POST"&&pathname==="/v1/internal/job-delivery-confirmations") {
+      if(!this.updateNotifications?.confirmJobDelivery||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Delivery confirmer is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobDeliveryConfirmationRequest(await this.readJson(request));
+        if(this.rejectStopping(response)) return;
+        const result=await this.updateNotifications.confirmJobDelivery(input);
+        send(response,200,{schema_version:1,...result});
+      } catch(error) {
+        this.logger.error("Slack job delivery confirmation failed",{error_code:"job_delivery_not_confirmed",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_delivery_not_confirmed",message:"Slack delivery could not be confirmed"}});
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/job-session-settlements") {
+      if(!this.updateNotifications?.settleJobSession||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Session settlement is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const input=parseJobSessionSettlementRequest(await this.readJson(request));
+        if(this.rejectStopping(response)) return;
+        const result=await this.updateNotifications.settleJobSession(input);
+        send(response,200,result);
+      } catch(error) {
+        this.logger.error("Slack job session settlement failed",{error_code:"job_session_not_settled",error_message:error instanceof Error?error.message:String(error)});
+        send(response,409,{schema_version:1,error:{code:"job_session_not_settled",message:"Slack Agent Session could not be settled"}});
+      }
+      return;
+    }
+    if(method==="POST"&&pathname==="/v1/internal/schedule-access-confirmations") {
+      if(!this.updateNotifications?.confirmScheduleAccess||!this.updateInternalTokenPath) { send(response,503,{schema_version:1,error:{code:"reporter_unavailable",message:"Access confirmer is not configured"}});return; }
+      if(!(await this.authorized(request))) { send(response,403,{schema_version:1,error:{code:"forbidden",message:"Internal authentication failed"}});return; }
+      try {
+        const body=await this.readJson(request) as Record<string,unknown>;
+        const input={schema_version:1 as const,event_id:String(body.event_id??""),workspace_id:String(body.workspace_id??""),channel_id:String(body.channel_id??""),user_id:String(body.user_id??"")};
+        if(this.rejectStopping(response)) return;
+        const result=await this.updateNotifications.confirmScheduleAccess(input); send(response,200,result);
+      } catch { send(response,409,{schema_version:1,error:{code:"schedule_access_not_confirmed",message:"Current Slack access could not be confirmed"}}); }
+      return;
+    }
+  }
+
+  private async handleReminder(request: IncomingMessage, response: ServerResponse, preflightOnly: boolean): Promise<void> {
+    if (!this.reminders || !this.updateInternalTokenPath) {
+      send(response, 503, { schema_version: 1, error: { code: "connector_unavailable", message: "Reminder connector is not configured" } });
+      return;
+    }
+    if (!(await this.authorized(request))) {
+      send(response, 403, { schema_version: 1, error: { code: "forbidden", message: "Internal authentication failed" } });
+      return;
+    }
+    if (this.adapter.isStopping()) {
+      send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+      return;
+    }
+    try {
+      const input = await this.readJson(request);
+      if (this.adapter.isStopping()) {
+        send(response, 503, { schema_version: 1, outcome: "unavailable", code: "shutting_down", retry_after_seconds: 1 });
+        return;
+      }
+      const result = await this.reminders.deliver(input, preflightOnly);
+      send(response, 200, { schema_version: 1, ...result });
+    } catch {
+      send(response, 400, { schema_version: 1, outcome: "rejected", code: "invalid_command" });
+    }
   }
 
   private async authorized(request: IncomingMessage): Promise<boolean> {

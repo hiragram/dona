@@ -475,10 +475,17 @@ export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
   async quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot> {
-    const response = await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
+    let snapshot = drainSnapshot(await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
-    }, this.policy.timeouts.drain_ms);
-    return drainSnapshot(response, "slack_adapter");
+    }, this.policy.timeouts.drain_ms), "slack_adapter");
+    const deadline = Date.now() + this.policy.timeouts.agent_drain_ms;
+    while (!snapshot.drained && Date.now() < deadline) {
+      await delay(100);
+      snapshot = drainSnapshot(await udsRequest(
+        this.policy.slack_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
+      ), "slack_adapter");
+    }
+    return snapshot;
   }
 
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {
@@ -712,11 +719,13 @@ export class RealRuntime implements RuntimePort {
       DONA_UPDATER_SOCKET_PATH: path.join(this.policy.control_root, "updater.sock"),
       DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
       DONA_HERDR_PATH: this.policy.executables.herdr,
+      DONA_CODEX_PATH: this.policy.executables.codex,
       DONA_GH_PATH: this.policy.executables.gh,
       DONA_GIT_PATH: this.policy.executables.git,
     })}`;
     const slackMcpEnvironment = `mcp_servers.dona_slack.env = ${tomlInlineTable({
       DOTENV_CONFIG_PATH: path.join(canonicalConfigRoot, "slack.env"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: this.policy.dispatcher_internal_token_file,
     })}`;
     const deadline = Date.now() + this.policy.timeouts.agent_exit_ms;
     let result: CommandResult;

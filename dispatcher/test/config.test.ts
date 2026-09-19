@@ -58,7 +58,7 @@ describe("job resource config", () => {
     const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
       scripts?: { test?: string };
     };
-    assert.equal(packageJson.scripts?.test, "node test/run-tests.mjs");
+    assert.equal(packageJson.scripts?.test, "node ../scripts/run-scheduler-integration-gate.mjs && node test/run-tests.mjs");
     const runner = fs.readFileSync(new URL("./run-tests.mjs", import.meta.url), "utf8");
     assert.match(runner, /--test-concurrency=1/);
     assert.match(runner, /\[dispatcher-test\] start/);
@@ -99,11 +99,12 @@ describe("job resource config", () => {
     assert.match(runner, /process\.stdout\.write\(failureStdout\)/);
     assert.match(runner, /process\.stderr\.write\(failureStderr\)/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
-    const markerBytes = fs.readdirSync(new URL("./", import.meta.url))
+    const markerSizes = fs.readdirSync(new URL("./", import.meta.url))
       .filter((name) => name.endsWith(".test.ts"))
       .sort()
-      .reduce((total, name) => total + Buffer.byteLength(`[dispatcher-test] start test/${name}\n`), 0);
-    assert.ok(markerBytes <= 800, `start markers exceed the legacy diagnostic budget: ${markerBytes}`);
+      .map(name => Buffer.byteLength(`[dispatcher-test:${"a".repeat(32)}] file-start test/${name} load=0.000\n`));
+    // Files accumulate, but the updater persists only the latest nonce-bound checkpoint.
+    assert.ok(markerSizes.every(bytes => bytes <= 800), "one checkpoint exceeds the unchanged diagnostic budget");
   });
 
   test("停止するtestでもbody実行前にcase-startを出力する", async () => {

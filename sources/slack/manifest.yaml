@@ -22,7 +22,9 @@ oauth_config:
       - groups:history
       - groups:read
       - im:history
+      - im:read
       - mpim:history
+      - mpim:read
       - chat:write
       - files:read
       - reactions:read

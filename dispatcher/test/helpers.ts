@@ -16,6 +16,7 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       herdrSession: "dona",
       agentName: "dona-main",
       herdrPath: "herdr",
+      codexPath: "codex",
       requestMaxBytes: 1_048_576,
       agentWaitTimeoutMs: 100,
       agentMissingGraceMs: 50,

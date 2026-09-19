@@ -14,6 +14,7 @@ import { SlackSocketAdapter, type WorkspaceSocket } from "./socket-adapter.js";
 import { SlackUpdateNotificationReporter } from "./update-notification.js";
 import { SlackJobProgressReporter } from "./job-progress.js";
 import { SlackWorkspaceRegistry } from "./workspace-registry.js";
+import { SlackReminderConnector } from "./reminder-connector.js";
 
 async function main(): Promise<void> {
   const config = loadAdapterConfig();
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
     config.buildSha,
     updateNotifications,
     config.updateInternalTokenPath,
+    new SlackReminderConnector(registry),
     new SlackJobProgressReporter(registry, (progressId, deliveryToken) => dispatcher.resolveJobProgress(progressId, deliveryToken)),
     config.appSchemaWrite,
     config.appSchemaReadMax,

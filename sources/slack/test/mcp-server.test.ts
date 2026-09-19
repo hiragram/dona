@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -38,6 +39,8 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }> = [];
   readonly sessionStatuses: Array<{
     channelId: string;
@@ -74,6 +77,7 @@ class FakeSlackClient implements SlackApiClient {
       isShared: false,
     };
   }
+  async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
   async listUsers(): Promise<SlackUserPage> {
     return { users: [await this.getUser()] };
   }
@@ -129,6 +133,8 @@ class FakeSlackClient implements SlackApiClient {
     text: string;
     threadTs?: string;
     replyBroadcast: boolean;
+    mrkdwn?: boolean;
+    parse?: "none";
   }): Promise<SlackPostResult> {
     this.posts.push(input);
     return { channelId: input.channelId, messageTs: "2.3", ...(input.threadTs ? { threadTs: input.threadTs } : {}) };
@@ -166,7 +172,7 @@ describe("Dona Slack MCP server", () => {
       logger,
       () => fake,
     );
-    const server = createSlackMcpServer(registry, logger);
+    const server = createSlackMcpServer(registry, logger,input=>JSON.stringify(input));
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -179,6 +185,7 @@ describe("Dona Slack MCP server", () => {
           "list_workspaces",
           "list_channels",
           "get_channel",
+          "check_user_channel_access",
           "list_users",
           "get_user",
           "get_thread",
@@ -193,6 +200,9 @@ describe("Dona Slack MCP server", () => {
         listed.tools.find(({ name }) => name === "get_thread")?.annotations?.readOnlyHint,
         true,
       );
+      const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1",event_id:"evt_test"}});
+      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null,
+        access_receipt:JSON.stringify({event_id:"evt_test",workspace_id:"T123",channel_id:"C123",user_id:"U1",channel_kind:"other",channel_user_id:null})});
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
@@ -239,6 +249,8 @@ describe("Dona Slack MCP server", () => {
           channel_id: "C123",
           text: "hello",
           thread_ts: "1.2",
+          mrkdwn: false,
+          parse: "none",
         },
       });
       assert.equal(result.isError, undefined);
@@ -248,13 +260,47 @@ describe("Dona Slack MCP server", () => {
           text: "hello",
           threadTs: "1.2",
           replyBroadcast: false,
+          mrkdwn: false,
+          parse: "none",
         },
       ]);
       assert.deepEqual(result.structuredContent, {
         workspace: "company",
         channel_id: "C123",
         message_ts: "2.3",
+        body_sha256: createHash("sha256").update("hello").digest("hex"),
         thread_ts: "1.2",
+        reply_broadcast: false,
+        mrkdwn: false,
+        parse: "none",
+      });
+
+      const scheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "scheduled",
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.deepEqual(fake.posts.at(-1), {
+        channelId: "C123",
+        text: "scheduled",
+        replyBroadcast: false,
+        mrkdwn: false,
+        parse: "none",
+        identityBlockId: `dona-job-${createHash("sha256").update("evt_01m1zfewbjx8v0844yrrkqwzc7").digest("hex").slice(0,32)}`,
+      });
+      assert.deepEqual(scheduledResult.structuredContent, {
+        workspace: "company",
+        channel_id: "C123",
+        message_ts: "2.3",
+        body_sha256: createHash("sha256").update("scheduled").digest("hex"),
+        reply_broadcast: false,
+        mrkdwn: false,
+        parse: "none",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
 
       const fileResult = await client.callTool({

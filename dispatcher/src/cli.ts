@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
+import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 
 function usage(): never {
   console.error(`Usage:
@@ -13,9 +14,15 @@ function usage(): never {
   dona-dispatcher event show <event_id>
   dona-dispatcher event retry <event_id> [--force]
   dona-dispatcher event complete <event_id>
+  dona-dispatcher event reconcile-notification <event_id> <workspace_id> <channel_id> <message_ts> [thread_ts] [--resume]
+  dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
-  dona-dispatcher job show <job_id>`);
+  dona-dispatcher job show <job_id>
+  dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher scheduler health
+  dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
+  dona-dispatcher scheduler retention [--apply --force]`);
   process.exit(2);
 }
 
@@ -32,13 +39,30 @@ async function main(): Promise<void> {
     await runService(config);
     return;
   }
-  if (!["event", "job"].includes(args[0]!)) usage();
+  if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
   const command = args[1];
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
   try {
+    if (args[0] === "scheduler") {
+      const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+      if (command === "health") { console.log(JSON.stringify(database.scheduler.operationalSnapshot(now), null, 2)); return; }
+      if (command === "outbox") {
+        const statusAt=args.indexOf("--status"),limitAt=args.indexOf("--limit");
+        if ((statusAt >= 0 && !args[statusAt+1]) || (limitAt >= 0 && !args[limitAt+1])) usage();
+        console.log(JSON.stringify(database.scheduler.listOutbox(statusAt<0?undefined:args[statusAt+1] as never,
+          limitAt<0?50:Number(args[limitAt+1])),null,2)); return;
+      }
+      if (command === "retention") {
+        const plan=database.scheduler.retentionPlan(now);
+        if (!args.includes("--apply")) { console.log(JSON.stringify({dry_run:true,...plan},null,2)); return; }
+        if (!args.includes("--force")) throw new Error("retention apply requires --force; run without --apply for dry-run");
+        database.scheduler.purge(now); console.log(JSON.stringify({dry_run:false,...plan},null,2)); return;
+      }
+      usage();
+    }
     if (args[0] === "job") {
       if (command === "list") {
         const statusIndex = args.indexOf("--status");
@@ -53,6 +77,10 @@ async function main(): Promise<void> {
         if (!row) throw new Error(`Job ${jobId} was not found`);
         console.log(JSON.stringify(row, null, 2));
         return;
+      }
+      if(command==="reconcile-run") {
+        const runId=eventIdAt(args,2),outcome=args[3];if(outcome!=="failed"&&outcome!=="cancelled")usage();
+        console.log(JSON.stringify(database.reconcileScheduledRun(runId,outcome),null,2));return;
       }
       usage();
     }
@@ -80,6 +108,20 @@ async function main(): Promise<void> {
     }
     if (command === "complete") {
       console.log(JSON.stringify(database.manualComplete(eventIdAt(args, 2)), null, 2));
+      return;
+    }
+    if(command==="reconcile-notification") {
+      if(args[3]==="not_sent") {
+        const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId,args.includes("--resume")),settlement=database.notificationSessionSettlementRequest(eventId);
+        if(settlement)await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement);
+        console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,new Date(),claim),null,2));return;
+      }
+      const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6]==="--resume"?undefined:args[6];
+      const claim=database.claimNotificationReconciliation(eventId,args.includes("--resume"));
+      const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
+      if(!verification) throw new Error("scheduled_notification_verification_unavailable");
+      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);
+      console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})},new Date(),claim),null,2));
       return;
     }
     if (command === "dead-letter") {

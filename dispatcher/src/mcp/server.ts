@@ -19,13 +19,23 @@ export interface DispatcherJobClient {
     jobKey?: string,
     canonicalPayloadSha256?: string,
   ): Promise<Record<string, unknown>>;
+  authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
+  recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
+  listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
   cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
+  previewSchedule(input: unknown): Promise<Record<string, unknown>>;
+  createSchedule(input: unknown): Promise<Record<string, unknown>>;
+  getSchedule(scheduleId: string, sourceEventId: string): Promise<Record<string, unknown>>;
+  listSchedules(sourceEventId: string, limit: number, cursor?: string): Promise<Record<string, unknown>>;
+  updateSchedule(scheduleId: string, input: unknown): Promise<Record<string, unknown>>;
+  transitionSchedule(scheduleId: string, action: "pause"|"resume"|"cancel", input: unknown): Promise<Record<string, unknown>>;
+  getScheduleHistory(scheduleId: string, sourceEventId: string, limit: number, cursor?: string): Promise<Record<string, unknown>>;
 }
 
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i).describe("現在処理中のDona event_id");
@@ -37,13 +47,23 @@ const updateRequestId = z.string().regex(/^upd_[0-9a-hjkmnp-tv-z]{26}$/);
 const updatePlanId = z.string().regex(/^plan_[0-9a-hjkmnp-tv-z]{26}$/);
 const planHash = z.string().regex(/^[0-9a-f]{64}$/);
 const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
+const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
+const scheduleIdempotencyKey = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
+const scheduleListCursor = z.string().regex(/^(?:0|[1-9]\d{0,14}|[1-8]\d{15}|900[0-6]\d{12}|90070\d{11}|90071[0-8]\d{10}|900719[0-8]\d{9}|9007199[01]\d{8}|90071992[0-4]\d{7}|900719925[0-3]\d{6}|9007199254[0-6]\d{5}|90071992547[0-3]\d{4}|9007199254740[0-8]\d{2}|90071992547409[0-8]\d|900719925474099[01])$/);
+const recurrence = z.record(z.string(), z.unknown());
+const scheduleContent = (max: number) => z.string().min(1).refine(value => [...value].length <= max);
+const scheduleAction = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("reminder"), body: scheduleContent(2000) }).strict(),
+  z.object({ kind: z.literal("work"), objective: scheduleContent(4000), notify: z.enum(["origin_thread", "none"]) }).strict(),
+]);
+const scheduleDefinition = z.object({ recurrence, action: scheduleAction }).strict();
 const jobKey = z.string().trim().regex(jobKeyPattern);
 const createJobKey = jobKey.refine(
   (value) => value !== legacyJobKey,
   `${legacyJobKey} is reserved; omit job_key for legacy behavior`,
 );
-const jobObjective = z.string().trim().min(1).refine(
-  (value) => Array.from(value).length <= jobObjectiveCharacterMax,
+const jobObjective = z.string().refine(value => value.trim().length > 0, "must contain non-whitespace").refine(
+  (value) => Array.from(value.trim()).length <= jobObjectiveCharacterMax,
   `must be at most ${jobObjectiveCharacterMax} characters`,
 );
 
@@ -74,7 +94,7 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
   const project = (value: unknown) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const row = value as Record<string, unknown>;
-    const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id"];
+    const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id", "notification_state", "notification_authorization_phase"];
     if (includeResult) keys.push("result_json");
     return {
       ...Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]])),
@@ -86,11 +106,11 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
-    ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.jobs.length >= 100 } : {}),
+    ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.truncated === true || response.jobs.length > 100 } : {}),
   };
 }
 
-function dispatcherApiError(error: unknown): { code: string; message: string } | undefined {
+function dispatcherApiError(error: unknown): { code: string; message: string; details?:Record<string,unknown> } | undefined {
   if (!(error instanceof DispatcherClientError) || !error.body || typeof error.body !== "object" || Array.isArray(error.body)) {
     return undefined;
   }
@@ -101,7 +121,9 @@ function dispatcherApiError(error: unknown): { code: string; message: string } |
     typeof structured.message !== "string" || structured.message.length > 2_000) {
     return undefined;
   }
-  return { code: structured.code, message: structured.message };
+  const details=structured.details;
+  return { code: structured.code, message: structured.message,
+    ...(details&&typeof details==="object"&&!Array.isArray(details)?{details:details as Record<string,unknown>}:{}) };
 }
 
 function failure(error: unknown, logger: Logger, tool: string) {
@@ -216,6 +238,16 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     }
   });
 
+  server.registerTool("list_owner_jobs", {
+    title: "List owner jobs",
+    description: "現在eventと同じ永続ownerに属するjobを取得します。",
+    inputSchema: { source_event_id: eventId },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ source_event_id }) => {
+    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
+    catch(error){ return failure(error,logger,"list_owner_jobs"); }
+  });
+
   server.registerTool("get_job_status", {
     title: "Get background job status",
     description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。group通知では現在の通知event_idを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
@@ -227,6 +259,26 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }
+  });
+
+  server.registerTool("authorize_job_notification", {
+    title:"Authorize scheduled job notification",
+    description:"scheduled dona_jobのSlack write直前に、永続schedule state・revision・expiry・900秒期限を再検証します。authorized以外やtool失敗では投稿してはいけません。応答不明時は再試行せずget_job_statusのnotification_authorization_phaseをread-only照合し、人間のreconcileへ送ります。",
+    inputSchema:{event_id:eventId,access_receipt:z.string().min(32).max(2_000).optional()},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+  },async({event_id,access_receipt})=>{
+    try { if(!client.authorizeJobNotification) throw new Error("Notification authorization is unavailable"); return success(await client.authorizeJobNotification(event_id,access_receipt)); }
+    catch(error){return failure(error,logger,"authorize_job_notification");}
+  });
+
+  server.registerTool("record_schedule_job_access", {
+    title:"Record scheduled job access receipt",
+    description:"check_user_channel_access成功直後に、その完全一致receiptを一度だけ永続化します。成功後は直ちにdelegate_jobを呼びます。",
+    inputSchema:{event_id:eventId,receipt:z.string().min(32).max(2_000)},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+  },async({event_id,receipt})=>{
+    try { if(!client.recordScheduleJobAccess) throw new Error("Schedule access recording is unavailable"); return success(await client.recordScheduleJobAccess(event_id,receipt)); }
+    catch(error){return failure(error,logger,"record_schedule_job_access");}
   });
 
   server.registerTool("steer_job", {
@@ -311,6 +363,14 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return failure(error, logger, "cancel_self_update");
     }
   });
+
+  server.registerTool("preview_schedule", { title: "Preview schedule", description: "作成前に固定宛先・権限期限・有限occurrenceを確認します。", inputSchema: { source_event_id: eventId, definition: scheduleDefinition, after: z.string(), before_or_equal: z.string(), limit: z.number().int().min(1).max(100) }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => { try { return success(await client.previewSchedule(input)); } catch (e) { return failure(e, logger, "preview_schedule"); } });
+  server.registerTool("create_schedule", { title: "Create schedule", description: "現在のSlack event contextへserver-side bindingしてscheduleを作成します。timeout時は同じidempotency_keyをblind retryせずget/listで照合します。", inputSchema: { source_event_id: eventId, idempotency_key: scheduleIdempotencyKey, definition: scheduleDefinition }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => { try { return success(await client.createSchedule(input)); } catch (e) { return failure(e, logger, "create_schedule"); } });
+  server.registerTool("get_schedule", { title: "Get schedule", description: "所有するscheduleの安全な投影を取得します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id}) => { try { return success(await client.getSchedule(schedule_id, source_event_id)); } catch (e) { return failure(e, logger, "get_schedule"); } });
+  server.registerTool("list_schedules", { title: "List schedules", description: "所有するscheduleをbounded paginationで列挙します。", inputSchema: { source_event_id: eventId, limit: z.number().int().min(1).max(100).default(50), cursor: scheduleListCursor.optional() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, limit, cursor}) => { try { return success(await client.listSchedules(source_event_id, limit, cursor)); } catch (e) { return failure(e, logger, "list_schedules"); } });
+  server.registerTool("update_schedule", { title: "Update schedule", description: "optimistic revisionと新しいevent authorizationでscheduleを更新します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId, expected_revision: z.number().int().positive(), definition: scheduleDefinition }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async ({schedule_id, ...input}) => { try { return success(await client.updateSchedule(schedule_id, input)); } catch (e) { return failure(e, logger, "update_schedule"); } });
+  for (const operation of ["pause", "resume", "cancel"] as const) server.registerTool(`${operation}_schedule`, { title: `${operation} schedule`, description: `optimistic revisionでscheduleを${operation}します。`, inputSchema: { source_event_id: eventId, schedule_id: scheduleId, expected_revision: z.number().int().positive() }, annotations: { readOnlyHint: false, destructiveHint: operation === "pause" || operation === "cancel", idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id, expected_revision}) => { try { return success(await client.transitionSchedule(schedule_id, operation, {source_event_id, expected_revision})); } catch (e) { return failure(e, logger, `${operation}_schedule`); } });
+  server.registerTool("get_schedule_history", { title: "Get schedule history", description: "run statusをbounded paginationで取得します。", inputSchema: { source_event_id: eventId, schedule_id: scheduleId, limit: z.number().int().min(1).max(100).default(50), cursor: z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\|run_[0-9a-f-]{36}$/).optional() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async ({source_event_id, schedule_id, limit, cursor}) => { try { return success(await client.getScheduleHistory(schedule_id, source_event_id, limit, cursor)); } catch (e) { return failure(e, logger, "get_schedule_history"); } });
 
   return server;
 }

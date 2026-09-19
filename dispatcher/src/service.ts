@@ -4,7 +4,11 @@ import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
+import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
 import { createLogger } from "./logger.js";
+import { SystemClock } from "./scheduler/clock.js";
+import { SchedulerService } from "./scheduler/service.js";
+import { ReminderPublisher, SlackAdapterReminderClient } from "./scheduler/reminder-publisher.js";
 import { DispatcherWorker } from "./worker.js";
 import { UpdaterClient } from "./updater-client.js";
 import {
@@ -41,7 +45,16 @@ export async function runService(config: DispatcherConfig): Promise<void> {
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger, () => jobSupervisor.wake());
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const scheduler = new SchedulerService(
+    database.scheduler,
+    new SystemClock(),
+    () => worker.wake(),
+    createLogger("dispatcher_scheduler"),
+    { pollMilliseconds: Math.min(config.queuePollMs, 60_000) },
+  );
+  const reminderPublisher = new ReminderPublisher(database.scheduler, new SlackAdapterReminderClient(config),
+    new SystemClock(), createLogger("dispatcher_slack_reminders"), Math.min(config.queuePollMs, 60_000));
   jobSupervisor = new JobSupervisor(
     database,
     new HerdrJobAgentRuntime(config, jobProgress !== undefined),
@@ -67,6 +80,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     new UpdaterClient(config.updaterSocketPath, config.jobCommandTimeoutMs),
     {
       async quiesce() {
+        await scheduler.stop();
+        await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
@@ -74,10 +89,15 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     },
     updateNotificationWorker,
     jobProgress,
+    undefined,
+    () => scheduler.wake(),
+    scheduler,
   );
 
   try {
     await api.start();
+    // Clear stale/expired outbox fences before due materialization decides overlap for a newer occurrence.
+    database.scheduler.recover(new SystemClock().now(), true);
     jobSupervisor.recoverStaleJobs();
     try { await jobProgress?.recover(); }
     catch (error) {
@@ -100,12 +120,17 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       }
     }
     worker.start();
+    scheduler.start();
+    reminderPublisher.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
+    if (scheduler.isRunning()) await scheduler.stop();
+    if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
+    await api.stop();
     database.close();
     updateNotificationDatabase.close();
     jobProgressStore?.close();
@@ -121,6 +146,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       try {
         api.beginShutdown();
         await api.stop();
+        await scheduler.stop();
+        await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
         await worker.stop();

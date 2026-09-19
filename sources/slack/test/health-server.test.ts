@@ -348,7 +348,7 @@ describe("SlackHealthServer", () => {
     const server = new SlackHealthServer(socketPath, {
       isSocketReady:()=>true, isStopping:()=>false, connectionStates:()=>({ company:"connected" }),
       async quiesce(){}, drainStatus:()=>({ quiescing:false, drained:false, in_flight:0, unsafe_states:[] }),
-    }, { healthReady:async()=>true }, logger, "2".repeat(40), undefined, tokenPath, {
+    }, { healthReady:async()=>true }, logger, "2".repeat(40), undefined, tokenPath, undefined, {
       async deliver() { throw Object.assign(new Error("unknown workspace"), { definitelyUnsent:true, progressPermanent:true }); },
     } as never);
     await server.start();
@@ -363,7 +363,7 @@ describe("SlackHealthServer", () => {
 
   test("treats not_in_channel progress rejection as permanent", async () => {
     const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-slack-progress-membership-")); roots.push(root); const socketPath=path.join(root,"run","slack.sock"); const tokenPath=path.join(root,"token"); const token="a".repeat(64); await fs.writeFile(tokenPath,token,{mode:0o600});
-    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,{async deliver(){throw new SlackApiError("not_in_channel","not in channel");}} as never);
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,undefined,{async deliver(){throw new SlackApiError("not_in_channel","not in channel");}} as never);
     await server.start(); try {
       const response=await request(socketPath,"/v1/internal/job-progress","POST",{schema_version:1,progress_id:"job_abc:1",delivery_token:"b".repeat(64)},{"x-dona-update-token":token});
       assert.equal(response.status,409); assert.deepEqual(response.body.error,{code:"not_in_channel"});
@@ -373,7 +373,7 @@ describe("SlackHealthServer", () => {
   test("progress drain waits for an accepted Adapter delivery", async () => {
     const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-slack-progress-drain-")); roots.push(root); const socketPath=path.join(root,"run","slack.sock"); const tokenPath=path.join(root,"token"); const token="a".repeat(64); await fs.writeFile(tokenPath,token,{mode:0o600});
     let release!:()=>void; const gate=new Promise<void>((resolve)=>{release=resolve;});
-    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,{async deliver(input:{progress_id:string}){await gate;return {progress_id:input.progress_id};}} as never);
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,undefined,{async deliver(input:{progress_id:string}){await gate;return {progress_id:input.progress_id};}} as never);
     await server.start(); try {
       const delivery=request(socketPath,"/v1/internal/job-progress","POST",{schema_version:1,progress_id:"job_abc:1",delivery_token:"b".repeat(64)},{"x-dona-update-token":token});
       await new Promise((resolve)=>setTimeout(resolve,10)); let drained=false; const drain=request(socketPath,"/v1/internal/job-progress/drain","POST",undefined,{"x-dona-update-token":token}).then((value)=>{drained=true;return value;});
@@ -383,7 +383,7 @@ describe("SlackHealthServer", () => {
 
   test("progress drain waits for a request still reading its body", async () => {
     const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-slack-progress-admission-")); roots.push(root); const socketPath=path.join(root,"run","slack.sock"); const tokenPath=path.join(root,"token"); const token="a".repeat(64); await fs.writeFile(tokenPath,token,{mode:0o600});
-    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,{async deliver(input:{progress_id:string}){return {progress_id:input.progress_id};}} as never); await server.start();
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>false,connectionStates:()=>({company:"connected"}),async quiesce(){},drainStatus:()=>({quiescing:false,drained:false,in_flight:0,unsafe_states:[]})},{healthReady:async()=>true},logger,"2".repeat(40),undefined,tokenPath,undefined,{async deliver(input:{progress_id:string}){return {progress_id:input.progress_id};}} as never); await server.start();
     try {
       const body=Buffer.from(JSON.stringify({schema_version:1,progress_id:"job_abc:1",delivery_token:"b".repeat(64)}));
       let resolveResponse!:(value:{status:number})=>void; const responsePromise=new Promise<{status:number}>((resolve)=>{resolveResponse=resolve;});
@@ -396,3 +396,28 @@ describe("SlackHealthServer", () => {
     } finally {await server.stop();}
   });
 });
+
+for(const operation of ["job-delivery-confirmations","job-session-settlements","schedule-access-confirmations"] as const) {
+  for(const slowBody of [false,true]) test(`scheduler内部操作 ${operation} はdrainへ参加する body=${slowBody}`,{timeout:5000},async()=>{
+    const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-internal-drain-"));roots.push(root);
+    const socketPath=path.join(root,"slack.sock"),tokenPath=path.join(root,"token"),token="d".repeat(64);await fs.writeFile(tokenPath,token,{mode:0o600});
+    let stopping=false,inFlight=0,calls=0,release!:()=>void,entered!:()=>void,tracked!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});const started=new Promise<void>(resolve=>{entered=resolve;});const registered=new Promise<void>(resolve=>{tracked=resolve;});
+    const deliver=async()=>{calls++;entered();await gate;return {schema_version:1,authorized:true};};
+    const port={deliver,confirmJobDelivery:deliver,settleJobSession:deliver,confirmScheduleAccess:deliver} as unknown as UpdateNotificationPort;
+    const server=new SlackHealthServer(socketPath,{isSocketReady:()=>true,isStopping:()=>stopping,connectionStates:()=>({}),async quiesce(){stopping=true;},drainStatus:()=>({quiescing:stopping,drained:stopping&&inFlight===0,in_flight:inFlight,unsafe_states:[]}),async trackOperation<T>(promise:Promise<T>){inFlight++;tracked();try{return await promise;}finally{inFlight--;}}},{healthReady:async()=>true},logger,"2".repeat(40),port,tokenPath);
+    await server.start();
+    const common={schema_version:1,event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",workspace_id:"T123",channel_id:"C123"};
+    const body=operation==="schedule-access-confirmations"?{...common,user_id:"U123"}:operation==="job-session-settlements"?{...common,thread_ts:"1789820001.000001",desired_session_status:"active"}:{...common,thread_ts:"1789820001.000001",message_ts:"1789820002.000001",body_sha256:"a".repeat(64),desired_session_status:"active"};
+    const route=`/v1/internal/${operation}`;const headers={"x-dona-update-token":token};
+    let finishBody:(()=>void)|undefined;
+    const delivery=slowBody?new Promise<number>((resolve,reject)=>{const encoded=Buffer.from(JSON.stringify(body));const req=http.request({socketPath,path:route,method:"POST",headers:{...headers,"content-type":"application/json","content-length":String(encoded.length)}},response=>{response.resume();response.on("end",()=>resolve(response.statusCode!));});req.on("error",reject);req.write(encoded.subarray(0,10));finishBody=()=>req.end(encoded.subarray(10));}):request(socketPath,route,"POST",body,headers).then(result=>result.status);
+    try {
+      await (slowBody?registered:started);
+      const quiesced=await request(socketPath,"/v1/admin/quiesce","POST",{schema_version:1,protocol:1,operation_id:"upd_01m1es03xy5cf8d9pm5cwx4srv",target_sha:"2".repeat(40)});
+      assert.equal(quiesced.status,202);assert.equal(quiesced.body.in_flight,1);assert.equal(quiesced.body.drained,false);
+      assert.equal((await request(socketPath,route,"POST",body,headers)).status,503);
+      finishBody?.();finishBody=undefined;release();assert.equal(await delivery,slowBody?503:200);assert.equal(calls,slowBody?0:1);assert.equal(inFlight,0);
+    }finally{release();finishBody?.();await server.stop();}
+  });
+}

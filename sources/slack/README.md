@@ -31,7 +31,7 @@ AdapterはHerdrやDispatcherのSQLiteを直接操作しません。使用して�
 2. 「Basic Information」→「App-Level Tokens」でtokenを発行します。
 3. App-Level Tokenには`connections:write`だけを付与します。
 4. Event Subscriptionsを有効にし、必要なBot Eventsを登録します。
-5. OAuth scopesを確認し、Appをworkspaceへinstall/reinstallします。
+5. OAuth scopes（owner DM照会用の`im:read`を含む）を確認し、Appをworkspaceへinstall/reinstallします。既存Appへscopeを追加した場合も各workspaceでreinstallが必要です。
 6. Botを受信対象チャンネルへ招待します。
 7. Request URLは設定しません。
 

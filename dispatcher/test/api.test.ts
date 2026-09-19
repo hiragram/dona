@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
-import { DispatcherApi } from "../src/api.js";
+import { DispatcherApi, scheduleAccessConfirmationTimeout } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
 import { UpdaterClientError } from "../src/updater-client.js";
@@ -79,6 +79,12 @@ function requestAndDropResponseBody(socketPath: string, route: string, body: unk
 }
 
 describe("DispatcherApi", () => {
+  test("bounds live access confirmation by the signed receipt lifetime", () => {
+    const issuedAt="2026-09-08T00:00:00.000Z",issued=Date.parse(issuedAt);
+    assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued),119_000);
+    assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued+118_500),500);
+    assert.throws(()=>scheduleAccessConfirmationTimeout(issuedAt,issued+119_000),/receipt_expired/);
+  });
   test("persists before returning 202 and returns the same event for duplicates", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -104,6 +110,27 @@ describe("DispatcherApi", () => {
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
     await api.stop();
     database.close();
+  });
+
+  test("readyはprocess liveとscheduler loopを分離しredacted metricsを公開する", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,undefined,undefined,undefined,undefined,
+      ()=>new Date("2026-09-11T00:00:00Z"),()=>{},
+      {operationalState:()=>({running:false,last_purge_at:null})});
+    await api.start();
+    assert.equal((await request(config.socketPath,"GET","/health/live")).status,200);
+    const ready=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(ready.status,503);
+    const metrics=await request(config.socketPath,"GET","/metrics/scheduler");
+    assert.equal(metrics.status,200);
+    assert.deepEqual(Object.keys(metrics.body),["schema_version","scheduler"]);
+    database.assertReadableWritable=()=>{throw new Error("database unavailable");};
+    const unavailable=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(unavailable.status,503);
+    assert.equal((unavailable.body.scheduler as {error_code:string}).error_code,"scheduler_storage_unavailable");
+    assert.equal((await request(config.socketPath,"GET","/health/version")).status,503);
+    await api.stop(); database.close();
   });
 
   test("rejects invalid media types and oversized bodies", async () => {
@@ -139,6 +166,7 @@ describe("DispatcherApi", () => {
     const accepted = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-job-api"));
     const created = await request(config.socketPath, "POST", "/v1/jobs", {
       source_event_id: accepted.body.event_id,
+      job_key:"primary",
       objective: "リポジトリを調査する",
       workspace: { kind: "github", repository: "owner/repo" },
     });
@@ -147,22 +175,38 @@ describe("DispatcherApi", () => {
     assert.equal(created.body.duplicate, false);
     const job = created.body.job as Record<string, unknown>;
     assert.match(String(job.job_id), /^job_/);
-    assert.equal(job.job_key, "legacy-default");
+    assert.equal(job.job_key, "primary");
     assert.equal(jobWakeCount, 1);
-    const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}`);
+    const shown = await request(config.socketPath, "GET", `/v1/jobs/${job.job_id}?source_event_id=${accepted.body.event_id}`);
     assert.equal(shown.status, 200);
     assert.equal((shown.body.job as Record<string, unknown>).source_event_id, accepted.body.event_id);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}`)).status,400);
+    const otherEnvelope=eventEnvelope("Ev-job-api-other");
+    otherEnvelope.reply_target!.thread_ts="1756722031.000001";
+    otherEnvelope.subject.thread_ts="1756722031.000001";
+    const other=await request(config.socketPath,"POST","/v1/events",otherEnvelope);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,403);
+    const siblingRequest={source_event_id:accepted.body.event_id,job_key:"sibling",objective:"追加調査",workspace:{kind:"scratch"}};
+    const sibling=await request(config.socketPath,"POST","/v1/jobs",siblingRequest);
+    assert.equal(sibling.status,202);
+    assert.equal((await request(config.socketPath,"POST","/v1/jobs",siblingRequest)).status,200);
+    assert.equal((await request(config.socketPath,"POST","/v1/jobs",{...siblingRequest,objective:"差し替え"})).status,409);
+    const ownerList=await request(config.socketPath,"GET",`/v1/jobs?source_event_id=${accepted.body.event_id}`);
+    assert.equal(ownerList.status,200);
+    assert.equal((ownerList.body.jobs as unknown[]).length,2);
+    assert.equal("objective" in (ownerList.body.jobs as Array<Record<string,unknown>>)[0]!,false);
+    assert.equal("workspace_json" in (ownerList.body.jobs as Array<Record<string,unknown>>)[0]!,false);
     const listed = await request(
       config.socketPath,
       "GET",
       "/v1/jobs?workspace_id=T_TEST&channel_id=C_TEST&thread_ts=1756722030.123456",
     );
     assert.equal(listed.status, 200);
-    assert.equal((listed.body.jobs as unknown[]).length, 1);
+    assert.equal((listed.body.jobs as unknown[]).length, 2);
     const reconciled = await request(
       config.socketPath,
       "GET",
-      `/v1/events/${accepted.body.event_id}/jobs?job_key=legacy-default`,
+      `/v1/events/${accepted.body.event_id}/jobs?job_key=primary`,
     );
     assert.equal(reconciled.status, 200);
     assert.equal((reconciled.body.jobs as Array<Record<string, unknown>>)[0]?.job_id, job.job_id);
@@ -561,5 +605,31 @@ describe("DispatcherApi", () => {
     });
     await api.stop();
     database.close();
+  });
+
+  test("exposes preview, CRUD and transition contracts over UDS", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
+      undefined, undefined, undefined, undefined, () => new Date("2026-09-06T00:00:00Z"));
+    await api.start();
+    const event = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-schedule-uds"));
+    database.beginDispatch(event.body.event_id as string, path.join(root, "schedule-result.json"));
+    database.markWaiting(event.body.event_id as string);
+    const definition = { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "UDS確認" } };
+    const preview = await request(config.socketPath, "POST", "/v1/schedules/preview", { source_event_id: event.body.event_id, definition, after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10 });
+    assert.equal(preview.status, 200);
+    const invalid = await request(config.socketPath, "POST", "/v1/schedules/preview", { source_event_id: event.body.event_id, definition: { ...definition, recurrence: { version: 1, kind: "daily", start_date: "2026-09-01", local_time: "09:00:00", timezone: "Invalid/Zone", tzdb_version: "2025b", interval: 1 } }, after: "2026-09-06T00:00:00Z", before_or_equal: "2026-09-09T00:00:00Z", limit: 10 });
+    assert.equal(invalid.status, 400);
+    assert.equal((invalid.body.error as { code: string }).code, "invalid_timezone");
+    const created = await request(config.socketPath, "POST", "/v1/schedules", { source_event_id: event.body.event_id, idempotency_key: "uds-create", definition });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const schedule = created.body.schedule as { schedule_id: string; revision: number };
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/${schedule.schedule_id}?source_event_id=${event.body.event_id}`)).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
+    assert.equal((await request(config.socketPath, "POST", `/v1/schedules/${schedule.schedule_id}/pause`, { source_event_id: event.body.event_id, expected_revision: 1 })).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/${schedule.schedule_id}/runs?source_event_id=${event.body.event_id}&limit=10`)).status, 200);
+    assert.equal((await request(config.socketPath, "GET", `/v1/schedules/%ZZ?source_event_id=${event.body.event_id}`)).status, 400);
+    await api.stop(); database.close();
   });
 });

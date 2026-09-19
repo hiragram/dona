@@ -27,7 +27,8 @@
     "node": "/opt/homebrew/bin/node",
     "launchctl": "/bin/launchctl",
     "gh": "/opt/homebrew/bin/gh",
-    "herdr": "/Users/USERNAME/.local/bin/herdr"
+    "herdr": "/Users/USERNAME/.local/bin/herdr",
+    "codex": "/opt/homebrew/bin/codex"
   },
   "timeouts": {
     "command_ms": 900000,

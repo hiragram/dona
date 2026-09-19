@@ -10,6 +10,7 @@ import {
   parseCreateJobRequest,
   parseEventEnvelope,
   parseInternalUpdateEventEnvelope,
+  parseInternalScheduleEventEnvelope,
   parseResultEnvelope,
   serializeJobWorkspace,
   stableStringify,
@@ -17,6 +18,10 @@ import {
 import { eventEnvelope } from "./helpers.js";
 
 describe("event validation", () => {
+  test("job objectiveはcanonical trimし空白だけを拒否する",()=>{
+    assert.equal(parseCreateJobRequest({source_event_id:"evt_1",objective:"  調査  ",workspace:{kind:"scratch"}}).objective,"調査");
+    assert.throws(()=>parseCreateJobRequest({source_event_id:"evt_1",objective:"   ",workspace:{kind:"scratch"}}),/Too small/);
+  });
   test("ignores unknown top-level fields", () => {
     const input = { ...eventEnvelope("Ev-1"), future_field: true };
     assert.equal("future_field" in parseEventEnvelope(input), false);
@@ -149,5 +154,23 @@ describe("job creation validation", () => {
     assert.deepEqual(workspace.__dona_job_resource, { objective_utf8_bytes: 12 });
     assert.equal(jobCreationPayloadSha256FromWorkspace(workspace), canonicalPayloadSha256);
     assert.equal(jobCreationObjectiveBytesFromWorkspace(workspace), 12);
+  });
+
+  test("dona_scheduleをinternal typed validatorだけで受理しstable identityを照合する", () => {
+    const envelope = {
+      schema_version: 1,
+      source: "dona_schedule",
+      external_event_id: "schedule:v1:s1:2026-09-05T00:01:00Z",
+      type: "schedule_due",
+      occurred_at: "2026-09-05T00:01:00Z",
+      subject: { tenant_id: "T1", owner_id: "U1", schedule_id: "s1" },
+      payload: { run_id: "run_1", revision: 1, occurrence_key: '["s1","2026-09-05T00:01:00Z"]',
+        work: { objective: "read-only調査", scope: "read_only", allowed_external_writes: [], result_destination: { kind: "none" } } },
+      reply_target: null,
+      trace: { schedule_id: "s1", run_id: "run_1" },
+    };
+    assert.throws(() => parseEventEnvelope(envelope), /source/);
+    assert.equal(parseInternalScheduleEventEnvelope(envelope).source, "dona_schedule");
+    assert.throws(() => parseInternalScheduleEventEnvelope({ ...envelope, external_event_id: "schedule:v1:s2:2026-09-05T00:01:00Z" }), /mismatch/);
   });
 });

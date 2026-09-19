@@ -36,7 +36,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
       launchd: { dispatcher_label: "dev.dona.dispatcher", slack_label: "dev.dona.slack-adapter" },
       executables: {
         git: "/usr/bin/git", npm: "/usr/bin/npm", node: "/usr/bin/node", launchctl: "/bin/launchctl",
-        gh: "/usr/bin/gh", herdr: "/usr/bin/herdr",
+        gh: "/usr/bin/gh", herdr: "/usr/bin/herdr", codex: "/usr/bin/codex",
       },
       timeouts: {
         command_ms: 5_000, health_ms: 100, drain_ms: 100, agent_drain_ms: 100,

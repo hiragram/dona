@@ -13,14 +13,14 @@ import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 
-async function fixture() {
+async function fixture(scheduleNow?: () => Date) {
   const { root, config } = await tempConfig();
   const database = new DispatcherDatabase(config.databasePath);
   const forbidden = async (): Promise<never> => { throw new Error("runtime must not be invoked"); };
   const supervisor = new JobSupervisor(database, {
     prepare: forbidden, get: forbidden, prompt: forbidden, wait: forbidden, cancel: forbidden,
   }, config, logger, () => {});
-  const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, supervisor, config, logger);
+  const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, supervisor, config, logger, undefined, undefined, undefined, undefined, scheduleNow);
   await api.start();
   const uds = new DispatcherApiClient(config.socketPath);
   const server = createDispatcherMcpServer(uds, logger);
@@ -111,8 +111,8 @@ test("MCP thread candidates, explicit control and cross-thread rejection preserv
     const bad = await f.call("cancel_job", { source_event_id: follow, job_id: `$(cat /private/token) ${two}` });
     assert.equal(bad.error, true);
     assert.equal(f.database.getJob(two)?.status, "queued");
-    const notification = eventEnvelope("notice"); notification.source = "dona_job";
-    const notice = f.database.enqueue(notification).row.event_id;
+    f.database.sealJobGroup(input.source_event_id);
+    const notice = f.database.enqueueJobNotification(one).row.event_id;
     assert.equal((await f.call("get_job_status", { source_event_id: notice, job_id: two })).error, undefined);
     assert.equal((await f.call("steer_job", { source_event_id: notice, job_id: two, instruction: "denied" })).error, true);
     const prompt = buildJobPrompt(f.database.getJob(two)!);
@@ -201,3 +201,60 @@ for (const status of ["blocked", "needs_review"] as const) {
     } finally { await f.close(); }
   });
 }
+
+
+test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisionへ接続する", async () => {
+  const f = await fixture(() => new Date("2026-09-06T00:00:00Z"));
+  try {
+    const names = ["preview_schedule", "create_schedule", "get_schedule", "list_schedules", "update_schedule", "pause_schedule", "resume_schedule", "cancel_schedule", "get_schedule_history"];
+    const config = await fs.readFile(new URL("../../.codex/config.toml", import.meta.url), "utf8");
+    const dispatcherConfig = config.split("[mcp_servers.dona_dispatcher]")[1]!;
+    const enabled = JSON.parse(dispatcherConfig.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
+    const advertised = (await f.client.listTools()).tools.map(tool => tool.name);
+    for (const name of [...names,"list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access"]) {
+      assert.ok(enabled.includes(name), name); assert.ok(advertised.includes(name), name);
+    }
+    assert.match(dispatcherConfig,/tool_timeout_sec = 150/);
+    f.database.beginDispatch(f.source, f.config.resultsDir + "/schedule.json"); f.database.markWaiting(f.source);
+    const definition = { recurrence:{version:1,kind:"once",at:"2026-09-08T00:00:00Z"}, action:{kind:"reminder",body:"通知内容は外部へ公開しない"} };
+    const call = async (name:string,args:Record<string,unknown>) => { const result = await f.call(name,args);assert.equal(result.error,undefined,JSON.stringify(result.data));return result.data; };
+    const input = {source_event_id:f.source, definition};
+    await call("preview_schedule",{...input,after:"2026-09-06T00:00:00Z",before_or_equal:"2026-09-09T00:00:00Z",limit:10});
+    const created = await call("create_schedule",{...input,idempotency_key:"mcp-all-nine"});
+    const schedule_id = created.schedule.schedule_id as string;
+    const target = {source_event_id:f.source,schedule_id};
+    assert.equal((await call("get_schedule",target)).schedule.revision,1);
+    assert.equal((await call("list_schedules",{source_event_id:f.source,limit:10})).schedules.length,1);
+    const paused = await call("pause_schedule",{...target,expected_revision:1});
+    assert.equal(paused.schedule.state,"paused");
+    const resumed = await call("resume_schedule",{...target,expected_revision:paused.schedule.revision});
+    assert.equal(resumed.schedule.state,"active");
+    const updateEvent = f.database.enqueue(eventEnvelope("schedule-update")).row.event_id;
+    f.database.beginDispatch(updateEvent,f.config.resultsDir + "/update.json");f.database.markWaiting(updateEvent);
+    const updated = await call("update_schedule",{...target,source_event_id:updateEvent,expected_revision:resumed.schedule.revision,definition:{...definition,action:{kind:"reminder",body:"更新内容"}}});
+    assert.equal(updated.schedule.revision,resumed.schedule.revision+1);
+    const history = await call("get_schedule_history",{...target,limit:10});
+    assert.doesNotMatch(JSON.stringify(history),/更新内容|通知内容/);
+    const cancelled = await call("cancel_schedule",{...target,expected_revision:updated.schedule.revision});
+    assert.equal(cancelled.schedule.state,"cancelled");
+    assert.equal(f.database.scheduler.get(schedule_id)?.state,"cancelled");
+  } finally { await f.close(); }
+});
+
+
+test("実DBからMCPまで99件・100件・101件の候補を正確に区別する", async () => {
+  const f = await fixture();
+  try {
+    const thread = {workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456"};
+    for (let i=0;i<101;i++) {
+      const source=f.database.enqueue(eventEnvelope(`candidate-${i}`)).row;
+      f.database.createJob({source_event_id:source.event_id,objective:"確認",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir);
+      if (i>=98) {
+        const result=await f.call("list_thread_jobs",thread);
+        assert.equal(result.error,undefined);
+        assert.equal(result.data.jobs.length,Math.min(i+1,100));
+        assert.equal(result.data.truncated,i===100);
+      }
+    }
+  } finally { await f.close(); }
+});
