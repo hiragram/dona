@@ -155,9 +155,16 @@ export class AuditRepository {
       }).immediate();
       if (!reservation) throw new AuditIntegrityError();
       const expected = { ...reservation, pending_transaction_id: null };
-      requireEqual(this.store.finalize(reservation), expected);
-      requireEqual(this.verify(), expected);
-      return committed;
+      // The first transaction is already durable. Reacquire the writer lock
+      // while the anchor is still pending, then serialize finalize + read-back.
+      // Otherwise a peer can append between finalize and verification and make
+      // this successfully committed operation look like an integrity failure.
+      const reserved = reservation;
+      return this.db.transaction(() => {
+        requireEqual(this.store.finalize(reserved), expected);
+        requireEqual(this.verifyInside(), expected);
+        return committed;
+      }).immediate();
     });
   }
 
@@ -189,10 +196,11 @@ export class AuditRepository {
       }).immediate();
       if (!reservation) throw new AuditIntegrityError();
       const expected = { ...reservation, pending_transaction_id: null };
-      requireEqual(this.store.finalize(reservation), expected);
-      // Delete only after external finalize. A crash before deletion leaves an
-      // authenticated but redundant prefix, which verify deliberately tolerates.
+      const reserved = reservation;
+      // Serialize finalize + read-back + deletion against other writers. A crash
+      // before deletion leaves an authenticated prefix for explicit cleanup.
       this.db.transaction(() => {
+        requireEqual(this.store.finalize(reserved), expected);
         requireEqual(this.verifyInside(), expected);
         this.db.prepare("DELETE FROM security_audit_records WHERE sequence<=?").run(throughSequence);
         requireEqual(this.verifyInside(), expected);

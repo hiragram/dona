@@ -247,3 +247,31 @@ test("checkpoint確定後の削除失敗は検証可能なprefixを残し、明�
   assert.equal(count(db, "security_audit_records"), 0);
   assert.deepEqual(store.calls, ["reserve", "finalize", "reserve", "finalize"]);
 });
+
+test("finalize直後の別connection appendを直列化し、確定済み業務更新を失敗扱いしない", (t) => {
+  const { db, filename, store, repository } = setup(t);
+  const otherDb = new Database(filename); otherDb.pragma("busy_timeout = 0");
+  try {
+    const other = new AuditRepository(otherDb, store, keys);
+    const finalize = store.finalize.bind(store);
+    let attempted = false; let blocked = false;
+    store.finalize = (reservation) => {
+      const response = finalize(reservation);
+      if (!attempted) {
+        attempted = true;
+        try { other.append("tx_competing", 1, event, () => {
+          otherDb.exec("INSERT INTO decisions VALUES ('competing','approved')");
+        }); } catch (error) { assert.ok(error instanceof AuditIntegrityError); blocked = true; }
+      }
+      return response;
+    };
+    const response = repository.append("tx_first", 1, event, () => {
+      db.exec("INSERT INTO decisions VALUES ('first','approved')"); return "first_receipt";
+    });
+    assert.equal(response.result, "first_receipt"); assert.equal(attempted, true); assert.equal(blocked, true);
+    assert.equal(count(db, "decisions"), 1); assert.equal(repository.verify().sequence, 1);
+    assert.deepEqual(store.calls, ["reserve", "finalize"]);
+    other.append("tx_after", 1, event, () => {});
+    assert.equal(repository.verify().sequence, 2);
+  } finally { otherDb.close(); }
+});
