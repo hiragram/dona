@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
-import { CanonicalBuild } from "../src/adapters.js";
+import { CanonicalBuild, canonicalDiagnosticStep } from "../src/adapters.js";
 import { ProcessRunner } from "../src/process.js";
 import type { CommandResult } from "../src/types.js";
 import { tempPolicy } from "./helpers.js";
@@ -313,6 +313,11 @@ test("stable updater uses separate controller-owned npm config files", async () 
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("canonical diagnostic steps normalize the sources/slack component to an allowed identifier", () => {
+  assert.equal(canonicalDiagnosticStep("sources/slack", ["ci"]), "sources.slack:npm-ci");
+  assert.match(canonicalDiagnosticStep("sources/slack", ["run", "typecheck"]), /^[a-z0-9._:-]+$/);
 });
 
 test("pre-activation command errors preserve timeout diagnostics before bounded output", async () => {

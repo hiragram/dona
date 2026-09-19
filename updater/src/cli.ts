@@ -13,6 +13,7 @@ import { ReleaseStore } from "./release-store.js";
 import { UpdateService } from "./service.js";
 import { parseRequestId } from "./validation.js";
 import { DiagnosticLogStore } from "./diagnostic-log.js";
+import { initializeServe } from "./serve-bootstrap.js";
 
 function usage(): never {
   console.error(`Usage:
@@ -73,10 +74,7 @@ async function main(): Promise<void> {
     if (command !== "serve" || process.argv.length !== 3) usage();
     const service = new UpdateService(controller, logger);
     const api = new UpdaterApi(path.join(policy.control_root, "updater.sock"), controller, database, service, logger);
-    await api.start();
-    diagnostics.recoverInterruptedCaptures();
-    controller.maintainDiagnostics();
-    service.start();
+    await initializeServe(api, diagnostics, controller, service);
     await new Promise<void>((resolve, reject) => {
       let stopping = false;
       const stop = async (signal: NodeJS.Signals): Promise<void> => {

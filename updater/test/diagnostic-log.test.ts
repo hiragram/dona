@@ -120,6 +120,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     const partialDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[5]!, 16_384).detail_tail);
     assert.equal(partialDetail.includes("secret-after-long-carry"), false);
     assert.match(partialDetail, /visible-after-line/);
+
+    const environmentCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-env" });
+    environmentCapture.write("stderr", Buffer.from("NPM_TOKEN=supersecret\nGITHUB_TOKEN=github-secret\nMY_PASSWORD=human-secret\nvisible"));
+    environmentCapture.finish(true);
+    const environmentDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[6]!, 16_384).detail_tail);
+    assert.equal(environmentDetail.includes("supersecret"), false);
+    assert.equal(environmentDetail.includes("github-secret"), false);
+    assert.equal(environmentDetail.includes("human-secret"), false);
+    assert.match(environmentDetail, /visible/);
   } finally {
     f.database.close();
   }

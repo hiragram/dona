@@ -69,7 +69,8 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /\b(?:authorization|token|secret|password)\s*[:=]\s*(["']?)/i.exec(this.pending);
+      const assignment = /(?:^|[^a-z0-9_])(?:[a-z0-9]+_)*(?:authorization|token|secret|password)\s*[:=]\s*(["']?)/i
+        .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(assignment.index + assignment[0].length);
@@ -86,7 +87,7 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|\s)(?:authorization|token|secret|password)\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_])(?:[a-z0-9]+_)*(?:authorization|token|secret|password)\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);

@@ -297,7 +297,7 @@ export class CanonicalBuild implements BuildPort {
           env: npmEnvironment,
           ...(diagnostic && this.diagnostics ? { diagnostic: {
             store: this.diagnostics,
-            identity: { ...diagnostic, step: `${component}:npm-${args.join("-")}` },
+            identity: { ...diagnostic, step: canonicalDiagnosticStep(component, args) },
           } } : {}),
         });
         requireSuccess(`npm ${args.join(" ")} (${component})`, result);
@@ -311,6 +311,13 @@ export class CanonicalBuild implements BuildPort {
     ));
     return { lock_hashes: lockHashes, node_version: process.versions.node, npm_version: npmVersion, compatibility };
   }
+}
+
+export function canonicalDiagnosticStep(
+  component: "dispatcher" | "sources/slack" | "updater",
+  args: readonly string[],
+): string {
+  return `${component.replaceAll("/", ".")}:npm-${args.join("-")}`;
 }
 
 interface HttpResponse {
