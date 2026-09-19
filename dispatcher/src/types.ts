@@ -159,3 +159,31 @@ export interface CreateJobResult {
   outcome: "created" | "reused";
   duplicate: boolean;
 }
+
+export interface JobGroupRow {
+  source_event_id: string;
+  sealed_at: string | null;
+  notification_mode: JobGroupNotificationMode;
+  attention_event_id: string | null;
+  all_terminal_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobGroupSnapshot {
+  source_event_id: string;
+  total: number;
+  pending: number;
+  status_counts: Partial<Record<JobStatus, number>>;
+  jobs: Array<{
+    job_id: string;
+    job_key: string;
+    status: JobStatus;
+  }>;
+  transition: JobGroupTransition;
+}
+
+
+export const jobGroupNotificationModes = ["legacy", "grouped"] as const;
+export type JobGroupNotificationMode = (typeof jobGroupNotificationModes)[number];
+export type JobGroupTransition = "progress" | "attention" | "all_terminal";
