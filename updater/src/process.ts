@@ -78,6 +78,7 @@ export class ProcessRunner {
             if (!nonce || !action || !identity) continue;
             if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
             if (nonce !== checkpointNonce) continue;
+            if (action === "file-start") metrics = undefined;
             fileState = `${action} ${identity}${fileMatch[4] ? ` elapsed_ms=${fileMatch[4]}` : ""}${fileMatch[5] ? ` load=${fileMatch[5]}` : ""}`;
             if (action === "file-start") currentFile = identity;
             else {

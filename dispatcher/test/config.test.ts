@@ -34,6 +34,9 @@ describe("job resource config", () => {
     const metrics = fs.readFileSync(new URL("./process-metrics.cjs", import.meta.url), "utf8");
     assert.match(metrics, /const markerLimit = 2048/);
     assert.match(metrics, /\["node", "git", "shell", "other"\]/);
+    assert.match(metrics, /childProcess\.fork = function instrumentedFork/);
+    assert.match(metrics, /active \+= 1;[\s\S]*originalSpawnSync/);
+    assert.match(runner, /--require=\$\{JSON\.stringify\(processMetrics\)\}/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
   });
 

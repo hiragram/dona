@@ -188,3 +188,24 @@ test("ProcessRunner keeps bounded process metrics and load without raw process d
   assert.equal(result.output_checkpoint.includes("pid="), false);
   assert.equal(Buffer.byteLength(result.output_checkpoint), 192);
 });
+
+test("ProcessRunner clears metrics when the next file starts", async () => {
+  const first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const script = `
+    process.stderr.write('[dispatcher-test:${first}] file-start test/api.test.ts load=0.125\\n');
+    process.stderr.write('[dispatcher-test:${first}] metrics scope=2;node=1/10,git=9/900,shell=0/0,other=0/0;active=0;overhead_us=5\\n');
+    process.stderr.write('[dispatcher-test:${first}] file-finish test/api.test.ts elapsed_ms=1000 load=0.125\\n');
+    process.stderr.write('[dispatcher-test:${second}] file-start test/worker.test.ts load=0.250\\n');
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    outputLimitBytes: 2_048,
+  });
+  assert.equal(
+    result.output_checkpoint,
+    "file=file-start test/worker.test.ts load=0.250; last_finish=file-finish test/api.test.ts elapsed_ms=1000 load=0.125; timeout=test/worker.test.ts",
+  );
+});

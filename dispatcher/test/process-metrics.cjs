@@ -79,11 +79,35 @@ const originalSpawnSync = childProcess.spawnSync;
 childProcess.spawnSync = function instrumentedSpawnSync(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
-  const result = originalSpawnSync.call(this, file, args, withNonce(options));
+  const actualArgs = Array.isArray(args) ? args : [];
+  const actualOptions = Array.isArray(args) ? options : args;
+  active += 1;
   totals[processClass].count += 1;
-  totals[processClass].elapsed += performance.now() - started;
   emit();
-  return result;
+  try {
+    return originalSpawnSync.call(this, file, actualArgs, withNonce(actualOptions));
+  } finally {
+    totals[processClass].elapsed += performance.now() - started;
+    active = Math.max(0, active - 1);
+    emit();
+  }
+};
+
+const originalFork = childProcess.fork;
+childProcess.fork = function instrumentedFork(modulePath, args, options) {
+  const started = performance.now();
+  const actualArgs = Array.isArray(args) ? args : [];
+  const actualOptions = Array.isArray(args) ? options : args;
+  active += 1;
+  totals.node.count += 1;
+  emit();
+  const child = originalFork.call(this, modulePath, actualArgs, withNonce(actualOptions));
+  child.once("close", () => {
+    totals.node.elapsed += performance.now() - started;
+    active = Math.max(0, active - 1);
+    emit();
+  });
+  return child;
 };
 
 const originalExecFile = childProcess.execFile;
@@ -121,11 +145,16 @@ const originalExecFileSync = childProcess.execFileSync;
 childProcess.execFileSync = function instrumentedExecFileSync(file, args, options) {
   const started = performance.now();
   const processClass = classify(file);
+  const actualArgs = Array.isArray(args) ? args : [];
+  const actualOptions = Array.isArray(args) ? options : args;
+  active += 1;
+  totals[processClass].count += 1;
+  emit();
   try {
-    return originalExecFileSync.call(this, file, args, withNonce(options));
+    return originalExecFileSync.call(this, file, actualArgs, withNonce(actualOptions));
   } finally {
-    totals[processClass].count += 1;
     totals[processClass].elapsed += performance.now() - started;
+    active = Math.max(0, active - 1);
     emit();
   }
 };
