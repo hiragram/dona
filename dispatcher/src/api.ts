@@ -684,7 +684,7 @@ export class DispatcherApi {
           throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
         }
       }
-      sendJson(response, 200, { schema_version: 1, job });
+      sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
       return;
     }
     if (request.method === "POST" && action === "steer") {

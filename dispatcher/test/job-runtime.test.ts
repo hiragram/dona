@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { DispatcherDatabase } from "../src/database.js";
 import { buildJobPrompt } from "../src/job-prompt.js";
 import { codexAgentArguments, HerdrJobAgentRuntime, parseScheduledMcpInventory, PreparedWorkspaceCleanupError } from "../src/job-runtime.js";
+import { scheduledPermissionArguments } from "../src/scheduled-sandbox.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -103,12 +104,13 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     assert.equal(args[5]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[5]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
     assert.doesNotMatch(buildJobPrompt({...job,source:"dona_schedule"}), /progress_path|工程が変わるたび/);
-    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config),[
-      "-C",path.dirname(job.result_path),"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","-c",expectedOverride,
+    const scheduledOverride=`projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" }, ${JSON.stringify(path.dirname(job.result_path))} = { trust_level = "trusted" } }`;
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,[],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"]),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","-c",scheduledOverride,
     ]);
-    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"]),[
-      "-C",path.dirname(job.result_path),"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
-      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","-c",expectedOverride,
+    assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"],true,["/usr/bin/codex"]),[
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"]),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","-c",scheduledOverride,
     ]);
     database.close();
   });

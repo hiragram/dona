@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { scheduledExecutablePaths, scheduledPermissionArguments, verifyScheduledSandbox } from "./scheduled-sandbox.js";
+
 import type { DispatcherConfig } from "./config.js";
 import type { AgentStatus, HerdrCommandResult } from "./herdr.js";
 import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
@@ -34,12 +36,12 @@ function assertScratchWorkspacePath(row: JobRow, config: DispatcherConfig): void
   }
 }
 
-export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true): string[] {
+export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disabledMcpServers:readonly string[] = [], progressEnabled = true, executablePaths:readonly string[] = []): string[] {
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
   const args = row.source==="dona_schedule"
-    ? ["-C",resultDirectory,"--sandbox","workspace-write","--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+    ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
     : ["--add-dir", resultDirectory];
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
@@ -47,7 +49,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   let trustedPaths: string[];
   if (workspace.kind === "scratch") {
     assertScratchWorkspacePath(row, config);
-    trustedPaths = [row.workspace_path];
+    trustedPaths = row.source==="dona_schedule" ? [row.workspace_path,resultDirectory] : [row.workspace_path];
   } else {
     const [owner, repo] = workspace.repository.split("/") as [string, string];
     const repositoryPath = path.join(config.jobsWorkspaceRoot, "github", owner, repo, "repository");
@@ -317,8 +319,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       await fs.chmod(path.dirname(jobProgressPath(row)), 0o700);
     }
 
+    let executablePaths:string[]=[];
+    if(row.source==="dona_schedule") {
+      if(workspace.kind!=="scratch") throw new Error("Scheduled sandbox requires a scratch workspace");
+      executablePaths=await scheduledExecutablePaths(this.config.codexPath);
+      await verifyScheduledSandbox(resultDirectory,executablePaths,this.config.jobCommandTimeoutMs,
+        (executable,args,timeout)=>runProcess(executable,args,timeout,signal));
+    }
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
+      if(row.source==="dona_schedule") throw new Error("Existing scheduled agent permission identity cannot be verified");
       if (workspace.kind === "github") {
         await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
       }
@@ -359,7 +369,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
           "--kind", "codex",
           "--pane", String(paneId),
           "--timeout", String(this.config.jobAgentStartTimeoutMs),
-          "--", ...codexAgentArguments(row, this.config,disabledMcpServers, this.progressEnabled),
+          "--", ...codexAgentArguments(row, this.config,disabledMcpServers, this.progressEnabled,executablePaths),
         ],
         this.config.jobAgentStartTimeoutMs + 5_000,
         signal,

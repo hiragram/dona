@@ -1760,8 +1760,19 @@ export class DispatcherDatabase {
     const receiptValid=evidence?.event_id===eventId&&evidence.workspace_id===target?.workspace_id&&evidence.channel_id===target?.channel_id&&evidence.thread_ts===(target?.kind==="thread"?target.thread_ts:null)&&
       evidence.message_ts===validPost?.value.message_ts&&evidence.body_sha256===expectedBodySha256&&evidence.reply_broadcast===false&&evidence.identity_block_verified===true&&Number.isFinite(postedAt);
     const withinDeadline=receiptValid&&postedAt<=Date.parse(completion.materialized_at)+900_000;
+    const authorization=this.db.prepare(`SELECT r.expires_at FROM schedule_runs run
+      JOIN schedule_revisions r ON r.schedule_id=run.schedule_id AND r.revision=run.revision WHERE run.run_id=?`)
+      .get(owner.run_id??"") as {expires_at:string}|undefined;
+    const withinAuthorizationExpiry=receiptValid&&authorization!==undefined&&postedAt<Date.parse(authorization.expires_at);
     const withinWriteAuthorization=receiptValid&&completion.notification_write_authorized_at!==null&&postedAt>=Date.parse(completion.notification_write_authorized_at)-5_000&&postedAt<=Date.parse(completion.notification_write_authorized_at)+120_000;
-    return {delivered:receiptValid&&withinDeadline&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
+    return {delivered:receiptValid&&withinDeadline&&withinAuthorizationExpiry&&withinWriteAuthorization&&allowedActions&&posts.length===1&&!ambiguousPost&&completion.notification_state==="needs_review"&&completion.notification_authorization_phase==="write"&&validPost!==undefined,...(owner.run_id?{runId:owner.run_id}:{})};
+  }
+
+  jobNotificationState(jobId:string):Record<string,unknown> {
+    const row=this.db.prepare(`SELECT c.notification_state,c.notification_authorization_phase
+      FROM jobs j JOIN job_completion_results c ON c.notification_event_id=j.completion_event_id
+      WHERE j.job_id=? AND json_extract(c.owner_json,'$.kind')='schedule'`).get(jobId);
+    return row ? row as Record<string,unknown> : {};
   }
 
   isNotificationAccepted(eventId:string):boolean { return this.db.prepare("SELECT 1 FROM job_completion_results WHERE notification_event_id=? AND notification_state='accepted'").get(eventId)!==undefined; }

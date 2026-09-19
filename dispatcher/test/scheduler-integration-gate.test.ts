@@ -194,10 +194,12 @@ test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過
     const notification = harness.database.enqueueJobNotification(job.job_id, new Date()).row;
     harness.database.beginDispatch(notification.event_id, path.join(harness.root, "event-results", `${notification.event_id}.json`), new Date());
     assert.equal((await client.authorizeJobNotification(notification.event_id)).authorized, true);
+    assert.equal(((await client.getJob(job.job_id,notification.event_id)).job as Record<string,unknown>).notification_authorization_phase,"preflight");
     const notificationClaims = { ...claims, event_id: notification.event_id, issued_at: new Date().toISOString(), nonce: `notify_${notification.event_id}` };
     const notificationPayload = Buffer.from(JSON.stringify(notificationClaims)).toString("base64url");
     const notificationReceipt = `${notificationPayload}.${createHmac("sha256", token).update(notificationPayload).digest("base64url")}`;
     assert.equal((await client.authorizeJobNotification(notification.event_id, notificationReceipt)).authorized, true);
+    assert.equal(((await client.getJob(job.job_id,notification.event_id)).job as Record<string,unknown>).notification_authorization_phase,"write");
     const fakeSlack = new FakeSlack([]);
     const posted = fakeSlack.postWorkResult(notification.event_id, "read-only work completed");
     assert.equal(posted.event_id, notification.event_id);
