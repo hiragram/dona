@@ -137,6 +137,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     const pathDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[7]!, 16_384).detail_tail);
     assert.equal(pathDetail.includes("Support/Dona"), false);
     assert.match(pathDetail, /visible-after-path/);
+
+    const npmAuthCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-auth" });
+    npmAuthCapture.write("stderr", Buffer.from("//registry.example/:_auth"));
+    npmAuthCapture.write("stderr", Buffer.from("Token=supersecret\nvisible-after-auth"));
+    npmAuthCapture.finish(true);
+    const npmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[8]!, 16_384).detail_tail);
+    assert.equal(npmAuthDetail.includes("supersecret"), false);
+    assert.match(npmAuthDetail, /REDACTED_STREAM/);
+    assert.match(npmAuthDetail, /visible-after-auth/);
   } finally {
     f.database.close();
   }
@@ -301,6 +310,15 @@ test("write, atomic finalize, and read faults retain the command failure state",
     const readable = f.database.diagnosticLogs(f.claimed.request_id).find(({ step }) => step === "updater:npm-ci-read")!;
     fsSync.readSync = (() => { throw Object.assign(new Error("read"), { code: "EIO" }); }) as typeof fsSync.readSync;
     assert.equal(f.store.project(readable).capture_state, "read_error");
+    fsSync.readSync = originalRead;
+
+    let firstRead = true;
+    fsSync.readSync = ((descriptor: number, buffer: Uint8Array, offset: number, length: number, position: number | null) => {
+      const readLength = firstRead ? Math.max(1, Math.floor(length / 2)) : length;
+      firstRead = false;
+      return originalRead(descriptor, buffer, offset, readLength, position);
+    }) as typeof fsSync.readSync;
+    assert.match(String(f.store.project(readable).detail_tail), /failure/);
     fsSync.readSync = originalRead;
     assert.deepEqual(f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state), [
       "write_failed", "complete", "write_failed", "complete",
@@ -493,6 +511,31 @@ test("aggregate retention keeps the newest bounded set and records older logs as
     assert.equal(states.filter((state) => state === "complete").length, 1);
     assert.equal(states.filter((state) => state === "purged").length, 2);
   } finally {
+    f.database.close();
+  }
+});
+
+test("retention fsyncs a removed directory entry before marking its row purged", async () => {
+  const f = await fixture();
+  const originalFsync = fsSync.fsyncSync;
+  const originalMark = f.database.markDiagnosticPurged.bind(f.database);
+  const events: string[] = [];
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-retention" });
+    capture.write("stderr", Buffer.from("failure"));
+    capture.finish(true);
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "build failed",
+    });
+    fsSync.fsyncSync = ((descriptor) => { events.push("fsync"); return originalFsync(descriptor); }) as typeof fsSync.fsyncSync;
+    f.database.markDiagnosticPurged = ((logId, at) => { events.push("mark"); return originalMark(logId, at); }) as typeof f.database.markDiagnosticPurged;
+    f.store.enforceRetention(new Date("2999-01-01T00:00:00Z"), 1, 1);
+    assert.deepEqual(events, ["fsync", "mark"]);
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "purged");
+  } finally {
+    fsSync.fsyncSync = originalFsync;
+    f.database.markDiagnosticPurged = originalMark;
     f.database.close();
   }
 });

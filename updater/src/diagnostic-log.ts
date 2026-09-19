@@ -69,7 +69,7 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /(?:^|[^a-z0-9_])(?:[a-z0-9]+_)*(?:authorization|token|secret|password)\s*[:=]\s*(["']?)/i
+      const assignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*[:=]\s*(["']?)/i
         .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
@@ -96,7 +96,7 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|[^a-z0-9_])(?:[a-z0-9]+_)*(?:authorization|token|secret|password)\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
@@ -113,7 +113,7 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return output;
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|\b(?:authorization|token|secret|password)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])[a-z0-9_]*(?:authorization|auth_?token|token|secret|password)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -389,7 +389,12 @@ export class DiagnosticLogStore {
           throw new Error("diagnostic_open_identity_mismatch");
         }
         const buffer = Buffer.alloc(stats.size - start);
-        fs.readSync(descriptor, buffer, 0, buffer.length, start);
+        let offset = 0;
+        while (offset < buffer.length) {
+          const count = fs.readSync(descriptor, buffer, offset, buffer.length - offset, start + offset);
+          if (count <= 0) throw new Error("diagnostic_short_read");
+          offset += count;
+        }
         return { ...common, capture_state: row.capture_state, detail_tail: buffer.toString("utf8") };
       } finally {
         fs.closeSync(descriptor);
@@ -408,10 +413,24 @@ export class DiagnosticLogStore {
     if (!this.index) return;
     const cutoff = new Date(now.getTime() - retentionDays * 86_400_000);
     for (const row of this.index.diagnosticRetentionCandidates(cutoff, aggregateLimitBytes)) {
+      let removed = false;
       try {
-        if (row.relative_ref) fs.unlinkSync(this.resolveRow(row));
+        if (row.relative_ref) {
+          fs.unlinkSync(this.resolveRow(row));
+          removed = true;
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
+      if (removed) {
+        try {
+          const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
+          try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+        } catch {
+          // Keep the durable reference so a later maintenance pass can
+          // reconcile the unlink before marking the row as purged.
+          continue;
+        }
       }
       this.index.markDiagnosticPurged(row.log_id, now);
     }
