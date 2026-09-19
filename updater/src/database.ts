@@ -384,6 +384,9 @@ export class UpdateDatabase {
       const overQuota = retainedBytes + row.byte_size > aggregateLimitBytes;
       if (!expired && !overQuota) retainedBytes += row.byte_size;
       return expired || overQuota;
+    }).sort((left, right) => {
+      const finalized = (left.finalized_at ?? "").localeCompare(right.finalized_at ?? "");
+      return finalized || left.log_id.localeCompare(right.log_id);
     });
   }
 

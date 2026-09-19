@@ -165,6 +165,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(jsonDetail.includes("json-secret"), false, jsonDetail);
     assert.match(jsonDetail, /REDACTED_STREAM/);
     assert.match(jsonDetail, /visible-after-json/);
+
+    const apiKeyCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:api-key" });
+    apiKeyCapture.write("stderr", Buffer.from("OPENAI_API_"));
+    apiKeyCapture.write("stderr", Buffer.from('KEY=environment-secret\n{"apiKey":"json-api-secret"}\nvisible-after-api-key'));
+    apiKeyCapture.finish(true);
+    const apiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[11]!, 16_384).detail_tail);
+    assert.equal(apiKeyDetail.includes("environment-secret"), false, apiKeyDetail);
+    assert.equal(apiKeyDetail.includes("json-api-secret"), false, apiKeyDetail);
+    assert.match(apiKeyDetail, /visible-after-api-key/);
   } finally {
     f.database.close();
   }
@@ -525,6 +534,10 @@ test("aggregate retention keeps the newest bounded set and records older logs as
     });
     const before = f.database.diagnosticLogs(f.claimed.request_id);
     const largestSingleLog = Math.max(...before.map(({ byte_size }) => byte_size));
+    const purgeCandidates = f.database.diagnosticRetentionCandidates(new Date("1900-01-01T00:00:00Z"), largestSingleLog);
+    const expectedOldestFirst = [...purgeCandidates].sort((left, right) =>
+      (left.finalized_at ?? "").localeCompare(right.finalized_at ?? "") || left.log_id.localeCompare(right.log_id));
+    assert.deepEqual(purgeCandidates.map(({ log_id }) => log_id), expectedOldestFirst.map(({ log_id }) => log_id));
     f.store.enforceRetention(new Date(), 9_999, largestSingleLog);
     const states = f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state);
     assert.equal(states.filter((state) => state === "complete").length, 1);
@@ -548,6 +561,34 @@ test("retention fsyncs a removed directory entry before marking its row purged",
       last_error_code: "pre_activation_failed",
       last_error_message: "build failed",
     });
+    syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
+    f.database.markDiagnosticPurged = ((logId, at) => { events.push("mark"); return originalMark(logId, at); }) as typeof f.database.markDiagnosticPurged;
+    f.store.enforceRetention(new Date("2999-01-01T00:00:00Z"), 1, 1);
+    assert.deepEqual(events, ["fsync", "mark"]);
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "purged");
+  } finally {
+    syncStore.fsyncLogsDirectory = originalFsync;
+    f.database.markDiagnosticPurged = originalMark;
+    f.database.close();
+  }
+});
+
+test("retention fsyncs an already absent directory entry before marking its row purged", async () => {
+  const f = await fixture();
+  const syncStore = f.store as unknown as { fsyncLogsDirectory(): void };
+  const originalFsync = syncStore.fsyncLogsDirectory.bind(f.store);
+  const originalMark = f.database.markDiagnosticPurged.bind(f.database);
+  const events: string[] = [];
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-retention-missing" });
+    capture.write("stderr", Buffer.from("failure"));
+    capture.finish(true);
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "build failed",
+    });
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    fsSync.unlinkSync(path.join(f.policy.control_root, "diagnostics", row.relative_ref!));
     syncStore.fsyncLogsDirectory = () => { events.push("fsync"); originalFsync(); };
     f.database.markDiagnosticPurged = ((logId, at) => { events.push("mark"); return originalMark(logId, at); }) as typeof f.database.markDiagnosticPurged;
     f.store.enforceRetention(new Date("2999-01-01T00:00:00Z"), 1, 1);
