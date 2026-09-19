@@ -17,6 +17,8 @@ import type {
   RuntimeOperationKind,
   RuntimeOperationPhase,
   RuntimeOperationRow,
+  DiagnosticLogCapture,
+  DiagnosticLogRow,
 } from "./types.js";
 import { terminalUpdateStates, updateStates } from "./types.js";
 import { canonicalJson, sha256 } from "./validation.js";
@@ -101,7 +103,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 4) throw new Error(`Updater database schema ${version} is newer than supported schema 4`);
+    if (version > 5) throw new Error(`Updater database schema ${version} is newer than supported schema 5`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -184,6 +186,20 @@ export class UpdateDatabase {
         superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id)
       );
       CREATE INDEX update_outbox_status_idx ON update_outbox(status, created_at);
+      CREATE TABLE update_diagnostic_logs (
+        log_id        TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES update_requests(request_id),
+        attempt       INTEGER NOT NULL,
+        step          TEXT NOT NULL,
+        relative_ref  TEXT,
+        byte_size     INTEGER NOT NULL DEFAULT 0,
+        capture_state TEXT NOT NULL CHECK (capture_state IN ('capturing','complete','truncated','write_failed','purged')),
+        error_code    TEXT,
+        created_at    TEXT NOT NULL,
+        finalized_at  TEXT,
+        purged_at     TEXT
+      );
+      CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
       CREATE TABLE runtime_operations (
         operation_id        TEXT PRIMARY KEY,
         request_id          TEXT NOT NULL REFERENCES update_requests(request_id),
@@ -199,7 +215,7 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 4;
+      PRAGMA user_version = 5;
     `);
     if (version === 1) migrate(`
       ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
@@ -238,6 +254,26 @@ export class UpdateDatabase {
       ALTER TABLE update_requests ADD COLUMN transition_json TEXT;
       PRAGMA user_version = 4;
     `);
+    if (version >= 1 && version <= 4) migrate(`
+      CREATE TABLE update_diagnostic_logs (
+        log_id        TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES update_requests(request_id),
+        attempt       INTEGER NOT NULL,
+        step          TEXT NOT NULL,
+        relative_ref  TEXT,
+        byte_size     INTEGER NOT NULL DEFAULT 0,
+        capture_state TEXT NOT NULL CHECK (capture_state IN ('capturing','complete','truncated','write_failed','purged')),
+        error_code    TEXT,
+        created_at    TEXT NOT NULL,
+        finalized_at  TEXT,
+        purged_at     TEXT
+      );
+      CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
+      PRAGMA user_version = 5;
+    `);
+    this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'write_failed', relative_ref = NULL,
+      byte_size = 0, error_code = 'diagnostic_capture_interrupted', finalized_at = COALESCE(finalized_at, ?)
+      WHERE capture_state = 'capturing'`).run(new Date().toISOString());
   }
 
   close(): void {
@@ -251,6 +287,57 @@ export class UpdateDatabase {
   assertReadableWritable(): void {
     this.db.prepare("SELECT 1").get();
     this.db.prepare("UPDATE update_requests SET state = state WHERE 0").run();
+  }
+
+  reserveDiagnosticLog(capture: DiagnosticLogCapture): void {
+    this.db.transaction(() => {
+      const request = this.getRequired(capture.request_id);
+      if (request.attempt !== capture.attempt || request.completed_at !== null) throw new Error("diagnostic_log_request_binding_mismatch");
+      this.db.prepare(`INSERT INTO update_diagnostic_logs (
+        log_id, request_id, attempt, step, relative_ref, byte_size, capture_state, error_code, created_at
+      ) VALUES (?, ?, ?, ?, ?, 0, 'capturing', NULL, ?)`)
+        .run(capture.log_id, capture.request_id, capture.attempt, capture.step, capture.relative_ref, capture.created_at);
+    })();
+  }
+
+  finalizeDiagnosticLog(capture: DiagnosticLogCapture): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET relative_ref = ?, byte_size = ?, capture_state = ?,
+      error_code = ?, finalized_at = ?
+      WHERE log_id = ? AND request_id = ? AND attempt = ? AND step = ? AND capture_state = 'capturing'`)
+      .run(capture.relative_ref, capture.byte_size, capture.capture_state, capture.error_code, capture.finalized_at,
+        capture.log_id, capture.request_id, capture.attempt, capture.step).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_finalize_binding_mismatch");
+  }
+
+  discardDiagnosticLog(logId: string): void {
+    const changed = this.db.prepare("DELETE FROM update_diagnostic_logs WHERE log_id = ? AND capture_state = 'capturing'").run(logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_discard_binding_mismatch");
+  }
+
+  diagnosticLogs(requestId: string): DiagnosticLogRow[] {
+    return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
+      .all(requestId) as DiagnosticLogRow[];
+  }
+
+  diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[] {
+    const rows = this.db.prepare(`SELECT logs.* FROM update_diagnostic_logs logs
+      JOIN update_requests requests ON requests.request_id = logs.request_id
+      WHERE logs.capture_state IN ('complete','truncated','write_failed') AND requests.completed_at IS NOT NULL
+      ORDER BY logs.finalized_at DESC, logs.log_id DESC`).all() as DiagnosticLogRow[];
+    let retainedBytes = 0;
+    return rows.filter((row) => {
+      const expired = !!row.finalized_at && row.finalized_at < cutoff.toISOString();
+      const overQuota = retainedBytes + row.byte_size > aggregateLimitBytes;
+      if (!expired && !overQuota) retainedBytes += row.byte_size;
+      return expired || overQuota;
+    });
+  }
+
+  markDiagnosticPurged(logId: string, at = new Date()): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'purged', relative_ref = NULL,
+      error_code = NULL, purged_at = ? WHERE log_id = ? AND capture_state IN ('complete','truncated','write_failed')`)
+      .run(at.toISOString(), logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_purge_state_mismatch");
   }
 
   createPlan(request: PlanRequest, material: PlanMaterial, at = new Date()): { row: UpdateRow; plan: UpdatePlan; duplicate: boolean } {

@@ -5,6 +5,7 @@ import type { UpdateDatabase } from "./database.js";
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, Clock, DispatcherPort, GitPort, Logger, ReleaseStorePort, RuntimePort } from "./ports.js";
 import { redactText } from "./redaction.js";
+import { DiagnosticLogStore } from "./diagnostic-log.js";
 import type {
   ApplyRequest,
   CommandResult,
@@ -109,6 +110,7 @@ export class UpdateController {
     private readonly logger: Logger,
     private readonly clock: Clock = systemClock,
     private readonly owner = `controller-${process.pid}-${ulid().toLowerCase()}`,
+    private readonly diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database),
   ) {}
 
   async plan(request: PlanRequest): Promise<Record<string, unknown>> {
@@ -225,6 +227,7 @@ export class UpdateController {
       audit: this.database.auditRows(requestId),
       outbox: this.database.outboxFor(requestId) ?? null,
       runtime_operations: this.database.runtimeOperations(requestId),
+      diagnostics: this.database.diagnosticLogs(requestId).map((log) => this.diagnostics.project(log, 4_096, requestId)),
       runtime_state: row.state,
       notification_state: this.notificationState(this.database.outboxFor(requestId)),
       observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth, main_agent: mainAgent },
@@ -466,7 +469,7 @@ export class UpdateController {
         const stagingPath = await this.releases.prepareStaging(row.request_id, row.fence);
         await this.git.stage(row.target_sha, stagingPath);
         this.assertLease(row);
-        const build = await this.build.buildRelease(stagingPath);
+        const build = await this.build.buildRelease(stagingPath, { request_id: row.request_id, attempt: row.attempt });
         this.assertLease(row);
         if (canonicalJson(build.compatibility) !== canonicalJson(JSON.parse(row.compatibility_json))) {
           throw new Error("staged_compatibility_metadata_differs_from_approved_plan");
@@ -1731,6 +1734,11 @@ export class UpdateController {
         : `${redactText(message)}; the current runtime could not be verified exactly`,
       observed_active_sha: currentVerified ? row.current_sha : null,
     }, this.clock.now());
+    this.diagnostics.enforceRetention(
+      this.clock.now(),
+      this.policy.diagnostic_retention_days,
+      this.policy.diagnostic_aggregate_limit_bytes,
+    );
     this.logger.error("Update attempt failed", {
       request_id: requestId,
       state: row.state,

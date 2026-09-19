@@ -1,0 +1,332 @@
+import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { afterEach, test } from "node:test";
+
+import { DiagnosticLogStore } from "../src/diagnostic-log.js";
+import { UpdateDatabase } from "../src/database.js";
+import { ProcessRunner } from "../src/process.js";
+import { currentSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
+
+const roots: string[] = [];
+afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
+
+async function fixture(perLogLimit = 16 * 1024) {
+  const { root, policy } = await tempPolicy();
+  roots.push(root);
+  const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+  const replyTarget = { kind: "slack_thread" as const, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1.000001" };
+  const planned = database.createPlan({ source_event_id: "evt_01M2Y000000000000000000001", reply_target: replyTarget }, {
+    current_sha: currentSha,
+    target_sha: targetSha,
+    previous_sha: null,
+    policy_version: policy.policy_version,
+    compatibility: policy.compatibility,
+    rollback_compatible: true,
+  });
+  database.approve({
+    source_event_id: "evt_01M2Y000000000000000000002",
+    reply_target: replyTarget,
+    plan_id: planned.plan.plan_id,
+    plan_hash: planned.plan.plan_hash,
+    approval_id: "approval-diagnostics",
+  });
+  const claimed = database.claim(planned.row.request_id, "diagnostic-test", 60_000)!;
+  const store = new DiagnosticLogStore(policy.control_root, perLogLimit, database);
+  return { root, policy, database, store, claimed };
+}
+
+test("durable capture keeps a late failure after the memory prefix is truncated", async () => {
+  const f = await fixture(32 * 1024);
+  try {
+    const result = await new ProcessRunner().run(process.execPath, ["-e",
+      "process.stdout.write('ok\\n'.repeat(2000)); process.stderr.write('setup ok\\n'.repeat(2000) + 'late assertion failure\\n'); process.exitCode=1"], {
+      timeoutMs: 2_000,
+      outputLimitBytes: 1_024,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test" } },
+    });
+    assert.equal(result.exit_code, 1);
+    assert.equal(result.output_truncated, true);
+    assert.equal(result.stderr.includes("late assertion failure"), false);
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    const projected = f.store.project(row, 8_192);
+    assert.equal(projected.capture_state, "complete");
+    assert.match(String(projected.detail_tail), /\[stderr\]/);
+    assert.match(String(projected.detail_tail), /late assertion failure/);
+    assert.equal(projected.log_id, result.diagnostic_log?.log_id);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("streaming redaction covers split UTF-8, token, URL, and local path before persistence", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-test" });
+    const utf8Prefix = Buffer.from("前半🙂 token=sec");
+    const splitInsideEmoji = Buffer.byteLength("前半") + 2;
+    capture.write("stdout", utf8Prefix.subarray(0, splitInsideEmoji));
+    capture.write("stdout", utf8Prefix.subarray(splitInsideEmoji));
+    capture.write("stdout", Buffer.from("ret-value https://private.example/in"));
+    capture.write("stderr", Buffer.from("ternal /Users/example/private/file 後半"));
+    const completed = capture.finish(true)!;
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    const projected = f.store.project(row, completed.byte_size);
+    const detail = String(projected.detail_tail);
+    assert.equal(detail.includes("secret-value"), false);
+    assert.equal(detail.includes("private.example"), false);
+    assert.equal(detail.includes("/Users/example"), false);
+    assert.match(detail, /REDACTED/);
+    assert.match(detail, /前半🙂/);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("disk quota is independent from memory capture and reports truncation", async () => {
+  const f = await fixture(4_096);
+  try {
+    const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stdout.write('x'.repeat(12000)); process.exitCode=1"], {
+      timeoutMs: 2_000,
+      outputLimitBytes: 512,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "slack:npm-build" } },
+    });
+    assert.equal(Buffer.byteLength(result.stdout), 512);
+    assert.equal(result.diagnostic_log?.capture_state, "truncated");
+    assert.equal(result.diagnostic_log?.byte_size, 4_096);
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!).capture_state, "truncated");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("timeout cleanup and signal exit both finalize their bound diagnostics", async () => {
+  const f = await fixture();
+  const pidPath = path.join(f.root, "diagnostic-child.pid");
+  try {
+    const timeoutScript = `
+      const { spawn } = require("node:child_process");
+      const fs = require("node:fs");
+      process.on("SIGTERM", () => {});
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      fs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));
+      process.stderr.write("waiting for timeout detail\\n");
+      setInterval(() => {}, 1000);
+    `;
+    const timedOut = await new ProcessRunner().run(process.execPath, ["-e", timeoutScript], {
+      timeoutMs: 50,
+      outputLimitBytes: 512,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test-timeout" } },
+    });
+    assert.equal(timedOut.timed_out, true);
+    assert.equal(timedOut.exit_signal, "SIGKILL");
+    assert.equal(timedOut.cleanup_status, "term=group-sent,kill=group-sent,closed=yes");
+    assert.equal(timedOut.diagnostic_log?.capture_state, "complete");
+    const childPid = Number(await fs.readFile(pidPath, "utf8"));
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+
+    const signalled = await new ProcessRunner().run(process.execPath, ["-e",
+      "process.stderr.write('signal failure detail\\n'); process.kill(process.pid, 'SIGTERM')"], {
+      timeoutMs: 2_000,
+      outputLimitBytes: 512,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-build-signal" } },
+    });
+    assert.equal(signalled.exit_code, null);
+    assert.equal(signalled.exit_signal, "SIGTERM");
+    assert.equal(signalled.diagnostic_log?.capture_state, "complete");
+    assert.deepEqual(f.database.diagnosticLogs(f.claimed.request_id).map(({ step }) => step), [
+      "updater:npm-test-timeout", "updater:npm-build-signal",
+    ]);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("read projection refuses missing, size-mismatched, and hard-linked files", async () => {
+  const f = await fixture();
+  try {
+    const make = (step: string) => {
+      const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step });
+      capture.write("stderr", Buffer.from("failure"));
+      return capture.finish(true)!;
+    };
+    const first = make("dispatcher:npm-ci");
+    const firstPath = path.join(f.policy.control_root, "diagnostics", first.relative_ref!);
+    await fs.appendFile(firstPath, "tamper");
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!).capture_state, "size_mismatch");
+
+    const second = make("dispatcher:npm-build");
+    const secondPath = path.join(f.policy.control_root, "diagnostics", second.relative_ref!);
+    await fs.link(secondPath, `${secondPath}.hardlink`);
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[1]!).capture_state, "read_error");
+
+    const third = make("dispatcher:npm-typecheck");
+    await fs.unlink(path.join(f.policy.control_root, "diagnostics", third.relative_ref!));
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[2]!).capture_state, "missing");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("read projection rejects symlink, unsafe mode, forged reference, and cross-request binding", async () => {
+  const f = await fixture();
+  try {
+    const make = (step: string) => {
+      const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step });
+      capture.write("stderr", Buffer.from("failure"));
+      return capture.finish(true)!;
+    };
+    const symlinked = make("dispatcher:npm-ci-symlink");
+    const symlinkPath = path.join(f.policy.control_root, "diagnostics", symlinked.relative_ref!);
+    await fs.unlink(symlinkPath);
+    await fs.symlink("/dev/null", symlinkPath);
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!).capture_state, "read_error");
+
+    const unsafe = make("dispatcher:npm-test-mode");
+    await fs.chmod(path.join(f.policy.control_root, "diagnostics", unsafe.relative_ref!), 0o666);
+    assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[1]!).capture_state, "read_error");
+
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[1]!;
+    assert.equal(f.store.project({ ...row, relative_ref: "/tmp/forged.log" }).capture_state, "read_error");
+    assert.equal(f.store.project({ ...row, relative_ref: "../forged.log" }).capture_state, "read_error");
+    assert.equal(f.store.project({ ...row, request_id: "upd_01m2y000000000000000000099" }, 4_096, f.claimed.request_id).error_code,
+      "diagnostic_request_binding_mismatch");
+    assert.throws(() => f.database.finalizeDiagnosticLog({
+      ...unsafe,
+      attempt: f.claimed.attempt + 1,
+      capture_state: "complete",
+    }), /diagnostic_log_finalize_binding_mismatch/);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("write, atomic finalize, and read faults retain the command failure state", async () => {
+  const f = await fixture();
+  const originalWrite = fsSync.writeSync;
+  const originalRead = fsSync.readSync;
+  try {
+    const writeCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-write" });
+    fsSync.writeSync = (() => { throw Object.assign(new Error("full"), { code: "ENOSPC" }); }) as typeof fsSync.writeSync;
+    writeCapture.write("stderr", Buffer.from("original command failure"));
+    fsSync.writeSync = originalWrite;
+    assert.equal(writeCapture.finish(true)?.error_code, "diagnostic_write_failed");
+
+    const finalizeCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-finalize" });
+    finalizeCapture.write("stderr", Buffer.from("failure"));
+    const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
+    const part = (await fs.readdir(logsRoot)).find((entry) => entry.endsWith(".part"))!;
+    await fs.writeFile(path.join(logsRoot, part.replace(/\.part$/, ".log")), "existing", { mode: 0o600 });
+    assert.equal(finalizeCapture.finish(true)?.error_code, "diagnostic_finalize_failed");
+
+    const readCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-read" });
+    readCapture.write("stderr", Buffer.from("failure"));
+    readCapture.finish(true);
+    const readable = f.database.diagnosticLogs(f.claimed.request_id).find(({ step }) => step === "updater:npm-ci-read")!;
+    fsSync.readSync = (() => { throw Object.assign(new Error("read"), { code: "EIO" }); }) as typeof fsSync.readSync;
+    assert.equal(f.store.project(readable).capture_state, "read_error");
+    fsSync.readSync = originalRead;
+    assert.deepEqual(f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state), [
+      "write_failed", "write_failed", "complete",
+    ]);
+  } finally {
+    fsSync.writeSync = originalWrite;
+    fsSync.readSync = originalRead;
+    f.database.close();
+  }
+});
+
+test("unsafe managed root becomes write_failed without changing command failure", async () => {
+  const f = await fixture();
+  try {
+    const diagnosticRoot = path.join(f.policy.control_root, "diagnostics");
+    await fs.mkdir(diagnosticRoot, { recursive: true, mode: 0o777 });
+    await fs.chmod(diagnosticRoot, 0o777);
+    const result = await new ProcessRunner().run(process.execPath, ["-e", "process.exitCode=1"], {
+      timeoutMs: 2_000,
+      outputLimitBytes: 512,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci" } },
+    });
+    assert.equal(result.exit_code, 1);
+    assert.equal(result.diagnostic_log?.capture_state, "write_failed");
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "write_failed");
+  } finally {
+    await fs.chmod(path.join(f.policy.control_root, "diagnostics"), 0o700);
+    f.database.close();
+  }
+});
+
+test("spawn failure is durable and retention never purges a non-terminal capture", async () => {
+  const f = await fixture();
+  try {
+    const result = await new ProcessRunner().run("/definitely/missing/dona-command", [], {
+      timeoutMs: 2_000,
+      outputLimitBytes: 512,
+      diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-typecheck" } },
+    });
+    assert.equal(result.exit_code, null);
+    assert.equal(result.spawn_error, "ENOENT");
+    assert.equal(result.diagnostic_log?.capture_state, "complete");
+    assert.deepEqual(f.database.diagnosticRetentionCandidates(new Date("2999-01-01T00:00:00Z"), 1), []);
+
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "spawn failed",
+    });
+    f.store.enforceRetention(new Date("2999-01-01T00:00:00Z"), 1, 1);
+    const purged = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(purged.capture_state, "purged");
+    assert.equal(f.store.project(purged).capture_state, "purged");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("an unavailable diagnostic index never prevents or rewrites the command result", async () => {
+  const throwingStore = {
+    start() { throw new Error("diagnostic index unavailable"); },
+  } as unknown as DiagnosticLogStore;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", "process.stderr.write('failure'); process.exitCode=7"], {
+    timeoutMs: 2_000,
+    outputLimitBytes: 512,
+    diagnostic: { store: throwingStore, identity: {
+      request_id: "upd_01m2y000000000000000000001", attempt: 1, step: "updater:npm-test",
+    } },
+  });
+  assert.equal(result.exit_code, 7);
+  assert.equal(result.stderr, "failure");
+  assert.equal(result.diagnostic_log, undefined);
+});
+
+test("reopen marks an interrupted capture write_failed instead of complete", async () => {
+  const f = await fixture();
+  const databasePath = path.join(f.policy.control_root, "updater.sqlite3");
+  try {
+    f.database.reserveDiagnosticLog({
+      request_id: f.claimed.request_id,
+      attempt: f.claimed.attempt,
+      step: "updater:npm-typecheck",
+      log_id: "log_01m2y000000000000000000001",
+      relative_ref: "logs/log_01m2y000000000000000000001.log",
+      byte_size: 0,
+      capture_state: "write_failed",
+      error_code: null,
+      created_at: "2026-09-19T00:00:00.000Z",
+      finalized_at: "2026-09-19T00:00:00.000Z",
+    });
+    f.database.close();
+    const reopened = new UpdateDatabase(databasePath);
+    try {
+      const row = reopened.diagnosticLogs(f.claimed.request_id)[0]!;
+      assert.equal(row.capture_state, "write_failed");
+      assert.equal(row.error_code, "diagnostic_capture_interrupted");
+      assert.equal(row.relative_ref, null);
+    } finally {
+      reopened.close();
+    }
+  } catch (error) {
+    try { f.database.close(); } catch { /* already closed */ }
+    throw error;
+  }
+});

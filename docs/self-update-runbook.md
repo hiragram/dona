@@ -36,6 +36,18 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
 6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
 
+### 失敗診断log
+
+pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit_bytes`とは独立して、受信時からstdout/stderrをstream種別付きで保存します。保存先はstable Updaterの`control_root/diagnostics/logs`だけで、directoryは0700、fileは0600です。request/attempt/stepとDBでbindしたopaque `log_id`からのみ参照し、caller指定path、絶対path、symlink、hard link、管理root外の参照は拒否します。
+
+- 既定のper-log上限は8 MiB、aggregate上限は64 MiB、retentionは14日です。上限後もcommand監視とSIGTERM→1秒grace→SIGKILL cleanupは継続します。
+- `get_self_update_status`の`diagnostics`は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを返します。private absolute pathは返しません。
+- token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
+- temp fileのまま停止したcaptureは次回DB open時に`write_failed`へ落とし、final file不在やsize不一致を`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
+- retentionはterminal requestだけを古い順に対象とし、active captureとnon-terminal requestを削除しません。purge後もDB recordと元byte sizeを保持します。
+
+この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
+
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
 
 schema境界を越えるtargetは、policyの`compatibility_transitions`へsource/target compatibilityと必要なcontrol-plane capabilityを完全一致で列挙します。旧形式policyは空のtransition集合として扱うため、従来どおり単一`compatibility`と一致するtarget以外をfail closedします。repository上のtransition追加だけではproduction policyやstable updaterは変化しません。guarded control-plane installを別途承認・実施してexact updater SHAとpolicyを確認した後に、新しいplanを生成します。これは`apply_self_update`、DB migration、pointer切替、service操作の承認を兼ねません。
@@ -111,3 +123,5 @@ legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplica
 ## Retention
 
 current、previous、active attemptを常に保護し、それ以外の直近2 successful releaseも残します。disk floor 2 GiB未満ではstageを開始しません。`doctor`はcleanup候補をdry-run表示し、success後cleanupはSHA形式・realpath containment・owner/modeを再検証したreleaseだけを対象にします。
+
+診断logのretentionはrelease retentionとは別です。policyの`diagnostic_log_limit_bytes`、`diagnostic_aggregate_limit_bytes`、`diagnostic_retention_days`を使い、terminal requestのfinalized logだけをpurgeします。

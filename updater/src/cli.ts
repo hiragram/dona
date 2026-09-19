@@ -12,6 +12,7 @@ import { redactText } from "./redaction.js";
 import { ReleaseStore } from "./release-store.js";
 import { UpdateService } from "./service.js";
 import { parseRequestId } from "./validation.js";
+import { DiagnosticLogStore } from "./diagnostic-log.js";
 
 function usage(): never {
   console.error(`Usage:
@@ -31,16 +32,21 @@ async function main(): Promise<void> {
   const policy = loadPolicy(process.env.DONA_UPDATE_POLICY_PATH ?? defaultPolicy);
   const logger = createLogger();
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+  const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database);
+  diagnostics.enforceRetention(new Date(), policy.diagnostic_retention_days, policy.diagnostic_aggregate_limit_bytes);
   const releases = new ReleaseStore(policy);
   const controller = new UpdateController(
     database,
     policy,
     new RealGit(policy),
-    new CanonicalBuild(policy),
+    new CanonicalBuild(policy, undefined, diagnostics),
     releases,
     new RealRuntime(policy),
     new RealDispatcher(policy),
     logger,
+    undefined,
+    undefined,
+    diagnostics,
   );
   const command = process.argv[2] ?? "serve";
   try {

@@ -9,9 +9,11 @@ import { parse as parseDotenv } from "dotenv";
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
 import { ProcessRunner, minimalEnvironment } from "./process.js";
+import { DiagnosticLogStore } from "./diagnostic-log.js";
 import { redactText } from "./redaction.js";
 import type {
   CommandResult,
+  DiagnosticLogIdentity,
   Compatibility,
   DrainSnapshot,
   HealthSnapshot,
@@ -27,13 +29,21 @@ import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 const mainAgentStartupPrompt =
   "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。";
 
+export class CommandFailureError extends Error {
+  constructor(message: string, readonly result: CommandResult) { super(message); }
+}
+
 function commandError(name: string, result: CommandResult): Error {
   const suffix = result.timed_out ? "timed out" : `exited ${result.exit_code}`;
   const checkpoint = result.output_checkpoint ? `; checkpoint=${result.output_checkpoint}` : "";
   const runner = `; runner=exit:${result.exit_code},signal:${result.exit_signal ?? "none"},cleanup:${result.cleanup_status ?? "unknown"}`;
   const stderr = redactText(result.stderr.slice(0, 250), 250);
   const stdout = redactText(result.stdout.slice(0, 250), 250);
-  return new Error(redactText(`${name} ${suffix}${checkpoint}${runner}; stderr=${stderr}; stdout=${stdout}`, 1_000));
+  const spawn = result.spawn_error ? `; spawn=${redactText(result.spawn_error, 100)}` : "";
+  const diagnostic = result.diagnostic_log
+    ? `; diagnostic=${result.diagnostic_log.log_id}:${result.diagnostic_log.capture_state}:${result.diagnostic_log.byte_size}`
+    : "";
+  return new CommandFailureError(redactText(`${name} ${suffix}${spawn}${checkpoint}${runner}${diagnostic}; stderr=${stderr}; stdout=${stdout}`, 1_000), result);
 }
 
 function requireSuccess(name: string, result: CommandResult): string {
@@ -237,7 +247,11 @@ async function isolatedNpmEnvironment(
 }
 
 export class CanonicalBuild implements BuildPort {
-  constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
+  constructor(
+    private readonly policy: UpdatePolicy,
+    private readonly runner = new ProcessRunner(),
+    private readonly diagnostics?: DiagnosticLogStore,
+  ) {}
 
   async toolchain(): Promise<{ node_version: string; npm_version: string }> {
     const npmVersion = requireSuccess("npm --version", await this.runner.run(this.policy.executables.npm, ["--version"], {
@@ -248,7 +262,7 @@ export class CanonicalBuild implements BuildPort {
     return { node_version: process.versions.node, npm_version: npmVersion };
   }
 
-  async buildRelease(checkoutPath: string): Promise<{
+  async buildRelease(checkoutPath: string, diagnostic?: Omit<DiagnosticLogIdentity, "step">): Promise<{
     lock_hashes: Record<string, string>;
     node_version: string;
     npm_version: string;
@@ -281,6 +295,10 @@ export class CanonicalBuild implements BuildPort {
           timeoutMs: this.policy.timeouts.command_ms,
           outputLimitBytes: this.policy.output_limit_bytes,
           env: npmEnvironment,
+          ...(diagnostic && this.diagnostics ? { diagnostic: {
+            store: this.diagnostics,
+            identity: { ...diagnostic, step: `${component}:npm-${args.join("-")}` },
+          } } : {}),
         });
         requireSuccess(`npm ${args.join(" ")} (${component})`, result);
       }

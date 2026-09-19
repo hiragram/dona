@@ -275,6 +275,38 @@ export interface CommandResult {
   output_checkpoint?: string;
   exit_signal?: NodeJS.Signals;
   cleanup_status?: string;
+  spawn_error?: string;
+  diagnostic_log?: DiagnosticLogCapture;
+}
+
+export type DiagnosticLogStoredState = "capturing" | "complete" | "truncated" | "write_failed" | "purged";
+export type DiagnosticLogState = DiagnosticLogStoredState | "missing" | "read_error" | "size_mismatch";
+
+export interface DiagnosticLogIdentity {
+  request_id: string;
+  attempt: number;
+  step: string;
+}
+
+export interface DiagnosticLogCapture extends DiagnosticLogIdentity {
+  log_id: string;
+  relative_ref: string | null;
+  byte_size: number;
+  capture_state: Exclude<DiagnosticLogStoredState, "capturing" | "purged">;
+  error_code: string | null;
+  created_at: string;
+  finalized_at: string;
+}
+
+export interface DiagnosticLogRow extends DiagnosticLogIdentity {
+  log_id: string;
+  relative_ref: string | null;
+  byte_size: number;
+  capture_state: DiagnosticLogStoredState;
+  error_code: string | null;
+  created_at: string;
+  finalized_at: string | null;
+  purged_at: string | null;
 }
 
 export interface ActivationReceipt {

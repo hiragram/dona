@@ -862,6 +862,8 @@ describe("UpdateController isolated end-to-end", () => {
     const row = f.database.get(planned.request_id as string)!;
     assert.equal(row.state, "failed");
     assert.equal(row.last_error_code, "pre_activation_failed");
+    assert.equal(row.activation_generation, 0);
+    assert.equal(row.restart_attempts, 0);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, []);
     f.database.close();

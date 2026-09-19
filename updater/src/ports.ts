@@ -1,6 +1,7 @@
 import type {
   ActivationReceipt,
   CommandResult,
+  DiagnosticLogIdentity,
   Compatibility,
   DrainSnapshot,
   HealthSnapshot,
@@ -34,7 +35,7 @@ export interface GitPort {
 
 export interface BuildPort {
   toolchain(): Promise<{ node_version: string; npm_version: string }>;
-  buildRelease(checkoutPath: string): Promise<{
+  buildRelease(checkoutPath: string, diagnostic?: Omit<DiagnosticLogIdentity, "step">): Promise<{
     lock_hashes: Record<string, string>;
     node_version: string;
     npm_version: string;
