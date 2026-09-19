@@ -20,6 +20,7 @@ const loginBindingSchema=z.strictObject({instance_id:id,tenant_id:id,login_ref:i
  .refine(value=>Date.parse(value.expires_at)-Date.parse(value.created_at)===300000);
 const loginSchema=z.strictObject({binding:loginBindingSchema,payload_ref:id,payload_digest:digest,key_version:revision,previous_session_ref:id.nullable()});
 export type StoredWebLogin=z.infer<typeof loginSchema>;
+export { loginSchema as storedWebLoginSchema };
 const nonceSchema=z.strictObject({nonce_digest:digest,session_ref:id,issued_at:utc,expires_at:utc})
  .refine(value=>Date.parse(value.expires_at)>Date.parse(value.issued_at)
   && Date.parse(value.expires_at)-Date.parse(value.issued_at)<=10000);

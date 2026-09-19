@@ -16,6 +16,9 @@ const resourceId = "web_auth_state";
 const indexSchema = z.strictObject({ key_version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER), digest: z.string().regex(/^[a-f0-9]{64}$/) });
 const indexesSchema = z.array(indexSchema).max(128).refine(rows => new Set(rows.map(row => row.key_version)).size === rows.length);
 export type WebIndexCandidate = z.infer<typeof indexSchema>;
+export const webAuthDenialReasonSchema = z.enum(["identity_invalid", "identity_unavailable", "identity_mismatch", "session_invalid",
+  "session_revoked", "session_expired", "origin_invalid", "csrf_invalid", "cookie_invalid", "cookie_ambiguous"]);
+export type WebAuthDenialReason = z.infer<typeof webAuthDenialReasonSchema>;
 export type WebStoreResult = SessionIngressResult | { status: "denied"; reason: AuditEvent["reason"] }
   | { status: "succeeded"; kind: "initialized" | "restarted" | "login_created" | "session_created" | "revoked" | "expired"; generation: number }
   | { status: "succeeded"; kind: "login_consumed"; login: StoredWebLogin; payload: StoredWebPayload; receipt_id: string };
@@ -153,9 +156,11 @@ export class WebAuthRepository {
       return { next, payloads: [], result: { status: "succeeded", kind: "initialized", generation: 1 } };
     });
   }
-  restart(transactionId: string): WebStoreResult {
+  restart(transactionId: string, expectedGeneration?: number): WebStoreResult {
+    if (expectedGeneration !== undefined && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1)) throw new WebStateError();
     return this.commit(transactionId, "policy.change.v1", null, (state, mark) => {
       if (!state) return deny(state, "deployment_invalid");
+      if (expectedGeneration !== undefined && state.bff_generation !== expectedGeneration) return deny(state, "revision_mismatch");
       const next = restartWebAuthState(state, mark.effective_utc);
       return { next, payloads: [], result: { status: "succeeded", kind: "restarted", generation: next.bff_generation } };
     });
@@ -190,21 +195,36 @@ export class WebAuthRepository {
   }
   consumeLogin(transactionId: string, loginRef: string, cookie: WebIndexCandidate): WebStoreResult {
     const candidate = indexes([cookie])[0]!;
+    return this.commit(transactionId, "web.login.v1", null, (state, mark) => this.consumeLoginPlan(state, mark, transactionId, loginRef, candidate));
+  }
+  /** Select and consume in one audited transaction. Never derive login_ref from
+   * the raw browser cookie or return a secret through a preliminary read. */
+  consumeLoginByCookie(transactionId: string, cookieIndexes: WebIndexCandidate[]): WebStoreResult {
+    const candidates = indexes(cookieIndexes);
     return this.commit(transactionId, "web.login.v1", null, (state, mark) => {
       if (!state) return deny(state, "deployment_invalid");
-      const login = state.logins.find(value => value.binding.login_ref === loginRef);
-      if (!login) return deny(state, "already_consumed");
-      const now = Date.parse(mark.effective_utc);
-      if (login.binding.cookie_key_version !== candidate.key_version || login.binding.cookie_digest !== candidate.digest) return deny(state, "cookie_invalid");
-      if (login.binding.bff_generation !== state.bff_generation || now >= Date.parse(login.binding.expires_at)) return deny(state, "expired");
-      if (state.consumed_logins.length >= 512) return deny(state, "quota_exceeded");
-      const payload = this.payload(login);
-      const next = { ...state, updated_at: mark.effective_utc, logins: state.logins.filter(value => value !== login),
-        consumed_logins: [...state.consumed_logins, { receipt_id: transactionId, login_ref: loginRef, bff_generation: state.bff_generation, previous_session_ref: login.previous_session_ref,
-          consumed_at: mark.effective_utc, expires_at: new Date(Math.min(now + 10000, Date.parse(login.binding.expires_at))).toISOString() }]
-          .sort((a, b) => a.receipt_id < b.receipt_id ? -1 : 1) };
-      return { next, payloads: [], result: { status: "succeeded", kind: "login_consumed", login, payload, receipt_id: transactionId } };
+      if (!candidates.length || state.logins.some(login => !candidates.some(candidate => candidate.key_version === login.binding.cookie_key_version))) return deny(state, "identity_unavailable");
+      const matches = state.logins.filter(login => candidates.some(candidate => candidate.key_version === login.binding.cookie_key_version && candidate.digest === login.binding.cookie_digest));
+      if (matches.length > 1) return deny(state, "cookie_ambiguous");
+      const login = matches[0]; if (!login) return deny(state, "already_consumed");
+      return this.consumeLoginPlan(state, mark, transactionId, login.binding.login_ref,
+        candidates.find(candidate => candidate.key_version === login.binding.cookie_key_version)!);
     });
+  }
+  private consumeLoginPlan(state: WebAuthState | undefined, mark: Readonly<ClockMark>, transactionId: string, loginRef: string, candidate: WebIndexCandidate): Plan {
+    if (!state) return deny(state, "deployment_invalid");
+    const login = state.logins.find(value => value.binding.login_ref === loginRef);
+    if (!login) return deny(state, "already_consumed");
+    const now = Date.parse(mark.effective_utc);
+    if (login.binding.cookie_key_version !== candidate.key_version || login.binding.cookie_digest !== candidate.digest) return deny(state, "cookie_invalid");
+    if (login.binding.bff_generation !== state.bff_generation || now >= Date.parse(login.binding.expires_at)) return deny(state, "expired");
+    if (state.consumed_logins.length >= 512) return deny(state, "quota_exceeded");
+    const payload = this.payload(login);
+    const next = { ...state, updated_at: mark.effective_utc, logins: state.logins.filter(value => value !== login),
+      consumed_logins: [...state.consumed_logins, { receipt_id: transactionId, login_ref: loginRef, bff_generation: state.bff_generation, previous_session_ref: login.previous_session_ref,
+        consumed_at: mark.effective_utc, expires_at: new Date(Math.min(now + 10000, Date.parse(login.binding.expires_at))).toISOString() }]
+        .sort((a, b) => a.receipt_id < b.receipt_id ? -1 : 1) };
+    return { next, payloads: [], result: { status: "succeeded", kind: "login_consumed", login, payload, receipt_id: transactionId } };
   }
   createSession(transactionId: string, receiptId: string, subjectIndexes: WebIndexCandidate[], session: StoredWebSession, payload: StoredWebPayload): WebStoreResult {
     const candidates = indexes(subjectIndexes);
@@ -245,6 +265,34 @@ export class WebAuthRepository {
         used_nonces: state.used_nonces.filter(value => value.session_ref !== sessionRef) };
       return { next, payloads: [], principal: state.principals.find(value => value.principal_id === session.state.principal_id)!,
         result: { status: "succeeded", kind: "revoked", generation: state.bff_generation } };
+    });
+  }
+
+  /** Authenticated BFF reports inactive IdP state for this cookie-bound token.
+   * The result remains a denial; payload deletion and audit commit together. */
+  revokeInactiveSession(transactionId: string, sessionRef: string, cookie: WebIndexCandidate): WebStoreResult {
+    const candidate = indexes([cookie])[0]!;
+    return this.commit(transactionId, "web.session.v1", null, (state, mark) => {
+      if (!state) return deny(state, "deployment_invalid");
+      const session = state.sessions.find(value => value.state.session_ref === sessionRef);
+      if (!session || session.cookie_key_version !== candidate.key_version || session.cookie_digest !== candidate.digest) return deny(state, "cookie_invalid");
+      const next: WebAuthState = { ...state, updated_at: mark.effective_utc,
+        sessions: state.sessions.map(value => value !== session ? value : { ...value, state: { ...value.state, state: "revoked" }, payload_ref: null, payload_digest: null }),
+        used_nonces: state.used_nonces.filter(value => value.session_ref !== sessionRef) };
+      // Do not upgrade an online authentication failure into a trusted actor.
+      return { ...deny(next, "identity_invalid"), session_ref: sessionRef };
+    });
+  }
+
+  /** Bounded denial only, never a client-claimed actor or permission grant. */
+  recordAuthDenial(transactionId: string, cookieIndexes: WebIndexCandidate[] | null, reasonInput: WebAuthDenialReason): WebStoreResult {
+    const candidates = cookieIndexes === null ? null : indexes(cookieIndexes), reason = webAuthDenialReasonSchema.parse(reasonInput);
+    return this.commit(transactionId, "web.session.v1", null, state => {
+      if (!state) return deny(state, "deployment_invalid");
+      if (candidates !== null && (!candidates.length || state.sessions.some(session => !candidates.some(candidate => candidate.key_version === session.cookie_key_version)))) return deny(state, "identity_unavailable");
+      const matches = candidates === null ? [] : state.sessions.filter(session => candidates.some(candidate => candidate.key_version === session.cookie_key_version && candidate.digest === session.cookie_digest));
+      if (matches.length > 1) return deny(state, "cookie_ambiguous");
+      return { ...deny(state, reason), session_ref: matches[0]?.state.session_ref ?? null };
     });
   }
 
