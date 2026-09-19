@@ -59,6 +59,9 @@ describe("job resource config", () => {
     assert.match(runner, /--require=\$\{JSON\.stringify\(processMetrics\)\}/);
     assert.match(runner, /DONA_ORIGINAL_NODE_OPTIONS: process\.env\.NODE_OPTIONS/);
     assert.match(metrics, /process\.env\.NODE_OPTIONS = originalNodeOptions/);
+    assert.ok(metrics.indexOf('name.includes("fake-git")') < metrics.indexOf('name.endsWith(".mjs")'));
+    assert.match(reporter, /event\.type === "test:stderr"/);
+    assert.match(reporter, /metrics scope=2/);
     assert.doesNotMatch(metrics, /\.pid|process\.argv|commandLine/);
   });
 

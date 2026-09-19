@@ -12,6 +12,15 @@ export default async function* checkpointReporter(source) {
   const occurrences = new Map();
   const queuedTypes = new Map();
   for await (const event of source) {
+    if (event.type === "test:stderr") {
+      const message = typeof event.data?.message === "string" ? event.data.message : "";
+      for (const line of message.split(/\r?\n/)) {
+        if (new RegExp(`^\\[dispatcher-test:${nonce}\\] metrics scope=2;node=\\d+\\/\\d+,git=\\d+\\/\\d+,shell=\\d+\\/\\d+,other=\\d+\\/\\d+;active=\\d+;overhead_us=\\d+$`).test(line)) {
+          yield `\n${line}\n`;
+        }
+      }
+      continue;
+    }
     const key = `${event.data?.nesting}:${event.data?.name}`;
     if (event.type === "test:enqueue") {
       const types = queuedTypes.get(key) ?? [];

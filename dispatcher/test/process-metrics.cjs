@@ -36,8 +36,8 @@ const markerLimit = 2048;
 
 function classify(file) {
   const name = path.basename(String(file)).toLowerCase();
-  if (name === "node" || name === "tsx" || name.endsWith(".mjs") || name.endsWith(".cjs")) return "node";
   if (name === "git" || name.includes("fake-git")) return "git";
+  if (name === "node" || name === "tsx" || name.endsWith(".mjs") || name.endsWith(".cjs")) return "node";
   if (["sh", "bash", "zsh"].includes(name)) return "shell";
   return "other";
 }
