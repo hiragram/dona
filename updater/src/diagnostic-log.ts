@@ -54,7 +54,7 @@ class StreamingRedactor {
       if (this.droppingSensitive) {
         const boundary = this.droppingQuote
           ? this.pending.indexOf(this.droppingQuote)
-          : this.pending.search(/[\s"'<>]/);
+          : this.pending.search(/[\r\n]/);
         if (boundary < 0) {
           // The whole carried value is sensitive. Drop it immediately so an
           // unterminated quoted value cannot grow memory without bound.
@@ -67,6 +67,14 @@ class StreamingRedactor {
         this.droppingQuote = undefined;
         continue;
       }
+      const assignment = /\b(?:authorization|token|secret|password)\s*[:=]\s*(["']?)/i.exec(this.pending);
+      if (assignment?.index !== undefined) {
+        output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
+        this.pending = this.pending.slice(assignment.index + assignment[0].length);
+        this.droppingSensitive = true;
+        this.droppingQuote = assignment[1] === "\"" || assignment[1] === "'" ? assignment[1] : undefined;
+        continue;
+      }
       if (final) {
         output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
         this.pending = "";
@@ -76,13 +84,11 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const assignment = /(?:^|\s)(?:authorization|token|secret|password)\s*[:=]\s*(["']?)$/i.exec(safe);
-        if (assignment?.index !== undefined) {
-          output += redactText(safe.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
-          this.pending = this.pending.slice(lastBoundary + 1);
-          this.droppingSensitive = true;
-          this.droppingQuote = assignment[1] === "\"" || assignment[1] === "'" ? assignment[1] : undefined;
-          continue;
+        const partialAssignment = /(?:^|\s)(?:authorization|token|secret|password)\s*$/i.exec(safe);
+        if (partialAssignment?.index !== undefined) {
+          output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
+          this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
+          return output;
         }
         output += redactText(safe, Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(lastBoundary + 1);
@@ -125,7 +131,6 @@ export class DiagnosticLogStore {
   recoverInterruptedCaptures(at = new Date()): void {
     if (!this.index) return;
     for (const row of this.index.capturingDiagnosticLogs()) {
-      let errorCode = "diagnostic_capture_interrupted";
       try {
         if (!logIdentifier.test(row.log_id) || row.relative_ref !== `logs/${row.log_id}.log`) {
           throw new Error("diagnostic_reference_invalid");
@@ -160,9 +165,11 @@ export class DiagnosticLogStore {
         }
         for (const entry of entries) fs.unlinkSync(entry.path);
       } catch {
-        errorCode = "diagnostic_recovery_cleanup_failed";
+        // Keep the bound row intact so a later singleton startup can retry;
+        // never turn an unremoved managed file into an unreferenced orphan.
+        continue;
       }
-      try { this.index.interruptDiagnosticLog(row.log_id, errorCode, at); }
+      try { this.index.interruptDiagnosticLog(row.log_id, "diagnostic_capture_interrupted", at); }
       catch { /* recovery is diagnostic-only and must not prevent service startup */ }
     }
   }
@@ -256,6 +263,8 @@ export class DiagnosticLogStore {
           return undefined;
         }
         let errorCode: string | null = null;
+        let recoveryRequired = false;
+        let published = false;
         try {
           if (writeFailed) throw new Error("write");
           fs.fsyncSync(descriptor);
@@ -271,6 +280,7 @@ export class DiagnosticLogStore {
           // link+unlink gives an atomic no-clobber publish on the same filesystem.
           // A crash between the calls leaves nlink=2, which the read path rejects.
           fs.linkSync(temporary, finalPath);
+          published = true;
           fs.unlinkSync(temporary);
           fs.chmodSync(finalPath, 0o600);
           const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
@@ -278,16 +288,18 @@ export class DiagnosticLogStore {
         } catch {
           errorCode = writeFailed ? "diagnostic_write_failed" : "diagnostic_finalize_failed";
           try { fs.closeSync(descriptor); } catch { /* already closed */ }
-          try { fs.unlinkSync(temporary); } catch { /* best effort */ }
+          try { this.cleanupFailedFinalize(temporary, finalPath, published); }
+          catch { recoveryRequired = true; }
         }
         const capture: DiagnosticLogCapture = {
           ...initial,
-          relative_ref: errorCode ? null : relativeRef,
-          byte_size: errorCode ? 0 : bytes,
+          relative_ref: errorCode && !recoveryRequired ? null : relativeRef,
+          byte_size: errorCode && !recoveryRequired ? 0 : bytes,
           capture_state: errorCode ? "write_failed" : truncated ? "truncated" : "complete",
           error_code: errorCode,
           finalized_at: new Date().toISOString(),
         };
+        if (recoveryRequired) return capture;
         try { this.index?.finalizeDiagnosticLog(capture); } catch {
           try { if (capture.relative_ref) fs.unlinkSync(finalPath); } catch { /* best effort */ }
           return { ...capture, relative_ref: null, byte_size: 0, capture_state: "write_failed", error_code: "diagnostic_index_write_failed" };
@@ -361,6 +373,30 @@ export class DiagnosticLogStore {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.assertPrivateDirectory(directory);
     fs.chmodSync(directory, 0o700);
+  }
+
+  private cleanupFailedFinalize(temporary: string, finalPath: string, published: boolean): void {
+    const candidates = published ? [temporary, finalPath] : [temporary];
+    const entries = candidates.flatMap((candidate) => {
+      try { return [{ path: candidate, stats: fs.lstatSync(candidate) }]; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    });
+    for (const entry of entries) {
+      if (!entry.stats.isFile() || entry.stats.isSymbolicLink() || (entry.stats.mode & 0o077) !== 0 ||
+        entry.stats.uid !== process.getuid?.()) throw new Error("diagnostic_finalize_cleanup_unsafe");
+    }
+    if (entries.length === 1 && entries[0]!.stats.nlink !== 1) throw new Error("diagnostic_finalize_cleanup_unsafe");
+    if (entries.length === 2) {
+      const [first, second] = entries;
+      if (first!.stats.nlink !== 2 || second!.stats.nlink !== 2 ||
+        first!.stats.dev !== second!.stats.dev || first!.stats.ino !== second!.stats.ino) {
+        throw new Error("diagnostic_finalize_cleanup_unsafe");
+      }
+    }
+    for (const entry of entries) fs.unlinkSync(entry.path);
   }
 
   private assertPrivateDirectory(directory: string): void {

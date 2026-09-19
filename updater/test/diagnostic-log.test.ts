@@ -96,6 +96,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(quotedDetail.includes("quoted-secret"), false);
     assert.match(quotedDetail, /REDACTED_STREAM/);
     assert.match(quotedDetail, /visible-after-secret/);
+
+    const spacedCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-ci" });
+    spacedCapture.write("stderr", Buffer.from("Authorization "));
+    spacedCapture.write("stderr", Buffer.from(": Bearer secret-token\npassword=\"alpha beta\" visible"));
+    spacedCapture.finish(true);
+    const spacedDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[3]!, 16_384).detail_tail);
+    assert.equal(spacedDetail.includes("secret-token"), false);
+    assert.equal(spacedDetail.includes("alpha beta"), false);
+    assert.match(spacedDetail, /REDACTED_STREAM/);
   } finally {
     f.database.close();
   }
@@ -250,6 +259,49 @@ test("write, atomic finalize, and read faults retain the command failure state",
   } finally {
     fsSync.writeSync = originalWrite;
     fsSync.readSync = originalRead;
+    f.database.close();
+  }
+});
+
+test("failed post-publish metadata update removes the final file before dropping its reference", async () => {
+  const f = await fixture();
+  const originalChmod = fsSync.chmodSync;
+  const originalUnlink = fsSync.unlinkSync;
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-post-publish" });
+    capture.write("stderr", Buffer.from("failure"));
+    fsSync.chmodSync = (() => { throw Object.assign(new Error("chmod"), { code: "EIO" }); }) as typeof fsSync.chmodSync;
+    const failed = capture.finish(true)!;
+    fsSync.chmodSync = originalChmod;
+    assert.equal(failed.error_code, "diagnostic_finalize_failed");
+    assert.equal(failed.relative_ref, null);
+    const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
+    assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry.includes(failed.log_id)), []);
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    assert.equal(row.capture_state, "write_failed");
+    assert.equal(row.relative_ref, null);
+
+    const retryCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-build-post-publish" });
+    retryCapture.write("stderr", Buffer.from("failure"));
+    fsSync.chmodSync = (() => { throw Object.assign(new Error("chmod"), { code: "EIO" }); }) as typeof fsSync.chmodSync;
+    fsSync.unlinkSync = ((file) => {
+      if (String(file).endsWith(".log")) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      return originalUnlink(file);
+    }) as typeof fsSync.unlinkSync;
+    const recoverable = retryCapture.finish(true)!;
+    fsSync.chmodSync = originalChmod;
+    fsSync.unlinkSync = originalUnlink;
+    assert.equal(recoverable.relative_ref, `logs/${recoverable.log_id}.log`);
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[1]!.capture_state, "capturing");
+
+    f.store.recoverInterruptedCaptures(new Date("2026-09-19T03:00:00.000Z"));
+    const recovered = f.database.diagnosticLogs(f.claimed.request_id)[1]!;
+    assert.equal(recovered.capture_state, "write_failed");
+    assert.equal(recovered.relative_ref, null);
+    assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry.includes(recoverable.log_id)), []);
+  } finally {
+    fsSync.chmodSync = originalChmod;
+    fsSync.unlinkSync = originalUnlink;
     f.database.close();
   }
 });
