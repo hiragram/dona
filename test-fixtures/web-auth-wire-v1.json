@@ -66,7 +66,8 @@
     },
     "payload_ref": "login_payload",
     "payload_digest": "e3fe5ec49e0e3ff8104f74831e02fe1529b6d65efd44a2433efc9bea34cca1fa",
-    "key_version": 1
+    "key_version": 1,
+    "previous_session_ref": null
   },
   "login_payload": {
     "codec_version": 1,

@@ -26,16 +26,18 @@ export function revokeWebPrincipal(input:WebAuthState,principalId:string,now:str
 }
 export function pruneExpiredWebState(input:WebAuthState,now:string):WebAuthState {
  const state=checked(input,now),at=Date.parse(now);
- const sessions=state.sessions.filter(row=>{
+ const logins=state.logins.filter(row=>at<Date.parse(row.binding.expires_at));
+ const consumed=state.consumed_logins.filter(row=>at<Date.parse(row.expires_at));
+ const pending=new Set([...logins,...consumed].flatMap(row=>row.previous_session_ref?[row.previous_session_ref]:[]));
+ const sessions=state.sessions.filter(row=>at<Date.parse(row.state.expires_at)+24*60*60*1000 || pending.has(row.state.session_ref)).map(row=>{
   const session=row.state;
-  // Keep revoked references until their original bounded validity window ends.
-  // Registry principals and retained subject aliases are never pruned here.
-  return at<Date.parse(session.expires_at) && at<Date.parse(session.access_token_expires_at)
-   && at-Date.parse(session.last_activity_at)<30*60*1000;
+  if(session.state==="revoked" || at>=Date.parse(session.expires_at) || at>=Date.parse(session.access_token_expires_at)
+   || at-Date.parse(session.last_activity_at)>=30*60*1000)
+   return {...row,state:{...session,state:"revoked" as const},payload_ref:null,payload_digest:null};
+  return row;
  });
- const refs=new Set(sessions.map(row=>row.state.session_ref));
+ const refs=new Set(sessions.filter(row=>row.state.state==="active").map(row=>row.state.session_ref));
  return encodeWebAuthState({...state,updated_at:now,sessions,
-  logins:state.logins.filter(row=>at<Date.parse(row.binding.expires_at)),
-  consumed_logins:state.consumed_logins.filter(row=>at<Date.parse(row.expires_at)),
+  logins,consumed_logins:consumed,
   used_nonces:state.used_nonces.filter(row=>refs.has(row.session_ref) && at<Date.parse(row.expires_at))}).state;
 }

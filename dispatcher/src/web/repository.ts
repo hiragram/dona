@@ -144,9 +144,15 @@ export class WebAuthRepository {
       return { next, payloads: [], result: { status: "succeeded", kind: "expired", generation: next.bff_generation } };
     });
   }
-  createLogin(transactionId: string, login: StoredWebLogin, payload: StoredWebPayload): WebStoreResult {
+  createLogin(transactionId: string, input: Omit<StoredWebLogin, "previous_session_ref">, payload: StoredWebPayload,
+    browserSessionCookies: WebIndexCandidate[] | null): WebStoreResult {
+    const candidates = browserSessionCookies === null ? null : indexes(browserSessionCookies);
     return this.commit(transactionId, "web.login.v1", null, (state, mark) => {
       if (!state) return deny(state, "deployment_invalid");
+      if (candidates !== null && (!candidates.length || state.sessions.some(session => !candidates.some(candidate => candidate.key_version === session.cookie_key_version)))) return deny(state, "identity_unavailable");
+      const prior = candidates === null ? [] : state.sessions.filter(session => candidates.some(candidate => candidate.key_version === session.cookie_key_version && candidate.digest === session.cookie_digest));
+      if (prior.length > 1) return deny(state, "cookie_invalid");
+      const login: StoredWebLogin = { ...input, previous_session_ref: prior[0]?.state.session_ref ?? null };
       if (state.logins.some(value => value.binding.login_ref === login.binding.login_ref)
         || state.consumed_logins.some(value => value.login_ref === login.binding.login_ref)
         || state.logins.some(value => value.binding.cookie_key_version === login.binding.cookie_key_version && value.binding.cookie_digest === login.binding.cookie_digest)
@@ -171,7 +177,7 @@ export class WebAuthRepository {
       if (state.consumed_logins.length >= 512) return deny(state, "quota_exceeded");
       const payload = this.payload(login);
       const next = { ...state, updated_at: mark.effective_utc, logins: state.logins.filter(value => value !== login),
-        consumed_logins: [...state.consumed_logins, { receipt_id: transactionId, login_ref: loginRef, bff_generation: state.bff_generation,
+        consumed_logins: [...state.consumed_logins, { receipt_id: transactionId, login_ref: loginRef, bff_generation: state.bff_generation, previous_session_ref: login.previous_session_ref,
           consumed_at: mark.effective_utc, expires_at: new Date(Math.min(now + 10000, Date.parse(login.binding.expires_at))).toISOString() }]
           .sort((a, b) => a.receipt_id < b.receipt_id ? -1 : 1) };
       return { next, payloads: [], result: { status: "succeeded", kind: "login_consumed", login, payload, receipt_id: transactionId } };
@@ -198,7 +204,10 @@ export class WebAuthRepository {
         || state.logins.some(value => value.binding.cookie_key_version === session.cookie_key_version && value.binding.cookie_digest === session.cookie_digest)) return deny(state, "idempotency_conflict");
       if (state.sessions.length >= 2048) return deny(state, "quota_exceeded");
       const next = { ...state, updated_at: mark.effective_utc, consumed_logins: state.consumed_logins.filter(value => value !== receipt),
-        sessions: [...state.sessions, session].sort((a, b) => a.state.session_ref < b.state.session_ref ? -1 : 1) };
+        sessions: [...state.sessions.map(value => value.state.session_ref !== receipt.previous_session_ref ? value
+          : { ...value, state: { ...value.state, state: "revoked" as const }, payload_ref: null, payload_digest: null }), session]
+          .sort((a, b) => a.state.session_ref < b.state.session_ref ? -1 : 1),
+        used_nonces: state.used_nonces.filter(value => value.session_ref !== receipt.previous_session_ref) };
       return { next, payloads: [payload], principal, result: { status: "succeeded", kind: "session_created", generation: state.bff_generation } };
     });
   }

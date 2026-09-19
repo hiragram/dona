@@ -9,7 +9,7 @@ const empty:WebAuthState={codec_version:1,instance_id:"instance",tenant_id:"tena
  retained_subject_key_versions:[1],principals:[],aliases:[],sessions:[],logins:[],consumed_logins:[],used_nonces:[]};
 const envelope={codec_version:1 as const,key_version:1,sealed_at:now,nonce:Buffer.alloc(12,1).toString("base64url"),ciphertext:Buffer.alloc(20,2).toString("base64url"),tag:Buffer.alloc(16,3).toString("base64url")};
 const login:StoredWebLogin={binding:{instance_id:"instance",tenant_id:"tenant",login_ref:"login",bff_generation:1,cookie_key_version:1,
- cookie_digest:"a".repeat(64),created_at:now,expires_at:"2026-09-19T00:05:00.000Z"},payload_ref:"login_payload",payload_digest:"0".repeat(64),key_version:1};
+ cookie_digest:"a".repeat(64),created_at:now,expires_at:"2026-09-19T00:05:00.000Z"},previous_session_ref:null,payload_ref:"login_payload",payload_digest:"0".repeat(64),key_version:1};
 const session:StoredWebSession={state:{codec_version:1,instance_id:"instance",tenant_id:"tenant",principal_id:"principal",session_ref:"session",state:"active",session_generation:1,principal_revoke_generation:1,
  identity_binding_revision:1,authz_revision:1,bff_generation:1,authenticated_at:now,expires_at:"2026-09-19T08:00:00.000Z",access_token_expires_at:"2026-09-19T08:00:00.000Z",last_activity_at:now},
  cookie_key_version:1,cookie_digest:"b".repeat(64),csrf_key_version:1,token_key_version:1,payload_ref:"session_payload",payload_digest:"0".repeat(64)};

@@ -361,9 +361,14 @@ test("事前判定のSQL更新を予約前に拒否し、接続設定を復元�
   repository.append("prepared_2",1,event,()=>{ db.exec("INSERT INTO decisions VALUES ('request_1','approved')"); });
   assert.equal(repository.verify().sequence,1);
 });
-test("事前判定の非同期処理をanchor予約前に拒否する", t => {
+test("事前判定の非同期処理は本体もawait後も実行せずanchor予約前に拒否する", async t => {
   const { repository, store } = setup(t);
-  assert.throws(() => repository.appendPrepared("prepared_1",1,(async () => ({event,resource_digest:null,mutation:()=>null})) as never),AuditIntegrityError);
+  let effects=0;
+  assert.throws(() => repository.appendPrepared("prepared_1",1,(async () => {
+    effects++;await Promise.resolve();effects++;
+    return {event,resource_digest:null,mutation:()=>null};
+  }) as never),AuditIntegrityError);
+  await Promise.resolve();assert.equal(effects,0);
   assert.deepEqual(store.calls,[]);assert.equal(repository.verify().sequence,0);
 });
 test("検証付き読み取りは更新とpeer commit後の古い結果を拒否する", t => {

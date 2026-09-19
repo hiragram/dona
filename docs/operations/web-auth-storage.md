@@ -13,11 +13,11 @@ metadataは4 MiB、principalは1,024件、subject aliasは16,384件、sessionは
 ## 操作契約
 
 - `initialize`は既存の共通監査rootに結ぶ空metadataだけを作る。principal、role、credential、subject key、信頼rootを自動作成しない。
-- `createLogin`は5分のlogin bindingと暗号化payloadを保存する。`consumeLogin`はcookie bindingと期限を確認し、payloadを削除した上でBFFへ返す。token交換は消費結果の確定後にだけ行う。
-- 消費時に最大10秒、かつ元のlogin期限を越えないreceiptを残す。`createSession`はこのreceipt、全保持subject keyのindex、単一の既存principal、current revision・generation・期限を照合し、receiptを一回だけ消費する。OIDC失敗後に同じ交換や消費を再送しない。
+- `createLogin`は5分のlogin bindingと暗号化payloadを保存する。BFFは開始requestのsession cookieがない場合だけ明示的な`null`を渡し、ある場合は保持keyによる全index候補を渡す。repositoryが旧sessionを照合し、置換対象をloginと消費receiptへ保存する。client指定のsession IDを置換対象にしない。`consumeLogin`はcookie bindingと期限を確認し、payloadを削除した上でBFFへ返す。token交換は消費結果の確定後にだけ行う。
+- 消費時に最大10秒、かつ元のlogin期限を越えないreceiptを残す。`createSession`はこのreceipt、全保持subject keyのindex、単一の既存principal、current revision・generation・期限を照合し、receiptを一回だけ消費する。新sessionの作成と同じtransactionで置換対象の旧sessionを失効させ、旧payloadとnonceを削除する。OIDC失敗後に同じ交換や消費を再送しない。
 - `lookupSession`は監査済みのlocal dataを返すだけで、online introspectionやresource認可を代行しない。現存rowに必要なcookie key versionの欠落と曖昧な複数一致を拒否する。BFFでは実keyの用途・状態・完全な保持inventoryも検証する。
 - `revokeSession`は同じcookie bindingを確認し、IdPへ接続せず失効metadataとpayload削除を確定する。BFFのOrigin、Fetch Metadata、CSRF確認は別途必須である。確定のreadback後にだけcookieを消す。
-- `restart`は共有BFF世代を進め、旧session・pending login・消費receiptを失効させる。`expire`はprotected clockで期限を確認し、不要になったsecretと短命metadataを同じtransactionで削除する。両操作はruntime hookへまだ接続していない。
+- `restart`は共有BFF世代を進め、旧session・pending login・消費receiptを失効させる。`expire`はprotected clockで期限を確認し、期限切れsessionのsecretを削除して失効させる。session IDとcookie digestのtombstoneは絶対期限から24時間後まで保持し、進行中のloginが置換対象として参照している間も削除しない。短命login・receiptは期限後に削除する。両操作はruntime hookへまだ接続していない。
 
 ## 検証と残る接続
 

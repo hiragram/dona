@@ -17,12 +17,12 @@ export type StoredWebSession=z.infer<typeof sessionSchema>;
 const loginBindingSchema=z.strictObject({instance_id:id,tenant_id:id,login_ref:id,bff_generation:revision,
  cookie_key_version:revision,cookie_digest:digest,created_at:utc,expires_at:utc})
  .refine(value=>Date.parse(value.expires_at)-Date.parse(value.created_at)===300000);
-const loginSchema=z.strictObject({binding:loginBindingSchema,payload_ref:id,payload_digest:digest,key_version:revision});
+const loginSchema=z.strictObject({binding:loginBindingSchema,payload_ref:id,payload_digest:digest,key_version:revision,previous_session_ref:id.nullable()});
 export type StoredWebLogin=z.infer<typeof loginSchema>;
 const nonceSchema=z.strictObject({nonce_digest:digest,session_ref:id,issued_at:utc,expires_at:utc})
  .refine(value=>Date.parse(value.expires_at)>Date.parse(value.issued_at)
   && Date.parse(value.expires_at)-Date.parse(value.issued_at)<=10000);
-const consumedLoginSchema=z.strictObject({receipt_id:id,login_ref:id,bff_generation:revision,consumed_at:utc,expires_at:utc})
+const consumedLoginSchema=z.strictObject({receipt_id:id,login_ref:id,bff_generation:revision,consumed_at:utc,expires_at:utc,previous_session_ref:id.nullable()})
  .refine(value=>Date.parse(value.expires_at)>Date.parse(value.consumed_at)
   && Date.parse(value.expires_at)-Date.parse(value.consumed_at)<=10000);
 function ordered<T>(rows:readonly T[],key:(row:T)=>string):boolean {
@@ -46,7 +46,8 @@ export const webAuthStateSchema=z.strictObject({
  if(value.principals.some(p=>!inScope(p)) || value.sessions.some(s=>!inScope(s.state) || !principals.has(s.state.principal_id))
   || value.logins.some(l=>!inScope(l.binding)) || value.aliases.some(a=>!principals.has(a.principal_id)
     || !value.retained_subject_key_versions.includes(a.index_key_version))
-  || value.used_nonces.some(n=>!sessionIds.has(n.session_ref)))bad();
+  || value.used_nonces.some(n=>!sessionIds.has(n.session_ref))
+  || [...value.logins,...value.consumed_logins].some(l=>l.previous_session_ref!==null && !sessionIds.has(l.previous_session_ref)))bad();
  if(value.sessions.some(s=>s.state.bff_generation>value.bff_generation) || value.logins.some(l=>l.binding.bff_generation!==value.bff_generation))bad();
  if(value.consumed_logins.some(l=>l.bff_generation!==value.bff_generation)
   || value.sessions.some(s=>Date.parse(s.state.last_activity_at)>Date.parse(value.updated_at))

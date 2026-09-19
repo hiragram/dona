@@ -73,7 +73,7 @@ export const loginCookie={key_version:1,digest:wire.login.binding.cookie_digest}
 export const sessionCookie={key_version:1,digest:wire.session.cookie_digest};
 export function activeSession(fixture:ReturnType<typeof setup>){
  assert.equal(fixture.store.initialize("initialize").status,"succeeded");fixture.seedRegistry();
- assert.equal(fixture.store.createLogin("create_login",wire.login,wire.login_payload).status,"succeeded");
+ assert.equal(fixture.store.createLogin("create_login",wire.login,wire.login_payload,null).status,"succeeded");
  assert.equal(fixture.store.consumeLogin("consume_login","login",loginCookie).status,"succeeded");
  assert.equal(fixture.store.createSession("create_session","consume_login",[{key_version:1,digest:"a".repeat(64)}],wire.session,wire.payload).status,"succeeded");
 }
