@@ -8,3 +8,6 @@ import "./approval/transaction.js";
 import "./web/state.js";
 
 import "./approval/native-clock.js";
+
+import "./web/ingress-wire.js";
+import "./web/ingress.js";

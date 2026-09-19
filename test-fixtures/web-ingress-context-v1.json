@@ -1,0 +1,64 @@
+{
+  "fixture_only": true,
+  "now": "2026-09-19T00:00:01.000Z",
+  "identity": {
+    "instance_id": "instance",
+    "tenant_id": "tenant",
+    "principal_id": "principal",
+    "session_ref": "session",
+    "session_generation": 1,
+    "principal_revoke_generation": 1,
+    "identity_binding_revision": 1,
+    "authz_revision": 1,
+    "bff_generation": 1
+  },
+  "key_byte": 99,
+  "fixtures": [
+    {
+      "target": "/",
+      "request": {
+        "method": "GET",
+        "route_id": "dashboard",
+        "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "resource": null
+      },
+      "token": "eyJjb2RlY192ZXJzaW9uIjoxLCJhdWRpZW5jZSI6ImRvbmEuZGlzcGF0Y2hlci53ZWItaW5ncmVzcyIsImtleV92ZXJzaW9uIjoxLCJpZGVudGl0eSI6eyJpbnN0YW5jZV9pZCI6Imluc3RhbmNlIiwidGVuYW50X2lkIjoidGVuYW50IiwicHJpbmNpcGFsX2lkIjoicHJpbmNpcGFsIiwic2Vzc2lvbl9yZWYiOiJzZXNzaW9uIiwic2Vzc2lvbl9nZW5lcmF0aW9uIjoxLCJwcmluY2lwYWxfcmV2b2tlX2dlbmVyYXRpb24iOjEsImlkZW50aXR5X2JpbmRpbmdfcmV2aXNpb24iOjEsImF1dGh6X3JldmlzaW9uIjoxLCJiZmZfZ2VuZXJhdGlvbiI6MX0sInJlcXVlc3QiOnsibWV0aG9kIjoiR0VUIiwicm91dGVfaWQiOiJkYXNoYm9hcmQiLCJib2R5X2RpZ2VzdCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJyZXNvdXJjZSI6bnVsbH0sImlzc3VlZF9hdCI6IjIwMjYtMDktMTlUMDA6MDA6MDEuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTA5LTE5VDAwOjAwOjExLjAwMFoiLCJub25jZSI6InJncHJPWjRHeENMck9lM2NSUWYtellFQW1GU2V6WEZMYk04QzFQZlp4cnMifQ.EsrVo4T8Df59xCEg9e-OY-YWmlYh0ahQKSEfym6i6YI"
+    },
+    {
+      "target": "/api/session",
+      "request": {
+        "method": "GET",
+        "route_id": "session",
+        "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "resource": null
+      },
+      "token": "eyJjb2RlY192ZXJzaW9uIjoxLCJhdWRpZW5jZSI6ImRvbmEuZGlzcGF0Y2hlci53ZWItaW5ncmVzcyIsImtleV92ZXJzaW9uIjoxLCJpZGVudGl0eSI6eyJpbnN0YW5jZV9pZCI6Imluc3RhbmNlIiwidGVuYW50X2lkIjoidGVuYW50IiwicHJpbmNpcGFsX2lkIjoicHJpbmNpcGFsIiwic2Vzc2lvbl9yZWYiOiJzZXNzaW9uIiwic2Vzc2lvbl9nZW5lcmF0aW9uIjoxLCJwcmluY2lwYWxfcmV2b2tlX2dlbmVyYXRpb24iOjEsImlkZW50aXR5X2JpbmRpbmdfcmV2aXNpb24iOjEsImF1dGh6X3JldmlzaW9uIjoxLCJiZmZfZ2VuZXJhdGlvbiI6MX0sInJlcXVlc3QiOnsibWV0aG9kIjoiR0VUIiwicm91dGVfaWQiOiJzZXNzaW9uIiwiYm9keV9kaWdlc3QiOiJlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1IiwicmVzb3VyY2UiOm51bGx9LCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTE5VDAwOjAwOjAxLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0xOVQwMDowMDoxMS4wMDBaIiwibm9uY2UiOiJwM2t3cHZTX0FJNzQwU2Z5cVVQT2Zwa1BKd0VmT3N0QU03cHprd2tiQUMwIn0.jj3gySYZwFjGp1r6-zdkjw50xjgYdHG2NvqnpUwB27Y"
+    },
+    {
+      "target": "/api/jobs/job_1",
+      "request": {
+        "method": "GET",
+        "route_id": "job_read",
+        "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "resource": {
+          "kind": "job",
+          "id": "job_1"
+        }
+      },
+      "token": "eyJjb2RlY192ZXJzaW9uIjoxLCJhdWRpZW5jZSI6ImRvbmEuZGlzcGF0Y2hlci53ZWItaW5ncmVzcyIsImtleV92ZXJzaW9uIjoxLCJpZGVudGl0eSI6eyJpbnN0YW5jZV9pZCI6Imluc3RhbmNlIiwidGVuYW50X2lkIjoidGVuYW50IiwicHJpbmNpcGFsX2lkIjoicHJpbmNpcGFsIiwic2Vzc2lvbl9yZWYiOiJzZXNzaW9uIiwic2Vzc2lvbl9nZW5lcmF0aW9uIjoxLCJwcmluY2lwYWxfcmV2b2tlX2dlbmVyYXRpb24iOjEsImlkZW50aXR5X2JpbmRpbmdfcmV2aXNpb24iOjEsImF1dGh6X3JldmlzaW9uIjoxLCJiZmZfZ2VuZXJhdGlvbiI6MX0sInJlcXVlc3QiOnsibWV0aG9kIjoiR0VUIiwicm91dGVfaWQiOiJqb2JfcmVhZCIsImJvZHlfZGlnZXN0IjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsInJlc291cmNlIjp7ImtpbmQiOiJqb2IiLCJpZCI6ImpvYl8xIn19LCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTE5VDAwOjAwOjAxLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0xOVQwMDowMDoxMS4wMDBaIiwibm9uY2UiOiJRUkVHMDJEOWZ0eTIzdExhZlBmQ1RYOWUxaXNEOGpGVVY3RU0xLVZ3QlFRIn0.51FkLonbVavkb1YXnA8AA0xFZqQdqfsDudpn00nLmQw"
+    },
+    {
+      "target": "/api/jobs/job_2",
+      "request": {
+        "method": "GET",
+        "route_id": "job_read",
+        "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "resource": {
+          "kind": "job",
+          "id": "job_2"
+        }
+      },
+      "token": "eyJjb2RlY192ZXJzaW9uIjoxLCJhdWRpZW5jZSI6ImRvbmEuZGlzcGF0Y2hlci53ZWItaW5ncmVzcyIsImtleV92ZXJzaW9uIjoxLCJpZGVudGl0eSI6eyJpbnN0YW5jZV9pZCI6Imluc3RhbmNlIiwidGVuYW50X2lkIjoidGVuYW50IiwicHJpbmNpcGFsX2lkIjoicHJpbmNpcGFsIiwic2Vzc2lvbl9yZWYiOiJzZXNzaW9uIiwic2Vzc2lvbl9nZW5lcmF0aW9uIjoxLCJwcmluY2lwYWxfcmV2b2tlX2dlbmVyYXRpb24iOjEsImlkZW50aXR5X2JpbmRpbmdfcmV2aXNpb24iOjEsImF1dGh6X3JldmlzaW9uIjoxLCJiZmZfZ2VuZXJhdGlvbiI6MX0sInJlcXVlc3QiOnsibWV0aG9kIjoiR0VUIiwicm91dGVfaWQiOiJqb2JfcmVhZCIsImJvZHlfZGlnZXN0IjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsInJlc291cmNlIjp7ImtpbmQiOiJqb2IiLCJpZCI6ImpvYl8yIn19LCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTE5VDAwOjAwOjAxLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0xOVQwMDowMDoxMS4wMDBaIiwibm9uY2UiOiJfa2E1TVd6cDhqeU5UbVVnM29XNkp4UDNWZUFyNENKUmxfOGRlQzVaSFJJIn0.JCw1p8NoLiTdnhJZJssyVRBEfqDfRz2uUbv5zSKFwvs"
+    }
+  ]
+}
