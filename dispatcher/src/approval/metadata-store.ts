@@ -31,9 +31,9 @@ function node(input: unknown): MetadataTreeNode {
   if (createHash("sha256").update("dona.metadata-tree-node.v1\0").update(raw).digest("hex") !== parsed.digest) throw new MetadataStoreError();
   return parsed;
 }
-function readNode(db: Database.Database, digest: string): string | undefined {
-  const row = db.prepare("SELECT CASE WHEN typeof(wire)='text' AND length(CAST(wire AS BLOB)) IN (132,176) THEN wire ELSE NULL END AS wire FROM main.approval_metadata_nodes WHERE digest=?")
-    .get(digest) as { wire: string | null } | undefined;
+const readSql = "SELECT CASE WHEN typeof(wire)='text' AND length(CAST(wire AS BLOB)) IN (132,176) THEN wire ELSE NULL END AS wire FROM main.approval_metadata_nodes WHERE digest=?";
+function readNode(statement: Database.Statement, digest: string): string | undefined {
+  const row = statement.get(digest) as { wire: string | null } | undefined;
   if (row === undefined) return undefined;
   return node({ digest, wire: row.wire }).wire;
 }
@@ -55,10 +55,12 @@ export class ApprovalMetadataNodes {
       if (!this.db.inTransaction) throw new MetadataStoreError();
       verifyOpenDatabaseFile(this.db); verifyApprovalMetadataSchema(this.db);
     });
+    // statementはこのcallback内だけで再利用し、SQL値とhashは毎回検証する。
+    const statement = guard(() => this.db.prepare(readSql));
     let active = true;
     const reader: MetadataTreeNodeReader = digest => guard(() => {
       if (!active || !this.db.inTransaction) throw new MetadataStoreError();
-      return readNode(this.db, digestSchema.parse(digest));
+      return readNode(statement, digestSchema.parse(digest));
     });
     try { const result = operation(reader); assertSynchronousResult(result); return result; }
     catch (error) {
@@ -80,13 +82,14 @@ export class ApprovalMetadataNodes {
       if (!Array.isArray(input) || input.length < 1 || input.length > 257) throw new MetadataStoreError();
       const nodes = input.map(node);
       if (new Set(nodes.map(item => item.digest)).size !== nodes.length) throw new MetadataStoreError();
+      const read = this.db.prepare(readSql);
       const insert = this.db.prepare("INSERT INTO main.approval_metadata_nodes(digest,wire) VALUES (?,?)");
       for (const item of nodes) {
-        const existing = readNode(this.db, item.digest);
+        const existing = readNode(read, item.digest);
         if (existing === undefined) insert.run(item.digest, item.wire);
         else if (existing !== item.wire) throw new MetadataStoreError();
       }
-      for (const item of nodes) if (readNode(this.db, item.digest) !== item.wire) throw new MetadataStoreError();
+      for (const item of nodes) if (readNode(read, item.digest) !== item.wire) throw new MetadataStoreError();
       verifyOpenDatabaseFile(this.db);
       return undefined;
     });

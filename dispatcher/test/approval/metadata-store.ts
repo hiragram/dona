@@ -211,3 +211,27 @@ test("保存後のwire破損と過大値をboundedに拒否する",t=>{
  verifyApprovalMetadataSchema(f.db);
  assert.throws(()=>f.audit.readVerified(()=>f.nodes.read(reader=>readMetadataValue(scope,root,"fixture_record",reader))));
 });
+
+test("同じreaderでも直前に保存したnodeをSQLから読み直す", t => {
+ const f=fixture(t),plan=prepareMetadataUpdate(scope,emptyMetadataRoot(scope),"fixture_record",null,digest,()=>undefined);
+ f.db.transaction(()=>f.nodes.read(reader=>{
+  assert.equal(reader(plan.proposed_root),undefined);
+  f.nodes.stage(plan.nodes);
+  assert.equal(reader(plan.proposed_root),plan.nodes.find(node=>node.digest===plan.proposed_root)!.wire);
+  assert.equal(readMetadataValue(scope,plan.proposed_root,"fixture_record",reader),digest);
+  return null;
+ }))();
+});
+test("同じreaderの先行結果をcacheせず後続SQL破損をboundedに拒否する", t => {
+ const f=fixture(t),root=commit(f);
+ assert.throws(()=>f.db.transaction(()=>f.nodes.read(reader=>{
+  assert.equal(readMetadataValue(scope,root,"fixture_record",reader),digest);
+  // 外部改変を再現するtest専用の非audit transaction。DDLもrollbackする。
+  f.db.exec("DROP TRIGGER approval_metadata_nodes_no_update; PRAGMA ignore_check_constraints=ON");
+  f.db.prepare("UPDATE approval_metadata_nodes SET wire=? WHERE digest=?").run("A".repeat(1000000),root);
+  f.db.exec("PRAGMA ignore_check_constraints=OFF; CREATE TRIGGER approval_metadata_nodes_no_update BEFORE UPDATE ON approval_metadata_nodes\n          BEGIN SELECT RAISE(ABORT,'approval_metadata_node_immutable'); END");
+  reader(root);
+  return null;
+ }))(),MetadataStoreError);
+ assert.equal(f.audit.readVerified(()=>f.nodes.read(reader=>readMetadataValue(scope,root,"fixture_record",reader))),digest);
+});
