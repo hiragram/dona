@@ -5,7 +5,7 @@ import path from "node:path";
 import http from "node:http";
 import net from "node:net";
 import test from "node:test";
-import { createHmac } from "node:crypto";
+import { createHmac, createHash } from "node:crypto";
 import { WebSessionService } from "../../src/web/session-service.js";
 import { WebAuthRepository } from "../../src/web/repository.js";
 import { verifyServiceRequest, signServiceResponse, parseSessionServiceInput, type WebServiceCredential } from "../../src/web/service-auth.js";
@@ -62,6 +62,18 @@ test("service proofの独立golden wireとdomain/scope/期限を照合する", (
   let reads = 0;
   assert.throws(() => signServiceResponse(fixture.request_proof, fixture.request_body, fixture.result, scope,
     () => ++reads === 1 ? credential : { ...credential, version: 2 }, fixture.now));
+});
+
+test("activity属性は固定dashboardだけに許可しservice MACの改変を拒否する", () => {
+  const input={...fixture.input,target:"/",user_navigation:true}, body=JSON.stringify(input);
+  assert.deepEqual(parseSessionServiceInput(body),input);
+  for(const altered of [{...input,target:"/api/session"},{...input,user_navigation:false},{...input,user_navigation:"true"}])
+    assert.throws(()=>parseSessionServiceInput(JSON.stringify(altered)));
+  const claims={...fixture.request_claims,body_digest:createHash("sha256").update(body).digest("hex")};
+  const proof=signedRequest(claims);assert.deepEqual(verifyServiceRequest(proof,body,scope,lookup,fixture.now),claims);
+  const stripped=JSON.stringify({...fixture.input,target:"/"});
+  assert.throws(()=>verifyServiceRequest(proof,stripped,scope,lookup,fixture.now));
+  assert.throws(()=>verifyServiceRequest(fixture.request_proof,body,scope,lookup,fixture.now));
 });
 
 test("実UDSからsession nonceと監査を確定し再送を拒否する", async t => {

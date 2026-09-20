@@ -188,8 +188,13 @@ export class WebAuthController {
         identity_binding_revision: session.identity_binding_revision, authz_revision: session.authz_revision, bff_generation: session.bff_generation };
       const context = signIngressContext(identity, ingressContextRequest(request.method, request.target, request.body), this.keys.context(), issued, new Date(deadline).toISOString());
       const target = route.id === "dashboard" ? "/" : "/api/session";
+      // Fetch MetadataはBFFでのみ解釈し、選択結果をUDS request全体のMACへ結ぶ。
+      // poll/SSEやprogrammatic fetchをuser navigationとして保存しない。
+      const userNavigation = route.id === "dashboard" && singleHeader(request.headers, "sec-fetch-mode") === "navigate"
+        && singleHeader(request.headers, "sec-fetch-dest") === "document" && singleHeader(request.headers, "sec-fetch-user") === "?1";
       auditAttempted = true;
-      const confirmation = await this.connections.session.confirm({ codec_version: 1, method: "GET", target, context }, identity);
+      const confirmation = await this.connections.session.confirm({ codec_version: 1, method: "GET", target, context,
+        ...(userNavigation ? { user_navigation: true as const } : {}) }, identity);
       if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
       if (confirmation.status === "denied") {
         switch (confirmation.reason) {

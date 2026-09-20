@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AuditEvent } from "../audit/codec.js";
 import { encodeWebAuthState, WebStateError, type WebAuthState } from "./model.js";
-import { evaluateSession, type RegistryPrincipal, type WebPrincipal } from "./domain.js";
+import { evaluateSession, nextActivity, type RegistryPrincipal, type WebPrincipal } from "./domain.js";
 import { ingressContextRequest, untrustedContextHints, verifyIngressContext, type ContextKey } from "./context.js";
 
 export type WebContextKeyLookup = (version:number) => ContextKey | undefined;
@@ -15,10 +15,11 @@ export interface SessionIngressPlan {
 }
 /** Pure plan only. The caller must verify the common audit root and current
  * payload in the same protected transaction, persist this nonce/state, and wait
- * for finalization before returning the principal. This is session confirmation,
- * not a resource capability and not proof of navigation or user activity. */
+ * for finalization before returning the principal. userNavigation is derived by
+ * the BFF and bound by the authenticated service request, never browser JSON.
+ * This grants no resource capability. Default confirmation is not activity. */
 export function prepareSessionIngress(input:WebAuthState,token:string,method:unknown,target:unknown,
- body:Uint8Array,now:string,lookup:WebContextKeyLookup):SessionIngressPlan {
+ body:Uint8Array,now:string,lookup:WebContextKeyLookup,userNavigation=false):SessionIngressPlan {
  const state=encodeWebAuthState(input).state;
  const at=Date.parse(now);
  if(!Number.isFinite(at) || new Date(at).toISOString()!==now || at<Date.parse(state.updated_at))throw new WebStateError();
@@ -28,6 +29,7 @@ export function prepareSessionIngress(input:WebAuthState,token:string,method:unk
  try {request=ingressContextRequest(method,target,body);hints=untrustedContextHints(token);}
  catch {return deny("proof_invalid");}
  if(request.method!=="GET" || !["session","dashboard"].includes(request.route_id) || body.byteLength!==0)return deny("operation_unsupported");
+ if(typeof userNavigation!=="boolean" || (userNavigation && request.route_id!=="dashboard"))return deny("operation_unsupported");
  const session=state.sessions.find(row=>row.state.session_ref===hints.session_ref);
  const principal=state.principals.find(row=>row.principal_id===session?.state.principal_id);
  if(!session || !principal)return deny("proof_invalid");
@@ -51,7 +53,9 @@ export function prepareSessionIngress(input:WebAuthState,token:string,method:unk
  if(state.used_nonces.some(row=>row.nonce_digest===nonce_digest))return deny("already_consumed");
  const retained=state.used_nonces.filter(row=>at<Date.parse(row.expires_at));
  if(retained.length>=2048)return deny("quota_exceeded");
- const next=encodeWebAuthState({...state,updated_at:now,used_nonces:[...retained,
+ const sessions=userNavigation?state.sessions.map(row=>row.state.session_ref===session.state.session_ref
+  ?{...row,state:{...row.state,last_activity_at:nextActivity(row.state,"user_navigation",now)}}:row):state.sessions;
+ const next=encodeWebAuthState({...state,sessions,updated_at:now,used_nonces:[...retained,
   {nonce_digest,session_ref:session.state.session_ref,issued_at:claims.issued_at,expires_at:claims.expires_at}]
   .sort((a,b)=>a.nonce_digest<b.nonce_digest?-1:1)}).state;
  return {next,principal,session_ref:session.state.session_ref,result:{status:"succeeded",kind:"session_verified",principal:decision.principal}};
