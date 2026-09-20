@@ -1,5 +1,5 @@
 import { assertSynchronousCallback } from "../audit/synchronous.js";
-import { prepareSessionIngress, type WebContextKeyLookup, type SessionIngressResult } from "./ingress.js";
+import { prepareSessionIngress, type WebContextKeyLookup, type SessionIngressGates, type SessionIngressResult } from "./ingress.js";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { AuditRepository } from "../audit/repository.js";
@@ -131,15 +131,15 @@ export class WebAuthRepository {
     });
   }
 
-  /** Internal session confirmation only. A returned principal is not a job or
-   * approval capability. Only BFF-derived, service-MAC-bound dashboard navigation
-   * may extend idle activity; default confirmation does not. */
-  verifySessionIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array,userNavigation=false):WebStoreResult {
+  /** Internal authorization prerequisite only. A returned principal is not a
+   * job or approval capability. Only authenticated BFF/route gates may mark a
+   * navigation or command as activity; poll/SSE confirmation does not. */
+  verifySessionIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array,gates:SessionIngressGates={}):WebStoreResult {
     const keys=this.contextKeys;
     return this.commit(transactionId,"web.session.v1",null,(state,mark)=>{
       if(!state)return deny(state,"deployment_invalid");
       if(!keys)return deny(state,"identity_unavailable");
-      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,keys,userNavigation);
+      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,keys,gates);
       if(plan.result.status==="succeeded"){
         const session=state.sessions.find(row=>row.state.session_ref===plan.session_ref);
         if(!session)throw new WebStateError();this.payload(session);

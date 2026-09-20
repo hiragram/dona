@@ -3,6 +3,7 @@ import type { AuditEvent } from "../audit/codec.js";
 import { encodeWebAuthState, WebStateError, type WebAuthState } from "./model.js";
 import { evaluateSession, nextActivity, type RegistryPrincipal, type WebPrincipal } from "./domain.js";
 import { ingressContextRequest, untrustedContextHints, verifyIngressContext, type ContextKey } from "./context.js";
+import { authorizeWebRoute, matchWebRoute, type WebRouteAuthorizationGates } from "./routes.js";
 
 export type WebContextKeyLookup = (version:number) => ContextKey | undefined;
 export type SessionIngressResult = {status:"denied";reason:AuditEvent["reason"]}
@@ -13,23 +14,24 @@ export interface SessionIngressPlan {
  principal?:RegistryPrincipal;
  session_ref:string|null;
 }
+export interface SessionIngressGates extends WebRouteAuthorizationGates { user_navigation?: boolean }
 /** Pure plan only. The caller must verify the common audit root and current
  * payload in the same protected transaction, persist this nonce/state, and wait
- * for finalization before returning the principal. userNavigation is derived by
- * the BFF and bound by the authenticated service request, never browser JSON.
- * This grants no resource capability. Default confirmation is not activity. */
+ * for finalization before returning the principal. Additional gates are derived
+ * by the authenticated BFF/route adapter and never from browser JSON. This
+ * grants no resource capability. Poll/SSE confirmation is not activity. */
 export function prepareSessionIngress(input:WebAuthState,token:string,method:unknown,target:unknown,
- body:Uint8Array,now:string,lookup:WebContextKeyLookup,userNavigation=false):SessionIngressPlan {
+ body:Uint8Array,now:string,lookup:WebContextKeyLookup,gates:SessionIngressGates={}):SessionIngressPlan {
  const state=encodeWebAuthState(input).state;
  const at=Date.parse(now);
  if(!Number.isFinite(at) || new Date(at).toISOString()!==now || at<Date.parse(state.updated_at))throw new WebStateError();
  let authenticated:{principal:RegistryPrincipal;session_ref:string}|undefined;
  const deny=(reason:AuditEvent["reason"]):SessionIngressPlan=>({next:state,result:{status:"denied",reason},session_ref:null,...authenticated});
- let request:ReturnType<typeof ingressContextRequest>,hints:ReturnType<typeof untrustedContextHints>;
- try {request=ingressContextRequest(method,target,body);hints=untrustedContextHints(token);}
+ let request:ReturnType<typeof ingressContextRequest>,route:ReturnType<typeof matchWebRoute>,hints:ReturnType<typeof untrustedContextHints>;
+ try {request=ingressContextRequest(method,target,body);route=matchWebRoute(method,target);hints=untrustedContextHints(token);}
  catch {return deny("proof_invalid");}
- if(request.method!=="GET" || !["session","dashboard"].includes(request.route_id) || body.byteLength!==0)return deny("operation_unsupported");
- if(typeof userNavigation!=="boolean" || (userNavigation && request.route_id!=="dashboard"))return deny("operation_unsupported");
+ if(typeof gates!=="object" || gates===null || Object.keys(gates).some(key=>!["user_navigation","csrf_verified","step_up_verified"].includes(key))
+   || (gates.user_navigation===true && request.route_id!=="dashboard"))return deny("operation_unsupported");
  const session=state.sessions.find(row=>row.state.session_ref===hints.session_ref);
  const principal=state.principals.find(row=>row.principal_id===session?.state.principal_id);
  if(!session || !principal)return deny("proof_invalid");
@@ -49,12 +51,15 @@ export function prepareSessionIngress(input:WebAuthState,token:string,method:unk
  authenticated={principal,session_ref:session.state.session_ref};
  const decision=evaluateSession(principal,session.state,{instance_id:state.instance_id,tenant_id:state.tenant_id,bff_generation:state.bff_generation},now);
  if(!decision.allowed)return deny(decision.reason);
+ const authorization=authorizeWebRoute(decision.principal,route,gates);
+ if(!authorization.allowed)return deny(authorization.reason);
  const nonce_digest=createHash("sha256").update("dona.web.ingress-nonce.v1\0").update(claims.nonce).digest("hex");
  if(state.used_nonces.some(row=>row.nonce_digest===nonce_digest))return deny("already_consumed");
  const retained=state.used_nonces.filter(row=>at<Date.parse(row.expires_at));
  if(retained.length>=2048)return deny("quota_exceeded");
- const sessions=userNavigation?state.sessions.map(row=>row.state.session_ref===session.state.session_ref
-  ?{...row,state:{...row.state,last_activity_at:nextActivity(row.state,"user_navigation",now)}}:row):state.sessions;
+ const activity=gates.user_navigation===true?"user_navigation":route.activity==="user_command"?"user_command":null;
+ const sessions=activity?state.sessions.map(row=>row.state.session_ref===session.state.session_ref
+  ?{...row,state:{...row.state,last_activity_at:nextActivity(row.state,activity,now)}}:row):state.sessions;
  const next=encodeWebAuthState({...state,sessions,updated_at:now,used_nonces:[...retained,
   {nonce_digest,session_ref:session.state.session_ref,issued_at:claims.issued_at,expires_at:claims.expires_at}]
   .sort((a,b)=>a.nonce_digest<b.nonce_digest?-1:1)}).state;

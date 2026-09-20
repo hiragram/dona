@@ -8,6 +8,12 @@ export interface WebRoute {
   activity: "none" | "user_navigation" | "user_command" | "automatic_poll" | "sse";
   resource: null | { kind: "job" | "approval"; id: string };
 }
+export interface WebRouteAuthorizationGates {
+  csrf_verified?: boolean;
+  step_up_verified?: boolean;
+}
+export type WebRouteAuthorization = { allowed: true } | { allowed: false; reason: "operation_unsupported" | "scope_denied" | "csrf_invalid" | "step_up_required" };
+interface ScopePrincipal { role_ids: readonly string[]; scopes: readonly string[] }
 interface Definition extends Omit<WebRoute,"resource"> { pattern: RegExp; resourceKind?: "job" | "approval" }
 const definitions: readonly Definition[] = [
   {id:"login",method:"GET",pattern:/^\/login$/,gate:"public",capability:"authentication",activity:"none"},
@@ -30,6 +36,32 @@ const definitions: readonly Definition[] = [
   {id:"approval_decision",method:"POST",pattern:/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})\/decision$/,resourceKind:"approval",gate:"approval_step_up",capability:"approval",activity:"user_command"},
 ];
 export class WebRouteError extends Error {constructor(){super("web_route_invalid");this.name="WebRouteError";}}
+const scopeRequirements: Readonly<Record<string, readonly string[]>> = {
+  job_list: ["job:read:own", "job:read:granted"], job_submit: ["job:submit"],
+  job_read: ["job:read:own", "job:read:granted"], job_events: ["job:read:own", "job:read:granted"],
+  job_cancel: ["job:cancel:own"], approval_read: ["approval:read:bound"],
+  approval_challenge: ["approval:decide:bound"], approval_decision: ["approval:decide:bound"],
+};
+const roleScopes: Readonly<Record<string, readonly string[]>> = {
+  requester: ["job:submit", "job:read:own", "job:cancel:own"], observer: ["job:read:granted"],
+  supervisor: ["approval:read:bound", "approval:decide:bound"],
+};
+/** Route-level eligibility only. The authoritative command/read/approval
+ * repository must still enforce owner, grant, binding, receipt and resource
+ * predicates in the same transaction as its operation. */
+export function authorizeWebRoute(principal: ScopePrincipal, route: WebRoute, gates: WebRouteAuthorizationGates = {}): WebRouteAuthorization {
+  if (!["session", "approval_step_up"].includes(route.gate)) return { allowed: false, reason: "operation_unsupported" };
+  if (route.method === "POST" && gates.csrf_verified !== true) return { allowed: false, reason: "csrf_invalid" };
+  if (route.gate === "approval_step_up" && gates.step_up_verified !== true) return { allowed: false, reason: "step_up_required" };
+  if (route.capability === "authentication") return { allowed: true };
+  const roles = new Set(principal.role_ids), scopes = new Set(principal.scopes);
+  if (roles.size !== principal.role_ids.length || scopes.size !== principal.scopes.length
+    || [...roles].some(role => !(role in roleScopes))
+    || [...scopes].some(scope => ![...roles].some(role => roleScopes[role]!.includes(scope)))) return { allowed: false, reason: "scope_denied" };
+  const required = scopeRequirements[route.id];
+  if (!required || !required.some(scope => scopes.has(scope))) return { allowed: false, reason: "scope_denied" };
+  return { allowed: true };
+}
 /** Validates the shape of a signed route binding; this does not authorize it. */
 export function matchesRouteBinding(routeId:string,method:string,resource:WebRoute["resource"]):boolean {
   const definition=definitions.find(value=>value.id===routeId && value.method===method);

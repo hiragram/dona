@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {matchWebRoute,WebRouteError} from '../src/routes.js';
+import {authorizeWebRoute,matchWebRoute,WebRouteError} from '../src/routes.js';
 test('非正規pathとqueryによるidentity差替えを正規化前に拒否する',()=>{
  for(const target of ['//api/jobs','https://example.test/api/jobs','/api/./jobs','/api/jobs/../session','/api/jobs/%72','/api/jobs/r%2Fcancel','/api/jobs/r?principal_id=other','/api/jobs/r#secret','/api/jobs/r\\cancel','/api/jobs/r\0','/api/jobs/r/'])
   assert.throws(()=>matchWebRoute('GET',target),WebRouteError);
@@ -31,4 +31,20 @@ test('login開始とCSRF準備は固定POSTだけを許可しresource権限を�
   const route=matchWebRoute('POST',target);assert.equal(route.gate,'public');assert.equal(route.capability,'authentication');assert.equal(route.activity,'none');assert.equal(route.resource,null);
   assert.throws(()=>matchWebRoute('GET',target),WebRouteError);assert.throws(()=>matchWebRoute('POST',target+'?next=other'),WebRouteError);
  }
+});
+
+test('command・read・approval routeはroleとscopeと追加gateを同時に要求する',()=>{
+ const requester={role_ids:['requester'],scopes:['job:submit','job:read:own','job:cancel:own']};
+ const observer={role_ids:['observer'],scopes:['job:read:granted']};
+ const supervisor={role_ids:['supervisor'],scopes:['approval:read:bound','approval:decide:bound']};
+ assert.deepEqual(authorizeWebRoute(requester,matchWebRoute('GET','/api/jobs/r')),{allowed:true});
+ assert.deepEqual(authorizeWebRoute(observer,matchWebRoute('GET','/api/jobs/r/events')),{allowed:true});
+ assert.deepEqual(authorizeWebRoute(observer,matchWebRoute('POST','/api/jobs'),{csrf_verified:true}),{allowed:false,reason:'scope_denied'});
+ assert.deepEqual(authorizeWebRoute(requester,matchWebRoute('POST','/api/jobs')),{allowed:false,reason:'csrf_invalid'});
+ assert.deepEqual(authorizeWebRoute(requester,matchWebRoute('POST','/api/jobs'),{csrf_verified:true}),{allowed:true});
+ assert.deepEqual(authorizeWebRoute(supervisor,matchWebRoute('GET','/api/approvals/a')),{allowed:true});
+ assert.deepEqual(authorizeWebRoute(supervisor,matchWebRoute('POST','/api/approvals/a/decision'),{csrf_verified:true}),{allowed:false,reason:'step_up_required'});
+ assert.deepEqual(authorizeWebRoute(supervisor,matchWebRoute('POST','/api/approvals/a/decision'),{csrf_verified:true,step_up_verified:true}),{allowed:true});
+ assert.deepEqual(authorizeWebRoute(supervisor,matchWebRoute('GET','/api/jobs/r')),{allowed:false,reason:'scope_denied'});
+ assert.deepEqual(authorizeWebRoute(requester,matchWebRoute('POST','/api/session/logout'),{csrf_verified:true}),{allowed:false,reason:'operation_unsupported'});
 });

@@ -2,7 +2,7 @@
 
 [Issue #141](https://github.com/hiragram/dona/issues/141)の部分実装。[ADR 0002](../../docs/adr/0002-web-trust-boundary.md)に従い、固定deployment policy、cookie/Host/Origin/CSRFの検証、OIDC Authorization Code + PKCEとonline introspectionを実装する。
 
-この段階ではHTTP listenerを起動せず、session・registry・権限・監査の正本へ接続しない。実IdPのaccount disable反映、TLS証明書、UDS所有権、credential用途、protected clock/anchorを検証したreadinessを宣言するものではない。
+loopback TLS listener、login/session controller、認証済みUDS client、起動時のsession世代更新までを固定compositionとして接続する。runtimeが渡すprotected clock、credential/key inventory、TLS material、Dispatcher側の監査付きrepositoryを起動前後に照合し、不足時はlistenしない。package自身はcredentialや証明書をprovisionせず、実IdP・実保護store・production activationを検証済みとは扱わない。private/internet proxy modeは未接続のためstartupでfail closedする。
 
 ## Cookieとbrowser境界
 
@@ -28,11 +28,17 @@ access tokenはAES-256-GCM、96-bit random nonce、128-bit tagでsealする。co
 
 cookieそのものは保存せず、version付きのkeyed digestでlookupする。session絶対期限とaccess token期限はseal済みbindingの期限へ反映する。idle 30分とcurrent revocationは後続repositoryが別途検証し、SSE/pollをactivityへ数えない。CSRFの既存値は期限後も同じcookie-bound sessionのlocal logout向けに再構成できるが、他resourceへの認可には使わない。
 
+## 後続routeへ渡す認可境界
+
+固定route表はcommand、read/SSE、approvalを同じprincipal filterへ結ぶ。Dispatcherは署名済みcontextをcurrent session・registry・BFF generationと同じ監査transactionで再検証し、routeごとのrole/scope、POSTのCSRF確認、approval decisionの独立step-up確認をすべて満たす場合だけprincipalを返す。user commandだけがidle activityを進め、自動pollとSSEは進めない。
+
+この判定はresource capabilityそのものではない。job owner、明示grant、supervisor binding、typed action hash、receipt、cursorなどのresource predicateは、#142・#143・#145の各authoritative repositoryが同じoperation transactionで追加検証する。Web login、scope所持、context tokenだけでresourceの存在や操作権限を与えない。
+
 ## 検証と残る作業
 
 架空IdP responseと一時署名keyで、claim/署名/key不一致、期限、cookie重複、Origin/CSRF、provider outage、timeout、response上限、introspectionの再取得を検証する。このfixtureは実providerやbrowserでの認証完了の証拠ではない。
 
-session rotation・durable revoke・restart失効、subject tombstone/key lifecycle、Dispatcherの現在権限照合、one-useのUDS context、監査付きcommit、TLS/UDS/readiness、実browserとの統合が残る。#141はこのpackageだけでは完了しない。
+fixtureではsession rotation・durable revoke・restart失効、subject tombstone/key lifecycle、Dispatcherのcurrent revision照合、one-use context、監査付きcommit、TLS/UDS/startup gate、browser login/logoutを検証する。実IdP、実credential/protected store、proxy deployment、production activationは未検証であり、package単体のtestをlive deployment証拠にはしない。
 
 参考: [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html)、[RFC 7662](https://www.rfc-editor.org/info/rfc7662/)、[jose](https://github.com/panva/jose)。
 
