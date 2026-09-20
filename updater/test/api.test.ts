@@ -161,3 +161,38 @@ test("startup lock rejects incomplete metadata and distinguishes a reused PID", 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("startup recovery replaces a writer lease whose PID was reused", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-writer-reused-pid-"));
+  const socketPath = path.join(root, "updater.sock");
+  const database = new UpdateDatabase(path.join(root, "updater.sqlite3"));
+  database.acquireWriterLease("00000000-0000-4000-8000-000000000000", process.pid);
+  const api = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database,
+    { isRunning: () => true, wake() {} }, logger);
+  try {
+    await api.start();
+    assert.equal((await request(socketPath)).status, 200);
+  } finally {
+    await api.stop();
+    database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup recovery removes a crash-orphaned auxiliary hard link", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-orphan-link-"));
+  const socketPath = path.join(root, "updater.sock");
+  const lockPath = path.join(root, "updater.start.lock");
+  const orphanPath = `${lockPath}.00000000-0000-4000-8000-000000000000.tmp`;
+  await fs.writeFile(lockPath, JSON.stringify({ pid: 999_999_999, process_start: "stale", token: "stale" }), { mode: 0o600 });
+  await fs.link(lockPath, orphanPath);
+  await fs.writeFile(socketPath, "stale", { mode: 0o600 });
+  const reservation = await reserveUpdaterSocket(socketPath);
+  try {
+    await assert.rejects(fs.lstat(orphanPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    assert.equal((await request(socketPath)).status, 503);
+  } finally {
+    await releaseUpdaterSocket(reservation);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

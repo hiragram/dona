@@ -40,6 +40,7 @@ export interface UpdaterSocketReservation {
 interface UpdaterStartupLock {
   path: string;
   token: string;
+  processStart: string;
 }
 
 export interface ProcessIdentity {
@@ -91,7 +92,7 @@ async function acquireStartupLock(
       }
       await fs.link(temporary, lockPath);
       await fs.unlink(temporary);
-      return { path: lockPath, token };
+      return { path: lockPath, token, processStart: self.identity };
     } catch (error) {
       try { await fs.unlink(temporary); } catch { /* best effort */ }
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -110,11 +111,23 @@ async function acquireStartupLock(
     if (observed.status === "alive" && observed.identity === owner.process_start) {
       throw new Error("updater_startup_lock_active");
     }
+    const current = await fs.lstat(lockPath);
+    for (const entry of await fs.readdir(controlRoot)) {
+      if (!entry.startsWith(`${path.basename(lockPath)}.`) || !/\.(?:tmp|stale)$/.test(entry)) continue;
+      const candidate = path.join(controlRoot, entry);
+      try {
+        const stats = await fs.lstat(candidate);
+        if (stats.dev === current.dev && stats.ino === current.ino && stats.isFile() &&
+          stats.uid === process.getuid?.() && (stats.mode & 0o077) === 0) await fs.unlink(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
     const stalePath = `${lockPath}.${token}.stale`;
     try {
       await fs.link(lockPath, stalePath);
-      const [claimed, current] = await Promise.all([fs.lstat(stalePath), fs.lstat(lockPath)]);
-      if (claimed.dev !== current.dev || claimed.ino !== current.ino || claimed.nlink !== 2 || current.nlink !== 2) {
+      const [claimed, claimedCurrent] = await Promise.all([fs.lstat(stalePath), fs.lstat(lockPath)]);
+      if (claimed.dev !== claimedCurrent.dev || claimed.ino !== claimedCurrent.ino || claimed.nlink !== 2 || claimedCurrent.nlink !== 2) {
         await fs.unlink(stalePath);
         continue;
       }
@@ -202,7 +215,7 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 
 export class UpdaterApi {
   private server: http.Server | undefined;
-  private readonly writerToken = randomUUID();
+  private writerToken: string | undefined;
   private writerLeaseHeld = false;
   private ownsSocket = false;
   private activeReservation: UpdaterSocketReservation | undefined;
@@ -223,6 +236,7 @@ export class UpdaterApi {
       this.activeReservation = reservation;
       this.server = reservation.server;
       this.ownsSocket = true;
+      this.writerToken = reservation.startupLock.token;
       this.database.acquireWriterLease(this.writerToken);
       this.writerLeaseHeld = true;
       this.server.removeAllListeners("request");
@@ -250,10 +264,11 @@ export class UpdaterApi {
   }
 
   private releaseWriterLease(): void {
-    if (!this.writerLeaseHeld) return;
+    if (!this.writerLeaseHeld || !this.writerToken) return;
     try {
       this.database.releaseWriterLease(this.writerToken);
       this.writerLeaseHeld = false;
+      this.writerToken = undefined;
     } catch (error) {
       this.logger.warn("Updater writer lease release failed", {
         error_code: "updater_writer_lease_release_failed",

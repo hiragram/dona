@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
@@ -95,8 +96,10 @@ export class UpdateDatabase {
   private readonly readonlyMode: boolean;
   private readonly diagnosticLogsAvailable: boolean;
   private readonly runtimeOperationsAvailable: boolean;
+  private readonly controlRoot: string;
 
   constructor(databasePath: string, options: UpdateDatabaseOptions = {}) {
+    this.controlRoot = path.dirname(databasePath);
     this.readonlyMode = options.readonly === true;
     if (!options.readonly) {
       fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -347,10 +350,37 @@ export class UpdateDatabase {
         return;
       }
       if (existing.owner_token === ownerToken && existing.owner_pid === ownerPid) return;
-      let alive = true;
-      try { process.kill(existing.owner_pid, 0); }
-      catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-      if (alive) throw new Error("updater_writer_already_active");
+      let startupOwner: { pid?: unknown; process_start?: unknown; token?: unknown } | undefined;
+      try {
+        startupOwner = JSON.parse(fs.readFileSync(path.join(this.controlRoot, "updater.start.lock"), "utf8")) as typeof startupOwner;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("updater_writer_startup_lock_invalid");
+      }
+      if (startupOwner?.token === existing.owner_token && startupOwner.pid === existing.owner_pid &&
+        typeof startupOwner.process_start === "string") {
+        let alive = false;
+        try {
+          process.kill(existing.owner_pid, 0);
+          alive = true;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "EPERM") alive = true;
+          else if (code !== "ESRCH") throw new Error("updater_writer_identity_unavailable");
+        }
+        if (alive) {
+          let identity: string;
+          try {
+            identity = execFileSync("/bin/ps", ["-p", String(existing.owner_pid), "-o", "lstart="], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "ignore"],
+            }).trim();
+          } catch {
+            throw new Error("updater_writer_identity_unavailable");
+          }
+          if (!identity) throw new Error("updater_writer_identity_unavailable");
+          if (identity === startupOwner.process_start) throw new Error("updater_writer_already_active");
+        }
+      }
       const changed = this.db.prepare(`UPDATE updater_writer_lease
         SET owner_token = ?, owner_pid = ?, acquired_at = ? WHERE singleton = 1 AND owner_token = ? AND owner_pid = ?`)
         .run(ownerToken, ownerPid, at.toISOString(), existing.owner_token, existing.owner_pid).changes;
