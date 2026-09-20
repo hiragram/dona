@@ -901,6 +901,37 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
+  test("status projects only the newest bounded diagnostic logs and reports omissions", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    const requestId = planned.request_id as string;
+    f.controller.apply({
+      source_event_id: approvalEventId,
+      reply_target: replyTarget,
+      plan_id: plan.plan_id,
+      plan_hash: plan.plan_hash,
+      approval_id: "human-approval-bounded-diagnostics",
+    });
+    const claimed = f.database.claim(requestId, "bounded-diagnostics-test", f.policy.timeouts.lease_ms)!;
+    const diagnostics = new DiagnosticLogStore(f.policy.control_root, f.policy.diagnostic_log_limit_bytes, f.database);
+    for (let index = 0; index < 40; index += 1) {
+      const capture = diagnostics.start({ request_id: requestId, attempt: claimed.attempt, step: `updater:test-${index}` },
+        new Date(Date.UTC(2026, 8, 2, 0, 0, index)));
+      capture.write("stderr", Buffer.from(`failure-${index}`));
+      capture.finish(true);
+    }
+
+    const status = await f.controller.status(requestId);
+    const projected = status.diagnostics as Array<{ step: string }>;
+    assert.equal(projected.length, 32);
+    assert.equal(status.diagnostics_total_count, 40);
+    assert.equal(status.diagnostics_omitted_count, 8);
+    assert.equal(projected[0]?.step, "updater:test-39");
+    assert.equal(projected.at(-1)?.step, "updater:test-8");
+    f.database.close();
+  });
+
   test("requires review instead of claiming an active SHA when pre-activation runtime evidence is inconsistent", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

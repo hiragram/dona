@@ -272,6 +272,22 @@ test("preserves stderr and stdout arrival order while redaction carry is pending
   }
 });
 
+test("keeps a safe suffix at its original event position after cross-event redaction", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-redacted-order" });
+    capture.write("stderr", Buffer.from("TOKEN"));
+    capture.write("stdout", Buffer.from("middle\n"));
+    capture.write("stderr", Buffer.from("=secret\nlast\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.ok(detail.indexOf("[stderr] [REDACTED_STREAM]") < detail.indexOf("[stdout] middle"), detail);
+    assert.ok(detail.indexOf("[stdout] middle") < detail.indexOf("[stderr] \nlast"), detail);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("bounds ordered output while an earlier stream keeps redaction carry pending", async () => {
   const f = await fixture(4_096);
   try {

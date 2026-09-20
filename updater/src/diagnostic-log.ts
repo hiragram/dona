@@ -419,8 +419,27 @@ export class DiagnosticLogStore {
       if (original === redacted.text) {
         for (const entry of consumed) queueText(entry.event, entry.source);
       } else if (redacted.text) {
-        const first = consumed[0]?.event ?? streamOutput[stream][0];
-        if (first) queueText(first, redacted.text);
+        let commonSuffix = 0;
+        while (commonSuffix < original.length && commonSuffix < redacted.text.length &&
+          original[original.length - commonSuffix - 1] === redacted.text[redacted.text.length - commonSuffix - 1]) {
+          commonSuffix += 1;
+        }
+        const queueOriginalRange = (start: number, end: number): void => {
+          let offset = 0;
+          for (const entry of consumed) {
+            const entryEnd = offset + entry.source.length;
+            const overlapStart = Math.max(start, offset);
+            const overlapEnd = Math.min(end, entryEnd);
+            if (overlapStart < overlapEnd) {
+              queueText(entry.event, entry.source.slice(overlapStart - offset, overlapEnd - offset));
+            }
+            offset = entryEnd;
+          }
+        };
+        const transformedPrefix = redacted.text.slice(0, redacted.text.length - commonSuffix);
+        const owner = consumed[0]?.event ?? streamOutput[stream][0];
+        if (owner) queueText(owner, transformedPrefix);
+        queueOriginalRange(original.length - commonSuffix, original.length);
       }
       for (const event of streamOutput[stream]) {
         if (event.remainingSource.length > 0) break;

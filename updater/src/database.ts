@@ -405,10 +405,21 @@ export class UpdateDatabase {
     if (changed !== 1) throw new Error("diagnostic_log_discard_binding_mismatch");
   }
 
-  diagnosticLogs(requestId: string): DiagnosticLogRow[] {
+  diagnosticLogs(requestId: string, limit?: number): DiagnosticLogRow[] {
     if (!this.diagnosticLogsAvailable) return [];
+    if (limit !== undefined) {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("diagnostic_log_limit_invalid");
+      return this.db.prepare(`SELECT * FROM update_diagnostic_logs WHERE request_id = ?
+        ORDER BY finalized_at DESC, log_id DESC LIMIT ?`).all(requestId, limit) as DiagnosticLogRow[];
+    }
     return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
       .all(requestId) as DiagnosticLogRow[];
+  }
+
+  diagnosticLogCount(requestId: string): number {
+    if (!this.diagnosticLogsAvailable) return 0;
+    return (this.db.prepare("SELECT COUNT(*) AS count FROM update_diagnostic_logs WHERE request_id = ?")
+      .get(requestId) as { count: number }).count;
   }
 
   capturingDiagnosticLogs(): DiagnosticLogRow[] {

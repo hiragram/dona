@@ -221,6 +221,9 @@ export class UpdateController {
       this.runtime.slackHealth(),
       this.runtime.mainAgentStatus(activeRelease),
     ]);
+    const diagnosticLimit = 32;
+    const diagnosticCount = this.database.diagnosticLogCount(requestId);
+    const diagnosticRows = this.database.diagnosticLogs(requestId, diagnosticLimit);
     return {
       schema_version: 1,
       update: row,
@@ -228,7 +231,9 @@ export class UpdateController {
       audit: this.database.auditRows(requestId),
       outbox: this.database.outboxFor(requestId) ?? null,
       runtime_operations: this.database.runtimeOperations(requestId),
-      diagnostics: this.database.diagnosticLogs(requestId).map((log) => this.diagnostics.project(log, 4_096, requestId)),
+      diagnostics: diagnosticRows.map((log) => this.diagnostics.project(log, 4_096, requestId)),
+      diagnostics_total_count: diagnosticCount,
+      diagnostics_omitted_count: Math.max(0, diagnosticCount - diagnosticRows.length),
       runtime_state: row.state,
       notification_state: this.notificationState(this.database.outboxFor(requestId)),
       observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth, main_agent: mainAgent },
