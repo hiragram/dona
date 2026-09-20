@@ -1815,10 +1815,14 @@ export class DispatcherDatabase {
           const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
             (action as Record<string,unknown>).ambiguous===true);
-          this.transition(eventId,["waiting_agent"],rejected&&!ambiguous?"dead_letter":"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            typeof (action as Record<string,unknown>).message_ts==="string");
+          const needsReview=ambiguous||posted;
+          this.transition(eventId,["waiting_agent"],rejected&&!needsReview?"dead_letter":"needs_review",{result_json:stableStringify(result),result_path:resultPath,
             completed_at:result.completed_at,last_error_code:rejected?event.last_error_code:"schedule_job_not_delegated",
             last_error_message:rejected?event.last_error_message:"Scheduled work completed without a bound job"});
-          this.scheduler.settleUndelegatedWorkEvent(eventId,rejected&&!ambiguous?"failed":"needs_review",
+          this.scheduler.settleUndelegatedWorkEvent(eventId,rejected&&!needsReview?"failed":"needs_review",
             new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
           return;
         }
@@ -1848,9 +1852,13 @@ export class DispatcherDatabase {
           const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
             (action as Record<string,unknown>).ambiguous===true);
-          this.transition(eventId,["waiting_agent"],ambiguous?"needs_review":"dead_letter",{result_json:stableStringify(result),result_path:resultPath,
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            typeof (action as Record<string,unknown>).message_ts==="string");
+          const needsReview=ambiguous||posted;
+          this.transition(eventId,["waiting_agent"],needsReview?"needs_review":"dead_letter",{result_json:stableStringify(result),result_path:resultPath,
             completed_at:result.completed_at,last_error_code:event.last_error_code,last_error_message:event.last_error_message});
-          this.scheduler.settleUndelegatedWorkEvent(eventId,ambiguous?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
+          this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
           return;
         }
       }

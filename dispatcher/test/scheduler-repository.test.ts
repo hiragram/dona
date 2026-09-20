@@ -1253,7 +1253,8 @@ test("scheduleのgeneric job_key誤付与は確定拒否として原因を残し
   assert.equal(JSON.parse(audit!.after_json).decision_code,"scheduled_scope_mismatch");
 });
 
-test("schedule委任の確定拒否後も曖昧な外部writeはneeds_reviewへ隔離する", () => {
+for (const [suffix,action] of [["曖昧な外部write",{tool:"dona_slack.post_message",ambiguous:true}],
+  ["成功済み外部write",{tool:"dona_slack.post_message",message_ts:"1234567890.123456"}]] as const) test(`schedule委任の確定拒否後も${suffix}はneeds_reviewへ隔離する`, () => {
   const {repo,dispatcher,raw,filename}=setup(); const objective="変更不可のobjective";
   repo.create("rejected_with_ambiguous_write",{...input,action:"work.read_only",content:objective},due,actor,now);
   const run=repo.materialize("rejected_with_ambiguous_write",1,due,later,due,actor).run;
@@ -1261,7 +1262,7 @@ test("schedule委任の確定拒否後も曖昧な外部writeはneeds_reviewへ�
   dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
   dispatcher.recordScheduledDelegationRejection(run.event_id!,"scheduled_dedicated_handoff_required",new Date(due));
   dispatcher.saveFailedResult(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"failed",summary:"投稿結果不明",
-    actions:[{tool:"dona_slack.post_message",ambiguous:true}],completed_at:due},resultPath,new Date(due));
+    actions:[action],completed_at:due},resultPath,new Date(due));
   assert.equal(dispatcher.get(run.event_id!)?.status,"needs_review");
   assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"delegation_rejected:scheduled_dedicated_handoff_required");
   assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
