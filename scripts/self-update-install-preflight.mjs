@@ -6,9 +6,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
+import { promisify } from "node:util";
 
 const canonicalRemote = "https://github.com/hiragram/dona.git";
+const execute = promisify(execFile);
 
 export function normalizeCanonicalRemote(remote) {
   if (/^git@github\.com:hiragram\/dona(?:\.git)?$/.test(remote)) return canonicalRemote;
@@ -147,6 +150,57 @@ export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
   throw new Error(`dispatcher ${expectedSha} was not observed ready`);
 }
 
+async function observeLaunchdRegistration(serviceTarget, timeoutMs) {
+  try {
+    await execute("/bin/launchctl", ["print", serviceTarget], { timeout: timeoutMs, killSignal: "SIGKILL" });
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === 113) return false;
+    if (error && typeof error === "object" && error.killed === true) {
+      throw new Error("launchd registration observation timed out");
+    }
+    const exitCode = error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
+    throw new Error(`launchd registration observation failed with exit ${exitCode}`);
+  }
+}
+
+async function observeBeforeDeadline(observe, serviceTarget, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      observe(serviceTarget, timeoutMs),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("launchd registration observation timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function waitForLaunchdServiceAbsent(domain,label,timeoutMs,options={}) {
+  if(!/^gui\/[1-9][0-9]*$/.test(domain)||!/^dev\.dona\.(?:dispatcher|updater)$/.test(label)||
+    !Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-launchd-unregistered arguments are invalid");
+  const observe=options.observe??observeLaunchdRegistration;
+  const sleep=options.sleep??((milliseconds)=>new Promise(resolve=>setTimeout(resolve,milliseconds)));
+  const now=options.now??Date.now;
+  const intervalMs=options.intervalMs??100;
+  const settledObservations=options.settledObservations??3;
+  if(!Number.isSafeInteger(intervalMs)||intervalMs<=0||!Number.isSafeInteger(settledObservations)||settledObservations<2) {
+    throw new Error("wait-launchd-unregistered observation policy is invalid");
+  }
+  const serviceTarget=`${domain}/${label}`;
+  const deadline=now()+timeoutMs;
+  let absentObservations=0;
+  do {
+    const remainingMs=Math.max(1,deadline-now());
+    if(await observeBeforeDeadline(observe,serviceTarget,remainingMs)) absentObservations=0;
+    else if(++absentObservations>=settledObservations)return;
+    await sleep(intervalMs);
+  } while(now()<deadline);
+  throw new Error(`${label} remained registered after bootout timeout`);
+}
+
 async function releaseTreeDigest(root) {
   const rootStats = await fs.lstat(root);
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error("release comparison root is invalid");
@@ -213,7 +267,7 @@ async function main() {
   const [mode, value, secondValue] = process.argv.slice(2);
   if (!value) {
     console.error(
-      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-dispatcher-sha <socket> <sha> <timeout-ms> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
+      "Usage: self-update-install-preflight.mjs validate-remote <remote> | assert-socket-unused <socket> | cleanup-staging <release-root> <staging-dir> | assert-control-upgrade-safe <socket> | quiesce-dispatcher <socket> <sha> | wait-launchd-unregistered <domain> <label> <timeout-ms> | wait-dispatcher-sha <socket> <sha> <timeout-ms> | wait-updater-sha <socket> <sha> <timeout-ms> [update-schema] | validate-existing-release <release> <staging> <sha>",
     );
     return 2;
   }
@@ -245,6 +299,10 @@ async function main() {
   }
   if(mode==="quiesce-dispatcher"&&secondValue) {
     try { await quiesceDispatcherForControlUpgrade(value,secondValue); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
+  }
+  if(mode==="wait-launchd-unregistered"&&secondValue&&process.argv[5]) {
+    try { await waitForLaunchdServiceAbsent(value,secondValue,Number(process.argv[5])); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "wait-updater-sha" && secondValue && process.argv[5]) {

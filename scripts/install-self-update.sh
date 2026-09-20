@@ -15,7 +15,7 @@ DOMAIN="gui/$UID"
 CONTROL_UPGRADE_ACTIVE=0
 CONTROL_SWAPPED=0
 DISPATCHER_PLIST_SWAPPED=0
-DISPATCHER_STOPPED=0
+DISPATCHER_RESTORE_REQUIRED=0
 CONTROL_BACKUP_ROOT=""
 
 bootstrap_updater_reconciled() {
@@ -43,6 +43,31 @@ bootstrap_updater_reconciled() {
     print -u2 -- "${context}のlaunchctl bootstrap attempt ${attempt}はexit ${exit_code}で拒否され、expected SHAの未登録状態を確認しました。"
     if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
   done
+  return 1
+}
+
+wait_dispatcher_unregistered() {
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-unregistered \
+    "$DOMAIN" "dev.dona.dispatcher" 30000
+}
+
+bootstrap_dispatcher_reconciled() {
+  local context=$1
+  local expected_sha=$2
+  local output=""
+  local exit_code=0
+  if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 2>&1); then
+    return 0
+  else
+    exit_code=$?
+  fi
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+    "$BASE_DIR/run/dispatcher.sock" "$expected_sha" 30000; then
+    print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの起動済み状態を確認しました。"
+    return 0
+  fi
+  print -u2 -- "${context}のlaunchctl bootstrapはexit ${exit_code}で失敗し、exact SHAの起動済み状態も確認できませんでした。"
+  if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
   return 1
 }
 
@@ -86,12 +111,26 @@ restore_control_plane() {
     print -u2 "旧stable updaterの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
   fi
-  if [[ "$DISPATCHER_STOPPED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
-    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1 || true
+  if [[ "$DISPATCHER_RESTORE_REQUIRED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
+    local dispatcher_bootout_exit=0
+    if [[ "$DISPATCHER_PLIST_SWAPPED" != "1" ]] && [[ -n "${ACTIVE_DISPATCHER_SHA:-}" ]] && \
+      $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+        "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 2000; then
+      DISPATCHER_RESTORE_REQUIRED=0
+      return 0
+    fi
+    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
+    if ! wait_dispatcher_unregistered; then
+      print -u2 "旧Dispatcher復旧前の登録解除を確認できません（bootout exit ${dispatcher_bootout_exit}）。backup: $CONTROL_BACKUP_ROOT"
+      return 1
+    fi
+    if [[ "$dispatcher_bootout_exit" != "0" ]]; then
+      print -u2 "旧Dispatcher復旧前のlaunchctl bootoutはexit ${dispatcher_bootout_exit}でしたが、登録解除済み状態を確認しました。"
+    fi
     if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
       /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
     fi
-    if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
+    if ! bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録" "$ACTIVE_DISPATCHER_SHA"; then
       print -u2 "旧Updaterの復旧後に旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
@@ -102,7 +141,7 @@ restore_control_plane() {
       return 1
     fi
     DISPATCHER_PLIST_SWAPPED=0
-    DISPATCHER_STOPPED=0
+    DISPATCHER_RESTORE_REQUIRED=0
   fi
   return 0
 }
@@ -324,12 +363,12 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
   fi
   CONTROL_SWAPPED=1
-  DISPATCHER_STOPPED=1
   ACTIVE_DISPATCHER_SHA=$(/usr/bin/basename "$(/usr/bin/readlink "$RUNTIME_ROOT/current")")
   if [[ ! "$ACTIVE_DISPATCHER_SHA" =~ '^[0-9a-f]{40}$' ]]; then
     print -u2 "active Dispatcher SHAをcurrent pointerから確定できません。"
     exit 1
   fi
+  DISPATCHER_RESTORE_REQUIRED=1
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
@@ -337,9 +376,13 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
       exit 1
     fi
   fi
+  if ! wait_dispatcher_unregistered; then
+    print -u2 "Dispatcherの登録解除完了を確認できないため、plistを更新しません。"
+    exit 1
+  fi
   /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
   DISPATCHER_PLIST_SWAPPED=1
-  if ! /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"; then
+  if ! bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録" "$ACTIVE_DISPATCHER_SHA"; then
     print -u2 "新しいDispatcher plistをlaunchdへ登録できないため、control-planeを復旧します。"
     exit 1
   fi
