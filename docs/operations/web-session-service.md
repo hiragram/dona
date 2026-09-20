@@ -25,3 +25,10 @@ timeout、接続切断、MAC不一致、監査anchorの結果不明は`web_servi
 BFF clientの実UDS fixtureと、file-backed SQLiteの実Web repositoryに接続するDispatcher service fixtureを、それぞれのpackageで検証する。両者が共有する公開golden wireは、production実装とは独立したHMAC計算で作成し、双方のcodecと照合する。正常確認、再送、header/proof/response改変、scope不一致、anchor応答喪失、dribbling、不完全request、socket属性を確認する。
 
 fixtureのcredentialはテスト専用の公開値であり、実credentialを作成・使用しない。OS保護store、実IdP、ブラウザlogin、TLS frontend、BFF起動時のepoch確定、installer、runtime readinessへの接続はまだ行っていない。importでlistenerを起動せず、既存DispatcherのAPIやproduction設定も変更しない。#141全体の完了条件は残る。
+
+
+## 拒否理由の保持
+
+session確認のsigned denialは固定enumの`reason`を必須にする。BFF clientは`SessionServiceResult`を返し、`null`へ畳み込まない。principalは成功分岐だけに含め、拒否にはresourceやcredentialを添えない。未知reasonや理由が欠ける旧応答はcodecで拒否する。両peerを同じreleaseへ揃える必要があり、旧新の混在を成功互換としない。
+
+contextは保存sessionに結ばれた元のrevisionを署名検証し、その後、同じ監査transaction内で現行principal/runtimeのrevision・失効・期限を評価する。古いbindingに権限を付与せず、変更を`proof_invalid`へ潰さずに`session_revoked`または`revision_mismatch`として監査できる。署名不正・別session等は引き続き`proof_invalid`。BFFは失効/revision変更を401 `session_revoked`へ写像し、基盤不明は503にする。署名検証・response binding・deadline・nonce一回性・no retryの条件は維持する。

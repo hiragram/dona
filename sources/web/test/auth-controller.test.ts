@@ -4,6 +4,24 @@ import { WebBoundaryError } from "../src/policy.js";
 import type { BrowserAuthRequest } from "../src/auth-controller.js";
 import { controllerFixture } from "./auth-controller-fixture.js";
 
+test("最終transactionの署名済み拒否理由を保持し追加監査writeをしない", async () => {
+  for (const [reason, status, publicReason] of [
+    ["session_revoked", 401, "session_revoked"], ["revision_mismatch", 401, "session_revoked"],
+    ["session_expired", 401, "session_expired"], ["identity_mismatch", 401, "identity_mismatch"],
+    ["session_invalid", 401, "session_invalid"], ["proof_invalid", 401, "session_invalid"],
+    ["already_consumed", 401, "session_invalid"], ["deployment_invalid", 503, "identity_unavailable"],
+    ["identity_unavailable", 503, "identity_unavailable"], ["clock_anomaly", 503, "identity_unavailable"],
+    ["quota_exceeded", 503, "identity_unavailable"], ["operation_unsupported", 503, "identity_unavailable"],
+  ] as const) {
+    const f = controllerFixture(); let confirms = 0;
+    f.connections.session.confirm = async () => { confirms++; return { status: "denied", reason }; };
+    const result = await f.controller.handle(f.request());
+    assert.equal(result.status, status); assert.deepEqual(JSON.parse(result.body), { error: publicReason });
+    assert.equal(confirms, 1); assert.ok(!f.calls.some(call => call.startsWith("write:")));
+    assert.equal(result.headers["set-cookie"], undefined);
+  }
+});
+
 function header(request: BrowserAuthRequest, name: string, value?: string): BrowserAuthRequest {
   return { ...request, headers: [...request.headers.filter(([key]) => key !== name), ...(value === undefined ? [] : [[name, value] as const])] };
 }

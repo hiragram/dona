@@ -68,7 +68,7 @@ export function controllerFixture(policy = fixturePolicy()) {
       calls.push("confirm"); contexts.push(input.context);
       verifyIngressContext(input.context, contextKey, identity, ingressContextRequest(input.method, input.target, Buffer.alloc(0)), at);
       const decision = evaluateSession(principal, session.state, { instance_id: policy.instance_id, tenant_id: policy.tenant_id, bff_generation: snapshot.bff_generation }, at);
-      return decision.allowed ? decision.principal : null;
+      return decision.allowed ? { status: "succeeded", principal: decision.principal } : { status: "denied", reason: decision.reason };
     } },
   };
   const controller = new WebAuthController(policy, connections, keys, () => at);

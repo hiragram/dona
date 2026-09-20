@@ -21,7 +21,7 @@ GETは空body、`Sec-Fetch-Site: same-origin`を要求し、Originがあればco
 2. local registry/session/世代/期限を照合し、sealed payloadのdigest・owner binding・AEADを検証してaccess tokenをメモリ内で開く。
 3. 固定OIDC introspectionを毎回実行し、raw subjectから全保持versionのHMAC indexを導出する。raw subject/tokenをresponseやdurable stateへ追加しない。
 4. current principalとrevision・BFF世代を再読し、実requestのmethod/route/bodyへ結合した最大10秒のcontextを作る。
-5. Dispatcherのsession transactionで現行registryとnonceを確認・監査確定した後だけ結果を返す。
+5. Dispatcherのsession transactionで現行registryとnonceを確認・監査確定した後だけ結果を返す。最終transactionの拒否reasonも署名付き応答から保持し、session失効・revision変更は401 `session_revoked`、期限切れは401 `session_expired`、基盤・clock・quota不明は503へ写像する。最終照合後に追加のdenial writeを行わない。
 
 request内では保護clockの巻戻りを拒否し、I/O後にも再読する。contextと最終成功の期限は10秒・session期限・online token期限の最小値。遅れた署名済み応答から期限後の成功を返さない。pollによるidle延長やpositive introspection cacheは行わない。
 
@@ -37,6 +37,6 @@ logoutは一回だけwriteし、signed成功後に同じcookie/sessionの失効�
 
 ## 検証と残る範囲
 
-controller unit 14件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続する5件を実行する。同じcommandが固定SQLite identity extensionのnative build、結合testの型検査、実行を順に行い、既存build成果物に依存しない。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
+controller unit 15件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続する6件を実行する。同じcommandが固定SQLite identity extensionのnative build、結合testの型検査、実行を順に行い、既存build成果物に依存しない。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
 
 IdPのHTTPS transport応答、clock/anchor、key、TLS listener分類はfixtureであり、実IdP・WebAuthn・browser・Keychain・productionのE2Eではない。login開始/callback、UI、TLS/proxy、operator provisioning、保護native broker、runtime/release接続と後続command/read/approval routeは残る。このcontrollerだけで#141やEpic全体を完了扱いしない。

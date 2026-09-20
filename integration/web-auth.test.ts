@@ -119,5 +119,35 @@ test("BFFのonline照合後のlocal revokeをDispatcherの最終transactionで�
     return confirm(...args);
   };
   const result = await f.controller.handle(f.local.request()); assert.equal(result.status, 401);
-  assert.deepEqual(JSON.parse(result.body), { error: "session_invalid" }); assert.equal(f.readState().sessions[0]!.state.state, "revoked");
+  assert.deepEqual(JSON.parse(result.body), { error: "session_revoked" }); assert.equal(f.readState().sessions[0]!.state.state, "revoked");
+  const latest = f.db.prepare("SELECT record_json FROM security_audit_records ORDER BY sequence DESC LIMIT 1").get() as { record_json: string };
+  assert.equal(JSON.parse(latest.record_json).event.reason, "session_revoked");
+});
+
+
+test("最終transaction直前のprincipal変更を監査付きで失効として返す", async t => {
+  for (const change of ["state", "revoke_generation", "authz_revision", "identity_binding_revision"] as const) {
+    const f = await fixture(t), confirm = f.connections.session.confirm.bind(f.connections.session);
+    let confirms = 0;
+    f.connections.session.confirm = async (...args) => {
+      confirms++;
+      f.transaction.runPrepared("fixture_principal_change", (_mark, verified) => {
+        const current = f.readState(), previous = encodeWebAuthState(current);
+        assert.equal(verified.resource_bindings.find(value => value.resource_id === "web_auth_state")?.resource_digest, previous.digest);
+        if (change === "state") current.principals[0]!.state = "revoked";
+        else current.principals[0]![change]++;
+        const next = encodeWebAuthState(current);
+        return { event: { scope, actor: { kind: "system" as const, id: "fixture_registry_change" }, action: "identity_change" as const,
+          operation: "identity.change.v1" as const, resource_id: "web_auth_state", outcome: "succeeded" as const, reason: "none" as const,
+          session_ref: null, receipt_id: null, attempt_id: null, policy_revision: 1, binding_revision: 1, authz_revision: 1 },
+          resource_digest: next.digest, mutation: () => { f.db.prepare("UPDATE web_auth_state SET state_json=? WHERE instance_id=? AND tenant_id=?").run(next.canonical, scope.instance_id, scope.tenant_id); return null; } };
+      });
+      return confirm(...args);
+    };
+    const before = f.audit.verify().sequence, result = await f.controller.handle(f.local.request());
+    assert.equal(result.status, 401); assert.deepEqual(JSON.parse(result.body), { error: "session_revoked" });
+    assert.equal(confirms, 1); assert.equal(f.audit.verify().sequence, before + 2); assert.equal(f.readState().used_nonces.length, 0);
+    const latest = f.db.prepare("SELECT record_json FROM security_audit_records ORDER BY sequence DESC LIMIT 1").get() as { record_json: string };
+    assert.equal(JSON.parse(latest.record_json).event.reason, change === "state" || change === "revoke_generation" ? "session_revoked" : "revision_mismatch");
+  }
 });

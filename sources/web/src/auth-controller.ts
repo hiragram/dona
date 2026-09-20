@@ -189,12 +189,20 @@ export class WebAuthController {
       const context = signIngressContext(identity, ingressContextRequest(request.method, request.target, request.body), this.keys.context(), issued, new Date(deadline).toISOString());
       const target = route.id === "dashboard" ? "/" : "/api/session";
       auditAttempted = true;
-      const principal = await this.connections.session.confirm({ codec_version: 1, method: "GET", target, context }, identity);
+      const confirmation = await this.connections.session.confirm({ codec_version: 1, method: "GET", target, context }, identity);
       if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
-      if (!principal) throw new AuthFailure(401, "session_invalid");
+      if (confirmation.status === "denied") {
+        switch (confirmation.reason) {
+          case "session_revoked": case "revision_mismatch": throw new AuthFailure(401, "session_revoked");
+          case "session_expired": throw new AuthFailure(401, "session_expired");
+          case "identity_mismatch": throw new AuthFailure(401, "identity_mismatch");
+          case "session_invalid": case "proof_invalid": case "already_consumed": throw new AuthFailure(401, "session_invalid");
+          default: throw new AuthFailure(503, "identity_unavailable");
+        }
+      }
       const currentCsrf = this.csrf(snapshot, now());
       if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
-      return response(200, { principal, csrf_token: currentCsrf });
+      return response(200, { principal: confirmation.principal, csrf_token: currentCsrf });
     } catch (error) {
       let failure = error instanceof AuthFailure ? error : error instanceof WebBoundaryError
         ? new AuthFailure(error.code === "identity_unavailable" || error.code === "deployment_invalid" ? 503
