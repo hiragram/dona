@@ -135,7 +135,8 @@ export class ApprovalDecisionBroker {
             mutation: () => ({ status: "reused" as const, decision_handle: prior.row.decision_id, decision: prior.row.kind, request_state: request.row.state }) };
         }
         if (!mutable) return denied("decision_conflict", event);
-        if (command.expected_revision !== request.row.revision) return denied("revision_mismatch", event);
+        // approve/reject bind the revision at card creation; delivery itself may
+        // advance request.revision. Cancel was checked against the current row.
         if (request.row.state === "approved") {
           if (command.action !== "cancel") return denied("decision_conflict", event);
           const expired = approvalExpired(request.row.consume_expires_at!, mark);

@@ -27,7 +27,7 @@ function setup(t: { after(fn: () => void): void }, sent = true) {
       const request = f.records.readInState(state, "request", requestId)!;
       const changes: Array<{previous: ApprovalRecord; next: ApprovalRecord}> = [{ previous: old, next: { ...old, row: {
         ...old.row, state: next, fence: 1, message_ref: next === "sent" ? "message_" + kind : null } } }];
-      if (kind === "approval_card" && next === "sent") changes.push({ previous: request, next: { ...request, row: { ...request.row, state: "sent" } } });
+      if (kind === "approval_card" && next === "sent") changes.push({ previous: request, next: { ...request, row: { ...request.row, state: "sent", revision: request.row.revision + 1 } } });
       const event: Omit<AuditEvent, "occurred_at"> = { scope: { instance_id: scope.instance_id, tenant_id: scope.workspace_id }, actor: { kind: "system", id: "fixture" },
         action: "approval_delivery", operation: "slack.post_thread_reply.v1", resource_id: requestId, outcome: "succeeded", reason: "none", session_ref: null, receipt_id: null, attempt_id: null,
         policy_revision: 1, binding_revision: 3, authz_revision: 7 };
@@ -60,7 +60,7 @@ test("approveはdecisionとeventを一度だけ作りpayloadを保持しconsume�
   const f = setup(t); f.setNow("2026-09-19T00:14:59.999Z");
   const first = f.decision.decide("approve", f.command("approve"));
   assert.equal(first.status, "decided"); assert.equal(f.read().row.state, "approved");
-  assert.equal(f.read().row.consume_expires_at, "2026-09-19T00:19:59.999Z"); assert.equal(f.read().row.revision, 2);
+  assert.equal(f.read().row.consume_expires_at, "2026-09-19T00:19:59.999Z"); assert.equal(f.read().row.revision, 3);
   assert.deepEqual([f.rows("approval_decisions"), f.rows("approval_event_outbox"), f.rows("approval_payload_secrets"), f.rows("approval_presentation_updates")], [1,1,1,1]);
   assert.equal(f.notification("pending_notice").row.state, "aborted");
   f.setNow("2026-09-19T00:15:00.000Z");
@@ -85,7 +85,7 @@ test("approveとcancelの先着だけがsingle decisionを確定しapproval後ca
   assert.equal(c.decision.decide("repeat", c.command("cancel")).status, "reused"); assert.equal(c.decision.decide("late", c.command("approve")).status, "denied");
   const a = setup(t); a.decision.decide("approve", a.command("approve"));
   assert.deepEqual(a.decision.decide("stale_cancel", a.command("cancel")), { status: "denied", reason: "revision_mismatch" });
-  assert.deepEqual(a.decision.decide("cancel", a.command("cancel", 2)), { status: "changed", request_state: "execution_cancelled" });
+  assert.deepEqual(a.decision.decide("cancel", a.command("cancel", 3)), { status: "changed", request_state: "execution_cancelled" });
   assert.equal(a.rows("approval_decisions"), 1); assert.equal(a.records.read("decision", a.requestId)!.row.kind, "approve");
   assert.equal(a.rows("approval_payload_secrets"), 0); assert.equal(a.rows("approval_presentation_updates"), 2);
 });
@@ -191,7 +191,7 @@ test("decision authority中のSQL writeは共有監査reserve前に拒否する"
     f.db.prepare("UPDATE approval_requests SET revision=revision+1").run(); return { status: "denied", reason: "unauthorized" };
   }, () => content, () => wrapping, () => notificationKey);
   assert.throws(() => broker.decide("bad_authority", f.command("approve")), ApprovalDecisionError);
-  assert.equal(f.anchors.calls.length, before); assert.equal(f.read().row.revision, 1);
+  assert.equal(f.anchors.calls.length, before); assert.equal(f.read().row.revision, 2);
 });
 
 
@@ -199,7 +199,7 @@ test("policy driftが同時にあっても別messageと古いcancel revisionで�
   for (const action of ["approve", "cancel"] as const) {
     const f = setup(t), before = f.read();
     f.setGrant(g => ({ ...g, policy_revision: 2, ...(action === "approve" ? { presentation_ref: "wrong_message" } : {}) }));
-    assert.equal(f.decision.decide("bad", f.command(action, action === "cancel" ? 2 : 1)).status, "denied");
+    assert.equal(f.decision.decide("bad", f.command(action, action === "cancel" ? 3 : 1)).status, "denied");
     assert.deepEqual(f.read(), before); assert.equal(f.rows("approval_payload_secrets"), 1);
   }
 });
