@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
+import { assertSynchronousResult } from "../audit/synchronous.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -53,6 +54,17 @@ function freeze<T>(value: T): T {
   return value;
 }
 
+/** Storage idempotency key only. Source ownership must be authenticated by
+ * the server; possession of this key grants no access to an existing request. */
+export function approvalCreationKey(contextInput: ApprovalSourceContext): string {
+  return guard(() => {
+    assertSynchronousResult(contextInput);
+    const context = contextSchema.parse(contextInput);
+    const { owner_kind: excludedOwnerKind, owner_id: excludedOwner, ...source } = context.request_source;
+    return hash({ codec_version: 1, instance_id: context.instance_id, workspace_id: context.workspace_id, source });
+  });
+}
+
 /** context must be derived from authenticated event identity or a persisted job
  * owner by the server. A parsed snapshot does not authenticate its requester. */
 export function encodeApprovalSnapshot(input: unknown, contextInput: ApprovalSourceContext) {
@@ -63,8 +75,7 @@ export function encodeApprovalSnapshot(input: unknown, contextInput: ApprovalSou
     const { encrypted_content_ref: excludedPayload, ...semantic } = snapshot;
     const encoded = canonical(snapshot);
     if (Buffer.byteLength(encoded, "utf8") > maximumBytes) throw new ApprovalSnapshotError();
-    const { owner_kind: excludedOwnerKind, owner_id: excludedOwner, ...creationSource } = context.request_source;
-    const creation_key = hash({ codec_version: 1, instance_id: context.instance_id, workspace_id: context.workspace_id, source: creationSource });
+    const creation_key = approvalCreationKey(context);
     return { canonical: encoded, semantic_hash: hash(semantic), creation_key, snapshot: freeze(snapshot) };
   });
 }

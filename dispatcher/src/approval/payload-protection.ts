@@ -78,9 +78,22 @@ export function createApprovalContentBinding(text: string, scopeInput: ApprovalC
     finally { data.fill(0); }
   });
 }
-function verifyContent(data: Uint8Array, scope: ApprovalContentScope, purpose: ApprovalContentPurpose, binding: ApprovalContentBinding, key: ApprovalPayloadKey): void {
+function contentMatches(data: Uint8Array, scope: ApprovalContentScope, purpose: ApprovalContentPurpose, binding: ApprovalContentBinding, key: ApprovalPayloadKey): boolean {
   checkedKey(key, "approval_content", binding.signed_at, false);
-  if (key.version !== binding.key_version || !timingSafeEqual(Buffer.from(binding.mac, "hex"), Buffer.from(mac(data, scope, purpose, key), "hex"))) throw Error();
+  if (key.version !== binding.key_version) throw Error();
+  return timingSafeEqual(Buffer.from(binding.mac, "hex"), Buffer.from(mac(data, scope, purpose, key), "hex"));
+}
+function verifyContent(data: Uint8Array, scope: ApprovalContentScope, purpose: ApprovalContentPurpose, binding: ApprovalContentBinding, key: ApprovalPayloadKey): void {
+  if (!contentMatches(data, scope, purpose, binding, key)) throw Error();
+}
+/** Duplicate comparison under a retained verification key. Only a valid but
+ * different body returns false; invalid/revoked/unavailable keys still throw. */
+export function matchesApprovalContentBinding(text: string, scopeInput: ApprovalContentScope, purposeInput: ApprovalContentPurpose, input: ApprovalContentBinding, key: ApprovalPayloadKey): boolean {
+  return guard(() => {
+    assertSynchronousResult(scopeInput); assertSynchronousResult(input);
+    const scope = scopeSchema.parse(scopeInput), purpose = contentPurpose.parse(purposeInput), binding = contentBindingSchema.parse(input), data = bytes(text, purpose === "thread_message");
+    try { return contentMatches(data, scope, purpose, binding, key); } finally { data.fill(0); }
+  });
 }
 export function verifyApprovalContentBinding(text: string, scopeInput: ApprovalContentScope, purposeInput: ApprovalContentPurpose, input: ApprovalContentBinding, key: ApprovalPayloadKey): void {
   guard(() => {

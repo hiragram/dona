@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encodeApprovalSnapshot, decodeApprovalSnapshot, ApprovalSnapshotError, type ApprovalSnapshot, type ApprovalSourceContext } from "../../src/approval/snapshot.js";
+import { approvalCreationKey, encodeApprovalSnapshot, decodeApprovalSnapshot, ApprovalSnapshotError, type ApprovalSnapshot, type ApprovalSourceContext } from "../../src/approval/snapshot.js";
 const context: ApprovalSourceContext = { instance_id: "instance_a", workspace_id: "workspace_a",
   request_source: { source_event_id: "event_a", source_job_id: null, owner_kind: "authenticated_event_actor", owner_id: "requester_a", operation_slot: "reply_1" } };
 function fixture(): ApprovalSnapshot {
@@ -60,4 +60,12 @@ test("canonical保存bytes以外と重複keyを拒否する", () => {
   for (const raw of [" " + encoded.canonical, encoded.canonical.replace('"codec_version":1', '"codec_version":2,"codec_version":1'), "x".repeat(256 * 1024 + 1)]) {
     assert.throws(() => decodeApprovalSnapshot(raw, encoded.semantic_hash, context), ApprovalSnapshotError);
   }
+});
+
+test("creation keyを先行lookupへ使っても既存codecと互換でowner認可の代わりにしない",()=>{
+ const original=encodeApprovalSnapshot(fixture(),context);
+ assert.equal(approvalCreationKey(context),original.creation_key);
+ assert.equal(approvalCreationKey({...context,request_source:{...context.request_source,owner_id:"other"}}),original.creation_key);
+ assert.notEqual(approvalCreationKey({...context,request_source:{...context.request_source,operation_slot:"other"}}),original.creation_key);
+ let calls=0;assert.throws(()=>approvalCreationKey(new Proxy(context,{get(){calls++;throw Error();}})),ApprovalSnapshotError);assert.equal(calls,0);
 });

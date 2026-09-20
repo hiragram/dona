@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { webcrypto } from "node:crypto";
-import { createApprovalContentBinding, verifyApprovalContentBinding, sealApprovalPayload, openApprovalPayload,
+import { createApprovalContentBinding, matchesApprovalContentBinding, verifyApprovalContentBinding, sealApprovalPayload, openApprovalPayload,
   ApprovalPayloadError, maximumApprovalPayloadBytes, type ApprovalPayloadBinding, type ApprovalPayloadKey } from "../../src/approval/payload-protection.js";
 import type { ClockMark } from "../../src/approval/clock.js";
 const at = "2026-09-19T00:00:00.000Z", scope = { instance_id: "instance_a", workspace_id: "workspace_a" };
@@ -114,4 +114,12 @@ test("RFC3394の公開wrapped keyとWebCrypto GCMの暗号文を復号する", a
     1, vectorOwner.content.mac, at, at, owner.expires_at]));
   const vectorRaw = Buffer.from(await webcrypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: vectorAad, tagLength: 128 }, cryptoKey, Buffer.from(text)));
   assert.equal(openApprovalPayload({ codec_version: 1, algorithm: "A256KW+A256GCM", key_version: 1, sealed_at: at, wrapped_key: wrapped, nonce: Buffer.from(nonce).toString("base64url"), ciphertext: vectorRaw.subarray(0, -16).toString("base64url"), tag: vectorRaw.subarray(-16).toString("base64url") }, vectorOwner, { ...wrapping(), secret: kek }, contentKey, mark()), text);
+});
+
+test("duplicate比較は本文違いと失効・用途違いのkeyを区別する",()=>{
+ const binding=createApprovalContentBinding(text,scope,"draft",content(),mark());
+ assert.equal(matchesApprovalContentBinding(text,scope,"draft",binding,{...content(),state:"verification_only"}),true);
+ assert.equal(matchesApprovalContentBinding(text+"x",scope,"draft",binding,{...content(),state:"verification_only"}),false);
+ for(const invalid of [{...content(),state:"revoked" as const},wrapping(),{...content(),version:2}])
+  assert.throws(()=>matchesApprovalContentBinding(text,scope,"draft",binding,invalid),ApprovalPayloadError);
 });
