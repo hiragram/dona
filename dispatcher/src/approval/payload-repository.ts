@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
+import { AuditRepository, assertCurrentAuditReadState, type AuditAnchorStore } from "../audit/repository.js";
 import type { AuditKeyLookup, VerifiedAuditState } from "../audit/codec.js";
 import { assertSynchronousResult } from "../audit/synchronous.js";
 import { ApprovalMetadataNodes } from "./metadata-store.js";
@@ -21,22 +21,30 @@ export class ApprovalPayloadRepository {
   private readonly nodes:ApprovalMetadataNodes;
   private readonly sql:ApprovalPayloadSql;
   private readonly scope:z.infer<typeof scopeSchema>;
-  constructor(db:Database.Database,anchors:AuditAnchorStore,keys:AuditKeyLookup,scopeInput:z.infer<typeof scopeSchema>){
+  constructor(private readonly db:Database.Database,anchors:AuditAnchorStore,keys:AuditKeyLookup,scopeInput:z.infer<typeof scopeSchema>){
     try{
       assertSynchronousResult(scopeInput);this.scope=Object.freeze(scopeSchema.parse(scopeInput));
       this.audit=new AuditRepository(db,anchors,keys);this.nodes=new ApprovalMetadataNodes(db);this.sql=new ApprovalPayloadSql(db,this.scope);
     }catch{throw new ApprovalPayloadRepositoryError();}
   }
   inspect(kind:ApprovalPayloadOwnerKind,ownerId:string):ApprovalPayloadInspection|null {
+    try{return this.audit.readVerifiedState(state=>this.inspectInState(state,kind,ownerId));}
+    catch{throw new ApprovalPayloadRepositoryError();}
+  }
+  /** 同じ監査callbackのexact stateだけを使う。SQL metadataの真正性と
+   * secretの存在/形式を照合するが、owner認可・本文認証・TTLは上位が行う。 */
+  inspectInState(state:VerifiedAuditState,kind:ApprovalPayloadOwnerKind,ownerId:string):ApprovalPayloadInspection|null {
     try{
+      assertCurrentAuditReadState(this.db,state);
       const key=approvalPayloadMetadataKey(this.scope,kind,ownerId);
-      return this.audit.readVerifiedState(state=>this.nodes.read(reader=>{
+      const result=this.nodes.read(reader=>{
         const root=approvalPayloadRoot(state,this.scope);
         const digest=readMetadataValue({...this.scope,collection:"approval_payloads_v1"},root,key,reader);
         const metadata=this.sql.readMetadata(kind,ownerId);
         if((metadata===null?null:encodeApprovalPayloadMetadata(metadata,this.scope).digest)!==digest)throw Error();
         return metadata===null?null:Object.freeze({metadata,secret:this.sql.readSecret(metadata)});
-      }));
+      });
+      assertCurrentAuditReadState(this.db,state);return result;
     }catch{throw new ApprovalPayloadRepositoryError();}
   }
 }

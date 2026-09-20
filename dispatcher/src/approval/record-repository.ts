@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
-import { AuditRepository, type AuditAnchorStore } from "../audit/repository.js";
-import type { AuditKeyLookup } from "../audit/codec.js";
+import { AuditRepository, assertCurrentAuditReadState, type AuditAnchorStore } from "../audit/repository.js";
+import type { AuditKeyLookup, VerifiedAuditState } from "../audit/codec.js";
 import { ApprovalMetadataNodes } from "./metadata-store.js";
 import { ApprovalIndexBlobs } from "./index-store.js";
 import { ApprovalMetadataPlan } from "./metadata-plan.js";
@@ -33,7 +33,7 @@ export class ApprovalRecordRepository {
   private readonly nodes: ApprovalMetadataNodes;
   private readonly indexes: ApprovalIndexBlobs;
   private readonly scope: ApprovalRecordScope;
-  constructor(db: Database.Database, anchors: AuditAnchorStore, keys: AuditKeyLookup, scope: ApprovalRecordScope) {
+  constructor(private readonly db: Database.Database, anchors: AuditAnchorStore, keys: AuditKeyLookup, scope: ApprovalRecordScope) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       this.audit = new AuditRepository(db, anchors, keys); this.sql = new ApprovalRecordSql(db, this.scope);
@@ -42,18 +42,29 @@ export class ApprovalRecordRepository {
   }
   read<K extends ApprovalRecordKind>(kind: K, primary: string): Of<K> | null;
   read(kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
+    try { return this.audit.readVerifiedState(state => this.readInState(state, kind, primary)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  /** Framework callbackのexact stateと同じconnectionだけで使う内部読取。
+   * actor認可やstate所持による任意root指定を提供しない。 */
+  readInState<K extends ApprovalRecordKind>(state: VerifiedAuditState, kind: K, primary: string): Of<K> | null;
+  readInState(state: VerifiedAuditState, kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
     try {
       // kind/primaryはcodecで検証し、任意rootを引数として受け取らない。
       approvalRecordKey(this.scope, kind, primary);
-      return this.withPlan(plan => this.record(plan, kind, primary));
+      return this.withPlan(state, plan => this.record(plan, kind, primary));
     } catch { throw new ApprovalRecordRepositoryError(); }
   }
   /** 固定aliasを現在rootから解決する。aliasが指すrowだけでなく、その
    * selector、all/active membership、全固定aliasを同じ読取で照合する。 */
   readAlias(selector: Selector): ApprovalRecord | null {
+    try { return this.audit.readVerifiedState(state => this.readAliasInState(state, selector)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  readAliasInState(state: VerifiedAuditState, selector: Selector): ApprovalRecord | null {
     try {
       const selectedKey = approvalIndexKey(this.scope, { kind: "alias", selector });
-      return this.withPlan(plan => {
+      return this.withPlan(state, plan => {
         if (selector.name === "presentation_active_message") return this.presentationHolder(plan, selector.message_ref);
         const index = plan.readIndex({ kind: "alias", selector });
         if (index === null) return null;
@@ -68,10 +79,14 @@ export class ApprovalRecordRepository {
   }
   /** 内部一覧の先頭のみ、最大4件/3MiB。truncatedを全件取得やexpiry sweep
    * 完了に変換しない。cursor、並べ替え、caller root、認可は受け付けない。 */
-  readListHead(list: ApprovalIndexList, limit: number) {
+  readListHead(list: ApprovalIndexList, limit: number): ApprovalRecordListHead {
+    try { return this.audit.readVerifiedState(state => this.readListHeadInState(state, list, limit)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  readListHeadInState(state: VerifiedAuditState, list: ApprovalIndexList, limit: number): ApprovalRecordListHead {
     try {
       approvalIndexKey(this.scope, { kind: "manifest", list }); z.number().int().min(1).max(4).parse(limit);
-      return this.withPlan(plan => {
+      return this.withPlan(state, plan => {
         const head = readApprovalListHead(plan, list, limit), records: ApprovalRecord[] = []; let bytes = 0;
         for (const primary of head.ids) {
           const record = this.record(plan, list.record_kind, primary);
@@ -111,14 +126,14 @@ export class ApprovalRecordRepository {
       if ((holder?.row.update_id === primary) !== holds) throw Error();
     }
   }
-  private withPlan(read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null): ApprovalRecord | null;
-  private withPlan(read: (plan: ApprovalMetadataPlan) => ApprovalRecordListHead): ApprovalRecordListHead;
-  private withPlan(read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null | ApprovalRecordListHead): ApprovalRecord | null | ApprovalRecordListHead {
-    return this.audit.readVerifiedState(state => {
-      const bindings = state.resource_bindings.filter(value => value.resource_id === "approval_records"
-        && value.scope.instance_id === this.scope.instance_id && value.scope.tenant_id === this.scope.workspace_id);
-      if (bindings.length !== 1) throw Error();
-      return this.nodes.read(nodes => this.indexes.read(indexes => read(new ApprovalMetadataPlan(this.scope, bindings[0]!.resource_digest, nodes, indexes))));
-    });
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null): ApprovalRecord | null;
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecordListHead): ApprovalRecordListHead;
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null | ApprovalRecordListHead): ApprovalRecord | null | ApprovalRecordListHead {
+    assertCurrentAuditReadState(this.db, state);
+    const bindings = state.resource_bindings.filter(value => value.resource_id === "approval_records"
+      && value.scope.instance_id === this.scope.instance_id && value.scope.tenant_id === this.scope.workspace_id);
+    if (bindings.length !== 1) throw Error();
+    const result = this.nodes.read(nodes => this.indexes.read(indexes => read(new ApprovalMetadataPlan(this.scope, bindings[0]!.resource_digest, nodes, indexes))));
+    assertCurrentAuditReadState(this.db, state); return result;
   }
 }

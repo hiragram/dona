@@ -26,6 +26,23 @@ export type AuditResourceUpdate =
   | { resource_commitments: AuditResourceCommitment[]; resource_digest?: never };
 export type AuditPreparedPlan<E, M> = AuditResourceUpdate & { event: E; mutation: M };
 
+// Exact state objects exist only during the framework's synchronous read phase.
+// Shape-compatible copies and objects retained beyond that callback confer nothing.
+const currentReadStates = new WeakMap<Database.Database, VerifiedAuditState>();
+/** Internal provenance check for same-connection repository reads. This does not
+ * authenticate business rows, actor permissions, or historical clock records. */
+export function assertCurrentAuditReadState(db: Database.Database, state: VerifiedAuditState): void {
+  const current = currentReadStates.get(db);
+  if (current === undefined || current !== state || !db.inTransaction
+    || db.pragma("query_only", { simple: true }) !== 1) throw new AuditIntegrityError();
+}
+function withCurrentReadState<T>(db: Database.Database, state: VerifiedAuditState, read: () => T): T {
+  if (currentReadStates.has(db)) throw new AuditIntegrityError();
+  currentReadStates.set(db, state);
+  try { assertCurrentAuditReadState(db, state); return read(); }
+  finally { currentReadStates.delete(db); }
+}
+
 const schemaVersion = 2;
 function guard<T>(operation: () => T): T {
   try { return operation(); } catch { throw new AuditIntegrityError(); }
@@ -201,7 +218,8 @@ export class AuditRepository {
       if (this.db.inTransaction) throw new AuditIntegrityError();
       return this.db.transaction(() => {
         const state = this.verifyStateInside();
-        const result = this.readOnly(() => reader(freezeState(state)));
+        const frozen = freezeState(state);
+        const result = this.readOnly(() => withCurrentReadState(this.db, frozen, () => reader(frozen)));
         this.verifyInside();
         return result;
       })();
@@ -251,7 +269,8 @@ export class AuditRepository {
       const committed = this.db.transaction(() => {
         const verified = this.verifyStateInside();
         const current = verified.anchor;
-        const plan = this.readOnly(() => prepare(freezeState(verified)), plan => {
+        const frozen = freezeState(verified);
+        const plan = this.readOnly(() => withCurrentReadState(this.db, frozen, () => prepare(frozen)), plan => {
           // Plans stay inside this transaction. Only their explicitly named
           // mutation may be callable; no accessor or deferred data is admitted.
           if (plan === null || typeof plan !== "object" || types.isProxy(plan)

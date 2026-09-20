@@ -5,8 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase } from "../../src/database.js";
-import { AuditRepository, installAuditSchema, type AuditAnchorStore } from "../../src/audit/repository.js";
-import { AuditIntegrityError, signAuditCheckpoint, verifyAuditRecord, type AuditAnchor, type AuditEvent, type AuditKey } from "../../src/audit/codec.js";
+import { AuditRepository, assertCurrentAuditReadState, installAuditSchema, type AuditAnchorStore } from "../../src/audit/repository.js";
+import { AuditIntegrityError, signAuditCheckpoint, verifyAuditRecord, type VerifiedAuditState, type AuditAnchor, type AuditEvent, type AuditKey } from "../../src/audit/codec.js";
 
 const key: AuditKey = { version: 1, purpose: "audit", state: "active", activated_at: "2026-09-01T00:00:00.000Z",
   signing_expires_at: "2026-11-01T00:00:00.000Z", secret: Buffer.alloc(32, 0x42) };
@@ -578,4 +578,56 @@ test("旧版retentionでrootが失われたDBでは読取と更新とcheckpoint�
  assert.throws(()=>retentionRepository(db,store).retain("unsafe_conversion",2,2,"2027-11-01T00:00:00.000Z"),AuditIntegrityError);
  assert.equal(readers,0);assert.equal(planners,0);assert.equal(store.calls.length,calls);assert.deepEqual(store.read(),before);
  assert.equal(count(db,"security_audit_records"),1);
+});
+
+test("verified read stateはcallback中のexact objectとconnectionだけで有効",t=>{
+ const f=setup(t),other=setup(t);let saved:VerifiedAuditState|undefined;let traps=0;
+ f.repository.readVerifiedState(state=>{
+  saved=state;assertCurrentAuditReadState(f.db,state);
+  for(const invalid of [{...state},structuredClone(state),new Proxy(state,{get(){traps++;throw Error();}})])
+   assert.throws(()=>assertCurrentAuditReadState(f.db,invalid),AuditIntegrityError);
+  assert.throws(()=>assertCurrentAuditReadState(other.db,state),AuditIntegrityError);
+  other.repository.readVerifiedState(peer=>{
+   assertCurrentAuditReadState(other.db,peer);assertCurrentAuditReadState(f.db,state);
+   assert.throws(()=>assertCurrentAuditReadState(f.db,peer),AuditIntegrityError);
+   assert.throws(()=>assertCurrentAuditReadState(other.db,state),AuditIntegrityError);return null;
+  });
+  assertCurrentAuditReadState(f.db,state);return null;
+ });
+ assert.ok(saved);assert.equal(traps,0);
+ assert.throws(()=>assertCurrentAuditReadState(f.db,saved!),AuditIntegrityError);
+ f.db.pragma("query_only=ON");
+ try{f.db.transaction(()=>{
+  assert.throws(()=>assertCurrentAuditReadState(f.db,saved!),AuditIntegrityError);
+  assert.throws(()=>assertCurrentAuditReadState(f.db,undefined as unknown as VerifiedAuditState),AuditIntegrityError);
+ })();}finally{f.db.pragma("query_only=OFF");}
+});
+
+test("例外で終わったread stateも失効し次のverified callbackへ持ち込めない",t=>{
+ const f=setup(t);let old:VerifiedAuditState|undefined;
+ assert.throws(()=>f.repository.readVerifiedState(state=>{old=state;throw Error("fixture failure");}),AuditIntegrityError);
+ assert.ok(old);assert.throws(()=>assertCurrentAuditReadState(f.db,old!),AuditIntegrityError);
+ f.repository.readVerifiedState(state=>{
+  assertCurrentAuditReadState(f.db,state);assert.throws(()=>assertCurrentAuditReadState(f.db,old!),AuditIntegrityError);return null;
+ });
+ assert.equal(f.store.calls.length,0);
+});
+
+test("prepare stateはmutation前に失効しprepare例外はanchorを予約しない",t=>{
+ const f=setup(t);let prepared:VerifiedAuditState|undefined;
+ f.repository.appendPrepared("phases",1,state=>{
+  prepared=state;assertCurrentAuditReadState(f.db,state);
+  assert.throws(()=>f.db.exec("INSERT INTO decisions VALUES('early','invalid')"));
+  return {event,resource_digest:null,mutation:()=>{
+   assert.throws(()=>assertCurrentAuditReadState(f.db,state),AuditIntegrityError);
+   f.db.exec("INSERT INTO decisions VALUES('expected','valid')");return null;
+  }};
+ });
+ assert.ok(prepared);assert.throws(()=>assertCurrentAuditReadState(f.db,prepared!),AuditIntegrityError);
+ const before=f.store.calls.length;
+ assert.throws(()=>f.repository.appendPrepared("throw",1,state=>{
+  prepared=state;assertCurrentAuditReadState(f.db,state);throw Error("fixture failure");
+ }),AuditIntegrityError);
+ assert.equal(f.store.calls.length,before);assert.throws(()=>assertCurrentAuditReadState(f.db,prepared!),AuditIntegrityError);
+ assert.equal(count(f.db,"decisions"),1);
 });
