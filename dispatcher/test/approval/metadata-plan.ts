@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { setup, scope as auditScope } from "../web/fixtures.js";
 import { installApprovalMetadataSchema, installApprovalIndexSchema } from "../../src/approval/schema.js";
@@ -202,4 +203,25 @@ test("writerは別scope・過大plan・改変wire・独立transaction呼出し�
   ]) assert.throws(() => f.db.transaction(() => f.writer.stage(changed))(), ApprovalMetadataPlanStoreError);
   assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(), { n: 0 });
   assert.throws(() => f.audit.readVerified(() => f.writer.stage(plan)));
+});
+
+test("proposed rootをleaf・中間node・別scopeへ差し替えても保存しない", t => {
+  for (const fault of ["leaf", "inner", "scope", "empty_scope"] as const) {
+    const f = fixture(t);
+    let changed: PreparedApprovalMetadata;
+    if (fault === "leaf" || fault === "inner") {
+      const plan = f.db.transaction(() => prepare(f, empty, p => p.putIndex(null, blank(all))))();
+      const wire = plan.node_wires.find(value => Buffer.from(value, "base64").readUInt16BE(33) === (fault === "leaf" ? 256 : 1))!;
+      const root = createHash("sha256").update("dona.metadata-tree-node.v1\0").update(Buffer.from(wire, "base64")).digest("hex");
+      changed = { ...plan, proposed_root: root };
+    } else {
+      const other = { ...scope, workspace_id: "other" }, p = new ApprovalMetadataPlan(other, emptyMetadataRoot({ ...other, collection: "approval_records_v1" }), () => undefined, () => undefined);
+      if (fault === "empty_scope") p.readRecordDigest("event", "event");
+      else p.putRecord(null, { codec_version: 1, scope: other, kind: "event", row: { event_id: "event", decision_id: "decision", kind: "dona_approval.decision.v1", state: "pending", delivered_at: null } });
+      changed = { ...p.finish(), scope };
+    }
+    assert.throws(() => f.db.transaction(() => f.writer.stage(changed)).immediate(), ApprovalMetadataPlanStoreError);
+    assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(), { n: 0 });
+    assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_index_blobs").get(), { n: 0 });
+  }
 });

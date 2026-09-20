@@ -16,6 +16,8 @@ readはnode overlayと既存readerを合わせ、point digest、blob canonical b
 
 `ApprovalMetadataPlanWriter`は1つのconnectionから両保存層を構成する。既存transaction内でscope、format、wire上限、重複、proposed rootのnodeを確認し、nodeを最大257個ごと、indexを最大32個でstageする。自分でBEGIN/commitや再試行をしない。全batchと業務rowは呼出側の同じ監査mutationで保存し、どこかが失敗したら例外を上位へ伝えて全体をrollbackする。mutation中の保存障害をcatchして成功扱いしてはいけない。
 
+保存前には新node overlayと同じDBのreaderを使い、既存metadata tree codecで固定keyへのpathを最大257node検証する。これにより、leafや途中のnode digestをrootへ差し替える改変と、別scopeのrootを拒否する。変更なしのplanも省略しない。このpath検証だけをrootのcurrent性や業務認可の証明には使わない。
+
 `putRecord`はcanonical record digestをpointへ結ぶだけで、旧SQL rowの読取・照合、cross-row参照、state transition、current binding/policy/clockやactor検証、business rowの書込を実装しない。これらを完了したrepositoryだけがこの内部plannerを使う。planの公開受付・保存後の再実行・外部callerによるroot指定は行わない。
 
 ## Listの局所更新と先頭読取

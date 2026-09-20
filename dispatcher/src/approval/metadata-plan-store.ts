@@ -7,6 +7,7 @@ import { ApprovalIndexBlobs } from "./index-store.js";
 import { encodeApprovalIndex } from "./index-codec.js";
 import type { ApprovalRecordScope } from "./record-codec.js";
 import type { PreparedApprovalMetadata } from "./metadata-plan.js";
+import { readMetadataValue } from "./metadata-tree.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
@@ -48,8 +49,12 @@ export class ApprovalMetadataPlanWriter {
       });
       if (new Set(indexes.map(index => index.digest)).size !== indexes.length) throw Error();
       if (nodes.length && !nodes.some(node => node.digest === plan.proposed_root)) throw Error();
-      // 空のplanでも同じschema/file/transaction条件を確認する。
-      if (nodes.length === 0) this.nodes.read(() => null);
+      // digestの配列内存在だけではleaf/中間nodeもrootになってしまう。
+      // 既存codecでscope付きdepth 0 rootから固定keyへのpathを検証する。
+      // このprobeはrootのcurrent性や業務認可の証明ではない。
+      const overlay = new Map(nodes.map(node => [node.digest, node.wire]));
+      this.nodes.read(reader => readMetadataValue({ ...this.scope, collection: "approval_records_v1" },
+        plan.proposed_root, "approval_plan_scope_check", hash => overlay.get(hash) ?? reader(hash)));
       if (indexes.length === 0) this.indexes.read(() => null);
       for (let offset = 0; offset < nodes.length; offset += 257) this.nodes.stage(nodes.slice(offset, offset + 257));
       if (indexes.length) this.indexes.stage(indexes);
