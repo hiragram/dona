@@ -25,3 +25,10 @@ test('OIDC callback以外へqueryを許可せずlogin完了案内はpublicのま
  assert.equal(matchWebRoute('GET','/login/complete').gate,'public');assert.equal(matchWebRoute('GET','/login/complete').activity,'none');
  for(const target of ['/login?next=external','/login/complete?code=fixture','/?session=fixture'])assert.throws(()=>matchWebRoute('GET',target),WebRouteError);
 });
+
+test('login開始とCSRF準備は固定POSTだけを許可しresource権限を持たない',()=>{
+ for(const target of ['/api/login/csrf','/api/login/start']) {
+  const route=matchWebRoute('POST',target);assert.equal(route.gate,'public');assert.equal(route.capability,'authentication');assert.equal(route.activity,'none');assert.equal(route.resource,null);
+  assert.throws(()=>matchWebRoute('GET',target),WebRouteError);assert.throws(()=>matchWebRoute('POST',target+'?next=other'),WebRouteError);
+ }
+});
