@@ -222,3 +222,29 @@ test("startup recovery never removes a live lock that replaced the inode it insp
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("startup recovery retries when the stale lock disappears after inspection", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-lock-disappeared-"));
+  const socketPath = path.join(root, "updater.sock");
+  const lockPath = path.join(root, "updater.start.lock");
+  await fs.writeFile(lockPath,
+    JSON.stringify({ pid: 999_999_999, process_start: "stale", token: "stale" }), { mode: 0o600 });
+  await fs.writeFile(socketPath, "stale", { mode: 0o600 });
+  let removed = false;
+  let reservation: Awaited<ReturnType<typeof reserveUpdaterSocket>> | undefined;
+  try {
+    reservation = await reserveUpdaterSocket(socketPath, {
+      afterReadStartupLock: async () => {
+        if (removed) return;
+        removed = true;
+        await fs.unlink(lockPath);
+      },
+    });
+    assert.equal(removed, true);
+    assert.equal((await fs.lstat(socketPath)).isSocket(), true);
+    assert.equal((await request(socketPath)).status, 503);
+  } finally {
+    if (reservation) await releaseUpdaterSocket(reservation);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
