@@ -115,3 +115,25 @@ test("markerは保存したexact stateだけを読みcallback外へstateを持�
   });
   assert.throws(() => f.store.readInState(retained!, f.claim.attempt_handle), ApprovalExecutionMarkerStoreError);
 });
+
+test("current mutation内の直接INSERTでも過去clockを参照するmarkerを拒否する", t => {
+  const f = setup(t), prior = f.attempt(), records = new ApprovalRecordMutation(f.db, scope);
+  // v4で既にexecutingになり、markerなしでv5へ移行した状態と同じ保存形。
+  f.transaction.runPrepared("legacy_execution", (mark, state) => {
+    const plan = records.prepare(mark, state, [{ previous: prior, next: { ...prior, row: { ...prior.row, state: "executing", fence: 2 } } }]);
+    return { event, resource_commitments: plan.resource_commitments, mutation: () => { plan.mutation(); return null; } };
+  });
+  const hash = f.read().row.semantic_hash;
+  assert.throws(() => f.transaction.runPrepared("stale_marker_insert", (_mark, state) => {
+    const old = f.history.readInState(state, "consume")!;
+    const signed = signApprovalExecutionMarker({ codec_version: 1, scope, request_id: f.requestId, consume_id: f.claim.consume_handle,
+      attempt_id: f.claim.attempt_handle, operation: "slack.post_thread_reply.v1", semantic_hash: hash, execution_fence: 2,
+      created_at: old.effective_utc, clock_transaction_id: old.transaction_id, key_version: 1 }, key, old);
+    return { event, resource_digest: null, mutation: () => {
+      f.db.prepare("INSERT INTO main.approval_execution_markers(attempt_id,request_id,consume_id,marker_json,clock_transaction_id) VALUES(?,?,?,?,?)")
+        .run(f.claim.attempt_handle, f.requestId, f.claim.consume_handle, JSON.stringify(signed), old.transaction_id);
+      return null;
+    } };
+  }));
+  assert.equal(f.db.prepare("SELECT count(*) FROM approval_execution_markers").pluck().get(), 0);
+});

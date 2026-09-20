@@ -290,6 +290,9 @@ CREATE TABLE approval_execution_markers (
   CHECK(json_type(marker_json,'$.marker.execution_fence') IS 'integer'
     AND json_extract(marker_json,'$.marker.execution_fence') BETWEEN 1 AND 9007199254740991)
 ) STRICT;
+CREATE TRIGGER approval_execution_markers_clock_provenance BEFORE INSERT ON approval_execution_markers
+  WHEN dona_clock_reference(NEW.clock_transaction_id) IS NOT 1
+  BEGIN SELECT RAISE(ABORT,'approval_clock_provenance_unverified'); END;
 CREATE TRIGGER approval_execution_marker_fence BEFORE INSERT ON approval_execution_markers
   WHEN NOT EXISTS(SELECT 1 FROM approval_execution_attempts WHERE attempt_id=NEW.attempt_id
     AND request_id=NEW.request_id AND consume_id=NEW.consume_id AND state='executing'
