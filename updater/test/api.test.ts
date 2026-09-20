@@ -196,3 +196,28 @@ test("startup recovery removes a crash-orphaned auxiliary hard link", async () =
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("startup recovery never removes a live lock that replaced the inode it inspected", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-lock-replaced-"));
+  const socketPath = path.join(root, "updater.sock");
+  const lockPath = path.join(root, "updater.start.lock");
+  await fs.writeFile(lockPath, JSON.stringify({ pid: 999_999_999, process_start: "stale", token: "stale" }), { mode: 0o600 });
+  let replaced = false;
+  try {
+    await assert.rejects(reserveUpdaterSocket(socketPath, {
+      inspectProcess: (pid) => pid === process.pid
+        ? { status: "alive", identity: "live-process" }
+        : { status: "dead" },
+      afterReadStartupLock: async () => {
+        if (replaced) return;
+        replaced = true;
+        await fs.unlink(lockPath);
+        await fs.writeFile(lockPath,
+          JSON.stringify({ pid: process.pid, process_start: "live-process", token: "live" }), { mode: 0o600 });
+      },
+    }), /updater_startup_lock_active/);
+    assert.match(await fs.readFile(lockPath, "utf8"), /"token":"live"/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
