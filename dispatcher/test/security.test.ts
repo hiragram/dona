@@ -42,3 +42,6 @@ import "./approval/notification-marker.js";
 import "./approval/create-broker.js";
 
 import "./approval/decision-broker.js";
+
+import "./approval/consume-broker.js";
+import "./approval/consume-concurrency.js";
