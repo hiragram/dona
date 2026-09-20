@@ -24,3 +24,7 @@ coverage/
 *.swp
 *~
 .dona-job-progress.json
+
+# Web browser fixture output
+sources/web/test-results/
+sources/web/playwright-report/

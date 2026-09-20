@@ -12,7 +12,7 @@
 
 Host、検証済みtransport、identity/proxy header拒否、同名cookieの重複・malformed cookie拒否を全endpointで適用する。callback以外はqueryを許可しない。callbackは専用parserでstate/code/issuer等を検証し、providerの自由記述errorやqueryをresponse/logへ転載しない。
 
-`/login`、publicな`/login/complete`、dashboardのHTMLとroutingはこのcontrollerに含めない。完了案内は別のpublic表示層で、session lookup・bootstrap・自動redirectをせず、固定dashboard linkを利用者が選ぶ新しいnavigationを提供する必要がある。callbackからの303にもno-referrerを付ける。
+`/login`とpublicな`/login/complete`のHTMLは[public表示層](web-public-pages.md)が扱う。dashboardのHTMLとTLS listenerでのroutingはこのcontrollerに含めない。完了案内は別のpublic表示層で、session lookup・bootstrap・自動redirectをせず、固定dashboard linkを利用者が選ぶ新しいnavigationを提供する必要がある。callbackからの303にもno-referrerを付ける。
 
 ## prelogin CSRFの範囲
 
@@ -42,4 +42,4 @@ consume/createのwriteを試みた後に応答が不明なら503とし、新し�
 
 `npm run verify:web`でWeb unitと型検査に加え、実SQLite・共有監査・UDS・BFF clientを接続した結合testを実行する。loginの結合testは署名JWTを作り、実OIDCのcode/PKCE/nonce/online検証を通す。prelogin/callback再送、wrong state/nonce、未登録subject、inactive、consume/session応答喪失、10秒期限、旧session rotationを検証する。
 
-HTTPS fetch応答、保護clock/anchor/key、TLS分類はfixtureであり、実IdP・browser・WebAuthn・Keychainやproductionの動作証拠ではない。public HTMLと実browser、TLS/proxy listener、local二者provisioning、保護native broker、runtime/release接続、明示activityとidle更新、後続read/command/approval routeは引き続き必要。この接続だけでIssue #141やEpic #139を完了扱いしない。
+HTTPS fetch応答、保護clock/anchor/key、TLS分類はfixtureであり、実IdP・browser・WebAuthn・Keychainやproductionの動作証拠ではない。public表示層のbrowser fixtureとは別に、TLS/proxy listenerとの統合と実IdP/browser、local二者provisioning、保護native broker、runtime/release接続、明示activityとidle更新、後続read/command/approval routeは引き続き必要。この接続だけでIssue #141やEpic #139を完了扱いしない。

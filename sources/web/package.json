@@ -10,13 +10,15 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "jose": "6.2.12",
     "zod": "4.5.4"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@types/node": "24.13.3",
     "tsx": "4.20.5",
     "typescript": "7.0.2"
