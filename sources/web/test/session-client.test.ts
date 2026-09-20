@@ -68,16 +68,17 @@ test("service codecは独立golden wireを照合し別requestと改変を拒否�
 
 test("BFF clientは実UDSで署名responseと期待principalを照合する", async t => {
   const f = await fixtureServer(t, (proof, response) => send(response, responseProof(proof)));
-  assert.deepEqual(await f.client().confirm(fixture.input, fixture.identity), fixture.result.principal); assert.equal(f.calls, 1);
-  const denied = await fixtureServer(t, (proof, response) => send(response, responseProof(proof, { result: { status: "denied" } })));
-  assert.equal(await denied.client().confirm(fixture.input, fixture.identity), null); assert.equal(denied.calls, 1);
+  assert.deepEqual(await f.client().confirm(fixture.input, fixture.identity), fixture.result); assert.equal(f.calls, 1);
+  const denied = await fixtureServer(t, (proof, response) => send(response, responseProof(proof, { result: { status: "denied", reason: "session_revoked" } })));
+  assert.deepEqual(await denied.client().confirm(fixture.input, fixture.identity), { status: "denied", reason: "session_revoked" }); assert.equal(denied.calls, 1);
 });
 
 test("MAC・request・principal・header・HTTP statusの不一致を再送せず拒否する", async t => {
-  for (const fault of ["mac", "old_request", "principal", "extra_header", "duplicate_header", "redirect", "oversize", "partial"] as const) {
+  for (const fault of ["mac", "old_request", "principal", "extra_header", "duplicate_header", "redirect", "oversize", "partial", "missing_reason", "unknown_reason"] as const) {
     const f = await fixtureServer(t, (proof, response) => {
       const valid = responseProof(proof);
-      if (fault === "redirect") { response.writeHead(302, { location: "https://example.invalid/" }); response.end(); }
+      if (fault === "missing_reason" || fault === "unknown_reason") send(response, responseProof(proof, { result: { status: "denied", ...(fault === "unknown_reason" ? { reason: "not_a_contract" } : {}) } }));
+      else if (fault === "redirect") { response.writeHead(302, { location: "https://example.invalid/" }); response.end(); }
       else if (fault === "oversize") send(response, "x".repeat(16385));
       else if (fault === "partial") { response.writeHead(200, { "content-type": "application/vnd.dona.web-session-response", "content-length": "1000", connection: "close" }); response.end("partial"); }
       else if (fault === "extra_header") send(response, valid, { "x-principal-id": "principal" });

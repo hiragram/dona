@@ -34,11 +34,14 @@ export function prepareSessionIngress(input:WebAuthState,token:string,method:unk
  let claims:ReturnType<typeof verifyIngressContext>;
  try {
   const key=lookup(hints.key_version);if(!key)return deny("proof_invalid");
+  // Authenticate the original session binding first. Current registry/runtime
+  // revisions are then evaluated below, preserving the audited revocation
+  // reason without granting authority from an old binding.
   claims=verifyIngressContext(token,key,{
    instance_id:state.instance_id,tenant_id:state.tenant_id,principal_id:principal.principal_id,
    session_ref:session.state.session_ref,session_generation:session.state.session_generation,
-   principal_revoke_generation:principal.revoke_generation,identity_binding_revision:principal.identity_binding_revision,
-   authz_revision:principal.authz_revision,bff_generation:state.bff_generation,
+   principal_revoke_generation:session.state.principal_revoke_generation,identity_binding_revision:session.state.identity_binding_revision,
+   authz_revision:session.state.authz_revision,bff_generation:session.state.bff_generation,
   },request,now);
  }catch{return deny("proof_invalid");}
  authenticated={principal,session_ref:session.state.session_ref};

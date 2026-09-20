@@ -29,7 +29,9 @@ const principalSchema = z.strictObject({ codec_version: z.literal(1), instance_i
 }).refine(value => new Set(value.role_ids).size === value.role_ids.length && new Set(value.scopes).size === value.scopes.length
   && value.scopes.every(scope => scopeEligible(value, scope)) && Date.parse(value.expires_at) > Date.parse(value.authenticated_at)
   && Date.parse(value.expires_at) - Date.parse(value.authenticated_at) <= 8 * 3600 * 1000);
-const resultSchema = z.discriminatedUnion("status", [z.strictObject({ status: z.literal("denied") }),
+export const sessionServiceDenialSchema = z.enum(["deployment_invalid", "identity_unavailable", "proof_invalid", "operation_unsupported",
+  "session_invalid", "session_revoked", "session_expired", "identity_mismatch", "revision_mismatch", "clock_anomaly", "already_consumed", "quota_exceeded"]);
+const resultSchema = z.discriminatedUnion("status", [z.strictObject({ status: z.literal("denied"), reason: sessionServiceDenialSchema }),
   z.strictObject({ status: z.literal("succeeded"), principal: principalSchema })]);
 export type SessionServiceResult = z.infer<typeof resultSchema>;
 const responseClaimsSchema = z.strictObject({ codec_version: z.literal(1), audience: z.literal("dona.bff.web-session-response"),

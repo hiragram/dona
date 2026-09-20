@@ -70,7 +70,7 @@ test("実UDSからsession nonceと監査を確定し再送を拒否する", asyn
   const response = await call(f.socket); assert.equal(response, fixture.response_proof);
   assert.equal(f.readState().used_nonces.length, 1); assert.equal(f.audit.verify().sequence, sequence + 1);
   const duplicate = await call(f.socket);
-  assert.deepEqual(JSON.parse(Buffer.from(duplicate.split(".")[0]!, "base64url").toString()).result, { status: "denied" });
+  assert.deepEqual(JSON.parse(Buffer.from(duplicate.split(".")[0]!, "base64url").toString()).result, { status: "denied", reason: "already_consumed" });
   assert.equal(f.readState().used_nonces.length, 1); assert.equal(f.audit.verify().sequence, sequence + 2);
   const persisted = JSON.stringify(f.db.prepare("SELECT record_json FROM security_audit_records").all());
   assert.ok(!persisted.includes(fixture.request_proof) && !persisted.includes(fixture.input.context));

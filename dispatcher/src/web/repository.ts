@@ -268,7 +268,7 @@ export class WebAuthRepository {
     });
   }
 
-  /** Authenticated BFF reports inactive IdP state for this cookie-bound token.
+  /** Authenticated BFF reports inactive/invalid IdP identity for this bound token.
    * The result remains a denial; payload deletion and audit commit together. */
   revokeInactiveSession(transactionId: string, sessionRef: string, cookie: WebIndexCandidate): WebStoreResult {
     const candidate = indexes([cookie])[0]!;

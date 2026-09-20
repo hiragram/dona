@@ -63,6 +63,11 @@ jobs:
         run: npm ci
         working-directory: ${{ matrix.component }}
 
+      - name: Install Dispatcher dependencies for Web integration
+        if: matrix.component == 'sources/web'
+        run: npm ci
+        working-directory: dispatcher
+
       - name: Run tests
         run: npm test
         working-directory: ${{ matrix.component }}
@@ -74,3 +79,7 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: ${{ matrix.component }}
+
+      - name: Verify Web integration
+        if: matrix.component == 'sources/web'
+        run: npm run test:web-integration

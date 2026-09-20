@@ -94,3 +94,17 @@ test("nonce保持数の上限を拒否し保護時刻で期限切れだけ除去
  assert.throws(()=>prepareSessionIngress(state,context.token,"GET","/api/session",Buffer.alloc(0),"2026-09-19T00:00:00.000Z",lookup));
  assert.throws(()=>prepareSessionIngress(state,context.token,"GET","/api/session",Buffer.alloc(0),"invalid",lookup));
 });
+
+test("署名済みsession bindingから現行revision失効を分類し権限を付与しない",t=>{
+ for(const change of ["state","revoke_generation","identity_binding_revision","authz_revision","bff_generation"] as const){
+  const f=setup(t);activeSession(f);const state=f.readState();
+  if(change==="state")state.principals[0]!.state="revoked";
+  else if(change==="bff_generation")state.bff_generation++;
+  else state.principals[0]![change]++;
+  const plan=prepareSessionIngress(state,context.token,"GET","/api/session",Buffer.alloc(0),contexts.now,lookup);
+  assert.deepEqual(plan.result,{status:"denied",reason:change==="identity_binding_revision" || change==="authz_revision"?"revision_mismatch":"session_revoked"});
+  assert.equal(plan.next.used_nonces.length,0);
+  const altered=context.token+"x";
+  assert.deepEqual(prepareSessionIngress(state,altered,"GET","/api/session",Buffer.alloc(0),contexts.now,lookup).result,{status:"denied",reason:"proof_invalid"});
+ }
+});
