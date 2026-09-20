@@ -921,14 +921,19 @@ describe("UpdateController isolated end-to-end", () => {
       capture.write("stderr", Buffer.from(`failure-${index}`));
       capture.finish(true);
     }
+    const active = diagnostics.start({ request_id: requestId, attempt: claimed.attempt, step: "updater:test-active" },
+      new Date(Date.UTC(2026, 8, 2, 0, 1, 0)));
 
     const status = await f.controller.status(requestId);
-    const projected = status.diagnostics as Array<{ step: string }>;
+    const projected = status.diagnostics as Array<{ step: string; capture_state: string }>;
     assert.equal(projected.length, 32);
-    assert.equal(status.diagnostics_total_count, 40);
-    assert.equal(status.diagnostics_omitted_count, 8);
-    assert.equal(projected[0]?.step, "updater:test-39");
-    assert.equal(projected.at(-1)?.step, "updater:test-8");
+    assert.equal(status.diagnostics_total_count, 41);
+    assert.equal(status.diagnostics_omitted_count, 9);
+    assert.equal(projected[0]?.step, "updater:test-active");
+    assert.equal(projected[0]?.capture_state, "capturing");
+    assert.equal(projected[1]?.step, "updater:test-39");
+    assert.equal(projected.at(-1)?.step, "updater:test-9");
+    active.finish(false);
     f.database.close();
   });
 

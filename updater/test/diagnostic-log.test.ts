@@ -305,6 +305,23 @@ test("keeps a later event safe prefix behind intervening output during cross-eve
   }
 });
 
+test("keeps safe text between multiple redactions at its later event position", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-multiple-redacted-order" });
+    capture.write("stderr", Buffer.from("TOKEN"));
+    capture.write("stdout", Buffer.from("middle\n"));
+    capture.write("stderr", Buffer.from("=first\nsafe TOKEN=second\nend\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.ok(detail.indexOf("[REDACTED_STREAM]") < detail.indexOf("[stdout] middle"), detail);
+    assert.ok(detail.indexOf("[stdout] middle") < detail.indexOf("[stderr] \nsafe"), detail);
+    assert.ok(detail.indexOf("[stderr] \nsafe") < detail.lastIndexOf("[REDACTED_STREAM]"), detail);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("redacts a raw PEM private key block across chunk boundaries", async () => {
   const f = await fixture();
   try {

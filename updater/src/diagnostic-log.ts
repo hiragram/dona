@@ -467,16 +467,6 @@ export class DiagnosticLogStore {
       if (original === redacted.text) {
         for (const entry of consumed) queueText(entry.event, entry.source);
       } else if (redacted.text) {
-        let commonPrefix = 0;
-        while (commonPrefix < original.length && commonPrefix < redacted.text.length &&
-          original[commonPrefix] === redacted.text[commonPrefix]) {
-          commonPrefix += 1;
-        }
-        let commonSuffix = 0;
-        while (commonSuffix < original.length - commonPrefix && commonSuffix < redacted.text.length - commonPrefix &&
-          original[original.length - commonSuffix - 1] === redacted.text[redacted.text.length - commonSuffix - 1]) {
-          commonSuffix += 1;
-        }
         const queueOriginalRange = (start: number, end: number): void => {
           let offset = 0;
           for (const entry of consumed) {
@@ -489,20 +479,42 @@ export class DiagnosticLogStore {
             offset = entryEnd;
           }
         };
-        queueOriginalRange(0, commonPrefix);
-        const transformed = redacted.text.slice(commonPrefix, redacted.text.length - commonSuffix);
-        let owner: OrderedOutput | undefined;
-        let offset = 0;
-        for (const entry of consumed) {
-          if (commonPrefix < offset + entry.source.length) {
-            owner = entry.event;
-            break;
+        const queueTransformed = (sourceOffset: number, text: string): void => {
+          if (!text) return;
+          let offset = 0;
+          for (const entry of consumed) {
+            if (sourceOffset < offset + entry.source.length) {
+              queueText(entry.event, text);
+              return;
+            }
+            offset += entry.source.length;
           }
-          offset += entry.source.length;
+          const owner = consumed.at(-1)?.event ?? streamOutput[stream][0];
+          if (owner) queueText(owner, text);
+        };
+        const marker = /\[REDACTED(?:_[A-Z]+)?\]/g;
+        let sourceOffset = 0;
+        let outputOffset = 0;
+        let transformed = "";
+        const mapLiteral = (literal: string): void => {
+          if (!literal) return;
+          const start = original.indexOf(literal, sourceOffset);
+          if (start < 0) {
+            transformed += literal;
+            return;
+          }
+          queueTransformed(sourceOffset, transformed);
+          transformed = "";
+          queueOriginalRange(start, start + literal.length);
+          sourceOffset = start + literal.length;
+        };
+        for (const match of redacted.text.matchAll(marker)) {
+          mapLiteral(redacted.text.slice(outputOffset, match.index));
+          transformed += match[0];
+          outputOffset = match.index! + match[0].length;
         }
-        owner ??= consumed.at(-1)?.event ?? streamOutput[stream][0];
-        if (owner) queueText(owner, transformed);
-        queueOriginalRange(original.length - commonSuffix, original.length);
+        mapLiteral(redacted.text.slice(outputOffset));
+        queueTransformed(sourceOffset, transformed);
       }
       for (const event of streamOutput[stream]) {
         if (event.remainingSource.length > 0) break;

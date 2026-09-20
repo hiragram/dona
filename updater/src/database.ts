@@ -440,7 +440,8 @@ export class UpdateDatabase {
     if (limit !== undefined) {
       if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("diagnostic_log_limit_invalid");
       return this.db.prepare(`SELECT * FROM update_diagnostic_logs WHERE request_id = ?
-        ORDER BY finalized_at DESC, log_id DESC LIMIT ?`).all(requestId, limit) as DiagnosticLogRow[];
+        ORDER BY (capture_state = 'capturing') DESC, COALESCE(finalized_at, created_at) DESC, log_id DESC LIMIT ?`)
+        .all(requestId, limit) as DiagnosticLogRow[];
     }
     return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
       .all(requestId) as DiagnosticLogRow[];
