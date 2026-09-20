@@ -11,6 +11,9 @@ test("cookieは固定属性とcanonicalな256-bit tokenだけを受け付ける"
   assert.match(header, /Secure; HttpOnly; SameSite=Strict; Max-Age=300$/); assert.ok(!header.includes("Domain"));
   assert.deepEqual(parseBrowserCookies([["Cookie", cookie]]), { session: token });
   assert.match(setBrowserCookie("login", token, 300), /SameSite=Lax/);
+  assert.match(setBrowserCookie("prelogin", token, 300), /^__Host-dona_prelogin=.*SameSite=Strict; Max-Age=300$/);
+  assert.deepEqual(parseBrowserCookies([["cookie", "__Host-dona_prelogin=" + token]]), { prelogin: token });
+  assert.throws(() => setBrowserCookie("prelogin", token, 301), WebBoundaryError);
   assert.throws(() => setBrowserCookie("login", token, 301), WebBoundaryError);
   assert.throws(() => setBrowserCookie("session", "short", 10), WebBoundaryError);
 });
@@ -21,6 +24,8 @@ test("同値を含む重複cookie・malformed cookieを選択せず拒否する"
   for (const invalid of [cookie + "\n", "bad", cookie + "; bad", "__Host-dona_session=short", "a=\"quoted\"", "a=値", "a=" + "x".repeat(8193)]) {
     assert.throws(() => parseBrowserCookies([["cookie", invalid]]), { code: "cookie_invalid" });
   }
+  assert.throws(() => parseBrowserCookies([["cookie", "__Host-dona_prelogin=" + token + "; __Host-dona_prelogin=" + token]]), { code: "cookie_ambiguous" });
+  assert.throws(() => parseBrowserCookies([["cookie", "__Host-dona_prelogin=short"]]), { code: "cookie_invalid" });
   assert.deepEqual(parseBrowserCookies([]), {});
 });
 test("Host・proxy spoof・Origin・CSRFの不一致を拒否する", () => {

@@ -37,6 +37,6 @@ logoutは一回だけwriteし、signed成功後に同じcookie/sessionの失効�
 
 ## 検証と残る範囲
 
-controller unit 15件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続する6件を実行する。同じcommandが固定SQLite identity extensionのnative build、結合testの型検査、実行を順に行い、既存build成果物に依存しない。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
+controller unit 15件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続するsession系6件に加え、[login接続](web-login-controller.md)の結合testを実行する。同じcommandが固定SQLite identity extensionのnative build、結合testの型検査、実行を順に行い、既存build成果物に依存しない。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
 
-IdPのHTTPS transport応答、clock/anchor、key、TLS listener分類はfixtureであり、実IdP・WebAuthn・browser・Keychain・productionのE2Eではない。login開始/callback、UI、TLS/proxy、operator provisioning、保護native broker、runtime/release接続と後続command/read/approval routeは残る。このcontrollerだけで#141やEpic全体を完了扱いしない。
+IdPのHTTPS transport応答、clock/anchor、key、TLS listener分類はfixtureであり、実IdP・WebAuthn・browser・Keychain・productionのE2Eではない。[login開始/callback](web-login-controller.md)は別controllerが担当する。UI、TLS/proxy、operator provisioning、保護native broker、runtime/release接続と後続command/read/approval routeは残る。このcontrollerだけで#141やEpic全体を完了扱いしない。

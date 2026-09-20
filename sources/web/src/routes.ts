@@ -11,6 +11,8 @@ export interface WebRoute {
 interface Definition extends Omit<WebRoute,"resource"> { pattern: RegExp; resourceKind?: "job" | "approval" }
 const definitions: readonly Definition[] = [
   {id:"login",method:"GET",pattern:/^\/login$/,gate:"public",capability:"authentication",activity:"none"},
+  {id:"prelogin_csrf",method:"POST",pattern:/^\/api\/login\/csrf$/,gate:"public",capability:"authentication",activity:"none"},
+  {id:"login_start",method:"POST",pattern:/^\/api\/login\/start$/,gate:"public",capability:"authentication",activity:"none"},
   {id:"login_callback",method:"GET",pattern:/^\/oidc\/callback$/,gate:"login_callback",capability:"authentication",activity:"none"},
   {id:"login_complete",method:"GET",pattern:/^\/login\/complete$/,gate:"public",capability:"authentication",activity:"none"},
   {id:"dashboard",method:"GET",pattern:/^\/$/,gate:"session",capability:"authentication",activity:"user_navigation"},
