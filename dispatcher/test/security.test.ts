@@ -16,6 +16,7 @@ import "./approval/native-keychain-cas.js";
 import "./approval/used-transactions.js";
 import "./approval/metadata-tree.js";
 import "./approval/metadata-store.js";
+import "./approval/record-codec.js";
 import "./web/session-service.js";
 import "./approval/protected-heads.js";
 import "./web/auth-read-service.js";
