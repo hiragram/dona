@@ -25,6 +25,7 @@ export interface DiagnosticLogIndex {
   diagnosticLogs(requestId: string): DiagnosticLogRow[];
   capturingDiagnosticLogs(): DiagnosticLogRow[];
   interruptDiagnosticLog(logId: string, errorCode: string, at?: Date): void;
+  diagnosticRetentionLogs(): DiagnosticLogRow[];
   diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[];
   markDiagnosticPurged(logId: string, at?: Date): void;
 }
@@ -49,6 +50,10 @@ class StreamingRedactor {
   finish(): string {
     this.pending += this.decoder.end();
     return this.drain(true);
+  }
+
+  hasPending(): boolean {
+    return this.pending.length > 0 || this.droppingSensitive;
   }
 
   private drain(final: boolean): string {
@@ -314,14 +319,68 @@ export class DiagnosticLogStore {
         offset = end;
       }
     };
+    interface OrderedOutput {
+      stream: "stdout" | "stderr";
+      text: string;
+      resolved: boolean;
+    }
+    const orderedOutput: OrderedOutput[] = [];
+    const openOutput: Partial<Record<"stdout" | "stderr", OrderedOutput>> = {};
+    let orderedOutputBytes = 0;
+    let orderedOutputTruncated = false;
+    const queueText = (event: OrderedOutput, text: string): void => {
+      if (!text || orderedOutputTruncated) return;
+      const encoded = Buffer.from(text, "utf8");
+      const remaining = Math.max(0, this.perLogLimitBytes - bytes - orderedOutputBytes);
+      const selected = encoded.subarray(0, remaining);
+      event.text += selected.toString("utf8");
+      orderedOutputBytes += selected.length;
+      if (selected.length < encoded.length) orderedOutputTruncated = true;
+    };
+    const flushOrderedOutput = (): void => {
+      while (orderedOutput[0]?.resolved) {
+        const next = orderedOutput.shift()!;
+        orderedOutputBytes -= Buffer.byteLength(next.text, "utf8");
+        append(next.stream, next.text);
+      }
+      if (orderedOutput.length === 0 && orderedOutputTruncated) truncated = true;
+    };
+    const redactInOrder = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      const event = openOutput[stream] ?? { stream, text: "", resolved: false };
+      if (!openOutput[stream]) {
+        openOutput[stream] = event;
+        orderedOutput.push(event);
+      }
+      queueText(event, redactors[stream].write(chunk));
+      if (!redactors[stream].hasPending()) {
+        event.resolved = true;
+        delete openOutput[stream];
+      }
+      flushOrderedOutput();
+    };
+    const finishRedactors = (): void => {
+      for (const stream of ["stdout", "stderr"] as const) {
+        const text = redactors[stream].finish();
+        const event = openOutput[stream];
+        if (event) {
+          queueText(event, text);
+          event.resolved = true;
+          delete openOutput[stream];
+        } else if (text) {
+          const completed = { stream, text: "", resolved: true };
+          orderedOutput.push(completed);
+          queueText(completed, text);
+        }
+      }
+      flushOrderedOutput();
+    };
     let finished = false;
     return {
-      write: (stream, chunk) => append(stream, redactors[stream].write(chunk)),
+      write: redactInOrder,
       finish: (commandFailed) => {
         if (finished) return undefined;
         finished = true;
-        append("stdout", redactors.stdout.finish());
-        append("stderr", redactors.stderr.finish());
+        finishRedactors();
         if (!commandFailed) {
           try { fs.closeSync(descriptor); } catch { /* best effort */ }
           let removed = false;
@@ -451,6 +510,20 @@ export class DiagnosticLogStore {
   enforceRetention(now: Date, retentionDays: number, aggregateLimitBytes: number): void {
     if (!this.index) return;
     const cutoff = new Date(now.getTime() - retentionDays * 86_400_000);
+    for (const row of this.index.diagnosticRetentionLogs()) {
+      if (!row.relative_ref) continue;
+      try {
+        fs.lstatSync(this.resolveRow(row));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+        try {
+          // Persist the observed absence before removing its durable DB
+          // reference, then exclude the missing file from quota accounting.
+          this.fsyncLogsDirectory();
+          this.index.markDiagnosticPurged(row.log_id, now);
+        } catch { /* a later maintenance pass will reconcile it */ }
+      }
+    }
     for (const row of this.index.diagnosticRetentionCandidates(cutoff, aggregateLimitBytes)) {
       let directoryEntryMustBeSynced = false;
       try {

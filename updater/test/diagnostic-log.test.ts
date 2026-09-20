@@ -206,6 +206,34 @@ test("disk quota is independent from memory capture and reports truncation", asy
   }
 });
 
+test("preserves stderr and stdout arrival order while redaction carry is pending", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-order" });
+    capture.write("stderr", Buffer.from("first"));
+    capture.write("stdout", Buffer.from("second\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.ok(detail.indexOf("[stderr] first") < detail.indexOf("[stdout] second"), detail);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("bounds ordered output while an earlier stream keeps redaction carry pending", async () => {
+  const f = await fixture(4_096);
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-order-limit" });
+    capture.write("stderr", Buffer.from("first"));
+    capture.write("stdout", Buffer.from(`${"x".repeat(16_384)}\n`));
+    const result = capture.finish(true)!;
+    assert.equal(result.capture_state, "truncated");
+    assert.equal(result.byte_size, 4_096);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("timeout cleanup and signal exit both finalize their bound diagnostics", async () => {
   const f = await fixture();
   const pidPath = path.join(f.root, "diagnostic-child.pid");
@@ -335,7 +363,7 @@ test("write, atomic finalize, and read faults retain the command failure state",
   try {
     const writeCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-ci-write" });
     fsSync.writeSync = (() => { throw Object.assign(new Error("full"), { code: "ENOSPC" }); }) as typeof fsSync.writeSync;
-    writeCapture.write("stderr", Buffer.from("original command failure"));
+    writeCapture.write("stderr", Buffer.from("original command failure\n"));
     fsSync.writeSync = originalWrite;
     assert.equal(writeCapture.finish(true)?.error_code, "diagnostic_write_failed");
 
@@ -617,6 +645,31 @@ test("aggregate retention keeps the newest bounded set and records older logs as
     const states = f.database.diagnosticLogs(f.claimed.request_id).map(({ capture_state }) => capture_state);
     assert.equal(states.filter((state) => state === "complete").length, 1);
     assert.equal(states.filter((state) => state === "purged").length, 2);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("aggregate retention excludes missing files before selecting quota victims", async () => {
+  const f = await fixture();
+  try {
+    for (const step of ["dispatcher:npm-old", "dispatcher:npm-new"]) {
+      const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step });
+      capture.write("stderr", Buffer.from(`failure-${step}`));
+      capture.finish(true);
+    }
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed", {
+      last_error_code: "pre_activation_failed",
+      last_error_message: "build failed",
+    });
+    const newestFirst = f.database.diagnosticRetentionLogs();
+    const missing = newestFirst[0]!;
+    const retained = newestFirst[1]!;
+    fsSync.unlinkSync(path.join(f.policy.control_root, "diagnostics", missing.relative_ref!));
+    f.store.enforceRetention(new Date(), 9_999, retained.byte_size);
+    const rows = f.database.diagnosticLogs(f.claimed.request_id);
+    assert.equal(rows.find(({ log_id }) => log_id === missing.log_id)?.capture_state, "purged");
+    assert.equal(rows.find(({ log_id }) => log_id === retained.log_id)?.capture_state, "complete");
   } finally {
     f.database.close();
   }

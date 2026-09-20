@@ -394,11 +394,15 @@ export class UpdateDatabase {
     if (changed !== 1) throw new Error("diagnostic_log_interrupt_state_mismatch");
   }
 
-  diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[] {
-    const rows = this.db.prepare(`SELECT logs.* FROM update_diagnostic_logs logs
+  diagnosticRetentionLogs(): DiagnosticLogRow[] {
+    return this.db.prepare(`SELECT logs.* FROM update_diagnostic_logs logs
       JOIN update_requests requests ON requests.request_id = logs.request_id
       WHERE logs.capture_state IN ('complete','truncated','write_failed') AND requests.completed_at IS NOT NULL
       ORDER BY logs.finalized_at DESC, logs.log_id DESC`).all() as DiagnosticLogRow[];
+  }
+
+  diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[] {
+    const rows = this.diagnosticRetentionLogs();
     let retainedBytes = 0;
     return rows.filter((row) => {
       const expired = !!row.finalized_at && row.finalized_at < cutoff.toISOString();
