@@ -44,21 +44,24 @@ class StreamingRedactor {
 
   constructor(private readonly privateRoots: readonly string[] = []) {}
 
-  write(chunk: Buffer): string {
-    this.pending += this.decoder.write(chunk);
-    return this.drain(false);
+  write(chunk: Buffer): RedactedChunk {
+    const decoded = this.decoder.write(chunk);
+    this.pending += decoded;
+    return { ...this.drain(false), decoded };
   }
 
-  finish(): string {
-    this.pending += this.decoder.end();
-    return this.drain(true);
+  finish(): RedactedChunk {
+    const decoded = this.decoder.end();
+    this.pending += decoded;
+    return { ...this.drain(true), decoded };
   }
 
   hasPending(): boolean {
     return this.pending.length > 0 || this.droppingSensitive;
   }
 
-  private drain(final: boolean): string {
+  private drain(final: boolean): Omit<RedactedChunk, "decoded"> {
+    const initialLength = this.pending.length;
     let output = "";
     while (this.pending.length > 0) {
       if (this.droppingSensitive) {
@@ -69,7 +72,7 @@ class StreamingRedactor {
           // The whole carried value is sensitive. Drop it immediately so an
           // unterminated quoted value cannot grow memory without bound.
           this.pending = "";
-          return output;
+          return { text: output, consumedCharacters: initialLength };
         }
         output += "[REDACTED_STREAM]";
         this.pending = this.pending.slice(boundary + (this.droppingQuote ? 1 : 0));
@@ -108,10 +111,17 @@ class StreamingRedactor {
         this.droppingQuote = undefined;
         continue;
       }
+      const credentialUri = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>/@:]+:[^\s"'<>/@]*@[^\s"'<>]*/i.exec(this.pending);
+      if (credentialUri?.index !== undefined) {
+        output += redactText(this.pending.slice(0, credentialUri.index), Number.MAX_SAFE_INTEGER);
+        output += "[REDACTED_STREAM]";
+        this.pending = this.pending.slice(credentialUri.index + credentialUri[0].length);
+        continue;
+      }
       if (final) {
         output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
         this.pending = "";
-        return output;
+        return { text: output, consumedCharacters: initialLength };
       }
       let configuredCarryStart = this.pending.length;
       for (const root of this.privateRoots) {
@@ -126,7 +136,7 @@ class StreamingRedactor {
       if (configuredCarryStart < this.pending.length) {
         output += redactText(this.pending.slice(0, configuredCarryStart), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(configuredCarryStart);
-        return output;
+        return { text: output, consumedCharacters: initialLength - this.pending.length };
       }
       const partialQuotedKey = /(?:^|[^a-z0-9_-])["'][a-z0-9_-]*$/i.exec(this.pending);
       if (partialQuotedKey?.index !== undefined) {
@@ -138,7 +148,7 @@ class StreamingRedactor {
           this.droppingSensitive = true;
           this.droppingQuote = undefined;
         }
-        return output;
+        return { text: output, consumedCharacters: initialLength - this.pending.length };
       }
       let lastBoundary = -1;
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
@@ -154,14 +164,14 @@ class StreamingRedactor {
             this.droppingSensitive = true;
             this.droppingQuote = undefined;
           }
-          return output;
+          return { text: output, consumedCharacters: initialLength - this.pending.length };
         }
         output += redactText(safe, Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(lastBoundary + 1);
         continue;
       }
-      if (this.pending.length <= maxCarryCharacters) return output;
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      if (this.pending.length <= maxCarryCharacters) return { text: output, consumedCharacters: initialLength - this.pending.length };
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*)\s*[:=]|\b[a-z][a-z0-9+.-]*:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -172,7 +182,7 @@ class StreamingRedactor {
       output += redactText(this.pending.slice(0, emitLength), Number.MAX_SAFE_INTEGER);
       this.pending = this.pending.slice(emitLength);
     }
-    return output;
+    return { text: output, consumedCharacters: initialLength - this.pending.length };
   }
 
   private findClosingQuote(quote: "\"" | "'"): number {
@@ -185,6 +195,12 @@ class StreamingRedactor {
     this.quoteBackslashParity = escaped;
     return -1;
   }
+}
+
+interface RedactedChunk {
+  text: string;
+  decoded: string;
+  consumedCharacters: number;
 }
 
 export interface DiagnosticCaptureSession {
@@ -359,10 +375,11 @@ export class DiagnosticLogStore {
     interface OrderedOutput {
       stream: "stdout" | "stderr";
       text: string;
+      remainingSource: string;
       resolved: boolean;
     }
     const orderedOutput: OrderedOutput[] = [];
-    const openOutput: Partial<Record<"stdout" | "stderr", OrderedOutput>> = {};
+    const streamOutput: Record<"stdout" | "stderr", OrderedOutput[]> = { stdout: [], stderr: [] };
     let orderedOutputBytes = 0;
     let orderedOutputTruncated = false;
     const queueText = (event: OrderedOutput, text: string): void => {
@@ -382,32 +399,50 @@ export class DiagnosticLogStore {
       }
       if (orderedOutput.length === 0 && orderedOutputTruncated) truncated = true;
     };
-    const redactInOrder = (stream: "stdout" | "stderr", chunk: Buffer): void => {
-      const event = openOutput[stream] ?? { stream, text: "", resolved: false };
-      if (!openOutput[stream]) {
-        openOutput[stream] = event;
-        orderedOutput.push(event);
+    const applyRedacted = (stream: "stdout" | "stderr", redacted: RedactedChunk): void => {
+      let remaining = redacted.consumedCharacters;
+      const consumed: Array<{ event: OrderedOutput; source: string }> = [];
+      for (const event of streamOutput[stream]) {
+        if (remaining <= 0) break;
+        const length = Math.min(remaining, event.remainingSource.length);
+        if (length > 0) {
+          consumed.push({ event, source: event.remainingSource.slice(0, length) });
+          event.remainingSource = event.remainingSource.slice(length);
+          remaining -= length;
+        }
       }
-      queueText(event, redactors[stream].write(chunk));
-      if (!redactors[stream].hasPending()) {
+      const original = consumed.map((entry) => entry.source).join("");
+      if (original === redacted.text) {
+        for (const entry of consumed) queueText(entry.event, entry.source);
+      } else if (redacted.text) {
+        const first = consumed[0]?.event ?? streamOutput[stream][0];
+        if (first) queueText(first, redacted.text);
+      }
+      for (const event of streamOutput[stream]) {
+        if (event.remainingSource.length > 0) break;
         event.resolved = true;
-        delete openOutput[stream];
       }
+      while (streamOutput[stream][0]?.resolved) streamOutput[stream].shift();
       flushOrderedOutput();
+    };
+    const redactInOrder = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      const redacted = redactors[stream].write(chunk);
+      const event = { stream, text: "", remainingSource: redacted.decoded, resolved: redacted.decoded.length === 0 };
+      orderedOutput.push(event);
+      if (!event.resolved) streamOutput[stream].push(event);
+      applyRedacted(stream, redacted);
     };
     const finishRedactors = (): void => {
       for (const stream of ["stdout", "stderr"] as const) {
-        const text = redactors[stream].finish();
-        const event = openOutput[stream];
-        if (event) {
-          queueText(event, text);
-          event.resolved = true;
-          delete openOutput[stream];
-        } else if (text) {
-          const completed = { stream, text: "", resolved: true };
-          orderedOutput.push(completed);
-          queueText(completed, text);
+        const redacted = redactors[stream].finish();
+        if (redacted.decoded) {
+          const event = { stream, text: "", remainingSource: redacted.decoded, resolved: false };
+          orderedOutput.push(event);
+          streamOutput[stream].push(event);
         }
+        applyRedacted(stream, redacted);
+        for (const event of streamOutput[stream]) event.resolved = true;
+        streamOutput[stream] = [];
       }
       flushOrderedOutput();
     };
