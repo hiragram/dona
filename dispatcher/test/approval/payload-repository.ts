@@ -1,3 +1,5 @@
+import { ApprovalClockHistory, approvalClockHistoryResource } from "../../src/approval/clock-history.js";
+import { ApprovalHistoryTransaction } from "../../src/approval/history-transaction.js";
 import { AuditRepository } from "../../src/audit/repository.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -49,7 +51,7 @@ function fixture(t:{after(fn:()=>void):void},initialize=true){
   return {...f,recordMutation:new ApprovalRecordMutation(f.db,scope),records:new ApprovalRecordRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys,scope),
     payloadMutation:new ApprovalPayloadMutation(f.db,scope),payloads:new ApprovalPayloadRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys,scope),payloadSql:new ApprovalPayloadSql(f.db,scope)};
 }
-type Fixture=ReturnType<typeof fixture>;
+type Fixture=Omit<ReturnType<typeof fixture>,"transaction"> & {transaction:Pick<ReturnType<typeof fixture>["transaction"],"runPrepared">};
 function sealed(binding:ApprovalPayloadBinding,mark:ClockMark){
   const envelope=sealApprovalPayload(text,binding,wrappingKey,contentKey,mark);
   const metadata:ApprovalPayloadMetadata={codec_version:1,binding,consume_id:binding.owner_kind==="attempt"?"consume":null,
@@ -308,4 +310,22 @@ test("同一transactionの読取でもSQL-only改変は監査reserve前に拒否
   }),ApprovalTransactionError);
   assert.equal(f.anchors.calls.length,before);
  }
+});
+
+test("record・payload・過去clockの三rootをcreate/consume/削除で同一commitする",t=>{
+ const raw=fixture(t);
+ raw.transaction.runPrepared("fixture_clock_root",()=>({event,resource_commitments:[{scope:auditScope,resource_id:approvalClockHistoryResource,
+  resource_digest:emptyMetadataRoot({...scope,collection:"approval_clock_marks_v1"})}],mutation:()=>null}));
+ const f={...raw,transaction:new ApprovalHistoryTransaction(raw.db,raw.providers,scope)},history=new ApprovalClockHistory(raw.db,scope);
+ create(f);consume(f);
+ const audit=new AuditRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys);
+ audit.readVerifiedState(state=>{
+  const request=f.records.readInState(state,"request","request")!,attempt=f.records.readInState(state,"execution","attempt")!;
+  assert.equal(history.readInState(state,request.row.clock_transaction_id)!.effective_utc,request.row.created_at);
+  assert.equal(history.readInState(state,attempt.row.clock_transaction_id)!.effective_utc,attempt.row.claimed_at);
+  assert.equal(f.payloads.inspectInState(state,"request","request")!.secret.status,"deleted");
+  assert.equal(f.payloads.inspectInState(state,"attempt","attempt")!.secret.status,"present");return null;
+ });
+ const row=JSON.parse(f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id='consume'").pluck().get() as string);
+ assert.deepEqual(row.resource_commitments.map((r:{resource_id:string})=>r.resource_id),[approvalClockHistoryResource,"approval_payloads","approval_records"]);
 });
