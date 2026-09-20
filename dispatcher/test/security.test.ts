@@ -33,3 +33,5 @@ import "./approval/record-mutation.js";
 import "./approval/payload-protection.js";
 
 import "./approval/payload-metadata.js";
+
+import "./approval/payload-repository.js";
