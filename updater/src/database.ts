@@ -94,6 +94,7 @@ export class UpdateDatabase {
   private readonly db: Database.Database;
   private readonly readonlyMode: boolean;
   private readonly diagnosticLogsAvailable: boolean;
+  private readonly runtimeOperationsAvailable: boolean;
 
   constructor(databasePath: string, options: UpdateDatabaseOptions = {}) {
     this.readonlyMode = options.readonly === true;
@@ -109,10 +110,18 @@ export class UpdateDatabase {
     }
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version > 7) {
+      this.db.close();
+      throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+    }
     if (options.readonly) this.db.pragma("query_only = ON");
     else this.migrate();
     this.diagnosticLogsAvailable = this.db.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'",
+    ).get() !== undefined;
+    this.runtimeOperationsAvailable = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_operations'",
     ).get() !== undefined;
   }
 
@@ -801,11 +810,13 @@ export class UpdateDatabase {
   }
 
   runtimeOperation(requestId: string, kind: RuntimeOperationKind): RuntimeOperationRow | undefined {
+    if (!this.runtimeOperationsAvailable) return undefined;
     return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? AND kind = ?")
       .get(requestId, kind) as RuntimeOperationRow | undefined;
   }
 
   runtimeOperations(requestId: string): RuntimeOperationRow[] {
+    if (!this.runtimeOperationsAvailable) return [];
     return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? ORDER BY created_at, operation_id")
       .all(requestId) as RuntimeOperationRow[];
   }

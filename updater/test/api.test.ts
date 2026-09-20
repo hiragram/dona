@@ -98,8 +98,28 @@ test("startup lock serializes stale socket recovery between concurrent servers",
     assert.equal(rejected.length, 1);
     assert.match(String(rejected[0]!.reason), /updater_startup_lock_active/);
     assert.equal((await fs.lstat(socketPath)).isSocket(), true);
+    assert.equal((await request(socketPath)).status, 503);
   } finally {
     if (fulfilled[0]) await releaseUpdaterSocket(fulfilled[0].value);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup lock rejects incomplete metadata and distinguishes a reused PID", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-identity-"));
+  const socketPath = path.join(root, "updater.sock");
+  const lockPath = path.join(root, "updater.start.lock");
+  try {
+    await fs.writeFile(lockPath, "{", { mode: 0o600 });
+    await assert.rejects(reserveUpdaterSocket(socketPath), /updater_startup_lock_invalid/);
+    assert.equal(await fs.readFile(lockPath, "utf8"), "{");
+
+    await fs.unlink(lockPath);
+    await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, process_start: "reused-pid", token: "stale" }), { mode: 0o600 });
+    await fs.writeFile(socketPath, "stale", { mode: 0o600 });
+    const reservation = await reserveUpdaterSocket(socketPath);
+    await releaseUpdaterSocket(reservation);
+  } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });

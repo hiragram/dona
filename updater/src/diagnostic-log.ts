@@ -293,7 +293,10 @@ export class DiagnosticLogStore {
     };
     try {
       this.ensurePrivateDirectory(this.root);
+      this.fsyncDirectory(path.dirname(this.root));
       this.ensurePrivateDirectory(this.logsRoot);
+      this.fsyncDirectory(this.root);
+      this.fsyncLogsDirectory();
     } catch {
       const failed = { ...initial, relative_ref: null, error_code: "diagnostic_root_unavailable" };
       return { write() {}, finish: (commandFailed) => {
@@ -379,6 +382,7 @@ export class DiagnosticLogStore {
       resolved: boolean;
     }
     const orderedOutput: OrderedOutput[] = [];
+    const maxOrderedOutputEvents = 4_096;
     const streamOutput: Record<"stdout" | "stderr", OrderedOutput[]> = { stdout: [], stderr: [] };
     let orderedOutputBytes = 0;
     let orderedOutputTruncated = false;
@@ -427,7 +431,8 @@ export class DiagnosticLogStore {
     };
     const redactInOrder = (stream: "stdout" | "stderr", chunk: Buffer): void => {
       const redacted = redactors[stream].write(chunk);
-      if (orderedOutputTruncated) {
+      if (orderedOutputTruncated || orderedOutput.length >= maxOrderedOutputEvents) {
+        orderedOutputTruncated = true;
         applyRedacted(stream, redacted);
         return;
       }
@@ -589,7 +594,14 @@ export class DiagnosticLogStore {
     for (const row of this.index.diagnosticRetentionLogs()) {
       if (!row.relative_ref) continue;
       try {
-        fs.lstatSync(this.resolveRow(row));
+        const file = this.resolveRow(row);
+        const stats = fs.lstatSync(file);
+        if (stats.size !== row.byte_size) {
+          if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid?.()) continue;
+          fs.unlinkSync(file);
+          this.fsyncLogsDirectory();
+          this.index.markDiagnosticPurged(row.log_id, now);
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
         try {
@@ -633,7 +645,11 @@ export class DiagnosticLogStore {
   }
 
   private fsyncLogsDirectory(): void {
-    const directory = fs.openSync(this.logsRoot, fs.constants.O_RDONLY);
+    this.fsyncDirectory(this.logsRoot);
+  }
+
+  private fsyncDirectory(pathname: string): void {
+    const directory = fs.openSync(pathname, fs.constants.O_RDONLY);
     try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   }
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
@@ -51,28 +52,51 @@ function processAlive(pid: number): boolean {
   }
 }
 
+function processStartIdentity(pid: number): string | null {
+  if (!processAlive(pid)) return null;
+  try {
+    const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
 async function acquireStartupLock(controlRoot: string): Promise<UpdaterStartupLock> {
   const lockPath = path.join(controlRoot, "updater.start.lock");
   const token = randomUUID();
+  const processStart = processStartIdentity(process.pid);
+  if (!processStart) throw new Error("updater_startup_identity_unavailable");
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const temporary = `${lockPath}.${token}.tmp`;
     try {
-      const handle = await fs.open(lockPath, "wx", 0o600);
+      const handle = await fs.open(temporary, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, token })}\n`);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, process_start: processStart, token })}\n`);
         await handle.sync();
       } finally {
         await handle.close();
       }
+      await fs.link(temporary, lockPath);
+      await fs.unlink(temporary);
       return { path: lockPath, token };
     } catch (error) {
+      try { await fs.unlink(temporary); } catch { /* best effort */ }
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    let owner: { pid?: unknown; token?: unknown } = {};
-    try { owner = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown; token?: unknown }; }
+    let owner: { pid?: unknown; process_start?: unknown; token?: unknown };
+    try { owner = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown; process_start?: unknown; token?: unknown }; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error("updater_startup_lock_invalid");
     }
-    if (typeof owner.pid === "number" && processAlive(owner.pid)) throw new Error("updater_startup_lock_active");
+    if (typeof owner.pid !== "number" || typeof owner.process_start !== "string" || typeof owner.token !== "string") {
+      throw new Error("updater_startup_lock_invalid");
+    }
+    if (processStartIdentity(owner.pid) === owner.process_start) throw new Error("updater_startup_lock_active");
     const stalePath = `${lockPath}.${token}.stale`;
     try {
       await fs.rename(lockPath, stalePath);
@@ -98,7 +122,9 @@ export async function reserveUpdaterSocket(socketPath: string): Promise<UpdaterS
   await fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(socketPath), 0o700);
   const startupLock = await acquireStartupLock(path.dirname(socketPath));
-  const server = http.createServer();
+  const server = http.createServer((_request, response) => {
+    send(response, 503, { schema_version: 1, status: "starting", service: "updater" });
+  });
   let ownsSocket = false;
   try {
     try {
@@ -179,6 +205,7 @@ export class UpdaterApi {
       this.ownsSocket = true;
       this.database.acquireWriterLease(this.writerToken);
       this.writerLeaseHeld = true;
+      this.server.removeAllListeners("request");
       this.server.on("request", (request, response) => void this.handle(request, response));
     } catch (error) {
       if (this.activeReservation) {

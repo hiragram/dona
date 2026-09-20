@@ -87,20 +87,32 @@ describe("UpdateDatabase", () => {
     const raw = new Database(databasePath);
     raw.exec(`
       CREATE TABLE update_requests (request_id TEXT PRIMARY KEY, state TEXT NOT NULL);
-      PRAGMA user_version = 4;
+      PRAGMA user_version = 1;
     `);
     raw.close();
 
     const reader = new UpdateDatabase(databasePath, { readonly: true });
     assert.equal(reader.accessMode(), "read_only");
     assert.deepEqual(reader.diagnosticLogs("upd_01m1es03xy5cf8d9pm5cwx4srv"), []);
+    assert.deepEqual(reader.runtimeOperations("upd_01m1es03xy5cf8d9pm5cwx4srv"), []);
     assert.throws(() => reader.assertReadableWritable(), /readonly|read-only/i);
     reader.close();
 
     const unchanged = new Database(databasePath, { readonly: true });
-    assert.equal(unchanged.pragma("user_version", { simple: true }), 4);
+    assert.equal(unchanged.pragma("user_version", { simple: true }), 1);
     assert.equal(unchanged.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'").get(), undefined);
     unchanged.close();
+  });
+
+  test("read-only open rejects a database schema newer than this binary", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    await fs.mkdir(policy.control_root, { recursive: true });
+    const raw = new Database(databasePath);
+    raw.pragma("user_version = 8");
+    raw.close();
+    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 7/);
   });
 
   test("binds idempotent approval to the exact plan and detects payload mismatch", async () => {

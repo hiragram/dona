@@ -282,6 +282,11 @@ test("bounds ordered output while an earlier stream keeps redaction carry pendin
     const result = capture.finish(true)!;
     assert.equal(result.capture_state, "truncated");
     assert.equal(result.byte_size, 4_096);
+
+    const redactedCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-redacted-event-limit" });
+    redactedCapture.write("stderr", Buffer.from("first"));
+    for (let index = 0; index < 10_000; index += 1) redactedCapture.write("stdout", Buffer.from("TOKEN=secret"));
+    assert.equal(redactedCapture.finish(true)?.capture_state, "truncated");
   } finally {
     f.database.close();
   }
@@ -482,7 +487,7 @@ test("open validation failure closes its descriptor and removes the managed part
     fsSync.fstatSync = originalFstat;
     fsSync.closeSync = originalClose;
     assert.equal(capture.finish(true)?.error_code, "diagnostic_open_failed");
-    assert.equal(closeCalls, 2);
+    assert.ok(closeCalls >= 2);
     const logsRoot = path.join(f.policy.control_root, "diagnostics", "logs");
     assert.deepEqual((await fs.readdir(logsRoot)).filter((entry) => entry.endsWith(".part")), []);
     const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
@@ -634,17 +639,29 @@ test("unsafe managed root becomes write_failed without changing command failure"
 test("creates the managed logs directory before reserving a capturing row", async () => {
   const f = await fixture();
   const originalReserve = f.database.reserveDiagnosticLog.bind(f.database);
+  const syncStore = f.store as unknown as { fsyncDirectory(pathname: string): void };
+  const originalFsync = syncStore.fsyncDirectory.bind(f.store);
   let directoryExistedAtReservation = false;
+  let directoryDurableAtReservation = false;
+  let durableDirectories = 0;
   try {
+    syncStore.fsyncDirectory = (pathname) => {
+      if (pathname === f.policy.control_root || pathname === path.join(f.policy.control_root, "diagnostics") ||
+        pathname === path.join(f.policy.control_root, "diagnostics", "logs")) durableDirectories += 1;
+      originalFsync(pathname);
+    };
     f.database.reserveDiagnosticLog = ((capture) => {
       directoryExistedAtReservation = fsSync.existsSync(path.join(f.policy.control_root, "diagnostics", "logs"));
+      directoryDurableAtReservation = durableDirectories >= 3;
       return originalReserve(capture);
     }) as typeof f.database.reserveDiagnosticLog;
     const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-directory-order" });
     capture.write("stderr", Buffer.from("failure"));
     capture.finish(true);
     assert.equal(directoryExistedAtReservation, true);
+    assert.equal(directoryDurableAtReservation, true);
   } finally {
+    syncStore.fsyncDirectory = originalFsync;
     f.database.reserveDiagnosticLog = originalReserve;
     f.database.close();
   }
@@ -723,6 +740,22 @@ test("aggregate retention excludes missing files before selecting quota victims"
     const rows = f.database.diagnosticLogs(f.claimed.request_id);
     assert.equal(rows.find(({ log_id }) => log_id === missing.log_id)?.capture_state, "purged");
     assert.equal(rows.find(({ log_id }) => log_id === retained.log_id)?.capture_state, "complete");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("aggregate retention purges a file whose actual size exceeds its bound row", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-inflated" });
+    capture.write("stderr", Buffer.from("bounded failure"));
+    capture.finish(true);
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed");
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    fsSync.appendFileSync(path.join(f.policy.control_root, "diagnostics", row.relative_ref!), Buffer.alloc(8_192));
+    f.store.enforceRetention(new Date(), 9_999, row.byte_size);
+    assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]!.capture_state, "purged");
   } finally {
     f.database.close();
   }
