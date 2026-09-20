@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -19,6 +21,7 @@ import {
 } from "../../src/web/analysis-runtime.js";
 
 const start = "2026-09-20T00:00:00.000Z";
+const clock = { reserve: () => ({ effective_utc: start }) };
 const receipt: AnalysisReceipt = {
   codec_version: 1, profile: "analysis.read_only.v1", receipt_id: "receipt_1", job_id: "job_1",
   instance_id: "instance", tenant_id: "tenant", principal_id: "principal", session_generation: 1,
@@ -36,6 +39,7 @@ const current = {
   source_grant_revision: receipt.source_grant_revision, snapshot_digest: receipt.snapshot_digest,
   broker_id: receipt.broker_id, broker_generation: receipt.broker_generation,
 };
+const tokenizer = { tokenizer_id: "fixed_tokenizer", count: (_text: string) => 1 };
 
 function authorization(value: AnalysisReceipt) {
   return { receipt_id: value.receipt_id, job_id: value.job_id, instance_id: value.instance_id,
@@ -45,45 +49,50 @@ function authorization(value: AnalysisReceipt) {
     source_grant_revision: value.source_grant_revision, snapshot_digest: value.snapshot_digest,
     broker_id: value.broker_id, broker_generation: value.broker_generation };
 }
-function setup(t: test.TestContext, configured = receipt) {
+function setup(t: test.TestContext, configured = receipt, protectedClock = clock) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-runtime-"));
   const filename = path.join(directory, "runtime.sqlite");
   const db = new Database(filename); db.pragma("foreign_keys=ON"); db.pragma("journal_mode=WAL"); db.pragma("synchronous=FULL");
-  const secret = Buffer.alloc(32, 0x41); const store = new AnalysisRuntimeStore(db, secret); store.register(configured);
+  const secret = Buffer.alloc(32, 0x41); const store = new AnalysisRuntimeStore(db, secret, protectedClock); store.register(configured);
   t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return { db, filename, secret, store };
 }
 
 test("analysis profileはnetwork・shell・snapshot外filesystemとambient credentialを公開しない", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-profile-"));
-  const worker = path.join(directory, "analysis-worker"), snapshot = path.join(directory, "snapshot"), scratch = path.join(directory, "scratch");
-  fs.writeFileSync(worker, "fixture"); fs.mkdirSync(snapshot); fs.mkdirSync(scratch);
+  const worker = path.join(directory, "analysis-worker"), snapshot = path.join(directory, "snapshot"), scratchRoot = path.join(directory, "scratch-root");
+  fs.writeFileSync(worker, "fixture"); fs.mkdirSync(snapshot); fs.mkdirSync(scratchRoot);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const configured = { ...receipt, snapshot_digest: analysisSnapshotDigest(snapshot) };
   const { store } = setup(t, configured);
   const permit = store.authorizeStage(configured.receipt_id, "snapshot_open", authorization(configured), 1, start);
   const launch = authorizedAnalysisSandboxLaunch({ store, snapshot_permit: permit, current: authorization(configured),
-    worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch, now: start });
+    worker_executable: worker, snapshot_path: snapshot, scratch_root: scratchRoot, now: start });
   assert.equal(launch.executable, "/usr/bin/sandbox-exec");
   assert.equal(launch.args[2], fs.realpathSync(worker));
   assert.match(launch.args[1], /\(deny network\*\)/);
   assert.ok(launch.args[1].includes(`(allow process-exec (literal "${fs.realpathSync(worker)}"))`));
   assert.match(launch.args[1], /\(deny process-fork\)/);
+  assert.ok(launch.stdin_snapshot.byteLength > 0); assert.ok(!launch.args[1].includes(fs.realpathSync(snapshot)));
   assert.doesNotMatch(launch.args[1], /allow network|allow process\*|\/Users|\.ssh|Keychain/);
   assert.deepEqual(launch.env, { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" });
   for (const name of ["HOME", "GH_TOKEN", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"]) assert.equal(name in launch.env, false);
   assert.equal(launch.scratch_quota.maximum_bytes, configured.maximum_scratch_bytes);
-  fs.writeFileSync(path.join(scratch, "overflow"), Buffer.alloc(configured.maximum_scratch_bytes + 1));
-  let killed = false; const stop = startAnalysisScratchGuard(launch, () => { killed = true; }); stop(); assert.equal(killed, true);
+  assert.equal(path.basename(launch.cwd), configured.job_id);
+  fs.writeFileSync(path.join(launch.cwd, "overflow"), Buffer.alloc(configured.maximum_scratch_bytes + 1));
+  let killed = false; const stop = startAnalysisScratchGuard(launch, () => { killed = true; }, () => Date.parse(start)); stop(); assert.equal(killed, true);
+  fs.rmSync(path.join(launch.cwd, "overflow")); fs.writeFileSync(path.join(launch.cwd, "zero1"), ""); fs.writeFileSync(path.join(launch.cwd, "zero2"), "");
+  killed = false; const stopEntries = startAnalysisScratchGuard(launch, () => { killed = true; }, () => Date.parse(start)); stopEntries(); assert.equal(killed, true);
+  killed = false; const stopRuntime = startAnalysisScratchGuard(launch, () => { killed = true; }, () => Date.parse(configured.expires_at)); stopRuntime(); assert.equal(killed, true);
 });
 
-test("macOS sandbox実体でnetwork・shell・snapshot外file到達が0になる", { skip: process.platform !== "darwin" }, (t) => {
+test("macOS sandbox実体でnetwork・shell・snapshot外file到達が0になる", { skip: process.platform !== "darwin" }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-sandbox-"));
-  const snapshot = path.join(directory, "snapshot"), scratch = path.join(directory, "scratch"), outside = path.join(directory, "outside");
-  fs.mkdirSync(snapshot); fs.mkdirSync(scratch); fs.mkdirSync(outside);
+  const snapshot = path.join(directory, "snapshot"), scratchRoot = path.join(directory, "scratch-root"), outside = path.join(directory, "outside");
+  fs.mkdirSync(snapshot); fs.mkdirSync(scratchRoot); fs.mkdirSync(outside);
   fs.writeFileSync(path.join(snapshot, "allowed.txt"), "snapshot"); fs.writeFileSync(path.join(outside, "secret.txt"), "secret");
   const source = path.join(directory, "worker.c"), worker = path.join(snapshot, "worker");
-  fs.writeFileSync(source, `#include <arpa/inet.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <sys/socket.h>\n#include <sys/wait.h>\n#include <unistd.h>\nint main(int n,char**v){char b[9]={0};int f=open(v[1],O_RDONLY);int snapshot=f>=0&&read(f,b,8)==8;if(f>=0)close(f);f=open(v[2],O_WRONLY|O_CREAT,0600);int scratch=f>=0;if(f>=0){write(f,"ok",2);close(f);}f=open(v[3],O_RDONLY);int outside=f>=0;if(f>=0)close(f);pid_t p=fork();int shell=0;if(p==0){execl("/bin/sh","sh","-c","true",NULL);_exit(127);}else if(p>0){int s;waitpid(p,&s,0);shell=WIFEXITED(s)&&WEXITSTATUS(s)==0;}int s=socket(AF_INET,SOCK_STREAM,0),network=0;if(s>=0){struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(9)};inet_pton(AF_INET,"127.0.0.1",&a.sin_addr);network=connect(s,(struct sockaddr*)&a,sizeof(a))==0;close(s);}printf("{\\\"snapshot\\\":%s,\\\"scratch\\\":%s,\\\"outside\\\":%s,\\\"shell\\\":%s,\\\"network\\\":%s}",snapshot?"true":"false",scratch?"true":"false",outside?"true":"false",shell?"true":"false",network?"true":"false");}`);
+  fs.writeFileSync(source, `#include <arpa/inet.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/socket.h>\n#include <sys/wait.h>\n#include <unistd.h>\nint main(int n,char**v){char b[1];int snapshot=read(STDIN_FILENO,b,1)==1;int f=open(v[1],O_WRONLY|O_CREAT,0600);int scratch=f>=0;if(f>=0){write(f,"ok",2);close(f);}f=open(v[2],O_RDONLY);int outside=f>=0;if(f>=0)close(f);pid_t p=fork();int shell=0;if(p==0){execl("/bin/sh","sh","-c","true",NULL);_exit(127);}else if(p>0){int s;waitpid(p,&s,0);shell=WIFEXITED(s)&&WEXITSTATUS(s)==0;}int s=socket(AF_INET,SOCK_STREAM,0),network=0;if(s>=0){struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(atoi(v[3]))};inet_pton(AF_INET,"127.0.0.1",&a.sin_addr);network=connect(s,(struct sockaddr*)&a,sizeof(a))==0;close(s);}printf("{\\\"snapshot\\\":%s,\\\"scratch\\\":%s,\\\"outside\\\":%s,\\\"shell\\\":%s,\\\"network\\\":%s}",snapshot?"true":"false",scratch?"true":"false",outside?"true":"false",shell?"true":"false",network?"true":"false");}`);
   const compiled = spawnSync("/usr/bin/clang", [source, "-o", worker], { encoding: "utf8" });
   assert.equal(compiled.status, 0, compiled.stderr);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -91,9 +100,14 @@ test("macOS sandbox実体でnetwork・shell・snapshot外file到達が0になる
   const { store } = setup(t, configured);
   const launch = authorizedAnalysisSandboxLaunch({ store,
     snapshot_permit: store.authorizeStage(configured.receipt_id, "snapshot_open", authorization(configured), 1, start),
-    current: authorization(configured), worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch, now: start });
-  const run = spawnSync(launch.executable, [...launch.args, path.join(snapshot, "allowed.txt"),
-    path.join(scratch, "result.txt"), path.join(outside, "secret.txt")], { cwd: launch.cwd, env: launch.env, encoding: "utf8" });
+    current: authorization(configured), worker_executable: worker, snapshot_path: snapshot, scratch_root: scratchRoot, now: start });
+  const server = net.createServer(); server.listen(0, "127.0.0.1"); await once(server, "listening"); t.after(() => server.close());
+  const address = server.address(); assert.ok(address && typeof address !== "string"); const port = String(address.port);
+  const baseline = spawnSync(worker, [path.join(launch.cwd, "baseline.txt"), path.join(outside, "secret.txt"), port],
+    { input: launch.stdin_snapshot, encoding: "utf8" });
+  assert.equal(JSON.parse(baseline.stdout).network, true);
+  const run = spawnSync(launch.executable, [...launch.args, path.join(launch.cwd, "result.txt"),
+    path.join(outside, "secret.txt"), port], { cwd: launch.cwd, env: launch.env, input: launch.stdin_snapshot, encoding: "utf8" });
   assert.equal(run.status, 0, JSON.stringify({ error: run.error?.message, signal: run.signal, stderr: run.stderr, stdout: run.stdout })); assert.deepEqual(JSON.parse(run.stdout),
     { snapshot: true, scratch: true, outside: false, shell: false, network: false });
 });
@@ -104,7 +118,7 @@ test("receiptはowner・source manifest・quotaをdurableに固定しpayload差�
   assert.throws(() => f.store.register({ ...receipt, source_manifest_digest: "c".repeat(64) }),
     (error) => error instanceof AnalysisRuntimeError && error.code === "conflict");
   const other = new Database(f.filename); other.pragma("journal_mode=WAL"); other.pragma("synchronous=FULL"); other.pragma("foreign_keys=ON");
-  try { assert.equal(new AnalysisRuntimeStore(other, f.secret).register(receipt).outcome, "reused"); } finally { other.close(); }
+  try { assert.equal(new AnalysisRuntimeStore(other, f.secret, clock).register(receipt).outcome, "reused"); } finally { other.close(); }
 });
 
 test("stageごとにcurrent owner・grant・broker identityを再認可する", (t) => {
@@ -114,6 +128,13 @@ test("stageごとにcurrent owner・grant・broker identityを再認可する", 
   assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", { ...current, source_manifest_digest: "c".repeat(64) }, 5, start));
   assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", { ...current, broker_generation: 2 }, 5, start));
   assert.match(store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+});
+
+test("caller時刻がrollback-resistant clock markと一致しない場合はfail closedする", (t) => {
+  const protectedClock = { reserve: () => ({ effective_utc: "2026-09-20T00:00:01.000Z" }) };
+  const { store } = setup(t, receipt, protectedClock);
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
 });
 
 test("snapshot_openはone-shot permitと実snapshot digestを照合する", (t) => {
@@ -137,17 +158,17 @@ test("receipt payloadやquota ledgerのDB改変はpermit発行をfail closedす�
 
 test("in-memory・rollback journal・非同期durability設定を拒否する", (t) => {
   const memory = new Database(":memory:"); t.after(() => memory.close());
-  assert.throws(() => new AnalysisRuntimeStore(memory, Buffer.alloc(32)), AnalysisRuntimeError);
+  assert.throws(() => new AnalysisRuntimeStore(memory, Buffer.alloc(32), clock), AnalysisRuntimeError);
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-durability-"));
   const db = new Database(path.join(directory, "bad.sqlite")); t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
-  assert.throws(() => new AnalysisRuntimeStore(db, Buffer.alloc(32)), AnalysisRuntimeError);
+  assert.throws(() => new AnalysisRuntimeStore(db, Buffer.alloc(32), clock), AnalysisRuntimeError);
 });
 
 test("permitはone-shot fenceでconcurrent利用とtamper・expiryを拒否する", async (t) => {
   const { store } = setup(t); let now = start; let calls = 0;
   const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 0x42),
-  { invoke: async () => { calls++; return { output: "ok", usage_tokens: 2 }; } }, () => now);
+  { invoke: async () => { calls++; return { output: "ok", usage_tokens: 2 }; } }, tokenizer, () => current, () => now);
   const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
   const settled = await Promise.allSettled([broker.invoke({ permit, prompt: "one" }), broker.invoke({ permit, prompt: "one" })]);
   assert.equal(settled.filter((value) => value.status === "fulfilled").length, 1); assert.equal(calls, 1);
@@ -157,12 +178,43 @@ test("permitはone-shot fenceでconcurrent利用とtamper・expiryを拒否す�
   now = "2026-09-20T00:00:11.000Z"; await assert.rejects(broker.invoke({ permit: expiring, prompt: "late" }));
 });
 
+test("restart時にreserved callが残るreceiptをneeds_reviewへ停止する", (t) => {
+  const { store } = setup(t);
+  const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
+  store.consumeInferencePermit(permit, "f".repeat(64), current, 1, start);
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+});
+
+test("fixed tokenizerでpromptとoutputの合計をprovider送信前に予約する", async (t) => {
+  const { store } = setup(t); let calls = 0;
+  const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
+    endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
+  { invoke: async () => { calls++; return { output: "bad", usage_tokens: 1 }; } },
+  { tokenizer_id: "fixed_tokenizer", count: () => 20 }, () => current, () => start);
+  const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
+  await assert.rejects(broker.invoke({ permit, prompt: "large" }), (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+  assert.equal(calls, 0);
+});
+
+test("provider送信直前のcurrent authorization失効を拒否する", async (t) => {
+  const { store } = setup(t); let calls = 0;
+  const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
+    endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
+  { invoke: async () => { calls++; return { output: "bad", usage_tokens: 1 }; } }, tokenizer,
+  () => ({ ...current, authz_revision: 2 }), () => start);
+  await assert.rejects(broker.invoke({ permit: store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), prompt: "x" }));
+  assert.equal(calls, 0);
+});
+
 test("brokerだけがcredentialを受け取りmodel・endpoint・quotaを固定する", async (t) => {
   const { store } = setup(t); let observed: Record<string, unknown> | undefined;
   const credential = Buffer.alloc(32, 0x55);
   const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, credential,
-  { invoke: async (input) => { observed = input; return { output: "answer", usage_tokens: 3 }; } }, () => start);
+  { invoke: async (input) => { observed = input; return { output: "answer", usage_tokens: 3 }; } }, tokenizer, () => current, () => start);
   const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
   const result = await broker.invoke({ permit, prompt: "private snapshot excerpt" });
   assert.equal(result.output, "answer"); assert.equal(observed?.endpoint, "https://inference.invalid/v1/fixed");
@@ -176,7 +228,7 @@ test("broker identity・scope・quota改変はprovider call前に拒否する", 
   const { store } = setup(t); let calls = 0;
   const wrong = new FixedInferenceBroker(store, { broker_id: "other", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
-  { invoke: async () => { calls++; return { output: "bad", usage_tokens: 1 }; } }, () => start);
+  { invoke: async () => { calls++; return { output: "bad", usage_tokens: 1 }; } }, tokenizer, () => current, () => start);
   const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
   await assert.rejects(wrong.invoke({ permit, prompt: "x" }), (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
   assert.equal(calls, 0);
@@ -188,15 +240,15 @@ test("timeout・crash後はreservationを返さずrestart後にacceptance_unknow
   const f = setup(t);
   const broker = new FixedInferenceBroker(f.store, { broker_id: "broker", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
-  { invoke: async () => { throw new Error("connection lost"); } }, () => start);
+  { invoke: async () => { throw new Error("connection lost"); } }, tokenizer, () => current, () => start);
   const permit = f.store.authorizeStage(receipt.receipt_id, "inference", current, 8, start);
   await assert.rejects(broker.invoke({ permit, prompt: "x" }), (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
   const call = f.db.prepare("SELECT call_id FROM analysis_runtime_calls").get() as { call_id: string };
   const other = new Database(f.filename); other.pragma("journal_mode=WAL"); other.pragma("synchronous=FULL"); other.pragma("foreign_keys=ON");
   try {
-    const recovered = new AnalysisRuntimeStore(other, f.secret).reconcileCall(call.call_id);
-    assert.equal(recovered?.status, "acceptance_unknown"); assert.equal(recovered?.reserved_tokens, 8);
-    const recoveredStore = new AnalysisRuntimeStore(other, f.secret);
+    const recovered = new AnalysisRuntimeStore(other, f.secret, clock).reconcileCall(call.call_id);
+    assert.equal(recovered?.status, "acceptance_unknown"); assert.equal(recovered?.reserved_tokens, 9);
+    const recoveredStore = new AnalysisRuntimeStore(other, f.secret, clock);
     assert.throws(() => recoveredStore.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
       (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
   } finally { other.close(); }
@@ -208,7 +260,7 @@ test("broker timeoutはtransportをabortしてacceptance_unknownを永続化す�
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
   { invoke: ({ signal }) => new Promise((resolve) => {
     signal.addEventListener("abort", () => { aborted = true; resolve({ output: "late", usage_tokens: 1 }); }, { once: true });
-  }) }, () => start, 5);
+  }) }, tokenizer, () => current, () => start, 5);
   const permit = f.store.authorizeStage(receipt.receipt_id, "inference", current, 8, start);
   await assert.rejects(broker.invoke({ permit, prompt: "x" }), (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
   assert.equal(aborted, true);
@@ -220,7 +272,7 @@ test("provider受理後の応答検証失敗はreceiptをneeds_reviewで停止�
   const { store } = setup(t);
   const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
-  { invoke: async () => ({ output: "overspent", usage_tokens: 6 }) }, () => start);
+  { invoke: async () => ({ output: "overspent", usage_tokens: 7 }) }, tokenizer, () => current, () => start);
   const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
   await assert.rejects(broker.invoke({ permit, prompt: "x" }),
     (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
@@ -232,7 +284,7 @@ test("resultはsource manifestへ結合しredacted digestだけを保存する",
   const { store } = setup(t);
   const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
     endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
-  { invoke: async () => ({ output: "sensitive answer", usage_tokens: 2 }) }, () => start);
+  { invoke: async () => ({ output: "sensitive answer", usage_tokens: 2 }) }, tokenizer, () => current, () => start);
   const result = await broker.invoke({ permit: store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), prompt: "input" });
   assert.equal(store.reconcileCall(result.call_id)?.status, "succeeded");
   const wrongPermit = store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start);
@@ -242,4 +294,15 @@ test("resultはsource manifestへ結合しredacted digestだけを保存する",
   const finalPermit = store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start);
   store.commitResult(receipt.receipt_id, finalPermit, current, receipt.source_manifest_digest, "d".repeat(64), start);
   assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start));
+});
+
+test("call ledger行の削除はreceipt root不一致としてresult commitを拒否する", async (t) => {
+  const { store, db } = setup(t);
+  const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
+    endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
+  { invoke: async () => ({ output: "answer", usage_tokens: 2 }) }, tokenizer, () => current, () => start);
+  await broker.invoke({ permit: store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), prompt: "x" });
+  db.prepare("DELETE FROM analysis_runtime_calls").run();
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
 });
