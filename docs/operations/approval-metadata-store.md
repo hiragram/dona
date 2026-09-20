@@ -1,0 +1,31 @@
+# 承認metadata storeとschema v2
+
+## 範囲
+
+`ApprovalMetadataNodes`は[metadata tree](approval-metadata-tree.md)のimmutable nodeを、承認recordと同じSQLite DBに保存する内部componentである。`ApprovalTransaction`/`AuditRepository`が所有する同じconnectionで呼び、自分でtransaction・root・署名鍵・runtime admissionを作らない。
+
+この段階ではcanonical row codec、一覧の完全性付きindex、request/decision/consume/execution/outbox repository、operator/protected providerは未接続。#16全体の完了ではない。
+
+## 明示migration
+
+`installApprovalMetadataSchema`は、既存owner-only fileのWALとFULL/EXTRA durability、native file identity、schema v1とforeign key整合を確認し、writer lock内の単一transactionでv2へ移行する。request等の既存recordを保持し、version tableとimmutable node table/triggerだけを更新する。既に正当なv2なら検証だけ行う。
+
+新規DBは既存の明示`installApprovalSchema`によるv1を先に必要とする。constructorはv1をv2へ変換せず、未準備なら拒否する。既存v1 callerのschema検証は維持し、v1/v2それぞれの完全なDDL/trigger inventoryと対応するversion行を照合する。未知version、部分的なDDL、改変trigger、TEMP shadowを自動修復しない。
+
+migrationは既存recordの本人性やcanonical snapshotを再認証しない。node tableが空でも業務recordが空とは限らないため、空rootへ自動登録しない。repository activationには、明示的に検証された空集合または別途検証済みのmigration inventoryと共有監査への登録が必要である。
+
+## 読取とstage
+
+`read`は外側のtransaction内でschemaを一度検証し、同期callbackへbounded readerを渡す。callback終了後はreaderを失効させ、別transactionでの再利用も拒否する。個別nodeは固定長とcanonical base64、digest、type/depth/prefixを確認する。rootとのscope/path照合はmetadata treeが行う。
+
+`stage`は最大257個の異なるnodeだけを受け、既存の同digest nodeはwireの完全一致を必要とする。新nodeをINSERTし、全件をread-backする。UPDATE/DELETE/REPLACEとGCは提供しない。DBにある過大wireはSQL側でNULLへ分類し、無制限の本文をJSへ取り込まず検証不能にする。
+
+SQLite transactionが存在するだけでは認証・認可の証明にならない。brokerはcurrent binding/policy/clock/rootを既存監査coordinatorで検証し、業務recordとstageを同じmutationで実行する。read-only prepareへのstageは既存のquery-only/native SQL guardが拒否する。このcomponentからguardを変更したりBEGIN/COMMITしたりしない。
+
+## 障害境界
+
+業務mutationが失敗すればnodeと業務recordが共にrollbackする。anchor reserve不明ではDBをcommitせず、finalize不明ではcommit済みでも成功を返さない。既存audit providerの照合へ進み、同じ操作を自動再実行しない。孤立nodeや自己申告rootから正本を復旧しない。
+
+## 検証と未検証
+
+fixtureで共有監査とのcommit/rollback、reserve/finalize応答不明、Web schema共存、既存request保持、v1→v2と再open、DDL/version/TEMP改変、immutable node、過大・不正wire、reader失効を確認する。実credential store、runtime activation、production migrationの証拠とは分ける。この変更はproduction DBやKeychainを操作しない。

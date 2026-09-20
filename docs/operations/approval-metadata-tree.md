@@ -28,6 +28,8 @@ point proofだけではSQL一覧から削除されたrowの欠落を検出でき
 
 既存approval schemaはexact DDL/trigger inventoryを検証する。node tableを業務DBへ追加する際は明示version migrationと同じSQL guardに対応し、未知DDLやTEMP shadowを拒否する。外部triggerを黙って許可したり別connectionへ書いたりして回避しない。retentionやGCは未提供で、一回性ledgerや必要nodeを削除しない。
 
+node保存とv1→v2の明示migrationは[承認metadata store](approval-metadata-store.md)を使う。storeの追加だけでcanonical rowや一覧完全性、既存recordのroot採用を完了したことにはならない。
+
 ## 検証
 
 複数recordの作成・更新・独立性、旧rootの不変性、nodeの再読、期待値競合、欠落node、別scope/path、非canonical/改ざんwire、読取上限、実行可能入力・不正digestの拒否をunit fixtureで確認する。SQLite durability、実protected provider、実IdP、production接続の証拠とは分ける。

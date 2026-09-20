@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
-import { loadSecurityExtension } from "../audit/file-identity.js";
+import { assertSecurityDurability } from "../audit/durability.js";
+import { withSecurityTransactionLock } from "../audit/coordination.js";
+import { loadSecurityExtension, verifyOpenDatabaseFile } from "../audit/file-identity.js";
 
 export class ApprovalSchemaError extends Error {
   constructor() { super("approval_schema_unverified"); this.name = "ApprovalSchemaError"; }
@@ -191,18 +193,36 @@ const schemaSql = `
           BEGIN SELECT RAISE(ABORT,'approval_clock_provenance_unverified'); END;
 `).join("");
 
+
+const metadataSql = `
+        CREATE TABLE approval_metadata_nodes (
+          digest TEXT PRIMARY KEY NOT NULL CHECK(length(digest)=64 AND digest NOT GLOB '*[^a-f0-9]*'),
+          wire TEXT NOT NULL CHECK(length(CAST(wire AS BLOB)) IN (132,176))
+        ) STRICT;
+        CREATE TRIGGER approval_metadata_nodes_no_update BEFORE UPDATE ON approval_metadata_nodes
+          BEGIN SELECT RAISE(ABORT,'approval_metadata_node_immutable'); END;
+        CREATE TRIGGER approval_metadata_nodes_no_delete BEFORE DELETE ON approval_metadata_nodes
+          BEGIN SELECT RAISE(ABORT,'approval_metadata_node_immutable'); END;
+`;
+const schemaV2Sql = schemaSql.replace("CHECK(version=1)", "CHECK(version=2)")
+  .replace("INSERT INTO approval_schema VALUES (1)", "INSERT INTO approval_schema VALUES (2)") + metadataSql;
+
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
 }
-let expectedShape: string | undefined;
+let expectedShapes: Map<number, string> | undefined;
 /** Hot-path schema and connection checks only. Row-level foreign keys are
  * enforced by SQLite statements/commit, not a repeated historical row scan. */
-export function verifyApprovalSchema(db: Database.Database): void {
+function verifiedVersion(db: Database.Database): number {
   try {
-    if (expectedShape === undefined) {
-      const expected = new Database(":memory:");
-      try { expected.exec(schemaSql); expectedShape = shape(expected); }
-      finally { expected.close(); }
+    if (expectedShapes === undefined) {
+      const computed = new Map<number, string>();
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql]] as const) {
+        const expected = new Database(":memory:");
+        try { expected.exec(sql); computed.set(version, shape(expected)); }
+        finally { expected.close(); }
+      }
+      expectedShapes = computed;
     }
     if (db.pragma("recursive_triggers", { simple: true }) !== 1 || db.pragma("foreign_keys", { simple: true }) !== 1
       || db.pragma("ignore_check_constraints", { simple: true }) !== 0
@@ -212,10 +232,18 @@ export function verifyApprovalSchema(db: Database.Database): void {
       || row.sql !== "CREATE TRIGGER security_audit_no_update BEFORE UPDATE ON security_audit_records\n          BEGIN SELECT RAISE(ABORT, 'security_audit_append_only'); END")) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type='trigger'").get()) throw new ApprovalSchemaError();
     if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_'").get()) throw new ApprovalSchemaError();
-    if (expectedShape !== shape(db)) throw new ApprovalSchemaError();
+    const actual = shape(db);
+    const version = [...expectedShapes].find(([, expected]) => actual === expected)?.[0];
+    if (version === undefined) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;
-    if (rows.length !== 1 || rows[0]?.version !== 1) throw new ApprovalSchemaError();
+    if (rows.length !== 1 || rows[0]?.version !== version) throw new ApprovalSchemaError();
+    return version;
   } catch { throw new ApprovalSchemaError(); }
+}
+
+export function verifyApprovalSchema(db: Database.Database): void { verifiedVersion(db); }
+export function verifyApprovalMetadataSchema(db: Database.Database): void {
+  if (verifiedVersion(db) !== 2) throw new ApprovalSchemaError();
 }
 
 function verifyIntegrityInside(db: Database.Database): void {
@@ -251,5 +279,24 @@ export function installApprovalSchema(db: Database.Database): void {
       db.exec(schemaSql);
       verifyIntegrityInside(db);
     }).immediate();
+  } catch { throw new ApprovalSchemaError(); }
+}
+
+
+/** 明示的なv1->v2 migration。既存recordと監査を維持し、node schema
+ * だけを追加する。rootを作成せず既存recordの正当性を自己申告しない。 */
+export function installApprovalMetadataSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => db.transaction(() => {
+      assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+      verifyIntegrityInside(db);
+      if (verifiedVersion(db) === 2) return;
+      db.exec("DROP TABLE main.approval_schema");
+      db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=2)) STRICT; INSERT INTO approval_schema VALUES (2)");
+      db.exec(metadataSql);
+      verifyIntegrityInside(db); verifyApprovalMetadataSchema(db);
+    }).immediate());
   } catch { throw new ApprovalSchemaError(); }
 }
