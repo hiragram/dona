@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { UpdaterApi } from "../src/api.js";
+import { releaseUpdaterSocket, reserveUpdaterSocket, UpdaterApi } from "../src/api.js";
 import type { UpdateController } from "../src/controller.js";
 import { UpdateDatabase } from "../src/database.js";
 import type { Logger } from "../src/ports.js";
@@ -69,7 +69,7 @@ test("atomic writer lease prevents a second server from unlinking the active soc
   const database = new UpdateDatabase(path.join(root, "updater.sqlite3"));
   const service = { isRunning: () => true, wake() {} };
   const first = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database, service, logger);
-  const second = new UpdaterApi(path.join(root, "second.sock"), undefined as unknown as UpdateController, database, service, logger);
+  const second = new UpdaterApi(path.join(root, "second", "updater.sock"), undefined as unknown as UpdateController, database, service, logger);
   try {
     await first.start();
     await assert.rejects(second.start(), /updater_writer_already_active/);
@@ -79,6 +79,27 @@ test("atomic writer lease prevents a second server from unlinking the active soc
     await first.stop();
     await second.stop();
     database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup lock serializes stale socket recovery between concurrent servers", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-startup-"));
+  const socketPath = path.join(root, "updater.sock");
+  await fs.writeFile(socketPath, "stale", { mode: 0o600 });
+  const results = await Promise.allSettled([
+    reserveUpdaterSocket(socketPath),
+    reserveUpdaterSocket(socketPath),
+  ]);
+  const fulfilled = results.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof reserveUpdaterSocket>>> => result.status === "fulfilled");
+  const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  try {
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.match(String(rejected[0]!.reason), /updater_startup_lock_active/);
+    assert.equal((await fs.lstat(socketPath)).isSocket(), true);
+  } finally {
+    if (fulfilled[0]) await releaseUpdaterSocket(fulfilled[0].value);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

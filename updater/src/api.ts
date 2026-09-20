@@ -33,21 +33,81 @@ async function socketAlive(socketPath: string): Promise<boolean> {
 export interface UpdaterSocketReservation {
   socketPath: string;
   server: http.Server;
+  startupLock: UpdaterStartupLock;
+}
+
+interface UpdaterStartupLock {
+  path: string;
+  token: string;
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function acquireStartupLock(controlRoot: string): Promise<UpdaterStartupLock> {
+  const lockPath = path.join(controlRoot, "updater.start.lock");
+  const token = randomUUID();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const handle = await fs.open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, token })}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return { path: lockPath, token };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let owner: { pid?: unknown; token?: unknown } = {};
+    try { owner = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown; token?: unknown }; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+    }
+    if (typeof owner.pid === "number" && processAlive(owner.pid)) throw new Error("updater_startup_lock_active");
+    const stalePath = `${lockPath}.${token}.stale`;
+    try {
+      await fs.rename(lockPath, stalePath);
+      await fs.unlink(stalePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error("updater_startup_lock_contended");
+}
+
+async function releaseStartupLock(lock: UpdaterStartupLock): Promise<void> {
+  try {
+    const owner = JSON.parse(await fs.readFile(lock.path, "utf8")) as { token?: unknown };
+    if (owner.token !== lock.token) throw new Error("updater_startup_lock_owner_mismatch");
+    await fs.unlink(lock.path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 export async function reserveUpdaterSocket(socketPath: string): Promise<UpdaterSocketReservation> {
   await fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(socketPath), 0o700);
-  try {
-    await fs.lstat(socketPath);
-    if (await socketAlive(socketPath)) throw new Error(`Another updater is listening on ${socketPath}`);
-    await fs.unlink(socketPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  const startupLock = await acquireStartupLock(path.dirname(socketPath));
   const server = http.createServer();
   let ownsSocket = false;
   try {
+    try {
+      await fs.lstat(socketPath);
+      if (await socketAlive(socketPath)) throw new Error(`Another updater is listening on ${socketPath}`);
+      await fs.unlink(socketPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error);
       server.once("error", onError);
@@ -58,12 +118,13 @@ export async function reserveUpdaterSocket(socketPath: string): Promise<UpdaterS
       });
     });
     await fs.chmod(socketPath, 0o600);
-    return { socketPath, server };
+    return { socketPath, server, startupLock };
   } catch (error) {
     try { await new Promise<void>((resolve) => server.close(() => resolve())); } catch { /* best effort */ }
     if (ownsSocket) {
       try { await fs.unlink(socketPath); } catch { /* best effort */ }
     }
+    try { await releaseStartupLock(startupLock); } catch { /* preserve the original error */ }
     throw error;
   }
 }
@@ -73,6 +134,7 @@ export async function releaseUpdaterSocket(reservation: UpdaterSocketReservation
   try { await fs.unlink(reservation.socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  await releaseStartupLock(reservation.startupLock);
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
@@ -97,6 +159,7 @@ export class UpdaterApi {
   private readonly writerToken = randomUUID();
   private writerLeaseHeld = false;
   private ownsSocket = false;
+  private activeReservation: UpdaterSocketReservation | undefined;
 
   constructor(
     private readonly socketPath: string,
@@ -111,16 +174,17 @@ export class UpdaterApi {
   async start(): Promise<void> {
     try {
       const reservation = this.reservation ?? await reserveUpdaterSocket(this.socketPath);
+      this.activeReservation = reservation;
       this.server = reservation.server;
       this.ownsSocket = true;
       this.database.acquireWriterLease(this.writerToken);
       this.writerLeaseHeld = true;
       this.server.on("request", (request, response) => void this.handle(request, response));
     } catch (error) {
-      if (this.ownsSocket && this.server) {
-        try { await new Promise<void>((resolve) => this.server!.close(() => resolve())); } catch { /* best effort */ }
-        try { await fs.unlink(this.socketPath); } catch { /* best effort */ }
+      if (this.activeReservation) {
+        try { await releaseUpdaterSocket(this.activeReservation); } catch { /* preserve the original error */ }
       }
+      this.activeReservation = undefined;
       this.server = undefined;
       this.ownsSocket = false;
       this.releaseWriterLease();
@@ -129,15 +193,11 @@ export class UpdaterApi {
   }
 
   async stop(): Promise<void> {
-    if (this.server && this.ownsSocket) {
-      await new Promise<void>((resolve, reject) => this.server!.close((error) => error ? reject(error) : resolve()));
+    if (this.activeReservation && this.ownsSocket) {
+      await releaseUpdaterSocket(this.activeReservation);
+      this.activeReservation = undefined;
       this.server = undefined;
       this.ownsSocket = false;
-      try {
-        await fs.unlink(this.socketPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
     }
     this.releaseWriterLease();
   }
