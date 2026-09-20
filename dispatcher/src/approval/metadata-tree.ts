@@ -50,10 +50,7 @@ function digest(input: string): Buffer {
   return Buffer.from(input, "hex");
 }
 function guarded<T>(operation: () => T): T {
-  try { return operation(); } catch (error) {
-    if (error instanceof MetadataConflictError) throw error;
-    throw new MetadataTreeError();
-  }
+  try { return operation(); } catch { throw new MetadataTreeError(); }
 }
 
 /** 明示的なgenesis作成用。共有監査のbinding欠落・未知versionを
@@ -100,11 +97,15 @@ export function readMetadataValue(scope: unknown, root: string, recordKey: strin
  * audit sequence、削除・retention権限、初期化・runtime接続は提供しない。 */
 export function prepareMetadataUpdate(scopeInput: unknown, root: string, recordKey: string,
   expectedValue: string | null, proposedValue: string, reader: MetadataTreeNodeReader): MetadataTreeUpdate {
-  return guarded(() => {
+  const { path, value } = guarded(() => {
     if (expectedValue !== null) digest(expectedValue);
     const value = digest(proposedValue);
     const path = walk(scopeInput, root, recordKey, reader);
-    if (path.value !== expectedValue) throw new MetadataConflictError();
+    return { path, value };
+  });
+  // readerや入力検証から伝播した例外を競合として扱わない。
+  if (path.value !== expectedValue) throw new MetadataConflictError();
+  return guarded(() => {
     if (expectedValue === proposedValue) throw new MetadataTreeError();
     const nodes: MetadataTreeNode[] = [];
     const add = (raw: Buffer): Buffer => {

@@ -92,7 +92,13 @@ test("read数はtree深さに固定されreader例外を公開しない", () => 
   const reader = (key: string) => { reads++; return f.reader(key); };
   assert.equal(readMetadataValue(scope, f.root, "request_a", reader), value("a")); assert.equal(reads, 257);
   reads = 0; prepareMetadataUpdate(scope, f.root, "request_a", value("a"), value("b"), reader); assert.equal(reads, 257);
-  assert.throws(() => readMetadataValue(scope, f.root, "request_a", () => { throw new Error("private-detail"); }), { message: "metadata_tree_unverified" });
+  for (const error of [new Error("private-detail"), new MetadataConflictError(), Object.assign(new MetadataConflictError(), { message: "private-detail" })]) {
+    const failedReader = () => { throw error; };
+    for (const operation of [
+      () => readMetadataValue(scope, f.root, "request_a", failedReader),
+      () => prepareMetadataUpdate(scope, f.root, "request_a", value("a"), value("b"), failedReader),
+    ]) assert.throws(operation, { name: "MetadataTreeError", message: "metadata_tree_unverified" });
+  }
 });
 
 test("実行可能scopeと不正digestを拒否し削除を提供しない", () => {
