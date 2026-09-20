@@ -59,6 +59,26 @@ export class ApprovalRecordSqlError extends Error {
   constructor() { super("approval_record_sql_unverified"); this.name = "ApprovalRecordSqlError"; }
 }
 export interface ApprovalRecordSqlChange { readonly previous: ApprovalRecord | null; readonly next: ApprovalRecord }
+type RowValues = Record<string, string | number | null>;
+/** 既存SQL triggerが拒否するmutable値をreserve前にも検証する。
+ * operation固有の認可・TTL・完全なstate machineの代替ではない。 */
+function mutableChecks(kind: ApprovalRecordKind, old: RowValues, next: RowValues): void {
+  if ("fence" in old && Number(next.fence) < Number(old.fence)) throw Error();
+  if (kind === "request") {
+    if (Number(next.revision) < Number(old.revision) || (old.consume_expires_at !== null && next.consume_expires_at !== old.consume_expires_at)
+      || (["rejected", "cancelled", "expired", "delivery_failed", "consumed", "execution_cancelled", "consume_expired", "needs_review"].includes(String(old.state)) && next.state !== old.state)) throw Error();
+  }
+  if (kind === "execution" && ["succeeded", "failed", "needs_review"].includes(String(old.state))
+    && (next.receipt_ref !== old.receipt_ref || next.failure_code !== old.failure_code)) throw Error();
+  if (kind === "notification" && old.message_ref !== null && next.message_ref !== old.message_ref) throw Error();
+  if (kind === "event" && old.state === "delivered" && (next.state !== old.state || next.delivered_at !== old.delivered_at)) throw Error();
+  if (next.state === old.state || !["execution", "notification", "presentation"].includes(kind)) return;
+  const transitions: Record<string, readonly string[]> = kind === "execution"
+    ? { claimed: ["executing", "needs_review"], executing: ["succeeded", "failed", "acceptance_unknown", "needs_review"], acceptance_unknown: ["succeeded", "failed", "needs_review"] }
+    : { pending: ["dispatching", "aborted", "needs_review"], dispatching: [kind === "notification" ? "sent" : "succeeded", "failed", "acceptance_unknown", "needs_review"],
+      acceptance_unknown: kind === "notification" ? ["sent", "needs_review"] : ["succeeded", "failed", "needs_review"] };
+  if (!transitions[String(old.state)]?.includes(String(next.state))) throw Error();
+}
 /** 構造を検証したSQL recordのみ。parent/root/actor/binding/stateの認証は
  * 上位repositoryで別途必要。transportから直接呼び出すAPIではない。 */
 export class ApprovalRecordSql {
@@ -82,29 +102,40 @@ export class ApprovalRecordSql {
     } catch { throw new ApprovalRecordSqlError(); }
     finally { try { verifyOpenDatabaseFile(this.db); } catch { throw new ApprovalRecordSqlError(); } }
   }
+  /** reserve前のprepareでSQL expected値・immutable列・budgetを検証する。
+   * current audit rootとの照合やactor認可は上位componentが担当する。 */
+  validate(input: readonly ApprovalRecordSqlChange[]): void {
+    try { this.checked(input); }
+    catch { throw new ApprovalRecordSqlError(); }
+    finally { try { verifyOpenDatabaseFile(this.db); } catch { throw new ApprovalRecordSqlError(); } }
+  }
+  private checked(input: readonly ApprovalRecordSqlChange[]) {
+    assertSynchronousResult(input);
+    if (!this.db.inTransaction || !Array.isArray(input) || input.length < 1 || input.length > 16) throw Error();
+    verifyOpenDatabaseFile(this.db); verifyApprovalIndexSchema(this.db);
+    const seen = new Set<string>(); let bytes = 0;
+    return input.map(change => {
+      if (Object.keys(change).sort().join(",") !== "next,previous") throw Error();
+      const next = encodeApprovalRecord(change.next, this.scope);
+      const previous = change.previous === null ? null : encodeApprovalRecord(change.previous, this.scope);
+      if (seen.has(next.key) || (previous !== null && previous.key !== next.key)) throw Error();
+      seen.add(next.key); bytes += Buffer.byteLength(next.canonical) + (previous ? Buffer.byteLength(previous.canonical) : 0);
+      if (bytes > 8 * 1024 * 1024) throw Error();
+      const table = tables[next.record.kind], row = next.record.row as unknown as Record<string, string | number | null>;
+      const old = previous?.record.row as unknown as Record<string, string | number | null> | undefined;
+      if (old && table.columns.some(column => !table.mutable.includes(column.name) && row[column.name] !== old[column.name])) throw Error();
+      if (old) mutableChecks(next.record.kind, old, row);
+      const primary = row[table.primary] as string;
+      const actual = this.read(next.record.kind, primary);
+      if ((actual === null ? null : encodeApprovalRecord(actual, this.scope).digest) !== (previous?.digest ?? null)) throw Error();
+      return { next, previous, table, row, old, primary };
+    });
+  }
   /** 同じ共有監査mutation内でのみ使用し、例外は必ずtransactionまで伝播する。
    * これはSQL保存だけで、audit root更新と認可を代行しない。 */
   stage(input: readonly ApprovalRecordSqlChange[]): void {
     try {
-      assertSynchronousResult(input);
-      if (!this.db.inTransaction || !Array.isArray(input) || input.length < 1 || input.length > 16) throw Error();
-      verifyOpenDatabaseFile(this.db); verifyApprovalIndexSchema(this.db);
-      const seen = new Set<string>(); let bytes = 0;
-      const changes = input.map(change => {
-        if (Object.keys(change).sort().join(",") !== "next,previous") throw Error();
-        const next = encodeApprovalRecord(change.next, this.scope);
-        const previous = change.previous === null ? null : encodeApprovalRecord(change.previous, this.scope);
-        if (seen.has(next.key) || (previous !== null && previous.key !== next.key)) throw Error();
-        seen.add(next.key); bytes += Buffer.byteLength(next.canonical) + (previous ? Buffer.byteLength(previous.canonical) : 0);
-        if (bytes > 8 * 1024 * 1024) throw Error();
-        const table = tables[next.record.kind], row = next.record.row as unknown as Record<string, string | number | null>;
-        const old = previous?.record.row as unknown as Record<string, string | number | null> | undefined;
-        if (old && table.columns.some(column => !table.mutable.includes(column.name) && row[column.name] !== old[column.name])) throw Error();
-        const primary = row[table.primary] as string;
-        const actual = this.read(next.record.kind, primary);
-        if ((actual === null ? null : encodeApprovalRecord(actual, this.scope).digest) !== (previous?.digest ?? null)) throw Error();
-        return { next, previous, table, row, old, primary };
-      });
+      const changes = this.checked(input);
       for (const { next, previous, table, row, old, primary } of changes) {
         if (previous?.digest === next.digest) continue;
         const query = queries[next.record.kind];

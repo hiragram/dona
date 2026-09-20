@@ -32,6 +32,27 @@ function ends(plan: ApprovalMetadataPlan, current: Manifest): { head: Link; tail
     throw new ApprovalMetadataPlanError();
   return { head, tail };
 }
+/** pointで指定したmemberと隣接参照を検証する。全listの走査ではない。 */
+export function verifyApprovalListMembership(plan: ApprovalMetadataPlan, list: ApprovalIndexList, recordId: string, expected: boolean): void {
+  return guarded(plan, () => {
+    if (typeof expected !== "boolean") throw new ApprovalMetadataPlanError();
+    const current = manifest(plan, list), boundary = ends(plan, current);
+    const value = plan.readIndex({ kind: "link", list: current.list, record_id: recordId });
+    if ((value?.kind === "link" && value.member) !== expected) {
+      if (expected) throw new ApprovalMetadataPlanError();
+      throw new MetadataConflictError();
+    }
+    if (!expected) return;
+    if (value?.kind !== "link" || boundary === null) throw new ApprovalMetadataPlanError();
+    const previous = value.previous === null ? null : link(plan, current.list, value.previous);
+    const next = value.next === null ? null : link(plan, current.list, value.next);
+    if ((previous === null) !== (current.head === recordId) || (next === null) !== (current.tail === recordId)
+      || (previous !== null && previous.next !== recordId) || (next !== null && next.previous !== recordId)
+      || (current.count === 1 && (previous !== null || next !== null))
+      || (current.count === 2 && previous !== null && next !== null)
+      || (current.count > 3 && previous?.record_id === current.head && next?.record_id === current.tail)) throw new ApprovalMetadataPlanError();
+  });
+}
 /** 内部list操作。record/状態/alias/認可の変更はrepositoryが同じplanへ加える。
  * 欠落manifestを空listに変換しない。初期manifest作成は明示genesisに限定する。 */
 export function appendApprovalList(plan: ApprovalMetadataPlan, listInput: ApprovalIndexList, recordId: string): void {

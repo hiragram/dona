@@ -27,3 +27,5 @@ import "./web/auth-write-service.js";
 import "./web/internal-gateway.js";
 
 import "./approval/record-repository.js";
+
+import "./approval/record-mutation.js";
