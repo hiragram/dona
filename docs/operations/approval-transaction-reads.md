@@ -1,0 +1,19 @@
+# 承認recordとpayloadの同一transaction読取
+
+`ApprovalRecordRepository.readInState`、`readAliasInState`、`readListHeadInState`と`ApprovalPayloadRepository.inspectInState`は、既存の`AuditRepository.readVerifiedState`または`ApprovalTransaction.runPrepared`の同期read-only callback内で使う。callbackが受け取ったexact stateと同じSQLite connectionに限り、record・index・payloadを一つの監査状態で照合できる。`runPrepared`では、その読取結果からrecord/payload mutationを準備し、同じwriter lockとSQL snapshotのまま両rootをcommitできる。
+
+既存の`read`、`readAlias`、`readListHead`、`inspect`は自身で監査transactionを開き、この内部経路へ委譲する。nested transactionを許可する変更ではなく、更新transactionの中では`InState`の経路を使う。
+
+## stateの有効範囲
+
+監査frameworkは、検証済みのfrozen stateをconnectionとともにmodule-privateの一時registryへ登録する。`assertCurrentAuditReadState`はexact object、実行中のSQLite transaction、read-only設定を確認する。callbackが正常終了した場合も例外で終わった場合も、`finally`で登録を失効させる。mutation開始時にはすでに失効している。確認に必要な`query_only`の読取だけをnative SQL guardで許可し、値を変えるPRAGMAは引き続き拒否する。
+
+同じ内容のcopy、Proxy、別connectionのstate、過去のcallbackで受け取ったstate、普通のSQLite read transactionでは使えない。stateを保持したまま別の操作へ流用することもできない。別connectionの監査callbackを内部で入れ子にしても、各stateは元のconnectionだけに結合される。
+
+各repositoryはこのprovenance確認に加え、従来どおりcurrent root、scope、SQL row、metadata digest、親参照、alias/listなどを照合する。欠落rootの初期化やraw SQLへのfallbackは行わない。戻り値はそのcallback内の検証結果であり、後のtransactionに対する権限や鮮度の証明ではない。
+
+## 継続する境界
+
+この内部読取はactor・binding・current visibilityを認可しない。payloadの`present`も形式とdigestの照合結果であり、HMAC/GCM認証、owner関係、現在のTTL判定はbrokerで接続する必要がある。SQLに保存された過去のclock markも、このstateの所持だけではboot/elapsedの認証済み証拠にならない。
+
+試験はfixtureのproviderで同一prepareの照合・request無効化・payload削除をcommitし、state流用とSQLだけの改変を拒否する。production broker、実credential、実IdP/WebAuthn、公開decision/consume endpointの完成を示すものではない。callbackは内部の同期JavaScriptであり、任意コードを安全に実行するsandboxではない。

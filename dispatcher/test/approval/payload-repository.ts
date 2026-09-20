@@ -1,3 +1,4 @@
+import { AuditRepository } from "../../src/audit/repository.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { openSecurityDatabase } from "../../src/audit/coordination.js";
@@ -20,7 +21,7 @@ import { encodeApprovalPayloadEnvelope, type ApprovalPayloadMetadata } from "../
 import { ApprovalTransactionError } from "../../src/approval/transaction.js";
 import type { ApprovalRecordKind } from "../../src/approval/record-codec.js";
 import type { ClockMark } from "../../src/approval/clock.js";
-import type { AuditEvent } from "../../src/audit/codec.js";
+import type { AuditEvent, VerifiedAuditState } from "../../src/audit/codec.js";
 const scope={instance_id:auditScope.instance_id,workspace_id:auditScope.tenant_id};
 const start="2026-09-19T00:00:00.000Z",text="fixture-only approval body";
 const contentKey:ApprovalPayloadKey={version:1,purpose:"approval_content",state:"active",activated_at:"2026-09-01T00:00:00.000Z",signing_expires_at:"2026-11-01T00:00:00.000Z",secret:Buffer.alloc(32,61)};
@@ -253,4 +254,58 @@ test("再open後も同じ監査anchorとpayload metadata・暗号文を照合す
     const reopened=new ApprovalPayloadRepository(db,f.providers.auditAnchors,f.providers.auditKeys,scope);
     assert.deepEqual(reopened.inspect("request","request"),before);
   }finally{db.close();}
+});
+
+test("同一prepareでrecord・alias・list・payloadを照合して無効化と削除をcommitする",t=>{
+ const f=fixture(t);create(f);f.setNow("2026-09-19T00:01:00.000Z");
+ f.transaction.runPrepared("read_and_remove",(mark,state)=>{
+  const request=f.records.readInState(state,"request","request")!,payload=f.payloads.inspectInState(state,"request","request")!;
+  assert.deepEqual(f.records.readAliasInState(state,{name:"request_creation",creation_key:request.row.creation_key}),request);
+  assert.deepEqual(f.records.readListHeadInState(state,{record_kind:"request",membership:"active"},4),{count:1,records:[request],truncated:false});
+  assert.equal(payload.secret.status,"present");assert.equal(payload.metadata.binding.semantic_hash,request.row.semantic_hash);
+  assert.throws(()=>f.records.read("request","request"));assert.throws(()=>f.payloads.inspect("request","request"));
+  const record=f.recordMutation.prepare(mark,state,[{previous:request,next:{...request,row:{...request.row,state:"needs_review",revision:request.row.revision+1}}}]);
+  const removal=f.payloadMutation.prepare(mark,state,[{previous:payload.metadata,next:{...payload.metadata,state:"deleted",deleted_at:mark.effective_utc},envelope:null}]);
+  return {event,resource_commitments:[...removal.resource_commitments,...record.resource_commitments],mutation:()=>{record.mutation();removal.mutation();return null;}};
+ });
+ const audit=new AuditRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys);
+ audit.readVerifiedState(state=>{
+  const request=f.records.readInState(state,"request","request")!;
+  assert.equal(request.row.state,"needs_review");assert.equal(f.payloads.inspectInState(state,"request","request")!.secret.status,"deleted");
+  assert.deepEqual(f.records.readAliasInState(state,{name:"request_creation",creation_key:request.row.creation_key}),request);
+  assert.deepEqual(f.records.readListHeadInState(state,{record_kind:"request",membership:"active"},4),{count:0,records:[],truncated:false});return null;
+ });
+});
+
+test("同一transaction読取は偽state・別connection・callback後・mutation phaseを拒否する",t=>{
+ const f=fixture(t),other=fixture(t);create(f);create(other);let captured:VerifiedAuditState|undefined;
+ const bad=(state:VerifiedAuditState)=>{
+  assert.throws(()=>f.records.readInState(state,"request","request"));
+  assert.throws(()=>f.records.readAliasInState(state,{name:"request_creation",creation_key:"0".repeat(64)}));
+  assert.throws(()=>f.records.readListHeadInState(state,{record_kind:"request",membership:"all"},4));
+  assert.throws(()=>f.payloads.inspectInState(state,"request","request"));
+ };
+ f.transaction.runPrepared("capture",(_mark,state)=>{
+  captured=state;bad(structuredClone(state));
+  assert.throws(()=>other.records.readInState(state,"request","request"));
+  assert.throws(()=>other.payloads.inspectInState(state,"request","request"));
+  return {event,resource_digest:null,mutation:()=>{bad(state);return null;}};
+ });
+ assert.ok(captured);bad(captured);
+ f.db.pragma("query_only=ON");try{f.db.transaction(()=>bad(captured!))();}finally{f.db.pragma("query_only=OFF");}
+ f.transaction.runPrepared("next",(_mark,state)=>{bad(captured!);assert.equal(f.records.readInState(state,"request","request")!.row.state,"requested");return {event,resource_digest:null,mutation:()=>null};});
+});
+
+test("同一transactionの読取でもSQL-only改変は監査reserve前に拒否する",t=>{
+ for(const fault of ["record","payload"] as const){
+  const f=fixture(t);create(f);
+  if(fault==="record")f.db.exec("UPDATE approval_requests SET state='needs_review',revision=2");
+  else f.db.exec("UPDATE approval_payload_metadata SET state='deleted',deleted_at='2026-09-19T00:01:00.000Z'");
+  const before=f.anchors.calls.length;
+  assert.throws(()=>f.transaction.runPrepared("tampered",(_mark,state)=>{
+   f.records.readInState(state,"request","request");f.payloads.inspectInState(state,"request","request");
+   return {event,resource_digest:null,mutation:()=>assert.fail("unverified data must not commit")};
+  }),ApprovalTransactionError);
+  assert.equal(f.anchors.calls.length,before);
+ }
 });
