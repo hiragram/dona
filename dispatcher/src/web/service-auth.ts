@@ -38,7 +38,8 @@ const responseClaimsSchema = z.strictObject({ codec_version: z.literal(1), audie
   key_version: revision, instance_id: id, tenant_id: id, request_nonce: nonce, request_body_digest: digest,
   request_proof_digest: digest, issued_at: utc, expires_at: utc, result: resultSchema });
 const inputSchema = z.strictObject({ codec_version: z.literal(1), method: z.literal("GET"), target: z.enum(["/", "/api/session"]),
-  context: z.string().min(1).max(8192).regex(/^[A-Za-z0-9_.-]+$/) });
+  context: z.string().min(1).max(8192).regex(/^[A-Za-z0-9_.-]+$/), user_navigation: z.literal(true).optional() })
+  .refine(value => value.user_navigation !== true || value.target === "/");
 export type SessionServiceInput = z.infer<typeof inputSchema>;
 export class WebServiceError extends Error {
   constructor() { super("web_service_unverified"); this.name = "WebServiceError"; }

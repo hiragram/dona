@@ -31,6 +31,25 @@ function privateFailure(result: Awaited<ReturnType<ReturnType<typeof controllerF
   assert.deepEqual(Object.keys(JSON.parse(result.body)), ["error"]);
 }
 
+test("BFFは同一originの明示dashboard navigationだけをservice activityへ分類する", async () => {
+  for (const target of ["/", "/api/session"]) for (const mode of ["navigation", "poll", "script", "frame", "missing_user", "false_user", "duplicate_user"]) {
+    const f=controllerFixture(), confirm=f.connections.session.confirm;
+    let observed: boolean | undefined;
+    f.connections.session.confirm=async (input,identity)=>{observed=input.user_navigation;return confirm(input,identity);};
+    let request=header(header(header(f.request(target),"sec-fetch-mode","navigate"),"sec-fetch-dest","document"),"sec-fetch-user","?1");
+    if(mode==="poll")request=f.request(target);
+    if(mode==="script")request=header(request,"sec-fetch-mode","cors");
+    if(mode==="frame")request=header(request,"sec-fetch-dest","iframe");
+    if(mode==="missing_user")request=header(request,"sec-fetch-user");
+    if(mode==="false_user")request=header(request,"sec-fetch-user","?0");
+    if(mode==="duplicate_user")request={...request,headers:[...request.headers,["sec-fetch-user","?1"]]};
+    const result=await f.controller.handle(request);
+    if(mode==="duplicate_user" && target==="/")assert.ok(result.status>=400);
+    else assert.equal(result.status,200);
+    assert.equal(observed,target==="/" && mode==="navigation"?true:undefined);
+  }
+});
+
 test("各session requestでonline照合と現行registryとDispatcher確認を行う", async () => {
   const f = controllerFixture(), before = f.snapshot.session.state.last_activity_at;
   for (let i = 0; i < 2; i++) {

@@ -132,13 +132,14 @@ export class WebAuthRepository {
   }
 
   /** Internal session confirmation only. A returned principal is not a job or
-   * approval capability. This call never extends idle activity. */
-  verifySessionIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array):WebStoreResult {
+   * approval capability. Only BFF-derived, service-MAC-bound dashboard navigation
+   * may extend idle activity; default confirmation does not. */
+  verifySessionIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array,userNavigation=false):WebStoreResult {
     const keys=this.contextKeys;
     return this.commit(transactionId,"web.session.v1",null,(state,mark)=>{
       if(!state)return deny(state,"deployment_invalid");
       if(!keys)return deny(state,"identity_unavailable");
-      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,keys);
+      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,keys,userNavigation);
       if(plan.result.status==="succeeded"){
         const session=state.sessions.find(row=>row.state.session_ref===plan.session_ref);
         if(!session)throw new WebStateError();this.payload(session);

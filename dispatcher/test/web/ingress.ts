@@ -1,16 +1,63 @@
 import fs from "node:fs";
 import test from "node:test";
 import assert from "node:assert/strict";
+import {createHmac} from "node:crypto";
 import {WebAuthRepository} from "../../src/web/repository.js";
 import {encodeWebAuthState} from "../../src/web/model.js";
 import {openSecurityDatabase} from "../../src/audit/coordination.js";
 import {prepareSessionIngress} from "../../src/web/ingress.js";
-import type {ContextKey} from "../../src/web/context.js";
+import {ingressContextRequest,type ContextKey} from "../../src/web/context.js";
 import {setup,scope,activeSession,wire} from "./fixtures.js";
 const contexts=JSON.parse(fs.readFileSync(new URL("../../../test-fixtures/web-ingress-context-v1.json",import.meta.url),"utf8"));
 const context=contexts.fixtures.find((row:{target:string})=>row.target==="/api/session");
 const key:ContextKey={purpose:"web_ingress_context",version:1,state:"active",activated_at:"2026-09-01T00:00:00.000Z",signing_expires_at:"2026-11-01T00:00:00.000Z",secret:Buffer.alloc(32,contexts.key_byte)};
 const lookup=(version:number)=>version===1?key:undefined;
+const dashboard=contexts.fixtures.find((row:{target:string})=>row.target==="/");
+test("明示navigationだけがnonce消費と同じ監査でactivityを進め再送では進めない",t=>{
+ for(const navigation of [false,true]){
+  const f=setup(t);activeSession(f);const store=new WebAuthRepository(f.db,f.providers,scope,lookup);
+  const before=f.readState(),now="2026-09-19T00:00:02.000Z";f.setNow(now);
+  assert.equal(store.verifySessionIngress("navigate",dashboard.token,"GET","/",Buffer.alloc(0),navigation).status,"succeeded");
+  const expected=structuredClone(before.sessions);if(navigation)expected[0]!.state.last_activity_at=now;
+  assert.deepEqual(f.readState().sessions,expected);assert.equal(f.readState().used_nonces.length,1);
+  f.audit.verify();f.setNow("2026-09-19T00:00:03.000Z");
+  assert.deepEqual(store.verifySessionIngress("replay_nav",dashboard.token,"GET","/",Buffer.alloc(0),navigation),{status:"denied",reason:"already_consumed"});
+  assert.deepEqual(f.readState().sessions,expected);
+ }
+});
+test("navigationでも期限切れ・失効・改変・別routeを復活させない",t=>{
+ for(const fault of ["idle","absolute","token","revoked","proof","route"]){
+  const f=setup(t);activeSession(f);const state=f.readState(),session=state.sessions[0]!.state;
+  const now=fault==="idle"?"2026-09-19T00:30:01.000Z":fault==="absolute"?session.expires_at:"2026-09-19T00:00:02.000Z";
+  if(fault==="token"){session.access_token_expires_at=now;session.expires_at=now;}
+  if(fault==="revoked"){session.state="revoked";state.sessions[0]!.payload_ref=null;state.sessions[0]!.payload_digest=null;}
+  // Pure planner fixture: keep a fresh proof while independently expiring the session.
+  const expires=new Date(Date.parse(now)+10000).toISOString();
+  const target=fault==="route"?"/api/session":"/";
+  const claims=JSON.parse(Buffer.from(dashboard.token.split(".")[0],"base64url").toString());
+  const payload=Buffer.from(JSON.stringify({...claims,request:ingressContextRequest("GET",target,Buffer.alloc(0)),issued_at:now,expires_at:expires})).toString("base64url");
+  let token=payload+"."+createHmac("sha256",key.secret).update("dona.web.ingress-context.v1\0").update(payload).digest("base64url");
+  if(fault==="proof")token+="x";
+  const before=structuredClone(state.sessions),result=prepareSessionIngress(state,token,"GET",target,Buffer.alloc(0),now,lookup,true);
+  assert.deepEqual(result.result,{status:"denied",reason:fault==="proof"?"proof_invalid":fault==="route"?"operation_unsupported":fault==="revoked"?"session_revoked":"session_expired"},fault);
+  assert.deepEqual(result.next.sessions,before);assert.equal(result.next.used_nonces.length,0);
+ }
+});
+test("navigationのmetadata失敗・anchor応答喪失は成功ackも暗黙再試行もしない",t=>{
+ for(const fault of ["sql","reserve_after","finalize_before","finalize_after"] as const){
+  const f=setup(t);activeSession(f);const store=new WebAuthRepository(f.db,f.providers,scope,lookup);
+  const before=f.readState().sessions,now="2026-09-19T00:00:02.000Z";f.setNow(now);
+  if(fault==="sql"){
+   const original=f.db.prepare.bind(f.db);
+   t.mock.method(f.db,"prepare",((sql:string)=>{if(sql.startsWith("UPDATE web_auth_state"))throw Error("fixture metadata failure");return original(sql);}) as typeof f.db.prepare);
+  }else f.anchors.fault=fault;
+  const calls=f.anchors.calls.length;
+  assert.throws(()=>store.verifySessionIngress("nav_uncertain",dashboard.token,"GET","/",Buffer.alloc(0),true));
+  assert.equal(f.anchors.calls.length-calls,fault.startsWith("finalize")?2:1);
+  const expected=structuredClone(before);if(fault.startsWith("finalize"))expected[0]!.state.last_activity_at=now;
+  assert.deepEqual(f.readState().sessions,expected);assert.equal(f.readState().used_nonces.length,fault.startsWith("finalize")?1:0);
+ }
+});
 test("current sessionと署名を照合しnonceを一回だけ監査へ確定する",t=>{
  const f=setup(t);activeSession(f);const store=new WebAuthRepository(f.db,f.providers,scope,lookup);
  const before=f.readState(),sequence=f.audit.verify().sequence;

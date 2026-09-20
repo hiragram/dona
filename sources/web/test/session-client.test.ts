@@ -66,6 +66,17 @@ test("service codecは独立golden wireを照合し別requestと改変を拒否�
     () => ++reads === 1 ? credential : { ...credential, version: 2 }, fixture.now));
 });
 
+test("BFF service codecのactivityはdashboard専用で既存wireの省略を維持する", () => {
+  const input={...fixture.input,target:"/",user_navigation:true};
+  assert.equal(encodeSessionServiceInput(input),JSON.stringify(input));
+  assert.equal(encodeSessionServiceInput(fixture.input),fixture.request_body);
+  const body=encodeSessionServiceInput(input),proof=signServiceRequest(body,fixture.scope,credential,fixture.now);
+  const claims=JSON.parse(Buffer.from(proof.split(".")[0]!,"base64url").toString());
+  assert.equal(claims.body_digest,hash(body));assert.equal(seal("request",claims),proof);
+  for(const altered of [{...input,target:"/api/session"},{...input,user_navigation:false},{...input,user_navigation:"true"}])
+    assert.throws(()=>encodeSessionServiceInput(altered),WebServiceError);
+});
+
 test("BFF clientは実UDSで署名responseと期待principalを照合する", async t => {
   const f = await fixtureServer(t, (proof, response) => send(response, responseProof(proof)));
   assert.deepEqual(await f.client().confirm(fixture.input, fixture.identity), fixture.result); assert.equal(f.calls, 1);
