@@ -1,0 +1,23 @@
+# 承認recordのSQL保存と監査付き読取
+
+Issue #16の内部componentとして、7種のrecordを固定SQL projectionへ接続する。`ApprovalRecordRepository.read`は共有監査chain、DB外anchor、現在のscopeに一致する`approval_records` resource rootを検証し、point digestとSQL行のcanonical digestを照合してから返す。root欠落、SQLだけの行、rootだけの行、不一致や不正な行を「存在しない」へ変換しない。
+
+このcomponentはtransport APIではなく、actor・現在のsupervisor binding・visibilityの認可や操作可能性判定を提供しない。callerから任意のrootを受け取らず、既存SQL行からrootを自動生成しない。返却record内のactor/binding identifierを認証済みproofとして使ってはならない。
+
+## 親参照
+
+読取は最大32件のpoint cacheを持ち、同じ監査read transaction内で親を検証する。decisionはrequestのscope、semantic hash、binding ID/revisionを確認する。consumeとexecutionはrequest、approve decision、一意なattempt/consumeの相互参照とclaimed timeを確認する。notificationは親requestのrevision上限、presentationは配送済みnotificationのmessage参照とpresentation revisionを確認する。eventのdecision ID検索は監査rootの固定aliasを経由し、実decision IDも一致させる。
+
+これは親方向の参照整合性であり、requestから全childが存在することや、全secondary alias/listの完全性、TTLの全境界、状態遷移の可否を一括保証しない。consumeの保存済みclaimがdecision以後・consume expiry未満であることは検証するが、現在の操作許可には保護時計・現行policy・認可の追加検証が必要。
+
+## 保存境界
+
+`ApprovalRecordSql`は同じSQLite connectionの共有監査mutationで使う内部保存層である。table/column/SQLは7種の固定定義からだけ生成し、入力identifierをSQLへ補間しない。SQL上のNULLと不正・過大な値、不存在を区別する。constructorと各操作でschema、file identity、必要なtransaction状態を確認する。
+
+`stage`は最大16件、previous/next canonical合計8MiBの最終変更を受ける。全入力、重複primary、immutable列、SQLのexpected digestを先に確認し、mutable列だけを旧値付きCASで更新する。全変更後にcanonical digestを再読する。decisionとconsumeは更新しない。INSERTの保護時計参照とconsume/attemptのdeferred FKは既存schema/native guardに従う。保存層だけではactor認可、現在rootとの結合、全cross-row制約を代行しない。
+
+上位の準備処理がSQL変更とmetadata planを同じ監査mutationへ含め、どちらの失敗もtransactionへ伝播させる必要がある。予想外のstage競合をnormal duplicateとしてcatchしない。普通の重複はreserve前のprepareで確認し、適切なdenial/idempotent planを選ぶ。anchor reserve/finalizeの応答喪失時は成功扱いや自動再実行をせず、既存のreconcile境界に従う。
+
+## 検証範囲
+
+fixtureのSQLite/native guardと共有監査providerを用い、7種の保存・読取・再open、mutable update、CAS競合、immutable拒否、親参照の不一致、SQLとrootの食い違い、secondary aliasの不整合、過大nullable値、保護時計参照、SQL/metadata rollback、anchor応答喪失を検証する。fixtureのanchor/keyは本番providerではない。brokerの認可付き更新、完全なalias/list接続、expiry sweep、retention/GC、暗号化payload削除、実providerやruntime接続は後続作業であり、本変更だけでIssue #16を完了としない。
