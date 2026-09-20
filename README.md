@@ -63,6 +63,8 @@ updater自身はroutine updateの対象外です。stable updater/policy/schema�
 
 [Web trust boundary ADR](./docs/adr/0002-web-trust-boundary.md)と[decision / deployment fixture](./docs/adr/fixtures/web-trust-boundary.md)に、identity・tenant・session・approvalの契約を記載しています。設計成果物であり、Web runtimeやapproval実行の有効化ではありません。
 
+[Supervisor approval ADR](./docs/adr/0001-supervisor-approval.md)と[contract fixture](./docs/adr/fixtures/supervisor-approval-contracts.md)に、承認のtrust boundary、lifecycle、UX、運用方針、release gateを記載しています。
+
 ## 全体検証
 
 ```sh
