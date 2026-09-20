@@ -13,6 +13,7 @@ import {
 
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
+  delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
   getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
@@ -154,7 +155,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("delegate_job", {
     title: "Delegate background job",
-    description: "長時間になりそうな調査・開発を別のCodexワーカーへ委任します。独立目的ごとに初回write前に安定job_keyを決めます。created/reused成功時のactionだけをResult actionsへ記録します。後続validation/conflict/limit失敗でも成功済jobをcancelせずpartial successを利用者とResultへ明示します。timeoutはblind retryせずlist_event_jobsでread-only reconcileします。委任後はgroup terminalまでprocessingを保ち、progressでは投稿・active遷移しません。",
+    description: "通常のSlack eventから長時間作業を別のCodexワーカーへ委任します。dona_scheduleには使用せずdelegate_scheduled_workを使います。独立目的ごとに初回write前に安定job_keyを決めます。created/reused成功時のactionだけをResult actionsへ記録します。後続validation/conflict/limit失敗でも成功済jobをcancelせずpartial successを利用者とResultへ明示します。timeoutはblind retryせずlist_event_jobsでread-only reconcileします。委任後はgroup terminalまでprocessingを保ち、progressでは投稿・active遷移しません。",
     inputSchema: {
       source_event_id: eventId,
       job_key: createJobKey.optional().describe("同じsource event内でcallerがwrite前に決める安定key。省略時のみlegacy-default"),
@@ -180,6 +181,26 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       return success(data);
     } catch (error) {
       return failure(error, logger, "delegate_job");
+    }
+  });
+
+  server.registerTool("delegate_scheduled_work", {
+    title: "Delegate persisted scheduled work",
+    description: "record_schedule_job_access成功直後にdona_scheduleのevent_idだけを渡します。objective、workspace、scope、job_keyは指定できず、Dispatcherが永続化済みread-only契約から復元します。timeout・切断はacceptance unknownなので再実行せずlist_owner_jobsで照合します。",
+    inputSchema: { event_id: eventId },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ event_id }) => {
+    try {
+      if (!client.delegateScheduledWork) throw new Error("Scheduled delegation is unavailable");
+      const response = await client.delegateScheduledWork(event_id);
+      const data = projectJobResponse(response);
+      const job = data.job as Record<string, unknown> | undefined;
+      if (job && typeof job.job_id === "string" && (response.outcome === "created" || response.outcome === "reused")) {
+        data.action = { tool: "delegate_scheduled_work", source_event_id: event_id, job_id: job.job_id, outcome: response.outcome };
+      }
+      return success(data);
+    } catch (error) {
+      return failure(error, logger, "delegate_scheduled_work");
     }
   });
 
@@ -273,7 +294,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("record_schedule_job_access", {
     title:"Record scheduled job access receipt",
-    description:"check_user_channel_access成功直後に、その完全一致receiptを一度だけ永続化します。成功後は直ちにdelegate_jobを呼びます。",
+    description:"check_user_channel_access成功直後に、その完全一致receiptを一度だけ永続化します。成功後は直ちにdelegate_scheduled_workを呼びます。",
     inputSchema:{event_id:eventId,receipt:z.string().min(32).max(2_000)},
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
   },async({event_id,receipt})=>{

@@ -670,7 +670,7 @@ export class SchedulerRepository {
     this.completeIfDrained(run.schedule_id,now);
   }
 
-  settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string): void {
+  settleUndelegatedWorkEvent(eventId: string, outcome: "failed" | "needs_review", now: string, decisionCode?: string): void {
     utc(now); id(eventId);
     this.db.transaction(() => {
       const run = this.db.prepare("SELECT * FROM schedule_runs WHERE event_id=?").get(eventId) as Run | undefined;
@@ -686,7 +686,7 @@ export class SchedulerRepository {
       // No write is materialized after a delegation preflight fails: the same failure may be
       // the current-access denial, and the outbox path cannot prove that access independently.
       this.audit(before, this.get(run.schedule_id)!, `event_${outcome}`,
-        {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:eventId},settledAt,undefined,this.getRun(run.run_id)!);
+        {tenant_id:before.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:eventId},settledAt,undefined,this.getRun(run.run_id)!,undefined,decisionCode);
       this.completeIfDrained(run.schedule_id, settledAt);
     }).immediate();
   }

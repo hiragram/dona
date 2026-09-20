@@ -11,7 +11,7 @@
 
 ## 実行と取消し
 
-materialization transactionはwork eventとbindingを同時に保存する。通常workerは`dona_schedule`を処理し、promptに保存済みobjective、`read_only` scope、空の`allowed_external_writes`、Result destinationを明示する。`delegate_job`の重複は既存jobを返し、異なる内容ならpayload mismatchになる。
+materialization transactionはwork eventとbindingを同時に保存する。通常workerは`dona_schedule`を処理し、promptに保存済みobjective、`read_only` scope、空の`allowed_external_writes`、Result destinationを明示する。current access receiptの記録後は`delegate_scheduled_work(event_id)`だけを使い、Dispatcherが永続化済みobjectiveとscratch workspaceを復元する。callerは`job_key`、objective、workspace、scopeを送れない。通常job向け`delegate_job`へschedule eventを渡した場合は確定拒否し、jobを作らない。専用handoffの重複は同じ1件のjobを返す。
 
 job作成時に最新のschedule state、revision、authorization expiry、misfireを再確認してからrunを`started`へ移す。拒否時はjob INSERTだけを戻し、runの`cancelled`/`skipped`決定はcommitする。schedule cancel・pause・authorization expiry後も開始済みworkのResultは保存するが、repository policyに従って通知だけを抑止する。未開始runは既存scheduler遷移で`cancelled`または`skipped`となりjob作成を拒否する。
 

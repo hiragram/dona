@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 import Database from "better-sqlite3";
 import { envelopeFromRow } from "../src/prompt.js";
-import { DispatcherDatabase } from "../src/database.js";
+import { DispatcherDatabase, ScheduledJobCreationError } from "../src/database.js";
 import { migrateJobRouting } from "../src/job-routing.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
 import type { Actor, RevisionInput, Run, SchedulerRepository } from "../src/scheduler/repository.js";
@@ -1210,6 +1210,65 @@ test("委任前current access失敗はscheduleをneeds_reviewへ固定する", (
   assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
   assert.equal(repo.get("access_denied")?.state,"needs_review");
   assert.throws(()=>dispatcher.manualRetry(run.event_id!,true,new Date(due)),/requires_reconciliation/);
+});
+
+test("schedule専用handoffは永続契約だけからjobをちょうど1件作る", () => {
+  const {repo,dispatcher,raw}=setup(); const objective="永続化済みobjective";
+  repo.create("dedicated_handoff",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("dedicated_handoff",1,due,later,due,actor).run;
+  const payload=JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:Record<string,unknown>};
+  payload.work.authorization_target={workspace_id:"T_TEST",channel_id:"C_TEST"};
+  raw.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(JSON.stringify(payload),run.event_id);
+  dispatcher.beginDispatch(run.event_id!,"/tmp/dedicated-result.json",new Date(due));
+  dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:new Date(due).toISOString(),nonce:"dedicated_nonce"},new Date(due));
+  const first=dispatcher.createScheduledJob(run.event_id!,"/tmp/jobs","/tmp/results",new Date(due));
+  const reused=dispatcher.createScheduledJob(run.event_id!,"/tmp/jobs","/tmp/results",new Date(due));
+  assert.equal(first.outcome,"created"); assert.equal(reused.outcome,"reused");
+  assert.equal(first.row.job_id,reused.row.job_id); assert.equal(first.row.objective,objective);
+  assert.deepEqual(JSON.parse(first.row.workspace_json).kind,"scratch");
+  assert.equal(raw.prepare("SELECT count(*) FROM jobs WHERE source_event_id=?").pluck().get(run.event_id),1);
+  assert.equal(repo.getRun(run.run_id)?.job_id,first.row.job_id);
+});
+
+test("scheduleのgeneric job_key誤付与は確定拒否として原因を残しambiguousにしない", () => {
+  const {repo,dispatcher,raw,filename}=setup(); const objective="変更不可のobjective";
+  repo.create("key_rejected",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("key_rejected",1,due,later,due,actor).run;
+  const payload=JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:Record<string,unknown>};
+  payload.work.authorization_target={workspace_id:"T_TEST",channel_id:"C_TEST"};
+  raw.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(JSON.stringify(payload),run.event_id);
+  const resultPath=path.join(path.dirname(filename),`${run.event_id}.json`);
+  dispatcher.beginDispatch(run.event_id!,resultPath,new Date(due));
+  dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:new Date(due).toISOString(),nonce:"key_nonce"},new Date(due));
+  assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,job_key:"wrong.key",objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),
+    error=>error instanceof ScheduledJobCreationError&&error.code==="scheduled_scope_mismatch");
+  dispatcher.recordScheduledDelegationRejection(run.event_id!,"scheduled_scope_mismatch",new Date(due));
+  dispatcher.saveFailedResult(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"failed",summary:"委任は確定拒否されました",actions:[],completed_at:due},resultPath,new Date(due));
+  assert.equal(raw.prepare("SELECT count(*) FROM jobs WHERE source_event_id=?").pluck().get(run.event_id),0);
+  assert.equal(dispatcher.get(run.event_id!)?.status,"dead_letter");
+  assert.equal(dispatcher.get(run.event_id!)?.last_error_code,"delegation_rejected:scheduled_scope_mismatch");
+  assert.equal(repo.getRun(run.run_id)?.status,"failed");
+  assert.notEqual(repo.getRun(run.run_id)?.reason,"ambiguous_write");
+  const audit=(repo.auditHistory("key_rejected") as Array<{operation:string;after_json:string}>).find(row=>row.operation==="event_failed");
+  assert.equal(JSON.parse(audit!.after_json).decision_code,"scheduled_scope_mismatch");
+});
+
+test("schedule専用handoffのreceipt欠落と契約改変をfail-closedで拒否する", () => {
+  const {repo,dispatcher,raw}=setup(); const objective="readonly";
+  repo.create("contract_rejected",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("contract_rejected",1,due,later,due,actor).run;
+  const initialPayload=JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:Record<string,unknown>};
+  initialPayload.work.authorization_target={workspace_id:"T_TEST",channel_id:"C_TEST"};
+  raw.prepare("UPDATE events SET payload_json=? WHERE event_id=?").run(JSON.stringify(initialPayload),run.event_id);
+  dispatcher.beginDispatch(run.event_id!,"/tmp/contract-result.json",new Date(due)); dispatcher.markWaiting(run.event_id!,new Date(due));
+  assert.throws(()=>dispatcher.createScheduledJob(run.event_id!,"/tmp/jobs","/tmp/results",new Date(due)),
+    error=>error instanceof ScheduledJobCreationError&&error.code==="scheduled_access_receipt_unavailable");
+  const payload=JSON.parse(dispatcher.get(run.event_id!)!.payload_json) as {work:{scope:string;allowed_external_writes:string[]}};
+  payload.work.scope="write"; payload.work.allowed_external_writes=["slack"];
+  raw.prepare("UPDATE events SET payload_json=?,schedule_access_checked_at=? WHERE event_id=?").run(JSON.stringify(payload),due,run.event_id);
+  assert.throws(()=>dispatcher.createScheduledJob(run.event_id!,"/tmp/jobs","/tmp/results",new Date(due)),
+    error=>error instanceof ScheduledJobCreationError&&error.code==="scheduled_scope_mismatch");
+  assert.equal(raw.prepare("SELECT count(*) FROM jobs WHERE source_event_id=?").pluck().get(run.event_id),0);
 });
 
 test("scheduled Resultの未来時刻と曖昧なSlack writeをfail-closedにする", () => {

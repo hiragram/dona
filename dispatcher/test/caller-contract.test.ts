@@ -211,7 +211,7 @@ test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisi
     const dispatcherConfig = config.split("[mcp_servers.dona_dispatcher]")[1]!;
     const enabled = JSON.parse(dispatcherConfig.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
     const advertised = (await f.client.listTools()).tools.map(tool => tool.name);
-    for (const name of [...names,"list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access"]) {
+    for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access"]) {
       assert.ok(enabled.includes(name), name); assert.ok(advertised.includes(name), name);
     }
     assert.match(dispatcherConfig,/tool_timeout_sec = 150/);
