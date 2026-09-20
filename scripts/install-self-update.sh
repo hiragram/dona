@@ -119,9 +119,7 @@ restore_control_plane() {
       DISPATCHER_RESTORE_REQUIRED=0
       return 0
     fi
-    if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-      /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
-    fi
+    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
     if ! wait_dispatcher_unregistered; then
       print -u2 "旧Dispatcher復旧前の登録解除を確認できません（bootout exit ${dispatcher_bootout_exit}）。backup: $CONTROL_BACKUP_ROOT"
       return 1

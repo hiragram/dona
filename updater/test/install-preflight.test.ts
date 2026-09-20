@@ -233,6 +233,11 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source,/DISPATCHER_RESTORE_REQUIRED=1[\s\S]*wait_dispatcher_unregistered[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
   assert.match(source,/if \[\[ "\$DISPATCHER_RESTORE_REQUIRED" == "1"[\s\S]*wait_dispatcher_unregistered[\s\S]*bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録"/);
   assert.match(source,/launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher" \|\| dispatcher_bootout_exit=\$\?[\s\S]*wait_dispatcher_unregistered/);
+  const restoreBranch = source.slice(source.indexOf('if [[ "$DISPATCHER_RESTORE_REQUIRED" == "1"'));
+  const restoreBootout = restoreBranch.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?');
+  const restoreWait = restoreBranch.indexOf("wait_dispatcher_unregistered", restoreBootout);
+  assert.ok(restoreBootout >= 0 && restoreBootout < restoreWait);
+  assert.doesNotMatch(restoreBranch.slice(0, restoreBootout), /launchctl print "\$DOMAIN\/dev\.dona\.dispatcher"/);
   assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
   assert.match(source, /wait-launchd-unregistered/);
   assert.match(source, /updater\.database-was-absent/);
