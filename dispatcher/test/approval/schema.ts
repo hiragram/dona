@@ -15,7 +15,7 @@ import { DispatcherDatabase } from "../../src/database.js";
 import {
   installApprovalSchema,
   installApprovalMetadataSchema, installApprovalIndexSchema, installApprovalPayloadSchema,
-  verifyApprovalPayloadSchema, verifyApprovalIndexSchema,
+  verifyApprovalPayloadSchema, verifyApprovalIndexSchema, installApprovalExecutionMarkerSchema, verifyApprovalExecutionMarkerSchema,
   verifyApprovalSchema,
   verifyApprovalIntegrity,
   ApprovalSchemaError,
@@ -868,4 +868,32 @@ test("別application IDを上書きせずpayload schema移行をrollbackする",
   assert.equal(db.pragma("application_id",{simple:true}),123);
   assert.equal(db.prepare("SELECT version FROM approval_schema").pluck().get(),3);
   assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE name='approval_payload_secrets'").get(),undefined);
+});
+
+test("execution marker v5移行は既存execution・payload・auditを保持しmarkerを捏造しない", t => {
+  const { db, filename } = payloadSchema(t); request(db); decide(db); db.transaction(() => consume(db))(); payload(db);
+  db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope);
+  db.exec("UPDATE approval_execution_attempts SET state='executing',fence=2");
+  const tables = ["approval_requests", "approval_consumes", "approval_execution_attempts", "approval_payload_metadata", "approval_payload_secrets"];
+  const before = tables.map(table => db.prepare(`SELECT * FROM ${table}`).all());
+  installApprovalExecutionMarkerSchema(db); assert.equal(db.prepare("SELECT version FROM approval_schema").pluck().get(), 5);
+  assert.deepEqual(tables.map(table => db.prepare(`SELECT * FROM ${table}`).all()), before);
+  assert.equal(db.prepare("SELECT count(*) FROM approval_execution_markers").pluck().get(), 0); verifyDatabasePayloadHistory(db);
+  for (const install of [installApprovalSchema, installApprovalMetadataSchema, installApprovalIndexSchema, installApprovalPayloadSchema, installApprovalExecutionMarkerSchema]) install(db);
+  const reopened = new Database(filename); reopened.pragma("foreign_keys=ON");
+  try { installApprovalSchema(reopened); verifyApprovalExecutionMarkerSchema(reopened); verifyApprovalPayloadSchema(reopened); }
+  finally { reopened.close(); }
+});
+test("execution marker migrationはv4以前・部分schema・payload履歴欠落を修復しない", t => {
+  const { db } = securePayloadSetup(t);
+  assert.throws(() => installApprovalExecutionMarkerSchema(db), ApprovalSchemaError);
+  installApprovalMetadataSchema(db); assert.throws(() => installApprovalExecutionMarkerSchema(db), ApprovalSchemaError);
+  installApprovalIndexSchema(db); assert.throws(() => installApprovalExecutionMarkerSchema(db), ApprovalSchemaError);
+  assert.equal(db.prepare("SELECT version FROM approval_schema").pluck().get(), 3);
+  for (const damage of ["DROP TRIGGER approval_execution_marker_immutable", "CREATE TABLE approval_marker_unknown(id TEXT)", "PRAGMA application_id=0"]) {
+    const f = payloadSchema(t); installApprovalExecutionMarkerSchema(f.db); f.db.exec(damage);
+    assert.throws(() => verifyApprovalExecutionMarkerSchema(f.db), ApprovalSchemaError);
+    assert.throws(() => installApprovalExecutionMarkerSchema(f.db), ApprovalSchemaError);
+    assert.throws(() => verifyApprovalPayloadSchema(f.db), ApprovalSchemaError);
+  }
 });

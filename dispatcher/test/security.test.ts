@@ -45,3 +45,6 @@ import "./approval/decision-broker.js";
 
 import "./approval/consume-broker.js";
 import "./approval/consume-concurrency.js";
+
+import "./approval/execution-marker.js";
+import "./approval/execution-marker-store.js";

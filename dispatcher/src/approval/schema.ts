@@ -273,6 +273,36 @@ CREATE TRIGGER approval_payload_terminal_delete AFTER UPDATE OF state ON approva
 const schemaV4Sql = schemaV3Sql.replace("CHECK(version=3)", "CHECK(version=4)")
   .replace("INSERT INTO approval_schema VALUES (3)", "INSERT INTO approval_schema VALUES (4)") + payloadSql;
 
+const executionMarkerSql = `
+CREATE TABLE approval_execution_markers (
+  attempt_id TEXT PRIMARY KEY NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 128),
+  request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 128),
+  consume_id TEXT NOT NULL CHECK(length(consume_id) BETWEEN 1 AND 128),
+  marker_json TEXT NOT NULL CHECK(json_valid(marker_json) AND length(CAST(marker_json AS BLOB)) BETWEEN 1 AND 2048),
+  clock_transaction_id TEXT NOT NULL REFERENCES approval_clock_reservations(transaction_id),
+  FOREIGN KEY(attempt_id,request_id,consume_id) REFERENCES approval_execution_attempts(attempt_id,request_id,consume_id),
+  CHECK(json_extract(marker_json,'$.marker.codec_version') IS 1),
+  CHECK(json_extract(marker_json,'$.marker.attempt_id') IS attempt_id),
+  CHECK(json_extract(marker_json,'$.marker.request_id') IS request_id),
+  CHECK(json_extract(marker_json,'$.marker.consume_id') IS consume_id),
+  CHECK(json_extract(marker_json,'$.marker.clock_transaction_id') IS clock_transaction_id),
+  CHECK(json_extract(marker_json,'$.marker.operation') IS 'slack.post_thread_reply.v1'),
+  CHECK(json_type(marker_json,'$.marker.execution_fence') IS 'integer'
+    AND json_extract(marker_json,'$.marker.execution_fence') BETWEEN 1 AND 9007199254740991)
+) STRICT;
+CREATE TRIGGER approval_execution_marker_fence BEFORE INSERT ON approval_execution_markers
+  WHEN NOT EXISTS(SELECT 1 FROM approval_execution_attempts WHERE attempt_id=NEW.attempt_id
+    AND request_id=NEW.request_id AND consume_id=NEW.consume_id AND state='executing'
+    AND fence=json_extract(NEW.marker_json,'$.marker.execution_fence'))
+  BEGIN SELECT RAISE(ABORT,'approval_execution_marker_fence'); END;
+CREATE TRIGGER approval_execution_marker_immutable BEFORE UPDATE ON approval_execution_markers
+  BEGIN SELECT RAISE(ABORT,'approval_execution_marker_immutable'); END;
+CREATE TRIGGER approval_execution_marker_no_delete BEFORE DELETE ON approval_execution_markers
+  BEGIN SELECT RAISE(ABORT,'approval_retention_not_authorized'); END;
+`;
+const schemaV5Sql = schemaV4Sql.replace("CHECK(version=4)", "CHECK(version=5)")
+  .replace("INSERT INTO approval_schema VALUES (4)", "INSERT INTO approval_schema VALUES (5)") + executionMarkerSql;
+
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
 }
@@ -283,7 +313,7 @@ function verifiedVersion(db: Database.Database): number {
   try {
     if (expectedShapes === undefined) {
       const computed = new Map<number, string>();
-      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql]] as const) {
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql], [5, schemaV5Sql]] as const) {
         const expected = new Database(":memory:");
         try { expected.exec(sql); computed.set(version, shape(expected)); }
         finally { expected.close(); }
@@ -303,7 +333,7 @@ function verifiedVersion(db: Database.Database): number {
     if (version === undefined) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== version) throw new ApprovalSchemaError();
-    if (version === 4) verifyDatabasePayloadHistory(db);
+    if (version >= 4) verifyDatabasePayloadHistory(db);
     return version;
   } catch { throw new ApprovalSchemaError(); }
 }
@@ -317,7 +347,7 @@ export function verifyApprovalIndexSchema(db: Database.Database): void {
 }
 
 export function verifyApprovalPayloadSchema(db: Database.Database): void {
-  if (verifiedVersion(db) !== 4) throw new ApprovalSchemaError();
+  if (verifiedVersion(db) < 4) throw new ApprovalSchemaError();
 }
 
 function verifyIntegrityInside(db: Database.Database): void {
@@ -429,4 +459,31 @@ export function installApprovalPayloadSchema(db: Database.Database): void {
       verifyOpenDatabaseFile(db);
     });
   } catch { throw new ApprovalSchemaError(); }
+}
+
+/** 明示的なv4->v5移行。既存execution codecとrecordを変更しない。
+ * marker、監査root、credential、実行許可は自動作成しない。 */
+export function installApprovalExecutionMarkerSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyIntegrityInside(db);
+        const version = verifiedVersion(db);
+        if (version < 4) throw new ApprovalSchemaError();
+        if (version === 4) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=5)) STRICT; INSERT INTO approval_schema VALUES (5)");
+          db.exec(executionMarkerSql);
+          verifyIntegrityInside(db); verifyApprovalExecutionMarkerSchema(db);
+        }
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
+  } catch { throw new ApprovalSchemaError(); }
+}
+export function verifyApprovalExecutionMarkerSchema(db: Database.Database): void {
+  if (verifiedVersion(db) !== 5) throw new ApprovalSchemaError();
 }
