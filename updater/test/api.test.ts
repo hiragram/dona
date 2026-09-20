@@ -69,7 +69,7 @@ test("atomic writer lease prevents a second server from unlinking the active soc
   const database = new UpdateDatabase(path.join(root, "updater.sqlite3"));
   const service = { isRunning: () => true, wake() {} };
   const first = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database, service, logger);
-  const second = new UpdaterApi(socketPath, undefined as unknown as UpdateController, database, service, logger);
+  const second = new UpdaterApi(path.join(root, "second.sock"), undefined as unknown as UpdateController, database, service, logger);
   try {
     await first.start();
     await assert.rejects(second.start(), /updater_writer_already_active/);

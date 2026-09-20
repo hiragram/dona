@@ -111,7 +111,7 @@ class StreamingRedactor {
         this.droppingQuote = undefined;
         continue;
       }
-      const credentialUri = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>/@:]+:[^\s"'<>/@]*@[^\s"'<>]*/i.exec(this.pending);
+      const credentialUri = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>/@:]*:[^\s"'<>/@]*@[^\s"'<>]*/i.exec(this.pending);
       if (credentialUri?.index !== undefined) {
         output += redactText(this.pending.slice(0, credentialUri.index), Number.MAX_SAFE_INTEGER);
         output += "[REDACTED_STREAM]";
@@ -427,6 +427,10 @@ export class DiagnosticLogStore {
     };
     const redactInOrder = (stream: "stdout" | "stderr", chunk: Buffer): void => {
       const redacted = redactors[stream].write(chunk);
+      if (orderedOutputTruncated) {
+        applyRedacted(stream, redacted);
+        return;
+      }
       const event = { stream, text: "", remainingSource: redacted.decoded, resolved: redacted.decoded.length === 0 };
       orderedOutput.push(event);
       if (!event.resolved) streamOutput[stream].push(event);

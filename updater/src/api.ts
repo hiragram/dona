@@ -30,6 +30,51 @@ async function socketAlive(socketPath: string): Promise<boolean> {
   });
 }
 
+export interface UpdaterSocketReservation {
+  socketPath: string;
+  server: http.Server;
+}
+
+export async function reserveUpdaterSocket(socketPath: string): Promise<UpdaterSocketReservation> {
+  await fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+  await fs.chmod(path.dirname(socketPath), 0o700);
+  try {
+    await fs.lstat(socketPath);
+    if (await socketAlive(socketPath)) throw new Error(`Another updater is listening on ${socketPath}`);
+    await fs.unlink(socketPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const server = http.createServer();
+  let ownsSocket = false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => reject(error);
+      server.once("error", onError);
+      server.listen(socketPath, () => {
+        server.off("error", onError);
+        ownsSocket = true;
+        resolve();
+      });
+    });
+    await fs.chmod(socketPath, 0o600);
+    return { socketPath, server };
+  } catch (error) {
+    try { await new Promise<void>((resolve) => server.close(() => resolve())); } catch { /* best effort */ }
+    if (ownsSocket) {
+      try { await fs.unlink(socketPath); } catch { /* best effort */ }
+    }
+    throw error;
+  }
+}
+
+export async function releaseUpdaterSocket(reservation: UpdaterSocketReservation): Promise<void> {
+  try { await new Promise<void>((resolve) => reservation.server.close(() => resolve())); } catch { /* best effort */ }
+  try { await fs.unlink(reservation.socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   if (request.headers["content-type"]?.split(";", 1)[0] !== "application/json") throw new ValidationError("Content-Type must be application/json");
   const chunks: Buffer[] = [];
@@ -60,32 +105,17 @@ export class UpdaterApi {
     private readonly service: Pick<UpdateService, "isRunning" | "wake">,
     private readonly logger: Logger,
     private readonly buildSha = process.env.DONA_UPDATER_BUILD_SHA ?? "development",
+    private readonly reservation?: UpdaterSocketReservation,
   ) {}
 
   async start(): Promise<void> {
-    this.database.acquireWriterLease(this.writerToken);
-    this.writerLeaseHeld = true;
     try {
-      await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
-      await fs.chmod(path.dirname(this.socketPath), 0o700);
-      try {
-        await fs.lstat(this.socketPath);
-        if (await socketAlive(this.socketPath)) throw new Error(`Another updater is listening on ${this.socketPath}`);
-        await fs.unlink(this.socketPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      this.server = http.createServer((request, response) => void this.handle(request, response));
-      await new Promise<void>((resolve, reject) => {
-        const onError = (error: Error): void => reject(error);
-        this.server!.once("error", onError);
-        this.server!.listen(this.socketPath, () => {
-          this.server!.off("error", onError);
-          this.ownsSocket = true;
-          resolve();
-        });
-      });
-      await fs.chmod(this.socketPath, 0o600);
+      const reservation = this.reservation ?? await reserveUpdaterSocket(this.socketPath);
+      this.server = reservation.server;
+      this.ownsSocket = true;
+      this.database.acquireWriterLease(this.writerToken);
+      this.writerLeaseHeld = true;
+      this.server.on("request", (request, response) => void this.handle(request, response));
     } catch (error) {
       if (this.ownsSocket && this.server) {
         try { await new Promise<void>((resolve) => this.server!.close(() => resolve())); } catch { /* best effort */ }

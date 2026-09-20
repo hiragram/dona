@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { CanonicalBuild, RealDispatcher, RealGit, RealRuntime } from "./adapters.js";
-import { UpdaterApi } from "./api.js";
+import { releaseUpdaterSocket, reserveUpdaterSocket, UpdaterApi, type UpdaterSocketReservation } from "./api.js";
 import { UpdateController } from "./controller.js";
 import { UpdateDatabase } from "./database.js";
 import { createLogger } from "./logger.js";
@@ -52,29 +52,34 @@ async function main(): Promise<void> {
   const defaultPolicy = path.join(os.homedir(), "Library", "Application Support", "Dona", "update-control", "policy.json");
   const policy = loadPolicy(process.env.DONA_UPDATE_POLICY_PATH ?? defaultPolicy);
   const logger = createLogger();
-  const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"), {
-    readonly: command === "status" || command === "doctor",
-  });
-  const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database, [
-    policy.config_root,
-    policy.release_root,
-    path.dirname(policy.current_pointer),
-  ]);
-  const releases = new ReleaseStore(policy);
-  const controller = new UpdateController(
-    database,
-    policy,
-    new RealGit(policy),
-    new CanonicalBuild(policy, undefined, diagnostics),
-    releases,
-    new RealRuntime(policy),
-    new RealDispatcher(policy),
-    logger,
-    undefined,
-    undefined,
-    diagnostics,
-  );
+  const socketPath = path.join(policy.control_root, "updater.sock");
+  let reservation: UpdaterSocketReservation | undefined = command === "serve"
+    ? await reserveUpdaterSocket(socketPath)
+    : undefined;
+  let database: UpdateDatabase | undefined;
   try {
+    database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"), {
+      readonly: command === "status" || command === "doctor",
+    });
+    const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database, [
+      policy.config_root,
+      policy.release_root,
+      path.dirname(policy.current_pointer),
+    ]);
+    const releases = new ReleaseStore(policy);
+    const controller = new UpdateController(
+      database,
+      policy,
+      new RealGit(policy),
+      new CanonicalBuild(policy, undefined, diagnostics),
+      releases,
+      new RealRuntime(policy),
+      new RealDispatcher(policy),
+      logger,
+      undefined,
+      undefined,
+      diagnostics,
+    );
     if (command === "status") {
       console.log(JSON.stringify(await controller.status(requestId), null, 2));
       return;
@@ -92,7 +97,8 @@ async function main(): Promise<void> {
       return;
     }
     const service = new UpdateService(controller, logger);
-    const api = new UpdaterApi(path.join(policy.control_root, "updater.sock"), controller, database, service, logger);
+    const api = new UpdaterApi(socketPath, controller, database, service, logger, undefined, reservation);
+    reservation = undefined;
     await initializeServe(api, diagnostics, controller, service);
     await new Promise<void>((resolve, reject) => {
       let stopping = false;
@@ -112,7 +118,8 @@ async function main(): Promise<void> {
       process.once("SIGTERM", () => void stop("SIGTERM"));
     });
   } finally {
-    database.close();
+    if (reservation) await releaseUpdaterSocket(reservation);
+    database?.close();
   }
 }
 

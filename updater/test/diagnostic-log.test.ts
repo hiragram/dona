@@ -126,18 +126,28 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.match(connectionDetail, /REDACTED_STREAM/);
     assert.match(connectionDetail, /visible-after-connection/);
 
+    const emptyUserConnectionCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-empty-user-connection" });
+    emptyUserConnectionCapture.write("stderr", Buffer.from("REDIS_URL=redis://:s3"));
+    emptyUserConnectionCapture.write("stderr", Buffer.from("cr3t@cache.internal/0\nvisible-after-redis"));
+    emptyUserConnectionCapture.finish(true);
+    const emptyUserConnectionDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[6]!, 16_384).detail_tail);
+    assert.equal(emptyUserConnectionDetail.includes("s3cr3t"), false);
+    assert.equal(emptyUserConnectionDetail.includes("cache.internal"), false);
+    assert.match(emptyUserConnectionDetail, /REDACTED_STREAM/);
+    assert.match(emptyUserConnectionDetail, /visible-after-redis/);
+
     const partialCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-build-partial" });
     partialCapture.write("stderr", Buffer.from(`password${" ".repeat(5_000)}`));
     partialCapture.write("stderr", Buffer.from("secret-after-long-carry\nvisible-after-line"));
     partialCapture.finish(true);
-    const partialDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[6]!, 16_384).detail_tail);
+    const partialDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[7]!, 16_384).detail_tail);
     assert.equal(partialDetail.includes("secret-after-long-carry"), false);
     assert.match(partialDetail, /visible-after-line/);
 
     const environmentCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-env" });
     environmentCapture.write("stderr", Buffer.from("NPM_TOKEN=supersecret\nGITHUB_TOKEN=github-secret\nMY_PASSWORD=human-secret\nvisible"));
     environmentCapture.finish(true);
-    const environmentDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[7]!, 16_384).detail_tail);
+    const environmentDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[8]!, 16_384).detail_tail);
     assert.equal(environmentDetail.includes("supersecret"), false);
     assert.equal(environmentDetail.includes("github-secret"), false);
     assert.equal(environmentDetail.includes("human-secret"), false);
@@ -147,7 +157,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     pathCapture.write("stderr", Buffer.from("failed at /Users/alice/Library/Application "));
     pathCapture.write("stderr", Buffer.from("Support/Dona/private.log\nvisible-after-path"));
     pathCapture.finish(true);
-    const pathDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[8]!, 16_384).detail_tail);
+    const pathDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[9]!, 16_384).detail_tail);
     assert.equal(pathDetail.includes("Support/Dona"), false);
     assert.match(pathDetail, /visible-after-path/);
 
@@ -155,7 +165,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     npmAuthCapture.write("stderr", Buffer.from("//registry.example/:_auth"));
     npmAuthCapture.write("stderr", Buffer.from("Token=supersecret\nvisible-after-auth"));
     npmAuthCapture.finish(true);
-    const npmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[9]!, 16_384).detail_tail);
+    const npmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[10]!, 16_384).detail_tail);
     assert.equal(npmAuthDetail.includes("supersecret"), false);
     assert.match(npmAuthDetail, /REDACTED_STREAM/);
     assert.match(npmAuthDetail, /visible-after-auth/);
@@ -164,7 +174,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     middleSecretCapture.write("stderr", Buffer.from("AWS_SECRET_"));
     middleSecretCapture.write("stderr", Buffer.from("ACCESS_KEY=cloud-secret\nvisible-after-cloud-auth"));
     middleSecretCapture.finish(true);
-    const middleSecretDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[10]!, 16_384).detail_tail);
+    const middleSecretDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[11]!, 16_384).detail_tail);
     assert.equal(middleSecretDetail.includes("cloud-secret"), false);
     assert.match(middleSecretDetail, /REDACTED_STREAM/);
     assert.match(middleSecretDetail, /visible-after-cloud-auth/);
@@ -173,7 +183,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     jsonCapture.write("stderr", Buffer.from('{"to'));
     jsonCapture.write("stderr", Buffer.from('ken":"json-secret"}\nvisible-after-json'));
     jsonCapture.finish(true);
-    const jsonDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[11]!, 16_384).detail_tail);
+    const jsonDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[12]!, 16_384).detail_tail);
     assert.equal(jsonDetail.includes("json-secret"), false, jsonDetail);
     assert.match(jsonDetail, /REDACTED_STREAM/);
     assert.match(jsonDetail, /visible-after-json/);
@@ -182,7 +192,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     apiKeyCapture.write("stderr", Buffer.from("OPENAI_API_"));
     apiKeyCapture.write("stderr", Buffer.from('KEY=environment-secret\n{"apiKey":"json-api-secret"}\nvisible-after-api-key'));
     apiKeyCapture.finish(true);
-    const apiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[12]!, 16_384).detail_tail);
+    const apiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[13]!, 16_384).detail_tail);
     assert.equal(apiKeyDetail.includes("environment-secret"), false, apiKeyDetail);
     assert.equal(apiKeyDetail.includes("json-api-secret"), false, apiKeyDetail);
     assert.match(apiKeyDetail, /visible-after-api-key/);
@@ -191,7 +201,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     legacyNpmAuthCapture.write("stderr", Buffer.from("//registry.example/:_au"));
     legacyNpmAuthCapture.write("stderr", Buffer.from("th=BASE64_CREDENTIAL\nvisible-after-legacy-auth"));
     legacyNpmAuthCapture.finish(true);
-    const legacyNpmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[13]!, 16_384).detail_tail);
+    const legacyNpmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[14]!, 16_384).detail_tail);
     assert.equal(legacyNpmAuthDetail.includes("BASE64_CREDENTIAL"), false, legacyNpmAuthDetail);
     assert.match(legacyNpmAuthDetail, /REDACTED_STREAM/);
     assert.match(legacyNpmAuthDetail, /visible-after-legacy-auth/);
@@ -200,7 +210,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     hyphenatedApiKeyCapture.write("stderr", Buffer.from("X-API-"));
     hyphenatedApiKeyCapture.write("stderr", Buffer.from("Key: header-secret\nx-api-key='config-secret'\nvisible-after-hyphenated-api-key"));
     hyphenatedApiKeyCapture.finish(true);
-    const hyphenatedApiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[14]!, 16_384).detail_tail);
+    const hyphenatedApiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[15]!, 16_384).detail_tail);
     assert.equal(hyphenatedApiKeyDetail.includes("header-secret"), false, hyphenatedApiKeyDetail);
     assert.equal(hyphenatedApiKeyDetail.includes("config-secret"), false, hyphenatedApiKeyDetail);
     assert.match(hyphenatedApiKeyDetail, /REDACTED_STREAM/);
@@ -210,7 +220,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     privateKeyCapture.write("stderr", Buffer.from("SSH_PRIVATE_"));
     privateKeyCapture.write("stderr", Buffer.from('KEY=ssh-secret\nprivateKey="camel-secret"\nprivate-key=hyphen-secret\nvisible-after-private-key'));
     privateKeyCapture.finish(true);
-    const privateKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[15]!, 16_384).detail_tail);
+    const privateKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[16]!, 16_384).detail_tail);
     assert.equal(privateKeyDetail.includes("ssh-secret"), false, privateKeyDetail);
     assert.equal(privateKeyDetail.includes("camel-secret"), false, privateKeyDetail);
     assert.equal(privateKeyDetail.includes("hyphen-secret"), false, privateKeyDetail);
@@ -220,7 +230,7 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     configuredRootCapture.write("stderr", Buffer.from("failed at /opt/company/private "));
     configuredRootCapture.write("stderr", Buffer.from("releases/staging/source.ts:42\nvisible-after-configured-root"));
     configuredRootCapture.finish(true);
-    const configuredRootDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[16]!, 16_384).detail_tail);
+    const configuredRootDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[17]!, 16_384).detail_tail);
     assert.equal(configuredRootDetail.includes("/opt/company"), false, configuredRootDetail);
     assert.equal(configuredRootDetail.includes("staging/source.ts"), false, configuredRootDetail);
     assert.match(configuredRootDetail, /visible-after-configured-root/);
@@ -268,6 +278,7 @@ test("bounds ordered output while an earlier stream keeps redaction carry pendin
     const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-order-limit" });
     capture.write("stderr", Buffer.from("first"));
     capture.write("stdout", Buffer.from(`${"x".repeat(16_384)}\n`));
+    for (let index = 0; index < 10_000; index += 1) capture.write("stdout", Buffer.from("x"));
     const result = capture.finish(true)!;
     assert.equal(result.capture_state, "truncated");
     assert.equal(result.byte_size, 4_096);
