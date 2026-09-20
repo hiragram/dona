@@ -54,22 +54,14 @@ export class ApprovalRecordRepository {
     try {
       const selectedKey = approvalIndexKey(this.scope, { kind: "alias", selector });
       return this.withPlan(plan => {
+        if (selector.name === "presentation_active_message") return this.presentationHolder(plan, selector.message_ref);
         const index = plan.readIndex({ kind: "alias", selector });
-        if (index === null) {
-          if (selector.name === "presentation_active_message") this.sql.assertNoPresentationHolder(selector.message_ref);
-          return null;
-        }
+        if (index === null) return null;
         if (index.kind !== "alias") throw Error();
-        if (index.target === null) {
-          if (index.selector.name !== "presentation_active_message") throw Error();
-          this.sql.assertNoPresentationHolder(index.selector.message_ref); return null;
-        }
+        if (index.target === null) throw Error();
         const record = this.record(plan, aliasKinds[index.selector.name], index.target);
         if (record === null) throw Error();
-        if (index.selector.name === "presentation_active_message") {
-          if (record.kind !== "presentation" || record.row.message_ref !== index.selector.message_ref
-            || !["dispatching", "acceptance_unknown"].includes(record.row.state)) throw Error();
-        } else if (!approvalRecordAliases(record).some(value => approvalIndexKey(this.scope, { kind: "alias", selector: value }) === selectedKey)) throw Error();
+        if (!approvalRecordAliases(record).some(value => approvalIndexKey(this.scope, { kind: "alias", selector: value }) === selectedKey)) throw Error();
         this.verifyIndexes(plan, record); return record;
       });
     } catch { throw new ApprovalRecordRepositoryError(); }
@@ -94,7 +86,17 @@ export class ApprovalRecordRepository {
   private record(plan: ApprovalMetadataPlan, kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
     return readApprovalRecordGraph(this.scope, plan, (type, key) => this.sql.read(type, key), kind, primary);
   }
-  private verifyIndexes(plan: ApprovalMetadataPlan, record: ApprovalRecord): void {
+  private presentationHolder(plan: ApprovalMetadataPlan, messageRef: string): Of<"presentation"> | null {
+    const index = plan.readIndex({ kind: "alias", selector: { name: "presentation_active_message", message_ref: messageRef } });
+    if (index !== null && index.kind !== "alias") throw Error();
+    if (index === null || index.target === null) { this.sql.assertNoPresentationHolder(messageRef); return null; }
+    const holder = this.record(plan, "presentation", index.target);
+    if (holder?.kind !== "presentation" || holder.row.message_ref !== messageRef
+      || !["dispatching", "acceptance_unknown"].includes(holder.row.state)) throw Error();
+    // holder自身のmessage aliasは直前に解決済み。再帰せず他の全indexを検証する。
+    this.verifyIndexes(plan, holder, false); return holder;
+  }
+  private verifyIndexes(plan: ApprovalMetadataPlan, record: ApprovalRecord, checkHolder = true): void {
     const primary = approvalRecordPrimary(record);
     verifyApprovalListMembership(plan, { record_kind: record.kind, membership: "all" }, primary, true);
     if (!["decision", "consume"].includes(record.kind))
@@ -103,11 +105,10 @@ export class ApprovalRecordRepository {
       const index = plan.readIndex({ kind: "alias", selector });
       if (index?.kind !== "alias" || index.target !== primary) throw Error();
     }
-    if (record.kind === "presentation") {
-      const index = plan.readIndex({ kind: "alias", selector: { name: "presentation_active_message", message_ref: record.row.message_ref } });
-      if (index !== null && index.kind !== "alias") throw Error();
+    if (record.kind === "presentation" && checkHolder) {
+      const holder = this.presentationHolder(plan, record.row.message_ref);
       const holds = ["dispatching", "acceptance_unknown"].includes(record.row.state);
-      if ((index?.target === primary) !== holds) throw Error();
+      if ((holder?.row.update_id === primary) !== holds) throw Error();
     }
   }
   private withPlan(read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null): ApprovalRecord | null;

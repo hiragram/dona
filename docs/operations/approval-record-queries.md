@@ -6,7 +6,7 @@
 
 creation key、decision ID、consume/attempt、notification request/kind/message、event decision、presentation revision/message fenceという既存の固定selectorだけを受ける。selectorをcodecで検証し、alias targetのrecordと実際のselectorが一致することを確認する。存在するaliasが欠落recordや別recordを指す場合は失敗し、`null`にしない。
 
-recordの全固定aliasとall/active membershipも照合する。presentationのmessage holderは`dispatching`または`acceptance_unknown`だけであり、解放後のtombstoneと未登録aliasは、同じtransactionで固定partial UNIQUE indexを使いSQLにholderが残っていないことも確認してから`null`を返す。SQL確認は不整合を拒否するためだけに使い、SQLをrootの代替にはしない。履歴aliasを解放したりone-shot IDを再利用したりする操作は追加しない。
+recordの全固定aliasとall/active membershipも照合する。presentationのmessage holderは`dispatching`または`acceptance_unknown`だけであり、解放後のtombstoneと未登録aliasは、同じtransactionで固定partial UNIQUE indexを使いSQLにholderが残っていないことも確認してから`null`を返す。SQL確認は不整合を拒否するためだけに使い、SQLをrootの代替にはしない。履歴presentationをrevision aliasや一覧から読む場合も、引継ぎ先holderのrecord・親・全固定alias・membershipを検証する。holderが別message、非実行中、欠落、またはそのindexが不整合なら拒否する。履歴aliasを解放したりone-shot IDを再利用したりする操作は追加しない。
 
 ## 内部一覧の先頭
 
