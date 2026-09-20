@@ -86,19 +86,30 @@ export interface MutationFields {
   restart_attempts?: number;
 }
 
+export interface UpdateDatabaseOptions {
+  readonly?: boolean;
+}
+
 export class UpdateDatabase {
   private readonly db: Database.Database;
+  private readonly readonlyMode: boolean;
 
-  constructor(databasePath: string) {
-    fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
-    fs.chmodSync(path.dirname(databasePath), 0o700);
-    this.db = new Database(databasePath);
-    fs.chmodSync(databasePath, 0o600);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("synchronous = FULL");
+  constructor(databasePath: string, options: UpdateDatabaseOptions = {}) {
+    this.readonlyMode = options.readonly === true;
+    if (!options.readonly) {
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+      fs.chmodSync(path.dirname(databasePath), 0o700);
+    }
+    this.db = new Database(databasePath, options.readonly ? { readonly: true, fileMustExist: true } : undefined);
+    if (!options.readonly) {
+      fs.chmodSync(databasePath, 0o600);
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("synchronous = FULL");
+    }
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    if (options.readonly) this.db.pragma("query_only = ON");
+    else this.migrate();
   }
 
   private migrate(): void {
@@ -295,6 +306,10 @@ export class UpdateDatabase {
 
   close(): void {
     this.db.close();
+  }
+
+  accessMode(): "read_only" | "read_write" {
+    return this.readonlyMode ? "read_only" : "read_write";
   }
 
   checkpoint(): void {

@@ -79,6 +79,29 @@ describe("UpdateDatabase", () => {
     migrated.close();
   });
 
+  test("opens legacy databases read-only without applying forward migrations", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    await fs.mkdir(policy.control_root, { recursive: true });
+    const raw = new Database(databasePath);
+    raw.exec(`
+      CREATE TABLE update_requests (request_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      PRAGMA user_version = 4;
+    `);
+    raw.close();
+
+    const reader = new UpdateDatabase(databasePath, { readonly: true });
+    assert.equal(reader.accessMode(), "read_only");
+    assert.throws(() => reader.assertReadableWritable(), /readonly|read-only/i);
+    reader.close();
+
+    const unchanged = new Database(databasePath, { readonly: true });
+    assert.equal(unchanged.pragma("user_version", { simple: true }), 4);
+    assert.equal(unchanged.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'").get(), undefined);
+    unchanged.close();
+  });
+
   test("binds idempotent approval to the exact plan and detects payload mismatch", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

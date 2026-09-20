@@ -184,6 +184,16 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(legacyNpmAuthDetail.includes("BASE64_CREDENTIAL"), false, legacyNpmAuthDetail);
     assert.match(legacyNpmAuthDetail, /REDACTED_STREAM/);
     assert.match(legacyNpmAuthDetail, /visible-after-legacy-auth/);
+
+    const hyphenatedApiKeyCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:hyphenated-api-key" });
+    hyphenatedApiKeyCapture.write("stderr", Buffer.from("X-API-"));
+    hyphenatedApiKeyCapture.write("stderr", Buffer.from("Key: header-secret\nx-api-key='config-secret'\nvisible-after-hyphenated-api-key"));
+    hyphenatedApiKeyCapture.finish(true);
+    const hyphenatedApiKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[13]!, 16_384).detail_tail);
+    assert.equal(hyphenatedApiKeyDetail.includes("header-secret"), false, hyphenatedApiKeyDetail);
+    assert.equal(hyphenatedApiKeyDetail.includes("config-secret"), false, hyphenatedApiKeyDetail);
+    assert.match(hyphenatedApiKeyDetail, /REDACTED_STREAM/);
+    assert.match(hyphenatedApiKeyDetail, /visible-after-hyphenated-api-key/);
   } finally {
     f.database.close();
   }

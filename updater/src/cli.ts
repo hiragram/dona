@@ -32,7 +32,10 @@ async function main(): Promise<void> {
   const defaultPolicy = path.join(os.homedir(), "Library", "Application Support", "Dona", "update-control", "policy.json");
   const policy = loadPolicy(process.env.DONA_UPDATE_POLICY_PATH ?? defaultPolicy);
   const logger = createLogger();
-  const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+  const command = process.argv[2] ?? "serve";
+  const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"), {
+    readonly: command === "status" || command === "doctor",
+  });
   const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database);
   const releases = new ReleaseStore(policy);
   const controller = new UpdateController(
@@ -48,7 +51,6 @@ async function main(): Promise<void> {
     undefined,
     diagnostics,
   );
-  const command = process.argv[2] ?? "serve";
   try {
     if (command === "status") {
       const requestId = process.argv[3];

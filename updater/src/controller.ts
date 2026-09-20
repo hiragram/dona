@@ -271,7 +271,7 @@ export class UpdateController {
       fast_forward: remote.target_reachable,
       ci_trusted: remote.ci_trusted,
       cleanup_dry_run: await this.releases.cleanupPlan(protectedShas),
-      database: "read_write",
+      database: this.database.accessMode(),
       updater_self_update: "disabled",
       main_agent: mainAgent,
     };
