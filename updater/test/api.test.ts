@@ -201,6 +201,7 @@ test("startup recovery never removes a live lock that replaced the inode it insp
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-lock-replaced-"));
   const socketPath = path.join(root, "updater.sock");
   const lockPath = path.join(root, "updater.start.lock");
+  const replacementPath = path.join(root, "replacement.lock");
   await fs.writeFile(lockPath, JSON.stringify({ pid: 999_999_999, process_start: "stale", token: "stale" }), { mode: 0o600 });
   let replaced = false;
   try {
@@ -211,9 +212,9 @@ test("startup recovery never removes a live lock that replaced the inode it insp
       afterReadStartupLock: async () => {
         if (replaced) return;
         replaced = true;
-        await fs.unlink(lockPath);
-        await fs.writeFile(lockPath,
+        await fs.writeFile(replacementPath,
           JSON.stringify({ pid: process.pid, process_start: "live-process", token: "live" }), { mode: 0o600 });
+        await fs.rename(replacementPath, lockPath);
       },
     }), /updater_startup_lock_active/);
     assert.match(await fs.readFile(lockPath, "utf8"), /"token":"live"/);
