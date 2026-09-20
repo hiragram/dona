@@ -127,7 +127,11 @@ function runProcess(
   stdin = "",
 ): Promise<HerdrCommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    // 入力不要の短命コマンドは、終了後の空 write による EPIPE を避ける。
+    // update-ref --stdin など実データを渡す場合だけ pipe を作る。
+    const child = stdin === ""
+      ? spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] })
+      : spawn(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -166,7 +170,7 @@ function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 1_048_576) stderr += chunk.toString("utf8");
     });
-    child.stdin.on("error", (error) => {
+    child.stdin?.on("error", (error) => {
       stderr = error.message;
       terminate();
       finish({ ok: false, stdout, stderr, exitCode: child.exitCode, timedOut, aborted });
@@ -178,7 +182,7 @@ function runProcess(
     child.once("close", (code) => {
       finish({ ok: code === 0 && !timedOut && !aborted, stdout, stderr, exitCode: code, timedOut, aborted });
     });
-    child.stdin.end(stdin);
+    child.stdin?.end(stdin);
   });
 }
 
