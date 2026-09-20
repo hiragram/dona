@@ -7,6 +7,8 @@ import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
+import { markDatabasePayloadHistory, verifyDatabasePayloadHistory } from "../src/payload-backup-boundary.js";
+import { installWebAuthSchema, verifyWebAuthSchema } from "../src/web/schema.js";
 
 import {
   assertReceiptMatchesDatabases,
@@ -367,4 +369,44 @@ test("payload入り既存backupとsourceをreceipt再利用・復旧の各経路
     if (state !== "receipt") await assert.rejects(fs.access(input.receiptPath));
     else assert.deepEqual(JSON.parse(await fs.readFile(input.receiptPath,"utf8")),receipt);
   }
+});
+
+
+test("payload導入履歴はrename・drop後のfreelistを含む全体backupを拒否する",async()=>{
+  for(const kind of ["web","approval"] as const) for(const operation of ["rename","drop"] as const){
+    const input=await payloadBackupFixture();const db=new Database(input.databasePath);
+    const marker="fixture-only-payload-page-".repeat(300);db.pragma("foreign_keys=ON");db.pragma("secure_delete=OFF");
+    if(kind==="web"){
+      installWebAuthSchema(db);verifyWebAuthSchema(db);
+      db.exec("INSERT INTO web_auth_state VALUES('i','w','{}')");
+      db.prepare("INSERT INTO web_auth_payloads VALUES('i','w','p',?)").run(JSON.stringify({fixture:marker}));
+    }else db.transaction(()=>{
+      // Approval's real v4 installer is tested in approval/schema.ts. This
+      // rollout fixture exercises its shared persistent-history primitive.
+      markDatabasePayloadHistory(db);db.exec("CREATE TABLE approval_payload_secrets(value TEXT)");
+      db.prepare("INSERT INTO approval_payload_secrets VALUES(?)").run(marker);
+    })();
+    verifyDatabasePayloadHistory(db);
+    const table=kind==="web"?"web_auth_payloads":"approval_payload_secrets";
+    db.pragma("foreign_keys=OFF");
+    db.exec(operation==="rename"?`ALTER TABLE ${table} RENAME TO historical_fixture`:`DROP TABLE ${table}`);
+    if(kind==="web")db.exec("DROP TABLE web_auth_state; DROP TABLE web_auth_schema");
+    if(operation==="drop")assert.ok(Number(db.pragma("freelist_count",{simple:true}))>0);
+    db.close();
+    assert.ok((await fs.readFile(input.databasePath)).includes(Buffer.from("fixture-only-payload-page-")));
+    const reopened=new Database(input.databasePath);try{verifyDatabasePayloadHistory(reopened);}finally{reopened.close();}
+    await assert.rejects(migrateV2ToV3WithBackup(input),/schema_full_backup_payload_store_forbidden/);
+    await assert.rejects(fs.access(input.backupPath));
+  }
+});
+
+test("旧Web schemaの明示admissionは履歴を記録しmarker不明の読取を拒否する",async()=>{
+  const input=await payloadBackupFixture();const db=new Database(input.databasePath);db.pragma("foreign_keys=ON");
+  try{
+    installWebAuthSchema(db);db.pragma("application_id=0");
+    assert.throws(()=>verifyWebAuthSchema(db));
+    installWebAuthSchema(db);verifyDatabasePayloadHistory(db);verifyWebAuthSchema(db);
+    db.pragma("application_id=123");assert.throws(()=>installWebAuthSchema(db));
+    assert.equal(db.pragma("application_id",{simple:true}),123);
+  }finally{db.close();}
 });

@@ -8,6 +8,8 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
+import { verifyDatabasePayloadHistory } from "../../src/payload-backup-boundary.js";
+import { withMutationSqlGuard } from "../../src/audit/file-identity.js";
 import { openSecurityDatabase } from "../../src/audit/coordination.js";
 import { DispatcherDatabase } from "../../src/database.js";
 import {
@@ -842,4 +844,28 @@ test("attempt payloadはexact requestとconsumeへ結合し別requestのattempt�
   payload(db,"r1",row);
   db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_a1',?)").run(fixtureEnvelope);
   verifyApprovalIntegrity(db);
+});
+
+
+test("payload導入履歴は再open後も残り監査mutationで解除できない", t => {
+  const {db,filename}=payloadSchema(t);
+  verifyDatabasePayloadHistory(db);
+  db.transaction(()=>withMutationSqlGuard(db,()=>{
+    verifyDatabasePayloadHistory(db);
+    assert.throws(()=>db.pragma("application_id=0"),/not authorized/);
+  }))();
+  const reopened=new Database(filename);
+  try { verifyDatabasePayloadHistory(reopened); } finally { reopened.close(); }
+  db.pragma("application_id=0");
+  assert.throws(()=>verifyApprovalPayloadSchema(db),ApprovalSchemaError);
+  assert.throws(()=>installApprovalPayloadSchema(db),ApprovalSchemaError);
+});
+
+test("別application IDを上書きせずpayload schema移行をrollbackする", t => {
+  const {db}=securePayloadSetup(t);installApprovalMetadataSchema(db);installApprovalIndexSchema(db);
+  db.pragma("application_id=123");
+  assert.throws(()=>installApprovalPayloadSchema(db),ApprovalSchemaError);
+  assert.equal(db.pragma("application_id",{simple:true}),123);
+  assert.equal(db.prepare("SELECT version FROM approval_schema").pluck().get(),3);
+  assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE name='approval_payload_secrets'").get(),undefined);
 });

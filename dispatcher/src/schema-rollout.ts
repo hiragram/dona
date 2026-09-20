@@ -78,9 +78,11 @@ export function verifyDatabase(db: Database.Database, expectedVersion: number): 
 }
 
 /** Full-file SQLite backups cannot exclude individual tables, including their
- * freed pages. Even an empty protected payload table disallows this operation. */
+ * freed pages. A persistent history marker also rejects renamed/dropped stores.
+ * Schema markers conservatively reject pre-marker and damaged security schemas. */
 export function assertFullBackupHasNoPayloadStore(db: Database.Database): void {
-  if (db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) {
+  if (db.pragma("main.application_id", { simple: true }) !== 0
+    || db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_schema','web_auth_schema','approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) {
     throw new Error("schema_full_backup_payload_store_forbidden");
   }
 }

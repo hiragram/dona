@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import {markDatabasePayloadHistory,verifyDatabasePayloadHistory} from "../payload-backup-boundary.js";
 import {WebStateError} from "./model.js";
 const sql=`
  CREATE TABLE web_auth_schema (version INTEGER PRIMARY KEY CHECK(version=1)) STRICT;
@@ -21,6 +22,7 @@ let expected:string|undefined;
 function shape(db:Database.Database):string{return JSON.stringify(db.prepare(shapeSql).all());}
 export function verifyWebAuthSchema(db:Database.Database):void {
  try{
+  verifyDatabasePayloadHistory(db);
   if(expected===undefined){const fixture=new Database(":memory:");try{fixture.exec(sql);expected=shape(fixture);}finally{fixture.close();}}
   if(shape(db)!==expected || db.prepare(shadowSql).get() || db.pragma("foreign_keys",{simple:true})!==1
     || db.pragma("ignore_check_constraints",{simple:true})!==0 || db.pragma("encoding",{simple:true})!=="UTF-8")throw new WebStateError();
@@ -34,6 +36,7 @@ export function installWebAuthSchema(db:Database.Database):void {
  try{
   if(db.inTransaction)throw new WebStateError();
   db.transaction(()=>{
+   markDatabasePayloadHistory(db);
    if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='web_auth_schema' AND type='table'").get()){verifyWebAuthSchema(db);return;}
    if(db.prepare(shapeSql).get() || db.prepare(shadowSql).get())throw new WebStateError();
    db.exec(sql);verifyWebAuthSchema(db);

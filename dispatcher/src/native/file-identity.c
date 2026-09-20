@@ -52,7 +52,8 @@ static int authorize_mutation(void *data, int action, const char *first,
       /* Only the fixed read-only checks used by the repository are permitted. */
       return !second && first && (!strcmp(first, "foreign_keys") ||
         !strcmp(first, "recursive_triggers") || !strcmp(first, "foreign_key_check") ||
-        !strcmp(first, "ignore_check_constraints") || !strcmp(first, "encoding")) ? SQLITE_OK : SQLITE_DENY;
+        !strcmp(first, "ignore_check_constraints") || !strcmp(first, "encoding") ||
+        !strcmp(first, "application_id")) ? SQLITE_OK : SQLITE_DENY;
     default: return SQLITE_DENY;
   }
 }

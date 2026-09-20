@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { markDatabasePayloadHistory, verifyDatabasePayloadHistory } from "../payload-backup-boundary.js";
 import { assertSecurityDurability } from "../audit/durability.js";
 import { withSecurityTransactionLock } from "../audit/coordination.js";
 import { loadSecurityExtension, verifyOpenDatabaseFile } from "../audit/file-identity.js";
@@ -302,6 +303,7 @@ function verifiedVersion(db: Database.Database): number {
     if (version === undefined) throw new ApprovalSchemaError();
     const rows = db.prepare("SELECT version FROM approval_schema").all() as Array<{ version: number }>;
     if (rows.length !== 1 || rows[0]?.version !== version) throw new ApprovalSchemaError();
+    if (version === 4) verifyDatabasePayloadHistory(db);
     return version;
   } catch { throw new ApprovalSchemaError(); }
 }
@@ -418,6 +420,7 @@ export function installApprovalPayloadSchema(db: Database.Database): void {
         if (version === 3) {
           db.exec("DROP TABLE main.approval_schema");
           db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=4)) STRICT; INSERT INTO approval_schema VALUES (4)");
+          markDatabasePayloadHistory(db);
           db.exec(payloadSql);
           verifyIntegrityInside(db); verifyApprovalPayloadSchema(db);
         }
