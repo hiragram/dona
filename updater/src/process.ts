@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
 
-import type { CommandResult } from "./types.js";
+import type { DiagnosticLogIdentity, CommandResult } from "./types.js";
+import type { DiagnosticCaptureSession, DiagnosticLogStore } from "./diagnostic-log.js";
 
 export interface RunOptions {
   cwd?: string;
   timeoutMs: number;
   outputLimitBytes: number;
   env?: Readonly<Record<string, string>>;
+  diagnostic?: { store: DiagnosticLogStore; identity: DiagnosticLogIdentity };
 }
 
 export function minimalEnvironment(extra: Readonly<Record<string, string>> = {}): Record<string, string> {
@@ -25,7 +27,15 @@ export class ProcessRunner {
     if (!executable.startsWith("/") || args.some((arg) => arg.includes("\0"))) {
       throw new Error("Executable and argv must be validated before execution");
     }
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
+      let diagnostic: DiagnosticCaptureSession | undefined;
+      try {
+        diagnostic = options.diagnostic?.store.start(options.diagnostic.identity);
+      } catch {
+        // Diagnostic persistence is subordinate to the command. An unavailable
+        // index must not prevent the command from running or alter its result.
+        diagnostic = undefined;
+      }
       const child = spawn(executable, [...args], {
         cwd: options.cwd,
         env: options.env ? { ...options.env } : minimalEnvironment(),
@@ -45,6 +55,7 @@ export class ProcessRunner {
       let metrics: string | undefined;
       const unfinishedCases = new Map<string, number>();
       let timedOut = false;
+      let settled = false;
       let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
@@ -128,16 +139,25 @@ export class ProcessRunner {
         if (stdout.length >= stderr.length) stdout = stdout.subarray(Math.min(overflow, stdout.length));
         else stderr = stderr.subarray(Math.min(overflow, stderr.length));
       };
-      child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk, false); rebalance(); });
-      child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk, true); rebalance(); });
+      const writeDiagnostic = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+        try { diagnostic?.write(stream, chunk); } catch { /* command capture remains authoritative */ }
+      };
+      const finishDiagnostic = (failed: boolean) => {
+        try { return diagnostic?.finish(failed); } catch { return undefined; }
+      };
+      child.stdout.on("data", (chunk: Buffer) => { writeDiagnostic("stdout", chunk); stdout = append(stdout, chunk, false); rebalance(); });
+      child.stderr.on("data", (chunk: Buffer) => { writeDiagnostic("stderr", chunk); stderr = append(stderr, chunk, true); rebalance(); });
       let hardKillTimer: NodeJS.Timeout | undefined;
+      let cleanupPollTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null = null;
       const finish = (): void => {
-        if (closedCode === undefined) return;
+        if (closedCode === undefined || settled) return;
+        settled = true;
         const cleanupStatus = timedOut
           ? `term=${termOutcome},kill=${killOutcome},closed=yes`
           : "term=not-sent,kill=not-sent,closed=yes";
+        const diagnosticLog = finishDiagnostic(timedOut || closedCode !== 0);
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -147,6 +167,7 @@ export class ProcessRunner {
           ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
           ...(exitSignal ? { exit_signal: exitSignal } : {}),
           cleanup_status: cleanupStatus,
+          ...(diagnosticLog ? { diagnostic_log: diagnosticLog } : {}),
         });
       };
       const signalGroup = (signal: NodeJS.Signals): string => {
@@ -160,6 +181,28 @@ export class ProcessRunner {
         }
         return child.kill(signal) ? "child-sent" : "unavailable";
       };
+      const finishAfterGroupCleanup = (): void => {
+        if (!child.pid) { finish(); return; }
+        const deadline = Date.now() + 1_000;
+        const poll = (): void => {
+          try {
+            process.kill(-child.pid!, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+              cleanupPollTimer = undefined;
+              finish();
+              return;
+            }
+          }
+          if (Date.now() >= deadline) {
+            cleanupPollTimer = undefined;
+            finish();
+            return;
+          }
+          cleanupPollTimer = setTimeout(poll, 20);
+        };
+        poll();
+      };
       const timer = setTimeout(() => {
         timedOut = true;
         const pending = [...unfinishedCases].at(-1);
@@ -170,20 +213,33 @@ export class ProcessRunner {
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
-          finish();
+          finishAfterGroupCleanup();
         }, 1_000);
       }, options.timeoutMs);
       timer.unref();
       child.once("error", (error) => {
         clearTimeout(timer);
         if (hardKillTimer) clearTimeout(hardKillTimer);
-        reject(error);
+        if (cleanupPollTimer) clearTimeout(cleanupPollTimer);
+        if (settled) return;
+        settled = true;
+        const diagnosticLog = finishDiagnostic(true);
+        resolve({
+          exit_code: null,
+          stdout: stdout.toString("utf8"),
+          stderr: stderr.toString("utf8"),
+          timed_out: false,
+          output_truncated: truncated,
+          spawn_error: (error as NodeJS.ErrnoException).code ?? "spawn_error",
+          cleanup_status: "spawn-failed",
+          ...(diagnosticLog ? { diagnostic_log: diagnosticLog } : {}),
+        });
       });
       child.once("close", (code, signal) => {
         clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
-        if (!hardKillTimer) finish();
+        if (!hardKillTimer && !cleanupPollTimer) finish();
       });
     });
   }

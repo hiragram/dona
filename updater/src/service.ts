@@ -55,6 +55,7 @@ export class UpdateService {
   private async loop(): Promise<void> {
     while (this.running) {
       try {
+        this.controller.maintainDiagnostics();
         await this.controller.processNext();
         await this.controller.deliverOutbox();
       } catch (error) {

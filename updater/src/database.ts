@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import Database from "better-sqlite3";
 import { ulid } from "ulid";
@@ -17,6 +18,8 @@ import type {
   RuntimeOperationKind,
   RuntimeOperationPhase,
   RuntimeOperationRow,
+  DiagnosticLogCapture,
+  DiagnosticLogRow,
 } from "./types.js";
 import { terminalUpdateStates, updateStates } from "./types.js";
 import { canonicalJson, sha256 } from "./validation.js";
@@ -84,24 +87,50 @@ export interface MutationFields {
   restart_attempts?: number;
 }
 
+export interface UpdateDatabaseOptions {
+  readonly?: boolean;
+}
+
 export class UpdateDatabase {
   private readonly db: Database.Database;
+  private readonly readonlyMode: boolean;
+  private readonly diagnosticLogsAvailable: boolean;
+  private readonly runtimeOperationsAvailable: boolean;
+  private readonly controlRoot: string;
 
-  constructor(databasePath: string) {
-    fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
-    fs.chmodSync(path.dirname(databasePath), 0o700);
-    this.db = new Database(databasePath);
-    fs.chmodSync(databasePath, 0o600);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("synchronous = FULL");
+  constructor(databasePath: string, options: UpdateDatabaseOptions = {}) {
+    this.controlRoot = path.dirname(databasePath);
+    this.readonlyMode = options.readonly === true;
+    if (!options.readonly) {
+      fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+      fs.chmodSync(path.dirname(databasePath), 0o700);
+    }
+    this.db = new Database(databasePath, options.readonly ? { readonly: true, fileMustExist: true } : undefined);
+    if (!options.readonly) {
+      fs.chmodSync(databasePath, 0o600);
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("synchronous = FULL");
+    }
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version > 7) {
+      this.db.close();
+      throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+    }
+    if (options.readonly) this.db.pragma("query_only = ON");
+    else this.migrate();
+    this.diagnosticLogsAvailable = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'",
+    ).get() !== undefined;
+    this.runtimeOperationsAvailable = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_operations'",
+    ).get() !== undefined;
   }
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 4) throw new Error(`Updater database schema ${version} is newer than supported schema 4`);
+    if (version > 7) throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -184,6 +213,27 @@ export class UpdateDatabase {
         superseded_by_outbox_id TEXT REFERENCES update_outbox(outbox_id)
       );
       CREATE INDEX update_outbox_status_idx ON update_outbox(status, created_at);
+      CREATE TABLE update_diagnostic_logs (
+        log_id        TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES update_requests(request_id),
+        attempt       INTEGER NOT NULL,
+        step          TEXT NOT NULL,
+        relative_ref  TEXT,
+        byte_size     INTEGER NOT NULL DEFAULT 0,
+        content_sha256 TEXT,
+        capture_state TEXT NOT NULL CHECK (capture_state IN ('capturing','complete','truncated','write_failed','purged')),
+        error_code    TEXT,
+        created_at    TEXT NOT NULL,
+        finalized_at  TEXT,
+        purged_at     TEXT
+      );
+      CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
+      CREATE TABLE updater_writer_lease (
+        singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner_token  TEXT NOT NULL,
+        owner_pid    INTEGER NOT NULL,
+        acquired_at  TEXT NOT NULL
+      );
       CREATE TABLE runtime_operations (
         operation_id        TEXT PRIMARY KEY,
         request_id          TEXT NOT NULL REFERENCES update_requests(request_id),
@@ -199,7 +249,7 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 4;
+      PRAGMA user_version = 7;
     `);
     if (version === 1) migrate(`
       ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
@@ -238,10 +288,44 @@ export class UpdateDatabase {
       ALTER TABLE update_requests ADD COLUMN transition_json TEXT;
       PRAGMA user_version = 4;
     `);
+    if (version >= 1 && version <= 4) migrate(`
+      CREATE TABLE update_diagnostic_logs (
+        log_id        TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES update_requests(request_id),
+        attempt       INTEGER NOT NULL,
+        step          TEXT NOT NULL,
+        relative_ref  TEXT,
+        byte_size     INTEGER NOT NULL DEFAULT 0,
+        capture_state TEXT NOT NULL CHECK (capture_state IN ('capturing','complete','truncated','write_failed','purged')),
+        error_code    TEXT,
+        created_at    TEXT NOT NULL,
+        finalized_at  TEXT,
+        purged_at     TEXT
+      );
+      CREATE INDEX update_diagnostic_logs_retention_idx ON update_diagnostic_logs(capture_state, finalized_at);
+      PRAGMA user_version = 5;
+    `);
+    if (version >= 1 && version <= 5) migrate(`
+      CREATE TABLE updater_writer_lease (
+        singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner_token  TEXT NOT NULL,
+        owner_pid    INTEGER NOT NULL,
+        acquired_at  TEXT NOT NULL
+      );
+      PRAGMA user_version = 6;
+    `);
+    if (version >= 1 && version <= 6) migrate(`
+      ALTER TABLE update_diagnostic_logs ADD COLUMN content_sha256 TEXT;
+      PRAGMA user_version = 7;
+    `);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  accessMode(): "read_only" | "read_write" {
+    return this.readonlyMode ? "read_only" : "read_write";
   }
 
   checkpoint(): void {
@@ -251,6 +335,162 @@ export class UpdateDatabase {
   assertReadableWritable(): void {
     this.db.prepare("SELECT 1").get();
     this.db.prepare("UPDATE update_requests SET state = state WHERE 0").run();
+  }
+
+  acquireWriterLease(ownerToken: string, ownerPid = process.pid, at = new Date()): void {
+    if (!/^[0-9a-f-]{36}$/.test(ownerToken) || !Number.isSafeInteger(ownerPid) || ownerPid < 1) {
+      throw new Error("updater_writer_identity_invalid");
+    }
+    this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT owner_token, owner_pid FROM updater_writer_lease WHERE singleton = 1")
+        .get() as { owner_token: string; owner_pid: number } | undefined;
+      if (!existing) {
+        this.db.prepare(`INSERT INTO updater_writer_lease(singleton, owner_token, owner_pid, acquired_at)
+          VALUES (1, ?, ?, ?)`).run(ownerToken, ownerPid, at.toISOString());
+        return;
+      }
+      if (existing.owner_token === ownerToken && existing.owner_pid === ownerPid) return;
+      let startupOwner: { pid?: unknown; process_start?: unknown; token?: unknown } | undefined;
+      try {
+        startupOwner = JSON.parse(fs.readFileSync(path.join(this.controlRoot, "updater.start.lock"), "utf8")) as typeof startupOwner;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("updater_writer_startup_lock_invalid");
+      }
+      if (startupOwner?.token === existing.owner_token && startupOwner.pid === existing.owner_pid &&
+        typeof startupOwner.process_start === "string") {
+        let alive = false;
+        try {
+          process.kill(existing.owner_pid, 0);
+          alive = true;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "EPERM") alive = true;
+          else if (code !== "ESRCH") throw new Error("updater_writer_identity_unavailable");
+        }
+        if (alive) {
+          let identity: string;
+          try {
+            identity = execFileSync("/bin/ps", ["-p", String(existing.owner_pid), "-o", "lstart="], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "ignore"],
+            }).trim();
+          } catch {
+            throw new Error("updater_writer_identity_unavailable");
+          }
+          if (!identity) throw new Error("updater_writer_identity_unavailable");
+          if (identity === startupOwner.process_start) throw new Error("updater_writer_already_active");
+        }
+      }
+      const changed = this.db.prepare(`UPDATE updater_writer_lease
+        SET owner_token = ?, owner_pid = ?, acquired_at = ? WHERE singleton = 1 AND owner_token = ? AND owner_pid = ?`)
+        .run(ownerToken, ownerPid, at.toISOString(), existing.owner_token, existing.owner_pid).changes;
+      if (changed !== 1) throw new Error("updater_writer_lease_conflict");
+    })();
+  }
+
+  releaseWriterLease(ownerToken: string): void {
+    const changed = this.db.prepare("DELETE FROM updater_writer_lease WHERE singleton = 1 AND owner_token = ?")
+      .run(ownerToken).changes;
+    if (changed !== 1) throw new Error("updater_writer_lease_mismatch");
+  }
+
+  reserveDiagnosticLog(capture: DiagnosticLogCapture): void {
+    this.db.transaction(() => {
+      const request = this.getRequired(capture.request_id);
+      if (request.attempt !== capture.attempt || request.completed_at !== null) throw new Error("diagnostic_log_request_binding_mismatch");
+      this.db.prepare(`INSERT INTO update_diagnostic_logs (
+        log_id, request_id, attempt, step, relative_ref, byte_size, capture_state, error_code, created_at
+      ) VALUES (?, ?, ?, ?, ?, 0, 'capturing', NULL, ?)`)
+        .run(capture.log_id, capture.request_id, capture.attempt, capture.step, capture.relative_ref, capture.created_at);
+    })();
+  }
+
+  recordFailedDiagnosticLog(capture: DiagnosticLogCapture): void {
+    this.db.transaction(() => {
+      const request = this.getRequired(capture.request_id);
+      if (request.attempt !== capture.attempt || request.completed_at !== null || capture.relative_ref !== null ||
+        capture.byte_size !== 0 || capture.content_sha256 !== null || capture.capture_state !== "write_failed") {
+        throw new Error("diagnostic_log_request_binding_mismatch");
+      }
+      this.db.prepare(`INSERT INTO update_diagnostic_logs (
+        log_id, request_id, attempt, step, relative_ref, byte_size, content_sha256, capture_state, error_code, created_at, finalized_at
+      ) VALUES (?, ?, ?, ?, NULL, 0, NULL, 'write_failed', ?, ?, ?)`).run(
+        capture.log_id, capture.request_id, capture.attempt, capture.step, capture.error_code,
+        capture.created_at, capture.finalized_at,
+      );
+    })();
+  }
+
+  finalizeDiagnosticLog(capture: DiagnosticLogCapture): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET relative_ref = ?, byte_size = ?, content_sha256 = ?, capture_state = ?,
+      error_code = ?, finalized_at = ?
+      WHERE log_id = ? AND request_id = ? AND attempt = ? AND step = ? AND capture_state = 'capturing'`)
+      .run(capture.relative_ref, capture.byte_size, capture.content_sha256, capture.capture_state, capture.error_code, capture.finalized_at,
+        capture.log_id, capture.request_id, capture.attempt, capture.step).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_finalize_binding_mismatch");
+  }
+
+  discardDiagnosticLog(logId: string): void {
+    const changed = this.db.prepare("DELETE FROM update_diagnostic_logs WHERE log_id = ? AND capture_state = 'capturing'").run(logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_discard_binding_mismatch");
+  }
+
+  diagnosticLogs(requestId: string, limit?: number): DiagnosticLogRow[] {
+    if (!this.diagnosticLogsAvailable) return [];
+    if (limit !== undefined) {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("diagnostic_log_limit_invalid");
+      return this.db.prepare(`SELECT * FROM update_diagnostic_logs WHERE request_id = ?
+        ORDER BY (capture_state = 'capturing') DESC, COALESCE(finalized_at, created_at) DESC, log_id DESC LIMIT ?`)
+        .all(requestId, limit) as DiagnosticLogRow[];
+    }
+    return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
+      .all(requestId) as DiagnosticLogRow[];
+  }
+
+  diagnosticLogCount(requestId: string): number {
+    if (!this.diagnosticLogsAvailable) return 0;
+    return (this.db.prepare("SELECT COUNT(*) AS count FROM update_diagnostic_logs WHERE request_id = ?")
+      .get(requestId) as { count: number }).count;
+  }
+
+  capturingDiagnosticLogs(): DiagnosticLogRow[] {
+    return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE capture_state = 'capturing' ORDER BY created_at, log_id")
+      .all() as DiagnosticLogRow[];
+  }
+
+  interruptDiagnosticLog(logId: string, errorCode: string, at = new Date()): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'write_failed', relative_ref = NULL,
+      byte_size = 0, content_sha256 = NULL, error_code = ?, finalized_at = ? WHERE log_id = ? AND capture_state = 'capturing'`)
+      .run(errorCode, at.toISOString(), logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_interrupt_state_mismatch");
+  }
+
+  diagnosticRetentionLogs(): DiagnosticLogRow[] {
+    return this.db.prepare(`SELECT logs.* FROM update_diagnostic_logs logs
+      JOIN update_requests requests ON requests.request_id = logs.request_id
+      WHERE logs.capture_state IN ('complete','truncated','write_failed') AND requests.completed_at IS NOT NULL
+      ORDER BY logs.finalized_at DESC, logs.log_id DESC`).all() as DiagnosticLogRow[];
+  }
+
+  diagnosticRetentionCandidates(cutoff: Date, aggregateLimitBytes: number): DiagnosticLogRow[] {
+    const rows = this.diagnosticRetentionLogs();
+    let retainedBytes = 0;
+    return rows.filter((row) => {
+      const expired = !!row.finalized_at && row.finalized_at < cutoff.toISOString();
+      const overQuota = retainedBytes + row.byte_size > aggregateLimitBytes;
+      if (!expired && !overQuota) retainedBytes += row.byte_size;
+      return expired || overQuota;
+    }).sort((left, right) => {
+      const finalized = (left.finalized_at ?? "").localeCompare(right.finalized_at ?? "");
+      return finalized || left.log_id.localeCompare(right.log_id);
+    });
+  }
+
+  markDiagnosticPurged(logId: string, at = new Date()): void {
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'purged', relative_ref = NULL,
+      content_sha256 = NULL, error_code = NULL, purged_at = ? WHERE log_id = ? AND capture_state IN ('complete','truncated','write_failed')`)
+      .run(at.toISOString(), logId).changes;
+    if (changed !== 1) throw new Error("diagnostic_log_purge_state_mismatch");
   }
 
   createPlan(request: PlanRequest, material: PlanMaterial, at = new Date()): { row: UpdateRow; plan: UpdatePlan; duplicate: boolean } {
@@ -612,11 +852,13 @@ export class UpdateDatabase {
   }
 
   runtimeOperation(requestId: string, kind: RuntimeOperationKind): RuntimeOperationRow | undefined {
+    if (!this.runtimeOperationsAvailable) return undefined;
     return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? AND kind = ?")
       .get(requestId, kind) as RuntimeOperationRow | undefined;
   }
 
   runtimeOperations(requestId: string): RuntimeOperationRow[] {
+    if (!this.runtimeOperationsAvailable) return [];
     return this.db.prepare("SELECT * FROM runtime_operations WHERE request_id = ? ORDER BY created_at, operation_id")
       .all(requestId) as RuntimeOperationRow[];
   }

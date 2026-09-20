@@ -5,6 +5,7 @@ import type { UpdateDatabase } from "./database.js";
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, Clock, DispatcherPort, GitPort, Logger, ReleaseStorePort, RuntimePort } from "./ports.js";
 import { redactText } from "./redaction.js";
+import { DiagnosticLogStore } from "./diagnostic-log.js";
 import type {
   ApplyRequest,
   CommandResult,
@@ -98,6 +99,7 @@ function rolloutMatchesTargetCompatibility(
 }
 
 export class UpdateController {
+  private nextDiagnosticRetentionAt = 0;
   constructor(
     private readonly database: UpdateDatabase,
     private readonly policy: UpdatePolicy,
@@ -109,6 +111,7 @@ export class UpdateController {
     private readonly logger: Logger,
     private readonly clock: Clock = systemClock,
     private readonly owner = `controller-${process.pid}-${ulid().toLowerCase()}`,
+    private readonly diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database),
   ) {}
 
   async plan(request: PlanRequest): Promise<Record<string, unknown>> {
@@ -218,6 +221,9 @@ export class UpdateController {
       this.runtime.slackHealth(),
       this.runtime.mainAgentStatus(activeRelease),
     ]);
+    const diagnosticLimit = 32;
+    const diagnosticCount = this.database.diagnosticLogCount(requestId);
+    const diagnosticRows = this.database.diagnosticLogs(requestId, diagnosticLimit);
     return {
       schema_version: 1,
       update: row,
@@ -225,10 +231,31 @@ export class UpdateController {
       audit: this.database.auditRows(requestId),
       outbox: this.database.outboxFor(requestId) ?? null,
       runtime_operations: this.database.runtimeOperations(requestId),
+      diagnostics: diagnosticRows.map((log) => this.diagnostics.project(log, 4_096, requestId)),
+      diagnostics_total_count: diagnosticCount,
+      diagnostics_omitted_count: Math.max(0, diagnosticCount - diagnosticRows.length),
       runtime_state: row.state,
       notification_state: this.notificationState(this.database.outboxFor(requestId)),
       observed: { ...observed, dispatcher: dispatcherHealth, slack_adapter: slackHealth, main_agent: mainAgent },
     };
+  }
+
+  maintainDiagnostics(): void {
+    const now = this.clock.now();
+    if (now.getTime() < this.nextDiagnosticRetentionAt) return;
+    this.nextDiagnosticRetentionAt = now.getTime() + 60_000;
+    try {
+      this.diagnostics.enforceRetention(
+        now,
+        this.policy.diagnostic_retention_days,
+        this.policy.diagnostic_aggregate_limit_bytes,
+      );
+    } catch (error) {
+      this.logger.warn("Diagnostic retention sweep failed", {
+        error_code: "diagnostic_retention_failed",
+        error_message: redactText(error instanceof Error ? error.message : String(error), 500),
+      });
+    }
   }
 
   async doctor(): Promise<Record<string, unknown>> {
@@ -249,7 +276,7 @@ export class UpdateController {
       fast_forward: remote.target_reachable,
       ci_trusted: remote.ci_trusted,
       cleanup_dry_run: await this.releases.cleanupPlan(protectedShas),
-      database: "read_write",
+      database: this.database.accessMode(),
       updater_self_update: "disabled",
       main_agent: mainAgent,
     };
@@ -466,7 +493,7 @@ export class UpdateController {
         const stagingPath = await this.releases.prepareStaging(row.request_id, row.fence);
         await this.git.stage(row.target_sha, stagingPath);
         this.assertLease(row);
-        const build = await this.build.buildRelease(stagingPath);
+        const build = await this.build.buildRelease(stagingPath, { request_id: row.request_id, attempt: row.attempt });
         this.assertLease(row);
         if (canonicalJson(build.compatibility) !== canonicalJson(JSON.parse(row.compatibility_json))) {
           throw new Error("staged_compatibility_metadata_differs_from_approved_plan");
@@ -1731,6 +1758,11 @@ export class UpdateController {
         : `${redactText(message)}; the current runtime could not be verified exactly`,
       observed_active_sha: currentVerified ? row.current_sha : null,
     }, this.clock.now());
+    this.diagnostics.enforceRetention(
+      this.clock.now(),
+      this.policy.diagnostic_retention_days,
+      this.policy.diagnostic_aggregate_limit_bytes,
+    );
     this.logger.error("Update attempt failed", {
       request_id: requestId,
       state: row.state,

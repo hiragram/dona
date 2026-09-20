@@ -47,6 +47,9 @@ export interface UpdatePolicy {
     lease_ms: number;
   };
   output_limit_bytes: number;
+  diagnostic_log_limit_bytes: number;
+  diagnostic_aggregate_limit_bytes: number;
+  diagnostic_retention_days: number;
   disk_floor_bytes: number;
   retain_successful: number;
   required_checks: string[];
@@ -102,7 +105,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
     "schema_version", "policy_version", "repository", "canonical_remote", "default_branch",
     "control_root", "config_root", "release_root", "current_pointer", "previous_pointer", "dispatcher_socket",
     "slack_socket", "dispatcher_internal_token_file", "main_agent", "launchd", "executables", "timeouts",
-    "output_limit_bytes", "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
+    "output_limit_bytes", "diagnostic_log_limit_bytes", "diagnostic_aggregate_limit_bytes", "diagnostic_retention_days",
+    "disk_floor_bytes", "retain_successful", "required_checks", "require_verified_signature", "compatibility",
   ];
   const extras = Object.keys(value).filter((key) => ![...policyKeys, "compatibility_transitions"].includes(key));
   const missing = policyKeys.filter((key) => !(key in value));
@@ -193,6 +197,11 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   const transitionKeys = compatibilityTransitions.map(({ from_sha, from, to }) =>
     JSON.stringify({ from_sha, from, to }));
   if (new Set(transitionKeys).size !== transitionKeys.length) throw new ValidationError("compatibility_transitions contains duplicates");
+  const diagnosticLogLimitBytes = integer(value.diagnostic_log_limit_bytes, "diagnostic_log_limit_bytes", 4_096);
+  const diagnosticAggregateLimitBytes = integer(value.diagnostic_aggregate_limit_bytes, "diagnostic_aggregate_limit_bytes", 4_096);
+  if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes) {
+    throw new ValidationError("diagnostic_aggregate_limit_bytes must cover at least one diagnostic log");
+  }
   return {
     schema_version: 1,
     policy_version: value.policy_version,
@@ -228,6 +237,9 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       lease_ms: integer(timeouts.lease_ms, "timeouts.lease_ms"),
     },
     output_limit_bytes: integer(value.output_limit_bytes, "output_limit_bytes", 1_024),
+    diagnostic_log_limit_bytes: diagnosticLogLimitBytes,
+    diagnostic_aggregate_limit_bytes: diagnosticAggregateLimitBytes,
+    diagnostic_retention_days: integer(value.diagnostic_retention_days, "diagnostic_retention_days"),
     disk_floor_bytes: integer(value.disk_floor_bytes, "disk_floor_bytes", 0),
     retain_successful: integer(value.retain_successful, "retain_successful"),
     required_checks: [...requiredChecks] as string[],

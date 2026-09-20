@@ -340,7 +340,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_self_update_status", {
     title: "Get Dona self-update status",
-    description: "update state、lease/fence、SHA、health、rollback可否、outboxを取得します。",
+    description: "update state、lease/fence、SHA、health、rollback可否、outbox、boundedな失敗診断stateを取得します。",
     inputSchema: { request_id: updateRequestId.optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ request_id }) => {

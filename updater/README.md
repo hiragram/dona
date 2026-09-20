@@ -34,7 +34,7 @@ policyは次を固定します。
 - `dev.dona.dispatcher`と`dev.dona.slack-adapter`
 - fixed Herdr session `dona`、agent名`dona-main`、minimum Herdr version
 - absolute `git/npm/node/gh/herdr/launchctl`
-- timeout、output上限、disk floor、retention
+- timeout、memory output上限、diagnostic logのper-log/aggregate上限とretention、disk floor、release retention
 - expected GitHub Actions check 3件と、任意のcommit signature gate
 - protocol/config/app schema read/write range
 
@@ -53,7 +53,7 @@ node dist/cli.js reconcile upd_...
 node dist/cli.js rollback upd_... --confirm-plan-hash <64-hex>
 ```
 
-operator rollbackは`needs_review`かつcurrent=exact target、previous=planned current、互換性ありの場合、plan hash一致の場合だけ再開します。`/metrics`はstate別件数とpending outbox数を出します。statusはlease/fence、attempt、activation generation、restart回数、SHA、health、last error、audit、runtime operations、runtime/notification state、outboxを返します。
+operator rollbackは`needs_review`かつcurrent=exact target、previous=planned current、互換性ありの場合、plan hash一致の場合だけ再開します。`/metrics`はstate別件数とpending outbox数を出します。statusはlease/fence、attempt、activation generation、restart回数、SHA、health、last error、audit、runtime operations、runtime/notification state、outboxに加え、request/attempt/stepへbindした診断logのstateとredacted tailを返します。private pathとraw全文は返しません。
 
 ## 検証
 
@@ -70,3 +70,5 @@ testはtemporary SQLite/release root、isolated temporary Git remote、fake runt
 ## Stable control-plane更新
 
 stable updater自身はroutine updateに含めません。policy/schema変更はmaintenance windowで`./scripts/install-self-update.sh --upgrade-control`を使い、非terminal requestがないこと、旧DB checkpoint/integrity/backup、新旧version healthを確認して切り替えます。Slack完了通知のidentityはmessage blockで照合するため、外部manifest attestationは不要です。app DB migrationとGitHub repository settings変更は対象外です。
+
+したがってdiagnostic log実装を含むPRをmainへmergeしただけでは、稼働stable Updaterへ反映済みとは扱いません。

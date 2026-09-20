@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
@@ -29,6 +31,190 @@ async function socketAlive(socketPath: string): Promise<boolean> {
   });
 }
 
+export interface UpdaterSocketReservation {
+  socketPath: string;
+  server: http.Server;
+  startupLock: UpdaterStartupLock;
+}
+
+interface UpdaterStartupLock {
+  path: string;
+  token: string;
+  processStart: string;
+}
+
+export interface ProcessIdentity {
+  status: "alive" | "dead" | "unknown";
+  identity?: string;
+}
+
+export interface UpdaterSocketOptions {
+  inspectProcess?: (pid: number) => ProcessIdentity;
+  afterReadStartupLock?: () => void | Promise<void>;
+}
+
+function inspectProcess(pid: number): ProcessIdentity {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: "dead" };
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return { status: "dead" };
+    if (code !== "EPERM") return { status: "unknown" };
+  }
+  try {
+    const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return value ? { status: "alive", identity: value } : { status: "unknown" };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+async function acquireStartupLock(
+  controlRoot: string,
+  processInspector: (pid: number) => ProcessIdentity,
+  afterReadStartupLock?: () => void | Promise<void>,
+): Promise<UpdaterStartupLock> {
+  const lockPath = path.join(controlRoot, "updater.start.lock");
+  const token = randomUUID();
+  const self = processInspector(process.pid);
+  if (self.status !== "alive" || !self.identity) throw new Error("updater_startup_identity_unavailable");
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const temporary = `${lockPath}.${token}.tmp`;
+    try {
+      const handle = await fs.open(temporary, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, process_start: self.identity, token })}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await fs.link(temporary, lockPath);
+      await fs.unlink(temporary);
+      return { path: lockPath, token, processStart: self.identity };
+    } catch (error) {
+      try { await fs.unlink(temporary); } catch { /* best effort */ }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let owner: { pid?: unknown; process_start?: unknown; token?: unknown };
+    let ownerStats: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      const handle = await fs.open(lockPath, "r");
+      try {
+        owner = JSON.parse(await handle.readFile("utf8")) as { pid?: unknown; process_start?: unknown; token?: unknown };
+        ownerStats = await handle.stat();
+      } finally {
+        await handle.close();
+      }
+    }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error("updater_startup_lock_invalid");
+    }
+    if (typeof owner.pid !== "number" || typeof owner.process_start !== "string" || typeof owner.token !== "string") {
+      throw new Error("updater_startup_lock_invalid");
+    }
+    const observed = processInspector(owner.pid);
+    if (observed.status === "unknown") throw new Error("updater_startup_identity_unavailable");
+    if (observed.status === "alive" && observed.identity === owner.process_start) {
+      throw new Error("updater_startup_lock_active");
+    }
+    await afterReadStartupLock?.();
+    const current = await fs.lstat(lockPath);
+    if (current.dev !== ownerStats.dev || current.ino !== ownerStats.ino) continue;
+    for (const entry of await fs.readdir(controlRoot)) {
+      if (!entry.startsWith(`${path.basename(lockPath)}.`) || !/\.(?:tmp|stale)$/.test(entry)) continue;
+      const candidate = path.join(controlRoot, entry);
+      try {
+        const stats = await fs.lstat(candidate);
+        if (stats.dev === current.dev && stats.ino === current.ino && stats.isFile() &&
+          stats.uid === process.getuid?.() && (stats.mode & 0o077) === 0) await fs.unlink(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    const stalePath = `${lockPath}.${token}.stale`;
+    try {
+      await fs.link(lockPath, stalePath);
+      const [claimed, claimedCurrent] = await Promise.all([fs.lstat(stalePath), fs.lstat(lockPath)]);
+      if (claimed.dev !== ownerStats.dev || claimed.ino !== ownerStats.ino ||
+        claimed.dev !== claimedCurrent.dev || claimed.ino !== claimedCurrent.ino ||
+        claimed.nlink !== 2 || claimedCurrent.nlink !== 2) {
+        await fs.unlink(stalePath);
+        continue;
+      }
+      await fs.unlink(lockPath);
+      await fs.unlink(stalePath);
+    } catch (error) {
+      try { await fs.unlink(stalePath); } catch { /* best effort */ }
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error("updater_startup_lock_contended");
+}
+
+async function releaseStartupLock(lock: UpdaterStartupLock): Promise<void> {
+  try {
+    const owner = JSON.parse(await fs.readFile(lock.path, "utf8")) as { token?: unknown };
+    if (owner.token !== lock.token) throw new Error("updater_startup_lock_owner_mismatch");
+    await fs.unlink(lock.path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+export async function reserveUpdaterSocket(socketPath: string, options: UpdaterSocketOptions = {}): Promise<UpdaterSocketReservation> {
+  await fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+  await fs.chmod(path.dirname(socketPath), 0o700);
+  const startupLock = await acquireStartupLock(
+    path.dirname(socketPath),
+    options.inspectProcess ?? inspectProcess,
+    options.afterReadStartupLock,
+  );
+  const server = http.createServer((_request, response) => {
+    send(response, 503, { schema_version: 1, status: "starting", service: "updater" });
+  });
+  let ownsSocket = false;
+  try {
+    try {
+      await fs.lstat(socketPath);
+      if (await socketAlive(socketPath)) throw new Error(`Another updater is listening on ${socketPath}`);
+      await fs.unlink(socketPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => reject(error);
+      server.once("error", onError);
+      server.listen(socketPath, () => {
+        server.off("error", onError);
+        ownsSocket = true;
+        resolve();
+      });
+    });
+    await fs.chmod(socketPath, 0o600);
+    return { socketPath, server, startupLock };
+  } catch (error) {
+    try { await new Promise<void>((resolve) => server.close(() => resolve())); } catch { /* best effort */ }
+    if (ownsSocket) {
+      try { await fs.unlink(socketPath); } catch { /* best effort */ }
+    }
+    try { await releaseStartupLock(startupLock); } catch { /* preserve the original error */ }
+    throw error;
+  }
+}
+
+export async function releaseUpdaterSocket(reservation: UpdaterSocketReservation): Promise<void> {
+  try { await new Promise<void>((resolve) => reservation.server.close(() => resolve())); } catch { /* best effort */ }
+  try { await fs.unlink(reservation.socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await releaseStartupLock(reservation.startupLock);
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   if (request.headers["content-type"]?.split(";", 1)[0] !== "application/json") throw new ValidationError("Content-Type must be application/json");
   const chunks: Buffer[] = [];
@@ -48,6 +234,10 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 
 export class UpdaterApi {
   private server: http.Server | undefined;
+  private writerToken: string | undefined;
+  private writerLeaseHeld = false;
+  private ownsSocket = false;
+  private activeReservation: UpdaterSocketReservation | undefined;
 
   constructor(
     private readonly socketPath: string,
@@ -56,39 +246,53 @@ export class UpdaterApi {
     private readonly service: Pick<UpdateService, "isRunning" | "wake">,
     private readonly logger: Logger,
     private readonly buildSha = process.env.DONA_UPDATER_BUILD_SHA ?? "development",
+    private readonly reservation?: UpdaterSocketReservation,
   ) {}
 
   async start(): Promise<void> {
-    await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(this.socketPath), 0o700);
     try {
-      await fs.lstat(this.socketPath);
-      if (await socketAlive(this.socketPath)) throw new Error(`Another updater is listening on ${this.socketPath}`);
-      await fs.unlink(this.socketPath);
+      const reservation = this.reservation ?? await reserveUpdaterSocket(this.socketPath);
+      this.activeReservation = reservation;
+      this.server = reservation.server;
+      this.ownsSocket = true;
+      this.writerToken = reservation.startupLock.token;
+      this.database.acquireWriterLease(this.writerToken);
+      this.writerLeaseHeld = true;
+      this.server.removeAllListeners("request");
+      this.server.on("request", (request, response) => void this.handle(request, response));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (this.activeReservation) {
+        try { await releaseUpdaterSocket(this.activeReservation); } catch { /* preserve the original error */ }
+      }
+      this.activeReservation = undefined;
+      this.server = undefined;
+      this.ownsSocket = false;
+      this.releaseWriterLease();
+      throw error;
     }
-    this.server = http.createServer((request, response) => void this.handle(request, response));
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => reject(error);
-      this.server!.once("error", onError);
-      this.server!.listen(this.socketPath, () => {
-        this.server!.off("error", onError);
-        resolve();
-      });
-    });
-    await fs.chmod(this.socketPath, 0o600);
   }
 
   async stop(): Promise<void> {
-    if (this.server) {
-      await new Promise<void>((resolve, reject) => this.server!.close((error) => error ? reject(error) : resolve()));
+    if (this.activeReservation && this.ownsSocket) {
+      await releaseUpdaterSocket(this.activeReservation);
+      this.activeReservation = undefined;
       this.server = undefined;
+      this.ownsSocket = false;
     }
+    this.releaseWriterLease();
+  }
+
+  private releaseWriterLease(): void {
+    if (!this.writerLeaseHeld || !this.writerToken) return;
     try {
-      await fs.unlink(this.socketPath);
+      this.database.releaseWriterLease(this.writerToken);
+      this.writerLeaseHeld = false;
+      this.writerToken = undefined;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.logger.warn("Updater writer lease release failed", {
+        error_code: "updater_writer_lease_release_failed",
+        error_message: redactText(error instanceof Error ? error.message : String(error)),
+      });
     }
   }
 
