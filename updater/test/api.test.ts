@@ -96,11 +96,49 @@ test("startup lock serializes stale socket recovery between concurrent servers",
   try {
     assert.equal(fulfilled.length, 1);
     assert.equal(rejected.length, 1);
-    assert.match(String(rejected[0]!.reason), /updater_startup_lock_active/);
+    assert.match(String(rejected[0]!.reason), /updater_startup_lock_(?:active|contended)/);
     assert.equal((await fs.lstat(socketPath)).isSocket(), true);
     assert.equal((await request(socketPath)).status, 503);
   } finally {
     if (fulfilled[0]) await releaseUpdaterSocket(fulfilled[0].value);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup acquisition serializes concurrent recovery of the same stale lock", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-stale-race-"));
+  const socketPath = path.join(root, "updater.sock");
+  await fs.writeFile(path.join(root, "updater.start.lock"),
+    JSON.stringify({ pid: 999_999_999, process_start: "stale", token: "stale" }), { mode: 0o600 });
+  await fs.writeFile(socketPath, "stale", { mode: 0o600 });
+  const results = await Promise.allSettled([reserveUpdaterSocket(socketPath), reserveUpdaterSocket(socketPath)]);
+  const fulfilled = results.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof reserveUpdaterSocket>>> => result.status === "fulfilled");
+  const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  try {
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.match(String(rejected[0]!.reason), /updater_startup_lock_(?:active|contended)/);
+    assert.equal((await request(socketPath)).status, 503);
+  } finally {
+    if (fulfilled[0]) await releaseUpdaterSocket(fulfilled[0].value);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup lock fails closed when a live owner identity cannot be inspected", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-api-identity-unknown-"));
+  const socketPath = path.join(root, "updater.sock");
+  const lockPath = path.join(root, "updater.start.lock");
+  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, process_start: "owner", token: "owner" }), { mode: 0o600 });
+  let calls = 0;
+  try {
+    await assert.rejects(reserveUpdaterSocket(socketPath, {
+      inspectProcess: () => ++calls === 1
+        ? { status: "alive", identity: "self" }
+        : { status: "unknown" },
+    }), /updater_startup_identity_unavailable/);
+    assert.match(await fs.readFile(lockPath, "utf8"), /"token":"owner"/);
+  } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });

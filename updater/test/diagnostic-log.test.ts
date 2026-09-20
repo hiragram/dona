@@ -307,6 +307,22 @@ test("redacts a raw PEM private key block across chunk boundaries", async () => 
   }
 });
 
+test("redacts passphrase assignments across chunk boundaries", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-passphrase" });
+    capture.write("stderr", Buffer.from("SSH_KEY_PASS"));
+    capture.write("stderr", Buffer.from("PHRASE=topsecret\nKEY_PASSPHRASE='quoted-secret'\nafter\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.equal(detail.includes("topsecret"), false);
+    assert.equal(detail.includes("quoted-secret"), false);
+    assert.match(detail, /after/);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("bounds ordered output while an earlier stream keeps redaction carry pending", async () => {
   const f = await fixture(4_096);
   try {
@@ -791,6 +807,28 @@ test("aggregate retention purges a file whose actual size exceeds its bound row"
     fsSync.appendFileSync(path.join(f.policy.control_root, "diagnostics", row.relative_ref!), Buffer.alloc(8_192));
     f.store.enforceRetention(new Date(), 9_999, row.byte_size);
     assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]!.capture_state, "purged");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("aggregate retention excludes a same-size digest mismatch before quota selection", async () => {
+  const f = await fixture();
+  try {
+    for (const step of ["dispatcher:npm-valid", "dispatcher:npm-corrupt"]) {
+      const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step });
+      capture.write("stderr", Buffer.from("same-sized-failure"));
+      capture.finish(true);
+    }
+    f.database.terminal(f.claimed.request_id, f.claimed.fence, "failed", "pre_activation_failed");
+    const rows = f.database.diagnosticLogs(f.claimed.request_id);
+    const valid = rows.find(({ step }) => step === "dispatcher:npm-valid")!;
+    const corrupt = rows.find(({ step }) => step === "dispatcher:npm-corrupt")!;
+    fsSync.writeFileSync(path.join(f.policy.control_root, "diagnostics", corrupt.relative_ref!), Buffer.alloc(corrupt.byte_size, 0x78));
+    f.store.enforceRetention(new Date(), 9_999, valid.byte_size);
+    const after = f.database.diagnosticLogs(f.claimed.request_id);
+    assert.equal(after.find(({ log_id }) => log_id === corrupt.log_id)?.capture_state, "purged");
+    assert.equal(after.find(({ log_id }) => log_id === valid.log_id)?.capture_state, "complete");
   } finally {
     f.database.close();
   }

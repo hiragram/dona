@@ -42,40 +42,49 @@ interface UpdaterStartupLock {
   token: string;
 }
 
-function processAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+export interface ProcessIdentity {
+  status: "alive" | "dead" | "unknown";
+  identity?: string;
 }
 
-function processStartIdentity(pid: number): string | null {
-  if (!processAlive(pid)) return null;
+export interface UpdaterSocketOptions {
+  inspectProcess?: (pid: number) => ProcessIdentity;
+}
+
+function inspectProcess(pid: number): ProcessIdentity {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: "dead" };
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return { status: "dead" };
+    if (code !== "EPERM") return { status: "unknown" };
+  }
   try {
     const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    return value || null;
+    return value ? { status: "alive", identity: value } : { status: "unknown" };
   } catch {
-    return null;
+    return { status: "unknown" };
   }
 }
 
-async function acquireStartupLock(controlRoot: string): Promise<UpdaterStartupLock> {
+async function acquireStartupLock(
+  controlRoot: string,
+  processInspector: (pid: number) => ProcessIdentity,
+): Promise<UpdaterStartupLock> {
   const lockPath = path.join(controlRoot, "updater.start.lock");
   const token = randomUUID();
-  const processStart = processStartIdentity(process.pid);
-  if (!processStart) throw new Error("updater_startup_identity_unavailable");
+  const self = processInspector(process.pid);
+  if (self.status !== "alive" || !self.identity) throw new Error("updater_startup_identity_unavailable");
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const temporary = `${lockPath}.${token}.tmp`;
     try {
       const handle = await fs.open(temporary, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, process_start: processStart, token })}\n`);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, process_start: self.identity, token })}\n`);
         await handle.sync();
       } finally {
         await handle.close();
@@ -96,12 +105,23 @@ async function acquireStartupLock(controlRoot: string): Promise<UpdaterStartupLo
     if (typeof owner.pid !== "number" || typeof owner.process_start !== "string" || typeof owner.token !== "string") {
       throw new Error("updater_startup_lock_invalid");
     }
-    if (processStartIdentity(owner.pid) === owner.process_start) throw new Error("updater_startup_lock_active");
+    const observed = processInspector(owner.pid);
+    if (observed.status === "unknown") throw new Error("updater_startup_identity_unavailable");
+    if (observed.status === "alive" && observed.identity === owner.process_start) {
+      throw new Error("updater_startup_lock_active");
+    }
     const stalePath = `${lockPath}.${token}.stale`;
     try {
-      await fs.rename(lockPath, stalePath);
+      await fs.link(lockPath, stalePath);
+      const [claimed, current] = await Promise.all([fs.lstat(stalePath), fs.lstat(lockPath)]);
+      if (claimed.dev !== current.dev || claimed.ino !== current.ino || claimed.nlink !== 2 || current.nlink !== 2) {
+        await fs.unlink(stalePath);
+        continue;
+      }
+      await fs.unlink(lockPath);
       await fs.unlink(stalePath);
     } catch (error) {
+      try { await fs.unlink(stalePath); } catch { /* best effort */ }
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
@@ -118,10 +138,10 @@ async function releaseStartupLock(lock: UpdaterStartupLock): Promise<void> {
   }
 }
 
-export async function reserveUpdaterSocket(socketPath: string): Promise<UpdaterSocketReservation> {
+export async function reserveUpdaterSocket(socketPath: string, options: UpdaterSocketOptions = {}): Promise<UpdaterSocketReservation> {
   await fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   await fs.chmod(path.dirname(socketPath), 0o700);
-  const startupLock = await acquireStartupLock(path.dirname(socketPath));
+  const startupLock = await acquireStartupLock(path.dirname(socketPath), options.inspectProcess ?? inspectProcess);
   const server = http.createServer((_request, response) => {
     send(response, 503, { schema_version: 1, status: "starting", service: "updater" });
   });

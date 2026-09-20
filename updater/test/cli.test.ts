@@ -75,6 +75,15 @@ test("serve reserves the singleton socket before migrating a legacy database", a
       assert.match(error.stderr ?? "", /Another updater is listening/);
       return true;
     });
+    await assert.rejects(execFileAsync(
+      path.resolve("node_modules/.bin/tsx"),
+      [path.resolve("src/cli.ts"), "reconcile", "upd_01m1es03xy5cf8d9pm5cwx4srv"],
+      { env: { ...process.env, DONA_UPDATE_POLICY_PATH: policyPath } },
+    ), (error: NodeJS.ErrnoException & { code?: number; stderr?: string }) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr ?? "", /Another updater is listening/);
+      return true;
+    });
   } finally {
     await new Promise<void>((resolve) => incumbent.close(() => resolve()));
   }

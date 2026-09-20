@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   const policy = loadPolicy(process.env.DONA_UPDATE_POLICY_PATH ?? defaultPolicy);
   const logger = createLogger();
   const socketPath = path.join(policy.control_root, "updater.sock");
-  let reservation: UpdaterSocketReservation | undefined = command === "serve"
+  let reservation: UpdaterSocketReservation | undefined = ["serve", "reconcile", "rollback"].includes(command)
     ? await reserveUpdaterSocket(socketPath)
     : undefined;
   let database: UpdateDatabase | undefined;

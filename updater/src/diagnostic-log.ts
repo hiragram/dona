@@ -104,7 +104,7 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*)\s*[:=]\s*(["']?)/i
+      const assignment = /(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*)\s*[:=]\s*(["']?)/i
         .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
@@ -196,7 +196,7 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*)\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*)\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
@@ -213,7 +213,7 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return { text: output, consumedCharacters: initialLength - this.pending.length };
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password)[a-z0-9_-]*)\s*[:=]|\b[a-z][a-z0-9+.-]*:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_-])(?:"[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*"|'[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*'|[a-z0-9_-]*(?:authorization|auth[-_]?token|_auth|api[-_]?key|private[-_]?key|token|secret|password|passphrase)[a-z0-9_-]*)\s*[:=]|\b[a-z][a-z0-9+.-]*:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -657,8 +657,9 @@ export class DiagnosticLogStore {
       try {
         const file = this.resolveRow(row);
         const stats = fs.lstatSync(file);
-        if (stats.size !== row.byte_size) {
-          if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid?.()) continue;
+        const projected = this.project(row, 1, row.request_id);
+        if (projected.capture_state !== row.capture_state) {
+          if ((!stats.isFile() && !stats.isSymbolicLink()) || stats.uid !== process.getuid?.()) continue;
           fs.unlinkSync(file);
           this.fsyncLogsDirectory();
           this.index.markDiagnosticPurged(row.log_id, now);
