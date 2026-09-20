@@ -1,0 +1,33 @@
+# 承認レコードのdigest tree
+
+## 目的と現在の範囲
+
+共有監査のroot inventoryは最大64件なので、寿命全体のrequest数をそのままaudit resource数にしない。`metadata-tree.ts`は固定scopeの承認record keyをcanonical row digestへ結び付ける純粋なcodecである。既存の`used-transactions.ts`はaudit/clockの一回性ledgerとして維持し、そのnode形式や使用済みIDを変更しない。
+
+このcomponentだけではApprovalBroker、SQLite repository、supervisor binding、runtime admissionは完成しない。監査の独立sequenceや署名鍵、protected providerの代替を作らない。#16の一部として、業務recordとindex nodeを同じ監査transactionでcommitする後続repositoryへ接続する。
+
+## rootとkeyの契約
+
+scopeは`instance_id`、`workspace_id`、固定`collection: approval_records_v1`。keyはserver側で種類と永続record identityから一意に作るopaque identifierで、画面文字列や外部本文を使わない。種類間の重複を避けるkey生成とcanonical row codecの検証はrepositoryの責務。
+
+rootは同scopeに対する既存`VerifiedAuditState.resource_bindings`のcurrent digestを取得する。DBに置かれた自己申告rootや利用者の引数を正本としない。`emptyMetadataRoot`は明示genesisの計画用であり、欠落binding、未知version、読取失敗を空集合へ変換する手段ではない。古い正当なrootのproofは数学的には有効なので、freshnessとrollback拒否は既存共有監査とDB外CAS anchorで保証する。
+
+leafにはkey pathと32-byteのrow digestだけを含め、生snapshot、token、payload、private URLを保存しない。hash自体を秘密化・認証手段とみなさず、recordのredactionと共有監査のHMAC検証を維持する。
+
+## updateとread
+
+`readMetadataValue`は最大257個の固定サイズnodeを読み、scope・depth・prefix・type・digest・canonical base64を確認する。認証された空subtreeならnull、必要nodeが欠けていれば`metadata_tree_unverified`。両者を同じ状態として扱わない。
+
+`prepareMetadataUpdate`はexpected rootと旧valueを確認して、新rootと最大257個のimmutable nodeを返す。初回のexpected valueはnull。既存valueが異なれば`metadata_value_conflict`。同値更新と削除は提供しない。作成済みrequestの再照会や応答喪失後のreconcileは、brokerがdurable receiptから判定する。
+
+戻り値は更新案であってwrite受理ではない。repositoryはwriter lock下でcurrent audit root・binding・policy・clockを検証し、recordとnodeを同一transactionへ保存し、既存audit reserve/commit/finalize/read-backを完了してから結果を公開する。不明なwriteを自動再実行しない。read callbackは内部の同期専用契約であり、任意JavaScriptのsandboxではない。
+
+## 一覧と保存の残作業
+
+point proofだけではSQL一覧から削除されたrowの欠落を検出できない。pending/outboxのrestart復元には、同じrootに結ぶcount/head/next等の完全性付きindexかrange proofが必要。SQL SELECTの返ったrowだけを確認して全件検証と主張しない。
+
+既存approval schemaはexact DDL/trigger inventoryを検証する。node tableを業務DBへ追加する際は明示version migrationと同じSQL guardに対応し、未知DDLやTEMP shadowを拒否する。外部triggerを黙って許可したり別connectionへ書いたりして回避しない。retentionやGCは未提供で、一回性ledgerや必要nodeを削除しない。
+
+## 検証
+
+複数recordの作成・更新・独立性、旧rootの不変性、nodeの再読、期待値競合、欠落node、別scope/path、非canonical/改ざんwire、読取上限、実行可能入力・不正digestの拒否をunit fixtureで確認する。SQLite durability、実protected provider、実IdP、production接続の証拠とは分ける。
