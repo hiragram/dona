@@ -289,14 +289,20 @@ export function installApprovalMetadataSchema(db: Database.Database): void {
   try {
     loadSecurityExtension(db);
     if (db.inTransaction) throw new ApprovalSchemaError();
-    withSecurityTransactionLock(db, () => db.transaction(() => {
-      assertSecurityDurability(db); verifyOpenDatabaseFile(db);
-      verifyIntegrityInside(db);
-      if (verifiedVersion(db) === 2) return;
-      db.exec("DROP TABLE main.approval_schema");
-      db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=2)) STRICT; INSERT INTO approval_schema VALUES (2)");
-      db.exec(metadataSql);
-      verifyIntegrityInside(db); verifyApprovalMetadataSchema(db);
-    }).immediate());
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+        verifyIntegrityInside(db);
+        if (verifiedVersion(db) !== 2) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=2)) STRICT; INSERT INTO approval_schema VALUES (2)");
+          db.exec(metadataSql);
+          verifyIntegrityInside(db); verifyApprovalMetadataSchema(db);
+        }
+        // 既存v2でも省略せず、旧inodeへのmigrationを成功にしない。
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
   } catch { throw new ApprovalSchemaError(); }
 }

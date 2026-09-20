@@ -21,7 +21,7 @@ function schemaFixture(t: { after(fn: () => void): void }) {
  const configure=()=>{db.pragma("journal_mode=WAL");db.pragma("foreign_keys=ON");db.pragma("synchronous=FULL");};
  configure();installApprovalSchema(db);
  t.after(()=>{if(db.open)db.close();fs.rmSync(directory,{recursive:true,force:true});});
- return {get db(){return db;},reopen(){db.close();db=openSecurityDatabase(filename);configure();}};
+ return {filename,get db(){return db;},reopen(){db.close();db=openSecurityDatabase(filename);configure();}};
 }
 function fixture(t: { after(fn: () => void): void }) {
  const f=setup(t); installApprovalMetadataSchema(f.db); const nodes=new ApprovalMetadataNodes(f.db);
@@ -146,6 +146,30 @@ test("v1の未知DDL・version・TEMP shadowをmigrationで修復しない",t=>{
   assert.throws(()=>installApprovalMetadataSchema(f.db),ApprovalSchemaError);
   assert.deepEqual(f.db.prepare("SELECT type,name,sql FROM main.sqlite_master ORDER BY name").all(),before);
   assert.equal(f.db.prepare("SELECT 1 FROM main.sqlite_master WHERE name='approval_metadata_nodes'").get(),undefined);
+ }
+});
+
+test("v1移行末尾と既存v2の早期returnでもDB置換を検出して成功にしない",t=>{
+ for(const version of [1,2]){
+  const f=schemaFixture(t);if(version===2)installApprovalMetadataSchema(f.db);
+  const prepare=f.db.prepare.bind(f.db);let checks=0,replaced=false;
+  // 固定FK検証の直後に別processのrenameを再現するtest-only hook。
+  f.db.prepare=((...args:Parameters<typeof f.db.prepare>)=>{
+   const statement=prepare(...args);
+   if(args[0]==="PRAGMA main.foreign_key_check"){
+    const get=statement.get.bind(statement);
+    statement.get=((...bindings:Parameters<typeof statement.get>)=>{
+     const value=get(...bindings);
+     if(++checks===(version===1?2:1)){
+      fs.renameSync(f.filename,f.filename+".detached");fs.copyFileSync(f.filename+".detached",f.filename);fs.chmodSync(f.filename,0o600);replaced=true;
+     }
+     return value;
+    }) as typeof statement.get;
+   }
+   return statement;
+  }) as typeof f.db.prepare;
+  try{assert.throws(()=>installApprovalMetadataSchema(f.db),ApprovalSchemaError);}finally{f.db.prepare=prepare;}
+  assert.equal(replaced,true);assert.deepEqual(f.db.prepare("SELECT version FROM approval_schema").get(),{version});
  }
 });
 

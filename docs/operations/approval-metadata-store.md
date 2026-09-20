@@ -10,6 +10,8 @@
 
 `installApprovalMetadataSchema`は、既存owner-only fileのWALとFULL/EXTRA durability、native file identity、schema v1とforeign key整合を確認し、writer lock内の単一transactionでv2へ移行する。request等の既存recordを保持し、version tableとimmutable node table/triggerだけを更新する。既に正当なv2なら検証だけ行う。
 
+既存v2を含め、transaction完了直前とcommit後にもfile identityを検証する。途中でDB pathが移動・置換された場合は移行成功を返さない。commit後のidentity喪失では操作結果を自動再試行せず、外部の照合へ進む。
+
 新規DBは既存の明示`installApprovalSchema`によるv1を先に必要とする。constructorはv1をv2へ変換せず、未準備なら拒否する。既存v1 callerのschema検証は維持し、v1/v2それぞれの完全なDDL/trigger inventoryと対応するversion行を照合する。未知version、部分的なDDL、改変trigger、TEMP shadowを自動修復しない。
 
 migrationは既存recordの本人性やcanonical snapshotを再認証しない。node tableが空でも業務recordが空とは限らないため、空rootへ自動登録しない。repository activationには、明示的に検証された空集合または別途検証済みのmigration inventoryと共有監査への登録が必要である。
