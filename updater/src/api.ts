@@ -123,7 +123,13 @@ async function acquireStartupLock(
       throw new Error("updater_startup_lock_active");
     }
     await afterReadStartupLock?.();
-    const current = await fs.lstat(lockPath);
+    let current: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      current = await fs.lstat(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
     if (current.dev !== ownerStats.dev || current.ino !== ownerStats.ino) continue;
     for (const entry of await fs.readdir(controlRoot)) {
       if (!entry.startsWith(`${path.basename(lockPath)}.`) || !/\.(?:tmp|stale)$/.test(entry)) continue;
