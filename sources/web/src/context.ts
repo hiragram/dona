@@ -37,6 +37,9 @@ function keyCheck(key:ContextKey,issued:number,now:number,sign:boolean):void {
     || !["active","verification_only"].includes(key.state) || (sign && key.state!=="active")
     || end<=start || end-start>90*24*3600*1000 || issued<start || issued>=end || now<issued) throw new ContextError();
 }
+export function assertContextSigningKey(key:ContextKey,now:string):void {
+  guard(()=>{const at=millis(now);keyCheck(key,at,at,true);});
+}
 function canonical(claims:ContextClaims):string {return JSON.stringify(claimsSchema.parse(claims));}
 function mac(payload:string,key:ContextKey):Buffer {
   return createHmac("sha256",key.secret).update("dona.web.ingress-context.v1\0").update(payload).digest();

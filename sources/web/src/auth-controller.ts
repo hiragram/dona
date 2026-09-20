@@ -67,8 +67,9 @@ function response(status: Status, value?: unknown, clear = false): BrowserAuthRe
 export class WebAuthController {
   private readonly policy: WebPolicy;
   constructor(policy: WebPolicy, private readonly connections: BrowserAuthConnections,
-    private readonly keys: BrowserAuthKeys, private readonly protectedNow: () => string) {
+    private readonly keys: BrowserAuthKeys, private readonly protectedNow: () => string, private readonly generation: number) {
     this.policy = parseWebPolicy(policy);
+    z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).parse(generation);
   }
   private clock(): () => string {
     let previous = -Infinity;
@@ -87,7 +88,11 @@ export class WebAuthController {
   }
   private async read(input: AuthReadInput, now: () => string): Promise<AuthReadResult> {
     const result = authReadResultSchema.parse(await this.connections.read.read(input)); now();
-    validateReadBinding(input, result, this.policy); return result;
+    validateReadBinding(input, result, this.policy);
+    if ((result.operation === "login_context" && result.bff_generation !== this.generation)
+      || (result.operation !== "login_context" && result.snapshot !== null && result.snapshot.bff_generation !== this.generation))
+      throw new AuthFailure(401, "session_revoked");
+    return result;
   }
   private async local(candidates: Index[], now: () => string): Promise<Snapshot> {
     const result = await this.read({ codec_version: 1, operation: "session_lookup", cookie_indexes: candidates }, now);

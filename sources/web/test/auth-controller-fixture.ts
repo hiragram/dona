@@ -71,7 +71,7 @@ export function controllerFixture(policy = fixturePolicy()) {
       return decision.allowed ? { status: "succeeded", principal: decision.principal } : { status: "denied", reason: decision.reason };
     } },
   };
-  const controller = new WebAuthController(policy, connections, keys, () => at);
+  const controller = new WebAuthController(policy, connections, keys, () => at, 1);
   function request(target = "/api/session", method = "GET"): BrowserAuthRequest {
     return { target, method, transportVerified: true, body: Buffer.from(method === "POST" ? "{}" : ""),
       headers: [["host", new URL(policy.origin).host], ["sec-fetch-site", "same-origin"], ["cookie", "__Host-dona_session=" + cookie],
