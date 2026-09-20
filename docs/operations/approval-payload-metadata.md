@@ -1,0 +1,13 @@
+# 承認payloadのcanonical metadata
+
+Issue #16の内部保存component用codec。暗号化payloadと長期metadataを分け、共有auditのresource commitmentへ結合するための形式を定める。DBへの保存、audit rootの初期化、現在のactor認可、復号をこのcodecの成功から推定しない。
+
+`ApprovalPayloadMetadata` v1は、immutableなbinding、attempt用consume ID、暗号化envelopeのdigest、active/deleted状態と削除時刻を保持する。requestのconsume IDはnull、attemptは必須。削除済みでもowner・payload ref・元envelope digestを残し、同じowner keyのtombstoneとして扱える。削除時刻が作成時刻より前、scope不一致、未知version/fieldを拒否する。時刻の真正性は共有保護clockへ接続する上位の責務である。
+
+metadata keyはscope・owner kind・owner IDへ結合する。metadata digestとcipher envelope digestはそれぞれ別domainを使い、平文の無鍵hashを保存しない。metadataには本文やciphertextを含めない。保存wireのdecodeはbyte上限、canonical bytes、期待digestを検査し、duplicate field・異なる数値表記・余分な空白も拒否する。objectからのencodeは入力field順序に依存しない。
+
+`parseApprovalPayloadBinding`と`parseSealedApprovalPayload`は既存暗号化codecのstrict schemaを共有し、passive data、canonical base64url、byte長を検査してfreezeする。parser単独ではHMACやGCM tagを検証しない。本文利用には既存`openApprovalPayload`と現在のowner・保持期限・認可検証が必要になる。
+
+共有metadata treeには`approval_payloads_v1` collectionを明示追加する。既存`approval_records_v1`の形式は変更しない。同じowner keyでも別collectionのroot/nodeは流用できない。rootの正本は後続repositoryが共有auditから取得するもので、caller指定rootや空rootへのfallbackを認可するものではない。
+
+fixtureはcanonical round-trip、scope/owner分離、active/deletedとconsumeの組、改変・過大入力・accessor/Proxy拒否、collectionを越えたroot/node流用を検証する。実credential、SQLのlifecycle、auditへのcommit、production runtimeはこのcodecの検証範囲に含まない。

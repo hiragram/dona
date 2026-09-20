@@ -143,3 +143,20 @@ export function openApprovalPayload(input: unknown, ownerInput: ApprovalPayloadB
     } finally { unwrapped?.fill(0); dataKey?.fill(0); first?.fill(0); plaintext?.fill(0); }
   });
 }
+
+/** 保存用shape parser。署名/GCMの検証や時刻・actorの認可を行わない。 */
+export function parseApprovalPayloadBinding(input: unknown): ApprovalPayloadBinding {
+  return guard(() => {
+    assertSynchronousResult(input); const binding=bindingSchema.parse(input);
+    Object.freeze(binding.scope); Object.freeze(binding.content); return Object.freeze(binding);
+  });
+}
+export function parseSealedApprovalPayload(input: unknown): SealedApprovalPayload {
+  return guard(() => {
+    assertSynchronousResult(input); const envelope=envelopeSchema.parse(input);
+    decode(envelope.wrapped_key,40); decode(envelope.nonce,12); decode(envelope.tag,16);
+    const ciphertext=decode(envelope.ciphertext);
+    if(ciphertext.length<1 || ciphertext.length>maximumApprovalPayloadBytes) throw Error();
+    return Object.freeze(envelope);
+  });
+}

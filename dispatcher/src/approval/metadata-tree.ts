@@ -4,7 +4,7 @@ import { assertSynchronousCallback, assertSynchronousResult } from "../audit/syn
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).refine(value => !/\s/.test(value));
 const scopeSchema = z.strictObject({ instance_id: identifier, workspace_id: identifier,
-  collection: z.literal("approval_records_v1") });
+  collection: z.enum(["approval_records_v1", "approval_payloads_v1"]) });
 export type MetadataTreeScope = z.infer<typeof scopeSchema>;
 export type MetadataTreeNodeReader = (digest: string) => string | undefined;
 export interface MetadataTreeNode { readonly digest: string; readonly wire: string }
