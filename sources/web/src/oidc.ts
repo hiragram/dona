@@ -38,6 +38,9 @@ export class OidcProtocol {
     if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") throw new WebBoundaryError("deployment_invalid");
     this.policy = parseWebPolicy(policy);
   }
+  /** Validate configured secret availability without retaining or exposing it.
+   * This is not an IdP connectivity or token-introspection success signal. */
+  assertConfiguration(): void { this.authentication(); }
   createLogin(now: number): { transaction: LoginTransaction; authorization_url: string } {
     try {
       seconds.parse(now);

@@ -38,6 +38,11 @@ function inventory(input: IdentityIndexInventory): IdentityIndexKey[] {
   if (!keys.has(input.active_version)) throw new IdentityIndexError();
   return [...keys.values()].sort((a,b) => a.version-b.version);
 }
+/** Local shape/completeness check only; the inventory must come from the current
+ * protected provider and its versions must match the durable registry. */
+export function identityInventoryVersions(input: IdentityIndexInventory): readonly number[] {
+  return guarded(() => Object.freeze(inventory(input).map(key => key.version)));
+}
 function canonical(input: IdentitySubject): Buffer {
   id.parse(input.instance_id); id.parse(input.tenant_id);
   if (typeof input.issuer !== "string" || input.issuer.length > 2048 || typeof input.subject !== "string") throw new IdentityIndexError();

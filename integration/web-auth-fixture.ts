@@ -56,8 +56,7 @@ export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePo
     write: new WebAuthWriteClient(socket, scope, () => credential, lookup, local.now),
     session: new WebSessionClient(socket, scope, () => credential, lookup, local.now), oidc,
   };
-  const controller = new WebAuthController(local.policy, connections, local.keys, local.now);
-  return { ...db, local, controller, connections, idpCalls: () => idpCalls, setOnline: (value: Record<string, unknown>) => { online = value; },
+  const controller = new WebAuthController(local.policy, connections, local.keys, local.now, 1);
+  return { ...db, local, controller, connections, socket, credential, lookup, repository, idpCalls: () => idpCalls, setOnline: (value: Record<string, unknown>) => { online = value; },
     setNow: (value: string) => { local.setNow(value); db.setNow(value); } };
 }
-

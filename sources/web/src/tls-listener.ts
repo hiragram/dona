@@ -54,7 +54,7 @@ export class WebLoopbackTlsListener {
       this.validAt = material.validAt;
       this.publicPages = new WebPublicPages(this.policy);
       this.login = new WebLoginController(this.policy, composition.connections, composition.keys, () => composition.protectedNow(), composition.generation);
-      this.auth = new WebAuthController(this.policy, composition.connections, composition.keys, () => composition.protectedNow());
+      this.auth = new WebAuthController(this.policy, composition.connections, composition.keys, () => composition.protectedNow(), composition.generation);
       this.server = createServer({ cert: material.certificate, key: material.privateKey, minVersion: "TLSv1.2",
         secureOptions: constants.SSL_OP_NO_TICKET | constants.SSL_OP_NO_RENEGOTIATION, sessionTimeout: 1, handshakeTimeout: handshakeMs,
         maxHeaderSize: 16384, requestTimeout: 0, headersTimeout: 0, keepAliveTimeout: 0,

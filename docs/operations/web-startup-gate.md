@@ -1,0 +1,27 @@
+# Web loopback起動時のsession世代gate
+
+`WebLoopbackStartup`は、保護providerを準備済みのlocal runtimeから明示的に呼び出す起動componentである。固定policyの私有UDSへread/write/session clientを組み立て、session失効と世代read-backを確認した後だけloopback TLS listenerを開始する。importだけでは起動しない。
+
+## 起動順序
+
+1. policy、用途別のactive keyと同versionのlookup、完全なcookie/identity inventory、context signing key、OIDC client secretの構文・取得可能性を確認する。秘密値を返したり記録したりしない。
+2. 署名付き`login_context`から現在の世代を読み、保護identity inventoryの全versionとdurable registryの保持versionを照合する。scope、UDS、service credentialはpolicyから固定する。
+3. 次世代の固定controllerとTLS listenerを構築する。この段階では証明書/SAN/鍵等を検証するがsocketは開かない。
+4. 読み取った世代を`expected_generation`とする`restart`を一回だけ送る。既存repositoryが共有監査transactionで全sessionを失効し、login/nonce/receiptとsealed payloadを削除して世代を一つ進める。
+5. 署名付き成功応答のoperation/kind/世代を照合し、さらに署名付き`login_context`を再読する。同じ次世代、現行inventoryと保護時刻を確認してからlistenerを開始する。
+
+各UDS clientの5秒上限に加えて、起動全体は15秒で打ち切る。保護時刻はstartupから各controllerへ同じ単調確認を通し、巻戻りを検出したinstanceを再開しない。transport deadline用の単調時計をsecurity decisionの保護時刻へ代用しない。
+
+## 競合・失敗・終了
+
+同じinstanceの二重startを拒否する。別プロセスによる世代変更、鍵不備、署名応答不明、anchor pending、read-back不一致、TLS bind失敗ではlistenerを開いたまま成功しない。restartが確定していた場合も、その世代や旧sessionの失効を戻さない。timeout、close、応答喪失を理由に同じwriteを再送しない。
+
+`close`はlistenerを閉じ、進行中の起動処理が終了するのを待つ。送信済みのrestartを取消済みと解釈せず、結果が届いてもclosed状態からlistenerを開かない。失敗・終了後の再startも許可せず、runtime側がdurable stateとprovider状態を確認する必要がある。
+
+loginだけでなく`WebAuthController`も起動時の世代を保持し、各署名付きsnapshotの現行世代が一致しなければ`session_revoked`として拒否する。古いBFFが新世代のsessionへ追従して認証することを防ぐ。現行BFFでは、旧sessionのcookieに対するIdP不要のlocal logoutを維持する。
+
+## 検証範囲
+
+実TLS、私有UDS、SQLite/native extension、共有監査repositoryの結合試験で、起動前失効、新世代login、設定不備、anchor応答不明、read-back前の競合、restart送信中のclose、clock巻戻りを確認する。証明書、秘密値、IdP、保護clock/key/anchorはfixtureである。
+
+このcomponentはOS保護providerの認証やlocal二者provisioningを実装せず、任意providerの所持をその証拠にも使わない。OIDC設定の確認は接続成功やtoken有効性の証明ではなく、各認証requestのonline照合を維持する。private/internet proxy attestation、native broker/key lifecycle、launchd/release/production接続、実IdP/browser/WebAuthn検証は残る。#141/Epic #139全体を完了扱いにしない。

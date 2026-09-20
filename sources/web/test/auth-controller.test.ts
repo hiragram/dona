@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { WebBoundaryError } from "../src/policy.js";
-import type { BrowserAuthRequest } from "../src/auth-controller.js";
+import { WebAuthController, type BrowserAuthRequest } from "../src/auth-controller.js";
 import { controllerFixture } from "./auth-controller-fixture.js";
 
 test("最終transactionの署名済み拒否理由を保持し追加監査writeをしない", async () => {
@@ -237,4 +237,18 @@ test("前後どちらのcurrent registryでもrevision変更をsession_revoked�
     const result = await f.controller.handle(f.request()); assert.equal(result.status, 401);
     assert.equal(result.body, '{"error":"session_revoked"}'); assert.equal(reason, "session_revoked"); assert.ok(!f.calls.includes("confirm"));
   }
+});
+
+test("古いBFFは新世代のsessionを採用せず現行BFFだけが旧cookieのlocal logoutを扱う", async () => {
+  for(const target of ["/api/session","/api/session/csrf","/api/session/logout","/api/session/logout-status"]){
+    const f=controllerFixture();f.snapshot.bff_generation=2;
+    const request=f.request(target,target==="/api/session"?"GET":"POST");
+    assert.equal((await f.controller.handle(request)).status,401);
+    assert.ok(!f.calls.includes("oidc") && !f.calls.includes("confirm") && !f.calls.includes("write:revoke_session"));
+  }
+  const f=controllerFixture();f.snapshot.bff_generation=2;f.snapshot.session.state.state="revoked";
+  f.snapshot.session.payload_ref=null;f.snapshot.session.payload_digest=null;f.snapshot.payload=null;
+  const current=new WebAuthController(f.policy,f.connections,f.keys,f.now,2);
+  assert.equal((await current.handle(f.request("/api/session/logout","POST"))).status,204);
+  assert.throws(()=>new WebAuthController(f.policy,f.connections,f.keys,f.now,0));
 });
