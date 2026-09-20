@@ -12,7 +12,9 @@ import { ApprovalIndexBlobs } from "../../src/approval/index-store.js";
 import { ApprovalMetadataPlan } from "../../src/approval/metadata-plan.js";
 import { ApprovalMetadataPlanWriter } from "../../src/approval/metadata-plan-store.js";
 import { emptyMetadataRoot } from "../../src/approval/metadata-tree.js";
-import { readApprovalListHead } from "../../src/approval/index-list.js";
+import { readApprovalListHead, appendApprovalList } from "../../src/approval/index-list.js";
+import { approvalRecordAliases } from "../../src/approval/record-indexes.js";
+import { openSecurityDatabase } from "../../src/audit/coordination.js";
 import { installApprovalMetadataSchema, installApprovalIndexSchema } from "../../src/approval/schema.js";
 import { ApprovalTransactionError } from "../../src/approval/transaction.js";
 import type { AuditEvent } from "../../src/audit/codec.js";
@@ -99,6 +101,12 @@ test("配送・decision/event・consume/attemptを異なるrecordとして更新
   assert.equal(f.records.read("execution", "attempt")!.row.state, "claimed");
   assert.equal(list(f, "request", "active").count, 0); assert.equal(list(f, "request", "all").count, 1);
   assert.equal(list(f, "decision", "all").count, 1); assert.equal(list(f, "consume", "all").count, 1); assert.equal(list(f, "execution", "active").count, 1);
+  for(const kind of ["request","decision","consume","execution","notification","event"] as const){
+    const primary=kind==="execution"?"attempt":kind==="notification"?"notification":kind==="event"?"event":"request";
+    const record=f.records.read(kind,primary)!;
+    for(const selector of approvalRecordAliases(record))assert.deepEqual(f.records.readAlias(selector),record);
+    assert.ok(f.records.readListHead({record_kind:kind,membership:"all"},4).records.some(value=>JSON.stringify(value)===JSON.stringify(record)));
+  }
 });
 
 test("stale SQL・illegal transition・clock不一致・欠落rootをreserve前に拒否する", t => {
@@ -159,6 +167,8 @@ test("presentation message fenceを解放してから引継ぎacceptance unknown
   commit(f, "updates", [{ previous: null, next: first }, { previous: null, next: second }]);
   const claimed = { ...first, row: { ...first.row, state: "dispatching" as const, fence: 1 } };
   commit(f, "claim_first", [{ previous: first, next: claimed }]);
+  assert.deepEqual(f.records.readAlias({name:"presentation_revision",notification_attempt_id:"notification",desired_revision:2}),claimed);
+  assert.deepEqual(f.records.readAlias({name:"presentation_active_message",message_ref:"message_notification"}),claimed);
   const nextClaim = { ...second, row: { ...second.row, state: "dispatching" as const, fence: 1 } };
   const settled = { ...claimed, row: { ...claimed.row, state: "succeeded" as const } };
   // SQL unique indexもmetadata aliasも、release前にacquireする入力順を正規化する。
@@ -168,6 +178,8 @@ test("presentation message fenceを解放してから引継ぎacceptance unknown
   assert.deepEqual(list(f, "presentation", "active").ids, ["update_2"]);
   const unknown = { ...nextClaim, row: { ...nextClaim.row, state: "acceptance_unknown" as const } };
   commit(f, "unknown", [{ previous: nextClaim, next: unknown }]);
+  assert.deepEqual(f.records.readAlias({name:"presentation_active_message",message_ref:"message_notification"}),unknown);
+  assert.deepEqual(f.records.readListHead({record_kind:"presentation",membership:"all"},4).records,[settled,unknown]);
   const third = structuredClone(second); third.row.update_id = "update_3"; third.row.desired_revision = 4; third.row.clock_transaction_id = "third";
   commit(f, "third", [{ previous: null, next: third }]);
   const calls = f.anchors.calls.length;
@@ -175,6 +187,77 @@ test("presentation message fenceを解放してから引継ぎacceptance unknown
   assert.equal(f.anchors.calls.length, calls);
   assert.equal(f.records.read("presentation", "update_3")!.row.state, "pending");
   assert.equal(f.records.read("presentation", "update_2")!.row.state, "acceptance_unknown");
+  commit(f,"release_unknown",[{previous:unknown,next:{...unknown,row:{...unknown.row,state:"needs_review"}}}]);
+  assert.equal(f.records.readAlias({name:"presentation_active_message",message_ref:"message_notification"}),null);
+});
+
+test("内部一覧は4件上限とtruncatedを保持し再open後も同じrootから読む",t=>{
+  const f=fixture(t);assert.deepEqual(f.records.readListHead({record_kind:"request",membership:"active"},4),{count:0,records:[],truncated:false});
+  for(let i=0;i<5;i++){
+    const transactionId="request_"+i,record=values(transactionId).request;
+    const source={...snapshotFixture(),...scope};source.request_source.source_event_id="event_"+i;
+    const encoded=encodeApprovalSnapshot(source,{...scope,request_source:source.request_source});
+    Object.assign(record.row,{request_id:transactionId,creation_key:encoded.creation_key,snapshot_json:encoded.canonical,semantic_hash:encoded.semantic_hash});
+    commit(f,transactionId,[{previous:null,next:record}]);
+  }
+  const sequence=f.audit.verify().sequence,result=f.records.readListHead({record_kind:"request",membership:"active"},4);
+  assert.equal(result.count,5);assert.equal(result.records.length,4);assert.equal(result.truncated,true);
+  assert.deepEqual(result.records.map(row=>row.kind==="request"?row.row.request_id:null),["request_0","request_1","request_2","request_3"]);
+  assert.ok(Object.isFrozen(result) && Object.isFrozen(result.records) && result.records.every(row=>Object.isFrozen(row)&&Object.isFrozen(row.row)));
+  for(const limit of [0,5,NaN,1.5])assert.throws(()=>f.records.readListHead({record_kind:"request",membership:"all"},limit),ApprovalRecordRepositoryError);
+  assert.throws(()=>f.records.readListHead({record_kind:"decision",membership:"active"},1),ApprovalRecordRepositoryError);
+  assert.equal(f.records.readAlias({name:"decision_id",decision_id:"missing"}),null);assert.equal(f.audit.verify().sequence,sequence);
+  assert.throws(()=>f.records.readAlias({name:"__proto__"} as never),ApprovalRecordRepositoryError);
+  assert.throws(()=>f.records.readAlias({name:"decision_id",decision_id:"missing",root:"0".repeat(64)} as never),ApprovalRecordRepositoryError);
+  const other=new ApprovalRecordRepository(f.db,f.providers.auditAnchors,f.providers.auditKeys,{...scope,workspace_id:"other"});
+  assert.throws(()=>other.readAlias({name:"decision_id",decision_id:"missing"}),ApprovalRecordRepositoryError);
+  assert.throws(()=>other.readListHead({record_kind:"request",membership:"all"},1),ApprovalRecordRepositoryError);
+  f.db.close();const db=openSecurityDatabase(f.filename);
+  try{
+    db.pragma("foreign_keys=ON");db.pragma("synchronous=FULL");
+    const reopened=new ApprovalRecordRepository(db,f.providers.auditAnchors,f.providers.auditKeys,scope);
+    assert.deepEqual(reopened.readListHead({record_kind:"request",membership:"active"},4),result);
+  }finally{db.close();}
+});
+
+test("aliasと一覧でもSQLやparentの改変・pending anchorを空結果へ変換しない",t=>{
+  for(const fault of ["sql","parent","pending"]){
+    const f=fixture(t);create(f);deliver(f);
+    if(fault==="sql")f.db.prepare("UPDATE approval_notifications SET fence=fence+1").run();
+    if(fault==="parent")f.db.prepare("UPDATE approval_requests SET revision=revision+1").run();
+    if(fault==="pending")f.anchors.value={...f.anchors.value,pending_transaction_id:"unknown"};
+    assert.throws(()=>f.records.readAlias({name:"notification_message",message_ref:"message_notification"}),ApprovalRecordRepositoryError);
+    assert.throws(()=>f.records.readListHead({record_kind:"notification",membership:"all"},4),ApprovalRecordRepositoryError);
+  }
+  const f=fixture(t,false);
+  assert.throws(()=>f.records.readAlias({name:"decision_id",decision_id:"missing"}),ApprovalRecordRepositoryError);
+  assert.throws(()=>f.records.readListHead({record_kind:"request",membership:"all"},1),ApprovalRecordRepositoryError);
+});
+
+test("署名済みmetadataでもaliasの別record割当とterminalのactive混入を拒否する",t=>{
+  for(const fault of ["alias","active"]){
+    const f=fixture(t);create(f);
+    if(fault==="active"){
+      const previous=f.records.read("request","request")!;
+      commit(f,"terminal_fixture",[{previous,next:{...previous,row:{...previous.row,state:"cancelled",revision:2}}}]);
+    }
+    // 明示的に不整合なsigned storage fixtureを構成し、root照合だけで返さないことを検証する。
+    f.transaction.runPrepared("inconsistent_fixture",(_mark,state)=>{
+      const metadata=f.nodes.read(nodes=>f.indexes.read(indexes=>{
+        const root=state.resource_bindings.find(value=>value.resource_id==="approval_records")!.resource_digest;
+        const plan=new ApprovalMetadataPlan(scope,root,nodes,indexes);
+        if(fault==="alias")plan.putIndex(null,{codec_version:1,scope,kind:"alias",selector:{name:"request_creation",creation_key:"0".repeat(64)},target:"request"});
+        else appendApprovalList(plan,{record_kind:"request",membership:"active"},"request");
+        return plan.finish();
+      }));
+      return{event:{...event,resource_id:"approval_records"},resource_digest:metadata.proposed_root,mutation:()=>{f.writer.stage(metadata);return null;}};
+    });
+    if(fault==="alias")assert.throws(()=>f.records.readAlias({name:"request_creation",creation_key:"0".repeat(64)}),ApprovalRecordRepositoryError);
+    else{
+      assert.throws(()=>f.records.readListHead({record_kind:"request",membership:"active"},4),ApprovalRecordRepositoryError);
+      assert.throws(()=>f.records.readAlias({name:"request_creation",creation_key:values("unused").request.row.creation_key}),ApprovalRecordRepositoryError);
+    }
+  }
 });
 
 test("別primaryでもcreation/notification aliasの重複をSQL UNIQUEより前に拒否する", t => {
