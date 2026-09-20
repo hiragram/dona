@@ -14,6 +14,7 @@ import { ApprovalMetadataPlanWriter } from "../../src/approval/metadata-plan-sto
 import { emptyMetadataRoot } from "../../src/approval/metadata-tree.js";
 import { readApprovalListHead, appendApprovalList } from "../../src/approval/index-list.js";
 import { approvalRecordAliases } from "../../src/approval/record-indexes.js";
+import { withMutationSqlGuard } from "../../src/audit/file-identity.js";
 import { openSecurityDatabase } from "../../src/audit/coordination.js";
 import { installApprovalMetadataSchema, installApprovalIndexSchema } from "../../src/approval/schema.js";
 import { ApprovalTransactionError } from "../../src/approval/transaction.js";
@@ -149,15 +150,20 @@ test("SQL保存後のmetadata障害とanchor応答喪失で部分成功を公開
   }
 });
 
-test("prepared mutationを別clock transactionで実行できない", t => {
-  const f = fixture(t); let captured: ReturnType<ApprovalRecordMutation["prepare"]> | undefined;
-  f.transaction.runPrepared("prepare_only", (mark, state) => {
-    captured = f.mutation.prepare(mark, state, [{ previous: null, next: values("prepare_only").request }]);
-    return { event, resource_digest: null, mutation: () => null };
-  });
-  assert.ok(captured);
-  assert.throws(() => f.transaction.runPrepared("later", () => ({ event, ...captured! })), ApprovalTransactionError);
-  assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_requests").get(), { n: 0 });
+test("prepared mutationは一致する保護clock transaction内でだけ実行できる", t => {
+  for(const mode of ["plain","unclocked","outside","different"] as const){
+    const f = fixture(t); let captured: ReturnType<ApprovalRecordMutation["prepare"]> | undefined;
+    f.transaction.runPrepared("prepare_only", (mark, state) => {
+      captured = f.mutation.prepare(mark, state, [{ previous: null, next: values("prepare_only").request }]);
+      return { event, resource_digest: null, mutation: () => null };
+    });
+    assert.ok(captured);
+    if(mode==="plain") assert.throws(()=>f.db.transaction(()=>captured!.mutation())());
+    else if(mode==="unclocked") assert.throws(()=>f.db.transaction(()=>withMutationSqlGuard(f.db,()=>captured!.mutation()))());
+    else if(mode==="outside") assert.throws(()=>captured!.mutation());
+    else assert.throws(() => f.transaction.runPrepared("later", () => ({ event, ...captured! })), ApprovalTransactionError);
+    assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_requests").get(), { n: 0 });
+  }
 });
 
 test("presentation message fenceを解放してから引継ぎacceptance unknown中の後続writeを拒否する", t => {

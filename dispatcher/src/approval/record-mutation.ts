@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { assertActiveClockMutation } from "../audit/file-identity.js";
 import { z } from "zod";
 import type { VerifiedAuditState, AuditResourceCommitment } from "../audit/codec.js";
 import type { ClockMark } from "./clock.js";
@@ -93,8 +94,7 @@ export class ApprovalRecordMutation {
       return Object.freeze({ resource_commitments: commitments, mutation: () => {
         if (used) throw new ApprovalRecordMutationError(); used = true;
         try {
-          const current = this.db.prepare("SELECT dona_clock_reference(?) AS ok").get(transactionId) as { ok: number };
-          if (current.ok !== 1) throw Error();
+          assertActiveClockMutation(this.db, transactionId);
           this.sql.stage(ordered); this.writer.stage(metadata); return null;
         }
         catch { throw new ApprovalRecordMutationError(); }

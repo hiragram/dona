@@ -60,3 +60,12 @@ export function withClockRowsReadOnly<T>(db: Database.Database, transactionId: s
   try { return callback(); }
   finally { control.get(token, 3, null); }
 }
+
+/** Prepared persistence closures must run in the framework's current clock
+ * mutation phase, not merely inside an arbitrary SQLite transaction. */
+export function assertActiveClockMutation(db: Database.Database, transactionId: string): void {
+  if (!mutationTokens.has(db) || !db.inTransaction || typeof transactionId !== "string"
+    || !/^[A-Za-z0-9_-]{1,128}$/.test(transactionId)) throw new Error("security_clock_mutation_unverified");
+  const row = db.prepare("SELECT dona_clock_reference(?) AS ok").get(transactionId) as { ok: number };
+  if (row.ok !== 1) throw new Error("security_clock_mutation_unverified");
+}
