@@ -194,6 +194,16 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(hyphenatedApiKeyDetail.includes("config-secret"), false, hyphenatedApiKeyDetail);
     assert.match(hyphenatedApiKeyDetail, /REDACTED_STREAM/);
     assert.match(hyphenatedApiKeyDetail, /visible-after-hyphenated-api-key/);
+
+    const privateKeyCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:private-key" });
+    privateKeyCapture.write("stderr", Buffer.from("SSH_PRIVATE_"));
+    privateKeyCapture.write("stderr", Buffer.from('KEY=ssh-secret\nprivateKey="camel-secret"\nprivate-key=hyphen-secret\nvisible-after-private-key'));
+    privateKeyCapture.finish(true);
+    const privateKeyDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[14]!, 16_384).detail_tail);
+    assert.equal(privateKeyDetail.includes("ssh-secret"), false, privateKeyDetail);
+    assert.equal(privateKeyDetail.includes("camel-secret"), false, privateKeyDetail);
+    assert.equal(privateKeyDetail.includes("hyphen-secret"), false, privateKeyDetail);
+    assert.match(privateKeyDetail, /visible-after-private-key/);
   } finally {
     f.database.close();
   }

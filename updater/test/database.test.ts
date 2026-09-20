@@ -93,6 +93,7 @@ describe("UpdateDatabase", () => {
 
     const reader = new UpdateDatabase(databasePath, { readonly: true });
     assert.equal(reader.accessMode(), "read_only");
+    assert.deepEqual(reader.diagnosticLogs("upd_01m1es03xy5cf8d9pm5cwx4srv"), []);
     assert.throws(() => reader.assertReadableWritable(), /readonly|read-only/i);
     reader.close();
 

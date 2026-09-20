@@ -93,6 +93,7 @@ export interface UpdateDatabaseOptions {
 export class UpdateDatabase {
   private readonly db: Database.Database;
   private readonly readonlyMode: boolean;
+  private readonly diagnosticLogsAvailable: boolean;
 
   constructor(databasePath: string, options: UpdateDatabaseOptions = {}) {
     this.readonlyMode = options.readonly === true;
@@ -110,6 +111,9 @@ export class UpdateDatabase {
     this.db.pragma("foreign_keys = ON");
     if (options.readonly) this.db.pragma("query_only = ON");
     else this.migrate();
+    this.diagnosticLogsAvailable = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'",
+    ).get() !== undefined;
   }
 
   private migrate(): void {
@@ -393,6 +397,7 @@ export class UpdateDatabase {
   }
 
   diagnosticLogs(requestId: string): DiagnosticLogRow[] {
+    if (!this.diagnosticLogsAvailable) return [];
     return this.db.prepare("SELECT * FROM update_diagnostic_logs WHERE request_id = ? ORDER BY attempt, created_at, log_id")
       .all(requestId) as DiagnosticLogRow[];
   }
