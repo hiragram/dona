@@ -53,7 +53,7 @@ export class ApprovalMetadataNodes {
     guard(() => {
       assertSynchronousCallback(operation);
       if (!this.db.inTransaction) throw new MetadataStoreError();
-      verifyApprovalMetadataSchema(this.db);
+      verifyOpenDatabaseFile(this.db); verifyApprovalMetadataSchema(this.db);
     });
     let active = true;
     const reader: MetadataTreeNodeReader = digest => guard(() => {
@@ -66,11 +66,16 @@ export class ApprovalMetadataNodes {
       // repositoryへ伝え、callback由来の例外messageは引き継がない。
       if (error instanceof MetadataConflictError) throw new MetadataConflictError();
       throw new MetadataStoreError();
-    } finally { active = false; }
+    } finally {
+      active = false;
+      // callbackの通常競合よりもfile identity喪失を優先して拒否する。
+      guard(() => verifyOpenDatabaseFile(this.db));
+    }
   }
   stage(input: readonly MetadataTreeNode[]): undefined {
     return guard(() => {
       if (!this.db.inTransaction) throw new MetadataStoreError();
+      verifyOpenDatabaseFile(this.db);
       verifyApprovalMetadataSchema(this.db); assertSynchronousResult(input);
       if (!Array.isArray(input) || input.length < 1 || input.length > 257) throw new MetadataStoreError();
       const nodes = input.map(node);
@@ -82,6 +87,7 @@ export class ApprovalMetadataNodes {
         else if (existing !== item.wire) throw new MetadataStoreError();
       }
       for (const item of nodes) if (readNode(this.db, item.digest) !== item.wire) throw new MetadataStoreError();
+      verifyOpenDatabaseFile(this.db);
       return undefined;
     });
   }

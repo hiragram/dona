@@ -58,6 +58,26 @@ test("業務mutation失敗ではnodeもrollbackする",t=>{
  assert.deepEqual(f.anchors.calls,["reserve"]);
 });
 
+test("読取の前後でDBの移動・置換を検出し旧inodeの結果を返さない",t=>{
+ for(const when of ["before","during","conflict"] as const){
+  const f=fixture(t),root=commit(f);
+  const replace=()=>{fs.renameSync(f.filename,f.filename+".detached");fs.copyFileSync(f.filename+".detached",f.filename);fs.chmodSync(f.filename,0o600);};
+  if(when==="before")replace();
+  let rejected=false;
+  assert.throws(()=>f.audit.readVerified(()=>{
+   try{return f.nodes.read(reader=>{
+    const value=readMetadataValue(scope,root,"fixture_record",reader);
+    if(when!=="before")replace();
+    if(when==="conflict")throw new MetadataConflictError();
+    return value;
+   });}catch(error){
+    assert.ok(error instanceof MetadataStoreError);assert.equal(error.message,"approval_metadata_store_unverified");rejected=true;throw error;
+   }
+  }),{name:"AuditIntegrityError",message:"audit_integrity_unverified"});
+  assert.equal(rejected,true);
+ }
+});
+
 test("codecの通常競合はstore障害にせず同じ監査transactionでdenialへできる",t=>{
  const f=fixture(t),root=commit(f);
  const result=f.transaction.runPrepared("metadata_conflict",(_mark,state)=>{
