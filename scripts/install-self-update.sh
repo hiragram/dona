@@ -112,6 +112,7 @@ restore_control_plane() {
     return 1
   fi
   if [[ "$DISPATCHER_RESTORE_REQUIRED" == "1" && -f "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" ]]; then
+    local dispatcher_bootout_exit=0
     if [[ "$DISPATCHER_PLIST_SWAPPED" != "1" ]] && [[ -n "${ACTIVE_DISPATCHER_SHA:-}" ]] && \
       $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
         "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 2000; then
@@ -119,14 +120,14 @@ restore_control_plane() {
       return 0
     fi
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-      if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
-        print -u2 "旧Dispatcher復旧前の停止受理を確認できません。backup: $CONTROL_BACKUP_ROOT"
-        return 1
-      fi
+      /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
     fi
     if ! wait_dispatcher_unregistered; then
-      print -u2 "旧Dispatcher復旧前の登録解除を確認できません。backup: $CONTROL_BACKUP_ROOT"
+      print -u2 "旧Dispatcher復旧前の登録解除を確認できません（bootout exit ${dispatcher_bootout_exit}）。backup: $CONTROL_BACKUP_ROOT"
       return 1
+    fi
+    if [[ "$dispatcher_bootout_exit" != "0" ]]; then
+      print -u2 "旧Dispatcher復旧前のlaunchctl bootoutはexit ${dispatcher_bootout_exit}でしたが、登録解除済み状態を確認しました。"
     fi
     if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
       /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"

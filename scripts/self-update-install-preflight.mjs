@@ -150,14 +150,31 @@ export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
   throw new Error(`dispatcher ${expectedSha} was not observed ready`);
 }
 
-async function observeLaunchdRegistration(serviceTarget) {
+async function observeLaunchdRegistration(serviceTarget, timeoutMs) {
   try {
-    await execute("/bin/launchctl", ["print", serviceTarget]);
+    await execute("/bin/launchctl", ["print", serviceTarget], { timeout: timeoutMs, killSignal: "SIGKILL" });
     return true;
   } catch (error) {
     if (error && typeof error === "object" && error.code === 113) return false;
+    if (error && typeof error === "object" && error.killed === true) {
+      throw new Error("launchd registration observation timed out");
+    }
     const exitCode = error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
     throw new Error(`launchd registration observation failed with exit ${exitCode}`);
+  }
+}
+
+async function observeBeforeDeadline(observe, serviceTarget, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      observe(serviceTarget, timeoutMs),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("launchd registration observation timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -176,7 +193,8 @@ export async function waitForLaunchdServiceAbsent(domain,label,timeoutMs,options
   const deadline=now()+timeoutMs;
   let absentObservations=0;
   do {
-    if(await observe(serviceTarget)) absentObservations=0;
+    const remainingMs=Math.max(1,deadline-now());
+    if(await observeBeforeDeadline(observe,serviceTarget,remainingMs)) absentObservations=0;
     else if(++absentObservations>=settledObservations)return;
     await sleep(intervalMs);
   } while(now()<deadline);

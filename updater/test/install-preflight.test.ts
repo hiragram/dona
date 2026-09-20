@@ -23,7 +23,7 @@ type WaitForLaunchdServiceAbsent = (
   label: string,
   timeoutMs: number,
   options?: {
-    observe?: (target: string) => Promise<boolean>;
+    observe?: (target: string, timeoutMs: number) => Promise<boolean>;
     sleep?: (milliseconds: number) => Promise<void>;
     now?: () => number;
     intervalMs?: number;
@@ -177,6 +177,17 @@ test("launchdの登録解除timeoutは対象labelを保持し、plist切替前�
   );
 });
 
+test("launchdの登録観測自体が応答しない場合もdeadlineで失敗する", async () => {
+  await assert.rejects(
+    waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 20, {
+      observe: async () => new Promise<boolean>(() => undefined),
+      intervalMs: 1,
+      settledObservations: 3,
+    }),
+    /launchd registration observation timed out/,
+  );
+});
+
 test("macOS keeps a hardened staged updater renamable by reopening only its root", {
   skip: process.platform !== "darwin",
 }, async () => {
@@ -221,6 +232,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
   assert.match(source,/DISPATCHER_RESTORE_REQUIRED=1[\s\S]*wait_dispatcher_unregistered[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
   assert.match(source,/if \[\[ "\$DISPATCHER_RESTORE_REQUIRED" == "1"[\s\S]*wait_dispatcher_unregistered[\s\S]*bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録"/);
+  assert.match(source,/launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher" \|\| dispatcher_bootout_exit=\$\?[\s\S]*wait_dispatcher_unregistered/);
   assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
   assert.match(source, /wait-launchd-unregistered/);
   assert.match(source, /updater\.database-was-absent/);
