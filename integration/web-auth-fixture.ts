@@ -17,8 +17,8 @@ import { fixturePolicy, fixtureSecret } from "../sources/web/test/fixtures.js";
 
 // Real SQLite, audited repository, private UDS and BFF clients. IdP, protected
 // clock/anchor/key material and TLS-listener classification are fixtures only.
-export async function fixture(t: Parameters<typeof setup>[0]) {
-  const db = setup(t), local = controllerFixture({ ...fixturePolicy(), ...scope });
+export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePolicy()) {
+  const db = setup(t), local = controllerFixture({ ...policy, ...scope });
   db.store.initialize("initialize"); db.seedRegistry();
   const indexes = subjectLookupIndexes({ ...scope, issuer: local.policy.oidc.issuer, subject: "subject-A" }, local.keys.identities())
     .map(value => ({ key_version: value.identity_index_key_version, digest: value.subject_digest }));
