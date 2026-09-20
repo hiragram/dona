@@ -7,6 +7,8 @@ import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
+import { markDatabasePayloadHistory, verifyDatabasePayloadHistory } from "../src/payload-backup-boundary.js";
+import { installWebAuthSchema, verifyWebAuthSchema } from "../src/web/schema.js";
 
 import {
   assertReceiptMatchesDatabases,
@@ -304,4 +306,107 @@ test("a failed post-migration check rolls the source back to v2", async () => {
   assert.equal(reopened.pragma("user_version", { simple: true }), 2);
   assert.equal(reopened.prepare("SELECT name FROM sqlite_master WHERE name='job_groups'").get(), undefined);
   reopened.close();
+});
+
+async function payloadBackupFixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-payload-backup-")); roots.push(root);
+  const databasePath = path.join(root,"source.sqlite"), backupPath = path.join(root,"backup.sqlite"), receiptPath = path.join(root,"receipt.json");
+  const db = new Database(databasePath); db.pragma("journal_mode=WAL");
+  db.exec(await fs.readFile(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
+  db.close();
+  return {databasePath,backupPath,receiptPath,previous:bridge,target:activation,quiesced:true,drained:true};
+}
+
+test("payload tableが空でもDB全体backupをコピー前に拒否する", async () => {
+  for (const name of ["approval_payload_secrets","WEB_AUTH_PAYLOADS"]) {
+    const input = await payloadBackupFixture(); const db = new Database(input.databasePath);
+    db.exec(`CREATE TABLE ${name}(value TEXT)`); db.close();
+    await assert.rejects(migrateV2ToV3WithBackup(input), /schema_full_backup_payload_store_forbidden/);
+    await assert.rejects(fs.access(input.backupPath));
+    const source = new Database(input.databasePath);
+    try { assert.equal(source.pragma("user_version",{simple:true}),2); } finally { source.close(); }
+  }
+});
+
+test("backup中の別connectionによるpayload追加はsnapshotへ混入せずmigrationも拒否する", async t => {
+  const input = await payloadBackupFixture(); const other = new Database(input.databasePath);
+  other.exec("CREATE TABLE large_fixture(value BLOB); INSERT INTO large_fixture VALUES(zeroblob(2097152))");
+  t.after(() => other.close());
+  const original = Database.prototype.backup;
+  let injected = false;
+  const replacement: typeof original = function (this: Database.Database, destination, options) {
+    assert.equal(this.inTransaction, true);
+    return original.call(this, destination, {...options, progress: () => {
+      if (!injected) {
+        injected = true;
+        other.exec("CREATE TABLE approval_payload_secrets(value TEXT); INSERT INTO approval_payload_secrets VALUES('fixture-only')");
+      }
+      return 32;
+    }});
+  };
+  t.mock.method(Database.prototype,"backup",replacement);
+  await assert.rejects(migrateV2ToV3WithBackup(input), /schema_full_backup_payload_store_forbidden/);
+  assert.equal(injected,true);
+  const copied = new Database(input.backupPath);
+  try {
+    assert.equal(copied.prepare("SELECT 1 FROM sqlite_schema WHERE name='approval_payload_secrets'").get(),undefined);
+    assert.equal(copied.pragma("user_version",{simple:true}),2);
+  } finally { copied.close(); }
+  assert.equal(other.pragma("user_version",{simple:true}),2);
+  assert.equal(other.prepare("SELECT value FROM approval_payload_secrets").pluck().get(),"fixture-only");
+});
+
+test("payload入り既存backupとsourceをreceipt再利用・復旧の各経路で拒否する", async () => {
+  for (const location of ["source","backup"] as const) for (const state of ["v2","v3","receipt"] as const) {
+    const input = await payloadBackupFixture();
+    const receipt = await migrateV2ToV3WithBackup(input);
+    if (state === "v2") await fs.copyFile(input.backupPath,input.databasePath);
+    if (state === "receipt") await publishMigrationReceipt(input.receiptPath,receipt);
+    const db = new Database(location === "source" ? input.databasePath : input.backupPath);
+    db.exec("CREATE TABLE web_auth_payloads(value TEXT); INSERT INTO web_auth_payloads VALUES('fixture-only')"); db.close();
+    const result = await runRolloutCli(input.databasePath,input.backupPath,input.receiptPath);
+    assert.notEqual(result.exit,0); assert.match(result.stderr,/schema_full_backup_payload_store_forbidden/);
+    if (state !== "receipt") await assert.rejects(fs.access(input.receiptPath));
+    else assert.deepEqual(JSON.parse(await fs.readFile(input.receiptPath,"utf8")),receipt);
+  }
+});
+
+
+test("payload導入履歴はrename・drop後のfreelistを含む全体backupを拒否する",async()=>{
+  for(const kind of ["web","approval"] as const) for(const operation of ["rename","drop"] as const){
+    const input=await payloadBackupFixture();const db=new Database(input.databasePath);
+    const marker="fixture-only-payload-page-".repeat(300);db.pragma("foreign_keys=ON");db.pragma("secure_delete=OFF");
+    if(kind==="web"){
+      installWebAuthSchema(db);verifyWebAuthSchema(db);
+      db.exec("INSERT INTO web_auth_state VALUES('i','w','{}')");
+      db.prepare("INSERT INTO web_auth_payloads VALUES('i','w','p',?)").run(JSON.stringify({fixture:marker}));
+    }else db.transaction(()=>{
+      // Approval's real v4 installer is tested in approval/schema.ts. This
+      // rollout fixture exercises its shared persistent-history primitive.
+      markDatabasePayloadHistory(db);db.exec("CREATE TABLE approval_payload_secrets(value TEXT)");
+      db.prepare("INSERT INTO approval_payload_secrets VALUES(?)").run(marker);
+    })();
+    verifyDatabasePayloadHistory(db);
+    const table=kind==="web"?"web_auth_payloads":"approval_payload_secrets";
+    db.pragma("foreign_keys=OFF");
+    db.exec(operation==="rename"?`ALTER TABLE ${table} RENAME TO historical_fixture`:`DROP TABLE ${table}`);
+    if(kind==="web")db.exec("DROP TABLE web_auth_state; DROP TABLE web_auth_schema");
+    if(operation==="drop")assert.ok(Number(db.pragma("freelist_count",{simple:true}))>0);
+    db.close();
+    assert.ok((await fs.readFile(input.databasePath)).includes(Buffer.from("fixture-only-payload-page-")));
+    const reopened=new Database(input.databasePath);try{verifyDatabasePayloadHistory(reopened);}finally{reopened.close();}
+    await assert.rejects(migrateV2ToV3WithBackup(input),/schema_full_backup_payload_store_forbidden/);
+    await assert.rejects(fs.access(input.backupPath));
+  }
+});
+
+test("旧Web schemaの明示admissionは履歴を記録しmarker不明の読取を拒否する",async()=>{
+  const input=await payloadBackupFixture();const db=new Database(input.databasePath);db.pragma("foreign_keys=ON");
+  try{
+    installWebAuthSchema(db);db.pragma("application_id=0");
+    assert.throws(()=>verifyWebAuthSchema(db));
+    installWebAuthSchema(db);verifyDatabasePayloadHistory(db);verifyWebAuthSchema(db);
+    db.pragma("application_id=123");assert.throws(()=>installWebAuthSchema(db));
+    assert.equal(db.pragma("application_id",{simple:true}),123);
+  }finally{db.close();}
 });

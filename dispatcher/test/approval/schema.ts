@@ -8,9 +8,14 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
+import { verifyDatabasePayloadHistory } from "../../src/payload-backup-boundary.js";
+import { withMutationSqlGuard } from "../../src/audit/file-identity.js";
+import { openSecurityDatabase } from "../../src/audit/coordination.js";
 import { DispatcherDatabase } from "../../src/database.js";
 import {
   installApprovalSchema,
+  installApprovalMetadataSchema, installApprovalIndexSchema, installApprovalPayloadSchema,
+  verifyApprovalPayloadSchema, verifyApprovalIndexSchema,
   verifyApprovalSchema,
   verifyApprovalIntegrity,
   ApprovalSchemaError,
@@ -741,4 +746,126 @@ test("fenceとrequest revisionは巻き戻らず古いgenerationのCASを復活�
   db.exec("UPDATE approval_requests SET revision=2");
   assert.throws(()=>db.exec("UPDATE approval_requests SET revision=1"),/approval_revision_rollback/);
   assert.equal(db.prepare("UPDATE approval_requests SET revision=2 WHERE revision=1").run().changes,0);
+});
+
+function payload(db: Database.Database, id = "r1", overrides: Record<string, unknown> = {}) {
+  const binding = { codec_version: 1, scope: { instance_id: "i1", workspace_id: "w1" },
+    owner_kind: "request", owner_id: id, request_id: id, payload_ref: "p_" + id,
+    created_at: "2026-09-19T00:00:00.000Z", expires_at: "2026-09-19T00:20:00.000Z" };
+  const row = { payload_ref: binding.payload_ref, instance_id: "i1", workspace_id: "w1", owner_kind: "request", owner_id: id,
+    request_id: id, attempt_id: null, consume_id: null, binding_json: JSON.stringify(binding),
+    envelope_digest: "a".repeat(64), state: "active", created_at: binding.created_at, expires_at: binding.expires_at,
+    deleted_at: null, ...overrides };
+  const columns = Object.keys(row);
+  db.prepare(`INSERT INTO approval_payload_metadata (${columns.join(",")}) VALUES (${columns.map(x => "@" + x).join(",")})`).run(row);
+  return row;
+}
+function securePayloadSetup(t: { after(fn: () => void): void }) {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.homedir()), ".dona-payload-schema-fixture-"));
+  const filename = path.join(root,"fixture.sqlite"); fs.writeFileSync(filename,"",{mode:0o600,flag:"wx"});
+  const db = openSecurityDatabase(filename); db.pragma("journal_mode=WAL"); db.pragma("synchronous=FULL"); db.pragma("foreign_keys=ON");
+  installApprovalSchema(db);
+  db.prepare("INSERT INTO approval_clock_reservations VALUES (?,?)").run("tx_1",JSON.stringify({codec_version:1,transaction_id:"tx_1"}));
+  t.after(() => { db.close(); fs.rmSync(root,{recursive:true,force:true}); });
+  return {db,filename};
+}
+function payloadSchema(t: { after(fn: () => void): void }) {
+  const value = securePayloadSetup(t); installApprovalMetadataSchema(value.db); installApprovalIndexSchema(value.db);
+  installApprovalPayloadSchema(value.db); return value;
+}
+const fixtureEnvelope = JSON.stringify({ codec_version: 1, algorithm: "A256KW+A256GCM", ciphertext: "fixture-only" });
+
+test("payload schema v4は明示的なv3移行だけを許し既存recordと再起動互換性を保つ", t => {
+  const { db, filename } = securePayloadSetup(t); request(db);
+  const before = db.prepare("SELECT * FROM approval_requests").all();
+  assert.throws(() => installApprovalPayloadSchema(db), ApprovalSchemaError);
+  installApprovalMetadataSchema(db);
+  assert.throws(() => installApprovalPayloadSchema(db), ApprovalSchemaError);
+  installApprovalIndexSchema(db); installApprovalPayloadSchema(db);
+  assert.deepEqual(db.prepare("SELECT version FROM approval_schema").get(), { version: 4 });
+  assert.deepEqual(db.prepare("SELECT * FROM approval_requests").all(), before);
+  for (const install of [installApprovalSchema, installApprovalMetadataSchema, installApprovalIndexSchema, installApprovalPayloadSchema]) install(db);
+  verifyApprovalIndexSchema(db); verifyApprovalPayloadSchema(db);
+  assert.equal(db.prepare("SELECT count(*) FROM approval_payload_metadata").pluck().get(), 0);
+  const reopened = new Database(filename); reopened.pragma("foreign_keys=ON");
+  try { installApprovalSchema(reopened); verifyApprovalPayloadSchema(reopened); }
+  finally { reopened.close(); }
+});
+
+test("payload削除はmetadata tombstoneと同一transactionでrollbackし復活・差替えを拒否する", t => {
+  const { db } = payloadSchema(t); request(db); payload(db);
+  db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope);
+  assert.throws(() => db.exec("DELETE FROM approval_payload_secrets"), /approval_payload_secret_active/);
+  assert.throws(() => db.prepare("INSERT OR REPLACE INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope), /approval_payload_secret_active/);
+  assert.throws(() => db.exec("UPDATE approval_payload_metadata SET owner_id='other'"), /immutable/);
+  assert.throws(() => db.exec("DELETE FROM approval_payload_metadata"), /retained/);
+  const remove = () => db.exec("UPDATE approval_payload_metadata SET state='deleted',deleted_at='2026-09-19T00:01:00.000Z'");
+  assert.throws(() => db.transaction(() => { remove(); assert.equal(db.prepare("SELECT count(*) FROM approval_payload_secrets").pluck().get(), 0); throw Error("rollback fixture"); })(), /rollback fixture/);
+  assert.equal(db.prepare("SELECT count(*) FROM approval_payload_secrets").pluck().get(), 1);
+  assert.equal(db.prepare("SELECT state FROM approval_payload_metadata").pluck().get(), "active");
+  db.transaction(remove)();
+  assert.equal(db.prepare("SELECT count(*) FROM approval_payload_secrets").pluck().get(), 0);
+  assert.equal(db.prepare("SELECT state FROM approval_payload_metadata").pluck().get(), "deleted");
+  assert.throws(() => db.exec("UPDATE approval_payload_metadata SET state='active',deleted_at=NULL"), /immutable/);
+  assert.throws(() => db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope), /not_active/);
+});
+
+test("payload ownerとbindingの不一致・孤立secret・暗号文更新をDDLで拒否する", t => {
+  const { db } = payloadSchema(t); request(db);
+  for (const override of [{owner_id:"other"}, {instance_id:"other"}, {workspace_id:"other"}, {request_id:"other"},
+    {payload_ref:"other"}, {created_at:"other"}, {expires_at:"other"}, {attempt_id:"a1"}, {consume_id:"c1"},
+    {binding_json:"{}"}, {binding_json:JSON.stringify({padding:"あ".repeat(4096)})}, {envelope_digest:"G".repeat(64)}, {deleted_at:"now"}]) {
+    assert.throws(() => payload(db, "r1", override));
+  }
+  assert.throws(() => db.prepare("INSERT INTO approval_payload_secrets VALUES ('orphan',?)").run(fixtureEnvelope));
+  payload(db);
+  assert.throws(() => db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(JSON.stringify({codec_version:1,algorithm:"other"})));
+  assert.throws(() => db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope + " ".repeat(360448)));
+  db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_r1',?)").run(fixtureEnvelope);
+  assert.throws(() => db.prepare("UPDATE approval_payload_secrets SET envelope_json=?").run(fixtureEnvelope), /immutable/);
+});
+
+test("payload schemaのtrigger欠落・未知tableを修復せず拒否する", t => {
+  for (const sql of ["DROP TRIGGER approval_payload_terminal_delete", "CREATE TABLE approval_payload_unknown(id TEXT)"]) {
+    const { db } = payloadSchema(t); db.exec(sql);
+    assert.throws(() => verifyApprovalPayloadSchema(db), ApprovalSchemaError);
+    assert.throws(() => installApprovalPayloadSchema(db), ApprovalSchemaError);
+  }
+});
+
+test("attempt payloadはexact requestとconsumeへ結合し別requestのattemptを参照できない", t => {
+  const { db } = payloadSchema(t);
+  for (const id of ["r1","r2"]) { request(db,id); decide(db,id); db.transaction(() => consume(db,id))(); }
+  const binding = { codec_version:1,scope:{instance_id:"i1",workspace_id:"w1"},owner_kind:"attempt",owner_id:"a_r1",
+    request_id:"r1",payload_ref:"p_a1",created_at:"2026-09-19T00:02:00.000Z",expires_at:"2026-09-20T00:02:00.000Z" };
+  const row = {payload_ref:binding.payload_ref, owner_kind:"attempt",owner_id:"a_r1",attempt_id:"a_r1",consume_id:"c_r1",
+    created_at:binding.created_at,expires_at:binding.expires_at,binding_json:JSON.stringify(binding)};
+  assert.throws(() => payload(db,"r1",{...row,consume_id:"c_r2"}),/FOREIGN KEY/);
+  payload(db,"r1",row);
+  db.prepare("INSERT INTO approval_payload_secrets VALUES ('p_a1',?)").run(fixtureEnvelope);
+  verifyApprovalIntegrity(db);
+});
+
+
+test("payload導入履歴は再open後も残り監査mutationで解除できない", t => {
+  const {db,filename}=payloadSchema(t);
+  verifyDatabasePayloadHistory(db);
+  db.transaction(()=>withMutationSqlGuard(db,()=>{
+    verifyDatabasePayloadHistory(db);
+    assert.throws(()=>db.pragma("application_id=0"),/not authorized/);
+  }))();
+  const reopened=new Database(filename);
+  try { verifyDatabasePayloadHistory(reopened); } finally { reopened.close(); }
+  db.pragma("application_id=0");
+  assert.throws(()=>verifyApprovalPayloadSchema(db),ApprovalSchemaError);
+  assert.throws(()=>installApprovalPayloadSchema(db),ApprovalSchemaError);
+});
+
+test("別application IDを上書きせずpayload schema移行をrollbackする", t => {
+  const {db}=securePayloadSetup(t);installApprovalMetadataSchema(db);installApprovalIndexSchema(db);
+  db.pragma("application_id=123");
+  assert.throws(()=>installApprovalPayloadSchema(db),ApprovalSchemaError);
+  assert.equal(db.pragma("application_id",{simple:true}),123);
+  assert.equal(db.prepare("SELECT version FROM approval_schema").pluck().get(),3);
+  assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE name='approval_payload_secrets'").get(),undefined);
 });
