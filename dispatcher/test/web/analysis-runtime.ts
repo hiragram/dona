@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +12,9 @@ import {
   AnalysisRuntimeError,
   AnalysisRuntimeStore,
   FixedInferenceBroker,
-  analysisSandboxLaunch,
+  analysisSnapshotDigest,
+  authorizedAnalysisSandboxLaunch,
+  startAnalysisScratchGuard,
   type AnalysisReceipt,
 } from "../../src/web/analysis-runtime.js";
 
@@ -34,11 +37,19 @@ const current = {
   broker_id: receipt.broker_id, broker_generation: receipt.broker_generation,
 };
 
-function setup(t: test.TestContext) {
+function authorization(value: AnalysisReceipt) {
+  return { receipt_id: value.receipt_id, job_id: value.job_id, instance_id: value.instance_id,
+    tenant_id: value.tenant_id, principal_id: value.principal_id, session_generation: value.session_generation,
+    authz_revision: value.authz_revision, owner_revision: value.owner_revision,
+    source_manifest_id: value.source_manifest_id, source_manifest_digest: value.source_manifest_digest,
+    source_grant_revision: value.source_grant_revision, snapshot_digest: value.snapshot_digest,
+    broker_id: value.broker_id, broker_generation: value.broker_generation };
+}
+function setup(t: test.TestContext, configured = receipt) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-runtime-"));
   const filename = path.join(directory, "runtime.sqlite");
   const db = new Database(filename); db.pragma("foreign_keys=ON"); db.pragma("journal_mode=WAL"); db.pragma("synchronous=FULL");
-  const secret = Buffer.alloc(32, 0x41); const store = new AnalysisRuntimeStore(db, secret); store.register(receipt);
+  const secret = Buffer.alloc(32, 0x41); const store = new AnalysisRuntimeStore(db, secret); store.register(configured);
   t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return { db, filename, secret, store };
 }
@@ -48,7 +59,11 @@ test("analysis profileはnetwork・shell・snapshot外filesystemとambient crede
   const worker = path.join(directory, "analysis-worker"), snapshot = path.join(directory, "snapshot"), scratch = path.join(directory, "scratch");
   fs.writeFileSync(worker, "fixture"); fs.mkdirSync(snapshot); fs.mkdirSync(scratch);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const launch = analysisSandboxLaunch({ worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch });
+  const configured = { ...receipt, snapshot_digest: analysisSnapshotDigest(snapshot) };
+  const { store } = setup(t, configured);
+  const permit = store.authorizeStage(configured.receipt_id, "snapshot_open", authorization(configured), 1, start);
+  const launch = authorizedAnalysisSandboxLaunch({ store, snapshot_permit: permit, current: authorization(configured),
+    worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch, now: start });
   assert.equal(launch.executable, "/usr/bin/sandbox-exec");
   assert.equal(launch.args[2], fs.realpathSync(worker));
   assert.match(launch.args[1], /\(deny network\*\)/);
@@ -57,8 +72,9 @@ test("analysis profileはnetwork・shell・snapshot外filesystemとambient crede
   assert.doesNotMatch(launch.args[1], /allow network|allow process\*|\/Users|\.ssh|Keychain/);
   assert.deepEqual(launch.env, { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" });
   for (const name of ["HOME", "GH_TOKEN", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"]) assert.equal(name in launch.env, false);
-  assert.throws(() => analysisSandboxLaunch({ worker_executable: worker, snapshot_path: "/", scratch_path: scratch }));
-  assert.throws(() => analysisSandboxLaunch({ worker_executable: worker, snapshot_path: snapshot, scratch_path: snapshot }));
+  assert.equal(launch.scratch_quota.maximum_bytes, configured.maximum_scratch_bytes);
+  fs.writeFileSync(path.join(scratch, "overflow"), Buffer.alloc(configured.maximum_scratch_bytes + 1));
+  let killed = false; const stop = startAnalysisScratchGuard(launch, () => { killed = true; }); stop(); assert.equal(killed, true);
 });
 
 test("macOS sandbox実体でnetwork・shell・snapshot外file到達が0になる", { skip: process.platform !== "darwin" }, (t) => {
@@ -71,7 +87,11 @@ test("macOS sandbox実体でnetwork・shell・snapshot外file到達が0になる
   const compiled = spawnSync("/usr/bin/clang", [source, "-o", worker], { encoding: "utf8" });
   assert.equal(compiled.status, 0, compiled.stderr);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const launch = analysisSandboxLaunch({ worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch });
+  const configured = { ...receipt, snapshot_digest: analysisSnapshotDigest(snapshot) };
+  const { store } = setup(t, configured);
+  const launch = authorizedAnalysisSandboxLaunch({ store,
+    snapshot_permit: store.authorizeStage(configured.receipt_id, "snapshot_open", authorization(configured), 1, start),
+    current: authorization(configured), worker_executable: worker, snapshot_path: snapshot, scratch_path: scratch, now: start });
   const run = spawnSync(launch.executable, [...launch.args, path.join(snapshot, "allowed.txt"),
     path.join(scratch, "result.txt"), path.join(outside, "secret.txt")], { cwd: launch.cwd, env: launch.env, encoding: "utf8" });
   assert.equal(run.status, 0, JSON.stringify({ error: run.error?.message, signal: run.signal, stderr: run.stderr, stdout: run.stdout })); assert.deepEqual(JSON.parse(run.stdout),
@@ -83,7 +103,7 @@ test("receiptはowner・source manifest・quotaをdurableに固定しpayload差�
   assert.equal(f.store.register(receipt).outcome, "reused");
   assert.throws(() => f.store.register({ ...receipt, source_manifest_digest: "c".repeat(64) }),
     (error) => error instanceof AnalysisRuntimeError && error.code === "conflict");
-  const other = new Database(f.filename); other.pragma("foreign_keys=ON");
+  const other = new Database(f.filename); other.pragma("journal_mode=WAL"); other.pragma("synchronous=FULL"); other.pragma("foreign_keys=ON");
   try { assert.equal(new AnalysisRuntimeStore(other, f.secret).register(receipt).outcome, "reused"); } finally { other.close(); }
 });
 
@@ -96,12 +116,31 @@ test("stageごとにcurrent owner・grant・broker identityを再認可する", 
   assert.match(store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
 });
 
+test("snapshot_openはone-shot permitと実snapshot digestを照合する", (t) => {
+  const { store } = setup(t);
+  const permit = store.authorizeStage(receipt.receipt_id, "snapshot_open", current, 1, start);
+  assert.throws(() => store.consumeSnapshotPermit(permit, current, "c".repeat(64), start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+});
+
 test("receipt payloadやquota ledgerのDB改変はpermit発行をfail closedする", (t) => {
   const { store, db } = setup(t);
   db.prepare("UPDATE analysis_runtime_receipts SET payload_json=? WHERE receipt_id=?")
     .run(JSON.stringify({ ...receipt, maximum_tokens: 999 }), receipt.receipt_id);
   assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 5, start),
     (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+  db.prepare("UPDATE analysis_runtime_receipts SET payload_json=?,payload_digest=?,used_calls=1,reserved_tokens=1 WHERE receipt_id=?")
+    .run(JSON.stringify(receipt), createHash("sha256").update(JSON.stringify(receipt)).digest("hex"), receipt.receipt_id);
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 5, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+});
+
+test("in-memory・rollback journal・非同期durability設定を拒否する", (t) => {
+  const memory = new Database(":memory:"); t.after(() => memory.close());
+  assert.throws(() => new AnalysisRuntimeStore(memory, Buffer.alloc(32)), AnalysisRuntimeError);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dona-analysis-durability-"));
+  const db = new Database(path.join(directory, "bad.sqlite")); t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  assert.throws(() => new AnalysisRuntimeStore(db, Buffer.alloc(32)), AnalysisRuntimeError);
 });
 
 test("permitはone-shot fenceでconcurrent利用とtamper・expiryを拒否する", async (t) => {
@@ -153,12 +192,13 @@ test("timeout・crash後はreservationを返さずrestart後にacceptance_unknow
   const permit = f.store.authorizeStage(receipt.receipt_id, "inference", current, 8, start);
   await assert.rejects(broker.invoke({ permit, prompt: "x" }), (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
   const call = f.db.prepare("SELECT call_id FROM analysis_runtime_calls").get() as { call_id: string };
-  const other = new Database(f.filename); other.pragma("foreign_keys=ON");
+  const other = new Database(f.filename); other.pragma("journal_mode=WAL"); other.pragma("synchronous=FULL"); other.pragma("foreign_keys=ON");
   try {
     const recovered = new AnalysisRuntimeStore(other, f.secret).reconcileCall(call.call_id);
     assert.equal(recovered?.status, "acceptance_unknown"); assert.equal(recovered?.reserved_tokens, 8);
-    assert.throws(() => new AnalysisRuntimeStore(other, f.secret).commitResult(receipt.receipt_id, receipt.source_manifest_digest, "d".repeat(64), start),
-      (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
+    const recoveredStore = new AnalysisRuntimeStore(other, f.secret);
+    assert.throws(() => recoveredStore.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
+      (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
   } finally { other.close(); }
 });
 
@@ -176,6 +216,18 @@ test("broker timeoutはtransportをabortしてacceptance_unknownを永続化す�
   assert.equal(f.store.reconcileCall(call.call_id)?.status, "acceptance_unknown");
 });
 
+test("provider受理後の応答検証失敗はreceiptをneeds_reviewで停止する", async (t) => {
+  const { store } = setup(t);
+  const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
+    endpoint: "https://inference.invalid/v1/fixed", model: "fixed_model", tokenizer: "fixed_tokenizer" }, Buffer.alloc(32, 1),
+  { invoke: async () => ({ output: "overspent", usage_tokens: 6 }) }, () => start);
+  const permit = store.authorizeStage(receipt.receipt_id, "inference", current, 5, start);
+  await assert.rejects(broker.invoke({ permit, prompt: "x" }),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "ambiguous");
+  assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start),
+    (error) => error instanceof AnalysisRuntimeError && error.code === "denied");
+});
+
 test("resultはsource manifestへ結合しredacted digestだけを保存する", async (t) => {
   const { store } = setup(t);
   const broker = new FixedInferenceBroker(store, { broker_id: "broker", broker_generation: 1,
@@ -183,7 +235,11 @@ test("resultはsource manifestへ結合しredacted digestだけを保存する",
   { invoke: async () => ({ output: "sensitive answer", usage_tokens: 2 }) }, () => start);
   const result = await broker.invoke({ permit: store.authorizeStage(receipt.receipt_id, "inference", current, 5, start), prompt: "input" });
   assert.equal(store.reconcileCall(result.call_id)?.status, "succeeded");
-  assert.throws(() => store.commitResult(receipt.receipt_id, "e".repeat(64), "d".repeat(64), start));
-  store.commitResult(receipt.receipt_id, receipt.source_manifest_digest, "d".repeat(64), start);
+  const wrongPermit = store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start);
+  assert.throws(() => store.commitResult(receipt.receipt_id, wrongPermit, current, "e".repeat(64), "d".repeat(64), start));
+  const permit = store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start);
+  assert.throws(() => store.commitResult(receipt.receipt_id, permit, { ...current, authz_revision: 2 }, receipt.source_manifest_digest, "d".repeat(64), start));
+  const finalPermit = store.authorizeStage(receipt.receipt_id, "result_commit", current, 1, start);
+  store.commitResult(receipt.receipt_id, finalPermit, current, receipt.source_manifest_digest, "d".repeat(64), start);
   assert.throws(() => store.authorizeStage(receipt.receipt_id, "inference", current, 1, start));
 });
