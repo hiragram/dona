@@ -188,7 +188,7 @@ export class ApprovalNotificationBroker {
       changes.push({ previous: null, next: decision }, { previous: null, next: { codec_version: 1, scope: this.scope, kind: "event",
         row: { event_id: opaque("ape_"), decision_id: decision.row.decision_id, kind: "dona_approval.decision.v1", state: "pending", delivered_at: null } } });
     }
-    if (!requestPayloadRequired(requestState)) {
+    if (!undecided.has(requestState)) {
       // 別notificationのpending abortと既存sentの更新を同じtransactionへ含める。
       changes.push(...this.lifecycle.notifications(mark, state, request, nextRequest.row.revision)
         .filter(change => change.next.kind !== "notification" || change.next.row.notification_attempt_id !== notification.row.notification_attempt_id));
@@ -203,9 +203,10 @@ export class ApprovalNotificationBroker {
     const records = this.mutations.prepare(mark, state, changes), payload = this.payloads.inspectInState(state, "request", request.row.request_id);
     const removal = !requestPayloadRequired(requestState) && payload?.metadata.state === "active" ? this.payloadMutation.prepare(mark, state,
       [{ previous: payload.metadata, next: { ...payload.metadata, state: "deleted", deleted_at: mark.effective_utc }, envelope: null }]) : null;
+    const aborted = deliveryState === "aborted";
     const outcome: AuditEvent["outcome"] = deliveryState === "acceptance_unknown" || deliveryState === "needs_review" ? deliveryState
-      : deliveryState === "failed" ? "failed" : deliveryState === "dispatching" ? "pending" : "succeeded";
-    return { event: { ...event, outcome, reason, receipt_id: message }, resource_commitments: [...records.resource_commitments, ...(removal?.resource_commitments ?? [])],
+      : deliveryState === "failed" ? "failed" : deliveryState === "dispatching" ? "pending" : aborted ? "denied" : "succeeded";
+    return { event: { ...event, outcome, reason: aborted ? "decision_conflict" : reason, receipt_id: message }, resource_commitments: [...records.resource_commitments, ...(removal?.resource_commitments ?? [])],
       mutation: (): ApprovalNotificationResult => { records.mutation(); removal?.mutation(); return this.result(resultStatus, nextRequest, next); } };
   }
   private result(status: "dispatching" | "updated" | "unchanged", request: Request, notification: Notification): ApprovalNotificationResult {
@@ -213,8 +214,10 @@ export class ApprovalNotificationBroker {
   }
   private unchanged(event: Event, request: Request, notification: Notification) {
     const outcome: AuditEvent["outcome"] = notification.row.state === "acceptance_unknown" || notification.row.state === "needs_review" ? notification.row.state
-      : notification.row.state === "failed" ? "failed" : terminal(notification.row.state) ? "succeeded" : "pending";
-    return { event: { ...event, outcome }, resource_digest: null, mutation: () => this.result("unchanged", request, notification) };
+      : notification.row.state === "failed" ? "failed" : notification.row.state === "aborted" ? "denied"
+        : terminal(notification.row.state) ? "succeeded" : "pending";
+    return { event: { ...event, outcome, reason: notification.row.state === "aborted" ? "decision_conflict" : event.reason },
+      resource_digest: null, mutation: () => this.result("unchanged", request, notification) };
   }
   private denied(event: Event, reason: Extract<ApprovalNotificationResult, { status: "denied" }>["reason"]) {
     return { event: { ...event, outcome: "denied" as const, reason }, resource_digest: null,

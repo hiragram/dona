@@ -31,6 +31,22 @@ test("pending noticeはcardと独立しterminal後の遅着でもrequestを戻�
  f.setReceipt({outcome:"sent",presentation_ref:"message_pending_notice"});f.notifications.resolve("late_notice",f.notificationCommand("pending_notice"));
  assert.equal(f.read().row.state,"cancelled");assert.equal(f.notification("approval_card").row.state,"aborted");assert.equal(f.rows("approval_presentation_updates"),1);
 });
+test("承認後に遅着したpending noticeも承認済み表示へ更新する",t=>{
+ const f=notificationFixture(t);claim(f,"pending_notice");claim(f);f.notifications.resolve("card_sent",f.notificationCommand());
+ f.decision.decide("approve",f.command("approve",1));
+ f.setReceipt({outcome:"sent",presentation_ref:"message_pending_notice"});f.notifications.resolve("late_notice",f.notificationCommand("pending_notice"));
+ assert.equal(f.read().row.state,"approved");assert.equal(f.notification("pending_notice").row.state,"sent");
+ assert.equal(f.rows("approval_presentation_updates"),2);
+});
+test("terminal requestで中止した通知を配送成功として監査しない",t=>{
+ const f=notificationFixture(t);f.decision.decide("cancel",f.command("cancel",1));
+ const result=claim(f);assert.deepEqual(result,{status:"denied",reason:"already_consumed"});assert.equal(f.notification("approval_card").row.state,"aborted");
+ const latest=JSON.parse(f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id='claim_approval_card'").pluck().get() as string).event;
+ assert.equal(latest.outcome,"denied");assert.equal(latest.reason,"already_consumed");
+ const unchanged=f.notifications.recover("aborted_recover",f.notificationCommand());assert.equal(unchanged.status,"unchanged");
+ const second=JSON.parse(f.db.prepare("SELECT record_json FROM security_audit_records WHERE transaction_id='aborted_recover'").pluck().get() as string).event;
+ assert.equal(second.outcome,"denied");assert.equal(second.reason,"decision_conflict");
+});
 test("known card rejectionはpayload削除とnotice abort、notice単独拒否はcardを維持する",t=>{
  for(const kind of ["approval_card","pending_notice"] as const){const f=notificationFixture(t);claim(f,kind);f.setReceipt({outcome:"rejected",reason:"scope_denied"});
   f.notifications.resolve("rejected",f.notificationCommand(kind));assert.equal(f.notification(kind).row.state,"failed");
