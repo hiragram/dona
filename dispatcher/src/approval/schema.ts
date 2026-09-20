@@ -206,6 +206,18 @@ const metadataSql = `
 `;
 const schemaV2Sql = schemaSql.replace("CHECK(version=1)", "CHECK(version=2)")
   .replace("INSERT INTO approval_schema VALUES (1)", "INSERT INTO approval_schema VALUES (2)") + metadataSql;
+const indexSql = `
+        CREATE TABLE approval_index_blobs (
+          digest TEXT PRIMARY KEY NOT NULL CHECK(length(digest)=64 AND digest NOT GLOB '*[^a-f0-9]*'),
+          wire TEXT NOT NULL CHECK(length(CAST(wire AS BLOB)) BETWEEN 1 AND 2048)
+        ) STRICT;
+        CREATE TRIGGER approval_index_blobs_no_update BEFORE UPDATE ON approval_index_blobs
+          BEGIN SELECT RAISE(ABORT,'approval_index_blob_immutable'); END;
+        CREATE TRIGGER approval_index_blobs_no_delete BEFORE DELETE ON approval_index_blobs
+          BEGIN SELECT RAISE(ABORT,'approval_index_blob_immutable'); END;
+`;
+const schemaV3Sql = schemaV2Sql.replace("CHECK(version=2)", "CHECK(version=3)")
+  .replace("INSERT INTO approval_schema VALUES (2)", "INSERT INTO approval_schema VALUES (3)") + indexSql;
 
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
@@ -217,7 +229,7 @@ function verifiedVersion(db: Database.Database): number {
   try {
     if (expectedShapes === undefined) {
       const computed = new Map<number, string>();
-      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql]] as const) {
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql]] as const) {
         const expected = new Database(":memory:");
         try { expected.exec(sql); computed.set(version, shape(expected)); }
         finally { expected.close(); }
@@ -243,7 +255,10 @@ function verifiedVersion(db: Database.Database): number {
 
 export function verifyApprovalSchema(db: Database.Database): void { verifiedVersion(db); }
 export function verifyApprovalMetadataSchema(db: Database.Database): void {
-  if (verifiedVersion(db) !== 2) throw new ApprovalSchemaError();
+  if (verifiedVersion(db) < 2) throw new ApprovalSchemaError();
+}
+export function verifyApprovalIndexSchema(db: Database.Database): void {
+  if (verifiedVersion(db) !== 3) throw new ApprovalSchemaError();
 }
 
 function verifyIntegrityInside(db: Database.Database): void {
@@ -293,13 +308,38 @@ export function installApprovalMetadataSchema(db: Database.Database): void {
       db.transaction(() => {
         assertSecurityDurability(db); verifyOpenDatabaseFile(db);
         verifyIntegrityInside(db);
-        if (verifiedVersion(db) !== 2) {
+        if (verifiedVersion(db) === 1) {
           db.exec("DROP TABLE main.approval_schema");
           db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=2)) STRICT; INSERT INTO approval_schema VALUES (2)");
           db.exec(metadataSql);
           verifyIntegrityInside(db); verifyApprovalMetadataSchema(db);
         }
         // 既存v2でも省略せず、旧inodeへのmigrationを成功にしない。
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
+  } catch { throw new ApprovalSchemaError(); }
+}
+
+/** 明示的なv2->v3 migrationのみ。v1は別途v2への移行が必要。
+ * 未認証の既存rowからindexや監査rootを自動作成しない。 */
+export function installApprovalIndexSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+        verifyIntegrityInside(db);
+        const version = verifiedVersion(db);
+        if (version === 1) throw new ApprovalSchemaError();
+        if (version === 2) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=3)) STRICT; INSERT INTO approval_schema VALUES (3)");
+          db.exec(indexSql);
+          verifyIntegrityInside(db); verifyApprovalIndexSchema(db);
+        }
         verifyOpenDatabaseFile(db);
       }).immediate();
       verifyOpenDatabaseFile(db);
