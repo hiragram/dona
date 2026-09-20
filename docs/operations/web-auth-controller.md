@@ -25,18 +25,18 @@ GETは空body、`Sec-Fetch-Site: same-origin`を要求し、Originがあればco
 
 request内では保護clockの巻戻りを拒否し、I/O後にも再読する。contextと最終成功の期限は10秒・session期限・online token期限の最小値。遅れた署名済み応答から期限後の成功を返さない。pollによるidle延長やpositive introspection cacheは行わない。
 
-IdP inactiveでは`revoke_inactive`で失効・payload削除・拒否auditを同時に確定し、401を返す。IdP unavailableやkey不明は503。その他の拒否も固定reasonで監査へ接続し、監査が確認できなければ503とする。private principal/resourceは失敗responseへ含めない。
+IdP inactive、subject/client等のidentity不一致では`revoke_inactive`で失効・payload削除・拒否auditを同時に確定し、401を返す。IdP unavailableやkey不明は503。その他の拒否も固定reasonで監査へ接続し、返された拒否reasonが要求と一致しなければ503とする。cookie構文エラーは400、missing/unknown cookieは401、registry revision変更は401 `session_revoked`へ写像する。未認証のactor/identity headerは401 `identity_invalid`で拒否する。private principal/resourceは失敗responseへ含めない。
 
 ## local logoutと受理不明
 
 local CSRF/statusは権限を付与するAPIではなく、同じcookieの現行状態だけを扱う。期限切れ・既失効sessionでもkeyとbindingを確認できれば、IdPを呼ばずlocal logoutできる。別cookie、見つからないsession、照合不能を成功ackに変換しない。
 
-logoutは一回だけwriteし、signed成功後に同じcookie/sessionの失効とpayload削除をread-backする。writeまたはread-backが不明なら503とし、削除用Set-Cookieを送らない。mutation/session確認を一度試みた後に応答を失った場合、追加のdenial writeも行わない。後続のlogout-statusはread-onlyで照合し、失効が確認できた場合だけcookieを削除する。activeなら保持し、自動でlogoutを再POSTしない。
+logoutは一回だけwriteし、signed成功後に同じcookie/sessionの失効とpayload削除をread-backする。writeまたはread-backが不明なら503 `durability_unavailable`とし、削除用Set-Cookieを送らない。mutation/session確認を一度試みた後に応答を失った場合、追加のdenial writeも行わない。後続のlogout-statusはread-onlyで照合し、失効が確認できた場合だけcookieを削除する。activeなら保持し、自動でlogoutを再POSTしない。
 
 全responseはno-store・no-referrer・既存CSP等を使い、callback/token/cookieや詳細provider errorを転載しない。
 
 ## 検証と残る範囲
 
-controller unit 11件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続する5件を実行する。結合testの型検査も同じcommandで行う。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
+controller unit 14件に加え、`npm run test:web-integration`が実SQLite・共有監査・単一UDS・実BFF clientを接続する5件を実行する。同じcommandが固定SQLite identity extensionのnative build、結合testの型検査、実行を順に行い、既存build成果物に依存しない。Web CIはWebとDispatcherの依存をinstallし、このcommandを実行する。ローカルでも両packageで`npm ci`が必要。`npm run verify:web`はWeb test/typecheck/buildと結合検証を含む。
 
 IdPのHTTPS transport応答、clock/anchor、key、TLS listener分類はfixtureであり、実IdP・WebAuthn・browser・Keychain・productionのE2Eではない。login開始/callback、UI、TLS/proxy、operator provisioning、保護native broker、runtime/release接続と後続command/read/approval routeは残る。このcontrollerだけで#141やEpic全体を完了扱いしない。

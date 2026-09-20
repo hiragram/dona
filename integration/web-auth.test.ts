@@ -92,6 +92,7 @@ test("logout応答だけを失っても新しいwriteをせず現行stateをread
   let writes = 0; f.connections.write.mutate = async input => { writes++; await mutate(input); throw Error("fixture response lost"); };
   const before = f.audit.verify().sequence;
   const logout = await f.controller.handle(f.local.request("/api/session/logout", "POST")); assert.equal(logout.status, 503);
+  assert.equal(logout.body, '{"error":"durability_unavailable"}');
   assert.equal(logout.headers["set-cookie"], undefined); assert.equal(writes, 1); assert.equal(f.audit.verify().sequence, before + 1);
   const status = await f.controller.handle(f.local.request("/api/session/logout-status", "POST"));
   assert.equal(status.status, 200); assert.deepEqual(JSON.parse(status.body), { revoked: true });
@@ -99,12 +100,14 @@ test("logout応答だけを失っても新しいwriteをせず現行stateをread
   assert.equal(f.audit.verify().sequence, before + 1);
 });
 
-test("online subject不一致はregistry lookupで拒否しprivate principalを返さない", async t => {
-  const f = await fixture(t); f.setOnline({ active: true, sub: "other-subject", client_id: f.local.policy.oidc.client_id,
+test("online subject・client不一致はsessionを失効しprivate principalを返さない", async t => {
+ for (const mode of ["subject", "client"] as const) {
+  const f = await fixture(t); f.setOnline({ active: true, sub: mode === "subject" ? "other-subject" : "subject-A", client_id: mode === "client" ? "other-client" : f.local.policy.oidc.client_id,
     aud: f.local.policy.oidc.access_token_audience, exp: Date.parse(f.local.initial) / 1000 + 300 });
   const result = await f.controller.handle(f.local.request()); assert.equal(result.status, 401);
-  assert.deepEqual(JSON.parse(result.body), { error: "identity_mismatch" }); assert.equal(f.readState().used_nonces.length, 0);
-  assert.equal(f.readState().sessions[0]!.state.state, "active");
+  assert.deepEqual(JSON.parse(result.body), { error: "identity_invalid" }); assert.equal(f.readState().used_nonces.length, 0);
+  assert.equal(f.readState().sessions[0]!.state.state, "revoked"); assert.equal(f.readState().sessions[0]!.payload_ref, null);
+ }
 });
 
 test("BFFのonline照合後のlocal revokeをDispatcherの最終transactionで拒否する", async t => {

@@ -55,6 +55,7 @@ test("current registry・tenant・generation・expiryの不一致で成功contex
   const f = controllerFixture(); f.setOnline({ active: true, sub: "different-subject", expires_at: Date.parse(f.initial) / 1000 + 300 });
   const result = await f.controller.handle(f.request()); assert.equal(result.status, 401); privateFailure(result);
   assert.ok(!f.calls.includes("confirm"));
+  assert.equal(f.snapshot.session.state.state, "revoked");
 });
 
 test("IdP inactiveはdurable revokeへ接続し拒否後に成功認証へ戻さない", async () => {
@@ -63,6 +64,10 @@ test("IdP inactiveはdurable revokeへ接続し拒否後に成功認証へ戻さ
   assert.deepEqual(f.calls, ["read:session_lookup", "oidc", "write:revoke_inactive"]);
   assert.equal(f.snapshot.session.state.state, "revoked"); assert.equal(f.snapshot.payload, null);
   f.calls.length = 0; privateFailure(await f.controller.handle(f.request())); assert.ok(!f.calls.includes("oidc"));
+  const invalid = controllerFixture(); invalid.connections.oidc.introspect = async () => { throw new WebBoundaryError("identity_invalid"); };
+  assert.equal((await invalid.controller.handle(invalid.request())).status, 401);
+  assert.equal(invalid.snapshot.session.state.state, "revoked");
+  assert.deepEqual(invalid.calls, ["read:session_lookup", "write:revoke_inactive"]);
 });
 
 test("IdP障害・保護key不明・audit失敗では503でcookieを保持する", async () => {
@@ -93,6 +98,7 @@ test("logout応答喪失は再writeせずstatusのread-only照合後だけcookie
   const f = controllerFixture(), mutate = f.connections.write.mutate;
   f.connections.write.mutate = async input => { await mutate(input); throw Error("response lost"); };
   const unknown = await f.controller.handle(f.request("/api/session/logout", "POST")); assert.equal(unknown.status, 503); privateFailure(unknown);
+  assert.equal(unknown.body, '{"error":"durability_unavailable"}');
   assert.equal(f.snapshot.session.state.state, "revoked"); assert.deepEqual(f.calls, ["read:session_lookup", "write:revoke_session"]);
   const status = await f.controller.handle(f.request("/api/session/logout-status", "POST"));
   assert.equal(status.status, 200); assert.deepEqual(JSON.parse(status.body), { revoked: true }); assert.match(status.headers["set-cookie"]!, /Max-Age=0$/);
@@ -155,5 +161,43 @@ test("cookie key inventory不足・重複・revoked keyで既存sessionへfallba
       : { retained_versions: [1], keys: [{ ...key, state: "revoked" }] };
     const result = await f.controller.handle(f.request()); assert.equal(result.status, 503); privateFailure(result);
     assert.deepEqual(f.calls, ["write:record_denial"]);
+  }
+});
+
+test("監査側が別の拒否理由を返した場合は元errorを確定せず503にする", async () => {
+  for (const reason of ["deployment_invalid", "identity_unavailable", "cookie_ambiguous"] as const) {
+    const f = controllerFixture(); let writes = 0;
+    f.connections.write.mutate = async input => { writes++; assert.equal(input.operation, "record_denial"); return { operation: input.operation, result: { status: "denied", reason } }; };
+    const result = await f.controller.handle(header(f.request(), "origin", "null"));
+    assert.equal(result.status, 503); assert.equal(result.body, '{"error":"identity_unavailable"}'); privateFailure(result);
+    assert.equal(writes, 1);
+  }
+});
+
+test("cookie構文エラーの400とmissing・unknown cookieの401を区別する", async () => {
+  for (const malformed of [
+    "__Host-dona_session=invalid", "__Host-dona_login=invalid",
+    "__Host-dona_session=" + Buffer.alloc(32, 9).toString("base64url") + "; __Host-dona_session=" + Buffer.alloc(32, 9).toString("base64url"),
+    "__Host-dona_login=" + Buffer.alloc(32, 1).toString("base64url") + "; __Host-dona_login=" + Buffer.alloc(32, 2).toString("base64url"),
+  ]) {
+    const f = controllerFixture(), result = await f.controller.handle(header(f.request(), "cookie", malformed));
+    assert.equal(result.status, 400); assert.match(JSON.parse(result.body).error, /^cookie_(invalid|ambiguous)$/); privateFailure(result);
+  }
+  for (const cookie of [undefined, "__Host-dona_session=" + Buffer.alloc(32, 4).toString("base64url")]) {
+    const f = controllerFixture(); assert.equal((await f.controller.handle(header(f.request(), "cookie", cookie))).status, 401);
+  }
+  const f = controllerFixture(), forged = await f.controller.handle(header(f.request(), "x-actor-id", "other"));
+  assert.equal(forged.status, 401); assert.equal(forged.body, '{"error":"identity_invalid"}');
+});
+
+test("前後どちらのcurrent registryでもrevision変更をsession_revokedへ写像する", async () => {
+  for (const field of ["authz_revision", "identity_binding_revision"] as const) for (const late of [false, true]) {
+    const f = controllerFixture(), introspect = f.connections.oidc.introspect; let reason: string | undefined;
+    const mutate = f.connections.write.mutate;
+    f.connections.write.mutate = async input => { if (input.operation === "record_denial") reason = input.reason; return mutate(input); };
+    if (late) f.connections.oidc.introspect = async (...args) => { const result = await introspect(...args); f.snapshot.principal[field]++; return result; };
+    else f.snapshot.principal[field]++;
+    const result = await f.controller.handle(f.request()); assert.equal(result.status, 401);
+    assert.equal(result.body, '{"error":"session_revoked"}'); assert.equal(reason, "session_revoked"); assert.ok(!f.calls.includes("confirm"));
   }
 });

@@ -42,7 +42,7 @@ export interface BrowserAuthConnections {
   oidc: Pick<OidcProtocol, "introspect">;
 }
 class AuthFailure extends Error {
-  constructor(readonly status: Status, readonly reason: Reason) { super(reason); }
+  constructor(readonly status: Status, readonly reason: Reason, readonly publicReason: Reason | "durability_unavailable" = reason) { super(reason); }
 }
 const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
 const versions = z.array(z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)).min(1).max(128)
@@ -54,7 +54,7 @@ function binding(session: SessionState): SessionBinding {
 }
 function failure(reason: SessionDenial): AuthFailure {
   if (reason === "clock_anomaly") return new AuthFailure(503, "identity_unavailable");
-  return new AuthFailure(401, reason === "revision_mismatch" ? "identity_mismatch" : reason);
+  return new AuthFailure(401, reason === "revision_mismatch" ? "session_revoked" : reason);
 }
 function response(status: Status, value?: unknown, clear = false): BrowserAuthResponse {
   return { status, headers: { ...privateHeaders, ...(status === 204 ? {} : { "content-type": "application/json; charset=utf-8" }),
@@ -111,6 +111,8 @@ export class WebAuthController {
       if (!(request.body instanceof Uint8Array) || request.body.byteLength > 64 || request.headers.length > 128
         || request.headers.reduce((n, [key, value]) => n + Buffer.byteLength(key) + Buffer.byteLength(value), 0) > 16384)
         throw new AuthFailure(400, "session_invalid");
+      if (request.headers.some(([name]) => /^(authorization|x-(actor|email|user|principal|tenant).*)$/i.test(name)))
+        throw new AuthFailure(401, "identity_invalid");
       assertBrowserBoundary(this.policy, request.headers, request.transportVerified);
       let route;
       try { route = matchWebRoute(request.method, request.target); } catch { throw new AuthFailure(404, "session_invalid"); }
@@ -142,13 +144,14 @@ export class WebAuthController {
           return response(200, { revoked }, revoked);
         }
         auditAttempted = true;
-        const result = await this.write({ codec_version: 1, operation: "revoke_session", session_ref: session.session_ref, cookie: cookieIndex }, now);
-        if (result.status !== "succeeded" || result.kind !== "revoked") throw new AuthFailure(503, "identity_unavailable");
-        const after = await this.local(candidates, now);
-        if (after.session.state.session_ref !== session.session_ref || after.session.state.state !== "revoked" || after.payload !== null
-          || after.session.cookie_key_version !== cookieIndex.key_version || after.session.cookie_digest !== cookieIndex.digest)
-          throw new AuthFailure(503, "identity_unavailable");
-        return response(204, undefined, true);
+        try {
+          const result = await this.write({ codec_version: 1, operation: "revoke_session", session_ref: session.session_ref, cookie: cookieIndex }, now);
+          if (result.status !== "succeeded" || result.kind !== "revoked") throw Error();
+          const after = await this.local(candidates, now);
+          if (after.session.state.session_ref !== session.session_ref || after.session.state.state !== "revoked" || after.payload !== null
+            || after.session.cookie_key_version !== cookieIndex.key_version || after.session.cookie_digest !== cookieIndex.digest) throw Error();
+          return response(204, undefined, true);
+        } catch { throw new AuthFailure(503, "identity_unavailable", "durability_unavailable"); }
       }
       let decision = evaluateSession(snapshot.principal, session, { instance_id: this.policy.instance_id, tenant_id: this.policy.tenant_id,
         bff_generation: snapshot.bff_generation }, now());
@@ -157,18 +160,25 @@ export class WebAuthController {
       const tokenKey = this.keys.protection("web_access_token", snapshot.session.token_key_version);
       if (tokenKey.version !== snapshot.session.token_key_version) throw new AuthFailure(503, "identity_unavailable");
       const token = openAccessToken(payload.envelope, binding(session), tokenKey, now());
-      const online = await this.connections.oidc.introspect(token, () => Math.floor(Date.parse(now()) / 1000)); now();
-      if (!online.active) {
+      const rejectIdentity = async (): Promise<never> => {
         auditAttempted = true;
         const result = await this.write({ codec_version: 1, operation: "revoke_inactive", session_ref: session.session_ref, cookie: cookieIndex }, now);
         if (result.status !== "denied" || result.reason !== "identity_invalid") throw new AuthFailure(503, "identity_unavailable");
         throw new AuthFailure(401, "identity_invalid");
+      };
+      let online;
+      try { online = await this.connections.oidc.introspect(token, () => Math.floor(Date.parse(now()) / 1000)); now(); }
+      catch (error) {
+        if (error instanceof WebBoundaryError && error.code === "identity_invalid") return await rejectIdentity();
+        throw error;
       }
+      if (!online.active) return await rejectIdentity();
       const subjectIndexes = subjectLookupIndexes({ instance_id: this.policy.instance_id, tenant_id: this.policy.tenant_id,
         issuer: this.policy.oidc.issuer, subject: online.sub }, this.keys.identities())
         .map(index => ({ key_version: index.identity_index_key_version, digest: index.subject_digest }));
       const current = await this.read({ codec_version: 1, operation: "principal_lookup", subject_indexes: subjectIndexes }, now);
-      if (current.operation !== "principal_lookup" || current.snapshot === null) throw new AuthFailure(401, "identity_mismatch");
+      if (current.operation !== "principal_lookup") throw new AuthFailure(503, "identity_unavailable");
+      if (current.snapshot === null || current.snapshot.principal.principal_id !== session.principal_id) return await rejectIdentity();
       decision = evaluateSession(current.snapshot.principal, session, { instance_id: this.policy.instance_id, tenant_id: this.policy.tenant_id,
         bff_generation: current.snapshot.bff_generation }, now());
       if (!decision.allowed) throw failure(decision.reason);
@@ -188,16 +198,17 @@ export class WebAuthController {
     } catch (error) {
       let failure = error instanceof AuthFailure ? error : error instanceof WebBoundaryError
         ? new AuthFailure(error.code === "identity_unavailable" || error.code === "deployment_invalid" ? 503
-          : error.code === "origin_invalid" || error.code === "csrf_invalid" ? 403 : 401,
+          : error.code === "origin_invalid" || error.code === "csrf_invalid" ? 403
+            : error.code === "cookie_invalid" || error.code === "cookie_ambiguous" ? 400 : 401,
         error.code === "deployment_invalid" ? "identity_unavailable" : error.code)
         : new AuthFailure(503, "identity_unavailable");
       if (!auditAttempted) {
         try {
           const result = await this.write({ codec_version: 1, operation: "record_denial", cookie_indexes: candidates, reason: failure.reason }, now);
-          if (result.status !== "denied") throw Error();
+          if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
-      return response(failure.status, { error: failure.reason });
+      return response(failure.status, { error: failure.publicReason });
     }
   }
 }

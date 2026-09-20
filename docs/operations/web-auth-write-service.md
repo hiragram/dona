@@ -13,7 +13,7 @@ endpointは`POST /v1/web/auth/write`、Hostは`dona-web-auth-write`。入力はc
 | `consume_login` | 全必要versionのcookie indexから一意なloginを同一transaction内で選び、secret削除と一回限りreceiptを確定する |
 | `create_session` | receipt、全保持versionのsubject index、現行registry・revision、sealed tokenを照合して保存する |
 | `revoke_session` | 同じsessionとcookieだけをlocalに失効させる。IdPを呼ばず、既失効でも冪等に処理する |
-| `revoke_inactive` | IdP inactive時のsession失効・payload削除・拒否auditを同時に確定する |
+| `revoke_inactive` | IdP inactiveまたはidentity binding不一致時のsession失効・payload削除・拒否auditを同時に確定する |
 | `record_denial` | 限定された理由だけを拒否auditへ記録し、actorや権限をclient fieldから作らない |
 | `expire` | 保護時計に従って既存の期限切れcleanupを監査transactionで行う |
 

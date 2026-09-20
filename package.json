@@ -14,7 +14,7 @@
     "typecheck": "npm --prefix dispatcher run typecheck && npm --prefix sources/slack run typecheck && npm --prefix updater run typecheck",
     "build": "npm --prefix dispatcher run build && npm --prefix sources/slack run build && npm --prefix updater run build",
     "verify": "npm test && npm run typecheck && npm run build",
-    "test:web-integration": "sources/web/node_modules/.bin/tsc --noEmit -p integration/tsconfig.json && sources/web/node_modules/.bin/tsx --test integration/web-*.test.ts",
+    "test:web-integration": "node dispatcher/scripts/build-sqlite-identity.mjs && sources/web/node_modules/.bin/tsc --noEmit -p integration/tsconfig.json && sources/web/node_modules/.bin/tsx --test integration/web-*.test.ts",
     "verify:web": "npm --prefix sources/web test && npm --prefix sources/web run typecheck && npm --prefix sources/web run build && npm run test:web-integration"
   }
 }
