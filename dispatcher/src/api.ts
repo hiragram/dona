@@ -640,6 +640,11 @@ export class DispatcherApi {
     }
     if (request.method === "POST" && url.pathname === "/v1/jobs") {
       const input = parseCreateJobRequest(await this.readJson(request), true);
+      if (this.database.get(input.source_event_id)?.source === "dona_schedule") {
+        const code="scheduled_dedicated_handoff_required";
+        this.database.recordScheduledDelegationRejection(input.source_event_id,code);
+        throw new ApiRequestError(409,code,"Scheduled work must use the dedicated delegation endpoint");
+      }
       let result;
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);

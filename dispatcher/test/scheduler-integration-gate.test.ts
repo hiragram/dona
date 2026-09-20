@@ -214,9 +214,9 @@ test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過
     const rejectedPayload = Buffer.from(JSON.stringify(rejectedClaims)).toString("base64url");
     const rejectedReceipt = `${rejectedPayload}.${createHmac("sha256", token).update(rejectedPayload).digest("base64url")}`;
     await client.recordScheduleJobAccess(rejectedEventId, rejectedReceipt);
-    await assert.rejects(client.createJob({ source_event_id: rejectedEventId, job_key: "wrong.key",
-      objective: "inspect repository read-only", workspace: { kind: "scratch" } }), /scheduled_scope_mismatch/);
-    assert.equal(harness.database.get(rejectedEventId)?.last_error_code,"delegation_rejected:scheduled_scope_mismatch");
+    await assert.rejects(client.createJob({ source_event_id: rejectedEventId,
+      objective: "inspect repository read-only", workspace: { kind: "scratch" } }), /scheduled_dedicated_handoff_required/);
+    assert.equal(harness.database.get(rejectedEventId)?.last_error_code,"delegation_rejected:scheduled_dedicated_handoff_required");
     harness.database.saveFailedResult(rejectedEventId,{schema_version:1,event_id:rejectedEventId,status:"failed",
       summary:"delegation rejected",actions:[],completed_at:new Date().toISOString()},rejectedResultPath,new Date());
     assert.equal(harness.repo.getRun(rejectedRunId)?.status,"failed");
