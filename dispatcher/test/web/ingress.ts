@@ -13,15 +13,20 @@ const context=contexts.fixtures.find((row:{target:string})=>row.target==="/api/s
 const key:ContextKey={purpose:"web_ingress_context",version:1,state:"active",activated_at:"2026-09-01T00:00:00.000Z",signing_expires_at:"2026-11-01T00:00:00.000Z",secret:Buffer.alloc(32,contexts.key_byte)};
 const lookup=(version:number)=>version===1?key:undefined;
 const dashboard=contexts.fixtures.find((row:{target:string})=>row.target==="/");
+function routeToken(method:"GET"|"POST",target:string,body:Uint8Array,nonceByte:number):string{
+ const claims=JSON.parse(Buffer.from(context.token.split(".")[0],"base64url").toString());
+ const payload=Buffer.from(JSON.stringify({...claims,request:ingressContextRequest(method,target,body),nonce:Buffer.alloc(32,nonceByte).toString("base64url")})).toString("base64url");
+ return payload+"."+createHmac("sha256",key.secret).update("dona.web.ingress-context.v1\0").update(payload).digest("base64url");
+}
 test("明示navigationだけがnonce消費と同じ監査でactivityを進め再送では進めない",t=>{
  for(const navigation of [false,true]){
   const f=setup(t);activeSession(f);const store=new WebAuthRepository(f.db,f.providers,scope,lookup);
   const before=f.readState(),now="2026-09-19T00:00:02.000Z";f.setNow(now);
-  assert.equal(store.verifySessionIngress("navigate",dashboard.token,"GET","/",Buffer.alloc(0),navigation).status,"succeeded");
+  assert.equal(store.verifySessionIngress("navigate",dashboard.token,"GET","/",Buffer.alloc(0),{user_navigation:navigation}).status,"succeeded");
   const expected=structuredClone(before.sessions);if(navigation)expected[0]!.state.last_activity_at=now;
   assert.deepEqual(f.readState().sessions,expected);assert.equal(f.readState().used_nonces.length,1);
   f.audit.verify();f.setNow("2026-09-19T00:00:03.000Z");
-  assert.deepEqual(store.verifySessionIngress("replay_nav",dashboard.token,"GET","/",Buffer.alloc(0),navigation),{status:"denied",reason:"already_consumed"});
+  assert.deepEqual(store.verifySessionIngress("replay_nav",dashboard.token,"GET","/",Buffer.alloc(0),{user_navigation:navigation}),{status:"denied",reason:"already_consumed"});
   assert.deepEqual(f.readState().sessions,expected);
  }
 });
@@ -38,7 +43,7 @@ test("navigationでも期限切れ・失効・改変・別routeを復活させ�
   const payload=Buffer.from(JSON.stringify({...claims,request:ingressContextRequest("GET",target,Buffer.alloc(0)),issued_at:now,expires_at:expires})).toString("base64url");
   let token=payload+"."+createHmac("sha256",key.secret).update("dona.web.ingress-context.v1\0").update(payload).digest("base64url");
   if(fault==="proof")token+="x";
-  const before=structuredClone(state.sessions),result=prepareSessionIngress(state,token,"GET",target,Buffer.alloc(0),now,lookup,true);
+  const before=structuredClone(state.sessions),result=prepareSessionIngress(state,token,"GET",target,Buffer.alloc(0),now,lookup,{user_navigation:true});
   assert.deepEqual(result.result,{status:"denied",reason:fault==="proof"?"proof_invalid":fault==="route"?"operation_unsupported":fault==="revoked"?"session_revoked":"session_expired"},fault);
   assert.deepEqual(result.next.sessions,before);assert.equal(result.next.used_nonces.length,0);
  }
@@ -52,7 +57,7 @@ test("navigationのmetadata失敗・anchor応答喪失は成功ackも暗黙再�
    t.mock.method(f.db,"prepare",((sql:string)=>{if(sql.startsWith("UPDATE web_auth_state"))throw Error("fixture metadata failure");return original(sql);}) as typeof f.db.prepare);
   }else f.anchors.fault=fault;
   const calls=f.anchors.calls.length;
-  assert.throws(()=>store.verifySessionIngress("nav_uncertain",dashboard.token,"GET","/",Buffer.alloc(0),true));
+  assert.throws(()=>store.verifySessionIngress("nav_uncertain",dashboard.token,"GET","/",Buffer.alloc(0),{user_navigation:true}));
   assert.equal(f.anchors.calls.length-calls,fault.startsWith("finalize")?2:1);
   const expected=structuredClone(before);if(fault.startsWith("finalize"))expected[0]!.state.last_activity_at=now;
   assert.deepEqual(f.readState().sessions,expected);assert.equal(f.readState().used_nonces.length,fault.startsWith("finalize")?1:0);
@@ -154,4 +159,30 @@ test("署名済みsession bindingから現行revision失効を分類し権限を
   const altered=context.token+"x";
   assert.deepEqual(prepareSessionIngress(state,altered,"GET","/api/session",Buffer.alloc(0),contexts.now,lookup).result,{status:"denied",reason:"proof_invalid"});
  }
+});
+
+test("command・read・SSE・approvalは同じcurrent principal filterと追加gateを通る",t=>{
+ const f=setup(t);activeSession(f);const original=f.readState(),body=Buffer.from("{}");
+ const run=(roles:typeof original.principals[0]["role_ids"],scopes:typeof original.principals[0]["scopes"],method:"GET"|"POST",target:string,
+  gates:Parameters<typeof prepareSessionIngress>[7],nonce:number)=>{
+   const state=structuredClone(original);state.principals[0]!.role_ids=roles;state.principals[0]!.scopes=scopes;
+   const bytes=method==="POST"?body:Buffer.alloc(0);
+   return prepareSessionIngress(state,routeToken(method,target,bytes,nonce),method,target,bytes,contexts.now,lookup,gates);
+ };
+ const requesterRoles:typeof original.principals[0]["role_ids"]=["requester"];
+ const requesterScopes:typeof original.principals[0]["scopes"]=["job:submit","job:read:own","job:cancel:own"];
+ const observerRoles:typeof original.principals[0]["role_ids"]=["observer"];
+ const observerScopes:typeof original.principals[0]["scopes"]=["job:read:granted"];
+ const supervisorRoles:typeof original.principals[0]["role_ids"]=["supervisor"];
+ const supervisorScopes:typeof original.principals[0]["scopes"]=["approval:read:bound","approval:decide:bound"];
+ assert.equal(run(requesterRoles,requesterScopes,"GET","/api/jobs/job_1",{},2).result.status,"succeeded");
+ assert.equal(run(observerRoles,observerScopes,"GET","/api/jobs/job_1/events",{},3).result.status,"succeeded");
+ assert.deepEqual(run(observerRoles,observerScopes,"POST","/api/jobs",{csrf_verified:true},4).result,{status:"denied",reason:"scope_denied"});
+ assert.deepEqual(run(requesterRoles,requesterScopes,"POST","/api/jobs",{},5).result,{status:"denied",reason:"csrf_invalid"});
+ const submitted=run(requesterRoles,requesterScopes,"POST","/api/jobs",{csrf_verified:true},6);
+ assert.equal(submitted.result.status,"succeeded");assert.equal(submitted.next.sessions[0]!.state.last_activity_at,contexts.now);
+ assert.equal(run(supervisorRoles,supervisorScopes,"GET","/api/approvals/request_1",{},7).result.status,"succeeded");
+ assert.deepEqual(run(supervisorRoles,supervisorScopes,"POST","/api/approvals/request_1/decision",{csrf_verified:true},8).result,{status:"denied",reason:"step_up_required"});
+ assert.equal(run(supervisorRoles,supervisorScopes,"POST","/api/approvals/request_1/decision",{csrf_verified:true,step_up_verified:true},9).result.status,"succeeded");
+ assert.deepEqual(run(supervisorRoles,supervisorScopes,"GET","/api/jobs/job_1",{},10).result,{status:"denied",reason:"scope_denied"});
 });

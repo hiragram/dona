@@ -10,6 +10,12 @@ service credentialは`web_bff_service`用途の32 byte secret、version、instan
 
 serviceのinstance/tenantとrepositoryの構築scopeが異なる場合は、listenerを作る前に拒否する。返したprincipalはsession確認結果であり、jobやapprovalのcapabilityではない。後続routeには、それぞれのfresh contextとresourceごとの認可が引き続き必要である。
 
+## 後続routeの共通filter
+
+`prepareSessionIngress`はdashboard/sessionだけでなく、固定route表のcommand、read/SSE、approval routeにも同じcurrent session filterを適用する。POSTはBFFで完了したCSRF確認を認証済み内部callのgateとして必須にし、approval decisionはさらに独立step-upの確認を必須にする。roleとscopeはcurrent registryから再構成し、requesterへapproval権限、supervisorへjob権限を暗黙付与しない。成功した明示user commandだけがidle activityを進め、poll/SSEは進めない。
+
+route-level成功は後続adapterへverified principal contextを渡すための前提であり、resource認可の完了ではない。job owner/grant、approval binding/hash、receipt/cursor等は各routeのauthoritative transactionで再検証する。現在のsession service UDS endpointはdashboard/session確認専用のままとし、後続command/read/approval APIがbrowser本文をこのendpointへproxyする用途には広げない。
+
 ## 通信と失敗時の扱い
 
 serverは専用UDSだけをbindする。socketのparentはcanonicalでowner-onlyの0700、socketはowner-onlyの0600とし、既存pathを自動削除・上書きしない。起動時に記録したsocket identityと属性をrequestの受信時、repository呼出前、応答前に再確認する。clientも送信前と応答の採用前にsocketの属性とidentityを確認する。credentialや保護providerのprovisioning、directory作成、stale socketの運用処理はこのmoduleの責務ではない。
@@ -24,7 +30,7 @@ timeout、接続切断、MAC不一致、監査anchorの結果不明は`web_servi
 
 BFF clientの実UDS fixtureと、file-backed SQLiteの実Web repositoryに接続するDispatcher service fixtureを、それぞれのpackageで検証する。両者が共有する公開golden wireは、production実装とは独立したHMAC計算で作成し、双方のcodecと照合する。正常確認、再送、header/proof/response改変、scope不一致、anchor応答喪失、dribbling、不完全request、socket属性を確認する。
 
-fixtureのcredentialはテスト専用の公開値であり、実credentialを作成・使用しない。OS保護store、実IdP、ブラウザlogin、TLS frontend、BFF起動時のepoch確定、installer、runtime readinessへの接続はまだ行っていない。importでlistenerを起動せず、既存DispatcherのAPIやproduction設定も変更しない。#141全体の完了条件は残る。
+fixtureのcredentialはテスト専用の公開値であり、実credentialを作成・使用しない。loopback TLS frontend、browser login/logout、BFF起動時のepoch確定はisolated fixtureで接続するが、OS保護store、実IdP、installer、production runtime readinessは未検証である。importでlistenerを起動せず、既存production設定も変更しない。
 
 
 ## 拒否理由の保持

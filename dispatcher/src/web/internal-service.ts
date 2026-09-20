@@ -127,7 +127,7 @@ export class WebInternalService {
         const input = sessionAuth.parseSessionServiceInput(raw);
         this.assertRequestReady(started, request, response);
         const result = this.repository.verifySessionIngress("web_service_" + randomBytes(16).toString("hex"),
-          input.context, input.method, input.target, Buffer.alloc(0), input.user_navigation === true);
+          input.context, input.method, input.target, Buffer.alloc(0), { user_navigation: input.user_navigation === true });
         let reply: sessionAuth.SessionServiceResult;
         if (result.status === "denied") reply = { status: "denied", reason: sessionAuth.sessionServiceDenialSchema.parse(result.reason) };
         else if (result.kind === "session_verified") reply = { status: "succeeded", principal: result.principal };
