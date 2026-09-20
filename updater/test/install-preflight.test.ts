@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { CanonicalBuild, canonicalDiagnosticStep } from "../src/adapters.js";
 import { ProcessRunner } from "../src/process.js";
@@ -18,6 +18,22 @@ const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
 const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.sh", import.meta.url));
+type WaitForLaunchdServiceAbsent = (
+  domain: string,
+  label: string,
+  timeoutMs: number,
+  options?: {
+    observe?: (target: string) => Promise<boolean>;
+    sleep?: (milliseconds: number) => Promise<void>;
+    now?: () => number;
+    intervalMs?: number;
+    settledObservations?: number;
+  },
+) => Promise<void>;
+const preflightModule = await import(pathToFileURL(preflight).href) as {
+  waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
+};
+const { waitForLaunchdServiceAbsent } = preflightModule;
 
 test("developer installer atomically creates and shares the access receipt key",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
@@ -130,6 +146,37 @@ test("control-plane upgradeはDispatcherのquiesceとdrain完了を要求する"
   finally { await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); await fs.rm(root,{recursive:true,force:true}); }
 });
 
+test("launchdの登録解除はstale registrationが消えてから安定観測する", async () => {
+  const observations = [true, false, true, false, false, false];
+  let elapsed = 0;
+  const targets: string[] = [];
+  await waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 1_000, {
+    observe: async (target: string) => {
+      targets.push(target);
+      return observations.shift() ?? false;
+    },
+    sleep: async (milliseconds: number) => { elapsed += milliseconds; },
+    now: () => elapsed,
+    intervalMs: 10,
+    settledObservations: 3,
+  });
+  assert.deepEqual(targets, Array(6).fill("gui/501/dev.dona.dispatcher"));
+});
+
+test("launchdの登録解除timeoutは対象labelを保持し、plist切替前に失敗する", async () => {
+  let elapsed = 0;
+  await assert.rejects(
+    waitForLaunchdServiceAbsent("gui/501", "dev.dona.dispatcher", 25, {
+      observe: async () => true,
+      sleep: async (milliseconds: number) => { elapsed += milliseconds; },
+      now: () => elapsed,
+      intervalMs: 10,
+      settledObservations: 3,
+    }),
+    /dev\.dona\.dispatcher remained registered after bootout timeout/,
+  );
+});
+
 test("macOS keeps a hardened staged updater renamable by reopening only its root", {
   skip: process.platform !== "darwin",
 }, async () => {
@@ -172,9 +219,10 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
   assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
-  assert.match(source,/DISPATCHER_STOPPED=1[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
-  assert.match(source,/if \[\[ "\$DISPATCHER_STOPPED" == "1"[\s\S]*launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
-  assert.match(source, /launchctl bootstrap "\$DOMAIN" "\$LAUNCH_AGENTS_DIR\/dev\.dona\.dispatcher\.plist"/);
+  assert.match(source,/DISPATCHER_RESTORE_REQUIRED=1[\s\S]*wait_dispatcher_unregistered[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
+  assert.match(source,/if \[\[ "\$DISPATCHER_RESTORE_REQUIRED" == "1"[\s\S]*wait_dispatcher_unregistered[\s\S]*bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録"/);
+  assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
+  assert.match(source, /wait-launchd-unregistered/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /PRAGMA integrity_check/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
@@ -188,6 +236,13 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /exact SHAの登録済み状態を確認しました/);
   assert.match(source, /expected SHAの未登録状態を確認しました/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
+  const restoreRequired = source.indexOf("DISPATCHER_RESTORE_REQUIRED=1");
+  const quiesce = source.indexOf('quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock"');
+  const bootout = source.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher"', quiesce);
+  const waitUnregistered = source.indexOf("wait_dispatcher_unregistered", bootout);
+  const plistSwap = source.indexOf('/bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"', waitUnregistered);
+  assert.ok(restoreRequired >= 0 && restoreRequired < quiesce);
+  assert.ok(quiesce < bootout && bootout < waitUnregistered && waitUnregistered < plistSwap);
   assert.doesNotMatch(source, /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/u);
   const hardenedUpgradeTree = source.indexOf('find "$BACKUP_ROOT/updater.next" -type d -exec chmod 500 {} +');
   const writableUpgradeRoot = source.indexOf('chmod 700 "$BACKUP_ROOT/updater.next"');
