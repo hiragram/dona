@@ -1,0 +1,33 @@
+# 承認metadataの複数point更新と限定list操作
+
+#16の内部repository接続に向け、record point、list manifest/link、secondary aliasを1つの共有metadata rootへまとめて更新する。公開broker、業務rowのSQL保存、current binding/actor認可をこのcomponentで代替しない。
+
+## 共有監査prepareからmutationへの受け渡し
+
+`ApprovalMetadataPlan`は、同じ監査prepare内で取得したcurrent resource root、scope、`ApprovalMetadataNodes`と`ApprovalIndexBlobs`の同期readerを受け取る。constructorへ渡したroot自体は認可やcurrent状態の証明ではない。呼出側は共有AuditRepositoryの検証済みresource bindingを使い、欠落bindingを空rootへfallbackしてはいけない。genesisでは別途、既知の空DB/inventoryと保護されたanchorからの初期化条件が必要である。
+
+readはnode overlayと既存readerを合わせ、point digest、blob canonical bytes、scope、要求identityから導いたkeyを確認する。参照blobが欠落していれば不在として返さない。期待値の競合は固定`MetadataConflictError`、入力・読取障害は固定`approval_metadata_plan_unverified`になる。blob reader自身が競合errorを投げても正常な期待値競合に変換しない。
+
+更新対象は最大32個の異なるpoint、変更は最大64回、Merkle walkは最大256回、1 walkは既存の最大257nodeである。digestが変わらない場合も実際の旧point/blobを検証してから省略する。scopeやidentityが違う旧値で上書きできない。途中の失敗、複合list操作の失敗、上位からの`invalidate()`でplanを破棄し、それ以降の操作・`finish()`を拒否する。`finish()`後も再利用できない。変更を重ねて初期rootへ戻すplanはprepare中に拒否する。
+
+同じmanifest/linkを複数回変更した際は、current rootから到達する新nodeと最終pointが参照する新index blobだけを残し、中間versionを保存しない。既存subtree全体は走査しない。
+
+返却planはpassiveな固定形式で、最大8,224件のnode wire文字列と32件のindex wire文字列を持つ。node wireは最大176 byte、index wireは最大2,048 byte。digestは既存の固定domain hashから復元する。既存`assertSynchronousResult`の10,000要素/depth 16制限を変更せず、最大更新ケースも同じ検証を通す。
+
+`ApprovalMetadataPlanWriter`は1つのconnectionから両保存層を構成する。既存transaction内でscope、format、wire上限、重複、proposed rootのnodeを確認し、nodeを最大257個ごと、indexを最大32個でstageする。自分でBEGIN/commitや再試行をしない。全batchと業務rowは呼出側の同じ監査mutationで保存し、どこかが失敗したら例外を上位へ伝えて全体をrollbackする。mutation中の保存障害をcatchして成功扱いしてはいけない。
+
+`putRecord`はcanonical record digestをpointへ結ぶだけで、旧SQL rowの読取・照合、cross-row参照、state transition、current binding/policy/clockやactor検証、business rowの書込を実装しない。これらを完了したrepositoryだけがこの内部plannerを使う。planの公開受付・保存後の再実行・外部callerによるroot指定は行わない。
+
+## Listの局所更新と先頭読取
+
+- `appendApprovalList`: 必須manifestと両端link、件数に応じた境界を確認し、旧tail、新link、manifestを同じplanで更新する。既存memberの再追加は競合とする。activeの明示tombstoneだけは再加入の表現を持つが、業務状態として許されるかはrepositoryが判断する。
+- `removeActiveApprovalList`: activeだけを対象に、前後linkの相互参照とhead/tailを照合して除外する。除外linkはtombstoneとして保持し、all履歴やone-shot IDを解放しない。
+- `readApprovalListHead`: 認証済みheadから最大32件をたどり、相互参照・件数・末端を確認する。残りがあれば`truncated: true`を返す。全履歴を読んだ証拠や外部pagination cursorとして使わない。
+
+毎回全履歴を走査するものではない。current rootが正しい初期化と監査済みの完全なrepository更新から生成されたことを前提に、必要な隣接関係を検証する。manifest件数・全隣接関係・record/aliasの業務整合性を、単にcanonical codecを通っただけの任意rootへ対して証明しない。欠落manifestを空listとして補う初期化はない。
+
+外部pagination、root変更をまたぐcursor、expiry sweepの進捗保証、needs_reviewの検索方針、retention/GC、公開repository/brokerの接続は残る。先頭pageを繰り返すだけでは、後方のexpired rowを確実に処理できるとは主張しない。
+
+## 検証
+
+実SQLite/native guardと共有監査transactionで、複数pointのcommit、全batch rollback、2つ目のnode batchの失敗、reserve/finalize応答喪失を確認する。all/activeの追加・中間/先頭/末尾/最後の除外、scope/identity不一致、欠落blob、競合、上限、破棄済みplan、限定一覧の不整合を検証する。clock/鍵/CAS anchorはfixture providerで、実providerやproduction activationの証拠ではない。
