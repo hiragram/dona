@@ -50,3 +50,5 @@ import "./approval/execution-marker.js";
 import "./approval/execution-marker-store.js";
 
 import "./approval/execution-broker.js";
+
+import "./approval/notification-broker.js";

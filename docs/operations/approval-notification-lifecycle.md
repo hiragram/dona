@@ -1,0 +1,23 @@
+# Approval notificationの状態broker
+
+`ApprovalNotificationBroker`は#16のtransport-neutralなnotification outboxを扱います。approval cardと元threadのpending noticeを、保存済みの別attempt・別markerとして管理します。実Slack送信、projection公開、実認証providerは提供しません。
+
+## 配送開始
+
+commandはopaqueなnotification handle、authority ref、expected fenceだけです。必須の同期authorityが認証済みinternal worker、current request/binding/policy、requesterのtarget権限、supervisor visibility、shared状態、ordered thread snapshotを同じVerifiedAuditStateで照合します。cardの本文は、この認可と期限の検証後に保存済みbinding/保持鍵で認証します。
+
+pendingだけがdispatchingへ進み、fenceを増加させます。重複claim、既存dispatching/unknown/terminalは新しい配送許可を作りません。期限切れはexpire decision・event outbox・全pending abort・本文削除を同transactionへ保存します。current precondition不一致はneeds_reviewと本文削除へ進めます。
+
+dispatchingという結果はserializableな外部送信許可ではありません。後続のclosed transport workerが、fresh claim、current authority、短い開始期限、一回だけの送信を結合する必要があります。
+
+## 結果と復旧
+
+receiptはclient入力から受けず、trusted adapterがexact app author/target/保存marker/message identityへ結合した証拠から導出します。callbackとread-only reconcileを分け、current attempt fenceへ一致させます。sentはmessage refを保存し、cardではrequestをsentへ同時更新します。card作成時のrequest revisionは維持し、deliveryによるrequest revision増加を決定proofと混同しません。
+
+dispatchingを復旧した場合はrequestとattemptを同transactionで受理不明へ進め、古いcallbackを拒否します。0件はunknownのまま、複数のexact matchなどの曖昧さはneeds_reviewです。同じwriteを再送しません。決定的な送信拒否だけをfailedにし、cardの失敗はrequestのdelivery_failed・本文削除・pending notice abortへ結合します。pending notice単独の拒否はcardの進行を変えません。
+
+cancel/expiryなどが先着した後のsentもrequestを戻しません。exact messageを無効表示にするpresentation updateを一度だけ作ります。dispatch後に期限を超えた復旧やsent callbackでも、expire decisionと本文削除を同transactionへ含めます。表示更新の実行とmessage-level直列化はpresentation worker側の残範囲です。
+
+## 検証境界
+
+fixtureでclaim/重複、決定proofへの接続、current認可/期限、callback/reconcile、cancel後の遅着、cardとnoticeの独立性、SQL/audit障害、再openを検証します。fixture authorityやmessage refは実providerの証拠ではありません。外部proofの完全性、実Slack/Socket接続、配送worker、projectionの受け渡し、operator admission、productionは後続の接続と検証が必要です。
