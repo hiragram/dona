@@ -191,6 +191,38 @@ test("presentation message fenceを解放してから引継ぎacceptance unknown
   assert.equal(f.records.readAlias({name:"presentation_active_message",message_ref:"message_notification"}),null);
 });
 
+test("message holderの不在はnull tombstoneと未登録aliasの両方でSQLへ照合する", t => {
+  for (const state of ["dispatching", "acceptance_unknown"] as const) for (const absent of [false, true]) {
+    const f = fixture(t); create(f); deliver(f);
+    const first = values("updates").presentation; first.row.message_ref = "message_notification";
+    const selector = { name: "presentation_active_message" as const, message_ref: first.row.message_ref };
+    commit(f, "updates", [{ previous: null, next: first }]);
+    assert.equal(f.records.readAlias(selector), null);
+    assert.equal(f.records.readAlias({ ...selector, message_ref: "unused_message" }), null);
+    assert.throws(() => f.sql.assertNoPresentationHolder(selector.message_ref));
+    if (absent) {
+      // 未登録aliasに対し、SQLだけが進んだ不整合を作る。
+      f.db.prepare("UPDATE approval_presentation_updates SET state='dispatching',fence=1 WHERE update_id='update'").run();
+      if (state === "acceptance_unknown") f.db.prepare("UPDATE approval_presentation_updates SET state='acceptance_unknown' WHERE update_id='update'").run();
+    } else {
+      const claimed = { ...first, row: { ...first.row, state: "dispatching" as const, fence: 1 } };
+      commit(f, "claim", [{ previous: first, next: claimed }]);
+      if (state === "acceptance_unknown") commit(f, "unknown", [{ previous: claimed, next: { ...claimed, row: { ...claimed.row, state } } }]);
+      f.transaction.runPrepared("inconsistent_tombstone", (_mark, current) => {
+        const metadata = f.nodes.read(nodes => f.indexes.read(indexes => {
+          const root = current.resource_bindings.find(value => value.resource_id === "approval_records")!.resource_digest;
+          const plan = new ApprovalMetadataPlan(scope, root, nodes, indexes);
+          const previous = plan.readIndex({ kind: "alias", selector });
+          plan.putIndex(previous, { codec_version: 1, scope, kind: "alias", selector, target: null });
+          return plan.finish();
+        }));
+        return { event: { ...event, resource_id: "approval_records" }, resource_digest: metadata.proposed_root, mutation: () => { f.writer.stage(metadata); return null; } };
+      });
+    }
+    assert.throws(() => f.records.readAlias(selector), ApprovalRecordRepositoryError);
+  }
+});
+
 test("内部一覧は4件上限とtruncatedを保持し再open後も同じrootから読む",t=>{
   const f=fixture(t);assert.deepEqual(f.records.readListHead({record_kind:"request",membership:"active"},4),{count:0,records:[],truncated:false});
   for(let i=0;i<5;i++){

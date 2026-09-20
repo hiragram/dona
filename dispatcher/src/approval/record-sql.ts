@@ -90,6 +90,16 @@ export class ApprovalRecordSql {
       assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyApprovalIndexSchema(db);
     } catch { throw new ApprovalRecordSqlError(); }
   }
+  /** 固定partial UNIQUE indexによるmessage holderの存在確認。SQLを
+   * 権威として返さず、root上の不在との矛盾をfail closedにするためだけに使う。 */
+  assertNoPresentationHolder(messageRef: string): void {
+    try {
+      if (!this.db.inTransaction) throw Error();
+      id.parse(messageRef); verifyOpenDatabaseFile(this.db); verifyApprovalIndexSchema(this.db);
+      if (this.db.prepare("SELECT 1 FROM main.approval_presentation_updates INDEXED BY approval_one_message_write WHERE message_ref=? AND state IN ('dispatching','acceptance_unknown') LIMIT 1").get(messageRef)) throw Error();
+    } catch { throw new ApprovalRecordSqlError(); }
+    finally { try { verifyOpenDatabaseFile(this.db); } catch { throw new ApprovalRecordSqlError(); } }
+  }
   read(kindInput: ApprovalRecordKind, primaryKey: string): ApprovalRecord | null {
     try {
       if (!this.db.inTransaction) throw Error();

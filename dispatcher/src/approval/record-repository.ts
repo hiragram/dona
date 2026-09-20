@@ -55,9 +55,15 @@ export class ApprovalRecordRepository {
       const selectedKey = approvalIndexKey(this.scope, { kind: "alias", selector });
       return this.withPlan(plan => {
         const index = plan.readIndex({ kind: "alias", selector });
-        if (index === null) return null;
+        if (index === null) {
+          if (selector.name === "presentation_active_message") this.sql.assertNoPresentationHolder(selector.message_ref);
+          return null;
+        }
         if (index.kind !== "alias") throw Error();
-        if (index.target === null) return null;
+        if (index.target === null) {
+          if (index.selector.name !== "presentation_active_message") throw Error();
+          this.sql.assertNoPresentationHolder(index.selector.message_ref); return null;
+        }
         const record = this.record(plan, aliasKinds[index.selector.name], index.target);
         if (record === null) throw Error();
         if (index.selector.name === "presentation_active_message") {
