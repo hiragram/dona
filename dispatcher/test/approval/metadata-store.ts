@@ -8,7 +8,7 @@ import { setup, scope as auditScope } from "../web/fixtures.js";
 import { installApprovalSchema, installApprovalMetadataSchema, verifyApprovalMetadataSchema, ApprovalSchemaError } from "../../src/approval/schema.js";
 import { openSecurityDatabase } from "../../src/audit/coordination.js";
 import { ApprovalMetadataNodes, MetadataStoreError } from "../../src/approval/metadata-store.js";
-import { emptyMetadataRoot, prepareMetadataUpdate, readMetadataValue, type MetadataTreeNodeReader } from "../../src/approval/metadata-tree.js";
+import { emptyMetadataRoot, prepareMetadataUpdate, readMetadataValue, MetadataConflictError, type MetadataTreeNodeReader } from "../../src/approval/metadata-tree.js";
 import { ApprovalTransactionError } from "../../src/approval/transaction.js";
 import type { AuditEvent } from "../../src/audit/codec.js";
 const scope = { instance_id: auditScope.instance_id, workspace_id: auditScope.tenant_id, collection: "approval_records_v1" } as const;
@@ -56,6 +56,27 @@ test("業務mutation失敗ではnodeもrollbackする",t=>{
  assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(),{n:0});
  assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM fixture_business").get(),{n:0});
  assert.deepEqual(f.anchors.calls,["reserve"]);
+});
+
+test("codecの通常競合はstore障害にせず同じ監査transactionでdenialへできる",t=>{
+ const f=fixture(t),root=commit(f);
+ const result=f.transaction.runPrepared("metadata_conflict",(_mark,state)=>{
+  assert.equal(state.resource_bindings.find(item=>item.resource_id==="approval_records")?.resource_digest,root);
+  try {
+   f.nodes.read(reader=>prepareMetadataUpdate(scope,root,"fixture_record","0".repeat(64),"b".repeat(64),reader));
+   throw new Error("expected conflict");
+  } catch(error) {
+   assert.ok(error instanceof MetadataConflictError);
+   return {event:{...event,outcome:"denied",reason:"idempotency_conflict"},resource_digest:root,
+    mutation:()=>({status:"denied",reason:"idempotency_conflict"})};
+  }
+ });
+ assert.deepEqual(result,{status:"denied",reason:"idempotency_conflict"});
+ assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(),{n:257});
+ assert.deepEqual(f.anchors.calls,["reserve","finalize","reserve","finalize"]);
+ f.audit.readVerifiedState(state=>{assert.equal(state.resource_bindings.find(item=>item.resource_id==="approval_records")?.resource_digest,root);return null;});
+ assert.throws(()=>f.db.transaction(()=>f.nodes.read(()=>{throw Object.assign(new MetadataConflictError(),{message:"private detail"});}))(),
+  {name:"MetadataConflictError",message:"metadata_value_conflict"});
 });
 
 test("anchor不明を再試行せずnodeとbusinessのcommit境界を区別する",t=>{

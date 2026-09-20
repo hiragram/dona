@@ -6,6 +6,7 @@ import { verifyOpenDatabaseFile } from "../audit/file-identity.js";
 import { assertSynchronousCallback, assertSynchronousResult, type SynchronousCallback } from "../audit/synchronous.js";
 import { verifyApprovalMetadataSchema } from "./schema.js";
 import type { MetadataTreeNode, MetadataTreeNodeReader } from "./metadata-tree.js";
+import { MetadataConflictError } from "./metadata-tree.js";
 
 export class MetadataStoreError extends Error {
   constructor() { super("approval_metadata_store_unverified"); this.name = "MetadataStoreError"; }
@@ -49,18 +50,23 @@ export class ApprovalMetadataNodes {
   }
   read<F extends (reader: MetadataTreeNodeReader) => unknown>(operation: SynchronousCallback<F>): ReturnType<F>;
   read(operation: (reader: MetadataTreeNodeReader) => unknown): unknown {
-    return guard(() => {
+    guard(() => {
       assertSynchronousCallback(operation);
       if (!this.db.inTransaction) throw new MetadataStoreError();
       verifyApprovalMetadataSchema(this.db);
-      let active = true;
-      const reader: MetadataTreeNodeReader = digest => {
-        if (!active || !this.db.inTransaction) throw new MetadataStoreError();
-        return readNode(this.db, digestSchema.parse(digest));
-      };
-      try { const result = operation(reader); assertSynchronousResult(result); return result; }
-      finally { active = false; }
     });
+    let active = true;
+    const reader: MetadataTreeNodeReader = digest => guard(() => {
+      if (!active || !this.db.inTransaction) throw new MetadataStoreError();
+      return readNode(this.db, digestSchema.parse(digest));
+    });
+    try { const result = operation(reader); assertSynchronousResult(result); return result; }
+    catch (error) {
+      // 生node読取の障害はreader内で包む。codecの期待値競合だけを
+      // repositoryへ伝え、callback由来の例外messageは引き継がない。
+      if (error instanceof MetadataConflictError) throw new MetadataConflictError();
+      throw new MetadataStoreError();
+    } finally { active = false; }
   }
   stage(input: readonly MetadataTreeNode[]): undefined {
     return guard(() => {
