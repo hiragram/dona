@@ -42,6 +42,8 @@ class StreamingRedactor {
   private droppingQuote: "\"" | "'" | undefined;
   private quoteBackslashParity = false;
 
+  constructor(private readonly privateRoots: readonly string[] = []) {}
+
   write(chunk: Buffer): string {
     this.pending += this.decoder.write(chunk);
     return this.drain(false);
@@ -94,9 +96,36 @@ class StreamingRedactor {
         this.droppingQuote = undefined;
         continue;
       }
+      const configuredPath = this.privateRoots
+        .map((root) => ({ index: this.pending.indexOf(root), root }))
+        .filter((match) => match.index >= 0)
+        .sort((left, right) => left.index - right.index || right.root.length - left.root.length)[0];
+      if (configuredPath) {
+        output += redactText(this.pending.slice(0, configuredPath.index), Number.MAX_SAFE_INTEGER);
+        output += "[REDACTED_STREAM]";
+        this.pending = this.pending.slice(configuredPath.index + configuredPath.root.length);
+        this.droppingSensitive = true;
+        this.droppingQuote = undefined;
+        continue;
+      }
       if (final) {
         output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
         this.pending = "";
+        return output;
+      }
+      let configuredCarryStart = this.pending.length;
+      for (const root of this.privateRoots) {
+        const maximum = Math.min(root.length - 1, this.pending.length);
+        for (let length = maximum; length > 0; length -= 1) {
+          if (this.pending.endsWith(root.slice(0, length))) {
+            configuredCarryStart = Math.min(configuredCarryStart, this.pending.length - length);
+            break;
+          }
+        }
+      }
+      if (configuredCarryStart < this.pending.length) {
+        output += redactText(this.pending.slice(0, configuredCarryStart), Number.MAX_SAFE_INTEGER);
+        this.pending = this.pending.slice(configuredCarryStart);
         return output;
       }
       const partialQuotedKey = /(?:^|[^a-z0-9_-])["'][a-z0-9_-]*$/i.exec(this.pending);
@@ -166,14 +195,19 @@ export interface DiagnosticCaptureSession {
 export class DiagnosticLogStore {
   private readonly root: string;
   private readonly logsRoot: string;
+  private readonly privateRoots: readonly string[];
 
   constructor(
     controlRoot: string,
     private readonly perLogLimitBytes: number,
     private readonly index?: DiagnosticLogIndex,
+    privateRoots: readonly string[] = [],
   ) {
     this.root = path.join(controlRoot, "diagnostics");
     this.logsRoot = path.join(this.root, "logs");
+    this.privateRoots = [...new Set([controlRoot, ...privateRoots])]
+      .filter((root) => path.isAbsolute(root))
+      .sort((left, right) => right.length - left.length);
   }
 
   recoverInterruptedCaptures(at = new Date()): void {
@@ -288,7 +322,10 @@ export class DiagnosticLogStore {
         return commandFailed ? failed : undefined;
       } };
     }
-    const redactors = { stdout: new StreamingRedactor(), stderr: new StreamingRedactor() };
+    const redactors = {
+      stdout: new StreamingRedactor(this.privateRoots),
+      stderr: new StreamingRedactor(this.privateRoots),
+    };
     let bytes = 0;
     const contentHash = createHash("sha256");
     let truncated = false;

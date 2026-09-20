@@ -29,14 +29,37 @@ rollback requires an exact compatible request and explicit plan-hash confirmatio
 }
 
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  const command = argv[0] ?? "serve";
+  let requestId: string | undefined;
+  let confirmedPlanHash: string | undefined;
+  if (command === "status") {
+    if (argv.length > 2) usage();
+    requestId = argv[1] ? parseRequestId(argv[1]) : undefined;
+  } else if (command === "doctor") {
+    if (argv.length !== 1) usage();
+  } else if (command === "reconcile") {
+    if (argv.length !== 2) usage();
+    requestId = parseRequestId(argv[1]!);
+  } else if (command === "rollback") {
+    if (argv.length !== 4 || argv[2] !== "--confirm-plan-hash" || !/^[0-9a-f]{64}$/.test(argv[3] ?? "")) usage();
+    requestId = parseRequestId(argv[1]!);
+    confirmedPlanHash = argv[3]!;
+  } else if (command !== "serve" || argv.length !== 1) {
+    usage();
+  }
+
   const defaultPolicy = path.join(os.homedir(), "Library", "Application Support", "Dona", "update-control", "policy.json");
   const policy = loadPolicy(process.env.DONA_UPDATE_POLICY_PATH ?? defaultPolicy);
   const logger = createLogger();
-  const command = process.argv[2] ?? "serve";
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"), {
     readonly: command === "status" || command === "doctor",
   });
-  const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database);
+  const diagnostics = new DiagnosticLogStore(policy.control_root, policy.diagnostic_log_limit_bytes, database, [
+    policy.config_root,
+    policy.release_root,
+    path.dirname(policy.current_pointer),
+  ]);
   const releases = new ReleaseStore(policy);
   const controller = new UpdateController(
     database,
@@ -53,27 +76,21 @@ async function main(): Promise<void> {
   );
   try {
     if (command === "status") {
-      const requestId = process.argv[3];
-      if (process.argv.length > (requestId ? 4 : 3)) usage();
-      console.log(JSON.stringify(await controller.status(requestId ? parseRequestId(requestId) : undefined), null, 2));
+      console.log(JSON.stringify(await controller.status(requestId), null, 2));
       return;
     }
     if (command === "doctor") {
-      if (process.argv.length !== 3) usage();
       console.log(JSON.stringify(await controller.doctor(), null, 2));
       return;
     }
     if (command === "reconcile") {
-      if (process.argv.length !== 4) usage();
-      console.log(JSON.stringify(await controller.reconcile(parseRequestId(process.argv[3])), null, 2));
+      console.log(JSON.stringify(await controller.reconcile(requestId!), null, 2));
       return;
     }
     if (command === "rollback") {
-      if (process.argv.length !== 6 || process.argv[4] !== "--confirm-plan-hash" || !/^[0-9a-f]{64}$/.test(process.argv[5] ?? "")) usage();
-      console.log(JSON.stringify(await controller.operatorRollback(parseRequestId(process.argv[3]), process.argv[5]!), null, 2));
+      console.log(JSON.stringify(await controller.operatorRollback(requestId!, confirmedPlanHash!), null, 2));
       return;
     }
-    if (command !== "serve" || process.argv.length !== 3) usage();
     const service = new UpdateService(controller, logger);
     const api = new UpdaterApi(path.join(policy.control_root, "updater.sock"), controller, database, service, logger);
     await initializeServe(api, diagnostics, controller, service);

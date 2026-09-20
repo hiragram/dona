@@ -13,7 +13,7 @@ describe("DiagnosticLogStore", { concurrency: false }, () => {
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
 
-async function fixture(perLogLimit = 16 * 1024) {
+async function fixture(perLogLimit = 16 * 1024, privateRoots: readonly string[] = []) {
   const { root, policy } = await tempPolicy();
   roots.push(root);
   const database = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
@@ -34,7 +34,7 @@ async function fixture(perLogLimit = 16 * 1024) {
     approval_id: "approval-diagnostics",
   });
   const claimed = database.claim(planned.row.request_id, "diagnostic-test", 60_000)!;
-  const store = new DiagnosticLogStore(policy.control_root, perLogLimit, database);
+  const store = new DiagnosticLogStore(policy.control_root, perLogLimit, database, privateRoots);
   return { root, policy, database, store, claimed };
 }
 
@@ -63,7 +63,7 @@ test("durable capture keeps a late failure after the memory prefix is truncated"
 });
 
 test("streaming redaction covers split UTF-8, token, URL, and local path before persistence", async () => {
-  const f = await fixture();
+  const f = await fixture(16 * 1024, ["/opt/company/private releases"]);
   try {
     const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-test" });
     const utf8Prefix = Buffer.from("前半🙂 token=sec");
@@ -204,6 +204,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(privateKeyDetail.includes("camel-secret"), false, privateKeyDetail);
     assert.equal(privateKeyDetail.includes("hyphen-secret"), false, privateKeyDetail);
     assert.match(privateKeyDetail, /visible-after-private-key/);
+
+    const configuredRootCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:configured-root" });
+    configuredRootCapture.write("stderr", Buffer.from("failed at /opt/company/private "));
+    configuredRootCapture.write("stderr", Buffer.from("releases/staging/source.ts:42\nvisible-after-configured-root"));
+    configuredRootCapture.finish(true);
+    const configuredRootDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[15]!, 16_384).detail_tail);
+    assert.equal(configuredRootDetail.includes("/opt/company"), false, configuredRootDetail);
+    assert.equal(configuredRootDetail.includes("staging/source.ts"), false, configuredRootDetail);
+    assert.match(configuredRootDetail, /visible-after-configured-root/);
   } finally {
     f.database.close();
   }
