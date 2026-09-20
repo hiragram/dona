@@ -292,6 +292,7 @@ export interface DiagnosticLogCapture extends DiagnosticLogIdentity {
   log_id: string;
   relative_ref: string | null;
   byte_size: number;
+  content_sha256: string | null;
   capture_state: Exclude<DiagnosticLogStoredState, "capturing" | "purged">;
   error_code: string | null;
   created_at: string;
@@ -302,6 +303,7 @@ export interface DiagnosticLogRow extends DiagnosticLogIdentity {
   log_id: string;
   relative_ref: string | null;
   byte_size: number;
+  content_sha256: string | null;
   capture_state: DiagnosticLogStoredState;
   error_code: string | null;
   created_at: string;

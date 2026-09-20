@@ -103,7 +103,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 6) throw new Error(`Updater database schema ${version} is newer than supported schema 6`);
+    if (version > 7) throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -193,6 +193,7 @@ export class UpdateDatabase {
         step          TEXT NOT NULL,
         relative_ref  TEXT,
         byte_size     INTEGER NOT NULL DEFAULT 0,
+        content_sha256 TEXT,
         capture_state TEXT NOT NULL CHECK (capture_state IN ('capturing','complete','truncated','write_failed','purged')),
         error_code    TEXT,
         created_at    TEXT NOT NULL,
@@ -221,7 +222,7 @@ export class UpdateDatabase {
         updated_at          TEXT NOT NULL,
         UNIQUE(request_id, kind)
       );
-      PRAGMA user_version = 6;
+      PRAGMA user_version = 7;
     `);
     if (version === 1) migrate(`
       ALTER TABLE update_requests ADD COLUMN reconcile_after TEXT;
@@ -286,6 +287,10 @@ export class UpdateDatabase {
       );
       PRAGMA user_version = 6;
     `);
+    if (version >= 1 && version <= 6) migrate(`
+      ALTER TABLE update_diagnostic_logs ADD COLUMN content_sha256 TEXT;
+      PRAGMA user_version = 7;
+    `);
   }
 
   close(): void {
@@ -342,11 +347,27 @@ export class UpdateDatabase {
     })();
   }
 
+  recordFailedDiagnosticLog(capture: DiagnosticLogCapture): void {
+    this.db.transaction(() => {
+      const request = this.getRequired(capture.request_id);
+      if (request.attempt !== capture.attempt || request.completed_at !== null || capture.relative_ref !== null ||
+        capture.byte_size !== 0 || capture.content_sha256 !== null || capture.capture_state !== "write_failed") {
+        throw new Error("diagnostic_log_request_binding_mismatch");
+      }
+      this.db.prepare(`INSERT INTO update_diagnostic_logs (
+        log_id, request_id, attempt, step, relative_ref, byte_size, content_sha256, capture_state, error_code, created_at, finalized_at
+      ) VALUES (?, ?, ?, ?, NULL, 0, NULL, 'write_failed', ?, ?, ?)`).run(
+        capture.log_id, capture.request_id, capture.attempt, capture.step, capture.error_code,
+        capture.created_at, capture.finalized_at,
+      );
+    })();
+  }
+
   finalizeDiagnosticLog(capture: DiagnosticLogCapture): void {
-    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET relative_ref = ?, byte_size = ?, capture_state = ?,
+    const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET relative_ref = ?, byte_size = ?, content_sha256 = ?, capture_state = ?,
       error_code = ?, finalized_at = ?
       WHERE log_id = ? AND request_id = ? AND attempt = ? AND step = ? AND capture_state = 'capturing'`)
-      .run(capture.relative_ref, capture.byte_size, capture.capture_state, capture.error_code, capture.finalized_at,
+      .run(capture.relative_ref, capture.byte_size, capture.content_sha256, capture.capture_state, capture.error_code, capture.finalized_at,
         capture.log_id, capture.request_id, capture.attempt, capture.step).changes;
     if (changed !== 1) throw new Error("diagnostic_log_finalize_binding_mismatch");
   }
@@ -368,7 +389,7 @@ export class UpdateDatabase {
 
   interruptDiagnosticLog(logId: string, errorCode: string, at = new Date()): void {
     const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'write_failed', relative_ref = NULL,
-      byte_size = 0, error_code = ?, finalized_at = ? WHERE log_id = ? AND capture_state = 'capturing'`)
+      byte_size = 0, content_sha256 = NULL, error_code = ?, finalized_at = ? WHERE log_id = ? AND capture_state = 'capturing'`)
       .run(errorCode, at.toISOString(), logId).changes;
     if (changed !== 1) throw new Error("diagnostic_log_interrupt_state_mismatch");
   }
@@ -392,7 +413,7 @@ export class UpdateDatabase {
 
   markDiagnosticPurged(logId: string, at = new Date()): void {
     const changed = this.db.prepare(`UPDATE update_diagnostic_logs SET capture_state = 'purged', relative_ref = NULL,
-      error_code = NULL, purged_at = ? WHERE log_id = ? AND capture_state IN ('complete','truncated','write_failed')`)
+      content_sha256 = NULL, error_code = NULL, purged_at = ? WHERE log_id = ? AND capture_state IN ('complete','truncated','write_failed')`)
       .run(at.toISOString(), logId).changes;
     if (changed !== 1) throw new Error("diagnostic_log_purge_state_mismatch");
   }

@@ -44,7 +44,7 @@ pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit
 - `get_self_update_status`の`diagnostics`は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを返します。private absolute pathは返しません。
 - token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
 - temp fileのまま停止したcaptureは、SQLiteの`updater_writer_lease`をtransactionで取得し、その後にUpdater API socketを取得した単一writerのservice起動時だけ安全性を再検証して回収し、`write_failed`へ落とします。別の生存PIDがleaseを保持している場合はsocketへ触れず起動を拒否し、停止時はservice loopを止めてからleaseを解放します。crash後のdead PIDだけをCASで引き継ぎ、PID再利用など生存判定が曖昧な場合はfail closedにします。read-only CLIによるDB openはactive captureを変更しません。final file不在やsize不一致も`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
-- control DBは診断log tableとwriter leaseを含む`user_version = 6`へforward-onlyで移行します。schema 6を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
+- control DBは診断logのcontent digestとwriter leaseを含む`user_version = 7`へforward-onlyで移行します。schema 7を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
 - retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
 
 この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。

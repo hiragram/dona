@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -18,6 +19,7 @@ const maxCarryCharacters = 4_096;
 
 export interface DiagnosticLogIndex {
   reserveDiagnosticLog(capture: DiagnosticLogCapture): void;
+  recordFailedDiagnosticLog(capture: DiagnosticLogCapture): void;
   finalizeDiagnosticLog(capture: DiagnosticLogCapture): void;
   discardDiagnosticLog(logId: string): void;
   diagnosticLogs(requestId: string): DiagnosticLogRow[];
@@ -69,7 +71,7 @@ class StreamingRedactor {
         this.quoteBackslashParity = false;
         continue;
       }
-      const assignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*)\s*[:=]\s*(["']?)/i
+      const assignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*)\s*[:=]\s*(["']?)/i
         .exec(this.pending);
       if (assignment?.index !== undefined) {
         output += redactText(this.pending.slice(0, assignment.index), Number.MAX_SAFE_INTEGER);
@@ -108,7 +110,7 @@ class StreamingRedactor {
       for (const match of this.pending.matchAll(/[\s"'<>]/g)) lastBoundary = match.index;
       if (lastBoundary >= 0) {
         const safe = this.pending.slice(0, lastBoundary + 1);
-        const partialAssignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*)\s*$/i.exec(safe);
+        const partialAssignment = /(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*)\s*$/i.exec(safe);
         if (partialAssignment?.index !== undefined) {
           output += redactText(safe.slice(0, partialAssignment.index), Number.MAX_SAFE_INTEGER);
           this.pending = safe.slice(partialAssignment.index) + this.pending.slice(lastBoundary + 1);
@@ -125,7 +127,7 @@ class StreamingRedactor {
         continue;
       }
       if (this.pending.length <= maxCarryCharacters) return output;
-      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|api_?key|token|secret|password)[a-z0-9_]*)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
+      const sensitive = /(?:\b(?:xapp|xox[abp])[-_]|\b(?:ghp|github_pat)_|(?:^|[^a-z0-9_])(?:"[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*"|'[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*'|[a-z0-9_]*(?:authorization|auth_?token|_auth|api_?key|token|secret|password)[a-z0-9_]*)\s*[:=]|https?:\/\/|\/(?:Users|home|private|var\/folders|tmp)\/)/i.exec(this.pending);
       if (sensitive?.index !== undefined) {
         output += redactText(this.pending.slice(0, sensitive.index), Number.MAX_SAFE_INTEGER);
         this.pending = this.pending.slice(sensitive.index);
@@ -228,25 +230,26 @@ export class DiagnosticLogStore {
       log_id: logId,
       relative_ref: relativeRef,
       byte_size: 0,
+      content_sha256: null,
       capture_state: "write_failed",
       error_code: null,
       created_at: at.toISOString(),
       finalized_at: at.toISOString(),
     };
-    this.index?.reserveDiagnosticLog(initial);
     try {
       this.ensurePrivateDirectory(this.root);
       this.ensurePrivateDirectory(this.logsRoot);
     } catch {
       const failed = { ...initial, relative_ref: null, error_code: "diagnostic_root_unavailable" };
       return { write() {}, finish: (commandFailed) => {
-        try {
-          if (commandFailed) this.index?.finalizeDiagnosticLog(failed);
-          else this.index?.discardDiagnosticLog(logId);
-        } catch { /* diagnostic failure must not hide command outcome */ }
+        if (commandFailed) {
+          try { this.index?.recordFailedDiagnosticLog(failed); }
+          catch { /* diagnostic failure must not hide command outcome */ }
+        }
         return commandFailed ? failed : undefined;
       } };
     }
+    this.index?.reserveDiagnosticLog(initial);
     const temporary = path.join(this.logsRoot, `${logId}.part`);
     const finalPath = path.join(this.logsRoot, `${logId}.log`);
     let descriptor = -1;
@@ -282,6 +285,7 @@ export class DiagnosticLogStore {
     }
     const redactors = { stdout: new StreamingRedactor(), stderr: new StreamingRedactor() };
     let bytes = 0;
+    const contentHash = createHash("sha256");
     let truncated = false;
     let writeFailed = false;
     const append = (stream: "stdout" | "stderr", text: string): void => {
@@ -299,6 +303,7 @@ export class DiagnosticLogStore {
           while (written < selected.length) {
             const count = fs.writeSync(descriptor, selected, written, selected.length - written);
             if (count <= 0) throw new Error("diagnostic_short_write");
+            contentHash.update(selected.subarray(written, written + count));
             written += count;
             bytes += count;
           }
@@ -332,6 +337,7 @@ export class DiagnosticLogStore {
         let errorCode: string | null = null;
         let recoveryRequired = false;
         let published = false;
+        let contentSha256: string | null = null;
         try {
           if (writeFailed) throw new Error("write");
           fs.fsyncSync(descriptor);
@@ -355,6 +361,7 @@ export class DiagnosticLogStore {
           fs.chmodSync(finalPath, 0o600);
           fs.closeSync(descriptor);
           this.fsyncLogsDirectory();
+          contentSha256 = contentHash.digest("hex");
         } catch {
           errorCode = writeFailed ? "diagnostic_write_failed" : "diagnostic_finalize_failed";
           try { fs.closeSync(descriptor); } catch { /* already closed */ }
@@ -365,6 +372,7 @@ export class DiagnosticLogStore {
           ...initial,
           relative_ref: errorCode && !recoveryRequired ? null : relativeRef,
           byte_size: errorCode && !recoveryRequired ? 0 : bytes,
+          content_sha256: errorCode ? null : contentSha256,
           capture_state: errorCode ? "write_failed" : truncated ? "truncated" : "complete",
           error_code: errorCode,
           finalized_at: new Date().toISOString(),
@@ -372,7 +380,7 @@ export class DiagnosticLogStore {
         if (recoveryRequired) return capture;
         try { this.index?.finalizeDiagnosticLog(capture); } catch {
           try { if (capture.relative_ref) fs.unlinkSync(finalPath); } catch { /* best effort */ }
-          return { ...capture, relative_ref: null, byte_size: 0, capture_state: "write_failed", error_code: "diagnostic_index_write_failed" };
+          return { ...capture, relative_ref: null, byte_size: 0, content_sha256: null, capture_state: "write_failed", error_code: "diagnostic_index_write_failed" };
         }
         return capture;
       },
@@ -402,6 +410,9 @@ export class DiagnosticLogStore {
       if (stats.size !== row.byte_size) {
         return { ...common, capture_state: "size_mismatch" satisfies DiagnosticLogState, error_code: "diagnostic_size_mismatch" };
       }
+      if (!row.content_sha256 || !/^[0-9a-f]{64}$/.test(row.content_sha256)) {
+        return { ...common, capture_state: "read_error" satisfies DiagnosticLogState, error_code: "diagnostic_digest_missing" };
+      }
       const start = Math.max(0, stats.size - previewLimitBytes);
       const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
@@ -410,14 +421,20 @@ export class DiagnosticLogStore {
           opened.uid !== stats.uid || opened.dev !== stats.dev || opened.ino !== stats.ino || opened.size !== stats.size) {
           throw new Error("diagnostic_open_identity_mismatch");
         }
-        const buffer = Buffer.alloc(stats.size - start);
+        const digest = createHash("sha256");
+        let tail = Buffer.alloc(0);
         let offset = 0;
-        while (offset < buffer.length) {
-          const count = fs.readSync(descriptor, buffer, offset, buffer.length - offset, start + offset);
+        while (offset < stats.size) {
+          const buffer = Buffer.alloc(Math.min(64 * 1024, stats.size - offset));
+          const count = fs.readSync(descriptor, buffer, 0, buffer.length, offset);
           if (count <= 0) throw new Error("diagnostic_short_read");
+          const selected = buffer.subarray(0, count);
+          digest.update(selected);
+          tail = Buffer.concat([tail, selected]).subarray(-previewLimitBytes);
           offset += count;
         }
-        return { ...common, capture_state: row.capture_state, detail_tail: buffer.toString("utf8") };
+        if (digest.digest("hex") !== row.content_sha256) throw new Error("diagnostic_digest_mismatch");
+        return { ...common, capture_state: row.capture_state, detail_tail: tail.toString("utf8") };
       } finally {
         fs.closeSync(descriptor);
       }

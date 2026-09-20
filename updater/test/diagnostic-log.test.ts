@@ -56,6 +56,7 @@ test("durable capture keeps a late failure after the memory prefix is truncated"
     assert.match(String(projected.detail_tail), /\[stderr\]/);
     assert.match(String(projected.detail_tail), /late assertion failure/);
     assert.equal(projected.log_id, result.diagnostic_log?.log_id);
+    assert.match(String(row.content_sha256), /^[0-9a-f]{64}$/);
   } finally {
     f.database.close();
   }
@@ -174,6 +175,15 @@ test("streaming redaction covers split UTF-8, token, URL, and local path before 
     assert.equal(apiKeyDetail.includes("environment-secret"), false, apiKeyDetail);
     assert.equal(apiKeyDetail.includes("json-api-secret"), false, apiKeyDetail);
     assert.match(apiKeyDetail, /visible-after-api-key/);
+
+    const legacyNpmAuthCapture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-legacy-auth" });
+    legacyNpmAuthCapture.write("stderr", Buffer.from("//registry.example/:_au"));
+    legacyNpmAuthCapture.write("stderr", Buffer.from("th=BASE64_CREDENTIAL\nvisible-after-legacy-auth"));
+    legacyNpmAuthCapture.finish(true);
+    const legacyNpmAuthDetail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[12]!, 16_384).detail_tail);
+    assert.equal(legacyNpmAuthDetail.includes("BASE64_CREDENTIAL"), false, legacyNpmAuthDetail);
+    assert.match(legacyNpmAuthDetail, /REDACTED_STREAM/);
+    assert.match(legacyNpmAuthDetail, /visible-after-legacy-auth/);
   } finally {
     f.database.close();
   }
@@ -259,6 +269,27 @@ test("read projection refuses missing, size-mismatched, and hard-linked files", 
     const third = make("dispatcher:npm-typecheck");
     await fs.unlink(path.join(f.policy.control_root, "diagnostics", third.relative_ref!));
     assert.equal(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[2]!).capture_state, "missing");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("read projection rejects same-inode same-size content replacement", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "dispatcher:npm-digest" });
+    capture.write("stderr", Buffer.from("redacted failure detail"));
+    const completed = capture.finish(true)!;
+    const row = f.database.diagnosticLogs(f.claimed.request_id)[0]!;
+    const file = path.join(f.policy.control_root, "diagnostics", completed.relative_ref!);
+    const before = await fs.stat(file);
+    await fs.writeFile(file, Buffer.alloc(row.byte_size, 0x78), { flag: "r+" });
+    const after = await fs.stat(file);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    const projected = f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!);
+    assert.equal(projected.capture_state, "read_error");
+    assert.equal(projected.error_code, "diagnostic_read_failed");
   } finally {
     f.database.close();
   }
@@ -515,6 +546,25 @@ test("unsafe managed root becomes write_failed without changing command failure"
     assert.equal(f.database.diagnosticLogs(f.claimed.request_id)[0]?.capture_state, "write_failed");
   } finally {
     await fs.chmod(path.join(f.policy.control_root, "diagnostics"), 0o700);
+    f.database.close();
+  }
+});
+
+test("creates the managed logs directory before reserving a capturing row", async () => {
+  const f = await fixture();
+  const originalReserve = f.database.reserveDiagnosticLog.bind(f.database);
+  let directoryExistedAtReservation = false;
+  try {
+    f.database.reserveDiagnosticLog = ((capture) => {
+      directoryExistedAtReservation = fsSync.existsSync(path.join(f.policy.control_root, "diagnostics", "logs"));
+      return originalReserve(capture);
+    }) as typeof f.database.reserveDiagnosticLog;
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-directory-order" });
+    capture.write("stderr", Buffer.from("failure"));
+    capture.finish(true);
+    assert.equal(directoryExistedAtReservation, true);
+  } finally {
+    f.database.reserveDiagnosticLog = originalReserve;
     f.database.close();
   }
 });

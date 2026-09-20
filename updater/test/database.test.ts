@@ -43,7 +43,7 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
-  test("atomically migrates the released schema 1 database through schema 6", async () => {
+  test("atomically migrates the released schema 1 database through schema 7", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -73,7 +73,9 @@ describe("UpdateDatabase", () => {
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_operations'").get());
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'update_diagnostic_logs'").get());
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'updater_writer_lease'").get());
-    assert.equal(migrated.pragma("user_version", { simple: true }), 6);
+    const diagnosticColumns = migrated.pragma("table_info(update_diagnostic_logs)") as Array<{ name: string }>;
+    assert.ok(diagnosticColumns.some((column) => column.name === "content_sha256"));
+    assert.equal(migrated.pragma("user_version", { simple: true }), 7);
     migrated.close();
   });
 
