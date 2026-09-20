@@ -19,6 +19,10 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "createJob", args: [input] });
         return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
       },
+      async delegateScheduledWork(eventId) {
+        calls.push({ method: "delegateScheduledWork", args: [eventId] });
+        return { schema_version: 1, outcome: "created", job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
+      },
       async getJob(jobId, sourceEventId) {
         calls.push({ method: "getJob", args: [jobId, sourceEventId] });
         return { schema_version: 1, job: { job_id: jobId, status: "running", notification_state:"needs_review", notification_authorization_phase:"preflight" } };
@@ -77,6 +81,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
         "delegate_job",
+        "delegate_scheduled_work",
         "list_event_jobs",
         "list_thread_jobs",
         "list_owner_jobs",
@@ -128,6 +133,17 @@ describe("Dona Dispatcher MCP server", () => {
         }],
       }]);
 
+      const scheduled = await client.callTool({
+        name: "delegate_scheduled_work",
+        arguments: { event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
+      });
+      assert.equal(scheduled.isError, undefined);
+      assert.deepEqual((scheduled.structuredContent as Record<string,unknown>).action, {
+        tool: "delegate_scheduled_work", source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
+        job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", outcome: "created",
+      });
+      assert.deepEqual(calls[1], { method: "delegateScheduledWork", args: ["evt_01M1ES03XY5CF8D9PM5CWX4SRV"] });
+
       const status = await client.callTool({
         name: "get_job_status",
         arguments: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv", source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV" },
@@ -135,7 +151,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(status.isError, undefined);
       assert.equal((status.structuredContent as {job:Record<string,unknown>}).job.notification_authorization_phase,"preflight");
       assert.equal((status.structuredContent as { job: { status: string } }).job.status, "running");
-      assert.deepEqual(calls[1], {
+      assert.deepEqual(calls[2], {
         method: "getJob",
         args: ["job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV"],
       });

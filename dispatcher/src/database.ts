@@ -73,6 +73,11 @@ export class JobCreationError extends Error {
     super(message); this.name = "JobCreationError";
   }
 }
+export class ScheduledJobCreationError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message); this.name = "ScheduledJobCreationError";
+  }
+}
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
@@ -577,13 +582,13 @@ export class DispatcherDatabase {
     const binding = readEventJobBinding(this.db, sourceEvent.event_id);
     if (!binding) throw new Error(`Event ${sourceEvent.event_id} does not have an authorized job owner`);
     if (binding.owner.kind === "schedule" && parsedRequest.workspace.kind !== "scratch") {
-      throw new Error("Scheduled work permits only a scratch workspace");
+      throw new ScheduledJobCreationError("scheduled_workspace_mismatch", "Scheduled work permits only a scratch workspace");
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
       if (parsedRequest.job_key!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
-        throw new Error("Scheduled work request does not match its persisted read-only scope");
+        throw new ScheduledJobCreationError("scheduled_scope_mismatch", "Scheduled work request does not match its persisted read-only scope");
       }
     }
 
@@ -604,21 +609,21 @@ export class DispatcherDatabase {
             WHERE r.run_id=? AND r.job_id=? AND r.revision=? AND r.status='started'
               AND s.state='active' AND s.revision=r.revision AND julianday(v.expires_at)>julianday(?)`).get(
             binding.owner.run_id,existing.job_id,binding.owner.revision,at.toISOString());
-          if(!["dispatching","waiting_agent"].includes(sourceEvent.status)||!authorized) throw new Error("Schedule run is no longer authorized for job reuse");
+          if(!["dispatching","waiting_agent"].includes(sourceEvent.status)||!authorized) throw new ScheduledJobCreationError("scheduled_run_not_authorized", "Schedule run is no longer authorized for job reuse");
         }
         return {row:this.getJobRequired(existing.job_id),outcome:"reused",duplicate:true};
       }
       if(binding.owner.kind==="schedule") {
         if(!["dispatching","waiting_agent"].includes(sourceEvent.status)) {
-          throw new Error("Scheduled work event is not dispatching");
+          throw new ScheduledJobCreationError("scheduled_event_not_dispatching", "Scheduled work event is not dispatching");
         }
         const payload=JSON.parse(sourceEvent.payload_json) as {work?:{authorization_target?:{workspace_id?:unknown;channel_id?:unknown}}};
         const target=payload.work?.authorization_target;
-        if(typeof target?.workspace_id!=="string"||typeof target.channel_id!=="string") throw new Error("Scheduled work authorization target is missing");
+        if(typeof target?.workspace_id!=="string"||typeof target.channel_id!=="string") throw new ScheduledJobCreationError("scheduled_authorization_target_missing", "Scheduled work authorization target is missing");
         const earliest=new Date(at.getTime()-120_000).toISOString();
         const consumed=this.db.prepare(`UPDATE events SET schedule_access_consumed_at=? WHERE event_id=? AND schedule_access_checked_at>=?
           AND schedule_access_checked_at<=? AND schedule_access_consumed_at IS NULL`).run(at.toISOString(),sourceEvent.event_id,earliest,at.toISOString()).changes;
-        if(consumed!==1) throw new Error("Scheduled work current access receipt is missing or expired");
+        if(consumed!==1) throw new ScheduledJobCreationError("scheduled_access_receipt_unavailable", "Scheduled work current access receipt is missing or expired");
       } else {
         if(["completed","blocked","needs_review","dead_letter"].includes(sourceEvent.status)) throw new JobCreationError("job_group_closed","Source event is closed");
         const group=this.db.prepare("SELECT sealed_at,notification_mode FROM job_groups WHERE source_event_id=?").get(sourceEvent.event_id) as {sealed_at:string|null;notification_mode:string}|undefined;
@@ -689,8 +694,26 @@ export class DispatcherDatabase {
       }
       return { row: this.getJobRequired(jobId), outcome:"created", duplicate: false };
     }).immediate();
-    if (!created) throw new Error("Schedule run is no longer authorized for job creation");
+    if (!created) throw new ScheduledJobCreationError("scheduled_run_not_authorized", "Schedule run is no longer authorized for job creation");
     return created;
+  }
+
+  createScheduledJob(sourceEventId: string, workspaceRoot: string, resultDir: string, at = new Date()): CreateJobResult {
+    const event = this.getRequired(sourceEventId);
+    const payload = JSON.parse(event.payload_json) as { work?: { objective?: unknown } };
+    if (event.source !== "dona_schedule" || typeof payload.work?.objective !== "string") {
+      throw new ScheduledJobCreationError("scheduled_contract_missing", "Persisted scheduled work contract is unavailable");
+    }
+    return this.createJob({ source_event_id: sourceEventId, objective: payload.work.objective, workspace: { kind: "scratch" } }, workspaceRoot, resultDir, at);
+  }
+
+  recordScheduledDelegationRejection(eventId: string, code: string, at = new Date()): boolean {
+    if (!/^scheduled_[a-z0-9_]{1,96}$/.test(code)) throw new Error("invalid_scheduled_delegation_code");
+    const changed = this.db.prepare(`UPDATE events SET last_error_code=?,last_error_message=?,updated_at=?
+      WHERE event_id=? AND source='dona_schedule' AND status IN ('dispatching','waiting_agent')
+        AND NOT EXISTS (SELECT 1 FROM schedule_runs WHERE event_id=events.event_id AND job_id IS NOT NULL)`)
+      .run(`delegation_rejected:${code}`, "Scheduled job delegation was definitely rejected before acceptance", at.toISOString(), eventId).changes;
+    return changed === 1;
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -1787,10 +1810,20 @@ export class DispatcherDatabase {
       if(event.source==="dona_schedule") {
         const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
         if(!run?.job_id||run.status==="materialized") {
-          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
-            completed_at:result.completed_at,last_error_code:"schedule_job_not_delegated",last_error_message:"Scheduled work completed without a bound job"});
-          this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",
-            new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
+          const rejected=event.last_error_code?.startsWith("delegation_rejected:")===true;
+          const rejectionCode=rejected?event.last_error_code!.slice("delegation_rejected:".length):undefined;
+          const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).ambiguous===true);
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            typeof (action as Record<string,unknown>).message_ts==="string");
+          const needsReview=ambiguous||posted;
+          this.transition(eventId,["waiting_agent"],rejected&&!needsReview?"dead_letter":"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:rejected?event.last_error_code:"schedule_job_not_delegated",
+            last_error_message:rejected?event.last_error_message:"Scheduled work completed without a bound job"});
+          this.scheduler.settleUndelegatedWorkEvent(eventId,rejected&&!needsReview?"failed":"needs_review",
+            new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
           return;
         }
       }
@@ -1811,6 +1844,24 @@ export class DispatcherDatabase {
       const event=this.getRequired(eventId);
       if(event.status==="completed"&&["schedule_suppressed","schedule_notification_suppressed","job_result_superseded"].includes(event.last_error_code??"")) return;
       if(event.status==="needs_review"&&event.source==="dona_job") return;
+      if(event.source==="dona_schedule") {
+        const run=this.db.prepare("SELECT job_id,status FROM schedule_runs WHERE event_id=?").get(eventId) as {job_id:string|null;status:string}|undefined;
+        const rejected=event.last_error_code?.startsWith("delegation_rejected:")===true;
+        if((!run?.job_id||run.status==="materialized")&&rejected) {
+          const rejectionCode=event.last_error_code!.slice("delegation_rejected:".length);
+          const ambiguous=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).ambiguous===true);
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            typeof (action as Record<string,unknown>).message_ts==="string");
+          const needsReview=ambiguous||posted;
+          this.transition(eventId,["waiting_agent"],needsReview?"needs_review":"dead_letter",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:event.last_error_code,last_error_message:event.last_error_message});
+          this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
+          return;
+        }
+      }
       const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.delivered) {
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});

@@ -53,7 +53,7 @@ export class FakeJobRuntime {
     harness.database.beginDispatch(eventId, path.join(harness.root, "event-results", `${eventId}.json`), new Date(harness.clock.now()));
     harness.database.recordScheduleJobAccess(eventId, { workspace_id: "T_GATE", channel_id: "C_GATE", user_id: "U_GATE",
       issued_at: new Date(harness.clock.now()).toISOString(), nonce: `receipt_${eventId}` }, new Date(harness.clock.now()));
-    const created = harness.database.createJob({ source_event_id: eventId, objective, workspace: { kind: "scratch" } },
+    const created = harness.database.createScheduledJob(eventId,
       path.join(harness.root, "jobs"), path.join(harness.root, "results"), new Date(harness.clock.now()));
     const job = created.row;
     harness.database.beginJobPreparation(job.job_id, new Date(harness.clock.now()));

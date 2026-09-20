@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { dispatcherSchemaCompatibility, JobCreationError, type DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import { envelopeFromRow } from "./prompt.js";
@@ -400,6 +400,31 @@ export class DispatcherApi {
         catch(error) { throw new ApiRequestError(409,"schedule_access_not_authorized",error instanceof Error?error.message:String(error)); }
         return;
       }
+      const scheduledDelegation=/^\/v1\/scheduled-jobs\/([^/]+)\/delegate$/.exec(url.pathname);
+      if(request.method==="POST"&&scheduledDelegation) {
+        const eventId=decodeURIComponent(scheduledDelegation[1]!);
+        if(this.shuttingDown) {
+          this.database.recordScheduledDelegationRejection(eventId,"scheduled_capability_unavailable");
+          throw new ApiRequestError(503,"scheduled_capability_unavailable","Dispatcher is not accepting scheduled delegation while quiescing");
+        }
+        const body=await this.readJson(request);
+        if(body===null||typeof body!=="object"||Array.isArray(body)||Object.keys(body as Record<string,unknown>).length!==0) {
+          this.database.recordScheduledDelegationRejection(eventId,"scheduled_request_invalid");
+          throw new ApiRequestError(400,"scheduled_request_invalid","Scheduled delegation accepts only its event identity");
+        }
+        try {
+          const result=this.database.createScheduledJob(eventId,this.config.jobsWorkspaceRoot,this.config.jobResultsDir);
+          this.jobs.wake();
+          sendJson(response,result.duplicate?200:202,{schema_version:1,outcome:result.outcome,duplicate:result.duplicate,job:result.row});
+        } catch(error) {
+          if(error instanceof ScheduledJobCreationError) {
+            this.database.recordScheduledDelegationRejection(eventId,error.code);
+            throw new ApiRequestError(409,error.code,error.message);
+          }
+          throw error;
+        }
+        return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;
@@ -615,10 +640,19 @@ export class DispatcherApi {
     }
     if (request.method === "POST" && url.pathname === "/v1/jobs") {
       const input = parseCreateJobRequest(await this.readJson(request), true);
+      if (this.database.get(input.source_event_id)?.source === "dona_schedule") {
+        const code="scheduled_dedicated_handoff_required";
+        this.database.recordScheduledDelegationRejection(input.source_event_id,code);
+        throw new ApiRequestError(409,code,"Scheduled work must use the dedicated delegation endpoint");
+      }
       let result;
       try {
         result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
       } catch (error) {
+        if (error instanceof ScheduledJobCreationError) {
+          this.database.recordScheduledDelegationRejection(input.source_event_id,error.code);
+          throw new ApiRequestError(409,error.code,error.message);
+        }
         if (error instanceof JobCreationError) {
           if (error.limitDetails) {
             this.logger.warn("Job creation rejected by resource limit", {

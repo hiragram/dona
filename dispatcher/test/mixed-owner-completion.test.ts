@@ -162,7 +162,7 @@ for (const schema of ["fresh","v2"] as const) for (const outcome of ["completed"
         const created = await client.createJob({ source_event_id: ordinary.event_id, job_key, objective: "通常の調査", workspace: { kind: "scratch" } }) as { job: { job_id: string } };
         jobs.push(h.database.getJob(created.job.job_id)!);
       }
-      const created = await client.createJob({ source_event_id: eventId, objective: scheduledObjective, workspace: { kind: "scratch" } }) as { job: { job_id: string } };
+      const created = await client.delegateScheduledWork(eventId) as { job: { job_id: string } };
       jobs.push(h.database.getJob(created.job.job_id)!);
       assert.equal(jobs[2]!.objective,scheduledObjective);
       for (const id of [ordinary.event_id, eventId]) h.database.saveCompleted(id, { schema_version: 1, event_id: id, status: "completed", completed_at: new Date().toISOString() }, path.join(root, `${id}.json`));

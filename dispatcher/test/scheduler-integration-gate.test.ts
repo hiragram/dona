@@ -179,7 +179,7 @@ test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過
     const authorized = await client.recordScheduleJobAccess(eventId, receipt);
     assert.equal(authorized.authorized, true);
     assert.equal(harness.database.get(eventId)?.status, "waiting_agent");
-    const created = await client.createJob({ source_event_id: eventId, objective: "inspect repository read-only", workspace: { kind: "scratch" } });
+    const created = await client.delegateScheduledWork(eventId);
     const job = created.job as { job_id: string };
     assert.ok(job.job_id);
     await assert.rejects(client.recordScheduleJobAccess(eventId, receipt), /schedule_access_receipt_mismatch/);
@@ -204,6 +204,23 @@ test("署名済みaccess receiptはDispatcher UDSとcurrent Slack確認を通過
     const posted = fakeSlack.postWorkResult(notification.event_id, "read-only work completed");
     assert.equal(posted.event_id, notification.event_id);
     assert.equal(fakeSlack.workCalls.length, 1);
+
+    const rejectedDue = new Date(Date.parse(harness.clock.now()) + 1000).toISOString().replace(".000Z","Z");
+    const rejectedRunId = harness.materialize("generic_key_rejected", harness.input("work.read_only", false, rejectedDue), rejectedDue);
+    const rejectedEventId = harness.repo.getRun(rejectedRunId)!.event_id!;
+    const rejectedResultPath = path.join(harness.root, "event-results", `${rejectedEventId}.json`);
+    harness.database.beginDispatch(rejectedEventId, rejectedResultPath, new Date());
+    const rejectedClaims = { ...claims, event_id: rejectedEventId, issued_at: new Date().toISOString(), nonce: `signed_${rejectedEventId}` };
+    const rejectedPayload = Buffer.from(JSON.stringify(rejectedClaims)).toString("base64url");
+    const rejectedReceipt = `${rejectedPayload}.${createHmac("sha256", token).update(rejectedPayload).digest("base64url")}`;
+    await client.recordScheduleJobAccess(rejectedEventId, rejectedReceipt);
+    await assert.rejects(client.createJob({ source_event_id: rejectedEventId,
+      objective: "inspect repository read-only", workspace: { kind: "scratch" } }), /scheduled_dedicated_handoff_required/);
+    assert.equal(harness.database.get(rejectedEventId)?.last_error_code,"delegation_rejected:scheduled_dedicated_handoff_required");
+    harness.database.saveFailedResult(rejectedEventId,{schema_version:1,event_id:rejectedEventId,status:"failed",
+      summary:"delegation rejected",actions:[],completed_at:new Date().toISOString()},rejectedResultPath,new Date());
+    assert.equal(harness.repo.getRun(rejectedRunId)?.status,"failed");
+    assert.notEqual(harness.repo.getRun(rejectedRunId)?.reason,"ambiguous_write");
   } finally {
     if (api) await api.stop();
     if (slack?.listening) await new Promise<void>((resolve, reject) => slack!.close(error => error ? reject(error) : resolve()));

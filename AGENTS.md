@@ -61,7 +61,7 @@ Dispatcherのpromptには、次の値が含まれる。
 
 - `type: "app_mention"`はDonaが明示的に呼ばれたイベントなので、原則として対応対象とする。
 - `source: "dona_job"`の`job_completed`、`job_failed`、`job_blocked`、`job_cancelled`、`job_needs_review`は、Dispatcherが生成したバックグラウンドジョブの状態通知である。通常のSlack本文として宛先判定をやり直さず、後述のジョブ完了処理を行う。
-- `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`へ現在の`event_id`も渡して、`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`と共に返る署名済み`access_receipt`を直後にDispatcher MCPの`record_schedule_job_access`へ渡し、その成功直後だけ`delegate_job`を呼ぶ。receiptは対象event/workspace/channel/user/発行時刻へ束縛され、一度だけ記録・消費されて120秒で失効する。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_job`側でも永続schedule state・revision・expiryを再検証する。
+- `source: "dona_schedule"`のworkを委任する前には、`subject.tenant_id`と一致するworkspace aliasを確定し、Slack MCPの`check_user_channel_access`へ現在の`event_id`も渡して、`subject.owner_id`が`payload.work.authorization_target`（承認時channel）へ現在もアクセスできることを確認する。`authorized: true`と共に返る署名済み`access_receipt`を直後にDispatcher MCPの`record_schedule_job_access`へ渡し、その成功直後だけ現在の`event_id`で`delegate_scheduled_work`を呼ぶ。schedule workでは`delegate_job`を使わず、objective、workspace、scope、`job_key`を送らない。Dispatcherが永続化済み契約から復元する。receiptは対象event/workspace/channel/user/発行時刻へ束縛され、一度だけ記録・消費されて120秒で失効する。照会不能・不一致・非許可ではfail-closedとし委任しない。`authorization_target`は通知先として使用せず、`delegate_scheduled_work`側でも永続schedule state・revision・expiryを再検証する。
 - `type: "message"`かつ`subject.channel_type: "im"`はDonaとの1対1のDMなので、原則として対応対象とする。
 - public channelの`channel`、private channelの`group`、グループDMの`mpim`で発生した通常の`message`は、Donaも受信したというだけで、Dona宛とは限らない。
 - 通常の`message`では、Donaへの明示的な依頼や質問、Donaが参加しているスレッドへの返答、Donaの対応が必要な明確な理由がある場合だけ対応対象とする。
@@ -110,7 +110,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - GitHubリポジトリの調査・変更は`workspace_kind: "github"`と`repository: "owner/repo"`を指定する。必要なら`base_ref`も指定できる。worktreeは`~/.dona/workspaces/github/<owner>/<repo>/worktrees/<job_id>/`、branchは`dona/<job_id>`になる。
 - Dona独自のリポジトリ許可台帳はない。対象リポジトリの認証と権限は`gh`およびGitHub側に従う。依頼にないリポジトリへ対象を広げない。
 - `source_event_id`には現在のEvent Promptの`event_id`を使う。`objective`には、ワーカーが元のSlack会話を再読しなくても作業できる具体的な目的、制約、期待成果を含める。ただしtokenや不要なSlack本文全文を含めない。
-- 独立目的ごとに初回write前に安定した`job_key`を決め、`delegate_job`を1回ずつ呼ぶ。random key生成をDispatcherへ期待しない。key省略はlegacy互換に限る。
+- 通常jobは独立目的ごとに初回write前に安定した`job_key`を決め、`delegate_job`を1回ずつ呼ぶ。random key生成をDispatcherへ期待しない。key省略はlegacy互換に限る。schedule workはこの規則の対象外で、`delegate_scheduled_work`へevent IDだけを渡す。
 - 成功した`created` / `reused` callの`action`だけをResult Envelopeの`actions`へ記録する。fieldは`tool`、`source_event_id`、`job_key`、`job_id`、`outcome`だけとし、objective、workspace path、result path、secret、conflict、未実行案を成功actionに含めない。
 - 1件目成功後に2件目がvalidation/conflict/limitで失敗しても、成功済jobをrollback・cancelしない。確定済jobと失敗理由を区別したpartial successを利用者とResultのsummaryへ明示し、eventを`completed`として公開できる。
 - 委任成功後はワーカーを待たずEvent Resultを公開し、group terminal通知までAgent Sessionを`processing`に保つ。個別progressでは投稿・active遷移をしない。attention通知は後述の規則で`suspended`にする。
