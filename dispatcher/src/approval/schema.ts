@@ -219,6 +219,59 @@ const indexSql = `
 const schemaV3Sql = schemaV2Sql.replace("CHECK(version=2)", "CHECK(version=3)")
   .replace("INSERT INTO approval_schema VALUES (2)", "INSERT INTO approval_schema VALUES (3)") + indexSql;
 
+const payloadSql = `
+CREATE TABLE approval_payload_metadata (
+  payload_ref TEXT PRIMARY KEY NOT NULL CHECK(length(payload_ref) BETWEEN 1 AND 128),
+  instance_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+  owner_kind TEXT NOT NULL CHECK(owner_kind IN ('request','attempt')), owner_id TEXT NOT NULL,
+  request_id TEXT NOT NULL REFERENCES approval_requests(request_id), attempt_id TEXT, consume_id TEXT,
+  binding_json TEXT NOT NULL CHECK(json_valid(binding_json) AND length(CAST(binding_json AS BLOB))<=4096),
+  envelope_digest TEXT NOT NULL CHECK(length(envelope_digest)=64 AND envelope_digest NOT GLOB '*[^a-f0-9]*'),
+  state TEXT NOT NULL CHECK(state IN ('active','deleted')),
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL, deleted_at TEXT,
+  UNIQUE(owner_kind,owner_id),
+  FOREIGN KEY(attempt_id,request_id,consume_id) REFERENCES approval_execution_attempts(attempt_id,request_id,consume_id),
+  CHECK((owner_kind='request' AND owner_id=request_id AND attempt_id IS NULL AND consume_id IS NULL)
+    OR (owner_kind='attempt' AND owner_id=attempt_id AND attempt_id IS NOT NULL AND consume_id IS NOT NULL)),
+  CHECK((state='active' AND deleted_at IS NULL) OR (state='deleted' AND deleted_at IS NOT NULL)),
+  CHECK(json_extract(binding_json,'$.codec_version') IS 1),
+  CHECK(json_extract(binding_json,'$.scope.instance_id') IS instance_id),
+  CHECK(json_extract(binding_json,'$.scope.workspace_id') IS workspace_id),
+  CHECK(json_extract(binding_json,'$.owner_kind') IS owner_kind),
+  CHECK(json_extract(binding_json,'$.owner_id') IS owner_id),
+  CHECK(json_extract(binding_json,'$.request_id') IS request_id),
+  CHECK(json_extract(binding_json,'$.payload_ref') IS payload_ref),
+  CHECK(json_extract(binding_json,'$.created_at') IS created_at),
+  CHECK(json_extract(binding_json,'$.expires_at') IS expires_at)
+) STRICT;
+CREATE TABLE approval_payload_secrets (
+  payload_ref TEXT PRIMARY KEY NOT NULL REFERENCES approval_payload_metadata(payload_ref),
+  envelope_json TEXT NOT NULL CHECK(json_valid(envelope_json) AND length(CAST(envelope_json AS BLOB))<=360448),
+  CHECK(json_extract(envelope_json,'$.codec_version') IS 1),
+  CHECK(json_extract(envelope_json,'$.algorithm') IS 'A256KW+A256GCM')
+) STRICT;
+CREATE INDEX approval_payload_expiry ON approval_payload_metadata(state,expires_at);
+CREATE TRIGGER approval_payload_metadata_immutable BEFORE UPDATE OF
+  payload_ref,instance_id,workspace_id,owner_kind,owner_id,request_id,attempt_id,consume_id,binding_json,envelope_digest,created_at,expires_at
+  ON approval_payload_metadata BEGIN SELECT RAISE(ABORT,'approval_payload_metadata_immutable'); END;
+CREATE TRIGGER approval_payload_deleted_immutable BEFORE UPDATE ON approval_payload_metadata
+  WHEN OLD.state='deleted' BEGIN SELECT RAISE(ABORT,'approval_payload_deleted_immutable'); END;
+CREATE TRIGGER approval_payload_metadata_no_delete BEFORE DELETE ON approval_payload_metadata
+  BEGIN SELECT RAISE(ABORT,'approval_payload_metadata_retained'); END;
+CREATE TRIGGER approval_payload_secret_active BEFORE INSERT ON approval_payload_secrets
+  WHEN (SELECT state FROM approval_payload_metadata WHERE payload_ref=NEW.payload_ref) IS NOT 'active'
+  BEGIN SELECT RAISE(ABORT,'approval_payload_not_active'); END;
+CREATE TRIGGER approval_payload_secret_no_update BEFORE UPDATE ON approval_payload_secrets
+  BEGIN SELECT RAISE(ABORT,'approval_payload_secret_immutable'); END;
+CREATE TRIGGER approval_payload_secret_delete_guard BEFORE DELETE ON approval_payload_secrets
+  WHEN (SELECT state FROM approval_payload_metadata WHERE payload_ref=OLD.payload_ref) IS NOT 'deleted'
+  BEGIN SELECT RAISE(ABORT,'approval_payload_secret_active'); END;
+CREATE TRIGGER approval_payload_terminal_delete AFTER UPDATE OF state ON approval_payload_metadata
+  WHEN NEW.state='deleted' BEGIN DELETE FROM approval_payload_secrets WHERE payload_ref=NEW.payload_ref; END;
+`;
+const schemaV4Sql = schemaV3Sql.replace("CHECK(version=3)", "CHECK(version=4)")
+  .replace("INSERT INTO approval_schema VALUES (3)", "INSERT INTO approval_schema VALUES (4)") + payloadSql;
+
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
 }
@@ -229,7 +282,7 @@ function verifiedVersion(db: Database.Database): number {
   try {
     if (expectedShapes === undefined) {
       const computed = new Map<number, string>();
-      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql]] as const) {
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql]] as const) {
         const expected = new Database(":memory:");
         try { expected.exec(sql); computed.set(version, shape(expected)); }
         finally { expected.close(); }
@@ -258,7 +311,11 @@ export function verifyApprovalMetadataSchema(db: Database.Database): void {
   if (verifiedVersion(db) < 2) throw new ApprovalSchemaError();
 }
 export function verifyApprovalIndexSchema(db: Database.Database): void {
-  if (verifiedVersion(db) !== 3) throw new ApprovalSchemaError();
+  if (verifiedVersion(db) < 3) throw new ApprovalSchemaError();
+}
+
+export function verifyApprovalPayloadSchema(db: Database.Database): void {
+  if (verifiedVersion(db) !== 4) throw new ApprovalSchemaError();
 }
 
 function verifyIntegrityInside(db: Database.Database): void {
@@ -339,6 +396,30 @@ export function installApprovalIndexSchema(db: Database.Database): void {
           db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=3)) STRICT; INSERT INTO approval_schema VALUES (3)");
           db.exec(indexSql);
           verifyIntegrityInside(db); verifyApprovalIndexSchema(db);
+        }
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
+  } catch { throw new ApprovalSchemaError(); }
+}
+
+/** 明示的なv3->v4 migration。payloadを生成せず、鍵・監査root・runtimeを接続しない。 */
+export function installApprovalPayloadSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db);
+        verifyIntegrityInside(db);
+        const version = verifiedVersion(db);
+        if (version < 3) throw new ApprovalSchemaError();
+        if (version === 3) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=4)) STRICT; INSERT INTO approval_schema VALUES (4)");
+          db.exec(payloadSql);
+          verifyIntegrityInside(db); verifyApprovalPayloadSchema(db);
         }
         verifyOpenDatabaseFile(db);
       }).immediate();

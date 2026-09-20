@@ -77,11 +77,21 @@ export function verifyDatabase(db: Database.Database, expectedVersion: number): 
   if (version !== expectedVersion) throw new Error(`database_schema_${String(version)}_does_not_match_${expectedVersion}`);
 }
 
+/** Full-file SQLite backups cannot exclude individual tables, including their
+ * freed pages. Even an empty protected payload table disallows this operation. */
+export function assertFullBackupHasNoPayloadStore(db: Database.Database): void {
+  if (db.prepare("SELECT 1 FROM main.sqlite_schema WHERE lower(name) IN ('approval_payload_secrets','web_auth_payloads') LIMIT 1").get()) {
+    throw new Error("schema_full_backup_payload_store_forbidden");
+  }
+}
+
 export function assertReceiptMatchesDatabases(
   receipt: MigrationReceipt,
   migrated: Database.Database,
   backup: Database.Database,
 ): void {
+  assertFullBackupHasNoPayloadStore(migrated);
+  assertFullBackupHasNoPayloadStore(backup);
   verifyDatabase(migrated, 3);
   verifyDatabase(backup, 2);
   const backupCounts = countSnapshot(backup);
@@ -133,6 +143,10 @@ export async function migrateV2ToV3WithBackup(input: {
   const source = new Database(input.databasePath, { fileMustExist: true });
   source.pragma("foreign_keys = ON");
   try {
+    // Pin the exclusion check and Online Backup to the same read snapshot.
+    // A write transaction on this connection would make backup return LOCKED.
+    source.exec("BEGIN");
+    assertFullBackupHasNoPayloadStore(source);
     const actual = source.pragma("user_version", { simple: true }) as number;
     assertSchemaActivationSafe(input.previous, input.target, actual);
     verifyDatabase(source, 2);
@@ -147,6 +161,7 @@ export async function migrateV2ToV3WithBackup(input: {
     const backup = new Database(input.backupPath, { readonly: true, fileMustExist: true });
     try {
       backup.pragma("foreign_keys = ON");
+      assertFullBackupHasNoPayloadStore(backup);
       verifyDatabase(backup, 2);
       if (JSON.stringify(countSnapshot(backup)) !== JSON.stringify(before) ||
         JSON.stringify(contentSnapshot(backup)) !== JSON.stringify(beforeDigests)) {
@@ -156,10 +171,15 @@ export async function migrateV2ToV3WithBackup(input: {
       backup.close();
     }
 
+    source.exec("COMMIT");
+
     let preservation!: MigrationReceipt["preservation"];
     source.transaction(() => {
+      // A writer may have changed the schema after the backup snapshot.
+      assertFullBackupHasNoPayloadStore(source);
       migrateDispatcherDatabase(source, () => {}, true, 3);
       input.postMigrationHook?.();
+      assertFullBackupHasNoPayloadStore(source);
       verifyDatabase(source, 3);
       const after = countSnapshot(source);
       const afterDigests = contentSnapshot(source);
@@ -188,6 +208,7 @@ export async function migrateV2ToV3WithBackup(input: {
       completed_at: input.completedAt ?? new Date().toISOString(),
     };
   } finally {
-    source.close();
+    try { if (source.inTransaction) source.exec("ROLLBACK"); }
+    finally { source.close(); }
   }
 }

@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 
 import {
   assertReceiptMatchesDatabases,
+  assertFullBackupHasNoPayloadStore,
   contentSnapshot,
   countSnapshot,
   migrateV2ToV3WithBackup,
@@ -63,6 +64,8 @@ async function main(): Promise<void> {
     try {
       migrated.pragma("foreign_keys = ON");
       backup.pragma("foreign_keys = ON");
+      assertFullBackupHasNoPayloadStore(migrated);
+      assertFullBackupHasNoPayloadStore(backup);
       const migratedVersion = migrated.pragma("user_version", { simple: true });
       const backupVersion = backup.pragma("user_version", { simple: true });
       if (migratedVersion === 2 && backupVersion === 2) {
