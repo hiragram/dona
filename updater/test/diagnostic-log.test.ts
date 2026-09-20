@@ -288,6 +288,25 @@ test("keeps a safe suffix at its original event position after cross-event redac
   }
 });
 
+test("redacts a raw PEM private key block across chunk boundaries", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-pem-redaction" });
+    capture.write("stderr", Buffer.from("before -----BE"));
+    capture.write("stderr", Buffer.from("GIN OPENSSH PRIVATE KEY-----\nsecret-base64-body\n-----END OPEN"));
+    capture.write("stderr", Buffer.from("SSH PRIVATE KEY----- after\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.match(detail, /before/);
+    assert.match(detail, /REDACTED/);
+    assert.match(detail, /after/);
+    assert.equal(detail.includes("OPENSSH PRIVATE KEY"), false);
+    assert.equal(detail.includes("secret-base64-body"), false);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("bounds ordered output while an earlier stream keeps redaction carry pending", async () => {
   const f = await fixture(4_096);
   try {

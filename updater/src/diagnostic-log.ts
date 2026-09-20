@@ -41,6 +41,7 @@ class StreamingRedactor {
   private droppingSensitive = false;
   private droppingQuote: "\"" | "'" | undefined;
   private quoteBackslashParity = false;
+  private pemEndMarker: string | undefined;
 
   constructor(private readonly privateRoots: readonly string[] = []) {}
 
@@ -57,13 +58,35 @@ class StreamingRedactor {
   }
 
   hasPending(): boolean {
-    return this.pending.length > 0 || this.droppingSensitive;
+    return this.pending.length > 0 || this.droppingSensitive || this.pemEndMarker !== undefined;
   }
 
   private drain(final: boolean): Omit<RedactedChunk, "decoded"> {
     const initialLength = this.pending.length;
     let output = "";
     while (this.pending.length > 0) {
+      if (this.pemEndMarker) {
+        const boundary = this.pending.indexOf(this.pemEndMarker);
+        if (boundary < 0) {
+          if (final) {
+            this.pending = "";
+            return { text: output, consumedCharacters: initialLength };
+          }
+          let carryLength = 0;
+          const maximum = Math.min(this.pemEndMarker.length - 1, this.pending.length);
+          for (let length = maximum; length > 0; length -= 1) {
+            if (this.pending.endsWith(this.pemEndMarker.slice(0, length))) {
+              carryLength = length;
+              break;
+            }
+          }
+          this.pending = carryLength > 0 ? this.pending.slice(-carryLength) : "";
+          return { text: output, consumedCharacters: initialLength - this.pending.length };
+        }
+        this.pending = this.pending.slice(boundary + this.pemEndMarker.length);
+        this.pemEndMarker = undefined;
+        continue;
+      }
       if (this.droppingSensitive) {
         const boundary = this.droppingQuote
           ? this.findClosingQuote(this.droppingQuote)
@@ -117,6 +140,25 @@ class StreamingRedactor {
         output += "[REDACTED_STREAM]";
         this.pending = this.pending.slice(credentialUri.index + credentialUri[0].length);
         continue;
+      }
+      const pemBlock = /-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----/.exec(this.pending);
+      if (pemBlock?.index !== undefined) {
+        output += redactText(this.pending.slice(0, pemBlock.index), Number.MAX_SAFE_INTEGER);
+        output += "[REDACTED_STREAM]";
+        this.pending = this.pending.slice(pemBlock.index + pemBlock[0].length);
+        this.pemEndMarker = `-----END ${pemBlock[1]}-----`;
+        continue;
+      }
+      const pemPrefix = "-----BEGIN ";
+      const possiblePemStart = this.pending.lastIndexOf(pemPrefix);
+      if (possiblePemStart >= 0) {
+        output += redactText(this.pending.slice(0, possiblePemStart), Number.MAX_SAFE_INTEGER);
+        this.pending = this.pending.slice(possiblePemStart);
+        if (this.pending.length > maxCarryCharacters || /[\r\n]/.test(this.pending)) {
+          output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
+          this.pending = "";
+        }
+        return { text: output, consumedCharacters: initialLength - this.pending.length };
       }
       if (final) {
         output += redactText(this.pending, Number.MAX_SAFE_INTEGER);
