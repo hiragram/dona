@@ -4,16 +4,18 @@ import { z } from "zod";
 import { assertSynchronousResult } from "../audit/synchronous.js";
 import { ApprovalMetadataNodes } from "./metadata-store.js";
 import { ApprovalIndexBlobs } from "./index-store.js";
-import { encodeApprovalIndex } from "./index-codec.js";
+import { encodeApprovalIndex, decodeApprovalIndex } from "./index-codec.js";
 import type { ApprovalRecordScope } from "./record-codec.js";
 import type { PreparedApprovalMetadata } from "./metadata-plan.js";
-import { readMetadataValue } from "./metadata-tree.js";
+import { readMetadataValue, prepareMetadataUpdate } from "./metadata-tree.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const schema = z.strictObject({ codec_version: z.literal(1), scope: scopeSchema, expected_root: digest, proposed_root: digest,
-  node_wires: z.array(z.string().max(176)).max(32 * 257), index_wires: z.array(z.string().max(2048)).max(32) });
+  point_updates: z.array(z.strictObject({ key: z.string().regex(/^(index|record)_[a-f0-9]{64}$/), value: digest })).max(32)
+    .refine(points => points.every((point, index) => index === 0 || points[index - 1]!.key < point.key)),
+  index_wires: z.array(z.string().max(2048)).max(32) });
 export class ApprovalMetadataPlanStoreError extends Error {
   constructor() { super("approval_metadata_plan_store_unverified"); this.name = "ApprovalMetadataPlanStoreError"; }
 }
@@ -34,28 +36,51 @@ export class ApprovalMetadataPlanWriter {
       if (!this.db.inTransaction) throw Error();
       assertSynchronousResult(input); const plan = schema.parse(input);
       if (plan.scope.instance_id !== this.scope.instance_id || plan.scope.workspace_id !== this.scope.workspace_id) throw Error();
-      if ((plan.node_wires.length === 0) !== (plan.expected_root === plan.proposed_root)
-        || (plan.node_wires.length === 0 && plan.index_wires.length !== 0)) throw Error();
-      const nodes = plan.node_wires.map(wire => {
-        const raw = Buffer.from(wire, "base64");
-        if (![99, 131].includes(raw.length) || raw.toString("base64") !== wire) throw Error();
-        return { wire, digest: createHash("sha256").update("dona.metadata-tree-node.v1\0").update(raw).digest("hex") };
-      });
-      if (new Set(nodes.map(node => node.digest)).size !== nodes.length) throw Error();
+      if ((plan.point_updates.length === 0) !== (plan.expected_root === plan.proposed_root)) throw Error();
+      const pointValues = new Map(plan.point_updates.map(point => [point.key, point.value]));
       const indexes = plan.index_wires.map(wire => {
         if (Buffer.byteLength(wire) > 2048) throw Error();
         const decoded = encodeApprovalIndex(JSON.parse(wire), this.scope);
-        if (decoded.wire !== wire) throw Error(); return { wire, digest: decoded.digest };
+        if (decoded.wire !== wire || pointValues.get(decoded.key) !== decoded.digest) throw Error();
+        return { wire, digest: decoded.digest };
       });
       if (new Set(indexes.map(index => index.digest)).size !== indexes.length) throw Error();
-      if (nodes.length && !nodes.some(node => node.digest === plan.proposed_root)) throw Error();
-      // digestの配列内存在だけではleaf/中間nodeもrootになってしまう。
-      // 既存codecでscope付きdepth 0 rootから固定keyへのpathを検証する。
-      // このprobeはrootのcurrent性や業務認可の証明ではない。
-      const overlay = new Map(nodes.map(node => [node.digest, node.wire]));
-      this.nodes.read(reader => readMetadataValue({ ...this.scope, collection: "approval_records_v1" },
-        plan.proposed_root, "approval_plan_scope_check", hash => overlay.get(hash) ?? reader(hash)));
-      if (indexes.length === 0) this.indexes.read(() => null);
+      // callerが渡すnode配列を保存しない。全point変更からnodeを再生成し、
+      // proposed rootと一致してから保存するため、経路外nodeも欠落しない。
+      const treeScope = { ...this.scope, collection: "approval_records_v1" } as const;
+      const wires = this.nodes.read(reader => {
+        let root = plan.expected_root; const generated = new Map<string, string>();
+        const combined = (hash: string) => generated.get(hash) ?? reader(hash);
+        for (const point of plan.point_updates) {
+          const previous = readMetadataValue(treeScope, root, point.key, combined);
+          if (previous === point.value) continue;
+          const update = prepareMetadataUpdate(treeScope, root, point.key, previous, point.value, combined);
+          for (const node of update.nodes) generated.set(node.digest, node.wire);
+          root = update.proposed_root;
+        }
+        if (root !== plan.proposed_root || generated.size > 32 * 257) throw Error();
+        // 変更なしの場合も、scope付きrootとpathの検証を省略しない。
+        readMetadataValue(treeScope, root, "approval_plan_scope_check", combined);
+        for (const point of plan.point_updates) if (readMetadataValue(treeScope, root, point.key, combined) !== point.value) throw Error();
+        const retained = new Map<string, string>(), stack = [root];
+        while (stack.length) {
+          const hash = stack.pop()!; if (retained.has(hash)) continue;
+          const wire = generated.get(hash); if (wire === undefined) continue;
+          retained.set(hash, wire); const raw = Buffer.from(wire, "base64");
+          if (raw.length === 131) stack.push(raw.subarray(67, 99).toString("hex"), raw.subarray(99, 131).toString("hex"));
+        }
+        return [...retained].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, wire]) => wire);
+      });
+      const supplied = new Map(indexes.map(index => [index.digest, index.wire]));
+      this.indexes.read(reader => {
+        for (const point of plan.point_updates) if (point.key.startsWith("index_")) {
+          const wire = supplied.get(point.value) ?? reader(point.value); if (wire === undefined) throw Error();
+          if (decodeApprovalIndex(wire, point.value, this.scope).key !== point.key) throw Error();
+        }
+        return null;
+      });
+      const nodes = wires.map(wire => ({ wire,
+        digest: createHash("sha256").update("dona.metadata-tree-node.v1\0").update(Buffer.from(wire, "base64")).digest("hex") }));
       for (let offset = 0; offset < nodes.length; offset += 257) this.nodes.stage(nodes.slice(offset, offset + 257));
       if (indexes.length) this.indexes.stage(indexes);
       return undefined;

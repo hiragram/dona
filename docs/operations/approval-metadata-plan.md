@@ -12,11 +12,13 @@ readはnode overlayと既存readerを合わせ、point digest、blob canonical b
 
 同じmanifest/linkを複数回変更した際は、current rootから到達する新nodeと最終pointが参照する新index blobだけを残し、中間versionを保存しない。既存subtree全体は走査しない。
 
-返却planはpassiveな固定形式で、最大8,224件のnode wire文字列と32件のindex wire文字列を持つ。node wireは最大176 byte、index wireは最大2,048 byte。digestは既存の固定domain hashから復元する。既存`assertSynchronousResult`の10,000要素/depth 16制限を変更せず、最大更新ケースも同じ検証を通す。
+返却planはpassiveな固定形式で、key順に整列した最大32件の`point_updates`（keyと最終digest）と、最大32件・各2,048 byteのindex wireを持つ。node配列は受け渡さない。既存`assertSynchronousResult`の10,000要素/depth 16制限を変更せず、最大更新ケースも同じ検証を通す。
 
-`ApprovalMetadataPlanWriter`は1つのconnectionから両保存層を構成する。既存transaction内でscope、format、wire上限、重複、proposed rootのnodeを確認し、nodeを最大257個ごと、indexを最大32個でstageする。自分でBEGIN/commitや再試行をしない。全batchと業務rowは呼出側の同じ監査mutationで保存し、どこかが失敗したら例外を上位へ伝えて全体をrollbackする。mutation中の保存障害をcatchして成功扱いしてはいけない。
+`ApprovalMetadataPlanWriter`は1つのconnectionから両保存層を構成する。保存前にexpected rootと同じDBのreaderから全point変更を再実行し、生成されたrootがproposed rootと完全一致することと、各pointの最終digestを確認する。pointの省略、leaf/中間node/別scope rootへの差し替えを拒否する。変更なしの場合もscope付きroot/pathを検証する。writerの再構成・照合は最大97 walk、各walkは最大257nodeで、既存履歴全体は走査しない。
 
-保存前には新node overlayと同じDBのreaderを使い、既存metadata tree codecで固定keyへのpathを最大257node検証する。これにより、leafや途中のnode digestをrootへ差し替える改変と、別scopeのrootを拒否する。変更なしのplanも省略しない。このpath検証だけをrootのcurrent性や業務認可の証明には使わない。
+全index pointは供給されたwireまたは同じDBのimmutable blobからdecodeし、scope、digest、計算したkeyが一致することを確認する。新規参照blobが欠落する場合や、参照pointと異なるwireが供給された場合は、何もstageする前に拒否する。record pointのSQL row/親参照の照合は上位repositoryの責務である。
+
+再生成した最大8,224nodeから最終rootへ到達するものだけを残し、既存の固定domain hashを使って最大257個ごと、indexを最大32個でstageする。node wireは内部処理でも最大176 byteで、同期resultの既存上限を維持する。自分でBEGIN/commitや再試行をしない。全batchと業務rowは呼出側の同じ監査mutationで保存し、どこかが失敗したら例外を上位へ伝えて全体をrollbackする。mutation中の保存障害をcatchして成功扱いしてはいけない。再構成・path検証だけをrootのcurrent性や業務認可の証明には使わない。
 
 `putRecord`はcanonical record digestをpointへ結ぶだけで、旧SQL rowの読取・照合、cross-row参照、state transition、current binding/policy/clockやactor検証、business rowの書込を実装しない。これらを完了したrepositoryだけがこの内部plannerを使う。planの公開受付・保存後の再実行・外部callerによるroot指定は行わない。
 
@@ -24,7 +26,7 @@ readはnode overlayと既存readerを合わせ、point digest、blob canonical b
 
 - `appendApprovalList`: 必須manifestと両端link、件数に応じた境界を確認し、旧tail、新link、manifestを同じplanで更新する。既存memberの再追加は競合とする。activeの明示tombstoneだけは再加入の表現を持つが、業務状態として許されるかはrepositoryが判断する。
 - `removeActiveApprovalList`: activeだけを対象に、前後linkの相互参照とhead/tailを照合して除外する。除外linkはtombstoneとして保持し、all履歴やone-shot IDを解放しない。
-- `readApprovalListHead`: 認証済みheadから最大32件をたどり、相互参照・件数・末端を確認する。残りがあれば`truncated: true`を返す。全履歴を読んだ証拠や外部pagination cursorとして使わない。
+- `readApprovalListHead`: 認証済みheadから最大32件をたどり、相互参照・件数・末端を確認する。残りがあれば次linkを1件追加で読み、最後の返却IDへの逆参照を確認してから`truncated: true`を返す。全履歴を読んだ証拠や外部pagination cursorとして使わない。
 
 毎回全履歴を走査するものではない。current rootが正しい初期化と監査済みの完全なrepository更新から生成されたことを前提に、必要な隣接関係を検証する。manifest件数・全隣接関係・record/aliasの業務整合性を、単にcanonical codecを通っただけの任意rootへ対して証明しない。欠落manifestを空listとして補う初期化はない。
 

@@ -74,7 +74,7 @@ test("record pointとalias/listを同じ更新案へ結び変更なしは検証�
       assert.equal(p.readRecordDigest("request", "event"), null);
       p.putRecord(encoded.digest, record); p.putIndex(alias(1), alias(1));
     });
-    assert.equal(plan.proposed_root, root); assert.deepEqual(plan.node_wires, []); assert.deepEqual(plan.index_wires, []);
+    assert.equal(plan.proposed_root, root); assert.deepEqual(plan.point_updates, []); assert.deepEqual(plan.index_wires, []);
     f.writer.stage(plan);
   })();
 });
@@ -104,7 +104,7 @@ test("競合・上限・callback障害・finish後のplanは再利用できな�
   const reads = make(); for (let index = 0; index < 256; index++) reads.readRecordDigest("event", "event");
   assert.throws(() => reads.readRecordDigest("event", "event"), ApprovalMetadataPlanError); assert.throws(() => reads.finish(), ApprovalMetadataPlanError);
   const sealed = make(); sealed.putIndex(null, blank(all)); const result = sealed.finish();
-  assert.ok(Object.isFrozen(result) && Object.isFrozen(result.node_wires)); assert.throws(() => sealed.finish(), ApprovalMetadataPlanError);
+  assert.ok(Object.isFrozen(result) && Object.isFrozen(result.point_updates)); assert.throws(() => sealed.finish(), ApprovalMetadataPlanError);
   assert.throws(() => sealed.putIndex(null, alias(0)), ApprovalMetadataPlanError);
   assert.throws(() => make().finish(), ApprovalMetadataPlanError);
   const blob = encodeApprovalIndex(blank(all), scope), tree = prepareMetadataUpdate(treeScope, empty, blob.key, null, blob.digest, () => undefined);
@@ -128,8 +128,9 @@ test("同じpointの64回更新は最終node/blobだけを保持して中間値�
   const plan = f.db.transaction(() => prepare(f, empty, p => {
     for (let index = 0; index < 64; index++) p.putIndex(index === 0 ? null : versions[index - 1]!, versions[index]!);
   }))();
-  assert.equal(plan.node_wires.length, 257); assert.equal(plan.index_wires.length, 1); assertSynchronousResult(plan);
+  assert.equal(plan.point_updates.length, 1); assert.equal(plan.index_wires.length, 1); assertSynchronousResult(plan);
   f.db.transaction(() => f.writer.stage(plan)).immediate();
+  assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(), { n: 257 });
   assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_index_blobs").get(), { n: 1 });
   f.db.transaction(() => f.nodes.read(nodes => f.indexes.read(indexes => {
     const p = new ApprovalMetadataPlan(scope, plan.proposed_root, nodes, indexes);
@@ -197,9 +198,10 @@ test("writerは別scope・過大plan・改変wire・独立transaction呼出し�
   const f = fixture(t); const plan = f.db.transaction(() => prepare(f, empty, p => p.putIndex(null, blank(all))))();
   assert.throws(() => f.writer.stage(plan), ApprovalMetadataPlanStoreError);
   for (const changed of [
-    { ...plan, scope: { ...scope, workspace_id: "other" } }, { ...plan, node_wires: [...plan.node_wires, plan.node_wires[0]!] },
+    { ...plan, scope: { ...scope, workspace_id: "other" } }, { ...plan, point_updates: [...plan.point_updates, plan.point_updates[0]!] },
     { ...plan, node_wires: ["x"] }, { ...plan, index_wires: ["x".repeat(2049)] },
-    { ...plan, proposed_root: "0".repeat(64) }, { ...plan, node_wires: Array(32 * 257 + 1).fill(plan.node_wires[0]) },
+    { ...plan, index_wires: [encodeApprovalIndex(alias(99), scope).wire] },
+    { ...plan, proposed_root: "0".repeat(64) }, { ...plan, point_updates: Array(33).fill(plan.point_updates[0]) },
   ]) assert.throws(() => f.db.transaction(() => f.writer.stage(changed))(), ApprovalMetadataPlanStoreError);
   assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(), { n: 0 });
   assert.throws(() => f.audit.readVerified(() => f.writer.stage(plan)));
@@ -211,7 +213,10 @@ test("proposed rootをleaf・中間node・別scopeへ差し替えても保存し
     let changed: PreparedApprovalMetadata;
     if (fault === "leaf" || fault === "inner") {
       const plan = f.db.transaction(() => prepare(f, empty, p => p.putIndex(null, blank(all))))();
-      const wire = plan.node_wires.find(value => Buffer.from(value, "base64").readUInt16BE(33) === (fault === "leaf" ? 256 : 1))!;
+      const encoded = encodeApprovalIndex(blank(all), scope);
+      const tree = prepareMetadataUpdate(treeScope, empty, encoded.key, null, encoded.digest, () => undefined);
+      assert.equal(tree.proposed_root, plan.proposed_root);
+      const wire = tree.nodes.find(value => Buffer.from(value.wire, "base64").readUInt16BE(33) === (fault === "leaf" ? 256 : 1))!.wire;
       const root = createHash("sha256").update("dona.metadata-tree-node.v1\0").update(Buffer.from(wire, "base64")).digest("hex");
       changed = { ...plan, proposed_root: root };
     } else {
@@ -223,5 +228,22 @@ test("proposed rootをleaf・中間node・別scopeへ差し替えても保存し
     assert.throws(() => f.db.transaction(() => f.writer.stage(changed)).immediate(), ApprovalMetadataPlanStoreError);
     assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_metadata_nodes").get(), { n: 0 });
     assert.deepEqual(f.db.prepare("SELECT count(*) AS n FROM approval_index_blobs").get(), { n: 0 });
+  }
+});
+
+for (const fault of ["point", "index"] as const) test(`rootが参照する${fault}を省略したplanを保存しない`, t => {
+  const f = fixture(t), plan = f.db.transaction(() => prepare(f, empty, p => { p.putIndex(null, blank(all)); p.putIndex(null, alias(1)); }))();
+  const changed = fault === "point" ? { ...plan, point_updates: plan.point_updates.slice(1), index_wires: [] } : { ...plan, index_wires: [] };
+  assert.throws(() => f.db.transaction(() => f.writer.stage(changed)).immediate(), ApprovalMetadataPlanStoreError);
+});
+
+test("truncated境界の次linkが欠落・逆参照不一致なら先頭を返さない", () => {
+  for (const fault of ["missing", "previous"] as const) {
+    const plan = new ApprovalMetadataPlan(scope, empty, () => undefined, () => undefined);
+    plan.putIndex(null, blank(active)); for (const id of ["a", "b", "c"]) appendApprovalList(plan, active, id);
+    const current = plan.readIndex({ kind: "link", list: active, record_id: fault === "missing" ? "a" : "b" });
+    plan.putIndex(current, { ...current!, ...(fault === "missing" ? { next: "missing" } : { previous: null }) } as ApprovalIndex);
+    assert.throws(() => readApprovalListHead(plan, active, 1), ApprovalMetadataPlanError);
+    assert.throws(() => plan.finish(), ApprovalMetadataPlanError);
   }
 });

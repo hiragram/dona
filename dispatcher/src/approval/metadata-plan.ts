@@ -16,7 +16,7 @@ export interface PreparedApprovalMetadata {
   readonly scope: ApprovalRecordScope;
   readonly expected_root: string;
   readonly proposed_root: string;
-  readonly node_wires: readonly string[];
+  readonly point_updates: readonly { readonly key: string; readonly value: string }[];
   readonly index_wires: readonly string[];
 }
 /** 共有監査prepare内の内部component。caller rootやrecordの所持は認可ではない。
@@ -29,6 +29,7 @@ export class ApprovalMetadataPlan {
   private readonly indexes = new Map<string, string>();
   private readonly touched = new Set<string>();
   private readonly indexValues = new Map<string, string>();
+  private readonly values = new Map<string, string>();
   private changes = 0;
   private reads = 0;
   private observed = false;
@@ -72,6 +73,7 @@ export class ApprovalMetadataPlan {
       this.nodes.set(node.digest, node.wire);
     }
     this.root = plan.proposed_root;
+    this.values.set(key, proposed);
     // 同じmanifest/linkの中間versionを保存せず、最終rootから辿れる
     // 新nodeだけを保持する。既存subtreeはreaderに残し全履歴を走査しない。
     const retained = new Map<string, string>(), stack = [this.root];
@@ -135,7 +137,7 @@ export class ApprovalMetadataPlan {
       if (!this.observed) throw new ApprovalMetadataPlanError();
       if (this.changes !== 0 && this.root === this.initial) throw new ApprovalMetadataPlanError();
       const result = Object.freeze({ codec_version: 1 as const, scope: this.scope, expected_root: this.initial, proposed_root: this.root,
-        node_wires: Object.freeze([...this.nodes].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, wire]) => wire)),
+        point_updates: Object.freeze([...this.values].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => Object.freeze({ key, value }))),
         index_wires: Object.freeze([...this.indexes].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, wire]) => wire)) });
       assertSynchronousResult(result); this.sealed = true; return result;
     });

@@ -88,6 +88,10 @@ export function readApprovalListHead(plan: ApprovalMetadataPlan, list: ApprovalI
     }
     if (ids.length === current.count ? next !== null || previous !== current.tail
       : next === null || seen.has(next) || previous === current.tail) throw new ApprovalMetadataPlanError();
+    if (ids.length < current.count) {
+      const following = link(plan, current.list, next!);
+      if (following.previous !== previous) throw new ApprovalMetadataPlanError();
+    }
     return Object.freeze({ count: current.count, ids: Object.freeze(ids), truncated: ids.length < current.count });
   });
 }
