@@ -31,3 +31,5 @@ import "./approval/record-repository.js";
 import "./approval/record-mutation.js";
 
 import "./approval/payload-protection.js";
+
+import "./approval/payload-metadata.js";
