@@ -441,7 +441,13 @@ export class DiagnosticLogStore {
       while (orderedOutput[0]?.resolved) {
         const next = orderedOutput.shift()!;
         orderedOutputBytes -= Buffer.byteLength(next.text, "utf8");
-        append(next.stream, next.text);
+        let text = next.text;
+        while (orderedOutput[0]?.resolved && orderedOutput[0].stream === next.stream) {
+          const adjacent = orderedOutput.shift()!;
+          orderedOutputBytes -= Buffer.byteLength(adjacent.text, "utf8");
+          text += adjacent.text;
+        }
+        append(next.stream, text);
       }
       if (orderedOutput.length === 0 && orderedOutputTruncated) truncated = true;
     };
@@ -461,8 +467,13 @@ export class DiagnosticLogStore {
       if (original === redacted.text) {
         for (const entry of consumed) queueText(entry.event, entry.source);
       } else if (redacted.text) {
+        let commonPrefix = 0;
+        while (commonPrefix < original.length && commonPrefix < redacted.text.length &&
+          original[commonPrefix] === redacted.text[commonPrefix]) {
+          commonPrefix += 1;
+        }
         let commonSuffix = 0;
-        while (commonSuffix < original.length && commonSuffix < redacted.text.length &&
+        while (commonSuffix < original.length - commonPrefix && commonSuffix < redacted.text.length - commonPrefix &&
           original[original.length - commonSuffix - 1] === redacted.text[redacted.text.length - commonSuffix - 1]) {
           commonSuffix += 1;
         }
@@ -478,9 +489,19 @@ export class DiagnosticLogStore {
             offset = entryEnd;
           }
         };
-        const transformedPrefix = redacted.text.slice(0, redacted.text.length - commonSuffix);
-        const owner = consumed[0]?.event ?? streamOutput[stream][0];
-        if (owner) queueText(owner, transformedPrefix);
+        queueOriginalRange(0, commonPrefix);
+        const transformed = redacted.text.slice(commonPrefix, redacted.text.length - commonSuffix);
+        let owner: OrderedOutput | undefined;
+        let offset = 0;
+        for (const entry of consumed) {
+          if (commonPrefix < offset + entry.source.length) {
+            owner = entry.event;
+            break;
+          }
+          offset += entry.source.length;
+        }
+        owner ??= consumed.at(-1)?.event ?? streamOutput[stream][0];
+        if (owner) queueText(owner, transformed);
         queueOriginalRange(original.length - commonSuffix, original.length);
       }
       for (const event of streamOutput[stream]) {

@@ -288,6 +288,23 @@ test("keeps a safe suffix at its original event position after cross-event redac
   }
 });
 
+test("keeps a later event safe prefix behind intervening output during cross-event redaction", async () => {
+  const f = await fixture();
+  try {
+    const capture = f.store.start({ request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-redacted-prefix-order" });
+    capture.write("stderr", Buffer.from("first"));
+    capture.write("stdout", Buffer.from("middle\n"));
+    capture.write("stderr", Buffer.from(" later TOKEN=secret\nlast\n"));
+    capture.finish(true);
+    const detail = String(f.store.project(f.database.diagnosticLogs(f.claimed.request_id)[0]!, 16_384).detail_tail);
+    assert.ok(detail.indexOf("[stderr] first") < detail.indexOf("[stdout] middle"), detail);
+    assert.ok(detail.indexOf("[stdout] middle") < detail.indexOf("[stderr]  later"), detail);
+    assert.ok(detail.indexOf("[stderr]  later") < detail.indexOf("[REDACTED_STREAM]"), detail);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("redacts a raw PEM private key block across chunk boundaries", async () => {
   const f = await fixture();
   try {
