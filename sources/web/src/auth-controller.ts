@@ -212,8 +212,9 @@ export class WebAuthController {
         auditAttempted=true;const result=await this.connections.jobRead.execute({codec_version:1,operation:route.id==="job_list"?"list":route.id==="job_read"?"detail":"events",
           method:"GET",target:request.target,context,...(cursor?{cursor}:{}),...(limit?{limit}:{})});
         if(Date.parse(now())>=deadline)throw new AuthFailure(503,"identity_unavailable");
-        if(result.status==="denied")return response(result.reason==="not_found"?404:result.reason==="scope_denied"?403:
-          result.reason==="invalid_request"?400:result.reason==="cursor_invalid"?409:503,{error:result.reason});
+        if(result.status==="denied"){const publicReason=result.reason==="internal_error"?"identity_unavailable":result.reason;
+          return response(publicReason==="not_found"?404:publicReason==="scope_denied"?403:
+            publicReason==="invalid_request"?400:publicReason==="cursor_invalid"?409:503,{error:publicReason});}
         if(result.kind==="events")return eventResponse(result.reset_required?"reset":result.changed?"job":"heartbeat",result.event_cursor,
           result.reset_required?{reset_required:true}:{job:result.job});
         return response(200,result.kind==="list"?{items:result.items,next_cursor:result.next_cursor}:{job:result.job,event_cursor:result.event_cursor},false,maximumWebJobBrowserBodyBytes);

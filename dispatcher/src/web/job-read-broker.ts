@@ -26,7 +26,8 @@ export class WebJobReadBroker {
     const match=/^\/api\/jobs\/([A-Za-z0-9_-]{1,128})(\/events)?$/.exec(url.pathname);
     if(!match||url.search)return{status:"denied",reason:"invalid_request"};const jobId=match[1]!,row=this.database.getWebJobForRead(jobId,identity);
     if(!row)return{status:"denied",reason:"not_found"};this.syncProgress(row);
-    if(input.operation==="detail"&&match[2]===undefined)return{status:"succeeded",kind:"detail",job:this.project(row),event_cursor:this.database.webJobEventCursor(identity,jobId)};
+    if(input.operation==="detail"&&match[2]===undefined){const snapshot=this.database.webJobSnapshot(identity,jobId);
+      if(!snapshot)return{status:"denied",reason:"not_found"};return{status:"succeeded",kind:"detail",job:this.project(snapshot.row),event_cursor:snapshot.event_cursor};}
     if(input.operation==="events"&&match[2]==="/events"&&input.cursor){const changes=this.database.listWebJobChanges(identity,jobId,input.cursor);
       return{status:"succeeded",kind:"events",job:this.project(this.database.getWebJobForRead(jobId,identity)!),event_cursor:changes.next_cursor,
         changed:changes.rows.length>0,reset_required:changes.reset_required};}

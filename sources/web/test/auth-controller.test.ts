@@ -263,3 +263,9 @@ test("SSE cursorはLast-Event-IDをbrowser境界で検証し期限切れだけ40
     const result=await f.controller.handle(request);assert.equal(result.status,mode==="expired"?409:mode==="duplicate"?403:400,mode);assert.equal(reads,mode==="expired"?1:0,mode);
   }
 });
+
+test("job read内部障害はidentity_unavailableへ正規化する",async()=>{const f=controllerFixture();
+  f.connections.jobRead={execute:async()=>({status:"denied",reason:"internal_error"})};
+  const result=await f.controller.handle(f.request("/api/jobs"));
+  assert.equal(result.status,503);assert.equal(result.body,'{"error":"identity_unavailable"}');privateFailure(result);
+});

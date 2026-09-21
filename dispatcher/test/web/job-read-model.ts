@@ -32,6 +32,14 @@ test("principalでfilterしてstable cursorをpaginationし後発jobを混ぜな
   assert.throws(()=>f.jobs.listWebJobs({...owner,principal_id:"other"},1,first.next_cursor!,new Date("2026-09-21T00:01:01.000Z")),/cursor/);
 });
 
+test("projection初期backfillは通常readで再実行しない",t=>{const f=fixture(t),job=f.seed();
+  assert.deepEqual(f.jobs.listWebJobs(owner,20).rows.map(row=>row.job_id),[job]);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_state").get() as {count:number}).count,1);
+  f.raw.prepare("DELETE FROM web_job_projection_events WHERE job_id=?").run(job);
+  assert.deepEqual(f.jobs.listWebJobs(owner,20).rows,[]);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count,0);
+});
+
 test("event cursorは更新をmonotonicに再生しretention gapでresetを要求する",t=>{const f=fixture(t),job=f.seed();
   const cursor=f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:01:00.000Z"));
   f.raw.prepare("UPDATE jobs SET status='completed',completed_at=?,updated_at=? WHERE job_id=?")
@@ -42,6 +50,14 @@ test("event cursorは更新をmonotonicに再生しretention gapでresetを要�
   f.jobs.pruneWebJobProjection(new Date("2026-09-21T00:03:00.000Z"),new Date("2026-09-21T00:03:01.000Z"));
   f.seed(owner,"running","2026-09-21T00:04:00.000Z");
   assert.equal(f.jobs.listWebJobChanges(owner,job,cursor,50,new Date("2026-09-21T00:04:01.000Z")).reset_required,true);
+});
+
+test("detail snapshot直後の更新は同時取得したcursorから再生できる",t=>{const f=fixture(t),job=f.seed();
+  const snapshot=f.jobs.webJobSnapshot(owner,job,new Date("2026-09-21T00:01:00.000Z"));assert.ok(snapshot);assert.equal(snapshot.row.status,"running");
+  f.raw.prepare("UPDATE jobs SET status='completed',completed_at=?,updated_at=? WHERE job_id=?")
+    .run("2026-09-21T00:02:00.000Z","2026-09-21T00:02:00.000Z",job);
+  const changed=f.jobs.listWebJobChanges(owner,job,snapshot.event_cursor,50,new Date("2026-09-21T00:02:01.000Z"));
+  assert.equal(changed.rows.some(row=>row.event_kind==="updated"),true);
 });
 
 test("retentionはjob anchorと有効なlist cursorを保持しtimestamp逆転の欠落をresetにする",t=>{const f=fixture(t);

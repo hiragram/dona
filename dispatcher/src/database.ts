@@ -204,6 +204,10 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       sequence   INTEGER NOT NULL,
       updated_at TEXT NOT NULL
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS web_job_projection_state (
+      singleton      INTEGER PRIMARY KEY CHECK (singleton=1),
+      initialized_at TEXT NOT NULL
+    ) STRICT;
     CREATE TRIGGER IF NOT EXISTS web_job_projection_insert
       AFTER INSERT ON jobs WHEN new.source='web' BEGIN
         INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
@@ -219,10 +223,16 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
         INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
         VALUES(old.job_id,'deleted',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       END;
-    INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
-      SELECT jobs.job_id,'snapshot',jobs.updated_at FROM jobs WHERE jobs.source='web'
-      AND NOT EXISTS (SELECT 1 FROM web_job_projection_events events WHERE events.job_id=jobs.job_id);
   `);
+  const initialize = () => {
+    const claimed = db.prepare(`INSERT OR IGNORE INTO web_job_projection_state(singleton,initialized_at)
+      VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`).run().changes;
+    if (claimed === 0) return;
+    db.exec(`INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+      SELECT jobs.job_id,'snapshot',jobs.updated_at FROM jobs WHERE jobs.source='web'
+      AND NOT EXISTS (SELECT 1 FROM web_job_projection_events events WHERE events.job_id=jobs.job_id);`);
+  };
+  if (db.inTransaction) initialize(); else db.transaction(initialize).immediate();
 }
 
 export function migrateDispatcherDatabase(
@@ -433,6 +443,10 @@ export interface WebJobChangePage {
   next_cursor: string;
   reset_required: boolean;
 }
+export interface WebJobSnapshot {
+  row: JobRow;
+  event_cursor: string;
+}
 interface WebProjectionCursorRow {
   cursor_digest: string;
   cursor_kind: "list"|"events";
@@ -451,6 +465,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
   private readonly schemaWrite: 2 | 3;
+  private webJobProjectionReady = false;
 
   constructor(
     databasePath: string,
@@ -793,7 +808,7 @@ export class DispatcherDatabase {
   }
 
   listWebJobs(identity: WebJobReadIdentity, limit: number, cursor?: string, at = new Date()): WebJobPage {
-    ensureWebJobProjectionSchema(this.db);
+    this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error("web_job_read_invalid");
     return this.db.transaction(() => {
@@ -829,14 +844,24 @@ export class DispatcherDatabase {
   }
 
   webJobEventCursor(identity: WebJobReadIdentity, jobId: string, at = new Date()): string {
-    ensureWebJobProjectionSchema(this.db);
+    const snapshot = this.webJobSnapshot(identity, jobId, at);
+    if (!snapshot) throw new Error("web_job_not_found");
+    return snapshot.event_cursor;
+  }
+
+  webJobSnapshot(identity: WebJobReadIdentity, jobId: string, at = new Date()): WebJobSnapshot | undefined {
+    this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
-    if (!this.getWebJobForRead(jobId, identity)) throw new Error("web_job_not_found");
-    return this.issueWebProjectionCursor("events", identity, jobId, this.webProjectionHead(), null, null, at, 60 * 60_000);
+    return this.db.transaction(() => {
+      const row = this.getWebJobForRead(jobId, identity);
+      if (!row) return undefined;
+      const event_cursor = this.issueWebProjectionCursor("events", identity, jobId, this.webProjectionHead(), null, null, at, 60 * 60_000);
+      return { row, event_cursor };
+    }).immediate();
   }
 
   listWebJobChanges(identity: WebJobReadIdentity, jobId: string, cursor: string, limit = 50, at = new Date()): WebJobChangePage {
-    ensureWebJobProjectionSchema(this.db);
+    this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !this.getWebJobForRead(jobId, identity)) throw new Error("web_job_read_invalid");
     return this.db.transaction(() => {
@@ -844,7 +869,8 @@ export class DispatcherDatabase {
       const retention = this.db.prepare("SELECT pruned_through_sequence FROM web_job_projection_retention WHERE singleton=1")
         .get() as { pruned_through_sequence: number };
       if (saved.snapshot_sequence < retention.pruned_through_sequence) {
-        return { rows: [], next_cursor: this.webJobEventCursor(identity, jobId, at), reset_required: true };
+        return { rows: [], next_cursor: this.issueWebProjectionCursor("events", identity, jobId,
+          this.webProjectionHead(), null, null, at, 60 * 60_000), reset_required: true };
       }
       const rows = this.db.prepare(`SELECT sequence,job_id,event_kind,created_at FROM web_job_projection_events
         WHERE job_id=? AND sequence>? ORDER BY sequence LIMIT ?`)
@@ -855,7 +881,7 @@ export class DispatcherDatabase {
   }
 
   recordWebJobProgress(jobId: string, sequence: number, updatedAt: string): boolean {
-    ensureWebJobProjectionSchema(this.db);
+    this.ensureWebJobProjectionReady();
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId) || !Number.isSafeInteger(sequence) || sequence < 0
       || !Number.isFinite(Date.parse(updatedAt)) || new Date(updatedAt).toISOString() !== updatedAt) throw new Error("web_job_progress_invalid");
     return this.db.transaction(() => {
@@ -872,7 +898,7 @@ export class DispatcherDatabase {
   }
 
   pruneWebJobProjection(before: Date, at = new Date()): { events: number; cursors: number } {
-    ensureWebJobProjectionSchema(this.db);
+    this.ensureWebJobProjectionReady();
     if (!Number.isFinite(before.getTime()) || before.getTime() > at.getTime()) throw new Error("web_job_retention_invalid");
     return this.db.transaction(() => {
       const cutoff=before.toISOString(),candidate=this.db.prepare(`SELECT MAX(projection.sequence) AS sequence FROM web_job_projection_events projection
@@ -1690,6 +1716,12 @@ export class DispatcherDatabase {
     const row = this.get(eventId);
     if (!row) throw new Error(`Event ${eventId} was not found`);
     return row;
+  }
+
+  private ensureWebJobProjectionReady(): void {
+    if (this.webJobProjectionReady) return;
+    ensureWebJobProjectionSchema(this.db);
+    this.webJobProjectionReady = true;
   }
 
   private webJobOwnerSql(): string {
