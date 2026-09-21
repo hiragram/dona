@@ -12,7 +12,7 @@ export function envelopeFromRow(row: {
   reply_target_json: string | null;
   trace_json: string | null;
 }): EventEnvelope {
-  if (row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule") {
+  if (row.source !== "slack" && row.source !== "dona_job" && row.source !== "dona_update" && row.source !== "dona_schedule" && row.source !== "dona_message") {
     throw new Error(`Unsupported event source: ${row.source}`);
   }
   const envelope: EventEnvelope = {

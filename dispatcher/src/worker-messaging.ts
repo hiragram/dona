@@ -258,14 +258,22 @@ export class WorkerMessageRepository {
         if (!urgent && workspaceCadence?.last_delivery_at) availableAt = new Date(Math.max(Date.parse(availableAt),
           Date.parse(workspaceCadence.last_delivery_at)+workspaceCadence.minimum_interval_ms)).toISOString();
         if (!urgent && cadence?.pending_message_id) {
-          this.db.prepare("UPDATE worker_message_deliveries SET state='superseded',updated_at=? WHERE message_id=? AND consumer='dona-main' AND state='pending'")
-            .run(acceptedAt, cadence.pending_message_id);
+          const pending = this.db.prepare("SELECT kind,payload_json FROM worker_messages WHERE message_id=?")
+            .get(cadence.pending_message_id) as {kind:WorkerMessageKind;payload_json:string}|undefined;
+          const pendingPayload = pending ? JSON.parse(pending.payload_json) as {severity?:unknown} : undefined;
+          const pendingUrgent = pending?.kind === "question" || pending?.kind === "decision_request"
+            || (pending?.kind === "risk" && pendingPayload?.severity === "high");
+          if (!pendingUrgent) {
+            this.db.prepare("UPDATE worker_message_deliveries SET state='superseded',updated_at=? WHERE message_id=? AND consumer='dona-main' AND state='pending'")
+              .run(acceptedAt, cadence.pending_message_id);
+          }
         }
         const silenceInterval = cadence?.silence_interval_ms ?? 900_000;
         this.db.prepare(`INSERT INTO worker_message_cadence(job_id,last_report_at,silence_due_at,pending_message_id,generation,updated_at)
           VALUES(?,?,?,?,1,?) ON CONFLICT(job_id) DO UPDATE SET last_report_at=excluded.last_report_at,silence_due_at=excluded.silence_due_at,
-          pending_message_id=excluded.pending_message_id,generation=worker_message_cadence.generation+1,updated_at=excluded.updated_at`)
-          .run(jobId, acceptedAt, new Date(at.getTime() + silenceInterval).toISOString(), messageId, acceptedAt);
+          pending_message_id=COALESCE(excluded.pending_message_id,worker_message_cadence.pending_message_id),
+          generation=worker_message_cadence.generation+1,updated_at=excluded.updated_at`)
+          .run(jobId, acceptedAt, new Date(at.getTime() + silenceInterval).toISOString(), urgent ? null : messageId, acceptedAt);
       }
       const consumer = direction === "worker_to_dona" ? "dona-main" : "worker";
       this.db.prepare(`INSERT INTO worker_message_deliveries(delivery_id,message_id,consumer,state,available_at,lease_owner,lease_token_sha256,lease_expires_at,fence,attempt_count,delivered_at,created_at,updated_at)
@@ -380,6 +388,8 @@ export class WorkerMessageRepository {
       for (const row of rows) {
         if (terminal(row.status)) {
           this.db.prepare("UPDATE worker_message_deliveries SET state='superseded',updated_at=? WHERE delivery_id=? AND state='pending'").run(now,row.delivery_id);
+          this.db.prepare("UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE job_id=? AND pending_message_id=?")
+            .run(now,row.job_id,row.message_id);
           continue;
         }
         const report=JSON.parse(row.payload_json) as {severity?:unknown};
@@ -447,8 +457,8 @@ export class WorkerMessageRepository {
           throw new WorkerMessageError("worker_message_event_conflict","silence event identity has a different projection");
         const binding=readEventJobBinding(this.db,row.source_event_id);
         if(binding)insertEventJobBinding(this.db,event.event_id,binding);
-        this.db.prepare("UPDATE worker_message_cadence SET silence_due_at=?,updated_at=? WHERE job_id=? AND generation=?")
-          .run(new Date(at.getTime()+row.silence_interval_ms).toISOString(),now,row.job_id,row.generation);
+        this.db.prepare("UPDATE worker_message_cadence SET silence_due_at=NULL,updated_at=? WHERE job_id=? AND generation=?")
+          .run(now,row.job_id,row.generation);
       }
       return rows.length;
     }).immediate();
@@ -456,9 +466,16 @@ export class WorkerMessageRepository {
 
   purge(at = new Date()): number {
     const cutoff = new Date(at.getTime() - workerMessageRetentionDays * 86_400_000).toISOString();
-    return this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
-      (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
-      AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))`).run(cutoff).changes;
+    return this.db.transaction(() => {
+      this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
+        (SELECT m.message_id FROM worker_messages m WHERE m.accepted_at<? AND m.job_id IN
+          (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
+          AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased')))`)
+        .run(at.toISOString(),cutoff);
+      return this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
+        (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))`).run(cutoff).changes;
+    }).immediate();
   }
 
   project(row: WorkerMessageRow) {
@@ -493,10 +510,15 @@ export class WorkerMessagePublisher {
   private timer: NodeJS.Timeout | undefined;
   constructor(private readonly repository:WorkerMessageRepository,private readonly wake:()=>void,private readonly pollMs=30_000,
     private readonly onError:(error:unknown)=>void=()=>{}) {}
-  start():void { if(this.timer)return; this.tick(); this.timer=setInterval(()=>this.tick(),this.pollMs); this.timer.unref(); }
+  start():void { if(this.timer)return; this.runOnce(); this.timer=setInterval(()=>this.runOnce(),this.pollMs); this.timer.unref(); }
   stop():void { if(this.timer)clearInterval(this.timer); this.timer=undefined; }
-  private tick():void {
-    try { const published=this.repository.publishPendingReports(); const silence=this.repository.publishDueSilenceEvents(); if(published+silence>0)this.wake(); }
+  runOnce(at=new Date()):void {
+    try {
+      const published=this.repository.publishPendingReports(100,at);
+      const silence=this.repository.publishDueSilenceEvents(100,at);
+      this.repository.purge(at);
+      if(published+silence>0)this.wake();
+    }
     catch(error){this.onError(error);}
   }
 }

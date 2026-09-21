@@ -9,7 +9,8 @@ import { DispatcherApi } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
-import { WorkerMessageError } from "../src/worker-messaging.js";
+import { envelopeFromRow } from "../src/prompt.js";
+import { WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -92,6 +93,8 @@ describe("worker messaging ledger",()=>{
       const one=database.workerMessages.appendReport(job.job_id,report(source.event_id,1),new Date("2026-07-01T00:00:00Z"));
       const two=database.workerMessages.appendReport(job.job_id,report(source.event_id,2),new Date("2026-07-01T00:00:01Z"));
       assert.equal(database.workerMessages.operationalSnapshot(new Date("2026-07-01T00:20:00Z")).due_silence_deadlines,1);
+      assert.equal(database.workerMessages.publishDueSilenceEvents(100,new Date("2026-07-01T00:20:00Z")),1);
+      assert.equal(database.workerMessages.publishDueSilenceEvents(100,new Date("2026-07-01T00:40:00Z")),0);
       database.close();
       const sqlite=new Database(config.databasePath);
       const rows=sqlite.prepare("SELECT message_id,state FROM worker_message_deliveries ORDER BY created_at").all() as Array<{message_id:string;state:string}>;
@@ -105,9 +108,29 @@ describe("worker messaging ledger",()=>{
       reopened.beginJobPreparation(job.job_id); reopened.setJobRuntime(job.job_id,"workspace","pane");
       reopened.beginJobDispatch(job.job_id); reopened.markJobRunning(job.job_id);
       reopened.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-07-01T00:03:00Z"},job.result_path);
-      assert.equal(reopened.workerMessages.purge(new Date("2026-08-02T00:00:00Z")),2);
+      const sqliteAfterTerminal=new Database(config.databasePath);
+      sqliteAfterTerminal.prepare("UPDATE worker_message_cadence SET pending_message_id=? WHERE job_id=?").run(one.message.message_id,job.job_id);
+      sqliteAfterTerminal.close();
+      const publisher=new WorkerMessagePublisher(reopened.workerMessages,()=>{});
+      publisher.runOnce(new Date("2026-08-02T00:00:00Z"));
+      const sqliteAfterPurge=new Database(config.databasePath);
+      assert.equal((sqliteAfterPurge.prepare("SELECT COUNT(*) AS count FROM worker_messages").get() as {count:number}).count,0);
+      assert.equal((sqliteAfterPurge.prepare("SELECT pending_message_id FROM worker_message_cadence WHERE job_id=?").get(job.job_id) as {pending_message_id:string|null}).pending_message_id,null);
+      sqliteAfterPurge.close();
       reopened.close();
     } finally { try { database.close(); } catch {} }
+  });
+
+  test("緊急reportは後続の通常reportでcoalescingされない",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,report(source.event_id,1),new Date("2026-09-21T00:00:01Z"));
+      const urgent=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+        idempotency_key:"urgent-2",occurred_at:"2026-09-21T00:00:02.000Z",payload:{kind:"question",question:"確認が必要です"}},new Date("2026-09-21T00:00:02Z"));
+      const latest=database.workerMessages.appendReport(job.job_id,report(source.event_id,3),new Date("2026-09-21T00:00:03Z"));
+      const states=[first,urgent,latest].map(value=>(database.workerMessages.reconcile(job.job_id,source.event_id,"worker",value.message.idempotency_key) as {delivery:{state:string}}).delivery.state);
+      assert.deepEqual(states,["superseded","pending","pending"]);
+    } finally {database.close();}
   });
 
   test("workspace frequencyは同時にdueとなった別jobも直列化する",async()=>{
@@ -147,6 +170,7 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     const messageId=((created.body.message as Record<string,unknown>).message_id as string);
     const internal=database.getByExternalId("dona_message",`worker-message:${messageId}`);
     assert.ok(internal); assert.equal(internal.event_type,"worker_message_report");
+    assert.equal(envelopeFromRow(internal).source,"dona_message");
     const sqlite=new Database(config.databasePath);
     assert.deepEqual(readEventJobBinding(sqlite,internal.event_id)?.owner,readEventJobBinding(sqlite,source.event_id)?.owner);
     sqlite.close();
