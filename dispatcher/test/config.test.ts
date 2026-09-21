@@ -142,9 +142,11 @@ describe("job resource config", () => {
   test("同期無限loopへ入る前に親processへcase-startを出力する", async () => {
     const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-reporter-`);
     const fixture = `${temporaryDirectory}/pending.test.mjs`;
+    const readyPath = `${temporaryDirectory}/ready`;
     fs.writeFileSync(fixture, [
+      'import fs from "node:fs";',
       'import { test } from "node:test";',
-      'test("sync-loop", () => { process.on("SIGTERM", () => {}); while (true) {} });',
+      'test("sync-loop", () => { process.on("SIGTERM", () => {}); fs.writeFileSync(process.env.DONA_FIXTURE_READY, "ready"); while (true) {} });',
     ].join("\n"));
     const nonce = "0123456789abcdef0123456789abcdef";
     const markers: string[] = [];
@@ -160,6 +162,7 @@ describe("job resource config", () => {
     childEnvironment.DONA_CASE_CHECKPOINT_NONCE = nonce;
     childEnvironment.DONA_CASE_CHECKPOINT_DIR = checkpointChannel.directory;
     childEnvironment.DONA_PROCESS_METRICS_NONCE = nonce;
+    childEnvironment.DONA_FIXTURE_READY = readyPath;
     sanitizeNestedTestEnvironment(childEnvironment);
     childEnvironment.NODE_OPTIONS = `--require=${JSON.stringify(fileURLToPath(new URL("./case-checkpoint.cjs", import.meta.url)))} --require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`;
     let stderr = "";
@@ -179,7 +182,7 @@ describe("job resource config", () => {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("case-start marker was not emitted")), 2_000);
         const inspect = (): void => {
-          if (!caseStartPattern.test(markers.join("\n"))) return;
+          if (!caseStartPattern.test(markers.join("\n")) || !fs.existsSync(readyPath)) return;
           clearTimeout(timeout);
           clearInterval(timer);
           resolve();
