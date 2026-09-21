@@ -103,7 +103,9 @@ test("navigation確定後の応答喪失を503にしactivity writeを再送し�
 test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptまでsource=web commandを接続する", async t => {
   const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
   const jobs = new DispatcherDatabase(config.databasePath); t.after(() => jobs.close());
+  let cancelFailure = false;
   const controls = { wake() {}, async cancelWeb(jobId: string, identity: {instance_id:string;tenant_id:string;principal_id:string}) {
+    if (cancelFailure) throw Error("fixture internal failure");
     const before = jobs.assertWebJobOwner(jobId, identity), row = jobs.beginWebJobCancellation(jobId, identity);
     jobs.markJobCancelled(jobId, "fixture"); return { row: jobs.getJob(jobId)!, duplicate: before.status === "cancelled" || row.status === "cancelled" };
   } };
@@ -151,6 +153,8 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   const missing = await postCancel("job_missing"); assert.equal(missing.status, 404); assert.deepEqual(JSON.parse(missing.body), { error: "not_found" });
   mismatchOperation = true; const mismatch = await postCancel(first.job.job_id); mismatchOperation = false;
   assert.equal(mismatch.status, 400); assert.deepEqual(JSON.parse(mismatch.body), { error: "invalid_request" });
+  cancelFailure = true; const internal = await postCancel(first.job.job_id); cancelFailure = false;
+  assert.equal(internal.status, 503); assert.deepEqual(JSON.parse(internal.body), { error: "internal_error" });
   const raceJobs = [];
   for (const suffix of ["one", "two"]) {
     const race = await request(policy, "/api/jobs", "POST", headers, JSON.stringify({ request_id: randomBytes(32).toString("base64url"),

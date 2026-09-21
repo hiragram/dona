@@ -58,6 +58,10 @@ test("command入力のidentity・source・URL・path・token注入とoversizeを
   for (const patch of [{ source: "web" }, { principal_id: "other" }, { token: "secret" }, { path: "/private" }, { callback_url: "https://evil.invalid" }]) {
     const result = await f.controller.handle(commandRequest(f, "/api/jobs", { ...base, ...patch })); assert.equal(result.status, 400);
   }
+  for (const repository of [".owner/repo", "owner/.repo"]) {
+    const result = await f.controller.handle(commandRequest(f, "/api/jobs", { ...base, workspace: { kind: "github", repository } }));
+    assert.equal(result.status, 400);
+  }
   const large = await f.controller.handle(commandRequest(f, "/api/jobs", { ...base, objective: "x".repeat(65536) }));
   assert.equal(large.status, 400); assert.equal(calls, 0);
 });

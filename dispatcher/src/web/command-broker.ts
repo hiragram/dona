@@ -67,7 +67,7 @@ export class WebCommandBroker {
         if (message === "web_job_owner_mismatch") return { status: "denied", reason: "owner_mismatch" };
         if (message.startsWith("web_job_terminal:")) return { status: "denied", reason: "terminal" };
         if (message === "web_cancel_acceptance_unknown") return { status: "denied", reason: "acceptance_unknown" };
-        return { status: "denied", reason: "terminal" };
+        throw error;
       }
       const saved = this.database.recordWebCancelReceipt(receiptId, payloadHash, identity, jobId);
       return { status: "succeeded", outcome: result.duplicate ? "already_cancelled" : "cancelled", receipt_id: saved.receipt_id,

@@ -6,7 +6,7 @@ import { assertProtectionKey, type SessionProtectionKey } from "./session-protec
 const requestId = z.string().length(43).refine(value => /^[A-Za-z0-9_-]+$/.test(value)
   && Buffer.from(value, "base64url").byteLength === 32 && Buffer.from(value, "base64url").toString("base64url") === value);
 const workspace = z.discriminatedUnion("kind", [z.strictObject({ kind: z.literal("scratch") }),
-  z.strictObject({ kind: z.literal("github"), repository: z.string().regex(/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/),
+  z.strictObject({ kind: z.literal("github"), repository: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/),
     base_ref: z.string().min(1).max(255).refine(value => !value.startsWith("-") && !value.includes("..") && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value)).optional() })]);
 const submit = z.strictObject({ request_id: requestId, objective: z.string().trim().min(1).max(100000)
   .refine(value => Buffer.byteLength(value) <= 400000), workspace });
