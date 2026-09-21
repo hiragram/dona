@@ -31,22 +31,24 @@ grantは有限なUTC秒精度の`issued_at`とexclusiveな`expires_at`を持ち�
 
 delegated grantはparentのchild集合・operation集合の部分集合で、expiryがparent以前の場合だけ発行できる。child追加、operation追加、expiry延長のいずれか一つでも拡張ならdenyし、新しい上位grantで代用しない。
 
-v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exact_job`と`cancel_exact_job`はIssue #15のsupervisor approval domainへ接続し、次のtyped receiptを必須とする。receiptは`version, receipt_id, issuer_kind, issuer_id, tenant_id, principal_id, resource_kind, resource_id, resource_revision, operation, issued_at, expires_at, policy_revision, nonce`を上記と同じcanonical encodingで署名する。検証済み署名結果も判定入力とし、全fieldの存在、contract version、空でないissuer/receipt/nonceを確認する。issuerは`supervisor`だけ、日時は有限で`issued_at <= now < expires_at`、寿命は正かつ5分以内、operationとresource revisionは完全一致、一度だけ消費する。missing、未知version/issuer、未検証署名、未来発行、不正日時、期限切れ、revision/operation不一致、#15の実装が未提供の場合は`approval_unavailable`でdenyし、read grantから補完しない。将来、対象operationまたはissuerを変える場合は新contract versionと#15側の合意が必要である。
+v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exact_job`と`cancel_exact_job`はIssue #15のsupervisor approval domainへ接続し、次のtyped receiptを必須とする。receiptは`version, receipt_id, issuer_kind, issuer_id, tenant_id, workspace_id, principal_id, resource_kind, resource_id, resource_revision, operation, issued_at, expires_at, policy_revision, nonce`を上記と同じcanonical encodingで署名する。検証済み署名結果も判定入力とし、全fieldの存在、contract version、空でないissuer/receipt/nonceを確認する。issuerは`supervisor`だけ、日時は有限で`issued_at <= now < expires_at`、寿命は正かつ5分以内、tenant/workspace/principal、operation、policy revision、resource identity/revisionは完全一致、一度だけ消費する。missing、未知version/issuer、未検証署名、未来発行、不正日時、期限切れ、scope不一致、#15の実装が未提供の場合は`approval_unavailable`でdenyし、read grantから補完しない。将来、対象operationまたはissuerを変える場合は新contract versionと#15側の合意が必要である。
 
 ## 認可decision table
 
 1. agent transportを認証し、current event/attempt専用contextを取得する。
 2. principal binding、tenant/workspace、principal kind、grantのresource集合・operation・expiry・policy revisionを照合する。
-3. destinationを伴う操作はcurrent access proofを直前に検証する。
+3. destinationを伴う操作はcurrent access proofを直前に検証し、caller入力ではなくcurrent eventのimmutable reply targetへ一致させる。
 4. resource revisionとdisclosure projectionを確定し、認可後の可視集合だけを返す。
 
 どの段階でも不明ならdenyし、外部向けerrorは`not_available`または`access_unavailable`へ縮退する。restricted auditだけに`unverified_ingress`、`principal_mismatch`、`grant_expired`、`policy_revision_mismatch`、`membership_revoked`、`legacy_unknown`等を残す。存在・件数・cursor・timing・詳細errorで不可視resourceを推測できる差を作らない。
 
-current access proofは`status, event_id, principal_id, workspace_id, destination_id, issued_at, expires_at, nonce, consumed`を持ち、requestと全identityを一致させる。nonceは空でない文字列、署名検証済みでなければならない。日時は有限なUTC秒精度とし、`issued_at <= now < expires_at`、寿命は正かつ120秒以下、expiryはexclusive、write用proofは一度だけ消費する。destination/principal/event不一致、未来発行、負または不正な寿命、期限切れ、消費済み、provider unavailable/revokedは外部へ`access_unavailable`だけを返す。それ以外の内部denyはresource ID、件数、cursor等を付けず`not_available`へ縮退する。
+current access proofは`status, event_id, principal_id, workspace_id, destination_id, issued_at, expires_at, nonce, consumed`を持ち、requestと全identityを一致させる。nonceは空でない文字列、署名検証済みをboolean `true`として受けた場合だけ有効とする。日時は有限なUTC秒精度とし、server clockから得たcaller非依存の判定時刻で`issued_at <= now < expires_at`、寿命は正かつ120秒以下、expiryはexclusive、write用proofは一度だけ消費する。destinationはrequest/proof相互一致だけでなくcurrent eventのimmutable reply targetとも一致させる。destination/principal/event不一致、proof欠落、未来発行、負または不正な寿命、期限切れ、消費済み、provider unavailable/revokedは外部へ`access_unavailable`だけを返す。それ以外の内部denyはresource ID、件数、cursor等を付けず`not_available`へ縮退する。
 
 全operation catalogはallow fixtureを少なくとも1件持つ。read系と`resolve_origin_ref`のfixtureはjob/group/schedule/session/notificationのbefore/after snapshotが完全一致し、許容する副作用をrestricted authorization auditだけに固定する。denyされたsteer/cancelも同じくstate不変である。成功したwrite gateはaccess proof nonceとapproval nonceをoperation開始と同じatomic boundaryで消費し、同じ入力の二回目をdenyする。
 
-principal proof verifierは署名に加え、空でないnonce、有限な時刻、`issued_at <= now < expires_at`、正かつ120秒以下の寿命、未消費であることを確認する。expiry境界、未来発行、消費済みnonce、未検証署名はbindingを作らずdenyする。principal/binding/grant等の必須identity自体が欠落しても例外差を外部へ出さずsafe denyへ縮退する。
+principal proof verifierはraw JSONをcanonical parseする前に重複keyを拒否し、version、active key ID、全identity、署名、空でないnonce、有限かつcanonicalな時刻、`issued_at <= now < expires_at`、正かつ120秒以下の寿命、未消費であることを確認する。expiry境界、未来発行、消費済みnonce、unknown/retired key、未検証署名はbindingを作らずdenyする。principal/binding/grant/access proof等の必須identity自体が欠落しても例外差を外部へ出さずsafe denyへ縮退する。
+
+認可時刻、current policy revision、exact taskのcurrent revision、Epic parentのcurrent revision、対象childのcurrent revision、current event destinationはserver注入の独立したtrusted inputとする。callerがrequest内の`now`やdestination、古いparent/child revisionを自己整合させても採用しない。`exact_resource` v1は`task`だけ、`epic_children_snapshot`は`epic` parentと文字列配列のexact child集合だけを許可し、未知resource kindや配列以外のsnapshotはdenyする。
 
 fixtureの主な期待値は次のとおりである。
 

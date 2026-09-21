@@ -9,6 +9,32 @@ const fixture = JSON.parse(raw);
 const canonical = value => Array.isArray(value) ? value.map(canonical)
   : value !== null && typeof value === 'object'
     ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+const canonicalTimestamp = value => typeof value === 'string'
+  && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
+const setPath = (target, path, value) => {
+  const parts = path.split('.');
+  const leaf = parts.pop();
+  let current = target;
+  for (const part of parts) current = current[part];
+  current[leaf] = value;
+};
+const expandedAdversarialCases = () => fixture.adversarial_cases.map(vector => {
+  const base = structuredClone(fixture.cases.find(entry => entry.id === vector.base_id));
+  assert.ok(base, vector.id);
+  base.id = vector.id;
+  for (const [path, value] of Object.entries(vector.set ?? {})) setPath(base, path, value);
+  Object.assign(base, {
+    decision: vector.decision,
+    reason: vector.reason,
+    expected_external: { code: vector.reason === 'access_unavailable' ? 'access_unavailable' : 'not_available' },
+    trusted_context: vector.trusted_context ?? base.trusted_context,
+  });
+  if (vector.decision === 'deny') {
+    base.state_after = structuredClone(base.state_before);
+    base.expected_effects = ['restricted_authorization_audit'];
+  }
+  return base;
+});
 
 test('cross-thread authorization fixtureはversion 1と署名golden vectorを固定する', () => {
   assert.equal(fixture.contract, 'cross-thread-authorization');
@@ -41,9 +67,9 @@ test('principal proofとoperation catalogは重複のない固定集合である
   assert.deepEqual(fixture.principal_proof.kinds_allowed_owner_wide, ['human']);
 });
 
-const decide = entry => {
+const decide = (entry, trusted) => {
   const { request, binding, grant, principal, transport_context: transport, access_proof: access } = entry;
-  if (!transport.authenticated) return ['deny', 'unverified_ingress'];
+  if (transport.authenticated !== true) return ['deny', 'unverified_ingress'];
   if (!principal || !binding || !grant || principal.kind === 'unknown') return ['deny', 'legacy_unknown'];
   if (principal.kind !== 'human') return ['deny', 'principal_kind_denied'];
   if (transport.event_id !== request.event_id || transport.attempt !== request.attempt
@@ -56,13 +82,15 @@ const decide = entry => {
   }
   if (binding.status !== 'active' || binding.revoked_at) return ['deny', 'binding_revoked'];
   if (binding.current_revision !== request.binding_revision) return ['deny', 'binding_revoked'];
-  if (access.status === 'unavailable') return ['deny', 'access_unavailable'];
+  if (!access || typeof access !== 'object' || access.status === 'unavailable') return ['deny', 'access_unavailable'];
   if (access.status !== 'current') return ['deny', 'membership_revoked'];
-  const accessIssued = Date.parse(access.issued_at), accessExpires = Date.parse(access.expires_at), now = Date.parse(request.now);
+  const accessIssued = Date.parse(access.issued_at), accessExpires = Date.parse(access.expires_at), now = Date.parse(trusted.now);
   const accessLifetime = accessExpires - accessIssued;
   if (access.event_id !== request.event_id || access.principal_id !== principal.id
     || access.workspace_id !== request.workspace_id || access.destination_id !== request.destination_id
-    || access.consumed || !access.signature_verified || typeof access.nonce !== 'string' || access.nonce.length === 0
+    || request.destination_id !== trusted.event_destination_id || access.consumed || access.signature_verified !== true
+    || typeof access.nonce !== 'string' || access.nonce.length === 0
+    || !canonicalTimestamp(access.issued_at) || !canonicalTimestamp(access.expires_at) || !canonicalTimestamp(trusted.now)
     || ![accessIssued, accessExpires, now].every(Number.isFinite)
     || accessLifetime <= 0 || accessLifetime > fixture.access_proof.max_age_seconds * 1000
     || accessIssued > now || now >= accessExpires) {
@@ -72,35 +100,38 @@ const decide = entry => {
   if (grant.scope_kind === 'epic_children_snapshot') {
     if (grant.resource_kind !== 'epic' || request.parent_resource_id !== grant.resource_id
       || request.parent_resource_revision !== grant.resource_revision
-      || !grant.child_snapshot.includes(request.resource_id)) return ['deny', 'resource_mismatch'];
+      || !Array.isArray(grant.child_snapshot) || !grant.child_snapshot.every(value => typeof value === 'string')
+      || !grant.child_snapshot.includes(request.resource_id)
+      || trusted.current_parent_resource_revision !== request.parent_resource_revision
+      || trusted.current_child_resource_revision !== request.resource_revision) return ['deny', 'resource_mismatch'];
   } else {
+    if (grant.resource_kind !== 'task') return ['deny', 'resource_mismatch'];
     for (const key of ['resource_kind', 'resource_id', 'resource_revision']) if (request[key] !== grant[key]) return ['deny', 'resource_mismatch'];
+    if (trusted.current_resource_revision !== request.resource_revision) return ['deny', 'resource_mismatch'];
   }
   if (!fixture.grant.operations.includes(request.operation) || !fixture.grant.operations.includes(grant.operation)
     || request.operation !== grant.operation) return ['deny', 'operation_denied'];
   if (request.policy_revision !== grant.policy_revision
     || entry.current_policy_revision !== request.policy_revision) return ['deny', 'policy_revision_mismatch'];
   if (grant.status !== 'active' || grant.revoked_at) return ['deny', 'grant_revoked'];
-  const expectedGrantRevision = grant.scope_kind === 'epic_children_snapshot'
-    ? request.parent_resource_revision : request.resource_revision;
-  if (entry.current_resource_revision !== expectedGrantRevision) return ['deny', 'resource_mismatch'];
   const grantIssued = Date.parse(grant.issued_at), grantExpires = Date.parse(grant.expires_at);
   const grantLifetime = grantExpires - grantIssued;
-  if (![grantIssued, grantExpires, now].every(Number.isFinite) || grantIssued > now
+  if (!canonicalTimestamp(grant.issued_at) || !canonicalTimestamp(grant.expires_at)
+    || ![grantIssued, grantExpires, now].every(Number.isFinite) || grantIssued > now
     || grantLifetime <= 0 || grantLifetime > fixture.grant.max_age_seconds * 1000) return ['deny', 'invalid_grant_lifetime'];
   if (now >= grantExpires) return ['deny', 'grant_expired'];
   if (fixture.approval.required_operations.includes(request.operation)) {
     const receipt = entry.approval_receipt;
-    const requiredFields = ['version', 'receipt_id', 'issuer_kind', 'issuer_id', 'tenant_id', 'principal_id',
+    const requiredFields = ['version', 'receipt_id', 'issuer_kind', 'issuer_id', 'tenant_id', 'workspace_id', 'principal_id',
       'resource_kind', 'resource_id', 'resource_revision', 'operation', 'issued_at', 'expires_at',
       'policy_revision', 'nonce', 'consumed', 'signature_verified'];
     const complete = receipt && requiredFields.every(key => Object.hasOwn(receipt, key));
-    const validIssuer = complete && receipt.version === 1 && receipt.signature_verified
+    const validIssuer = complete && receipt.version === 1 && receipt.signature_verified === true
       && typeof receipt.receipt_id === 'string' && receipt.receipt_id.length > 0
       && typeof receipt.issuer_id === 'string' && receipt.issuer_id.length > 0
       && typeof receipt.nonce === 'string' && receipt.nonce.length > 0
       && fixture.approval.issuer_kinds.includes(receipt.issuer_kind);
-    const validIdentity = receipt && receipt.tenant_id === request.tenant_id
+    const validIdentity = receipt && receipt.tenant_id === request.tenant_id && receipt.workspace_id === request.workspace_id
       && receipt.principal_id === principal.id && receipt.resource_kind === request.resource_kind
       && receipt.resource_id === request.resource_id && receipt.resource_revision === request.resource_revision
       && receipt.operation === request.operation && receipt.policy_revision === request.policy_revision;
@@ -108,6 +139,7 @@ const decide = entry => {
     const receiptExpires = receipt ? Date.parse(receipt.expires_at) : NaN;
     const lifetime = receiptExpires - receiptIssued;
     if (!complete || !validIssuer || !validIdentity || receipt.consumed
+      || !canonicalTimestamp(receipt.issued_at) || !canonicalTimestamp(receipt.expires_at)
       || ![receiptIssued, receiptExpires, now].every(Number.isFinite) || receiptIssued > now
       || lifetime <= 0 || lifetime > fixture.approval.max_age_seconds * 1000
       || now >= receiptExpires) return ['deny', 'approval_unavailable'];
@@ -120,8 +152,9 @@ const projectDeny = entry => entry.decision === 'allow' ? null : ({
 });
 
 test('threat/failure fixtureは具体的な入力からallow/denyを導出する', () => {
-  const byId = Object.fromEntries(fixture.cases.map(entry => [entry.id, entry]));
-  assert.equal(Object.keys(byId).length, fixture.cases.length);
+  const cases = [...fixture.cases, ...expandedAdversarialCases()];
+  const byId = Object.fromEntries(cases.map(entry => [entry.id, entry]));
+  assert.equal(Object.keys(byId).length, cases.length);
   for (const id of ['stale_event_substitution', 'forged_completion', 'unauthenticated_enqueue',
     'different_actor', 'bot_principal', 'service_principal', 'membership_revoked',
     'provider_unavailable', 'grant_before_expiry', 'grant_at_expiry', 'exact_task_mismatch',
@@ -143,9 +176,11 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
     'steer_replayed_nonce', 'cancel_replayed_nonce']) {
     assert.ok(byId[id], id);
   }
-  for (const entry of fixture.cases) {
+  for (const entry of cases) {
     assert.ok(entry.request?.now, entry.id);
-    assert.deepEqual(decide(entry), [entry.decision, entry.reason], entry.id);
+    const trusted = entry.trusted_context;
+    assert.ok(trusted, entry.id);
+    assert.deepEqual(decide(entry, trusted), [entry.decision, entry.reason], entry.id);
     assert.deepEqual(projectDeny(entry), entry.expected_external, entry.id);
     if (entry.expected_external) assert.deepEqual(Object.keys(entry.expected_external), ['code'], entry.id);
     if (entry.request.operation.startsWith('read_') || entry.request.operation === 'resolve_origin_ref') {
@@ -165,19 +200,27 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
         ['authorized_operation', 'consume_access_nonce', 'consume_approval_nonce', 'restricted_authorization_audit'], entry.id);
     }
   }
-  assert.deepEqual(new Set(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.request.operation)),
+  assert.deepEqual(new Set(cases.filter(entry => entry.decision === 'allow').map(entry => entry.request.operation)),
     new Set(fixture.grant.operations));
   assert.equal(byId.grant_at_expiry.reason, 'grant_expired');
   assert.equal(byId.provider_unavailable.reason, 'access_unavailable');
   assert.equal(byId.legacy_unknown.principal.kind, 'unknown');
 });
 
-test('principal proofは期限・未来発行・replay・署名をfail-closedにする', () => {
+test('principal proofは完全なidentity・raw JSON・key rotation・時刻をfail-closedにする', () => {
   const decideProof = entry => {
     const now = Date.parse(entry.now), issued = Date.parse(entry.issued_at), expires = Date.parse(entry.expires_at);
-    if (!entry.signature_verified) return ['deny', 'unverified_ingress'];
+    if (entry.raw_json_has_duplicate_keys) return ['deny', 'invalid_proof_shape'];
+    if (entry.version !== 1 || !fixture.principal_proof.active_key_ids.includes(entry.key_id)) return ['deny', 'unknown_proof_key'];
+    if (entry.signature_verified !== true) return ['deny', 'unverified_ingress'];
+    for (const key of ['event_id', 'tenant_id', 'workspace_id', 'principal_id']) {
+      if (entry[key] !== fixture.principal_proof.expected_identity[key]) return ['deny', 'proof_identity_mismatch'];
+    }
+    if (entry.attempt !== fixture.principal_proof.expected_identity.attempt
+      || entry.principal_kind !== 'human') return ['deny', 'proof_identity_mismatch'];
     if (entry.consumed) return ['deny', 'proof_replayed'];
-    if (![now, issued, expires].every(Number.isFinite) || issued > now || expires - issued <= 0
+    if (!canonicalTimestamp(entry.now) || !canonicalTimestamp(entry.issued_at) || !canonicalTimestamp(entry.expires_at)
+      || ![now, issued, expires].every(Number.isFinite) || issued > now || expires - issued <= 0
       || expires - issued > fixture.principal_proof.expires_after_seconds * 1000) return ['deny', 'invalid_proof_time'];
     if (now >= expires) return ['deny', 'proof_expired'];
     return ['allow', 'verified'];

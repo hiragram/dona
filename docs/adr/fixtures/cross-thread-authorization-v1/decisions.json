@@ -7,6 +7,16 @@
     "kinds_allowed_owner_wide": [
       "human"
     ],
+    "active_key_ids": [
+      "fixture-key-v1"
+    ],
+    "expected_identity": {
+      "event_id": "evt_fixture_owner",
+      "attempt": 1,
+      "tenant_id": "T_FIXTURE",
+      "workspace_id": "T_FIXTURE",
+      "principal_id": "U_OWNER"
+    },
     "required_fields": [
       "attempt",
       "event_id",
@@ -35,58 +45,224 @@
     "cases": [
       {
         "id": "proof_before_expiry",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
         "now": "2026-09-21T00:01:59Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "expires_at": "2026-09-21T00:02:00Z",
         "nonce": "proof-1",
         "consumed": false,
         "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
         "decision": "allow",
         "reason": "verified"
       },
       {
         "id": "proof_at_expiry",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
         "now": "2026-09-21T00:02:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "expires_at": "2026-09-21T00:02:00Z",
         "nonce": "proof-2",
         "consumed": false,
         "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
         "decision": "deny",
         "reason": "proof_expired"
       },
       {
         "id": "proof_future_issued",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
         "now": "2026-09-21T00:00:00Z",
         "issued_at": "2026-09-21T00:00:01Z",
         "expires_at": "2026-09-21T00:01:00Z",
         "nonce": "proof-3",
         "consumed": false,
         "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
         "decision": "deny",
         "reason": "invalid_proof_time"
       },
       {
         "id": "proof_consumed",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
         "now": "2026-09-21T00:01:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "expires_at": "2026-09-21T00:02:00Z",
         "nonce": "proof-4",
         "consumed": true,
         "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
         "decision": "deny",
         "reason": "proof_replayed"
       },
       {
         "id": "proof_unverified",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
         "now": "2026-09-21T00:01:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "expires_at": "2026-09-21T00:02:00Z",
         "nonce": "proof-5",
         "consumed": false,
         "signature_verified": false,
+        "raw_json_has_duplicate_keys": false,
         "decision": "deny",
         "reason": "unverified_ingress"
+      },
+      {
+        "id": "proof_unknown_version",
+        "version": 2,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-6",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
+        "decision": "deny",
+        "reason": "unknown_proof_key"
+      },
+      {
+        "id": "proof_unknown_key",
+        "version": 1,
+        "key_id": "retired-key-v0",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-7",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
+        "decision": "deny",
+        "reason": "unknown_proof_key"
+      },
+      {
+        "id": "proof_event_mismatch",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_other",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-8",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
+        "decision": "deny",
+        "reason": "proof_identity_mismatch"
+      },
+      {
+        "id": "proof_workspace_mismatch",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_OTHER",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-9",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
+        "decision": "deny",
+        "reason": "proof_identity_mismatch"
+      },
+      {
+        "id": "proof_noncanonical_time",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00.000Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-10",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": false,
+        "decision": "deny",
+        "reason": "invalid_proof_time"
+      },
+      {
+        "id": "proof_duplicate_raw_key",
+        "version": 1,
+        "key_id": "fixture-key-v1",
+        "event_id": "evt_fixture_owner",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "now": "2026-09-21T00:01:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "expires_at": "2026-09-21T00:02:00Z",
+        "nonce": "proof-11",
+        "consumed": false,
+        "signature_verified": true,
+        "raw_json_has_duplicate_keys": true,
+        "raw_json": "{\"principal_id\":\"U_OWNER\",\"principal_id\":\"U_ATTACKER\"}",
+        "decision": "deny",
+        "reason": "invalid_proof_shape"
       }
     ]
   },
@@ -209,7 +385,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "stale_event_substitution",
@@ -302,7 +485,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "forged_completion",
@@ -395,7 +585,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "unauthenticated_enqueue",
@@ -488,7 +685,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "different_actor",
@@ -581,7 +785,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "bot_principal",
@@ -674,7 +885,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "service_principal",
@@ -767,7 +985,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "membership_revoked",
@@ -860,7 +1085,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "provider_unavailable",
@@ -953,7 +1185,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "grant_at_expiry",
@@ -1046,7 +1285,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:15:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "exact_task_mismatch",
@@ -1139,7 +1385,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "operation_denied",
@@ -1232,7 +1485,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "policy_revision_mismatch",
@@ -1325,7 +1585,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "legacy_unknown",
@@ -1393,7 +1660,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 1
+      "current_resource_revision": 1,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 1,
+        "current_parent_resource_revision": 1,
+        "current_child_resource_revision": 1
+      }
     },
     {
       "id": "stale_transport_capability",
@@ -1486,7 +1760,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "binding_tenant_mismatch",
@@ -1579,7 +1860,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "binding_workspace_mismatch",
@@ -1672,7 +1960,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "binding_kind_mismatch",
@@ -1765,7 +2060,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "grant_too_long",
@@ -1858,7 +2160,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "grant_revoked",
@@ -1952,7 +2261,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "unknown_operation",
@@ -2033,7 +2349,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_destination_mismatch",
@@ -2126,7 +2449,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_principal_mismatch",
@@ -2219,7 +2549,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_event_mismatch",
@@ -2312,7 +2649,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_expired",
@@ -2405,7 +2749,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_consumed",
@@ -2498,7 +2849,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_with_approval",
@@ -2575,6 +2933,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -2613,7 +2972,14 @@
         "consume_approval_nonce",
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_missing_approval",
@@ -2706,7 +3072,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "cancel_approval_at_expiry",
@@ -2783,6 +3156,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -2816,7 +3190,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_issuer_mismatch",
@@ -2893,6 +3274,7 @@
         "issuer_kind": "agent",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -2926,7 +3308,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_resource_mismatch",
@@ -3003,6 +3392,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:other",
@@ -3036,7 +3426,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_revision_mismatch",
@@ -3113,6 +3510,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -3146,7 +3544,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "principal_tenant_mismatch",
@@ -3239,7 +3644,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "principal_workspace_mismatch",
@@ -3332,7 +3744,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "binding_revoked",
@@ -3425,7 +3844,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "current_policy_revision_mismatch",
@@ -3518,7 +3944,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_negative_lifetime",
@@ -3611,7 +4044,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_future_issued_at",
@@ -3704,7 +4144,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_invalid_time",
@@ -3797,7 +4244,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_missing_field",
@@ -3874,6 +4328,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -3906,7 +4361,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_unknown_version",
@@ -3983,6 +4445,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -4016,7 +4479,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "steer_approval_unverified",
@@ -4093,6 +4563,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -4126,7 +4597,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "allow_cancel_exact_job",
@@ -4203,6 +4681,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -4241,7 +4720,14 @@
         "consume_approval_nonce",
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "allow_read_bounded_result",
@@ -4332,7 +4818,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "allow_read_exact_job_status",
@@ -4423,7 +4916,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "allow_resolve_origin_ref",
@@ -4514,7 +5014,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:10:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "epic_snapshot_child",
@@ -4609,7 +5116,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 1
+      }
     },
     {
       "id": "epic_future_child",
@@ -4706,7 +5220,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 1
+      }
     },
     {
       "id": "grant_invalid_time",
@@ -4799,7 +5320,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "grant_future_issued_at",
@@ -4892,7 +5420,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "approval_invalid_time",
@@ -4969,6 +5504,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -5002,7 +5538,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "approval_future_issued_at",
@@ -5079,6 +5622,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -5112,7 +5656,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "approval_negative_lifetime",
@@ -5189,6 +5740,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -5222,7 +5774,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_nonce_missing",
@@ -5314,7 +5873,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_nonce_empty",
@@ -5407,7 +5973,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "access_signature_unverified",
@@ -5500,7 +6073,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "unknown_grant_scope",
@@ -5593,7 +6173,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "principal_missing",
@@ -5681,7 +6268,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "exact_current_revision_mismatch",
@@ -5774,7 +6368,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 4
+      "current_resource_revision": 4,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 4,
+        "current_parent_resource_revision": 4,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "epic_current_revision_mismatch",
@@ -5871,7 +6472,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 4
+      "current_resource_revision": 4,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 4,
+        "current_parent_resource_revision": 4,
+        "current_child_resource_revision": 1
+      }
     },
     {
       "id": "steer_replayed_nonce",
@@ -5948,6 +6556,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -5981,7 +6590,14 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
     },
     {
       "id": "cancel_replayed_nonce",
@@ -6058,6 +6674,7 @@
         "issuer_kind": "supervisor",
         "issuer_id": "supervisor-fixture",
         "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
         "principal_id": "U_OWNER",
         "resource_kind": "task",
         "resource_id": "issue:160",
@@ -6091,7 +6708,181 @@
       "expected_effects": [
         "restricted_authorization_audit"
       ],
-      "current_resource_revision": 3
+      "current_resource_revision": 3,
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      }
+    }
+  ],
+  "adversarial_cases": [
+    {
+      "id": "authenticated_non_boolean",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "transport_context.authenticated": "false"
+      },
+      "decision": "deny",
+      "reason": "unverified_ingress"
+    },
+    {
+      "id": "access_proof_missing",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "access_proof": null
+      },
+      "decision": "deny",
+      "reason": "access_unavailable"
+    },
+    {
+      "id": "exact_unknown_resource_kind",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "request.resource_kind": "admin",
+        "grant.resource_kind": "admin"
+      },
+      "decision": "deny",
+      "reason": "resource_mismatch"
+    },
+    {
+      "id": "grant_noncanonical_time",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "grant.issued_at": "2026-09-21T00:00:00.000Z"
+      },
+      "decision": "deny",
+      "reason": "invalid_grant_lifetime"
+    },
+    {
+      "id": "access_noncanonical_time",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "access_proof.issued_at": "2026-09-21T00:13:59+00:00"
+      },
+      "decision": "deny",
+      "reason": "access_unavailable"
+    },
+    {
+      "id": "approval_tenant_mismatch",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.tenant_id": "T_OTHER"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_workspace_mismatch",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.workspace_id": "T_OTHER"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_principal_mismatch",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.principal_id": "U_OTHER"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_operation_mismatch",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.operation": "cancel_exact_job"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_policy_mismatch",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.policy_revision": 8
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_signature_non_boolean",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.signature_verified": "false"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "approval_noncanonical_time",
+      "base_id": "steer_with_approval",
+      "set": {
+        "approval_receipt.issued_at": "2026-09-21T00:09:00.000Z"
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable"
+    },
+    {
+      "id": "epic_child_snapshot_wrong_type",
+      "base_id": "epic_snapshot_child",
+      "set": {
+        "grant.child_snapshot": "issue:1610"
+      },
+      "decision": "deny",
+      "reason": "resource_mismatch"
+    },
+    {
+      "id": "epic_child_current_revision_mismatch",
+      "base_id": "epic_snapshot_child",
+      "set": {},
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 2
+      },
+      "decision": "deny",
+      "reason": "resource_mismatch"
+    },
+    {
+      "id": "caller_time_rollback",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "request.now": "2026-09-21T00:14:00Z"
+      },
+      "trusted_context": {
+        "now": "2026-09-21T00:15:00Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      },
+      "decision": "deny",
+      "reason": "grant_expired"
+    },
+    {
+      "id": "caller_destination_swap",
+      "base_id": "grant_before_expiry",
+      "set": {
+        "request.destination_id": "C_OTHER",
+        "access_proof.destination_id": "C_OTHER"
+      },
+      "trusted_context": {
+        "now": "2026-09-21T00:14:59Z",
+        "event_destination_id": "C_PRIVATE",
+        "current_resource_revision": 3,
+        "current_parent_resource_revision": 3,
+        "current_child_resource_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable"
     }
   ],
   "downstream": {
