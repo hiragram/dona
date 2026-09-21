@@ -27,6 +27,7 @@ import "./web/auth-write-service.js";
 import "./web/internal-gateway.js";
 import "./web/job-read-model.js";
 import "./web/analysis-runtime.js";
+import "./web/command-database.js";
 
 import "./approval/record-repository.js";
 

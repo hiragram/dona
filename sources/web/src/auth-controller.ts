@@ -16,12 +16,14 @@ import type { WebAuthWriteClient } from "./auth-write-client.js";
 import type { WebSessionClient } from "./session-client.js";
 import type { WebJobReadClient } from "./job-read-client.js";
 import { maximumWebJobBrowserBodyBytes } from "./job-read-wire.js";
+import type { WebCommandClient } from "./command-client.js";
+import { deriveWebIdempotencyKey, parseBrowserCommand } from "./browser-command.js";
 
 type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
 type Reason = "identity_invalid" | "identity_unavailable" | "identity_mismatch" | "session_invalid" | "session_revoked"
   | "session_expired" | "origin_invalid" | "csrf_invalid" | "cookie_invalid" | "cookie_ambiguous";
-type Status = 200 | 204 | 400 | 401 | 403 | 404 | 409 | 503;
+type Status = 200 | 201 | 204 | 400 | 401 | 403 | 404 | 409 | 429 | 503;
 export interface BrowserAuthRequest {
   method: string; target: string; headers: RawHeaders; body: Uint8Array;
   /** Trusted TLS/proxy listener result, never a request field/header. */
@@ -43,6 +45,7 @@ export interface BrowserAuthConnections {
   session: Pick<WebSessionClient, "confirm">;
   oidc: Pick<OidcProtocol, "introspect">;
   jobRead?: Pick<WebJobReadClient, "execute">;
+  command?: Pick<WebCommandClient, "execute">;
 }
 class AuthFailure extends Error {
   constructor(readonly status: Status, readonly reason: Reason, readonly publicReason: Reason | "durability_unavailable" = reason) { super(reason); }
@@ -118,7 +121,7 @@ export class WebAuthController {
     const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false;
     try {
       now();
-      if (!(request.body instanceof Uint8Array) || request.body.byteLength > 64 || request.headers.length > 128
+      if (!(request.body instanceof Uint8Array) || request.body.byteLength > 65536 || request.headers.length > 128
         || request.headers.reduce((n, [key, value]) => n + Buffer.byteLength(key) + Buffer.byteLength(value), 0) > 16384)
         throw new AuthFailure(400, "session_invalid");
       if (request.headers.some(([name]) => /^(authorization|x-(actor|email|user|principal|tenant).*)$/i.test(name)))
@@ -126,7 +129,7 @@ export class WebAuthController {
       assertBrowserBoundary(this.policy, request.headers, request.transportVerified);
       let route;
       try { route = matchWebRoute(request.method, request.target); } catch { throw new AuthFailure(404, "session_invalid"); }
-      if (!["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
+      if (!["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events", "job_submit", "job_cancel"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
       let jobCursor:string|undefined,jobLimit:number|undefined;
       if(route.id==="job_list"){
         const url=new URL(request.target,this.policy.origin),keys=[...url.searchParams.keys()];
@@ -135,10 +138,14 @@ export class WebAuthController {
         if(rawCursor!==null){if(!/^[A-Za-z0-9_-]{43}$/.test(rawCursor))throw new AuthFailure(400,"session_invalid");jobCursor=rawCursor;}
         if(rawLimit!==null){jobLimit=Number(rawLimit);if(!/^[1-9][0-9]?$/.test(rawLimit)||jobLimit>50)throw new AuthFailure(400,"session_invalid");}
       }
+      let browserCommand: ReturnType<typeof parseBrowserCommand> | undefined;
       if (route.method === "POST") {
         assertSameOrigin(this.policy, request.headers);
         if (singleHeader(request.headers, "content-type") !== "application/json") throw new AuthFailure(400, "session_invalid");
-        try { z.strictObject({}).parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(request.body))); }
+        try {
+          if (["job_submit", "job_cancel"].includes(route.id)) browserCommand = parseBrowserCommand(route.id, request.body);
+          else z.strictObject({}).parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(request.body)));
+        }
         catch { throw new AuthFailure(400, "session_invalid"); }
       } else {
         const origin = singleHeader(request.headers, "origin");
@@ -155,6 +162,7 @@ export class WebAuthController {
       if (!cookieIndex) throw new AuthFailure(401, "cookie_invalid");
       const csrf = this.csrf(snapshot, now());
       if (route.id === "local_csrf") return response(200, { csrf_token: csrf });
+      if (["job_submit", "job_cancel"].includes(route.id)) assertCsrf(this.policy, request.headers, csrf);
       if (route.id === "logout" || route.id === "logout_status") {
         assertCsrf(this.policy, request.headers, csrf);
         if (route.id === "logout_status") {
@@ -218,6 +226,22 @@ export class WebAuthController {
         if(result.kind==="events")return eventResponse(result.reset_required?"reset":result.changed?"job":"heartbeat",result.event_cursor,
           result.reset_required?{reset_required:true}:{job:result.job});
         return response(200,result.kind==="list"?{items:result.items,next_cursor:result.next_cursor}:{job:result.job,event_cursor:result.event_cursor},false,maximumWebJobBrowserBodyBytes);
+      }
+      if (browserCommand && ["job_submit", "job_cancel"].includes(route.id)) {
+        if (!this.connections.command) throw new AuthFailure(503, "identity_unavailable");
+        auditAttempted = true;
+        const command = await this.connections.command.execute({ codec_version: 1, operation: route.id === "job_submit" ? "submit" : "cancel",
+          method: "POST", target: request.target, context, browser_body: Buffer.from(request.body).toString("base64url"),
+          idempotency_key: deriveWebIdempotencyKey(identity, browserCommand.request_id,
+            this.keys.protection("web_cookie_index", snapshot.session.cookie_key_version), issued) });
+        if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
+        if (command.status === "denied") {
+          const status: Status = command.reason === "invalid_request" ? 400 : command.reason === "scope_denied" || command.reason === "owner_mismatch" ? 403
+            : command.reason === "not_found" ? 404 : command.reason === "quota_exceeded" ? 429
+              : command.reason === "identity_unavailable" || command.reason === "acceptance_unknown" || command.reason === "internal_error" ? 503 : 409;
+          return response(status, { error: command.reason });
+        }
+        return response(command.outcome === "created" ? 201 : 200, command);
       }
       const target = route.id === "dashboard" ? "/" : "/api/session";
       // Fetch MetadataはBFFでのみ解釈し、選択結果をUDS request全体のMACへ結ぶ。

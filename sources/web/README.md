@@ -53,3 +53,7 @@ OIDCのexchangeとinspectは、保護時計を都度再読するcallbackを必�
 login transactionのstate・nonce・PKCE verifierはweb_login_transaction専用keyで暗号化し、cookie keyed digestとそのkey version、instance/tenant、login ref、BFF generation、5分の期限へbindする。serverは監査付きtransactionで一回消費と保存secret削除を確定してから復号・token交換する。暗号化helper自体はreplayを防がず、durable consumeを代替しない。受理不明をtoken交換の再試行へ流さない。
 
 Web session・固定route・ingress contextの追加契約は [運用文書](../../docs/operations/web-session-contracts.md) を参照する。監査付き保存・実listenerへの接続は後続であり、このpackageだけで認可を完了しない。
+
+## Job command
+
+`POST /api/jobs`と`POST /api/jobs/:job_id/cancel`は、online照合済みsessionから署名したingress contextを固定command UDSへ渡す。browserの`request_id`はそのままjob keyにせず、保護鍵とverified bindingからserver側idempotency keyを導出する。durable receipt、owner照合、応答喪失時のreconcile、typed errorの詳細は[Web command API運用契約](../../docs/operations/web-command-api.md)を参照する。

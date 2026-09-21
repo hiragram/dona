@@ -120,7 +120,7 @@ test("別principalと未知jobを同じnot_found projectionにする",t=>{const 
 
 test("can_cancelは現行cancel受付状態だけを公開する",t=>{const f=fixture(t);
   const broker=new WebJobReadBroker({verifySessionIngress:()=>({status:"succeeded",kind:"session_verified",principal:{...owner}})} as never,f.jobs);
-  for(const [status,expected] of [["queued",true],["preparing",false],["dispatching",false],["retryable_failed",true],["running",true],["blocked",true],["completed",false]] as const){
+  for(const [status,expected] of [["queued",true],["preparing",true],["dispatching",true],["retryable_failed",true],["running",true],["blocked",true],["needs_review",true],["cancelling",false],["completed",false]] as const){
     const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
     assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
   }

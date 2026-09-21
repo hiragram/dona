@@ -9,6 +9,7 @@ import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { WebCommandIdentity } from "./database.js";
 import type { JobProgressCoordinator } from "./job-progress.js";
 
 class WakeSignal {
@@ -80,6 +81,7 @@ export interface JobControlResult {
 interface ActiveJob {
   sourceEventId: string;
   operation: Promise<void>;
+  startup: Promise<void>;
 }
 
 interface SupervisorClock {
@@ -119,6 +121,7 @@ export class JobSupervisor {
     private readonly wakeEventWorker: () => void,
     private progress?: JobProgressCoordinator,
     private readonly clock: SupervisorClock = systemClock,
+    private readonly readResult: typeof readJobResultEnvelope = readJobResultEnvelope,
   ) {}
 
   isRunning(): boolean {
@@ -220,6 +223,7 @@ export class JobSupervisor {
 
   cancel(jobId: string, sourceEventId: string, reason = "Cancelled by Dona"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
@@ -243,6 +247,34 @@ export class JobSupervisor {
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
+      return { row: this.database.getJob(jobId)!, duplicate: false };
+    });
+  }
+
+  cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
+    return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
+      const before = this.database.assertWebJobOwner(jobId, identity);
+      if (before.status === "cancelled") return { row: before, duplicate: true };
+      if (before.status === "needs_review" && before.last_error_code === "web_cancel_acceptance_unknown") {
+        throw new Error("web_cancel_acceptance_unknown");
+      }
+      const cancelling = this.database.beginWebJobCancellation(jobId, identity);
+      if (["queued", "retryable_failed"].includes(before.status)) {
+        this.database.markJobCancelled(jobId, reason); this.wake();
+        return { row: this.database.getJob(jobId)!, duplicate: false };
+      }
+      const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
+      if (!cancelled.ok) {
+        if (before.status === "needs_review" && !cancelled.timedOut
+          && ["agent_not_found", "agent_not_running"].includes(cancelled.errorCode ?? "")) {
+          this.database.markJobCancelled(jobId, reason); this.wake();
+          return { row: this.database.getJob(jobId)!, duplicate: false };
+        }
+        this.database.markJobNeedsReview(jobId, "web_cancel_acceptance_unknown", commandMessage(cancelled));
+        this.wake(); throw new Error("web_cancel_acceptance_unknown");
+      }
+      this.database.markJobCancelled(jobId, reason); this.trackCancelledWorkerCleanup(cancelling); this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
     });
   }
@@ -445,7 +477,9 @@ export class JobSupervisor {
   }
 
   private launch(row: JobRow): void {
-    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row))
+    let startupReady!: () => void;
+    const startup = new Promise<void>(resolve => { startupReady = resolve; });
+    const operation = (row.status === "running" ? this.monitor(row, startupReady) : this.startJob(row, startupReady))
       .catch((error: unknown) => {
         this.logger.error("Job operation failed unexpectedly", {
           job_id: row.job_id,
@@ -463,10 +497,11 @@ export class JobSupervisor {
         this.active.delete(row.job_id);
         this.wake();
       });
-    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation });
+    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation, startup });
   }
 
-  private async startJob(row: JobRow): Promise<void> {
+  private async startJob(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     try {
       await fs.access(row.result_path);
       this.database.markJobNeedsReview(row.job_id, "result_path_exists", "A job result file existed before prompt submission");
@@ -508,7 +543,7 @@ export class JobSupervisor {
     }
     if (!prompted.ok) {
       if (prompted.timedOut || prompted.errorCode === "agent_prompt_stalled") {
-        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted, startupReady);
         return;
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
@@ -535,7 +570,8 @@ export class JobSupervisor {
     this.database.markJobRunning(row.job_id);
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
-    await this.monitor(running);
+    await this.monitor(running, startupReady);
+    } finally { startupReady(); }
   }
 
   private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {
@@ -551,7 +587,11 @@ export class JobSupervisor {
     }
   }
 
-  private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
+  private async reconcileStalledPrompt(
+    row: JobRow,
+    initial: HerdrCommandResult,
+    startupReady: () => void = () => {},
+  ): Promise<void> {
     const startedAt = this.clock.now();
     const deadline = startedAt + this.config.jobPromptReconcileMs;
     let nextTick = startedAt;
@@ -628,7 +668,7 @@ export class JobSupervisor {
           this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
           return;
         }
-        await this.monitor(this.database.getJob(row.job_id)!);
+        await this.monitor(this.database.getJob(row.job_id)!, startupReady);
         return;
       }
     }
@@ -653,7 +693,7 @@ export class JobSupervisor {
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.markJobRunning(row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       return true;
@@ -664,11 +704,13 @@ export class JobSupervisor {
     }
   }
 
-  private async monitor(row: JobRow): Promise<void> {
+  private async monitor(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     const initialProgress=this.progress;
     try { await initialProgress?.ingest(this.database.getJob(row.job_id) ?? row); }
     catch (error) { await this.failOpenProgress(initialProgress,row.job_id,"job_progress_initial_ingest_failed",error); }
     if (await this.tryComplete(row, false)) return;
+    startupReady();
     let keepPolling = true;
     const pollAbort = new AbortController();
     const stopPoll = (): void => pollAbort.abort();
@@ -692,28 +734,23 @@ export class JobSupervisor {
     try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
     finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
-    if (!waited.ok) {
-      if (waited.timedOut || waited.errorCode === "timeout") {
-        this.logger.debug("Background job remains active", {
-          job_id: row.job_id,
-          job_status: "running",
-        });
+    await this.serialized(row.job_id, async () => {
+      if (["cancelling", "cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return;
+      if (!waited.ok) {
+        if (waited.timedOut || waited.errorCode === "timeout") {
+          this.logger.debug("Background job remains active", { job_id: row.job_id, job_status: "running" });
+          return;
+        }
+        this.database.markJobNeedsReview(row.job_id, waited.errorCode ?? "agent_wait_failed", commandMessage(waited));
         return;
       }
-      this.database.markJobNeedsReview(
-        row.job_id,
-        waited.errorCode ?? "agent_wait_failed",
-        commandMessage(waited),
-      );
-      return;
-    }
-    if (waited.agentStatus === "blocked") {
-      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
-      return;
-    }
-    if (["idle", "done"].includes(waited.agentStatus ?? "")) {
-      await this.tryComplete(row, true);
-    }
+      if (waited.agentStatus === "blocked") {
+        this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+        return;
+      }
+      if (["idle", "done"].includes(waited.agentStatus ?? "")) await this.tryComplete(row, true);
+    });
+    } finally { startupReady(); }
   }
 
   private async failOpenProgress(progress:JobProgressCoordinator|undefined,jobId:string,errorCode:string,error:unknown):Promise<void> {
@@ -726,7 +763,7 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {

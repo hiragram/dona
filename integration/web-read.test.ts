@@ -25,7 +25,7 @@ test("TLSからprincipal-scoped snapshotとSSE再接続へ収束しprivate field
       VALUES(?,?,?,'web',?,?,'SECRET objective','{}','running',0,?,'/private/work','/private/result',?,?,?)`)
       .run(id,eventId,id,scope.tenant_id,principal,created,`agent-${id}`,created,created);return id;};
   const owned=seed("principal","job_owned","2026-09-19T00:00:00.000Z");seed("other","job_foreign","2026-09-19T00:00:01.000Z");
-  const configured=await tlsPolicy();const f=await fixture(t,configured,repository=>new WebJobReadBroker(repository,jobs));
+  const configured=await tlsPolicy();const f=await fixture(t,configured,{jobReads:repository=>new WebJobReadBroker(repository,jobs)});
   const policy=f.local.policy,client=new WebJobReadClient(f.socket,scope,()=>f.credential,f.lookup,f.local.now);
   const oidc=await loginOidcFixture(policy,f.local.now,f.local.token),connections={...f.connections,jobRead:client,
     oidc:{...oidc.connection,introspect:f.connections.oidc.introspect.bind(f.connections.oidc)}};

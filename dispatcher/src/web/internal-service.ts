@@ -13,8 +13,10 @@ import { serviceScopeSchema, WebServiceError, type ServiceScope, type WebService
 import type { AuthWriteResult } from "./write-auth.js";
 import { maximumWebJobReadBodyBytes, parseWebJobReadInput, signWebJobReadResponse, verifyWebJobReadProof } from "./job-read-wire.js";
 import type { WebJobReadBroker } from "./job-read-broker.js";
+import { maximumWebCommandBodyBytes, parseWebCommandInput, signWebCommandResponse, verifyWebCommandProof } from "./command-wire.js";
+import type { WebCommandBroker } from "./command-broker.js";
 
-const kinds = ["session", "read", "write", "job_read"] as const;
+const kinds = ["session", "read", "write", "command", "job_read"] as const;
 type Kind = typeof kinds[number];
 type Mode = Kind | "all";
 const protocols = Object.freeze({
@@ -26,6 +28,8 @@ const protocols = Object.freeze({
     maximum: writeAuth.maximumServiceBodyBytes, type: "application/vnd.dona.web-auth-write-response" }),
   job_read: Object.freeze({ path: "/v1/web/jobs/read", host: "dona-web-job-read",
     maximum: maximumWebJobReadBodyBytes, type: "application/vnd.dona.web-job-read-response" }),
+  command: Object.freeze({ path: "/v1/web/command", host: "dona-web-command",
+    maximum: maximumWebCommandBodyBytes, type: "application/json" }),
 });
 
 function privateParent(socketPath: string): void {
@@ -48,7 +52,7 @@ function requestHeaders(request: http.IncomingMessage, mode: Mode): { proof: str
   const length = headers.get("content-length"), proof = headers.get("x-dona-service-proof");
   if (request.method !== "POST" || request.url !== protocol.path || request.httpVersion !== "1.1"
     || headers.get("host") !== protocol.host || headers.get("content-type") !== "application/json"
-    || headers.get("connection") !== "close" || !length || !/^[1-9][0-9]{0,4}$/.test(length)
+    || headers.get("connection") !== "close" || !length || !/^[1-9][0-9]{0,5}$/.test(length)
     || Number(length) > protocol.maximum || !proof || proof.length > 2048) throw new WebServiceError();
   return { proof, length: Number(length), kind };
 }
@@ -72,7 +76,7 @@ export class WebInternalService {
   private readonly scope: ServiceScope;
   constructor(private readonly socketPath: string, scope: ServiceScope, private readonly repository: WebAuthRepository,
     private readonly credentials: WebServiceCredentialLookup, private readonly now: () => string, private readonly deadlineMs: number, private readonly mode: Mode,
-    private readonly jobReads?: WebJobReadBroker) {
+    private readonly commands?: WebCommandBroker, private readonly jobReads?: WebJobReadBroker) {
     this.scope = serviceScopeSchema.parse(scope);
     if (mode !== "all" && !kinds.includes(mode)) throw new WebServiceError();
     if (!(repository instanceof WebAuthRepository) || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 5000) throw new WebServiceError();
@@ -125,7 +129,7 @@ export class WebInternalService {
     if (performance.now() - started >= this.deadlineMs || request.socket.destroyed || response.destroyed) throw new WebServiceError();
     this.assertEndpoint();
   }
-  private process(kind: Kind, raw: string, proof: string, started: number, request: http.IncomingMessage, response: http.ServerResponse): string {
+  private async process(kind: Kind, raw: string, proof: string, started: number, request: http.IncomingMessage, response: http.ServerResponse): Promise<string> {
     switch (kind) {
       case "session": {
         sessionAuth.verifyServiceRequest(proof, raw, this.scope, this.credentials, this.now());
@@ -182,6 +186,13 @@ export class WebInternalService {
         this.assertRequestReady(started, request, response);
         return signWebJobReadResponse(proof, raw, result, this.scope, this.credentials, this.now());
       }
+      case "command": {
+        if (!this.commands) throw new WebServiceError();
+        verifyWebCommandProof(proof, raw, this.scope, this.credentials, this.now());
+        const input = parseWebCommandInput(raw, proof, this.credentials); this.assertRequestReady(started, request, response);
+        const result = await this.commands.execute(input); this.assertRequestReady(started, request, response);
+        return signWebCommandResponse(proof, raw, result, this.scope, this.credentials, this.now());
+      }
       default: throw new WebServiceError();
     }
   }
@@ -192,7 +203,7 @@ export class WebInternalService {
       const headers = requestHeaders(request, this.mode), protocol = protocols[headers.kind];
       const raw = await body(request, headers.length, protocol.maximum);
       this.assertRequestReady(started, request, response);
-      const proof = this.process(headers.kind, raw, headers.proof, started, request, response);
+      const proof = await this.process(headers.kind, raw, headers.proof, started, request, response);
       this.assertRequestReady(started, request, response);
       response.writeHead(200, { "content-type": protocol.type, "content-length": String(Buffer.byteLength(proof)), connection: "close" });
       response.end(proof);

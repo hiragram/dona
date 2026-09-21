@@ -13,6 +13,7 @@ import { assertProtectionKey, type SessionProtectionKey } from "./session-protec
 import { identityInventoryVersions } from "./identity-index.js";
 import { assertContextSigningKey } from "./context.js";
 import { WebJobReadClient } from "./job-read-client.js";
+import { WebCommandClient } from "./command-client.js";
 
 export interface WebStartupProviders {
   keys: BrowserLoginKeys;
@@ -56,6 +57,7 @@ export class WebLoopbackStartup {
         write: new WebAuthWriteClient(this.policy.dispatcher_socket_path, scope, signing, lookup, this.now),
         session: new WebSessionClient(this.policy.dispatcher_socket_path, scope, signing, lookup, this.now),
         jobRead: new WebJobReadClient(this.policy.dispatcher_socket_path, scope, signing, lookup, this.now),
+        command: new WebCommandClient(this.policy.dispatcher_socket_path, scope, signing, lookup, this.now),
         oidc: new OidcProtocol(this.policy, providers.oidc, transport),
       };
     } catch { throw new WebStartupError(); }

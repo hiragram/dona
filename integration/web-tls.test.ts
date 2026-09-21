@@ -4,6 +4,13 @@ import { WebLoopbackTlsListener } from "../sources/web/src/tls-listener.js";
 import { request, tlsPolicy, tlsProvider, type TlsReply } from "../sources/web/test/tls-fixture.js";
 import { loginOidcFixture } from "../sources/web/test/login-oidc-fixture.js";
 import { fixture } from "./web-auth-fixture.js";
+import { randomBytes } from "node:crypto";
+import fs from "node:fs/promises";
+import { DispatcherDatabase } from "../dispatcher/src/database.js";
+import { WebCommandBroker } from "../dispatcher/src/web/command-broker.js";
+import { WebCommandClient } from "../sources/web/src/command-client.js";
+import { eventEnvelope, tempConfig } from "../dispatcher/test/helpers.js";
+import { scope } from "../dispatcher/test/web/fixtures.js";
 
 function cookie(reply: TlsReply, name: string): string {
   const lines = reply.headers["set-cookie"] ?? [], found = lines.find(line => line.startsWith(name + "="));
@@ -91,4 +98,76 @@ test("navigation確定後の応答喪失を503にしactivity writeを再送し�
   assert.equal(result.status,503);assert.deepEqual(JSON.parse(result.body),{error:"identity_unavailable"});
   assert.equal(result.headers["set-cookie"],undefined);assert.equal(calls,1);
   assert.equal(f.readState().sessions[0]!.state.last_activity_at,f.local.now());assert.equal(f.audit.verify().sequence,sequence+1);
+});
+
+test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptまでsource=web commandを接続する", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const jobs = new DispatcherDatabase(config.databasePath); t.after(() => jobs.close());
+  let cancelFailure = false;
+  const controls = { wake() {}, async cancelWeb(jobId: string, identity: {instance_id:string;tenant_id:string;principal_id:string}) {
+    if (cancelFailure) throw new TypeError("fixture internal failure");
+    const before = jobs.assertWebJobOwner(jobId, identity), row = jobs.beginWebJobCancellation(jobId, identity);
+    jobs.markJobCancelled(jobId, "fixture"); return { row: jobs.getJob(jobId)!, duplicate: before.status === "cancelled" || row.status === "cancelled" };
+  } };
+  const configuredPolicy = await tlsPolicy();
+  const f = await fixture(t, configuredPolicy, { commands: repository => new WebCommandBroker(repository, jobs, controls as never, config) });
+  const policy = f.local.policy;
+  const command = new WebCommandClient(f.socket, scope, () => f.credential, f.lookup, f.local.now); let loseResponse = false;
+  let mismatchOperation = false;
+  const commandConnection = { execute: async (input: Parameters<WebCommandClient["execute"]>[0]) => {
+    const result = await command.execute(mismatchOperation && input.operation === "cancel" ? { ...input, operation: "submit" } : input);
+    if (loseResponse) throw Error("fixture response lost"); return result; } };
+  const oidc = await loginOidcFixture(policy, f.local.now, f.local.token);
+  const listener = new WebLoopbackTlsListener(policy, { connections: { ...f.connections, command: commandConnection, oidc: { ...oidc.connection,
+    introspect: f.connections.oidc.introspect.bind(f.connections.oidc) } }, keys: { ...f.local.keys, active: f.local.key },
+    protectedNow: f.local.now, generation: 1, tls: tlsProvider });
+  await listener.start(); t.after(() => listener.close());
+  const cookieHeader = "__Host-dona_session=" + f.local.cookie;
+  const session = await request(policy, "/api/session", "GET", { cookie: cookieHeader, "sec-fetch-site": "same-origin" });
+  assert.equal(session.status, 200, session.body);
+  const csrf = JSON.parse(session.body).csrf_token as string, requestId = randomBytes(32).toString("base64url");
+  const body = JSON.stringify({ request_id: requestId, objective: "integration web job", workspace: { kind: "scratch" } });
+  const headers = { cookie: cookieHeader, origin: policy.origin, "sec-fetch-site": "same-origin", "content-type": "application/json", "x-dona-csrf": csrf };
+  const created = await request(policy, "/api/jobs", "POST", headers, body); assert.equal(created.status, 201, created.body);
+  const first = JSON.parse(created.body); assert.equal(first.outcome, "created"); assert.equal(jobs.getJob(first.job.job_id)?.source, "web");
+  const reused = await request(policy, "/api/jobs", "POST", headers, body); assert.equal(reused.status, 200, reused.body);
+  assert.equal(JSON.parse(reused.body).outcome, "reused"); assert.equal(jobs.listJobs().length, 1);
+  const lostBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url"), objective: "response loss", workspace: { kind: "scratch" } });
+  loseResponse = true; const lost = await request(policy, "/api/jobs", "POST", headers, lostBody); assert.equal(lost.status, 503, lost.body);
+  loseResponse = false; const reconciled = await request(policy, "/api/jobs", "POST", headers, lostBody);
+  assert.equal(reconciled.status, 200, reconciled.body); assert.equal(JSON.parse(reconciled.body).outcome, "reused"); assert.equal(jobs.listJobs().length, 2);
+  const reconcileJob = JSON.parse(reconciled.body).job.job_id as string;
+  jobs.beginJobPreparation(reconcileJob); jobs.beginJobDispatch(reconcileJob); jobs.markJobRunning(reconcileJob);
+  jobs.saveJobResult(reconcileJob, { schema_version: 1, job_id: reconcileJob, status: "completed", summary: "done",
+    completed_at: f.local.now() }, jobs.getJob(reconcileJob)!.result_path);
+  const postCancel = (jobId: string) => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers,
+    JSON.stringify({ request_id: randomBytes(32).toString("base64url") }));
+  const terminal = await postCancel(reconcileJob); assert.equal(terminal.status, 409); assert.deepEqual(JSON.parse(terminal.body), { error: "terminal" });
+  const foreign = jobs.createWebJob({ instance_id: scope.instance_id, tenant_id: scope.tenant_id, principal_id: "other",
+    idempotency_key: "f".repeat(64), objective: "other", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir);
+  const crossOwner = await postCancel(foreign.row.job_id); assert.equal(crossOwner.status, 403); assert.deepEqual(JSON.parse(crossOwner.body), { error: "owner_mismatch" });
+  const slackEvent = jobs.enqueue(eventEnvelope("web-command-scheduled-policy"));
+  const slackJob = jobs.createJob({ source_event_id: slackEvent.row.event_id, objective: "scheduled-like", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir);
+  const scheduled = await postCancel(slackJob.row.job_id); assert.equal(scheduled.status, 409); assert.deepEqual(JSON.parse(scheduled.body), { error: "scheduled_policy" });
+  const missing = await postCancel("job_missing"); assert.equal(missing.status, 404); assert.deepEqual(JSON.parse(missing.body), { error: "not_found" });
+  mismatchOperation = true; const mismatch = await postCancel(first.job.job_id); mismatchOperation = false;
+  assert.equal(mismatch.status, 400); assert.deepEqual(JSON.parse(mismatch.body), { error: "invalid_request" });
+  cancelFailure = true; const internal = await postCancel(first.job.job_id); cancelFailure = false;
+  assert.equal(internal.status, 503); assert.deepEqual(JSON.parse(internal.body), { error: "internal_error" });
+  const raceJobs = [];
+  for (const suffix of ["one", "two"]) {
+    const race = await request(policy, "/api/jobs", "POST", headers, JSON.stringify({ request_id: randomBytes(32).toString("base64url"),
+      objective: "cancel race " + suffix, workspace: { kind: "scratch" } })); raceJobs.push(JSON.parse(race.body).job.job_id as string);
+  }
+  const sharedCancel = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
+  const raced = await Promise.all(raceJobs.map(jobId => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers, sharedCancel)));
+  assert.deepEqual(raced.map(value => value.status).sort(), [200, 409]);
+  assert.deepEqual(raced.map(value => JSON.parse(value.body).error).filter(Boolean), ["idempotency_conflict"]);
+  assert.equal(raceJobs.filter(jobId => jobs.getJob(jobId)?.status === "cancelled").length, 1);
+  const cancelBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
+  loseResponse = true; const cancelled = await request(policy, `/api/jobs/${first.job.job_id}/cancel`, "POST", headers, cancelBody);
+  assert.equal(cancelled.status, 503, cancelled.body); loseResponse = false;
+  const duplicate = await request(policy, `/api/jobs/${first.job.job_id}/cancel`, "POST", headers, cancelBody);
+  assert.equal(duplicate.status, 200, duplicate.body); assert.equal(JSON.parse(duplicate.body).outcome, "already_cancelled");
 });
