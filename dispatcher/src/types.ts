@@ -49,16 +49,23 @@ export type JobWorkspace =
   | { kind: "scratch" }
   | { kind: "github"; repository: string; base_ref?: string };
 
+export interface JobDisplay {
+  short_name: string;
+  issue?: { repository: string; number: number };
+}
+
 export interface CreateJobRequest {
   source_event_id: string;
   job_key?: string;
   objective: string;
   workspace: JobWorkspace;
+  display?: JobDisplay;
 }
 
 export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
+  display?: JobDisplay;
 }
 
 

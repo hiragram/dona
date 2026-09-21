@@ -79,6 +79,10 @@ herdr --session dona agent wait dona-main --until idle --until done --until bloc
 
 バックグラウンドジョブでは、専用workspaceまたはworktreeを`--no-focus`で作り、30文字の`job_id`をそのままHerdr agent名としてCodexを起動します。新規`job_id`はULID互換の26文字の末尾4文字を固定slugにし、たとえば改善作業は`job_01m1ne631mt99zdpwfmrwsenhc`になります。slugは外部入力を転写せず、`enhc`（改善）、`mend`（修正）、`feat`（実装）、`test`（テスト）、`read`（文書）、`rvwx`（レビュー）、`rsch`（調査）、`sync`（更新）、`send`（デプロイ）、`tags`（リリース）、`task`（その他）の固定語彙から選びます。ULIDの時刻部と60bitのランダム値を保持し、既存のjob ID形式、DB schema v2、`agent_name = job_id`も維持するため、旧リリースへ戻した場合も新規ジョブを同じ名前で制御できます。`job_id`は従来どおりDB主キー、API、workspace/worktree path、branch、Result Envelopeに使い、永続済みのagent名も再起動時にそのまま使います。
 
+`delegate_job`へ表示専用の`display_name`を明示すると、新規workspaceの`--label`だけに使用します。構造化した`issue_repository`と`issue_number`も指定し、workspaceのrepositoryと一致する場合は`#<number> <display_name>`、Issue参照がない場合は短い作業名だけを表示します。objective全文やIssue titleから表示名を推測しません。NFC正規化、制御・ANSI・双方向制御文字の除去、空白の正規化を行い、URL、private path、secret相当、空文字、repository不一致は安全側で`agent_name`へfallbackします。最終ラベルはIssue prefixを含む48 Unicode code point以下で、UTF-16 surrogateを途中分割しません。画面幅によるHerdr側の省略はこの保存上限とは別です。
+
+正規化済みラベルはworkspace生成前に既存の`workspace_json`拡張metadataへ保存され、Dispatcher再起動や生成再開でも外部titleを再取得せず同じ値を再利用します。旧job、metadata欠落・破損、未知metadataを持つjobは従来の`agent_name`へfallbackし、独立schema migrationを必要としません。ラベルはlookup、認可、owner、routing、idempotency、Herdrのstart/get/prompt/wait/steer/cancelには使わず、argvの単一要素としてのみ渡します。fake Herdrでは3生成経路、identity維持、再起動・応答喪失を検証していますが、production processを操作する実画面・幅狭時の省略・Herdr cold restoreの確認はこの変更では未実施です。
+
 Codex 0.152.0でも有効な`projects = { "<path>" = { trust_level = "trusted" } }`inline tableを起動時overrideに使い、scratch jobではDispatcherが生成した`<jobsWorkspaceRoot>/scratch/<job_id>`との完全一致を検証した当該workspace 1件だけ、GitHub jobでは従来どおり検証・選択したrepositoryとworktreeだけをtrustします。scratch root、job-results、global Codex configはtrust対象にしません。これはsandbox、command approval、network policyを変更する設定ではありません。稼働中agentへの`agent prompt`はCodexのsteerとして扱われます。Dispatcher以外はジョブagentを直接操作しません。
 
 ## Dona Dispatcher MCP

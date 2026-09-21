@@ -27,6 +27,7 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import { createJobDisplayLabel } from "./job-display-label.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
@@ -571,7 +572,8 @@ export class DispatcherDatabase {
     const jobKey=parsedRequest.job_key??legacyJobKey;
     const canonicalPayloadSha256=canonicalJobPayloadSha256(parsedRequest);
     const objectiveUtf8Bytes=Buffer.byteLength(parsedRequest.objective,"utf8");
-    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes);
+    const displayLabel = createJobDisplayLabel(parsedRequest.display, parsedRequest.workspace);
+    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes,displayLabel);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -599,7 +601,7 @@ export class DispatcherDatabase {
       if (existing) {
         const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
         if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
-        const exactLegacyPayload=existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
+        const exactLegacyPayload=parsedRequest.display===undefined && existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
         if(stored===undefined&&!exactLegacyPayload)
           throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
         if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);

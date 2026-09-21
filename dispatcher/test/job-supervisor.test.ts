@@ -661,7 +661,7 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-background")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "調査する", workspace: { kind: "scratch" }, display: { short_name: "結果確認" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -870,7 +870,7 @@ describe("JobSupervisor", () => {
     const source = database.enqueue(eventEnvelope("Ev-steer-source")).row;
     const followUp = database.enqueue(eventEnvelope("Ev-steer-follow-up")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "長い作業", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "長い作業", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -904,7 +904,7 @@ describe("JobSupervisor", () => {
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-resumed-agent-name")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "実装する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "実装する", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -940,7 +940,7 @@ describe("JobSupervisor", () => {
     const source = database.enqueue(eventEnvelope("Ev-cancel-source")).row;
     const followUp = database.enqueue(eventEnvelope("Ev-cancel-follow-up")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "修正する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "修正する", workspace: { kind: "scratch" }, display: { short_name: "表示専用" } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;

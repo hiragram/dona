@@ -327,6 +327,7 @@ describe("DispatcherApi", () => {
       job_key: "private.key",
       objective: "private objective",
       workspace: { kind: "scratch" },
+      display: { short_name: "応答喪失の照合" },
     };
     assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 202);
     assert.equal((await request(config.socketPath, "POST", "/v1/jobs", requestBody)).status, 200);
