@@ -14,6 +14,7 @@ import {
   type DispatcherMigrationStep,
 } from "../src/database.js";
 import { envelopeFromRow } from "../src/prompt.js";
+import { jobWorkspaceLabel } from "../src/job-display-label.js";
 import { canonicalJobPayloadSha256, parseCreateJobRequest } from "../src/validation.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -1318,6 +1319,36 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
+  test("正規化済み表示ラベルを再起動後も再利用し旧jobはagent nameへfallbackする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    let database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-job-persisted-display")).row;
+    const displayed = database.createJob({
+      source_event_id: source.event_id,
+      objective: "objective全文は表示しない",
+      workspace: { kind: "github", repository: "owner/repo" },
+      display: { short_name: "  表示   作業  ", issue: { repository: "owner/repo", number: 87 } },
+    }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const legacySource = database.enqueue(eventEnvelope("Ev-job-display-legacy")).row;
+    const legacy = database.createJob({ source_event_id: legacySource.event_id, objective: "旧job", workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.close();
+
+    const raw = new Database(config.databasePath);
+    const legacyWorkspace = JSON.parse(legacy.workspace_json) as Record<string, unknown>;
+    legacyWorkspace.__future_metadata = { preserved: true };
+    raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(JSON.stringify(legacyWorkspace), legacy.job_id);
+    raw.close();
+
+    database = new DispatcherDatabase(config.databasePath);
+    const restoredDisplay = database.getJob(displayed.job_id)!;
+    const restoredLegacy = database.getJob(legacy.job_id)!;
+    assert.equal(jobWorkspaceLabel(restoredDisplay.workspace_json, restoredDisplay.agent_name), "#87 表示 作業");
+    assert.equal(jobWorkspaceLabel(restoredLegacy.workspace_json, restoredLegacy.agent_name), legacy.agent_name);
+    assert.deepEqual((JSON.parse(restoredLegacy.workspace_json) as Record<string, unknown>).__future_metadata, { preserved: true });
+    assert.equal(restoredDisplay.agent_name, restoredDisplay.job_id);
+    database.close();
+  });
+
   test("isolates legacy preparing and running jobs whose existing agent grants cannot be verified", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -1430,7 +1461,10 @@ describe("DispatcherDatabase", () => {
     const request={source_event_id:event.event_id,objective:"legacy",workspace:{kind:"scratch" as const}};
     const job=database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).row;
     const raw=new Database(config.databasePath); raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id); raw.close();
-    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.equal(database.createJob({...request,display:{short_name:"新しい表示"}},config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    const migratedLegacy=database.getJob(job.job_id)!;
+    assert.equal(jobWorkspaceLabel(migratedLegacy.workspace_json,migratedLegacy.agent_name),job.agent_name);
+    assert.equal((JSON.parse(migratedLegacy.workspace_json) as Record<string,unknown>).__dona_job_display,undefined);
     const followUp=database.enqueue(eventEnvelope("Ev-legacy-reuse-follow-up")).row;
     database.appendQueuedJobInstruction(job.job_id,followUp.event_id,"追加条件");
     assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");

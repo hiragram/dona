@@ -221,7 +221,7 @@ process.exit(1);
     database.close();
   });
 
-  test("passes the rollback-compatible display name through the Herdr workspace and agent-start boundary", async () => {
+  test("表示ラベルをscratch workspaceだけへ単一argvで渡しagent identityを維持する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const logPath = `${root}/herdr-argv.jsonl`;
@@ -249,7 +249,7 @@ process.exit(2);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-herdr-display-boundary")).row;
     const job = database.createJob(
-      { source_event_id: source.event_id, objective: "一覧を改善する", workspace: { kind: "scratch" } },
+      { source_event_id: source.event_id, objective: "一覧を改善する", workspace: { kind: "scratch" }, display: { short_name: '一覧 "改善" $(safe)' } },
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
@@ -265,7 +265,8 @@ process.exit(2);
     assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1" });
     assert.ok(workspace, JSON.stringify(calls));
     assert.ok(start, JSON.stringify(calls));
-    assert.equal(workspace[workspace.indexOf("--label") + 1], job.agent_name);
+    assert.equal(workspace[workspace.indexOf("--label") + 1], '一覧 "改善" $(safe)');
+    assert.equal(workspace.filter((value) => value === '一覧 "改善" $(safe)').length, 1);
     assert.equal(start[4], job.agent_name);
     assert.equal(job.agent_name, job.job_id);
     assert.match(job.agent_name, /enhc$/);
@@ -467,6 +468,7 @@ describe("GitHub workspace provisioning", () => {
       source_event_id: source.event_id,
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
+      display: { short_name: "表示ラベル", issue: { repository: "owner/repo", number: 87 } },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const repositoryPath = path.join(fixture.config.jobsWorkspaceRoot, "github", "owner", "repo", "repository");
     await git(fixture.seedPath, "push", "origin", "main:refs/heads/foo");
@@ -481,6 +483,8 @@ describe("GitHub workspace provisioning", () => {
     assert.ok(createIndex >= 0 && startIndex > createIndex, JSON.stringify(calls));
     const create = calls[createIndex]!;
     assert.equal(create[create.indexOf("--base") + 1], fixture.featureSha);
+    assert.equal(create[create.indexOf("--label") + 1], "#87 表示ラベル");
+    assert.equal(calls[startIndex]![4], job.agent_name);
     assert.equal(await git(fixture.root, "--git-dir", path.join(fixture.root, "origin.git"), "rev-parse", "refs/heads/feature/test"), fixture.raceSha);
     assert.ok(calls.slice(0, startIndex).some((args) => args[2] === "worktree" && args[3] === "create"));
     fixture.database.close();
@@ -821,6 +825,7 @@ process.exit(2);
       source_event_id: source.event_id,
       objective: "確認する",
       workspace: { kind: "github", repository: "owner/repo", base_ref: "feature/test" },
+      display: { short_name: "再利用ラベル", issue: { repository: "owner/repo", number: 87 } },
     }, fixture.config.jobsWorkspaceRoot, fixture.config.jobResultsDir).row;
     const runtime = new HerdrJobAgentRuntime(fixture.config);
     await runtime.prepare(job);
@@ -832,6 +837,8 @@ process.exit(2);
     const calls = (await fs.readFile(fixture.logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[2] === "worktree" && args[3] === "create").length, 1);
     assert.equal(calls.filter((args) => args[2] === "workspace" && args[3] === "create").length, 1);
+    const restored = calls.find((args) => args[2] === "workspace" && args[3] === "create")!;
+    assert.equal(restored[restored.indexOf("--label") + 1], "#87 再利用ラベル");
     fixture.database.close();
   });
 

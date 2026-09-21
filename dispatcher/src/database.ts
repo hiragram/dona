@@ -27,6 +27,7 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import { createJobDisplayLabel } from "./job-display-label.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
@@ -571,7 +572,9 @@ export class DispatcherDatabase {
     const jobKey=parsedRequest.job_key??legacyJobKey;
     const canonicalPayloadSha256=canonicalJobPayloadSha256(parsedRequest);
     const objectiveUtf8Bytes=Buffer.byteLength(parsedRequest.objective,"utf8");
-    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes);
+    const displayLabel = createJobDisplayLabel(parsedRequest.display, parsedRequest.workspace);
+    const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes,displayLabel);
+    const legacyWorkspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -586,7 +589,7 @@ export class DispatcherDatabase {
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
-      if (parsedRequest.job_key!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
+      if (parsedRequest.job_key!==undefined || parsedRequest.display!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
         throw new ScheduledJobCreationError("scheduled_scope_mismatch", "Scheduled work request does not match its persisted read-only scope");
       }
@@ -602,7 +605,7 @@ export class DispatcherDatabase {
         const exactLegacyPayload=existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
         if(stored===undefined&&!exactLegacyPayload)
           throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
-        if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
+        if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(legacyWorkspaceJson,existing.job_id);
         if(binding.owner.kind==="schedule") {
           const authorized=this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
             JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
