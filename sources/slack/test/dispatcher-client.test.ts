@@ -31,7 +31,7 @@ test("DispatcherClientはprivate keyを毎回読み、署名済みprincipal proo
   const envelope = { schema_version:1, source:"slack", external_event_id:"Ev-client-proof", type:"message",
     occurred_at:"2026-09-21T00:00:00Z", subject:{workspace_id:"T_FIXTURE",actor_id:"U_OWNER"}, payload:{text:"secret"},
     reply_target:{kind:"slack_thread",workspace_id:"T_FIXTURE",channel_id:"C_PRIVATE",thread_ts:"1.000001"}, trace:{ingress_attempt:2} };
-  assert.equal((await client.postEvent(envelope, 2)).statusCode, 202);
+  assert.equal((await client.postEvent(envelope, 2, "T_FIXTURE")).statusCode, 202);
   assert.equal(captured?.body, JSON.stringify(envelope));
   const proofHeader = captured?.headers["x-dona-slack-principal-proof"];
   const signature = captured?.headers["x-dona-slack-principal-signature"];
@@ -44,16 +44,20 @@ test("DispatcherClientはprivate keyを毎回読み、署名済みprincipal proo
   });
   assert.equal(signature, createHmac("sha256", key).update(raw).digest("base64url"));
   assert.equal(raw.includes("secret"), false);
+  await assert.rejects(
+    () => client.postEvent(envelope, 2, "T_OTHER"),
+    /invalid_slack_principal_input/,
+  );
 
   const rotatedKey = "rotated-dispatcher-client-principal-key-long-enough";
   await fs.writeFile(tokenPath, rotatedKey, { mode: 0o600 });
-  assert.equal((await client.postEvent(envelope, 3)).statusCode, 202);
+  assert.equal((await client.postEvent(envelope, 3, "T_FIXTURE")).statusCode, 202);
   const rotatedRaw = Buffer.from(captured?.headers["x-dona-slack-principal-proof"] as string, "base64url").toString("utf8");
   const rotatedProof = JSON.parse(rotatedRaw) as Record<string, unknown>;
   assert.equal(rotatedProof.key_id, principalProofKeyId(rotatedKey));
   assert.equal(rotatedProof.attempt, 3);
 
   await fs.chmod(tokenPath, 0o644);
-  await assert.rejects(() => client.postEvent(envelope, 4), /key is unavailable/);
+  await assert.rejects(() => client.postEvent(envelope, 4, "T_FIXTURE"), /key is unavailable/);
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });

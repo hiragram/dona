@@ -19,9 +19,14 @@ export interface DispatcherClientOptions {
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  async postEvent(envelope: unknown, attempt = 1): Promise<DispatcherResponse> {
+  async postEvent(envelope: unknown, attempt: number, authenticatedWorkspaceId: string): Promise<DispatcherResponse> {
     const token = await this.readPrivateIngressToken();
-    const signed = signSlackPrincipalProof(envelope as Record<string, unknown>, attempt, token);
+    const signed = signSlackPrincipalProof(
+      envelope as Record<string, unknown>,
+      attempt,
+      authenticatedWorkspaceId,
+      token,
+    );
     const body = Buffer.from(JSON.stringify(envelope));
     return this.request("POST", "/v1/events", body, undefined, {
       "x-dona-slack-principal-proof": signed.proof,

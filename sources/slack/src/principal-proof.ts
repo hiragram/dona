@@ -20,6 +20,7 @@ export function principalProofKeyId(key: string): string {
 export function signSlackPrincipalProof(
   envelope: Record<string, unknown>,
   attempt: number,
+  authenticatedWorkspaceId: string,
   key: string,
   now = new Date(),
   nonce = randomBytes(18).toString("base64url"),
@@ -27,6 +28,7 @@ export function signSlackPrincipalProof(
   const subject = envelope.subject as Record<string, unknown> | undefined;
   if (envelope.source !== "slack" || typeof envelope.external_event_id !== "string"
     || typeof subject?.workspace_id !== "string" || typeof subject.actor_id !== "string"
+    || authenticatedWorkspaceId !== subject.workspace_id
     || !Number.isSafeInteger(attempt) || attempt < 1 || !key) throw new Error("invalid_slack_principal_input");
   const proof = {
     version: 1,

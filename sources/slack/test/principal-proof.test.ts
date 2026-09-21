@@ -19,7 +19,7 @@ const envelope = {
 
 describe("Slack principal proof signer", () => {
   test("canonical identityをcurrent key、attempt、exclusive 120秒へ束縛する", () => {
-    const signed = signSlackPrincipalProof(envelope, 2, key, new Date("2026-09-21T00:00:00Z"), "nonce-fixture-0001");
+    const signed = signSlackPrincipalProof(envelope, 2, "T_FIXTURE", key, new Date("2026-09-21T00:00:00Z"), "nonce-fixture-0001");
     const raw = Buffer.from(signed.proof, "base64url").toString("utf8");
     assert.equal(raw, JSON.stringify({
       attempt: 2,
@@ -38,8 +38,9 @@ describe("Slack principal proof signer", () => {
   });
 
   test("actor欠落、workspace差替え用入力、空keyを署名しない", () => {
-    assert.throws(() => signSlackPrincipalProof({ ...envelope, subject: { workspace_id: "T_FIXTURE" } }, 1, key), /invalid_slack_principal_input/);
-    assert.throws(() => signSlackPrincipalProof(envelope, 0, key), /invalid_slack_principal_input/);
-    assert.throws(() => signSlackPrincipalProof(envelope, 1, ""), /invalid_slack_principal_input/);
+    assert.throws(() => signSlackPrincipalProof({ ...envelope, subject: { workspace_id: "T_FIXTURE" } }, 1, "T_FIXTURE", key), /invalid_slack_principal_input/);
+    assert.throws(() => signSlackPrincipalProof(envelope, 1, "T_OTHER", key), /invalid_slack_principal_input/);
+    assert.throws(() => signSlackPrincipalProof(envelope, 0, "T_FIXTURE", key), /invalid_slack_principal_input/);
+    assert.throws(() => signSlackPrincipalProof(envelope, 1, "T_FIXTURE", ""), /invalid_slack_principal_input/);
   });
 });
