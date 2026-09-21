@@ -19,6 +19,14 @@ export interface AgentExecutionContext {
   policy_revision: 1;
 }
 
+export class AgentPrincipalUnavailableError extends Error {
+  readonly code = "agent_context_reauthorization_required";
+  constructor() {
+    super("Verified principal binding is unavailable; replay the exact Slack event through authenticated ingress before retrying");
+    this.name = "AgentPrincipalUnavailableError";
+  }
+}
+
 interface ActiveContext extends AgentExecutionContext { token_sha256: string; }
 
 export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
@@ -32,6 +40,12 @@ export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
   schedule_work: ["record_schedule_job_access", "delegate_scheduled_work"],
   update_completion: ["get_self_update_status"],
 };
+
+export const agentBodyEventOperations = new Set([
+  "delegate_job", "steer_job", "cancel_job", "plan_self_update", "apply_self_update",
+  "cancel_self_update", "preview_schedule", "create_schedule", "update_schedule",
+  "pause_schedule", "resume_schedule", "cancel_schedule",
+]);
 
 function purpose(row: EventRow): AgentPurpose {
   if (row.source === "slack") return "human_command";
@@ -62,7 +76,7 @@ export class AgentContextManager {
 
   async issue(row: EventRow): Promise<AgentExecutionContext> {
     const principal = verifiedPrincipal(this.database, row);
-    if (!principal) throw new Error("Verified principal binding is unavailable for agent context");
+    if (!principal) throw new AgentPrincipalUnavailableError();
     const token = randomBytes(32).toString("base64url");
     const context: AgentExecutionContext = {
       event_id: row.event_id,
@@ -81,6 +95,20 @@ export class AgentContextManager {
     await fs.writeFile(temporary, `${JSON.stringify({ token, event_id: context.event_id })}\n`, { mode: 0o600 });
     await fs.rename(temporary, this.credentialPath);
     return context;
+  }
+
+  async ensure(row: EventRow): Promise<AgentExecutionContext> {
+    const principal = verifiedPrincipal(this.database, row);
+    if (!principal) throw new AgentPrincipalUnavailableError();
+    const active = this.active;
+    if (active?.event_id === row.event_id && active.attempt === row.attempt_count &&
+      active.tenant_id === principal.tenant_id && active.workspace_id === principal.workspace_id &&
+      active.principal_kind === principal.principal_kind && active.principal_id === principal.principal_id &&
+      Date.now() < Date.parse(active.expires_at)) {
+      const { token_sha256: _secret, ...context } = active;
+      return context;
+    }
+    return this.issue(row);
   }
 
   async revoke(eventId?: string): Promise<void> {

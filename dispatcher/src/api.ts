@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
+import { agentBodyEventOperations, agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
@@ -868,10 +868,22 @@ export class DispatcherApi {
       throw new BodyTooLargeError();
     }
     const body = await readBody(request, this.config.requestMaxBytes);
+    let input: unknown;
     try {
-      return JSON.parse(body.toString("utf8"));
+      input = JSON.parse(body.toString("utf8"));
     } catch {
       throw new RequestValidationError("Request body must be valid JSON");
     }
+    const context = this.verifiedAgentContexts.get(request);
+    const operation = agentOperation(request.method, new URL(request.url ?? "/", "http://localhost"));
+    if (context && operation && agentBodyEventOperations.has(operation)) {
+      const sourceEventId = input && typeof input === "object" && !Array.isArray(input)
+        ? (input as Record<string, unknown>).source_event_id
+        : undefined;
+      if (sourceEventId !== context.event_id) {
+        throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+      }
+    }
+    return input;
   }
 }

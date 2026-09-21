@@ -37,12 +37,16 @@ function proof(externalEventId: string): VerifiedSlackPrincipalProof {
   };
 }
 
-function rawRequest(socketPath: string, route: string, headers: Record<string, string>) {
+function rawRequest(socketPath: string, route: string, headers: Record<string, string>, method = "GET", body?: unknown) {
   return new Promise<number>((resolve, reject) => {
-    const request = http.request({ socketPath, path: route, method: "GET", headers }, response => {
+    const encoded = body === undefined ? undefined : JSON.stringify(body);
+    const request = http.request({ socketPath, path: route, method, headers: {
+      ...headers,
+      ...(encoded === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) }),
+    } }, response => {
       response.resume(); response.on("end", () => resolve(response.statusCode ?? 0));
     });
-    request.once("error", reject); request.end();
+    request.once("error", reject); request.end(encoded);
   });
 }
 
@@ -82,6 +86,13 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     const headers = { "x-dona-agent-token": credential.token, "x-dona-source-event-id": credential.event_id };
     assert.equal(await rawRequest(config.agentSocketPath,
       `/v1/events/${encodeURIComponent(other.event_id)}/jobs?source_event_id=${encodeURIComponent(source.event_id)}`, headers), 403);
+    assert.equal(await rawRequest(config.agentSocketPath, "/v1/jobs", headers, "POST", {
+      source_event_id: other.event_id,
+      job_key: "source-event-swap",
+      objective: "拒否されるべき操作",
+      workspace: { kind: "scratch" },
+    }), 403);
+    assert.deepEqual(database.listEventJobs(other.event_id), []);
     assert.equal(contexts.authorize(credential.token, source.event_id, "list_owner_jobs", new Date(context.expires_at)), undefined);
     assert.equal(await rawRequest(config.agentSocketPath, "/v1/admin/update-safety", headers), 403);
     assert.equal(contexts.authorize(credential.token, source.event_id, "authorize_job_notification"), undefined);
@@ -108,6 +119,11 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     await restarted.initialize();
     assert.equal(restarted.authorize(credential.token, source.event_id, "list_owner_jobs"), undefined);
     await assert.rejects(() => fs.access(config.agentCredentialPath));
+    const resumed = await restarted.ensure(completionDispatch);
+    const resumedCredential = JSON.parse(await fs.readFile(config.agentCredentialPath, "utf8")) as {token:string;event_id:string};
+    assert.equal(resumed.event_id, completion.event_id);
+    assert.notEqual(resumedCredential.token, completionCredential.token);
+    assert.ok(restarted.authorize(resumedCredential.token, completion.event_id, "get_job_status"));
   } finally {
     await api.stop(); database.close();
   }

@@ -9,7 +9,7 @@ import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import type { EventRow } from "./types.js";
 import type { JobNotificationVerifier } from "./job-notification-verifier.js";
-import type { AgentContextManager } from "./agent-context.js";
+import { AgentPrincipalUnavailableError, type AgentContextManager } from "./agent-context.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -248,6 +248,26 @@ export class DispatcherWorker {
 
     const existing = await this.tryComplete(row, false);
     if (existing) return;
+    try {
+      await this.agentContexts?.ensure(row);
+    } catch (error) {
+      await this.agentContexts?.revoke(row.event_id);
+      if (error instanceof AgentPrincipalUnavailableError) {
+        if (row.last_error_code !== error.code) {
+          this.database.recordWaitingError(row.event_id, error.code, error.message);
+          this.logger.warn("Waiting event requires authenticated ingress replay before agent context can resume", {
+            event_id: row.event_id,
+            sequence: row.sequence,
+            status_to: "waiting_agent",
+            error_code: error.code,
+          });
+        }
+        return;
+      }
+      this.database.markNeedsReview(row.event_id, "agent_context_unavailable",
+        error instanceof Error ? error.message : String(error));
+      return;
+    }
     const started = Date.now();
     const waited = await this.herdr.wait(this.abortController.signal);
     if(this.database.get(row.event_id)?.status!=="waiting_agent") return;

@@ -98,6 +98,16 @@ describe("verified principal binding", () => {
     const legacy = eventEnvelope("Ev-proof-legacy");
     const legacyRow = database.enqueue(legacy).row;
     assert.equal(database.getVerifiedPrincipalBinding(legacyRow.event_id), undefined);
+    const rebound = {
+      ...verified(legacy), attempt: 2, nonce: "legacy-reauthorization-proof-0002", proof_sha256: "2".repeat(64),
+    };
+    assert.equal(database.enqueue(legacy, new Date("2026-09-21T00:01:20Z"), rebound).duplicate, true);
+    assert.equal(database.getVerifiedPrincipalBinding(legacyRow.event_id)?.principal_id, "U_TEST");
+    const changed = structuredClone(legacy);
+    changed.payload = { ...changed.payload, text: "changed" };
+    assert.throws(() => database.enqueue(changed, new Date("2026-09-21T00:01:30Z"), {
+      ...rebound, attempt: 3, nonce: "legacy-mismatch-proof-0003", proof_sha256: "3".repeat(64),
+    }), PrincipalBindingConflictError);
     database.close();
   });
 });
