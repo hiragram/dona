@@ -32,3 +32,21 @@ test("dashboard navigationだけHTMLを返しsession APIはbounded JSONのまま
   assert.equal(json.headers["content-type"], "application/json; charset=utf-8");
   assert.equal(JSON.parse(json.body).principal.principal_id, "principal");
 });
+
+test("失効済みdashboard navigationだけsession cookieを消去してloginへ戻す", async () => {
+  const dashboard = controllerFixture();
+  dashboard.connections.session.confirm = async () => ({ status: "denied", reason: "session_revoked" });
+  const page = await dashboard.controller.handle(dashboard.request("/"));
+  assert.equal(page.status, 303);
+  assert.equal(page.headers.location, "/login");
+  assert.match(page.headers["set-cookie"]!, /Max-Age=0/);
+  assert.equal(page.headers["cache-control"], "no-store");
+  assert.equal(page.body, "");
+
+  const api = controllerFixture();
+  api.connections.session.confirm = async () => ({ status: "denied", reason: "session_revoked" });
+  const json = await api.controller.handle(api.request("/api/session"));
+  assert.equal(json.status, 401);
+  assert.deepEqual(JSON.parse(json.body), { error: "session_revoked" });
+  assert.equal(json.headers.location, undefined);
+});

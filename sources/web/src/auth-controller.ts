@@ -24,7 +24,7 @@ type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
 type Reason = "identity_invalid" | "identity_unavailable" | "identity_mismatch" | "session_invalid" | "session_revoked"
   | "session_expired" | "origin_invalid" | "csrf_invalid" | "cookie_invalid" | "cookie_ambiguous";
-type Status = 200 | 201 | 204 | 400 | 401 | 403 | 404 | 409 | 429 | 503;
+type Status = 200 | 201 | 204 | 303 | 400 | 401 | 403 | 404 | 409 | 429 | 503;
 export interface BrowserAuthRequest {
   method: string; target: string; headers: RawHeaders; body: Uint8Array;
   /** Trusted TLS/proxy listener result, never a request field/header. */
@@ -64,8 +64,11 @@ function failure(reason: SessionDenial): AuthFailure {
   return new AuthFailure(401, reason === "revision_mismatch" ? "session_revoked" : reason);
 }
 function response(status: Status, value?: unknown, clear = false, maximumBodyBytes?: number): BrowserAuthResponse {
-  return { status, headers: { ...privateHeaders, ...(status === 204 ? {} : { "content-type": "application/json; charset=utf-8" }),
-    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 ? "" : JSON.stringify(value), ...(maximumBodyBytes?{maximumBodyBytes}:{}) };
+  return { status, headers: { ...privateHeaders, ...(status === 204 || status === 303 ? {} : { "content-type": "application/json; charset=utf-8" }),
+    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 || status === 303 ? "" : JSON.stringify(value), ...(maximumBodyBytes?{maximumBodyBytes}:{}) };
+}
+function loginRedirect(): BrowserAuthResponse {
+  return { status: 303, headers: { ...privateHeaders, location: "/login", "set-cookie": clearBrowserCookie("session") }, body: "" };
 }
 function eventResponse(event:string,id:string,value:unknown):BrowserAuthResponse {const body=`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(value)}\n\n`;
   return{status:200,headers:{...privateHeaders,"content-type":"text/event-stream; charset=utf-8","x-accel-buffering":"no"},body,maximumBodyBytes:maximumWebJobBrowserBodyBytes};}
@@ -119,7 +122,7 @@ export class WebAuthController {
     return sessionCsrf(binding(snapshot.session.state), key, now, "existing");
   }
   async handle(request: BrowserAuthRequest): Promise<BrowserAuthResponse> {
-    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false;
+    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false, dashboard = false;
     try {
       now();
       if (!(request.body instanceof Uint8Array) || request.body.byteLength > 65536 || request.headers.length > 128
@@ -130,6 +133,7 @@ export class WebAuthController {
       assertBrowserBoundary(this.policy, request.headers, request.transportVerified);
       let route;
       try { route = matchWebRoute(request.method, request.target); } catch { throw new AuthFailure(404, "session_invalid"); }
+      dashboard = route.id === "dashboard";
       if (!["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events", "job_submit", "job_cancel"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
       let jobCursor:string|undefined,jobLimit:number|undefined;
       if(route.id==="job_list"){
@@ -279,7 +283,7 @@ export class WebAuthController {
           if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
-      return response(failure.status, { error: failure.publicReason });
+      return dashboard && failure.status === 401 ? loginRedirect() : response(failure.status, { error: failure.publicReason });
     }
   }
 }
