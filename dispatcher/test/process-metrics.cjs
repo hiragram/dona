@@ -19,9 +19,7 @@ if (!nonce || !/^[a-f0-9]{32}$/.test(nonce)) {
 
 process.env.DONA_PROCESS_METRICS_SCOPE = String(scope + 1);
 if (scope >= 2) {
-  globalThis[Symbol.for("dona.checkpoint-nonce")] = nonce;
   const originalNodeOptions = process.env.DONA_ORIGINAL_NODE_OPTIONS;
-  delete process.env.DONA_CHECKPOINT_REPORTER_NONCE;
   delete process.env.DONA_PROCESS_METRICS_NONCE;
   delete process.env.DONA_ORIGINAL_NODE_OPTIONS;
   if (originalNodeOptions) process.env.NODE_OPTIONS = originalNodeOptions;
@@ -52,7 +50,9 @@ function withNonce(options) {
     ...(options ?? {}),
     env: {
       ...baseEnv,
-      DONA_CHECKPOINT_REPORTER_NONCE: nonce,
+      DONA_DISPATCHER_TEST_FILE: process.env.DONA_DISPATCHER_TEST_FILE,
+      DONA_CASE_CHECKPOINT_NONCE: nonce,
+      DONA_CASE_CHECKPOINT_DIR: process.env.DONA_CASE_CHECKPOINT_DIR,
       DONA_PROCESS_METRICS_NONCE: nonce,
     },
   };

@@ -102,7 +102,7 @@ test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit 
   });
   assert.equal(result.exit_code, 0);
   assert.equal(result.output_truncated, true);
-  assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#1");
+  assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
   assert.equal(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr), 1_024);
   assert.ok(Buffer.byteLength(result.stdout) > 512);
@@ -167,14 +167,14 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
   }
 });
 
-test("ProcessCheckpointTracker counts indistinguishable concurrent cases without claiming an occurrence", () => {
+test("ProcessCheckpointTracker keeps the exact remaining concurrent case identity", () => {
   const tracker = checkpoint(
     "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\n",
     "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\n",
     "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#2\n",
     "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-finish test/api.test.ts:012345abcdef#1\n",
   );
-  assert.match(tracker.freezeTimeout(), /timeout=test\/api\.test\.ts:012345abcdef#1/);
+  assert.match(tracker.freezeTimeout(), /timeout=test\/api\.test\.ts:012345abcdef#2/);
 });
 
 test("ProcessCheckpointTracker recognizes a dedicated checkpoint after partial test output", () => {
@@ -182,7 +182,7 @@ test("ProcessCheckpointTracker recognizes a dedicated checkpoint after partial t
     "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\nother-partial-without-newline",
     "\n[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#7\n",
   );
-  assert.equal(tracker.freezeTimeout(), "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#1");
+  assert.equal(tracker.freezeTimeout(), "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#7");
 });
 
 test("ProcessCheckpointTracker freezes the timeout identity during cleanup output", () => {
@@ -217,6 +217,18 @@ test("ProcessCheckpointTracker preserves the failed case when the file failure f
   assert.equal(
     tracker.checkpoint(),
     "file=file-fail test/api.test.ts; last_finish=case-fail test/api.test.ts:012345abcdef#1; unfinished=none",
+  );
+});
+
+test("ProcessCheckpointTracker preserves an unfinished crash identity after file-fail", () => {
+  const tracker = checkpoint(
+    "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\n",
+    "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#3\n",
+    "[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-fail test/api.test.ts elapsed_ms=9\n",
+  );
+  assert.equal(
+    tracker.checkpoint(),
+    "file=file-fail test/api.test.ts elapsed_ms=9; last_finish=file-fail test/api.test.ts elapsed_ms=9; unfinished=test/api.test.ts:fedcba543210#3",
   );
 });
 
