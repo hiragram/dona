@@ -58,6 +58,12 @@ test("不正または重複session cookieのdashboard navigationだけloginへ�
   }
 });
 
+test("不正session cookieは監査失敗時も消去してloginへ戻す",async()=>{
+  for(const cookieHeader of ["__Host-dona_session=short","__Host-dona_session="+"A".repeat(43)+"; __Host-dona_session="+"A".repeat(43)]){
+    const dashboard=controllerFixture();dashboard.connections.write.mutate=async()=>{throw Error("private audit details");};const request=dashboard.request("/");request.headers=request.headers.map(([name,value])=>name==="cookie"?[name,cookieHeader]:[name,value]);const page=await dashboard.controller.handle(request);assert.equal(page.status,303);assert.equal(page.headers.location,"/login");assert.match(page.headers["set-cookie"]!,/Max-Age=0/);assert.equal(page.body,"");
+  }
+});
+
 test("IdP障害中のdashboard navigationはlocal logoutを持つsafe shellを返す", async () => {
   const dashboard = controllerFixture();
   dashboard.connections.oidc.introspect = async () => { throw Error("provider unavailable private detail"); };

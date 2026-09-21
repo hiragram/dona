@@ -283,13 +283,14 @@ export class WebAuthController {
             : error.code === "cookie_invalid" || error.code === "cookie_ambiguous" ? 400 : 401,
         error.code === "deployment_invalid" ? "identity_unavailable" : error.code)
         : new AuthFailure(503, "identity_unavailable");
+      const dashboardCookieRejected = dashboard && ["cookie_invalid", "cookie_ambiguous"].includes(failure.reason);
       if (!auditAttempted) {
         try {
           const result = await this.write({ codec_version: 1, operation: "record_denial", cookie_indexes: candidates, reason: failure.reason }, now);
           if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
-      if (dashboard && (failure.status === 401 || (failure.status === 400 && ["cookie_invalid", "cookie_ambiguous"].includes(failure.reason)))) return loginRedirect();
+      if (dashboardCookieRejected || (dashboard && failure.status === 401)) return loginRedirect();
       if (dashboard && dashboardBoundaryVerified && failure.status === 503) return dashboardFailurePage();
       return response(failure.status, { error: failure.publicReason });
     }
