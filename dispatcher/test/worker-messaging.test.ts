@@ -11,7 +11,7 @@ import { buildJobPrompt } from "../src/job-prompt.js";
 import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
 import { buildEventPrompt, envelopeFromRow } from "../src/prompt.js";
-import { WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
+import { WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -48,6 +48,9 @@ describe("worker messaging ledger",()=>{
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),occurred_at:"2026-02-31T00:00:00Z"}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),conversation_revision:Number.MAX_SAFE_INTEGER,
+        payload:{kind:"question",question:"回答が必要です"}}),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),payload:{kind:"decision_request",question:"界".repeat(4_000),options:Array.from({length:8},()=>"界".repeat(1_000))}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_too_large");
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,report(source.event_id,2)),
@@ -173,6 +176,45 @@ describe("worker messaging ledger",()=>{
         conversation_revision:5,payload:{operation:"answer",text:"Aで進めてください"}});
       assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
     } finally {database.close();}
+  });
+
+  test("pending questionの次revisionは無関係なmessage最大値ではなく相関元から生成する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"unrelated-max",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:Number.MAX_SAFE_INTEGER,
+        payload:{operation:"add_condition",text:"独立した条件"}});
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"bounded-question",occurred_at:"2026-09-21T00:00:02Z",conversation_revision:7,
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:02Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:03Z")),1);
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
+        kind:"question",next_producer_sequence:2,next_conversation_revision:8});
+    } finally {database.close();}
+  });
+
+  test("instruction bridgeがdurable typed messageを既存steer経路へ一度だけ配送する",async()=>{
+    const {database,source,job}=await fixture();
+    bindRuntime(database,job.job_id,"runtime-bridge");
+    const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      producer_sequence:1,idempotency_key:"bridge-answer",occurred_at:"2026-09-21T00:00:01Z",
+      payload:{operation:"answer",text:"この方針で続けてください"}});
+    const calls:Array<{jobId:string;sourceEventId:string;instruction:string}>=[];
+    const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(jobId,sourceEventId,typedInstruction){
+      calls.push({jobId,sourceEventId,instruction:typedInstruction});
+    }});
+    try {
+      assert.equal(await bridge.runOnce(),true);
+      assert.equal(await bridge.runOnce(),false);
+      assert.equal(calls.length,1);
+      assert.deepEqual({jobId:calls[0]!.jobId,sourceEventId:calls[0]!.sourceEventId},{jobId:job.job_id,sourceEventId:source.event_id});
+      assert.match(calls[0]!.instruction,/DONA_TYPED_INSTRUCTION/);
+      assert.match(calls[0]!.instruction,/この方針で続けてください/);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","bridge-answer") as
+        {delivery:{state:string;message_id:string}}).delivery.state,"delivered");
+      assert.equal(instruction.message.message_id,(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","bridge-answer") as
+        {message:{message_id:string}}).message.message_id);
+    } finally {await bridge.stop();database.close();}
   });
 
   test("複数の未回答questionは相関先を投影せず曖昧と示す",async()=>{
@@ -468,6 +510,27 @@ test("worker reportはterminal cleanup後も元runtimeでread-only reconcileで�
       undefined,{"x-dona-worker-runtime":"runtime-foreign"});
     assert.equal(rejected.status,403);
   } finally {await api.stop();database.close();}
+});
+
+test("過去runtimeは自分が生成したmessageだけをreconcileできる",async()=>{
+  const {database,source,job,config}=await fixture();
+  bindRuntime(database,job.job_id,"runtime-first");
+  database.workerMessages.appendWorkerReport(job.job_id,"runtime-first",report(source.event_id,1,"first-report"));
+  const sqlite=new Database(config.databasePath);
+  sqlite.prepare("UPDATE job_live_session_identities SET herdr_agent_session_id=? WHERE job_id=?").run("runtime-second",job.job_id);
+  sqlite.close();
+  database.workerMessages.appendWorkerReport(job.job_id,"runtime-second",report(source.event_id,2,"second-report"));
+  database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",
+    completed_at:"2026-09-21T00:00:04Z"},job.result_path);
+  database.markJobRuntimeCleaned(job.job_id);
+  try {
+    assert.equal(database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-first","first-report").reconciliation,"matched");
+    assert.throws(()=>database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-first","second-report"),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
+    assert.equal(database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-second","second-report").reconciliation,"matched");
+    assert.throws(()=>database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-second","first-report"),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
+  } finally {database.close();}
 });
 
 test("既存DBへのadditive migrationはrow・user_version・FKを保持する",async()=>{

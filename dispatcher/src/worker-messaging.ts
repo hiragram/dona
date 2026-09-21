@@ -47,7 +47,13 @@ const commonMessage = {
   conversation_revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 };
 
-export const workerReportSchema = z.object({ ...commonMessage, payload: reportPayload }).strict();
+export const workerReportSchema = z.object({ ...commonMessage, payload: reportPayload }).strict().superRefine((value, context) => {
+  if ((value.payload.kind === "question" || value.payload.kind === "decision_request")
+    && value.conversation_revision === Number.MAX_SAFE_INTEGER) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["conversation_revision"],
+      message: "must leave room for the correlated answer revision" });
+  }
+});
 export const donaInstructionSchema = z.object({ ...commonMessage, payload: instructionPayload }).strict();
 
 export type WorkerReportInput = z.infer<typeof workerReportSchema>;
@@ -94,6 +100,10 @@ export interface WorkerMessageDeliveryRow {
   delivered_fence: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface WorkerInstructionController {
+  steer(jobId:string,sourceEventId:string,instruction:string):Promise<unknown>;
 }
 
 export class WorkerMessageError extends Error {
@@ -148,10 +158,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS worker_messages_retention_idx ON worker_messages(accepted_at, message_id);
 
     CREATE TABLE IF NOT EXISTS worker_message_runtime_identities (
-      job_id                   TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+      message_id               TEXT PRIMARY KEY REFERENCES worker_messages(message_id) ON DELETE CASCADE,
       runtime_identity_sha256  TEXT NOT NULL CHECK (length(runtime_identity_sha256) = 64),
-      first_seen_at            TEXT NOT NULL,
-      PRIMARY KEY(job_id, runtime_identity_sha256)
+      first_seen_at            TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS worker_message_deliveries (
@@ -221,6 +230,19 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       updated_at             TEXT NOT NULL
     );
   `);
+  const runtimeIdentityColumns=new Set((db.pragma("table_info(worker_message_runtime_identities)") as Array<{name:string}>).map(row=>row.name));
+  if(runtimeIdentityColumns.has("job_id"))db.exec(`
+    CREATE TABLE worker_message_runtime_identities_v2 (
+      message_id TEXT PRIMARY KEY REFERENCES worker_messages(message_id) ON DELETE CASCADE,
+      runtime_identity_sha256 TEXT NOT NULL CHECK (length(runtime_identity_sha256) = 64),
+      first_seen_at TEXT NOT NULL
+    );
+    INSERT OR IGNORE INTO worker_message_runtime_identities_v2(message_id,runtime_identity_sha256,first_seen_at)
+      SELECT m.message_id,r.runtime_identity_sha256,r.first_seen_at
+      FROM worker_message_runtime_identities r JOIN worker_messages m ON m.job_id=r.job_id AND m.producer='worker';
+    DROP TABLE worker_message_runtime_identities;
+    ALTER TABLE worker_message_runtime_identities_v2 RENAME TO worker_message_runtime_identities;
+  `);
   const deliveryColumns=new Set((db.pragma("table_info(worker_message_deliveries)") as Array<{name:string}>).map(row=>row.name));
   if(!deliveryColumns.has("event_id"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN event_id TEXT REFERENCES events(event_id)");
   if(!deliveryColumns.has("delivered_lease_owner"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_lease_owner TEXT");
@@ -240,8 +262,8 @@ export class WorkerMessageRepository {
     this.assertWorkerRuntime(jobId, runtimeIdentity);
     return this.db.transaction(() => {
       const result=this.appendReport(jobId, raw, at);
-      this.db.prepare(`INSERT OR IGNORE INTO worker_message_runtime_identities(job_id,runtime_identity_sha256,first_seen_at)
-        VALUES(?,?,?)`).run(jobId,sha256(runtimeIdentity),at.toISOString());
+      this.db.prepare(`INSERT OR IGNORE INTO worker_message_runtime_identities(message_id,runtime_identity_sha256,first_seen_at)
+        VALUES(?,?,?)`).run(result.message.message_id,sha256(runtimeIdentity),at.toISOString());
       return result;
     }).immediate();
   }
@@ -354,7 +376,7 @@ export class WorkerMessageRepository {
   pendingQuestion(jobId: string) {
     const rows=this.db.prepare(`SELECT m.message_id,m.kind,
         COALESCE((SELECT MAX(next.producer_sequence) FROM worker_messages next WHERE next.job_id=m.job_id AND next.producer='dona-main'),0)+1 AS next_producer_sequence,
-        COALESCE((SELECT MAX(next.conversation_revision) FROM worker_messages next WHERE next.job_id=m.job_id),0)+1 AS next_conversation_revision
+        COALESCE(m.conversation_revision,0)+1 AS next_conversation_revision
       FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
       WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND d.consumer='dona-main'
         AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')
@@ -420,6 +442,19 @@ export class WorkerMessageRepository {
     return this.claim(jobId,sourceEventId,"worker",leaseOwner,limit,leaseMs,at);
   }
 
+  claimNextWorkerInstruction(leaseOwner:string,leaseMs:number,at=new Date()) {
+    const now=at.toISOString();
+    this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,lease_token_sha256=NULL,
+      lease_expires_at=NULL,updated_at=? WHERE consumer='worker' AND state='leased' AND lease_expires_at<=?`).run(now,now);
+    const candidate=this.db.prepare(`SELECT m.job_id,m.source_event_id FROM worker_message_deliveries d
+      JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
+      WHERE d.consumer='worker' AND d.state='pending' AND d.available_at<=?
+        AND j.status NOT IN ('completed','failed','cancelled')
+      ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT 1`)
+      .get(now) as {job_id:string;source_event_id:string}|undefined;
+    return candidate ? this.claim(candidate.job_id,candidate.source_event_id,"worker",leaseOwner,1,leaseMs,at)[0] : undefined;
+  }
+
   acknowledge(jobId: string, sourceEventId: string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
     return this.db.transaction(() => {
       const now = at.toISOString();
@@ -464,7 +499,7 @@ export class WorkerMessageRepository {
   }
 
   reconcileWorker(jobId:string,sourceEventId:string,runtimeIdentity:string,idempotencyKey:string) {
-    this.assertWorkerReconciliationRuntime(jobId,runtimeIdentity);
+    this.assertWorkerReconciliationRuntime(jobId,runtimeIdentity,idempotencyKey);
     return this.reconcile(jobId,sourceEventId,"worker",idempotencyKey);
   }
 
@@ -602,8 +637,6 @@ export class WorkerMessageRepository {
         (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
         AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))
         AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=worker_messages.message_id)`).run(cutoff).changes;
-      this.db.prepare(`DELETE FROM worker_message_runtime_identities WHERE NOT EXISTS
-        (SELECT 1 FROM worker_messages WHERE worker_messages.job_id=worker_message_runtime_identities.job_id AND producer='worker')`).run();
       return deleted;
     }).immediate();
   }
@@ -639,13 +672,14 @@ export class WorkerMessageRepository {
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
   }
 
-  private assertWorkerReconciliationRuntime(jobId:string,runtimeIdentity:string):void {
+  private assertWorkerReconciliationRuntime(jobId:string,runtimeIdentity:string,idempotencyKey:string):void {
     if(typeof runtimeIdentity!=="string"||runtimeIdentity.length<1||runtimeIdentity.length>512)
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity is invalid");
     const current=this.db.prepare("SELECT 1 FROM job_live_session_identities WHERE job_id=? AND herdr_agent_session_id=?")
       .get(jobId,runtimeIdentity);
-    const historical=this.db.prepare("SELECT 1 FROM worker_message_runtime_identities WHERE job_id=? AND runtime_identity_sha256=?")
-      .get(jobId,sha256(runtimeIdentity));
+    const historical=this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_runtime_identities r USING(message_id)
+      WHERE m.job_id=? AND m.producer='worker' AND m.idempotency_key=? AND r.runtime_identity_sha256=?`)
+      .get(jobId,idempotencyKey,sha256(runtimeIdentity));
     if(!current&&!historical)
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
   }
@@ -670,5 +704,43 @@ export class WorkerMessagePublisher {
       if(published+silence>0)this.wake();
     }
     catch(error){this.onError(error);}
+  }
+}
+
+export class WorkerInstructionBridge {
+  private timer:NodeJS.Timeout|undefined;
+  private operation:Promise<void>|undefined;
+  private readonly leaseOwner="dispatcher-worker-instruction-bridge";
+  constructor(private readonly repository:WorkerMessageRepository,private readonly controller:WorkerInstructionController,
+    private readonly pollMs=1_000,private readonly onError:(error:unknown)=>void=()=>{}) {}
+  start():void {
+    if(this.timer)return;
+    this.run();
+    this.timer=setInterval(()=>this.run(),this.pollMs);
+    this.timer.unref();
+  }
+  async stop():Promise<void> {
+    if(this.timer)clearInterval(this.timer);
+    this.timer=undefined;
+    await this.operation;
+  }
+  async runOnce(at=new Date()):Promise<boolean> {
+    const claimed=this.repository.claimNextWorkerInstruction(this.leaseOwner,workerMessageLeaseMaxMs,at);
+    if(!claimed)return false;
+    const {delivery,lease_token}=claimed;
+    const instruction=stableStringify({schema_version:workerMessageProtocolVersion,message_id:delivery.message_id,
+      correlation_message_id:delivery.correlation_message_id,conversation_revision:delivery.conversation_revision,
+      operation:delivery.kind,payload:delivery.payload});
+    await this.controller.steer(delivery.job_id,delivery.source_event_id,
+      `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`);
+    this.repository.acknowledge(delivery.job_id,delivery.source_event_id,delivery.delivery_id,this.leaseOwner,
+      lease_token,delivery.fence,new Date());
+    return true;
+  }
+  private run():void {
+    if(this.operation)return;
+    const operation=(async()=>{while(await this.runOnce());})().catch(error=>this.onError(error));
+    this.operation=operation;
+    void operation.finally(()=>{if(this.operation===operation)this.operation=undefined;});
   }
 }

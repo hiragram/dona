@@ -17,7 +17,7 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
-import { WorkerMessagePublisher } from "./worker-messaging.js";
+import { WorkerInstructionBridge, WorkerMessagePublisher } from "./worker-messaging.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -66,6 +66,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => worker.wake(),
     jobProgress,
   );
+  const workerInstructionBridge = new WorkerInstructionBridge(database.workerMessages,jobSupervisor,
+    Math.min(config.queuePollMs,1_000),error=>apiLogger.warn("Worker instruction delivery deferred",{
+      error_code:"worker_instruction_delivery_deferred",error_message:error instanceof Error?error.message:String(error),
+    }));
   if (!jobProgressStore) await jobSupervisor.disableProgress();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
@@ -85,6 +89,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       async quiesce() {
         await scheduler.stop();
         workerMessagePublisher.stop();
+        await workerInstructionBridge.stop();
         await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
@@ -128,9 +133,11 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     scheduler.start();
     reminderPublisher.start();
     jobSupervisor.start();
+    workerInstructionBridge.start();
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
+    await workerInstructionBridge.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();
     workerMessagePublisher.stop();
@@ -154,6 +161,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         await api.stop();
         await scheduler.stop();
         workerMessagePublisher.stop();
+        await workerInstructionBridge.stop();
         await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();

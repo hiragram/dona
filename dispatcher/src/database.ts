@@ -346,8 +346,8 @@ export function migrateDispatcherDatabase(
           correlation_message_id, conversation_revision, occurred_at, accepted_at
         FROM preserved_worker_messages_v3;
         INSERT INTO worker_message_runtime_identities (
-          job_id, runtime_identity_sha256, first_seen_at
-        ) SELECT job_id, runtime_identity_sha256, first_seen_at
+          message_id, runtime_identity_sha256, first_seen_at
+        ) SELECT message_id, runtime_identity_sha256, first_seen_at
         FROM preserved_worker_message_runtime_identities_v3;
         INSERT INTO worker_message_deliveries (
           delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,

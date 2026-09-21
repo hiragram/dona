@@ -4,7 +4,7 @@
 
 Worker Messaging は、worker と dona-main の途中経過・質問・判断を durable に交換する transport-neutral protocol である。`progress.json` は引き続き最新 phase の snapshot、Job Result と `dona_job` event は terminal outcome の正本であり、この ledger から backfill しない。
 
-本protocolは message の型、SQLite ledger、receipt、delivery、Dispatcher API／MCP、内部eventの安全な投影を所有する。Herdr promptへの組込み、dona-mainの意味判断、Slack文面と投稿は所有しない。
+本protocolは message の型、SQLite ledger、receipt、delivery、Dispatcher API／MCP、内部eventの安全な投影、およびworker向けtyped instructionを既存Herdr steer経路へ渡すbridgeを所有する。dona-mainの意味判断、Slack文面と投稿は所有しない。
 
 ## Contract
 
@@ -38,6 +38,7 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
+- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。process停止後もpending ledgerから再開し、steer側のevent idempotencyによりaccept済みpromptを重複投入しない。
 - `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`を返す。一意なら相関message ID、次のproducer sequence、conversation revisionを返し、複数なら`ambiguous: true`と`pending_count_at_least: 2`だけを返して相関先を推測させない。後続の人間回答はcurrent event bindingで`answer`へ変換し、成功後はAgent Sessionを`processing`へ戻す。通常のfree-form steerへ落とさない。
 
 ## 障害対応
