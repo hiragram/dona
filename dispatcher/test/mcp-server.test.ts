@@ -124,7 +124,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.idempotentHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
-      assert.equal(listed.tools.find(({ name }) => name === "send_worker_instruction")?.annotations?.idempotentHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "send_worker_instruction")?.annotations?.idempotentHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "get_worker_message")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "reconcile_worker_message")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);

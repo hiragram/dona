@@ -380,7 +380,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     description:"同じthreadに属する明示jobへtyped instructionをdurableに記録します。raw command、path、URL、environment、credentialを操作能力へ変換しません。timeout時は再送せずreconcile_worker_messageで照合します。",
     inputSchema:{job_id:jobId,source_event_id:eventId,producer_sequence:z.number().int().positive(),idempotency_key:workerMessageKey,
       occurred_at:workerMessageTime,correlation_message_id:workerMessageId.optional(),conversation_revision:z.number().int().nonnegative().optional(),payload:workerInstructionPayload},
-    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
   },async({job_id,...input})=>{
     try {if(!client.sendWorkerInstruction)throw new Error("Worker messaging is unavailable");return success(await client.sendWorkerInstruction(job_id,{schema_version:1,...input}));}
     catch(error){return failure(error,logger,"send_worker_instruction");}

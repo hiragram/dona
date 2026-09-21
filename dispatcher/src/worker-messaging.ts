@@ -407,7 +407,10 @@ export class WorkerMessageRepository {
         this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
           VALUES(?,1,'dona_message',?,'worker_message_report',?,?,?,?,?,'queued',?,?,?)`).run(eventId,`worker-message:${row.message_id}`,row.occurred_at,subject,payload,replyTarget,
           stableStringify({message_id:row.message_id,job_id:row.job_id}),now,now,now);
-        const event=this.db.prepare("SELECT event_id FROM events WHERE source='dona_message' AND external_event_id=?").get(`worker-message:${row.message_id}`) as {event_id:string};
+        const event=this.db.prepare("SELECT event_id,event_type,payload_json FROM events WHERE source='dona_message' AND external_event_id=?")
+          .get(`worker-message:${row.message_id}`) as {event_id:string;event_type:string;payload_json:string};
+        if(event.event_type!=="worker_message_report"||event.payload_json!==payload)
+          throw new WorkerMessageError("worker_message_event_conflict","internal event identity has a different projection");
         const binding=readEventJobBinding(this.db,row.source_event_id);
         if(binding)insertEventJobBinding(this.db,event.event_id,binding);
         this.db.prepare(`UPDATE worker_message_deliveries SET state='delivered',event_id=?,delivered_at=?,lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=? AND state='leased'`)
@@ -437,7 +440,11 @@ export class WorkerMessageRepository {
           VALUES(?,1,'dona_message',?,'worker_message_silence',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,now,
           stableStringify({job_id:row.job_id}),stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation}),replyTarget,
           stableStringify({job_id:row.job_id,generation:row.generation}),now,now,now);
-        const event=this.db.prepare("SELECT event_id FROM events WHERE source='dona_message' AND external_event_id=?").get(externalId) as {event_id:string};
+        const expectedPayload=stableStringify({schema_version:1,job_id:row.job_id,source_event_id:row.source_event_id,generation:row.generation});
+        const event=this.db.prepare("SELECT event_id,event_type,payload_json FROM events WHERE source='dona_message' AND external_event_id=?")
+          .get(externalId) as {event_id:string;event_type:string;payload_json:string};
+        if(event.event_type!=="worker_message_silence"||event.payload_json!==expectedPayload)
+          throw new WorkerMessageError("worker_message_event_conflict","silence event identity has a different projection");
         const binding=readEventJobBinding(this.db,row.source_event_id);
         if(binding)insertEventJobBinding(this.db,event.event_id,binding);
         this.db.prepare("UPDATE worker_message_cadence SET silence_due_at=?,updated_at=? WHERE job_id=? AND generation=?")
@@ -470,9 +477,8 @@ export class WorkerMessageRepository {
   }
 
   private assertAuthorized(job:JobRow,sourceEventId:string):void {
-    if(sourceEventId===job.source_event_id)return;
     const owner=readEventJobBinding(this.db,job.source_event_id)?.owner;
-    const caller=readEventJobBinding(this.db,sourceEventId)?.owner;
+    const caller=sourceEventId===job.source_event_id?owner:readEventJobBinding(this.db,sourceEventId)?.owner;
     if(!owner||!caller||stableStringify(owner)!==stableStringify(caller))
       throw new WorkerMessageError("job_binding_mismatch","source event does not own this job");
   }
