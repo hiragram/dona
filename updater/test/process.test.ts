@@ -46,7 +46,7 @@ test("ProcessRunner preserves only a safe terminal checkpoint after exact-limit 
   });
   assert.equal(result.exit_code, 0);
   assert.equal(result.output_truncated, true);
-  assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#1");
+  assert.equal(result.output_checkpoint, "file=file-start test/job-runtime.test.ts; last_finish=none; unfinished=test/job-runtime.test.ts:012345abcdef#9");
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
   assert.equal(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr), 1_024);
   assert.ok(Buffer.byteLength(result.stdout) > 512);
@@ -100,7 +100,7 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
   assert.equal(result.output_checkpoint.includes("secret-value"), false);
 });
 
-test("ProcessRunner counts indistinguishable concurrent cases without claiming an occurrence", async () => {
+test("ProcessRunner keeps the exact remaining concurrent case identity", async () => {
   const script = `
     process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
     process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\\n');
@@ -113,7 +113,7 @@ test("ProcessRunner counts indistinguishable concurrent cases without claiming a
     timeoutMs: 100,
     outputLimitBytes: 1_024,
   });
-  assert.match(result.output_checkpoint ?? "", /timeout=test\/api\.test\.ts:012345abcdef#1/);
+  assert.match(result.output_checkpoint ?? "", /timeout=test\/api\.test\.ts:012345abcdef#2/);
 });
 
 test("ProcessRunner recognizes a dedicated checkpoint after partial test output", async () => {
@@ -127,7 +127,7 @@ test("ProcessRunner recognizes a dedicated checkpoint after partial test output"
     timeoutMs: 100,
     outputLimitBytes: 1_024,
   });
-  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#1");
+  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#7");
 });
 
 test("ProcessRunner freezes the timeout identity during cleanup output", async () => {
@@ -144,7 +144,7 @@ test("ProcessRunner freezes the timeout identity during cleanup output", async (
     timeoutMs: 100,
     outputLimitBytes: 1_024,
   });
-  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#1");
+  assert.equal(result.output_checkpoint, "file=file-start test/api.test.ts; last_finish=none; timeout=test/api.test.ts:fedcba543210#2");
 });
 
 test("ProcessRunner ignores marker-shaped output without the bound nonce", async () => {
