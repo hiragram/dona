@@ -5,7 +5,7 @@ import { signSlackAccessReceipt } from "../src/access-receipt.js";
 import { verifyCurrentSlackAccess } from "../src/current-access.js";
 import { SlackApiError, type SlackApiClient, type SlackChannel, type SlackUser } from "../src/slack-api.js";
 
-const user: SlackUser = { id:"U_OWNER", teamId:"T_HOME", updatedAt:7, isBot:false, isAppUser:false, isDeleted:false };
+const user: SlackUser = { id:"U_OWNER", teamId:"T_HOME", updatedAt:7, isBot:false, isAppUser:false, isDeleted:false, stateKnown:true };
 const channel: SlackChannel = { id:"C_PRIVATE", isPrivate:false, isArchived:false, isMember:true, isShared:false, visibilityKnown:true };
 
 function provider(overrides: { user?:Partial<SlackUser>; channel?:Partial<SlackChannel>; member?:boolean; error?:boolean } = {}): SlackApiClient {
@@ -38,6 +38,7 @@ describe("Slack current access verifier", () => {
     await denied(provider({user:{isDeleted:true}}));
     await denied(provider({user:{isBot:true}}));
     await denied(provider({user:{isAppUser:true}}));
+    await denied(provider({user:{stateKnown:false}}));
     await denied(provider({user:{teamId:"T_OTHER"}}));
     const missingTeam=provider(); missingTeam.getUser=async()=>{
       const {teamId:_teamId,...withoutTeam}=user; return withoutTeam;
@@ -51,7 +52,7 @@ describe("Slack current access verifier", () => {
   });
 
   test("DMはcounterpart本人、mpim/privateは明示membershipを要求し、bot membershipを代用しない", async () => {
-    const dm=await verifyCurrentSlackAccess(provider({channel:{id:"D_OWNER",isIm:true,userId:"U_OWNER"}}),"T_HOME",
+    const dm=await verifyCurrentSlackAccess(provider({channel:{id:"D_OWNER",isIm:true,userId:"U_OWNER",visibilityKnown:false}}),"T_HOME",
       {eventId:"evt_dm",channelId:"D_OWNER",userId:"U_OWNER"});
     assert.equal(dm.destination_kind,"im");
     await denied(provider({channel:{id:"D_OTHER",isIm:true,userId:"U_OTHER"}}),"D_OTHER");

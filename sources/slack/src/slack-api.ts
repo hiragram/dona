@@ -82,6 +82,7 @@ export interface SlackUser {
   isBot: boolean;
   isAppUser: boolean;
   isDeleted: boolean;
+  stateKnown?: boolean;
   isAdmin?: boolean;
   isOwner?: boolean;
   isPrimaryOwner?: boolean;
@@ -243,6 +244,7 @@ function userFromResponse(user: {
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
     isDeleted: user.deleted ?? false,
+    stateKnown: typeof user.is_bot === "boolean" && typeof user.is_app_user === "boolean" && typeof user.deleted === "boolean",
     isAdmin: user.is_admin ?? false,
     isOwner: user.is_owner ?? false,
     isPrimaryOwner: user.is_primary_owner ?? false,

@@ -91,6 +91,7 @@ class FakeSlackClient implements SlackApiClient {
       isBot: false,
       isAppUser: false,
       isDeleted: false,
+      stateKnown: true,
     };
   }
   async getThread(): Promise<SlackThread> {

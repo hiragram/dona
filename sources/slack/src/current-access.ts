@@ -67,8 +67,8 @@ export async function verifyCurrentSlackAccess(
   const requiredRole=input.requiredRole??"member";
   const roleAllowed=requiredRole==="member"||requiredRole==="admin"&&(user!.isAdmin===true||user!.isOwner===true)
     ||requiredRole==="owner"&&user!.isOwner===true;
-  if (user!.id !== input.userId || user!.teamId !== workspaceId || user!.isDeleted || user!.isBot || user!.isAppUser
-    || channel!.id !== input.channelId || channel!.visibilityKnown !== true || channel!.isArchived || channel!.isShared || !kind || !member! || !roleAllowed
+  if (user!.id !== input.userId || user!.teamId !== workspaceId || user!.stateKnown !== true || user!.isDeleted || user!.isBot || user!.isAppUser
+    || channel!.id !== input.channelId || kind !== "im" && channel!.visibilityKnown !== true || channel!.isArchived || channel!.isShared || !kind || !member! || !roleAllowed
     || kind === "public_channel" && !channel!.isMember) unavailable();
   if (kind === "im" && channel!.userId !== input.userId) unavailable();
   return {
