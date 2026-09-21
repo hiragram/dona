@@ -15,7 +15,7 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 
 async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDenied?: boolean; pauseFirstAlphaDetail?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailFailsAfterCancel?: boolean } = {}) {
+  eventDenied?: boolean; pauseFirstAlphaDetail?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 503 } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
     result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
@@ -39,7 +39,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
     }
-    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailFailsAfterCancel&&cancelWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
+    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":"identity_unavailable"},options.detailAfterCancelStatus);return;}
       if(id==="job_alpha"){alphaDetailReads++;if(options.pauseFirstAlphaDetail&&alphaDetailReads===1)await options.pauseFirstAlphaDetail;}
       await fulfill(route, { job: options.pauseFirstAlphaDetail||options.multipleJobs?job({job_id:id,...(id==="job_alpha"?{error_code:alphaDetailReads===1?"old_projection":"new_projection"}:{})}):current, event_cursor: cursor }); return; }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/events$/.test(url.pathname)) {
@@ -98,6 +98,11 @@ test("submitのacceptance unknownは再POSTせず一覧をread-only再取得す�
   await expect(page.getByRole("heading", { name: "新しい依頼" })).toBeVisible(); const before = f.listReads;
   await page.getByLabel("依頼内容").fill("結果不明を確認する"); await page.getByRole("button", { name: "依頼を送信" }).click();
   await expect(page.getByRole("status")).toContainText("自動では再実行せず"); expect(f.submitWrites).toBe(1); expect(f.listReads).toBe(before + 1); expect(f.errors).toEqual([]);
+});
+
+test("submit受付不明後のreconcileが403ならprivate表示を消去する",async({page})=>{
+  const f=await fixture(page,{submitUnknown:true,listDeniedAfterFirst:true});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("失効を確認する");await page.getByRole("button",{name:"依頼を送信"}).click();
+  await expect(page.getByRole("status")).toContainText("受付結果は不明です");await expect(page.getByRole("button",{name:/job_alpha/})).toBeHidden();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("cancelはexact jobをdialogで確認し結果不明でも再POSTしない", async ({ page }) => {
@@ -164,8 +169,13 @@ test("取消dialogのjobからnavigationしたら送信せずdialogを閉じる"
 });
 
 test("cancel成功receipt後のdetail失敗を取消失敗へ戻さない",async({page})=>{
-  const f=await fixture(page,{detailFailsAfterCancel:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();
+  const f=await fixture(page,{detailAfterCancelStatus:503});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();
   await expect(page.getByRole("status")).toContainText("取消受付は確認済みですが");expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("cancel受付不明後のreconcileが403ならprivate表示を消去する",async({page})=>{
+  const f=await fixture(page,{cancelUnknown:true,detailAfterCancelStatus:403});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();
+  await expect(page.getByRole("status")).toContainText("取消の受付結果は不明です");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("terminal detailではSSEを開始せずerror codeとfocusを表示する", async ({ page }) => {

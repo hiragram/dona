@@ -28,7 +28,7 @@ export const dashboardScript = String.raw`(() => {
   const announce = (message, tone = "info") => { globalStatus.textContent = message; globalStatus.dataset.tone = tone; globalStatus.hidden = false; };
   const closeCancelDialog = () => { cancelPending=null;if(cancelDialog.open)cancelDialog.close(); };
   const clearPrivate = () => { privateVisible = false; canReadJobs=false; selectionGeneration++; closeCancelDialog(); view.hidden = true; list.replaceChildren(); detail.replaceChildren(); csrf = null; selected = null; eventCursor = null; streamAbort?.abort(); streamAbort = null; };
-  const failSession = error => { clearPrivate(); if (error?.status === 401) location.replace("/login"); else announce("現在の情報を確認できません。安全のため、以前の内容は表示していません。", "error"); };
+  const failSession = (error, message = "現在の情報を確認できません。安全のため、以前の内容は表示していません。") => { clearPrivate(); if (error?.status === 401) location.replace("/login"); else announce(message, "error"); };
   const readBody = async response => {
     if (response.headers.get("cache-control") !== "no-store" || response.headers.get("content-type") !== "application/json; charset=utf-8" || !response.body) throw Error("response_unverified");
     const reader = response.body.getReader(), parts = []; let size = 0;
@@ -88,14 +88,14 @@ export const dashboardScript = String.raw`(() => {
     if(new TextEncoder().encode(encoded).byteLength>65536){byId("objective-error").textContent="依頼全体を64 KiB以内にしてください。";byId("objective-error").hidden=false;byId("objective").focus();return;}
     submitButton.disabled=true;submitButton.setAttribute("aria-busy","true");announce("依頼を送信しています。結果を確認するまで完了扱いにしません。");
     try{let value;try{value=await api("/api/jobs",{method:"POST",headers:{"content-type":"application/json","x-dona-csrf":csrf},body:encoded});if(!value.job||!jobId(value.job.job_id))throw Error("receipt_invalid");}
-      catch(error){if(error?.status===401||error?.status===403)return failSession(error);if(error?.code==="acceptance_unknown"||!error?.status){announce("受付結果が不明です。同じ操作を自動では再実行せず、ジョブ一覧を再取得しました。","warning");await loadList().catch(()=>{});}else announce("依頼を受理できませんでした。入力と現在の権限を確認してください。","error");return;}
+      catch(error){if(error?.status===401||error?.status===403)return failSession(error);if(error?.code==="acceptance_unknown"||!error?.status){announce("受付結果が不明です。同じ操作を自動では再実行せず、ジョブ一覧を再取得しました。","warning");try{await loadList();}catch(readError){if(readError?.status===401||readError?.status===403)return failSession(readError,"受付結果は不明です。現在の権限も確認できないため、以前の内容は表示していません。");}}else announce("依頼を受理できませんでした。入力と現在の権限を確認してください。","error");return;}
       form.reset();repositoryField.hidden=true;baseField.hidden=true;byId("repository").required=false;announce(value.outcome==="reused"?"同じ依頼の受付結果を確認しました。":"依頼がdurably受理されました。","success");if(canReadJobs){try{await loadList();}catch(error){if(error?.status===401||error?.status===403)return failSession(error);announce("依頼の受付は確認済みですが、一覧を更新できませんでした。","warning");}await openJob(value.job.job_id,true);}
     }
     finally{submitButton.disabled=false;submitButton.removeAttribute("aria-busy");}
   };
   const cancel = async () => { if(!cancelPending||!csrf)return;const id=cancelPending,request_id=requestId();if(selected!==id){closeCancelDialog();announce("表示中のジョブが変わったため、取消は送信しませんでした。","warning");return;}cancelConfirm.disabled=true;cancelConfirm.setAttribute("aria-busy","true");
     try{let value;try{value=await api("/api/jobs/"+encodeURIComponent(id)+"/cancel",{method:"POST",headers:{"content-type":"application/json","x-dona-csrf":csrf},body:JSON.stringify({request_id})});}
-      catch(error){closeCancelDialog();if(error?.status===401||error?.status===403)return failSession(error);announce(error?.code==="acceptance_unknown"||!error?.status?"取消の受付結果が不明です。自動では再実行せず、ジョブ状態を再取得しました。":"取消を受け付けられませんでした。最新状態を確認してください。",error?.code==="acceptance_unknown"||!error?.status?"warning":"error");await loadDetail(id).catch(()=>{});return;}
+      catch(error){closeCancelDialog();if(error?.status===401||error?.status===403)return failSession(error);announce(error?.code==="acceptance_unknown"||!error?.status?"取消の受付結果が不明です。自動では再実行せず、ジョブ状態を再取得しました。":"取消を受け付けられませんでした。最新状態を確認してください。",error?.code==="acceptance_unknown"||!error?.status?"warning":"error");try{await loadDetail(id);}catch(readError){if(readError?.status===401||readError?.status===403)return failSession(readError,"取消の受付結果は不明です。現在の権限も確認できないため、以前の内容は表示していません。");}return;}
       announce(value.outcome==="already_cancelled"?"取消済みであることを確認しました。":"取消受付を確認しました。","success");closeCancelDialog();try{await loadDetail(id);}catch(error){if(error?.status===401||error?.status===403)return failSession(error);announce("取消受付は確認済みですが、最新状態を再取得できませんでした。","warning");}
     }
     finally{cancelConfirm.disabled=false;cancelConfirm.removeAttribute("aria-busy");}
