@@ -128,6 +128,10 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
   assert.equal(group?.reason_code,"human_input");
   assert.equal(JSON.stringify(group).includes(second.objective), false);
   const raw=new Database(config.databasePath);
+  raw.prepare("UPDATE human_wait_items SET state='open',resolved_at=NULL WHERE dedupe_key=?").run(`job:${job.job_id}`);
+  const repaired=database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:new Date(transitionAt.getTime()+1_000).toISOString()});
+  assert.equal(repaired.repaired>=1,true);
+  assert.equal(database.humanWaits.listInternal().some(item=>item.dedupe_key===`job:${job.job_id}`),false);
   raw.prepare("UPDATE jobs SET status='failed',updated_at=? WHERE job_id=?").run(new Date(transitionAt.getTime()+1_500).toISOString(),job.job_id);
   raw.close();
   assert.equal(database.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:notification.row.event_id,
@@ -137,6 +141,30 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
   const terminalEvent=database.enqueue(eventEnvelope("Ev-group-terminal")).row;
   database.claimJobGroupTransition(source.event_id,"all_terminal",terminalEvent.event_id,new Date(transitionAt.getTime()+2_000));
   assert.equal(database.humanWaits.listInternal().length,0);
+  const resolvedGroup=database.humanWaits.get(group!.item_id)!;
+  const retentionDb=new Database(config.databasePath);
+  const retention=retentionDb.prepare("SELECT julianday(retain_until)-julianday(resolved_at) AS days FROM human_wait_items WHERE item_id=?")
+    .get(group!.item_id) as {days:number};
+  retentionDb.close();
+  assert.equal(retention.days>29.99,true);
+  database.close();
+});
+
+test("attention ownership解除時はgroup waitを解消する", async () => {
+  const {database,config,source,job}=await jobFixture("wait.group.release.one");
+  database.createJob({source_event_id:source.event_id,job_key:"wait.group.release.two",objective:"second",workspace:{kind:"scratch"}},
+    config.jobsWorkspaceRoot,config.jobResultsDir,new Date("2026-09-21T00:00:44.000Z"));
+  database.markJobBlocked(job.job_id,"input");
+  const at=new Date(Date.now()+60_000);
+  database.saveCompleted(source.event_id,{schema_version:1,event_id:source.event_id,status:"completed",summary:"sealed",actions:[],completed_at:at.toISOString()},
+    "/tmp/human-wait-group-release.json",at);
+  database.enqueueJobNotification(job.job_id,new Date(at.getTime()+1_000));
+  assert.equal(database.humanWaits.listInternal().some(item=>item.resource_kind==="job_group"),true);
+  const raw=new Database(config.databasePath);
+  raw.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=?")
+    .run(new Date(at.getTime()+2_000).toISOString(),source.event_id);
+  raw.close();
+  assert.equal(database.humanWaits.listInternal().some(item=>item.resource_kind==="job_group"),false);
   database.close();
 });
 
@@ -164,9 +192,10 @@ test("repairはbounded cursorとsnapshot fenceを持ちdry-runでは予定件数
   const { database, config, source, job } = await jobFixture("wait.repair");
   database.markJobNeedsReview(job.job_id, "unknown", "redacted");
   const raw=new Database(config.databasePath);
+  raw.prepare("UPDATE jobs SET updated_at=? WHERE job_id=?").run("2026-09-21T00:00:00Z",job.job_id);
   raw.prepare("DELETE FROM human_wait_items WHERE dedupe_key=?").run(`job:${job.job_id}`);
   raw.close();
-  const snapshot = new Date(Date.now()+60_000).toISOString();
+  const snapshot = "2026-09-21T00:00:00.000Z";
   const dry = database.humanWaits.repair({ dryRun:true,limit:1,cursor:`group:${source.event_id}`,snapshotRevision:snapshot });
   assert.deepEqual({dry:dry.dry_run,scanned:dry.scanned,repaired:dry.repaired},{dry:true,scanned:1,repaired:1});
   assert.equal(database.humanWaits.listInternal().length,0);
@@ -253,6 +282,41 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
     assert.deepEqual(harness.database.humanWaits.listInternal("stale").map(item=>item.resource_kind).sort(),["notification","schedule_run"]);
     harness.raw.prepare("UPDATE connector_outbox SET status='sent',updated_at=? WHERE outbox_id=?").run("2026-09-05T00:02:00Z",outbox.outbox_id);
     harness.raw.prepare("UPDATE schedule_runs SET status='completed',reason=NULL,terminal_at=? WHERE run_id=?").run("2026-09-05T00:02:00Z",runId);
+    assert.equal(harness.database.humanWaits.listInternal().length,0);
+  } finally { harness.close(); }
+});
+
+test("schedule notificationは後から確定したeventへ追随する", () => {
+  const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
+  try {
+    const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-completion",harness.input("slack.reminder.post",false,due),due);
+    const run=harness.raw.prepare("SELECT schedule_id,revision FROM schedule_runs WHERE run_id=?").get(runId) as {schedule_id:string;revision:number};
+    const source=harness.database.enqueue(eventEnvelope("Ev-completion-source")).row;
+    const owner=JSON.stringify({kind:"schedule",tenant_id:"T_GATE",owner_id:"U_GATE",schedule_id:run.schedule_id,run_id:runId,revision:run.revision});
+    const destination=JSON.stringify({kind:"slack",target:{kind:"thread",workspace_id:"T_GATE",channel_id:"C_GATE",thread_ts:"1.000001"}});
+    harness.raw.prepare(`INSERT INTO job_completion_results(job_id,job_status,source_event_id,owner_json,destination_json,work_state,
+      notification_state,materialized_at,content_delete_at) VALUES('job_completion_wait','needs_review',?,?,?,?, 'none',?,?)`)
+      .run(source.event_id,owner,destination,"completed",due,"2026-10-05T00:01:00Z");
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id='job_completion_wait'").run();
+    const wait=harness.database.humanWaits.listInternal().find(item=>item.dedupe_key==='notification:job_completion_wait:needs_review')!;
+    assert.equal(wait.resource_id,"job_completion_wait");
+    const event=harness.database.enqueue(eventEnvelope("Ev-completion-origin")).row;
+    harness.raw.prepare("UPDATE job_completion_results SET notification_event_id=? WHERE job_id='job_completion_wait'").run(event.event_id);
+    assert.equal(harness.database.humanWaits.get(wait.item_id)?.resource_id,event.event_id);
+  } finally { harness.close(); }
+});
+
+test("旧schedule revisionから後発するneeds_reviewをopenにしない", () => {
+  const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
+  try {
+    const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-old-revision",harness.input("slack.reminder.post",false,due),due);
+    const run=harness.raw.prepare("SELECT schedule_id FROM schedule_runs WHERE run_id=?").get(runId) as {schedule_id:string};
+    const columns=(harness.raw.prepare("PRAGMA table_info(schedule_revisions)").all() as Array<{name:string}>).map(({name})=>name);
+    harness.raw.prepare(`INSERT INTO schedule_revisions(${columns.join(",")}) SELECT ${columns.map(name=>name==="revision"?"2":name).join(",")}
+      FROM schedule_revisions WHERE schedule_id=? AND revision=1`).run(run.schedule_id);
+    harness.raw.prepare("UPDATE schedules SET revision=2,updated_at='2026-09-05T00:02:00Z' WHERE schedule_id=?").run(run.schedule_id);
+    harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
+    harness.raw.prepare("UPDATE connector_outbox SET status='needs_review',updated_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
     assert.equal(harness.database.humanWaits.listInternal().length,0);
   } finally { harness.close(); }
 });
