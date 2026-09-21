@@ -99,6 +99,27 @@ function fakeRuntime(overrides: Partial<JobAgentRuntime>): JobAgentRuntime {
   };
 }
 
+test("web cancelはprepare完了まで待ち作成済みagentだけを停止する", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "a".repeat(64), objective: "prepare race", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  let releasePrepare!: () => void, releaseWait!: () => void, cancelCalls = 0;
+  const preparing = new Promise<void>(resolve => { releasePrepare = resolve; }), waiting = new Promise<void>(resolve => { releaseWait = resolve; });
+  const runtime = fakeRuntime({
+    async prepare() { await preparing; return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
+    async prompt() { return ok("working"); },
+    async wait() { await waiting; return { ...ok("working"), aborted: true }; },
+    async cancel() { cancelCalls++; releaseWait(); return ok("done"); },
+  });
+  const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined); supervisor.start();
+  await waitFor(() => database.getJob(job.job_id)?.status === "preparing");
+  const cancelled = supervisor.cancelWeb(job.job_id, owner); await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(cancelCalls, 0);
+  releasePrepare(); assert.equal((await cancelled).row.status, "cancelled"); assert.equal(cancelCalls, 1);
+  await supervisor.stop(); database.close();
+});
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });

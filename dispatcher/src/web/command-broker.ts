@@ -16,6 +16,7 @@ const canonical = (value: unknown) => createHash("sha256").update(JSON.stringify
 export interface WebCommandPaths { jobsWorkspaceRoot: string; jobResultsDir: string }
 
 export class WebCommandBroker {
+  private readonly controls = new Map<string, Promise<unknown>>();
   constructor(private readonly auth: WebAuthRepository, private readonly database: DispatcherDatabase,
     private readonly jobs: Pick<JobSupervisor, "cancelWeb" | "wake">, private readonly paths: WebCommandPaths) {}
   async execute(input: WebCommandInput): Promise<WebCommandResult> {
@@ -27,6 +28,9 @@ export class WebCommandBroker {
       if (ingress.kind !== "session_verified") return { status: "denied", reason: "identity_unavailable" };
       const identity: WebCommandIdentity = { instance_id: ingress.principal.instance_id, tenant_id: ingress.principal.tenant_id,
         principal_id: ingress.principal.principal_id };
+      const cancelTarget = /^\/api\/jobs\/([A-Za-z0-9_-]{1,128})\/cancel$/.exec(input.target);
+      if ((input.operation === "submit" && input.target !== "/api/jobs") || (input.operation === "cancel" && !cancelTarget))
+        return { status: "denied", reason: "invalid_request" };
       if (input.operation === "submit") {
         const command = submitBody.parse(parsed);
         const commandWorkspace = command.workspace.kind === "scratch" ? command.workspace
@@ -39,9 +43,10 @@ export class WebCommandBroker {
           job: { job_id: created.row.job_id, status: created.row.status } };
       }
       cancelBody.parse(parsed);
-      const jobId = /^\/api\/jobs\/([A-Za-z0-9_-]{1,128})\/cancel$/.exec(input.target)?.[1];
+      const jobId = cancelTarget?.[1];
       if (!jobId) return { status: "denied", reason: "invalid_request" };
       const receiptId = `web_cancel_${input.idempotency_key}`, payloadHash = canonical({ job_id: jobId });
+      return await this.serialized(receiptId, async () => {
       const receipt = this.database.getWebCommandReceipt(receiptId, identity);
       if (receipt) {
         if (receipt.operation !== "cancel" || receipt.canonical_sha256 !== payloadHash || receipt.job_id !== jobId)
@@ -67,11 +72,19 @@ export class WebCommandBroker {
       const saved = this.database.recordWebCancelReceipt(receiptId, payloadHash, identity, jobId);
       return { status: "succeeded", outcome: result.duplicate ? "already_cancelled" : "cancelled", receipt_id: saved.receipt_id,
         job: { job_id: result.row.job_id, status: result.row.status } };
+      });
     } catch (error) {
       if (error instanceof JobCreationError) return { status: "denied", reason: error.code === "job_group_limit_exceeded" ? "quota_exceeded" : "idempotency_conflict" };
       if (error instanceof z.ZodError || error instanceof SyntaxError || error instanceof TypeError)
         return { status: "denied", reason: "invalid_request" };
       return { status: "denied", reason: "internal_error" };
     }
+  }
+  private serialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.controls.get(key) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    this.controls.set(key, current);
+    void current.finally(() => { if (this.controls.get(key) === current) this.controls.delete(key); }).catch(() => undefined);
+    return current;
   }
 }

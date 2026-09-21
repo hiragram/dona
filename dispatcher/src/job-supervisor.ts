@@ -81,6 +81,7 @@ export interface JobControlResult {
 interface ActiveJob {
   sourceEventId: string;
   operation: Promise<void>;
+  startup: Promise<void>;
 }
 
 interface SupervisorClock {
@@ -221,6 +222,7 @@ export class JobSupervisor {
 
   cancel(jobId: string, sourceEventId: string, reason = "Cancelled by Dona"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
       const before = this.database.getJob(jobId);
       if (!before) throw new Error(`Job ${jobId} was not found`);
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
@@ -250,6 +252,7 @@ export class JobSupervisor {
 
   cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
+      await this.active.get(jobId)?.startup;
       const before = this.database.assertWebJobOwner(jobId, identity);
       if (before.status === "cancelled") return { row: before, duplicate: true };
       const cancelling = this.database.beginWebJobCancellation(jobId, identity);
@@ -465,7 +468,9 @@ export class JobSupervisor {
   }
 
   private launch(row: JobRow): void {
-    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row))
+    let startupReady!: () => void;
+    const startup = row.status === "running" ? Promise.resolve() : new Promise<void>(resolve => { startupReady = resolve; });
+    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row, startupReady))
       .catch((error: unknown) => {
         this.logger.error("Job operation failed unexpectedly", {
           job_id: row.job_id,
@@ -483,10 +488,11 @@ export class JobSupervisor {
         this.active.delete(row.job_id);
         this.wake();
       });
-    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation });
+    this.active.set(row.job_id, { sourceEventId: row.source_event_id, operation, startup });
   }
 
-  private async startJob(row: JobRow): Promise<void> {
+  private async startJob(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     try {
       await fs.access(row.result_path);
       this.database.markJobNeedsReview(row.job_id, "result_path_exists", "A job result file existed before prompt submission");
@@ -555,7 +561,9 @@ export class JobSupervisor {
     this.database.markJobRunning(row.job_id);
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
+    startupReady();
     await this.monitor(running);
+    } finally { startupReady(); }
   }
 
   private async readPromptBaseline(row: JobRow): Promise<HerdrCommandResult | undefined> {

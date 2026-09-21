@@ -29,6 +29,8 @@ test("idempotency keyはcontext key rotationではなくsessionの固定cookie k
   const rotatedContext = { ...f.keys.context(), version: 2, secret: Buffer.alloc(32, 42) };
   assert.notDeepEqual(rotatedContext.secret, f.keys.context().secret);
   assert.equal(deriveWebIdempotencyKey(identity, requestId, f.key("web_cookie_index"), f.initial), first);
+  const retained = { ...f.key("web_cookie_index"), state: "verification_only" as const };
+  assert.equal(deriveWebIdempotencyKey(identity, requestId, retained, "2026-11-01T00:00:01.000Z"), first);
 });
 
 test("command応答はrequest proofへbindしたMACがない限り受理しない", () => {

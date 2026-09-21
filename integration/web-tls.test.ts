@@ -111,8 +111,10 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   const f = await fixture(t, configuredPolicy, repository => new WebCommandBroker(repository, jobs, controls as never, config));
   const policy = f.local.policy;
   const command = new WebCommandClient(f.socket, scope, () => f.credential, f.lookup, f.local.now); let loseResponse = false;
+  let mismatchOperation = false;
   const commandConnection = { execute: async (input: Parameters<WebCommandClient["execute"]>[0]) => {
-    const result = await command.execute(input); if (loseResponse) throw Error("fixture response lost"); return result; } };
+    const result = await command.execute(mismatchOperation && input.operation === "cancel" ? { ...input, operation: "submit" } : input);
+    if (loseResponse) throw Error("fixture response lost"); return result; } };
   const oidc = await loginOidcFixture(policy, f.local.now, f.local.token);
   const listener = new WebLoopbackTlsListener(policy, { connections: { ...f.connections, command: commandConnection, oidc: { ...oidc.connection,
     introspect: f.connections.oidc.introspect.bind(f.connections.oidc) } }, keys: { ...f.local.keys, active: f.local.key },
@@ -147,6 +149,18 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
     config.jobsWorkspaceRoot, config.jobResultsDir);
   const scheduled = await postCancel(slackJob.row.job_id); assert.equal(scheduled.status, 409); assert.deepEqual(JSON.parse(scheduled.body), { error: "scheduled_policy" });
   const missing = await postCancel("job_missing"); assert.equal(missing.status, 404); assert.deepEqual(JSON.parse(missing.body), { error: "not_found" });
+  mismatchOperation = true; const mismatch = await postCancel(first.job.job_id); mismatchOperation = false;
+  assert.equal(mismatch.status, 400); assert.deepEqual(JSON.parse(mismatch.body), { error: "invalid_request" });
+  const raceJobs = [];
+  for (const suffix of ["one", "two"]) {
+    const race = await request(policy, "/api/jobs", "POST", headers, JSON.stringify({ request_id: randomBytes(32).toString("base64url"),
+      objective: "cancel race " + suffix, workspace: { kind: "scratch" } })); raceJobs.push(JSON.parse(race.body).job.job_id as string);
+  }
+  const sharedCancel = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
+  const raced = await Promise.all(raceJobs.map(jobId => request(policy, `/api/jobs/${jobId}/cancel`, "POST", headers, sharedCancel)));
+  assert.deepEqual(raced.map(value => value.status).sort(), [200, 409]);
+  assert.deepEqual(raced.map(value => JSON.parse(value.body).error).filter(Boolean), ["idempotency_conflict"]);
+  assert.equal(raceJobs.filter(jobId => jobs.getJob(jobId)?.status === "cancelled").length, 1);
   const cancelBody = JSON.stringify({ request_id: randomBytes(32).toString("base64url") });
   loseResponse = true; const cancelled = await request(policy, `/api/jobs/${first.job.job_id}/cancel`, "POST", headers, cancelBody);
   assert.equal(cancelled.status, 503, cancelled.body); loseResponse = false;

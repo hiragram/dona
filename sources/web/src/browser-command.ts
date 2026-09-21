@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { z } from "zod";
 import type { ContextIdentity } from "./context.js";
-import type { SessionProtectionKey } from "./session-protection.js";
+import { assertProtectionKey, type SessionProtectionKey } from "./session-protection.js";
 
 const requestId = z.string().length(43).refine(value => /^[A-Za-z0-9_-]+$/.test(value)
   && Buffer.from(value, "base64url").byteLength === 32 && Buffer.from(value, "base64url").toString("base64url") === value);
@@ -19,8 +19,7 @@ export function parseBrowserCommand(routeId: string, bytes: Uint8Array): Browser
 }
 export function deriveWebIdempotencyKey(identity: ContextIdentity, requestIdValue: string, key: SessionProtectionKey, now: string): string {
   requestId.parse(requestIdValue); const at = Date.parse(now);
-  if (key.purpose !== "web_cookie_index" || key.state === "revoked" || key.secret.byteLength !== 32
-    || at < Date.parse(key.activated_at) || at >= Date.parse(key.signing_expires_at)) throw new Error("web_command_unavailable");
+  assertProtectionKey(key, "web_cookie_index", at, false);
   return createHmac("sha256", key.secret).update("dona.web-command.idempotency.v1\0")
     .update(JSON.stringify([identity.instance_id, identity.tenant_id, identity.principal_id, identity.session_ref, requestIdValue])).digest("hex");
 }
