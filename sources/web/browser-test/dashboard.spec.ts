@@ -401,7 +401,7 @@ test("bfcache復帰のsession再確認中は以前のprincipalを表示しない
 test("tabを隠すとprivate表示を消し復帰時にsessionとresourceを再取得する",async({page})=>{
   const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("private draft");const beforeSession=f.sessionReads,beforeList=f.listReads;
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");
-  await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
+  await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("private draft");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
 });
 
 test("初期hidden tabは最初にvisibleになるまでsessionとprivate情報を取得しない",async({page})=>{
@@ -471,7 +471,7 @@ test("window focus復帰だけでもprivate表示を破棄して再検証する"
 
 test("window blur時点でprivate表示を破棄しfocus復帰後に再検証する",async({page})=>{
   const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("別windowへ移る前のdraft");const beforeSession=f.sessionReads,beforeList=f.listReads;await page.evaluate(()=>dispatchEvent(new FocusEvent("blur")));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");expect(f.sessionReads).toBe(beforeSession);
-  await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
+  await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("別windowへ移る前のdraft");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
 });
 
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
