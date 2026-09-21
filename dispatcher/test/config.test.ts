@@ -346,6 +346,8 @@ describe("job resource config", () => {
     assert.equal(defaults.jobPromptTimeoutMs, 30_000);
     assert.equal(defaults.jobPromptReconcileMs, 30_000);
     assert.equal(defaults.jobPromptReconcilePollMs, 5_000);
+    assert.equal(defaults.slackIngressTokenPath,
+      `${os.homedir()}/Library/Application Support/Dona/update-control/slack-ingress.token`);
 
     const configured = loadConfig({
       DONA_JOBS_PER_EVENT_MAX: "32",

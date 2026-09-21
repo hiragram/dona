@@ -319,6 +319,9 @@ export class SlackSocketAdapter {
       return;
     }
     const slackEventId = normalized.envelope.external_event_id;
+    const ingressAttempt = Number.isSafeInteger(envelope.retry_num) && (envelope.retry_num ?? -1) >= 0
+      ? envelope.retry_num! + 1 : 1;
+    normalized.envelope.trace = { ...normalized.envelope.trace, ingress_attempt: ingressAttempt };
     if (normalized.usedReceivedAt) {
       this.logger.warn("Slack event timestamp was invalid; receive time was used", {
         workspace,
@@ -331,7 +334,7 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      response = await this.dispatcher.postEvent(normalized.envelope);
+      response = await this.dispatcher.postEvent(normalized.envelope, ingressAttempt);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,

@@ -30,6 +30,7 @@ export interface DispatcherConfig {
   gitPath: string;
   updaterSocketPath: string;
   updateInternalTokenPath: string;
+  slackIngressTokenPath: string;
   updateNotificationDatabasePath: string;
   jobProgressDatabasePath: string;
   slackAdapterSocketPath: string;
@@ -167,6 +168,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     updateInternalTokenPath: expandHome(
       env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
+    slackIngressTokenPath: expandHome(
+      env.DONA_SLACK_INGRESS_TOKEN_PATH ?? path.join(base, "update-control", "slack-ingress.token"),
     ),
     updateNotificationDatabasePath: expandHome(
       env.DONA_UPDATE_NOTIFICATION_DATABASE_PATH ?? path.join(base, "update-notifications.sqlite3"),

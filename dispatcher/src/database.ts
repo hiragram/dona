@@ -28,6 +28,8 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
+import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, type VerifiedPrincipalBindingRow } from "./principal-binding.js";
+import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
@@ -391,6 +393,7 @@ export class DispatcherDatabase {
       this.db.transaction(() => {
         migrateDispatcherDatabase(this.db, this.migrationHook, true, this.schemaWrite);
         migrateScheduler(this.db, this.migrationHook, true);
+        migrateVerifiedPrincipalBindings(this.db);
       }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
@@ -458,7 +461,7 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueue(envelope: EventEnvelope, at = new Date()): EnqueueResult {
+  enqueue(envelope: EventEnvelope, at = new Date(), verifiedPrincipal?: VerifiedSlackPrincipalProof): EnqueueResult {
     const timestamp = at.toISOString();
     const subjectJson = stableStringify(envelope.subject);
     const payloadJson = stableStringify(envelope.payload);
@@ -479,6 +482,7 @@ export class DispatcherDatabase {
           existing.reply_target_json !== replyTargetJson;
         const binding=legacySlackBinding(existing);
         if(binding) insertEventJobBinding(this.db,existing.event_id,binding);
+        if (verifiedPrincipal) persistVerifiedPrincipalBinding(this.db, existing.event_id, verifiedPrincipal, timestamp);
         return { row: existing, duplicate: true, payloadMismatch: mismatch };
       }
 
@@ -510,8 +514,13 @@ export class DispatcherDatabase {
       if (!row) throw new Error("Inserted event could not be read back");
       const binding=legacySlackBinding(row);
       if(binding) insertEventJobBinding(this.db,row.event_id,binding);
+      if (verifiedPrincipal) persistVerifiedPrincipalBinding(this.db, row.event_id, verifiedPrincipal, timestamp);
       return { row, duplicate: false, payloadMismatch: false };
     })();
+  }
+
+  getVerifiedPrincipalBinding(eventId: string): VerifiedPrincipalBindingRow | undefined {
+    return readVerifiedPrincipalBinding(this.db, eventId);
   }
 
   get(eventId: string): EventRow | undefined {

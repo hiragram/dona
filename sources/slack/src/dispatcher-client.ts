@@ -1,6 +1,8 @@
 import http from "node:http";
 import fs from "node:fs/promises";
 
+import { signSlackPrincipalProof } from "./principal-proof.js";
+
 export interface DispatcherResponse {
   statusCode: number;
   body: string;
@@ -11,14 +13,38 @@ export interface DispatcherClientOptions {
   connectTimeoutMs: number;
   timeoutMs: number;
   internalTokenPath?: string;
+  ingressTokenPath?: string;
 }
 
 export class DispatcherClient {
   constructor(private readonly options: DispatcherClientOptions) {}
 
-  postEvent(envelope: unknown): Promise<DispatcherResponse> {
+  async postEvent(envelope: unknown, attempt = 1): Promise<DispatcherResponse> {
+    const token = await this.readPrivateIngressToken();
+    const signed = signSlackPrincipalProof(envelope as Record<string, unknown>, attempt, token);
     const body = Buffer.from(JSON.stringify(envelope));
-    return this.request("POST", "/v1/events", body);
+    return this.request("POST", "/v1/events", body, undefined, {
+      "x-dona-slack-principal-proof": signed.proof,
+      "x-dona-slack-principal-signature": signed.signature,
+    });
+  }
+
+  private async readPrivateIngressToken(): Promise<string> {
+    const tokenPath = this.options.ingressTokenPath;
+    if (!tokenPath) throw new Error("Slack principal proof key is unavailable");
+    try {
+      const stats = await fs.lstat(tokenPath);
+      const uid = process.getuid?.();
+      if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+        throw new Error("Slack principal proof key is unavailable");
+      }
+      const token = (await fs.readFile(tokenPath, "utf8")).trim();
+      if (token.length < 32) throw new Error("Slack principal proof key is unavailable");
+      return token;
+    } catch (error) {
+      if (error instanceof Error && error.message === "Slack principal proof key is unavailable") throw error;
+      throw new Error("Slack principal proof key is unavailable");
+    }
   }
 
   healthReady(): Promise<boolean> {
@@ -41,7 +67,7 @@ export class DispatcherClient {
     }
   }
 
-  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string): Promise<DispatcherResponse> {
+  private request(method: "GET" | "POST", path: string, body?: Buffer, internalToken?: string, extraHeaders: Record<string, string> = {}): Promise<DispatcherResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer: NodeJS.Timeout | undefined;
@@ -66,6 +92,7 @@ export class DispatcherClient {
                 "content-length": body.length,
               } : {}),
             ...(internalToken ? { "x-dona-update-token":internalToken } : {}),
+            ...extraHeaders,
           },
         },
         (response) => {

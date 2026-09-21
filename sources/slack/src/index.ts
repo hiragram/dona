@@ -40,6 +40,7 @@ async function main(): Promise<void> {
     connectTimeoutMs: config.dispatcherConnectTimeoutMs,
     timeoutMs: config.dispatcherTimeoutMs,
     internalTokenPath: config.updateInternalTokenPath,
+    ingressTokenPath: config.slackIngressTokenPath,
   });
   const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
   const updateNotifications = new SlackUpdateNotificationReporter(registry);
