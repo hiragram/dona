@@ -256,6 +256,22 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasWorkerMessages = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get() !== undefined;
+    if (hasWorkerMessages) {
+      migrateWorkerMessaging(db);
+      db.exec(`
+        CREATE TEMP TABLE preserved_worker_messages_v3 AS SELECT * FROM worker_messages;
+        CREATE TEMP TABLE preserved_worker_message_deliveries_v3 AS SELECT * FROM worker_message_deliveries;
+        CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
+        CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
+        CREATE TEMP TABLE preserved_worker_message_workspace_cadence_v3 AS SELECT * FROM worker_message_workspace_cadence;
+        DROP TABLE worker_message_receipts;
+        DROP TABLE worker_message_deliveries;
+        DROP TABLE worker_message_cadence;
+        DROP TABLE worker_messages;
+        DROP TABLE worker_message_workspace_cadence;
+      `);
+    }
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -315,6 +331,21 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
       ${jobsRunnableFairIndexSql};
     `);
+    if (hasWorkerMessages) {
+      migrateWorkerMessaging(db);
+      db.exec(`
+        INSERT INTO worker_messages SELECT * FROM preserved_worker_messages_v3;
+        INSERT INTO worker_message_deliveries SELECT * FROM preserved_worker_message_deliveries_v3;
+        INSERT INTO worker_message_receipts SELECT * FROM preserved_worker_message_receipts_v3;
+        INSERT INTO worker_message_cadence SELECT * FROM preserved_worker_message_cadence_v3;
+        INSERT INTO worker_message_workspace_cadence SELECT * FROM preserved_worker_message_workspace_cadence_v3;
+        DROP TABLE preserved_worker_messages_v3;
+        DROP TABLE preserved_worker_message_deliveries_v3;
+        DROP TABLE preserved_worker_message_receipts_v3;
+        DROP TABLE preserved_worker_message_cadence_v3;
+        DROP TABLE preserved_worker_message_workspace_cadence_v3;
+      `);
+    }
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");

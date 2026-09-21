@@ -6,10 +6,10 @@ import { afterEach, describe, test } from "node:test";
 import Database from "better-sqlite3";
 
 import { DispatcherApi } from "../src/api.js";
-import { DispatcherDatabase } from "../src/database.js";
+import { DispatcherDatabase, migrateDispatcherDatabase } from "../src/database.js";
 import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
-import { envelopeFromRow } from "../src/prompt.js";
+import { buildEventPrompt, envelopeFromRow } from "../src/prompt.js";
 import { WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
@@ -183,6 +183,32 @@ describe("worker messaging ledger",()=>{
   });
 });
 
+test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
+  const {root,config}=await tempConfig(); roots.push(root);
+  const v2=new Database(config.databasePath);
+  v2.pragma("foreign_keys = ON");
+  migrateDispatcherDatabase(v2,()=>{},false,2);
+  v2.close();
+  const bridge=new DispatcherDatabase(config.databasePath);
+  const source=bridge.enqueue(eventEnvelope("Ev-worker-message-v2-preservation")).row;
+  const job=bridge.createJob({source_event_id:source.event_id,objective:"worker message",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const created=bridge.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+  bridge.close();
+
+  const activation=new Database(config.databasePath);
+  activation.pragma("foreign_keys = ON");
+  migrateDispatcherDatabase(activation,()=>{},false,3);
+  assert.deepEqual(activation.pragma("foreign_key_check"),[]);
+  activation.close();
+
+  const reopened=new DispatcherDatabase(config.databasePath);
+  try {
+    const reconciled=reopened.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1");
+    assert.equal(reconciled.reconciliation,"matched");
+    assert.equal((reconciled as {message:{message_id:string}}).message.message_id,created.message.message_id);
+  } finally {reopened.close();}
+});
+
 function request(socketPath:string,method:string,route:string,body?:unknown) {
   const encoded=body===undefined?undefined:Buffer.from(JSON.stringify(body));
   return new Promise<{status:number;body:Record<string,unknown>}>((resolve,reject)=>{
@@ -202,6 +228,10 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     const internal=database.getByExternalId("dona_message",`worker-message:${messageId}`);
     assert.ok(internal); assert.equal(internal.event_type,"worker_message_report");
     assert.equal(envelopeFromRow(internal).source,"dona_message");
+    const prompt=buildEventPrompt(internal.event_id,"/tmp/result.json",envelopeFromRow(internal));
+    assert.match(prompt,/通常Slack messageの宛先判定を適用せず必ず処理対象/);
+    assert.match(prompt,/get_worker_messageへsource_event_idとして現在のevent_id/);
+    assert.match(prompt,/questionまたはdecision_request.*suspended/);
     const sqlite=new Database(config.databasePath);
     assert.deepEqual(readEventJobBinding(sqlite,internal.event_id)?.owner,readEventJobBinding(sqlite,source.event_id)?.owner);
     sqlite.close();
