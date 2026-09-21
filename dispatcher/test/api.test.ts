@@ -372,6 +372,7 @@ describe("DispatcherApi", () => {
       job_key: "response.lost",
       objective: "recover through read-only lookup",
       workspace: { kind: "scratch" },
+      display: { short_name: "応答喪失の表示" },
     };
     await requestAndDropResponseBody(config.socketPath, "/v1/jobs", createBody);
     const persisted = database.listEventJobs(sourceEventId, "response.lost");
@@ -388,6 +389,10 @@ describe("DispatcherApi", () => {
     assert.equal(reconciled.status, 200);
     assert.equal(reconciled.body.reconciliation, "matched");
     assert.equal((reconciled.body.jobs as Array<Record<string, unknown>>)[0]?.job_id, persisted[0]?.job_id);
+    assert.equal(
+      canonicalJobPayloadSha256(parseCreateJobRequest(createBody)),
+      canonicalJobPayloadSha256(parseCreateJobRequest({ ...createBody, display: undefined })),
+    );
     const conflict = await request(
       config.socketPath,
       "GET",

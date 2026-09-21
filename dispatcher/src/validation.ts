@@ -257,7 +257,6 @@ export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayl
   return {
     objective: request.objective,
     workspace: request.workspace,
-    ...(request.display ? { display: request.display } : {}),
   };
 }
 

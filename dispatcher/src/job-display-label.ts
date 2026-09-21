@@ -6,7 +6,7 @@ export const jobDisplayMetadataKey = "__dona_job_display";
 const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const unsafeFormatting = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const urlLike = /(?:\b[A-Za-z][A-Za-z0-9+.-]*:\/\/|\bwww\.)/u;
-const privatePathLike = /(?:^|[\s('"`])(?:~[\\/]|\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\|\/)[^\s'"`]+/u;
+const privatePathLike = /(?:^|[^A-Za-z0-9._~-])(?:~[\\/]|\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\|\/)[^\s'"`]+/u;
 const secretLike = /\b(?:bearer|token|password|passwd|secret|api[ _-]?key|authorization)\b\s*(?:[:=]|\S{12,})?/iu;
 const credentialLike = /(?:\bgh[pousr]_[A-Za-z0-9]{12,}|\bgithub_pat_[A-Za-z0-9_]{12,}|\bxox[baprs]-[A-Za-z0-9-]{12,}|\bsk-[A-Za-z0-9][A-Za-z0-9_-]{11,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)/u;
 

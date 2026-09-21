@@ -65,7 +65,6 @@ export interface CreateJobRequest {
 export interface CanonicalJobPayload {
   objective: string;
   workspace: JobWorkspace;
-  display?: JobDisplay;
 }
 
 
