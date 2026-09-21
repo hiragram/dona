@@ -23,9 +23,11 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "delegateScheduledWork", args: [eventId] });
         return { schema_version: 1, outcome: "created", job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
       },
-      async getJob(jobId, sourceEventId) {
-        calls.push({ method: "getJob", args: [jobId, sourceEventId] });
-        return { schema_version: 1, job: { job_id: jobId, status: "running", notification_state:"needs_review", notification_authorization_phase:"preflight" } };
+      async getJob(jobId, sourceEventId, options) {
+        calls.push({ method: "getJob", args: options===undefined?[jobId, sourceEventId]:[jobId,sourceEventId,options] });
+        return { schema_version: 1, job: { job_id: jobId, status: "running", notification_state:"needs_review", notification_authorization_phase:"preflight" },
+          ...(options?.includeLiveSession?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:"lsr_0123456789abcdef0123456789abcdef"}}:{}),
+          ...(options?.liveSessionReceiptId?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:options.liveSessionReceiptId}}:{}) };
       },
       async listEventJobs(...args) {
         calls.push({ method: "listEventJobs", args });
@@ -104,7 +106,8 @@ describe("Dona Dispatcher MCP server", () => {
         "cancel_schedule",
         "get_schedule_history",
       ]);
-      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.readOnlyHint, false);
+      assert.equal(listed.tools.find(({ name }) => name === "get_job_status")?.annotations?.idempotentHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "apply_self_update")?.annotations?.destructiveHint, true);
@@ -159,6 +162,13 @@ describe("Dona Dispatcher MCP server", () => {
         method: "getJob",
         args: ["job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV"],
       });
+      const liveStatus=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",include_live_session:true}});
+      assert.equal((liveStatus.structuredContent as {live_session:{identity_match:boolean}}).live_session.identity_match,true);
+      assert.deepEqual(calls[3],{method:"getJob",args:["job_01m1es03xy5cf8d9pm5cwx4srv","evt_01M1ES03XY5CF8D9PM5CWX4SRV",{includeLiveSession:true}]});
+      const receiptStatus=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",live_session_receipt_id:"lsr_0123456789abcdef0123456789abcdef"}});
+      assert.equal((receiptStatus.structuredContent as {receipt:{receipt_id:string}}).receipt.receipt_id,"lsr_0123456789abcdef0123456789abcdef");
+      const beforeConflict=calls.length;const conflict=await client.callTool({name:"get_job_status",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",include_live_session:true,live_session_receipt_id:"lsr_0123456789abcdef0123456789abcdef"}});
+      assert.equal(conflict.isError,true);assert.equal(calls.length,beforeConflict);
       const preview = await client.callTool({ name: "preview_schedule", arguments: {
         source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
         definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },

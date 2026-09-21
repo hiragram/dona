@@ -188,7 +188,8 @@ if (args.includes("pane") && args.includes("run")) {
 }
 if (args.includes("agent") && args.includes("start")) {
   fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
-  process.stdout.write(JSON.stringify({ result: { agent: { agent_status: "idle" } } }));
+  const agentName=args[args.indexOf("start")+1];
+  process.stdout.write(JSON.stringify({ result: { agent: { agent_name:agentName,workspace_id:"w1",pane_id:"w1:p1",agent_session:{kind:"id",value:"session-1"},agent_status: "idle" } } }));
   process.exit(0);
 }
 process.stderr.write(JSON.stringify({ error: { code: "unexpected", message: args.join(" ") } }));
@@ -204,7 +205,7 @@ process.exit(1);
     ).row;
 
     const prepared = await new HerdrJobAgentRuntime(config).prepare(job);
-    assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1" });
+    assert.deepEqual(prepared, { herdrWorkspaceId: "w1", herdrPaneId: "w1:p1",herdrAgentSessionId:"session-1" });
     const captured = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
     assert.deepEqual(captured, [
       "--session", config.herdrSession,

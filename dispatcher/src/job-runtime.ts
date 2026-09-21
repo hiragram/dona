@@ -13,6 +13,7 @@ import { jobWorkspaceLabel } from "./job-display-label.js";
 export interface PreparedJobRuntime {
   herdrWorkspaceId: string;
   herdrPaneId: string;
+  herdrAgentSessionId?: string;
 }
 
 export class PreparedWorkspaceCleanupError extends Error {
@@ -80,6 +81,15 @@ function parseJson(value: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+function agentSessionIdFromIdentity(identity: string | undefined, workspaceId: string, paneId: string, agentName: string): string | undefined {
+  if (!identity) return undefined;
+  try {
+    const tuple=JSON.parse(identity) as unknown;
+    if(!Array.isArray(tuple)||tuple.length!==4||tuple[0]!==workspaceId||tuple[1]!==paneId||tuple[2]!==agentName||typeof tuple[3]!=="string"||tuple[3].length<1||tuple[3].length>512)return undefined;
+    return tuple[3];
+  } catch { return undefined; }
 }
 
 function findValue(input: unknown, keys: readonly string[]): unknown {
@@ -340,7 +350,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const workspaceId = findValue(parsed, ["workspace_id"]);
       const paneId = findValue(parsed, ["pane_id"]);
       if (workspaceId !== undefined && paneId !== undefined) {
-        return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
+        const herdrWorkspaceId=String(workspaceId),herdrPaneId=String(paneId);
+        const herdrAgentSessionId=agentSessionIdFromIdentity(existingAgent.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+        return { herdrWorkspaceId, herdrPaneId, ...(herdrAgentSessionId?{herdrAgentSessionId}:{}) };
       }
     }
 
@@ -387,7 +399,9 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       if(workspace.kind==="scratch")await fs.rm(row.workspace_path,{recursive:true,force:true});
       throw commandError("Herdr agent start failed", started!);
     }
-    return { herdrWorkspaceId: String(workspaceId), herdrPaneId: String(paneId) };
+    const herdrWorkspaceId=String(workspaceId),herdrPaneId=String(paneId);
+    const herdrAgentSessionId=agentSessionIdFromIdentity(started.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+    return { herdrWorkspaceId, herdrPaneId, ...(herdrAgentSessionId?{herdrAgentSessionId}:{}) };
   }
 
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {

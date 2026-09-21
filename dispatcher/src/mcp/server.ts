@@ -14,7 +14,7 @@ import {
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
-  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>>;
+  getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
     jobKey?: string,
@@ -41,6 +41,7 @@ export interface DispatcherJobClient {
 
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i).describe("現在処理中のDona event_id");
 const jobId = z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/).describe("delegate_jobが返したjob_id");
+const liveSessionReceiptId=z.string().regex(/^lsr_[0-9a-f]{32}$/);
 const slackId = z.string().min(1).max(64);
 const threadTs = z.string().regex(/^\d+\.\d+$/);
 const repository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/);
@@ -126,6 +127,9 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
     ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.truncated === true || response.jobs.length > 100 } : {}),
+    ...(response.live_session&&typeof response.live_session==="object"&&!Array.isArray(response.live_session)?{live_session:response.live_session}:{}),
+    ...(response.reconciliation&&typeof response.reconciliation==="object"&&!Array.isArray(response.reconciliation)?{reconciliation:response.reconciliation}:{}),
+    ...(response.receipt&&typeof response.receipt==="object"&&!Array.isArray(response.receipt)?{receipt:response.receipt}:{}),
   };
 }
 
@@ -298,12 +302,17 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。group通知では現在の通知event_idを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
-    inputSchema: { job_id: jobId, source_event_id: eventId },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ job_id, source_event_id }) => {
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    inputSchema: { job_id: jobId, source_event_id: eventId,
+      include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
+      live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, async ({ job_id, source_event_id, include_live_session, live_session_receipt_id }) => {
     try {
-      return success(projectJobResponse(await client.getJob(job_id, source_event_id), true));
+      if(include_live_session===true&&live_session_receipt_id)throw new Error("include_live_session and live_session_receipt_id are mutually exclusive");
+      const options=include_live_session===true||live_session_receipt_id?{includeLiveSession:include_live_session===true,
+        ...(live_session_receipt_id?{liveSessionReceiptId:live_session_receipt_id}:{})}:undefined;
+      return success(projectJobResponse(await client.getJob(job_id, source_event_id,options), true));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }

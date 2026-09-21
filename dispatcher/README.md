@@ -94,7 +94,7 @@ schedule操作は、呼出し元が指定したworkspace・actor・返信先を�
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
 - `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合。元の`objective`とworkspaceも渡すとcanonical payloadの`matched` / `conflict`を判定
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
-- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。 状態と結果を取得
+- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。状態と結果を取得。`include_live_session: true`で保存済みexact identityだけをboundedに観測し、`live_session_receipt_id`で既存receiptを再読
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
 - `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
@@ -107,6 +107,8 @@ schedule操作は、呼出し元が指定したworkspace・actor・返信先を�
 - `get_schedule_history`: bounded paginationのrun履歴（本文・secretは非投影）
 
 対応UDS routeは`POST /v1/schedules/preview`、`POST|GET /v1/schedules`、`GET|PATCH /v1/schedules/:id`、`POST /v1/schedules/:id/{pause,resume,cancel}`、`GET /v1/schedules/:id/runs`です。due scan、Slack投稿、background job実行、自然言語日時解析はこのsurfaceの責務外です。
+
+live session観測は既定offです。`GET /v1/jobs/:job_id?source_event_id=...&include_live_session=true`は保存済みworkspace、pane、agent名、Herdr agent session IDの完全一致だけを照合し、実行するHerdr操作は`agent get`に限定します。prompt、Enter、start、wait、steer、cancel、job state更新、Result生成、自動復活は行いません。結果はraw identity、stdout/stderr、objective、pathを除いたsnapshotとopaque receiptです。`GET /v1/jobs/:job_id/live-session-receipts/:receipt_id?source_event_id=...`は新しいHerdr queryを行わず、再起動後も同じreceiptを再読します。状態行列、retention、migration/rollback、運用判断は[live session照合runbook](../docs/operations/live-session-reconciliation.md)を参照してください。
 
 `apply_self_update`のacceptedはupdater DB commit後だけ返ります。元のSlack受付eventが`completed`になる前にupdaterはactivationをclaimしません。timeoutや接続切断でapply/cancelのacceptanceが不明な場合は、同じwriteを再送せずstatusを確認します。
 
@@ -196,6 +198,10 @@ npm exec -- tsx src/cli.ts event retry evt_... --force
 npm exec -- tsx src/cli.ts job list
 npm exec -- tsx src/cli.ts job list --status running
 npm exec -- tsx src/cli.ts job show job_...
+npm exec -- tsx src/cli.ts job show job_... --live-session
+npm exec -- tsx src/cli.ts job show job_... --live-session-receipt lsr_...
+npm exec -- tsx src/cli.ts job live-session-retention
+npm exec -- tsx src/cli.ts job live-session-retention --apply --force
 ```
 
 `blocked`または`needs_review`のretryには`--force`が必要です。Herdr画面、結果ファイル、構造化ログを確認し、二重実行の可能性を理解した場合だけ実行してください。

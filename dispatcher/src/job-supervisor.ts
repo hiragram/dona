@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
@@ -10,6 +11,7 @@ import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
 import type { JobProgressCoordinator } from "./job-progress.js";
+import { buildLiveSessionReceipt, expectedLiveSessionIdentity, type LiveSessionReceiptProjection } from "./live-session.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -93,6 +95,7 @@ const systemClock: SupervisorClock = {
 };
 
 export class JobSupervisor {
+  private readonly liveSessionBootId=`boot_${randomUUID().replaceAll("-","")}`;
   private readonly wakeSignal = new WakeSignal();
   private readonly abortController = new AbortController();
   private readonly active = new Map<string, ActiveJob>();
@@ -123,6 +126,39 @@ export class JobSupervisor {
 
   isRunning(): boolean {
     return this.running && !this.stopping;
+  }
+
+  async observeLiveSession(jobId:string,sourceEventId?:string):Promise<LiveSessionReceiptProjection> {
+    const before=this.database.getJob(jobId);
+    if(!before)throw new Error(`Job ${jobId} was not found`);
+    const startedAt=new Date().toISOString();
+    const storedIdentity=this.database.getJobLiveSessionIdentity(jobId);
+    const expectedIdentity=expectedLiveSessionIdentity(before,storedIdentity);
+    let result:HerdrCommandResult|undefined;
+    if(expectedIdentity){
+      try { result=await this.runtime.get(before.agent_name,this.abortController.signal,this.config.jobCommandTimeoutMs); }
+      catch { result={ok:false,stdout:"",stderr:"",exitCode:null,timedOut:false,aborted:false,errorCode:"transport_unavailable"}; }
+    }
+    const after=this.database.getJob(jobId);
+    if(!after)throw new Error(`Job ${jobId} disappeared during live observation`);
+    const storedIdentityAfter=this.database.getJobLiveSessionIdentity(jobId);
+    const identityGenerationKey=(identity:typeof storedIdentity):string=>JSON.stringify(identity?[identity.job_id,identity.identity_version,
+      identity.herdr_agent_session_id,identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name,identity.recorded_at]:null);
+    const identityGenerationChanged=identityGenerationKey(storedIdentityAfter)!==identityGenerationKey(storedIdentity)
+      || expectedLiveSessionIdentity(after,storedIdentityAfter)!==expectedIdentity;
+    const completedAt=new Date().toISOString();
+    const previousStateChangeSeq=storedIdentity&&!identityGenerationChanged
+      ? this.database.latestLiveSessionStateChangeSeq(jobId,storedIdentity)
+      : undefined;
+    const receipt=buildLiveSessionReceipt({before,after,bootId:this.liveSessionBootId,startedAt,completedAt,
+      ...(sourceEventId?{sourceEventId}:{}),...(expectedIdentity?{expectedIdentity}:{}),
+      ...(identityGenerationChanged?{identityGenerationChanged:true}:{}),
+      ...(previousStateChangeSeq===undefined?{}:{previousStateChangeSeq}),...(result?{result}:{})});
+    return this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt,identityGenerationChanged?undefined:storedIdentity);
+  }
+
+  getLiveSessionReceipt(jobId:string,receiptId:string):LiveSessionReceiptProjection|undefined {
+    return this.database.getLiveSessionReceipt(jobId,receiptId);
   }
 
   start(): void {
@@ -642,7 +678,7 @@ export class JobSupervisor {
       this.logTransition(preparing, updated);
       return;
     }
-    this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId);
+    this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId, prepared.herdrAgentSessionId);
     if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     const promptBaseline = await this.readPromptBaseline(preparing);
     if (this.stopping) return;

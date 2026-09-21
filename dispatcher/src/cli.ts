@@ -6,6 +6,19 @@ import { DispatcherDatabase } from "./database.js";
 import { eventStatuses, jobStatuses, type EventStatus, type JobStatus } from "./types.js";
 import { runService } from "./service.js";
 import { SlackAdapterJobNotificationVerifier } from "./job-notification-verifier.js";
+import { HerdrJobAgentRuntime } from "./job-runtime.js";
+import { JobSupervisor } from "./job-supervisor.js";
+import { createLogger } from "./logger.js";
+import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
+
+function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
+  const safeKeys = [
+    "job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at",
+    "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state",
+    "completion_event_id",
+  ];
+  return Object.fromEntries(safeKeys.filter((key) => key in row).map((key) => [key, row[key]]));
+}
 
 function usage(): never {
   console.error(`Usage:
@@ -18,7 +31,8 @@ function usage(): never {
   dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
-  dona-dispatcher job show <job_id>
+  dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
+  dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
@@ -75,8 +89,27 @@ async function main(): Promise<void> {
         const jobId = eventIdAt(args, 2);
         const row = database.getJob(jobId);
         if (!row) throw new Error(`Job ${jobId} was not found`);
+        const receiptAt=args.indexOf("--live-session-receipt");
+        if(args.includes("--live-session")&&receiptAt>=0)usage();
+        if(receiptAt>=0){const receiptId=args[receiptAt+1];if(!receiptId)usage();const receipt=database.getLiveSessionReceipt(jobId,receiptId);
+          if(!receipt)throw new Error("Live session receipt was not found");console.log(JSON.stringify({schema_version:1,job:projectLiveJob(row as unknown as Record<string,unknown>),live_session:receipt.live_session,
+            reconciliation:receipt.reconciliation,receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
+              durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
+              result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}},null,2));return;}
+        if(args.includes("--live-session")){const supervisor=new JobSupervisor(database,new HerdrJobAgentRuntime(config,false),config,createLogger("dispatcher_cli"),()=>{});
+          const receipt=await supervisor.observeLiveSession(jobId);const refreshed=database.getJob(jobId);if(!refreshed)throw new Error(`Job ${jobId} disappeared during live observation`);console.log(JSON.stringify({schema_version:1,job:projectLiveJob(refreshed as unknown as Record<string,unknown>),live_session:receipt.live_session,
+            reconciliation:receipt.reconciliation,receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
+              durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
+              result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}},null,2));return;}
         console.log(JSON.stringify(row, null, 2));
         return;
+      }
+      if(command==="live-session-retention"){
+        const cutoff=new Date(Date.now()-liveSessionReceiptRetentionSeconds*1000).toISOString();
+        const plan=database.liveSessionRetentionPlan(cutoff);
+        if(!args.includes("--apply")){console.log(JSON.stringify({dry_run:true,cutoff,...plan},null,2));return;}
+        if(!args.includes("--force"))throw new Error("live session retention apply requires --force; run without --apply for dry-run");
+        console.log(JSON.stringify({dry_run:false,cutoff,...database.purgeLiveSessionReceipts(cutoff)},null,2));return;
       }
       if(command==="reconcile-run") {
         const runId=eventIdAt(args,2),outcome=args[3];if(outcome!=="failed"&&outcome!=="cancelled")usage();
