@@ -342,6 +342,18 @@ describe("DispatcherDatabase", () => {
     v3.close();
   });
 
+  test("未知のweb projection schemaではv2 jobs rebuild前にfail closedする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root); await createSchemaV2Fixture(config.databasePath);
+    const v2 = new DispatcherDatabase(config.databasePath);
+    v2.listWebJobs({ instance_id:"instance",tenant_id:"T_TEST",principal_id:"U-1",authorization_kind:"own" },20);
+    v2.close();
+    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=3").run();
+    const before = fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get();
+    assert.throws(() => migrateDispatcherDatabase(fixture,()=>{},false,3),/schema_unsupported/);
+    assert.deepEqual(fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get(),before);
+    assert.equal(fixture.pragma("user_version",{simple:true}),2); fixture.close();
+  });
+
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
       const { root, config } = await tempConfig();

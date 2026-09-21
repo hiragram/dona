@@ -167,7 +167,16 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
     WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
 `);}
+function assertSupportedWebJobProjectionSchema(db: Database.Database): void {
+  const schemaExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_job_projection_schema'").get();
+  if (schemaExists) {
+    const versions = db.prepare("SELECT version FROM web_job_projection_schema").all() as Array<{ version: number }>;
+    if (versions.length !== 1 || versions[0]!.version > 2) throw new Error("web_job_projection_schema_unsupported");
+  }
+}
+
 function ensureWebJobProjectionSchema(db: Database.Database): void {
+  assertSupportedWebJobProjectionSchema(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS web_job_projection_events (
       sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -319,6 +328,7 @@ export function migrateDispatcherDatabase(
       `Database schema version ${version} is newer than supported version ${dispatcherSchemaCompatibility.read_max}`,
     );
   }
+  assertSupportedWebJobProjectionSchema(db);
   if (version < 1) db.exec(`
     CREATE TABLE events (
       sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1062,10 +1072,11 @@ export class DispatcherDatabase {
     })();
   }
 
-  recordWebJobProgress(jobId: string, sequence: number, updatedAt: string): boolean {
+  recordWebJobProgress(jobId: string, sequence: number, updatedAt: string, receivedAt = new Date()): boolean {
     this.ensureWebJobProjectionReady();
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId) || !Number.isSafeInteger(sequence) || sequence < 0
-      || !Number.isFinite(Date.parse(updatedAt)) || new Date(updatedAt).toISOString() !== updatedAt) throw new Error("web_job_progress_invalid");
+      || !Number.isFinite(Date.parse(updatedAt)) || new Date(updatedAt).toISOString() !== updatedAt
+      || !Number.isFinite(receivedAt.getTime())) throw new Error("web_job_progress_invalid");
     return this.db.transaction(() => {
       const existing = this.db.prepare("SELECT sequence FROM web_job_progress_versions WHERE job_id=?")
         .get(jobId) as { sequence: number } | undefined;
@@ -1074,7 +1085,7 @@ export class DispatcherDatabase {
         ON CONFLICT(job_id) DO UPDATE SET sequence=excluded.sequence,updated_at=excluded.updated_at
         WHERE excluded.sequence>web_job_progress_versions.sequence`).run(jobId, sequence, updatedAt);
       this.db.prepare("INSERT INTO web_job_projection_events(job_id,event_kind,created_at) VALUES(?,'progress',?)")
-        .run(jobId, updatedAt);
+        .run(jobId, receivedAt.toISOString());
       return true;
     })();
   }

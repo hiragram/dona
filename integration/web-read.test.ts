@@ -44,6 +44,14 @@ test("TLSからprincipal-scoped snapshotとSSE再接続へ収束しprivate field
   const next=/^id: ([A-Za-z0-9_-]{43})$/m.exec(events.body)?.[1];assert.ok(next);
   const replay=await request(policy,`/api/jobs/${owned}/events`,"GET",{...headers,"last-event-id":next!});assert.match(replay.body,/event: heartbeat/);
   const hidden=await request(policy,"/api/jobs/job_foreign","GET",headers);assert.equal(hidden.status,404);assert.deepEqual(JSON.parse(hidden.body),{error:"not_found"});
+  const audited=(f.db.prepare("SELECT record_json FROM security_audit_records ORDER BY sequence").all() as Array<{record_json:string}>)
+    .map(row=>(JSON.parse(row.record_json) as {event:{operation:string;resource_id:string;outcome:string;reason:string}}).event)
+    .filter(event=>["web.job_list.v1","web.job_read.v1","web.sse_subscribe.v1"].includes(event.operation));
+  assert.deepEqual(audited.map(event=>[event.operation,event.resource_id,event.outcome,event.reason]),[
+    ["web.job_list.v1","web_jobs","succeeded","none"],["web.job_read.v1",owned,"succeeded","none"],
+    ["web.sse_subscribe.v1",owned,"succeeded","none"],["web.sse_subscribe.v1",owned,"succeeded","none"],
+    ["web.job_read.v1","job_foreign","denied","resource_not_visible"],
+  ]);
   const artifacts=Array.from({length:32},(_,index)=>({name:`${"report".repeat(18)}-${index}`,kind:"report",media_type:`application/${"x".repeat(116)}`,size_bytes:index}));
   for(let index=0;index<49;index++){const id=seed("principal",`job_large_${index}`,`2026-09-19T00:${String(index+1).padStart(2,"0")}:00.000Z`);
     raw.prepare("UPDATE jobs SET status='completed',completed_at=?,result_json=?,updated_at=? WHERE job_id=?").run("2026-09-19T01:00:00.000Z",

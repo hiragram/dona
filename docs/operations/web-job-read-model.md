@@ -15,7 +15,7 @@ Web job read modelは、認証済みBFFがDispatcherのprincipal-scoped UDSを�
 
 ## durable cursorとSSE
 
-`web_job_projection_events`はjob INSERTと、status・公開時刻が変わるUPDATEを同じSQLite transactionのtriggerでmonotonic sequenceへ記録する。通常のjob遷移では`updated_at`を既存値より必ず進めるため、wall clockが同一millisecondでも公開projectionの変更を欠落させない。非公開Result本文や内部errorだけの変更はevent有無のside channelへしない。progressは既存のdurable progress storeのsequenceを`web_job_progress_versions`へ単調にreconcileし、再起動後もcurrent snapshotへ収束できる。cursorはrandom 256-bit tokenのdigestだけをDBへ保存する。
+`web_job_projection_events`はjob INSERTと、status・公開時刻が変わるUPDATEを同じSQLite transactionのtriggerでmonotonic sequenceへ記録する。通常のjob遷移では`updated_at`を既存値より必ず進めるため、wall clockが同一millisecondでも公開projectionの変更を欠落させない。非公開Result本文や内部errorだけの変更はevent有無のside channelへしない。progressは既存のdurable progress storeのsequenceを`web_job_progress_versions`へ単調にreconcileし、再起動後もcurrent snapshotへ収束できる。worker由来のprogress時刻は表示用に限り、event retention時刻にはDispatcherが認証transactionで確定した受信時刻を使う。cursorはrandom 256-bit tokenのdigestだけをDBへ保存する。
 
 `GET /api/jobs/:id/events`はboundedなone-shot SSE responseを返して接続を閉じる。変更があれば`event: job`、なければ`event: heartbeat`、retention gapなら`event: reset`を返し、各responseのopaque `id`を次の`Last-Event-ID`に使う。同じcursorの再送は同じ範囲を安全に再読できるため、応答喪失、disconnect、duplicate deliveryでmemory-only stateを正本にしない。Web process restart後もcursorとevent ledgerはDispatcher DBから復元される。
 
@@ -25,7 +25,8 @@ one-shotかつbody上限付きなので、slow consumerはTLS listenerの既存�
 
 - event ledgerの削除は`pruneWebJobProjection`で時刻境界を明示して行う。存在するWeb jobはlist cursor用の最初のanchorだけを保持し、削除済みjobのanchor/tombstoneはwatermark更新後に削除する。cursor期限切れはmaintenanceに加え、新しいcursorを発行する通常runtime経路でもexpiry indexから固定上限ずつ回収する。
 - cursorが保持するsequenceより古いeventがretentionで失われた場合は、欠落を成功扱いせず`reset_required`を返す。clientは完全snapshotを再取得し、新しいdetail cursorから再開する。
-- Dispatcher UDS、署名response、current access確認、DB queryのいずれかが失敗した場合、BFFはstale cacheや旧APIへfallbackせず`identity_unavailable`にする。
+- Dispatcher UDS、署名response、current access確認、DB query、最終auditのいずれかが失敗した場合、BFFはstale cacheや旧APIへfallbackせず`identity_unavailable`にする。list/detail/SSEはsession auditに加えて専用operationでsuccess・resource不可視・cursor拒否・内部失敗の最終outcomeを記録し、応答直前にもcurrent session revisionを再照合する。
+- grant・cursorの期限判定とprogressの受信時刻にはsession ingressが確定したrollback-protectedな`effective_utc`を使い、OS wall clock巻戻りで失効済みauthorityを復活させない。未知のprojection schema versionはtriggerや`jobs` tableへDDLを行う前に拒否する。
 - event件数、cursor件数、最古event時刻、reset発生数を運用metric候補とする。private identity、job本文、Result summary、cursor token自体はlog/metricへ出さない。
 
 ## 検証
