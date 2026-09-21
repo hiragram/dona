@@ -56,6 +56,7 @@ export interface SlackChannel {
   isArchived: boolean;
   isMember: boolean;
   isShared: boolean;
+  visibilityKnown?: boolean;
   topic?: string;
   purpose?: string;
   memberCount?: number;
@@ -71,6 +72,8 @@ export interface SlackChannelPage {
 
 export interface SlackUser {
   id: string;
+  teamId?: string;
+  updatedAt?: number;
   username?: string;
   displayName?: string;
   realName?: string;
@@ -79,6 +82,12 @@ export interface SlackUser {
   isBot: boolean;
   isAppUser: boolean;
   isDeleted: boolean;
+  stateKnown?: boolean;
+  isAdmin?: boolean;
+  isOwner?: boolean;
+  isPrimaryOwner?: boolean;
+  isRestricted?: boolean;
+  isUltraRestricted?: boolean;
 }
 
 export interface SlackUserPage {
@@ -192,6 +201,9 @@ function channelFromResponse(channel: {
     isArchived: channel.is_archived ?? false,
     isMember: channel.is_member ?? false,
     isShared: channel.is_shared ?? channel.is_ext_shared ?? false,
+    visibilityKnown: typeof channel.is_private === "boolean"
+      && typeof channel.is_archived === "boolean"
+      && (typeof channel.is_shared === "boolean" || typeof channel.is_ext_shared === "boolean"),
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
@@ -203,16 +215,25 @@ function channelFromResponse(channel: {
 
 function userFromResponse(user: {
   id?: string;
+  team_id?: string;
+  updated?: number;
   name?: string;
   real_name?: string;
   tz?: string;
   is_bot?: boolean;
   is_app_user?: boolean;
   deleted?: boolean;
+  is_admin?: boolean;
+  is_owner?: boolean;
+  is_primary_owner?: boolean;
+  is_restricted?: boolean;
+  is_ultra_restricted?: boolean;
   profile?: { display_name?: string; real_name?: string; title?: string };
 }): SlackUser {
   return {
     id: nonEmpty(user.id, "user.id"),
+    ...(user.team_id ? { teamId: user.team_id } : {}),
+    ...(user.updated !== undefined ? { updatedAt: user.updated } : {}),
     ...(user.name ? { username: user.name } : {}),
     ...(user.profile?.display_name ? { displayName: user.profile.display_name } : {}),
     ...(user.profile?.real_name ?? user.real_name
@@ -223,6 +244,12 @@ function userFromResponse(user: {
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
     isDeleted: user.deleted ?? false,
+    stateKnown: typeof user.is_bot === "boolean" && typeof user.is_app_user === "boolean" && typeof user.deleted === "boolean",
+    isAdmin: user.is_admin ?? false,
+    isOwner: user.is_owner ?? false,
+    isPrimaryOwner: user.is_primary_owner ?? false,
+    isRestricted: user.is_restricted ?? false,
+    isUltraRestricted: user.is_ultra_restricted ?? false,
   };
 }
 
