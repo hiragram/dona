@@ -18,12 +18,13 @@ import type { WebJobReadClient } from "./job-read-client.js";
 import { maximumWebJobBrowserBodyBytes } from "./job-read-wire.js";
 import type { WebCommandClient } from "./command-client.js";
 import { deriveWebIdempotencyKey, parseBrowserCommand } from "./browser-command.js";
+import { dashboardFailurePage, dashboardPage } from "./dashboard.js";
 
 type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
 type Reason = "identity_invalid" | "identity_unavailable" | "identity_mismatch" | "session_invalid" | "session_revoked"
   | "session_expired" | "origin_invalid" | "csrf_invalid" | "cookie_invalid" | "cookie_ambiguous";
-type Status = 200 | 201 | 204 | 400 | 401 | 403 | 404 | 409 | 429 | 503;
+type Status = 200 | 201 | 204 | 303 | 400 | 401 | 403 | 404 | 409 | 429 | 503;
 export interface BrowserAuthRequest {
   method: string; target: string; headers: RawHeaders; body: Uint8Array;
   /** Trusted TLS/proxy listener result, never a request field/header. */
@@ -63,8 +64,11 @@ function failure(reason: SessionDenial): AuthFailure {
   return new AuthFailure(401, reason === "revision_mismatch" ? "session_revoked" : reason);
 }
 function response(status: Status, value?: unknown, clear = false, maximumBodyBytes?: number): BrowserAuthResponse {
-  return { status, headers: { ...privateHeaders, ...(status === 204 ? {} : { "content-type": "application/json; charset=utf-8" }),
-    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 ? "" : JSON.stringify(value), ...(maximumBodyBytes?{maximumBodyBytes}:{}) };
+  return { status, headers: { ...privateHeaders, ...(status === 204 || status === 303 ? {} : { "content-type": "application/json; charset=utf-8" }),
+    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 || status === 303 ? "" : JSON.stringify(value), ...(maximumBodyBytes?{maximumBodyBytes}:{}) };
+}
+function loginRedirect(): BrowserAuthResponse {
+  return { status: 303, headers: { ...privateHeaders, location: "/login", "set-cookie": clearBrowserCookie("session") }, body: "" };
 }
 function eventResponse(event:string,id:string,value:unknown):BrowserAuthResponse {const body=`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(value)}\n\n`;
   return{status:200,headers:{...privateHeaders,"content-type":"text/event-stream; charset=utf-8","x-accel-buffering":"no"},body,maximumBodyBytes:maximumWebJobBrowserBodyBytes};}
@@ -118,7 +122,7 @@ export class WebAuthController {
     return sessionCsrf(binding(snapshot.session.state), key, now, "existing");
   }
   async handle(request: BrowserAuthRequest): Promise<BrowserAuthResponse> {
-    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false;
+    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false, dashboard = false, dashboardBoundaryVerified = false;
     try {
       now();
       if (!(request.body instanceof Uint8Array) || request.body.byteLength > 65536 || request.headers.length > 128
@@ -129,6 +133,7 @@ export class WebAuthController {
       assertBrowserBoundary(this.policy, request.headers, request.transportVerified);
       let route;
       try { route = matchWebRoute(request.method, request.target); } catch { throw new AuthFailure(404, "session_invalid"); }
+      dashboard = route.id === "dashboard";
       if (!["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events", "job_submit", "job_cancel"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
       let jobCursor:string|undefined,jobLimit:number|undefined;
       if(route.id==="job_list"){
@@ -149,9 +154,15 @@ export class WebAuthController {
         catch { throw new AuthFailure(400, "session_invalid"); }
       } else {
         const origin = singleHeader(request.headers, "origin");
-        if (singleHeader(request.headers, "sec-fetch-site") !== "same-origin" || (origin !== undefined && origin !== this.policy.origin))
+        const site = singleHeader(request.headers, "sec-fetch-site");
+        const directDashboard = dashboard && (site === "none" || site === undefined) && origin === undefined
+          && singleHeader(request.headers, "sec-fetch-mode") === "navigate"
+          && singleHeader(request.headers, "sec-fetch-dest") === "document"
+          && singleHeader(request.headers, "sec-fetch-user") === "?1";
+        if (!directDashboard && (site !== "same-origin" || (origin !== undefined && origin !== this.policy.origin)))
           throw new AuthFailure(403, "origin_invalid");
         if (request.body.byteLength !== 0) throw new AuthFailure(400, "session_invalid");
+        dashboardBoundaryVerified = dashboard;
       }
       const cookie = parseBrowserCookies(request.headers).session;
       if (!cookie) throw new AuthFailure(401, "cookie_invalid");
@@ -263,6 +274,7 @@ export class WebAuthController {
       }
       const currentCsrf = this.csrf(snapshot, now());
       if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
+      if (route.id === "dashboard") return dashboardPage();
       return response(200, { principal: confirmation.principal, csrf_token: currentCsrf });
     } catch (error) {
       let failure = error instanceof AuthFailure ? error : error instanceof WebBoundaryError
@@ -271,12 +283,15 @@ export class WebAuthController {
             : error.code === "cookie_invalid" || error.code === "cookie_ambiguous" ? 400 : 401,
         error.code === "deployment_invalid" ? "identity_unavailable" : error.code)
         : new AuthFailure(503, "identity_unavailable");
+      const dashboardCookieRejected = dashboard && ["cookie_invalid", "cookie_ambiguous"].includes(failure.reason);
       if (!auditAttempted) {
         try {
           const result = await this.write({ codec_version: 1, operation: "record_denial", cookie_indexes: candidates, reason: failure.reason }, now);
           if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
+      if (dashboardCookieRejected || (dashboard && failure.status === 401)) return loginRedirect();
+      if (dashboard && dashboardBoundaryVerified && failure.status === 503) return dashboardFailurePage();
       return response(failure.status, { error: failure.publicReason });
     }
   }
