@@ -305,7 +305,8 @@ test("schema導入後のbounded repairは既存rowをbackfillしlegacy actorをo
     DROP TRIGGER IF EXISTS human_wait_job_insert; DROP TRIGGER IF EXISTS human_wait_job_update;
     DROP TRIGGER IF EXISTS human_wait_job_binding_insert; DROP TRIGGER IF EXISTS human_wait_group_update;
     DROP TRIGGER IF EXISTS human_wait_schedule_run_insert; DROP TRIGGER IF EXISTS human_wait_schedule_run_update;
-    DROP TRIGGER IF EXISTS human_wait_schedule_revision; DROP TRIGGER IF EXISTS human_wait_completion_update;
+    DROP TRIGGER IF EXISTS human_wait_schedule_revision; DROP TRIGGER IF EXISTS human_wait_schedule_update;
+    DROP TRIGGER IF EXISTS human_wait_completion_update;
     DROP TRIGGER IF EXISTS human_wait_outbox_insert; DROP TRIGGER IF EXISTS human_wait_outbox_update;
     DROP TRIGGER IF EXISTS human_wait_audit_insert; DROP TRIGGER IF EXISTS human_wait_audit_state;
     DROP TRIGGER IF EXISTS human_wait_no_sensitive_insert;
@@ -394,7 +395,7 @@ test("schedule notificationは後から確定したeventへ追随する", () => 
 test("schedule workのjob waitをrun waitへ集約する", () => {
   const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
   try {
-    const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-work-dedupe",harness.input("work.read_only",false,due),due);
+    const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-work-dedupe",harness.input("work.read_only",true,due),due);
     const run=harness.raw.prepare("SELECT event_id FROM schedule_runs WHERE run_id=?").get(runId) as {event_id:string};
     const result=new FakeJobRuntime().run(harness,run.event_id,"inspect");
     const completion=harness.raw.prepare("SELECT notification_event_id,destination_json FROM job_completion_results WHERE job_id=?")
@@ -407,13 +408,22 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:01:01.000Z"),true);
     assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)?.session_settlement_verified,1);
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE job_id=?").run(result.job_id);
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(result.job_id);
+    assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)?.session_settlement_verified,0);
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE job_id=?").run(result.job_id);
     harness.raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='steer_acceptance_unknown',updated_at='2026-09-05T00:02:00Z' WHERE job_id=?").run(result.job_id);
-    harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at='2026-09-05T00:02:00Z' WHERE run_id=?").run(runId);
+    harness.raw.prepare("UPDATE schedule_runs SET status='started',reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
+    harness.database.scheduler.markWorkRunNeedsReview(runId,result.job_id,"2026-09-05T00:02:00Z",run.event_id);
     const open=harness.database.humanWaits.listInternal();
     assert.equal(open.some(item=>item.dedupe_key===`job:${result.job_id}`),false);
     assert.equal(open.filter(item=>item.dedupe_key===`run:${runId}`).length,1);
     assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:02:01.000Z"),true);
     assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${runId}`)?.session_settlement_verified,1);
+    harness.database.scheduler.recoverWorkRunForResult(runId,result.job_id,run.event_id,"2026-09-05T00:02:02Z");
+    harness.database.scheduler.markWorkRunNeedsReview(runId,result.job_id,"2026-09-05T00:02:03Z",run.event_id);
+    const reopened=harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${runId}`)!;
+    assert.equal(reopened.session_settlement_verified,0);
+    assert.equal(reopened.source_revision,"2026-09-05T00:02:03Z");
   } finally { harness.close(); }
 });
 

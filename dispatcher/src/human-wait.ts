@@ -62,6 +62,7 @@ export function dropHumanWaitTriggersForCoreMigration(db: Database.Database): vo
     DROP TRIGGER IF EXISTS human_wait_schedule_run_insert;
     DROP TRIGGER IF EXISTS human_wait_schedule_run_update;
     DROP TRIGGER IF EXISTS human_wait_schedule_revision;
+    DROP TRIGGER IF EXISTS human_wait_schedule_update;
     DROP TRIGGER IF EXISTS human_wait_completion_update;
     DROP TRIGGER IF EXISTS human_wait_outbox_insert;
     DROP TRIGGER IF EXISTS human_wait_outbox_update;
@@ -249,7 +250,9 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       FROM schedules s WHERE s.schedule_id=NEW.schedule_id AND NEW.status='needs_review' AND s.revision=NEW.revision
         AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='run:'||NEW.run_id)
       ON CONFLICT(dedupe_key) DO UPDATE SET reason_code=excluded.reason_code,decision_kind=excluded.decision_kind,
-        source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,resolved_at=NULL,stale_at=NULL;
+        source_revision=excluded.source_revision,state='open',
+        session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,
+        updated_at=excluded.updated_at,resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',resolved_at=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         updated_at=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         source_revision=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -269,6 +272,12 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
             AND json_extract(b.owner_json,'$.schedule_id')=NEW.schedule_id))
       );
     END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_schedule_update AFTER UPDATE OF updated_at ON schedules BEGIN
+      UPDATE human_wait_items SET source_revision=NEW.updated_at,updated_at=NEW.updated_at,retain_until=datetime(NEW.updated_at,'+30 days')
+      WHERE resource_kind='schedule_run' AND parent_resource_id=NEW.schedule_id AND resource_revision=NEW.revision AND state='open'
+        AND EXISTS (SELECT 1 FROM schedule_runs r WHERE r.run_id=human_wait_items.resource_id AND r.status='needs_review' AND r.revision=NEW.revision)
+        AND julianday(source_revision)<julianday(NEW.updated_at);
+    END;
     CREATE TRIGGER IF NOT EXISTS human_wait_completion_update AFTER UPDATE OF notification_state,notification_event_id ON job_completion_results BEGIN
       INSERT INTO human_wait_items(item_id,dedupe_key,tenant_id,workspace_id,owner_kind,owner_principal_kind,owner_principal_id,
         decision_actor_kind,decision_kind,resource_kind,resource_id,parent_resource_id,resource_revision,reason_code,
@@ -283,7 +292,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
           AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)) AND NOT EXISTS (
         SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status)
-      ON CONFLICT(dedupe_key) DO UPDATE SET resource_id=excluded.resource_id,source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
+      ON CONFLICT(dedupe_key) DO UPDATE SET resource_id=excluded.resource_id,source_revision=excluded.source_revision,state='open',
+        session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',
         resolved_at=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
@@ -323,7 +333,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       FROM schedule_runs r JOIN schedules s USING(schedule_id)
       WHERE r.run_id=NEW.run_id AND NEW.status='needs_review' AND NEW.kind!='slack.work_result.post' AND s.revision=r.revision
         AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='outbox:'||NEW.outbox_id)
-      ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
+      ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',
+        session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at,
         retain_until=datetime(NEW.updated_at,'+30 days')
@@ -423,6 +434,21 @@ export class HumanWaitRepository {
         r.revision AS resource_revision,'ambiguous_write' AS reason_code,o.updated_at AS source_revision FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
         WHERE o.outbox_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
     };
+    const currentDesiredOpen=(row:Candidate):boolean=>{
+      if(row.kind==="job")return this.db.prepare(`SELECT 1 FROM jobs j WHERE j.job_id=? AND j.status IN ('blocked','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM job_groups g WHERE g.source_event_id=j.source_event_id AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM job_owner_bindings b WHERE b.job_id=j.job_id AND json_extract(b.owner_json,'$.kind')='schedule')`).get(row.resource_id)!==undefined;
+      if(row.kind==="group")return this.db.prepare("SELECT 1 FROM job_groups WHERE source_event_id=? AND attention_event_id IS NOT NULL AND all_terminal_event_id IS NULL")
+        .get(row.resource_id)!==undefined;
+      if(row.kind==="run")return this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
+        WHERE r.run_id=? AND r.status='needs_review' AND r.revision=s.revision`).get(row.resource_id)!==undefined;
+      if(row.kind==="completion")return this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedules s
+        ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id') WHERE c.job_id=? AND c.job_status=?
+        AND json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review'
+        AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)`).get(row.resource_id,row.aux_id)!==undefined;
+      return this.db.prepare(`SELECT 1 FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
+        WHERE o.outbox_id=? AND o.status='needs_review' AND o.kind!='slack.work_result.post' AND r.revision=s.revision`).get(row.resource_id)!==undefined;
+    };
     const derivedProjectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection)=>
       Object.entries(expected).some(([key,value])=>key!=="source_revision"&&item[key as keyof HumanWaitItemRow]!==value);
     const projectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection,row:Candidate)=>
@@ -454,7 +480,7 @@ export class HumanWaitRepository {
         const item=this.db.prepare("SELECT * FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as HumanWaitItemRow|undefined;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
         const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
-        const shouldOpen=row.desired_open===1&&!quarantinedAlready;
+        const shouldOpen=currentDesiredOpen(row)&&!quarantinedAlready;
         const expected=expectedProjection(row);
         if(expected&&Date.parse(expected.source_revision)!==Date.parse(row.source_revision)) continue;
         if((shouldOpen&&!item)||(item&&shouldOpen&&expected&&(item.state!=="open"||projectionMismatch(item,expected,row)))||(item&&!shouldOpen&&item.state==="open")) repaired++;
@@ -467,7 +493,7 @@ export class HumanWaitRepository {
       for(const row of page) {
         const item=this.db.prepare("SELECT * FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as HumanWaitItemRow|undefined;
         const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
-        const shouldOpen=row.desired_open===1&&!quarantinedAlready;
+        const shouldOpen=currentDesiredOpen(row)&&!quarantinedAlready;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
         const expected=expectedProjection(row);
         if(expected&&Date.parse(expected.source_revision)!==Date.parse(row.source_revision)) continue;
