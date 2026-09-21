@@ -249,6 +249,14 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasJobAuthorizationBindings = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_authorization_bindings'").get() !== undefined;
+    if (hasJobAuthorizationBindings) db.exec(`
+      CREATE TEMP TABLE preserved_job_authorization_bindings_v3 AS SELECT * FROM job_authorization_bindings;
+      DROP TRIGGER IF EXISTS job_authorization_binding_immutable;
+      DROP TRIGGER IF EXISTS job_authorization_source_match;
+      DROP TRIGGER IF EXISTS job_authorization_principal_complete;
+      DROP TRIGGER IF EXISTS job_authorization_task_match;
+    `);
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -311,6 +319,10 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
+    if (hasJobAuthorizationBindings) db.exec(`
+      INSERT INTO job_authorization_bindings SELECT * FROM preserved_job_authorization_bindings_v3;
+      DROP TABLE preserved_job_authorization_bindings_v3;
+    `);
     migrationHook("indexes_recreated");
 
     db.exec(`
