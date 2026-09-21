@@ -221,6 +221,14 @@ export class JobAuthorizationBindingRepository {
       binding_revision: existing ? existing.binding_revision + 1 : 1, authz_revision: principal.event_attempt,
     };
     const expectedCurrent = (): boolean => {
+      const currentPrincipal = readVerifiedPrincipalBinding(this.db, eventId);
+      if (!currentPrincipal || currentPrincipal.revoked_at !== null ||
+        currentPrincipal.tenant_id !== evidence.tenant_id || currentPrincipal.workspace_id !== evidence.workspace_id ||
+        currentPrincipal.principal_kind !== evidence.principal_kind || currentPrincipal.principal_id !== evidence.principal_id ||
+        currentPrincipal.proof_sha256 !== principal.proof_sha256 || currentPrincipal.event_attempt !== principal.event_attempt) return false;
+      const evidenceOwner = this.db.prepare("SELECT event_id FROM event_task_bindings WHERE authorization_evidence_sha256=?")
+        .get(evidence.evidence_sha256) as { event_id: string } | undefined;
+      if (evidenceOwner && evidenceOwner.event_id !== eventId) return false;
       const current = this.readEventTask(eventId);
       return current === undefined
         ? expectedBindingRevision === 0

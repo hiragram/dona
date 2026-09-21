@@ -132,6 +132,57 @@ test("共有auditのDB外CASとtask bindingを同じtransactionで確定する",
   dispatcher.close();
 });
 
+test("evidence重複とprincipal失効を外部anchor reserve前に拒否する", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  let dispatcher = new DispatcherDatabase(config.databasePath);
+  const firstEnvelope = eventEnvelope("Ev-task-precondition-first");
+  const first = dispatcher.enqueue(firstEnvelope, new Date("2026-09-21T00:01:00.000Z"), proof(firstEnvelope.external_event_id)).row;
+  const secondEnvelope = eventEnvelope("Ev-task-precondition-second");
+  const second = dispatcher.enqueue(secondEnvelope, new Date("2026-09-21T00:01:01.000Z"), proof(secondEnvelope.external_event_id)).row;
+  dispatcher.close();
+  const db = new Database(config.databasePath); db.pragma("foreign_keys = ON"); installAuditSchema(db);
+  const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "task_precondition_chain",
+    transaction_id: "task_precondition_genesis", signed_at: "2026-09-21T00:00:00.000Z", key_version: 1 }, auditKeys);
+  class Store implements AuditAnchorStore {
+    reservations = 0;
+    value: AuditAnchor = { chain_id: "task_precondition_chain", sequence: 0, mac: "0".repeat(64),
+      checkpoint_mac: checkpoint.mac, pending_transaction_id: null };
+    read() { return structuredClone(this.value); }
+    reserve(expected: AuditAnchor, proposed: AuditAnchor) { this.reservations++; assert.deepEqual(this.value, expected); this.value = structuredClone(proposed); return this.read(); }
+    finalize(reservation: AuditAnchor) { assert.deepEqual(this.value, reservation); this.value = { ...this.value, pending_transaction_id: null }; return this.read(); }
+  }
+  const store = new Store(); const realAudit = new AuditRepository(db, store, auditKeys); realAudit.initialize(checkpoint);
+  const bindings = new JobAuthorizationBindingRepository(db);
+  const sharedEvidence = evidence(first.event_id, "7");
+  bindings.bindEventTask(first.event_id, 0, { provider_verified: true, evidence: sharedEvidence }, verifier, realAudit,
+    { ...auditContext, transaction_id: "task_precondition_first" }, new Date("2026-09-21T00:01:30.000Z"));
+  const duplicateEvidence = { ...sharedEvidence, source_event_id: second.event_id,
+    authorization_principal_event_id: second.event_id };
+  assert.throws(() => bindings.bindEventTask(second.event_id, 0,
+    { provider_verified: true, evidence: duplicateEvidence }, verifier, realAudit,
+    { ...auditContext, transaction_id: "task_precondition_duplicate" }, new Date("2026-09-21T00:01:31.000Z")),
+  TaskBindingConflictError);
+  assert.equal(store.reservations, 1);
+
+  const revocationPeer = new Database(config.databasePath); revocationPeer.pragma("foreign_keys = ON");
+  const revokingAudit = {
+    appendConditional<T>(transactionId: string, keyVersion: number, event: AuditEvent,
+      precondition: () => boolean, mutation: () => T) {
+      revocationPeer.prepare("UPDATE verified_principal_bindings SET revoked_at=? WHERE event_id=?")
+        .run("2026-09-21T00:01:31.000Z", second.event_id);
+      return realAudit.appendConditional(transactionId, keyVersion, event, precondition, mutation);
+    },
+  } as Pick<AuditRepository, "appendConditional">;
+  assert.throws(() => bindings.bindEventTask(second.event_id, 0,
+    { provider_verified: true, evidence: evidence(second.event_id, "8") }, verifier, revokingAudit,
+    { ...auditContext, transaction_id: "task_precondition_revoked" }, new Date("2026-09-21T00:01:32.000Z")),
+  TaskBindingConflictError);
+  assert.equal(store.reservations, 1);
+  assert.equal(realAudit.verify().sequence, 1);
+  assert.equal(bindings.readEventTask(second.event_id), undefined);
+  revocationPeer.close(); db.close();
+});
+
 test("exact task bindingはretry-stableでCAS競合、別task、旧revisionを拒否する", async () => {
   const { root, config } = await tempConfig(); roots.push(root);
   const database = new DispatcherDatabase(config.databasePath);
