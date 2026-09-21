@@ -69,7 +69,9 @@ export class WebCommandBroker {
         job: { job_id: result.row.job_id, status: result.row.status } };
     } catch (error) {
       if (error instanceof JobCreationError) return { status: "denied", reason: error.code === "job_group_limit_exceeded" ? "quota_exceeded" : "idempotency_conflict" };
-      return { status: "denied", reason: "invalid_request" };
+      if (error instanceof z.ZodError || error instanceof SyntaxError || error instanceof TypeError)
+        return { status: "denied", reason: "invalid_request" };
+      return { status: "denied", reason: "internal_error" };
     }
   }
 }

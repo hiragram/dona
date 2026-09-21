@@ -20,12 +20,15 @@ export const webCommandResultSchema = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("succeeded"), outcome: z.enum(["created", "reused", "cancelled", "already_cancelled"]),
     receipt_id: z.string().min(1).max(96), job: projection }),
   z.strictObject({ status: z.literal("denied"), reason: z.enum(["invalid_request", "identity_unavailable", "scope_denied",
-    "idempotency_conflict", "quota_exceeded", "not_found", "owner_mismatch", "terminal", "scheduled_policy", "acceptance_unknown"]) }),
+    "idempotency_conflict", "quota_exceeded", "not_found", "owner_mismatch", "terminal", "scheduled_policy", "acceptance_unknown", "internal_error"]) }),
 ]);
 export type WebCommandResult = z.infer<typeof webCommandResultSchema>;
 export class WebCommandWireError extends Error { constructor() { super("web_command_unverified"); this.name = "WebCommandWireError"; } }
 const claimsSchema = z.strictObject({ codec_version: z.literal(1), key_version: z.number().int().min(1), instance_id: id, tenant_id: id,
   body_digest: digest, issued_at: z.string().datetime(), expires_at: z.string().datetime(), nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/) });
+const responseSchema = z.strictObject({ codec_version: z.literal(1), key_version: z.number().int().min(1), instance_id: id, tenant_id: id,
+  request_nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/), request_body_digest: digest, request_proof_digest: digest,
+  issued_at: z.string().datetime(), expires_at: z.string().datetime(), result: webCommandResultSchema });
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 export function parseWebCommandInput(raw: string): WebCommandInput {
   try { if (Buffer.byteLength(raw) > maximumWebCommandBodyBytes) throw Error(); const value = webCommandInputSchema.parse(JSON.parse(raw));
@@ -44,5 +47,20 @@ export function verifyWebCommandProof(proof: string, raw: string, scope: Service
     const actual = Buffer.from(parts[1]!, "base64url"), expected = createHmac("sha256", credential.secret)
       .update("dona.web-command.request.v1\0").update(parts[0]!).digest();
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw Error();
+  } catch { throw new WebCommandWireError(); }
+}
+export function signWebCommandResponse(requestProof: string, requestBody: string, result: WebCommandResult, scope: ServiceScope,
+  lookup: WebServiceCredentialLookup, now: string): string {
+  try {
+    verifyWebCommandProof(requestProof, requestBody, scope, lookup, now);
+    const part = requestProof.split(".")[0]!, request = claimsSchema.parse(JSON.parse(Buffer.from(part, "base64url").toString("utf8")));
+    const credential = lookup(request.key_version), at = Date.parse(now);
+    if (!credential || credential.state === "revoked" || at < Date.parse(request.issued_at) || at >= Date.parse(request.expires_at)) throw Error();
+    const response = responseSchema.parse({ codec_version: 1, key_version: request.key_version, ...scope, request_nonce: request.nonce,
+      request_body_digest: request.body_digest, request_proof_digest: hash(requestProof), issued_at: now,
+      expires_at: request.expires_at, result: webCommandResultSchema.parse(result) });
+    const payload = Buffer.from(JSON.stringify(response)).toString("base64url"), mac = createHmac("sha256", credential.secret)
+      .update("dona.web-command.response.v1\0").update(payload).digest("base64url");
+    return `${payload}.${mac}`;
   } catch { throw new WebCommandWireError(); }
 }

@@ -205,11 +205,13 @@ export class WebAuthController {
         auditAttempted = true;
         const command = await this.connections.command.execute({ codec_version: 1, operation: route.id === "job_submit" ? "submit" : "cancel",
           method: "POST", target: request.target, context, browser_body: Buffer.from(request.body).toString("base64url"),
-          idempotency_key: deriveWebIdempotencyKey(identity, browserCommand.request_id, this.keys.context(), issued) });
+          idempotency_key: deriveWebIdempotencyKey(identity, browserCommand.request_id,
+            this.keys.protection("web_cookie_index", snapshot.session.cookie_key_version), issued) });
         if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
         if (command.status === "denied") {
           const status: Status = command.reason === "invalid_request" ? 400 : command.reason === "scope_denied" || command.reason === "owner_mismatch" ? 403
-            : command.reason === "not_found" ? 404 : command.reason === "quota_exceeded" ? 429 : command.reason === "identity_unavailable" || command.reason === "acceptance_unknown" ? 503 : 409;
+            : command.reason === "not_found" ? 404 : command.reason === "quota_exceeded" ? 429
+              : command.reason === "identity_unavailable" || command.reason === "acceptance_unknown" || command.reason === "internal_error" ? 503 : 409;
           return response(status, { error: command.reason });
         }
         return response(command.outcome === "created" ? 201 : 200, command);

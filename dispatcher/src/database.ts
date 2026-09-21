@@ -264,6 +264,11 @@ export function migrateDispatcherDatabase(
   `);
   const migrateV3 = () => {
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
+    const hasWebReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_command_receipts'").get() !== undefined;
+    if (hasWebReceipts) db.exec(`
+      CREATE TABLE web_command_receipts_v3_backup AS SELECT * FROM web_command_receipts;
+      DROP TABLE web_command_receipts;
+    `);
     db.exec(`
       CREATE TABLE jobs_v3 (
         job_id                TEXT PRIMARY KEY,
@@ -362,6 +367,13 @@ export function migrateDispatcherDatabase(
       GROUP BY jobs.source_event_id;
     `);
     migrationHook("groups_backfilled");
+    if (hasWebReceipts) {
+      ensureWebCommandSchema(db);
+      db.exec(`
+        INSERT INTO web_command_receipts SELECT * FROM web_command_receipts_v3_backup;
+        DROP TABLE web_command_receipts_v3_backup;
+      `);
+    }
     db.pragma(`user_version = ${targetWrite}`);
   };
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
@@ -1232,7 +1244,7 @@ export class DispatcherDatabase {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     const row = this.getJobRequired(jobId);
     if (row.status === "cancelled") return row;
-    if (!["queued", "retryable_failed", "running", "blocked"].includes(row.status)) {
+    if (!["queued", "preparing", "dispatching", "retryable_failed", "running", "blocked"].includes(row.status)) {
       throw new Error(`Job ${jobId} in status ${row.status} cannot be cancelled`);
     }
     this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
@@ -1242,7 +1254,7 @@ export class DispatcherDatabase {
   beginWebJobCancellation(jobId: string, identity: WebCommandIdentity): JobRow {
     const row = this.assertWebJobOwner(jobId, identity);
     if (row.status === "cancelled") return row;
-    if (!["queued", "retryable_failed", "running", "blocked"].includes(row.status)) {
+    if (!["queued", "preparing", "dispatching", "retryable_failed", "running", "blocked"].includes(row.status)) {
       throw new Error(`web_job_terminal:${row.status}`);
     }
     this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });

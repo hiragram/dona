@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import type { ServiceScope, WebServiceCredential, WebServiceCredentialLookup } from "./service-auth.js";
-import { encodeWebCommandInput, maximumWebCommandBodyBytes, signWebCommandProof, webCommandResultSchema,
+import { encodeWebCommandInput, maximumWebCommandBodyBytes, signWebCommandProof, verifyWebCommandResponse,
   webCommandServiceHost, webCommandServicePath, WebCommandWireError, type WebCommandInput, type WebCommandResult } from "./command-wire.js";
 
 export class WebCommandClient {
@@ -25,8 +25,8 @@ export class WebCommandClient {
           response.once("error", () => finish()); response.once("end", () => {
             try { if (response.statusCode !== 200 || !response.complete) throw Error(); const after = fs.statSync(this.socketPath);
               if (after.dev !== before.dev || after.ino !== before.ino) throw Error();
-              const result = webCommandResultSchema.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))));
-              void this.credentials; finish(result); } catch { finish(); }
+              const result = verifyWebCommandResponse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)), proof, raw,
+                this.scope, this.credentials, this.now()); finish(result); } catch { finish(); }
           });
         });
         request.once("error", () => finish()); request.end(raw);

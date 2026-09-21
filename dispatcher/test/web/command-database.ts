@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import test from "node:test";
-import { DispatcherDatabase, JobCreationError } from "../../src/database.js";
+import Database from "better-sqlite3";
+import { DispatcherDatabase, JobCreationError, migrateDispatcherDatabase } from "../../src/database.js";
 import { tempConfig } from "../helpers.js";
 
 const owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
@@ -42,4 +43,25 @@ test("web submitはowner quota、canonical concurrency、owner-bound cancel rece
   assert.equal(db.recordWebCancelReceipt(receiptId, payload, owner, first.row.job_id).receipt_id, receipt.receipt_id);
   assert.equal(db.getWebCommandReceipt(receiptId, { ...owner, principal_id: "other" }), undefined);
   peer.close(); db.close();
+});
+
+test("v2 bridgeのweb receiptを保持したままv3へmigrationできる", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const initial = new Database(config.databasePath); migrateDispatcherDatabase(initial, () => {}, false, 2); initial.close();
+  let db = new DispatcherDatabase(config.databasePath); const key = "f".repeat(64);
+  const created = db.createWebJob(input(key), config.jobsWorkspaceRoot, config.jobResultsDir); db.close();
+  const raw = new Database(config.databasePath); raw.pragma("foreign_keys=ON");
+  assert.equal(raw.pragma("user_version", { simple: true }), 2); migrateDispatcherDatabase(raw, () => {}, false, 3); raw.close();
+  db = new DispatcherDatabase(config.databasePath);
+  assert.equal(db.getWebCommandReceipt("web_submit_" + key, owner)?.job_id, created.row.job_id); db.close();
+});
+
+test("preparingとdispatchingのweb jobもownerがcancellingへ遷移できる", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  for (const [index, status] of ["preparing", "dispatching"].entries()) {
+    let db = new DispatcherDatabase(config.databasePath); const created = db.createWebJob(input(String(index + 1).repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir); db.close();
+    const raw = new Database(config.databasePath); raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status, created.row.job_id); raw.close();
+    db = new DispatcherDatabase(config.databasePath); assert.equal(db.beginWebJobCancellation(created.row.job_id, owner).status, "cancelling");
+    db.markJobCancelled(created.row.job_id, "fixture"); db.close();
+  }
 });

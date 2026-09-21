@@ -11,7 +11,7 @@ import * as readAuth from "./read-auth.js";
 import * as writeAuth from "./write-auth.js";
 import { serviceScopeSchema, WebServiceError, type ServiceScope, type WebServiceCredentialLookup } from "./service-auth.js";
 import type { AuthWriteResult } from "./write-auth.js";
-import { maximumWebCommandBodyBytes, parseWebCommandInput, verifyWebCommandProof } from "./command-wire.js";
+import { maximumWebCommandBodyBytes, parseWebCommandInput, signWebCommandResponse, verifyWebCommandProof } from "./command-wire.js";
 import type { WebCommandBroker } from "./command-broker.js";
 
 const kinds = ["session", "read", "write", "command"] as const;
@@ -178,7 +178,7 @@ export class WebInternalService {
         verifyWebCommandProof(proof, raw, this.scope, this.credentials, this.now());
         const input = parseWebCommandInput(raw); this.assertRequestReady(started, request, response);
         const result = await this.commands.execute(input); this.assertRequestReady(started, request, response);
-        return JSON.stringify(result);
+        return signWebCommandResponse(proof, raw, result, this.scope, this.credentials, this.now());
       }
       default: throw new WebServiceError();
     }
