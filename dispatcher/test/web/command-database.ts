@@ -73,7 +73,7 @@ test("cancelling中のweb cancel再送はterminalにせずacceptance unknownへ�
   assert.throws(() => db.beginWebJobCancellation(created.row.job_id, owner), /web_cancel_acceptance_unknown/); db.close();
 });
 
-test("blockedとneeds_reviewのweb jobもworker解放確認まではowner quotaへ算入する", async t => {
+test("blockedとneeds_reviewのweb jobもownerが明示解放するまではquotaへ算入する", async t => {
   for (const [index, status] of ["blocked", "needs_review"].entries()) {
     const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
     let db = new DispatcherDatabase(config.databasePath, { jobsPerEventMax: 1, jobObjectiveTotalMaxBytes: 400000 });
@@ -82,6 +82,11 @@ test("blockedとneeds_reviewのweb jobもworker解放確認まではowner quota�
     db = new DispatcherDatabase(config.databasePath, { jobsPerEventMax: 1, jobObjectiveTotalMaxBytes: 400000 });
     assert.throws(() => db.createWebJob(input(String(index + 7).repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir),
       (error: unknown) => error instanceof JobCreationError && error.code === "job_group_limit_exceeded");
+    if (status === "needs_review") {
+      assert.equal(db.beginWebJobCancellation(created.row.job_id, owner).status, "cancelling");
+      db.markJobCancelled(created.row.job_id, "owner released reviewed job");
+      assert.equal(db.createWebJob(input("9".repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir).outcome, "created");
+    }
     db.close();
   }
 });

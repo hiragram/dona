@@ -262,6 +262,11 @@ export class JobSupervisor {
       }
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
       if (!cancelled.ok) {
+        if (before.status === "needs_review" && !cancelled.timedOut
+          && ["agent_not_found", "agent_not_running"].includes(cancelled.errorCode ?? "")) {
+          this.database.markJobCancelled(jobId, reason); this.wake();
+          return { row: this.database.getJob(jobId)!, duplicate: false };
+        }
         this.database.markJobNeedsReview(jobId, cancelled.errorCode ?? "cancel_acceptance_unknown", commandMessage(cancelled));
         this.wake(); throw new Error("web_cancel_acceptance_unknown");
       }

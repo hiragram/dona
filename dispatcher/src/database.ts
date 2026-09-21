@@ -1255,7 +1255,7 @@ export class DispatcherDatabase {
     const row = this.assertWebJobOwner(jobId, identity);
     if (row.status === "cancelled") return row;
     if (row.status === "cancelling") throw new Error("web_cancel_acceptance_unknown");
-    if (!["queued", "preparing", "dispatching", "retryable_failed", "running", "blocked"].includes(row.status)) {
+    if (!["queued", "preparing", "dispatching", "retryable_failed", "running", "blocked", "needs_review"].includes(row.status)) {
       throw new Error(`web_job_terminal:${row.status}`);
     }
     this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });

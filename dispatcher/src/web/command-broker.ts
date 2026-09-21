@@ -64,7 +64,7 @@ export class WebCommandBroker {
         if (error instanceof Error && error.message === "web_job_owner_mismatch") return { status: "denied", reason: "owner_mismatch" };
         throw error;
       }
-      if (["completed", "failed", "needs_review"].includes(candidate.status)) return { status: "denied", reason: "terminal" };
+      if (["completed", "failed"].includes(candidate.status)) return { status: "denied", reason: "terminal" };
       let result;
       try { result = await this.jobs.cancelWeb(jobId, identity); }
       catch (error) {

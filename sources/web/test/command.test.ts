@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { controllerFixture } from "./auth-controller-fixture.js";
 import { deriveWebIdempotencyKey } from "../src/browser-command.js";
+import { WebCommandClient } from "../src/command-client.js";
 import { encodeWebCommandInput, signWebCommandProof, verifyWebCommandResponse } from "../src/command-wire.js";
 
 function commandRequest(f: ReturnType<typeof controllerFixture>, target: string, value: unknown) {
@@ -77,4 +82,22 @@ test("cancelのtyped denialをbounded HTTP errorへ写像し応答喪失を自�
   const result = await f.controller.handle(commandRequest(f, "/api/jobs/job_test/cancel", { request_id: randomBytes(32).toString("base64url") }));
   assert.equal(result.status, 503); assert.deepEqual(JSON.parse(result.body), { error: "identity_unavailable" }); assert.equal(calls, 1);
   assert.ok(!result.body.includes("private")); assert.ok(!result.body.includes("token"));
+});
+
+test("command clientはowner-only directoryとsocketを送信前に検証する", async t => {
+  const directory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "dwcmd-")); fs.chmodSync(directory, 0o700);
+  const socket = path.join(directory, "s"); let calls = 0;
+  const server = http.createServer((_request, response) => { calls++; response.end(); });
+  await new Promise<void>(resolve => server.listen(socket, resolve)); fs.chmodSync(socket, 0o600);
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); fs.rmSync(directory, { recursive: true, force: true }); });
+  const now = "2026-09-19T00:00:01.000Z", scope = { instance_id: "instance", tenant_id: "tenant" };
+  const credential = { purpose: "web_bff_service" as const, version: 1, state: "active" as const, ...scope,
+    activated_at: "2026-09-01T00:00:00.000Z", signing_expires_at: "2026-11-01T00:00:00.000Z", secret: Buffer.alloc(32, 7) };
+  const input = { codec_version: 1 as const, operation: "submit" as const, method: "POST" as const, target: "/api/jobs",
+    context: "context", browser_body: Buffer.from("{}").toString("base64url"), idempotency_key: "a".repeat(64) };
+  const client = (target = socket) => new WebCommandClient(target, scope, () => credential, () => credential, () => now, 100);
+  fs.chmodSync(directory, 0o755); await assert.rejects(client().execute(input)); fs.chmodSync(directory, 0o700);
+  fs.chmodSync(socket, 0o666); await assert.rejects(client().execute(input)); fs.chmodSync(socket, 0o600);
+  const link = path.join(directory, "link"); fs.symlinkSync(socket, link); await assert.rejects(client(link).execute(input));
+  assert.equal(calls, 0);
 });

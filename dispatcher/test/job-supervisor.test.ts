@@ -163,6 +163,18 @@ test("web cancelはstalled promptの復旧後にworker終了を待たず実行�
   await supervisor.stop(); database.close();
 });
 
+test("ownerはworker消失を確認できるneeds_reviewをcancelしてquotaを解放できる", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "d".repeat(64), objective: "review cleanup", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  database.markJobNeedsReview(job.job_id, "prompt_acceptance_unknown", "fixture");
+  const supervisor = new JobSupervisor(database, fakeRuntime({ async cancel() { return failed("agent_not_found"); } }), config, logger, () => undefined);
+  const cancelled = await supervisor.cancelWeb(job.job_id, owner);
+  assert.equal(cancelled.row.status, "cancelled"); assert.equal(cancelled.row.last_error_code, "cancelled");
+  database.close();
+});
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
