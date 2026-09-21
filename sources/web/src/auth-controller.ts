@@ -283,7 +283,7 @@ export class WebAuthController {
           if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
-      if (dashboard && failure.status === 401) return loginRedirect();
+      if (dashboard && (failure.status === 401 || (failure.status === 400 && ["cookie_invalid", "cookie_ambiguous"].includes(failure.reason)))) return loginRedirect();
       if (dashboard && failure.status === 503) return dashboardFailurePage();
       return response(failure.status, { error: failure.publicReason });
     }
