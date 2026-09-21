@@ -97,7 +97,7 @@ async function main(): Promise<void> {
               durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
               result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}},null,2));return;}
         if(args.includes("--live-session")){const supervisor=new JobSupervisor(database,new HerdrJobAgentRuntime(config,false),config,createLogger("dispatcher_cli"),()=>{});
-          const receipt=await supervisor.observeLiveSession(jobId);console.log(JSON.stringify({schema_version:1,job:projectLiveJob(row as unknown as Record<string,unknown>),live_session:receipt.live_session,
+          const receipt=await supervisor.observeLiveSession(jobId);const refreshed=database.getJob(jobId);if(!refreshed)throw new Error(`Job ${jobId} disappeared during live observation`);console.log(JSON.stringify({schema_version:1,job:projectLiveJob(refreshed as unknown as Record<string,unknown>),live_session:receipt.live_session,
             reconciliation:receipt.reconciliation,receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
               durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
               result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}},null,2));return;}

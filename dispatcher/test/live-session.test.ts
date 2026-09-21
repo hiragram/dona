@@ -130,6 +130,20 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(raw.pragma("user_version",{simple:true}),3);raw.close();
   });
 
+  test("初期version 1 identity tableへruntime世代列をadditive migrationする",()=>{
+    const raw=new Database(":memory:");
+    raw.exec(`CREATE TABLE live_session_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL CHECK(version=1));
+      INSERT INTO live_session_schema VALUES(1,1);
+      CREATE TABLE job_live_session_identities(job_id TEXT PRIMARY KEY,identity_version INTEGER NOT NULL CHECK(identity_version=1),
+        herdr_agent_session_id TEXT NOT NULL,recorded_at TEXT NOT NULL);
+      INSERT INTO job_live_session_identities VALUES('job_old',1,'session-old','2026-09-21T00:00:00Z');`);
+    migrateLiveSession(raw);
+    const columns=new Set((raw.prepare("PRAGMA table_info(job_live_session_identities)").all() as Array<{name:string}>).map(row=>row.name));
+    assert.equal(columns.has("herdr_workspace_id"),true);assert.equal(columns.has("herdr_pane_id"),true);assert.equal(columns.has("agent_name"),true);
+    const migrated=raw.prepare("SELECT herdr_workspace_id,herdr_pane_id,agent_name FROM job_live_session_identities").get() as Record<string,unknown>;
+    assert.deepEqual(migrated,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null});raw.close();
+  });
+
   test("並行queryは独立したappend-only receiptを作る",async()=>{
     const state=await addressableJob();const calls:string[]=[];
     const supervisor=new JobSupervisor(state.database,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
@@ -146,6 +160,19 @@ describe("read-only live session reconciliation",()=>{
     sequence=11;const regressed=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     assert.equal(regressed.reconciliation.state,"unknown");assert.equal(regressed.reconciliation.confidence,"fail_closed");
     assert.equal(regressed.reconciliation.safe_next_action,"do_not_retry");
-    assert.ok(regressed.reconciliation.reason_codes.includes("state_sequence_regressed"));state.database.close();
+    assert.ok(regressed.reconciliation.reason_codes.includes("state_sequence_regressed"));
+    const repeated=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(repeated.reconciliation.state,"unknown");assert.ok(repeated.reconciliation.reason_codes.includes("state_sequence_regressed"));state.database.close();
+  });
+
+  test("rollback中にruntime列だけ更新されたidentity世代は照合しない",async()=>{
+    const state=await addressableJob();state.database.close();
+    const raw=new Database(state.config.databasePath);
+    raw.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=?").run("rollback-workspace","rollback-pane",state.job.job_id);
+    raw.close();
+    const reopened=new DispatcherDatabase(state.config.databasePath);const calls:string[]=[];
+    const supervisor=new JobSupervisor(reopened,runtimeWith(()=>{throw new Error("must not query stale identity");},calls),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(receipt.live_session.query_status,"not_addressable");assert.deepEqual(calls,[]);reopened.close();
   });
 });

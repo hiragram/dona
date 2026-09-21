@@ -86,8 +86,8 @@ describe("DispatcherApi", () => {
     const source=database.enqueue(eventEnvelope("Ev-live-api")).row;
     const other=database.enqueue({...eventEnvelope("Ev-live-api-other"),subject:{...eventEnvelope("x").subject,thread_ts:"1756722030.999999"},reply_target:{...eventEnvelope("x").reply_target,thread_ts:"1756722030.999999"}}).row;
     const job=database.createJob({source_event_id:source.event_id,objective:"PRIVATE",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
-    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w-private","p-private","s-private");database.beginJobDispatch(job.job_id);database.markJobNeedsReview(job.job_id,"prompt_acceptance_unknown","unknown");
-    const calls:string[]=[];const runtime:JobAgentRuntime={async prepare(){throw new Error("unused");},async get(agent){calls.push("get");return {ok:true,stdout:"RAW PRIVATE",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working",agentIdentity:JSON.stringify(["w-private","p-private",agent,"s-private"]),stateChangeSeq:5};},async prompt(){calls.push("prompt");throw new Error("forbidden");},async wait(){throw new Error("forbidden");},async cancel(){throw new Error("forbidden");}};
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w-private","p-private","s-private");database.beginJobDispatch(job.job_id);
+    const calls:string[]=[];let transitioned=false;const runtime:JobAgentRuntime={async prepare(){throw new Error("unused");},async get(agent){calls.push("get");if(!transitioned){database.markJobNeedsReview(job.job_id,"prompt_acceptance_unknown","unknown");transitioned=true;}return {ok:true,stdout:"RAW PRIVATE",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working",agentIdentity:JSON.stringify(["w-private","p-private",agent,"s-private"]),stateChangeSeq:5};},async prompt(){calls.push("prompt");throw new Error("forbidden");},async wait(){throw new Error("forbidden");},async cancel(){throw new Error("forbidden");}};
     const supervisor=new JobSupervisor(database,runtime,config,logger,()=>{});const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},supervisor,config,logger);await api.start();try{
     const durable=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}`);
     assert.equal(durable.status,200);assert.equal("live_session" in durable.body,false);assert.deepEqual(calls,[]);
@@ -95,6 +95,7 @@ describe("DispatcherApi", () => {
     assert.equal(denied.status,403);assert.deepEqual(calls,[]);
     const live=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}&include_live_session=true`);
     assert.equal(live.status,200);assert.equal((live.body.live_session as {identity_match:boolean}).identity_match,true);assert.deepEqual(calls,["get"]);
+    assert.equal((live.body.job as {status:string}).status,"needs_review");assert.equal((live.body.receipt as {durable_status_after:string}).durable_status_after,"needs_review");
     assert.doesNotMatch(JSON.stringify(live.body),/w-private|p-private|s-private|RAW PRIVATE/);
     const receiptId=(live.body.receipt as {receipt_id:string}).receipt_id;
     const reread=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/live-session-receipts/${receiptId}?source_event_id=${source.event_id}`);

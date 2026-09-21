@@ -32,6 +32,9 @@ export interface LiveSessionIdentityRow {
   job_id: string;
   identity_version: 1;
   herdr_agent_session_id: string;
+  herdr_workspace_id: string | null;
+  herdr_pane_id: string | null;
+  agent_name: string | null;
   recorded_at: string;
 }
 
@@ -109,6 +112,9 @@ export function migrateLiveSession(db: Database.Database): void {
       job_id TEXT PRIMARY KEY,
       identity_version INTEGER NOT NULL CHECK (identity_version = 1),
       herdr_agent_session_id TEXT NOT NULL CHECK (length(herdr_agent_session_id) BETWEEN 1 AND 512),
+      herdr_workspace_id TEXT NOT NULL,
+      herdr_pane_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL,
       recorded_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS live_session_query_receipts (
@@ -141,10 +147,15 @@ export function migrateLiveSession(db: Database.Database): void {
     CREATE TRIGGER IF NOT EXISTS live_session_receipts_no_update
       BEFORE UPDATE ON live_session_query_receipts BEGIN SELECT RAISE(ABORT, 'live_session_receipt_append_only'); END;
   `);
+  const identityColumns = new Set((db.prepare("PRAGMA table_info(job_live_session_identities)").all() as Array<{name:string}>).map(row=>row.name));
+  for (const column of ["herdr_workspace_id", "herdr_pane_id", "agent_name"] as const) {
+    if (!identityColumns.has(column)) db.exec(`ALTER TABLE job_live_session_identities ADD COLUMN ${column} TEXT`);
+  }
 }
 
 export function expectedLiveSessionIdentity(job: JobRow, identity: LiveSessionIdentityRow | undefined): string | undefined {
   if (!job.herdr_workspace_id || !job.herdr_pane_id || !identity?.herdr_agent_session_id) return undefined;
+  if (identity.herdr_workspace_id !== job.herdr_workspace_id || identity.herdr_pane_id !== job.herdr_pane_id || identity.agent_name !== job.agent_name) return undefined;
   return JSON.stringify([job.herdr_workspace_id, job.herdr_pane_id, job.agent_name, identity.herdr_agent_session_id]);
 }
 

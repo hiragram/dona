@@ -954,8 +954,9 @@ export class DispatcherDatabase {
       if(changed!==1)throw new Error(`Job ${jobId} is no longer preparing or cancelling`);
       this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
       if (agentSessionId !== undefined) this.db.prepare(`INSERT INTO job_live_session_identities(
-        job_id,identity_version,herdr_agent_session_id,recorded_at) VALUES(?,1,?,?)`)
-        .run(jobId,agentSessionId,at.toISOString());
+        job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at)
+        SELECT job_id,1,?,?,?,?,? FROM jobs WHERE job_id=?`)
+        .run(agentSessionId,herdrWorkspaceId,herdrPaneId,this.getJobRequired(jobId).agent_name,at.toISOString(),jobId);
     }).immediate();
   }
 
@@ -974,10 +975,10 @@ export class DispatcherDatabase {
   }
 
   latestLiveSessionStateChangeSeq(jobId: string, identityRecordedAt: string): number | undefined {
-    const row=this.db.prepare(`SELECT state_change_seq FROM live_session_query_receipts
+    const row=this.db.prepare(`SELECT MAX(state_change_seq) AS state_change_seq FROM live_session_query_receipts
       WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL
-      ORDER BY sequence DESC LIMIT 1`).get(jobId,identityRecordedAt) as {state_change_seq:number}|undefined;
-    return row?.state_change_seq;
+      `).get(jobId,identityRecordedAt) as {state_change_seq:number|null}|undefined;
+    return row?.state_change_seq ?? undefined;
   }
 
   liveSessionRetentionPlan(cutoff: string): { receipt_rows: number } {

@@ -743,12 +743,16 @@ export class DispatcherApi {
       }
       const includeLive=url.searchParams.get("include_live_session");
       if(includeLive!==null&&includeLive!=="true"&&includeLive!=="false")throw new ApiRequestError(400,"invalid_request","include_live_session must be true or false");
-      const projected={...job,...this.database.jobNotificationState(jobId)};
       if(includeLive==="true"){
         if(!this.jobs.observeLiveSession)throw new ApiRequestError(503,"live_session_unavailable","Live session observation is unavailable");
-        try{sendJson(response,200,projectLiveJobResponse(projected,await this.jobs.observeLiveSession(jobId,sourceEventId)));}
+        try{
+          const receipt=await this.jobs.observeLiveSession(jobId,sourceEventId);
+          const refreshed=this.database.getJob(jobId);
+          if(!refreshed)throw new Error(`Job ${jobId} disappeared during live observation`);
+          sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
+        }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: projected });
+      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
       return;
     }
     if (request.method === "POST" && action === "steer") {

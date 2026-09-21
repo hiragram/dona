@@ -35,7 +35,7 @@ snapshotの`freshness_ms`はquery開始から完了までの時間で、継続�
 
 ## 永続化、crash、concurrency、retention
 
-`live_session_schema` version 1はcore `PRAGMA user_version` 2/3と独立しています。`job_live_session_identities`は新しいagent準備時にworkspace/pane更新と同じtransactionでHerdr agent session IDを記録します。旧jobや旧binaryが作成したidentity欠落rowは推測せず`not_addressable`です。
+`live_session_schema` version 1はcore `PRAGMA user_version` 2/3と独立しています。`job_live_session_identities`は新しいagent準備時にworkspace/pane更新と同じtransactionでHerdr agent session IDと、その時点のworkspace/pane/agentを記録します。現在のruntime列と保存世代が一致しない場合や、旧job・旧binaryが作成したidentity欠落rowは推測せず`not_addressable`です。
 
 `live_session_query_receipts`はquery完了後に1 transactionでappendし、UPDATE triggerで改変を拒否します。process crashがappend前ならreceiptは存在せず、観測済みと推測しません。append後なら再起動後もopaque receipt IDで再読できます。並行queryは独立receiptを作り、job/session control stateを共有・変更しません。監査appendに失敗した場合、APIは`live_session_audit_unavailable`としてfail closedし、観測だけを成功として返しません。
 
@@ -52,7 +52,7 @@ receipt/auditにはjob ID、source event ID、boot discriminator、時刻、dura
 
 rolloutは既定offのadditive opt-inです。先にunit/fake API/MCP/CLIとmigration/restart/fault testを完了し、その後に認可された隔離環境だけでlive smokeを行います。production sessionを試験対象にしません。
 
-rollback時、旧binaryは従来の`jobs` schemaとcore `user_version`をそのまま読書きし、独立tableを無視します。新binaryへ戻した際、旧binary期間に作成・再準備されたjobは保存済みagent session IDがないため`not_addressable`となります。独立tableをdropしたりidentityを推測backfillしたりせず、従来のdurable-only statusへ戻します。rollback中も既存receiptは削除されず、30日retentionだけが削除を所有します。
+rollback時、旧binaryは従来の`jobs` schemaとcore `user_version`をそのまま読書きし、独立tableを無視します。新binaryへ戻した際、旧binary期間に作成されたjobは保存済みagent session IDがなく、再準備されたjobは保存済みruntime世代と現在のruntime列が一致しないため、どちらも`not_addressable`となります。独立tableをdropしたりidentityを推測backfillしたりせず、従来のdurable-only statusへ戻します。rollback中も既存receiptは削除されず、30日retentionだけが削除を所有します。
 
 ## 隔離live smoke
 
