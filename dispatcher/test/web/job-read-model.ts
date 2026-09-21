@@ -7,11 +7,18 @@ import Database from "better-sqlite3";
 import { DispatcherDatabase, type WebJobReadIdentity } from "../../src/database.js";
 import { WebJobReadBroker } from "../../src/web/job-read-broker.js";
 import { maintainWebJobProjection, startWebJobProjectionMaintenance } from "../../src/web/job-read-maintenance.js";
+import type { RegistryPrincipal } from "../../src/web/domain.js";
 import type { JobProgressPhase } from "../../src/types.js";
 
-const owner:WebJobReadIdentity={instance_id:"instance",tenant_id:"tenant",principal_id:"principal",authorization_kind:"own"};
+const owner:WebJobReadIdentity={instance_id:"instance",tenant_id:"tenant",principal_id:"principal",
+  identity_binding_revision:1,authz_revision:1,authorization_kind:"own"};
+const registryPrincipal=(identity:WebJobReadIdentity,options:{state?:"active"|"revoked";observer?:boolean}={}):RegistryPrincipal=>{
+  const observer=options.observer??true;return{codec_version:1,instance_id:identity.instance_id,tenant_id:identity.tenant_id,
+    principal_id:identity.principal_id,state:options.state??"active",revoke_generation:1,identity_binding_revision:identity.identity_binding_revision,
+    authz_revision:identity.authz_revision,role_ids:observer?["observer"]:["requester"],scopes:observer?["job:read:granted"]:["job:read:own"]};};
 const browserPrincipal=(identity:WebJobReadIdentity,scopes=["job:read:own"])=>(
-  {instance_id:identity.instance_id,tenant_id:identity.tenant_id,principal_id:identity.principal_id,scopes});
+  {instance_id:identity.instance_id,tenant_id:identity.tenant_id,principal_id:identity.principal_id,
+    identity_binding_revision:identity.identity_binding_revision,authz_revision:identity.authz_revision,scopes});
 const readAuth=(identity:WebJobReadIdentity,scopes=["job:read:own"],effective_utc="2026-09-21T00:01:00.000Z",
   auditJobReadOutcome:(...args:unknown[])=>boolean=()=>true)=>({verifyJobReadIngress:()=>({status:"succeeded" as const,kind:"job_read_session_verified" as const,
     principal:browserPrincipal(identity,scopes),session_ref:"session",effective_utc}),auditJobReadOutcome});
@@ -108,7 +115,7 @@ test("旧cursor schemaと旧update triggerをtransactionalにupgradeする",t=>{
   const columns=f.raw.pragma("table_info(web_job_projection_cursors)") as Array<{name:string}>;
   assert.equal(columns.some(column=>column.name==="authorization_kind"),true);
   assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors WHERE cursor_digest=?").get("a".repeat(64)) as {count:number}).count,0);
-  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1").get() as {version:number}).version,3);
+  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1").get() as {version:number}).version,4);
   const trigger=(f.raw.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get() as {sql:string}).sql;
   assert.equal(trigger.includes("old.status IS NOT new.status"),true);
   assert.equal(trigger.includes("old.result_json"),false);
@@ -130,12 +137,36 @@ test("version 2 cursor schemaはgrant evidence追加時に旧cursorをinvalid化
   const columns=f.raw.pragma("table_info(web_job_projection_cursors)") as Array<{name:string}>;
   assert.equal(columns.some(column=>column.name==="grant_revision"),true);
   assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors WHERE cursor_digest=?").get("b".repeat(64)) as {count:number}).count,0);
-  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema").get() as {version:number}).version,3);
+  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema").get() as {version:number}).version,4);
+});
+
+test("version 3 grantは厳格version 4 schemaへfail-closed移行する",t=>{const f=fixture(t),job=f.seed();
+  f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:01:00.000Z"));
+  f.raw.exec(`
+    DROP TABLE web_job_read_grants;
+    CREATE TABLE web_job_read_grants (
+      grant_id TEXT PRIMARY KEY,job_id TEXT NOT NULL,instance_id TEXT NOT NULL,tenant_id TEXT NOT NULL,principal_id TEXT NOT NULL,
+      grant_revision INTEGER NOT NULL,state TEXT NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+      UNIQUE(job_id,instance_id,tenant_id,principal_id)
+    ) STRICT;
+    CREATE INDEX web_job_read_grants_principal_idx ON web_job_read_grants(instance_id,tenant_id,principal_id,state,expires_at,job_id);
+    INSERT INTO web_job_read_grants VALUES('legacy','${job}','instance','tenant','observer',7,'active',
+      '2026-09-22T00:00:00.000Z','2026-09-21T00:00:00.000Z','2026-09-21T00:00:00.000Z');
+    UPDATE web_job_projection_schema SET version=3;
+  `);
+  (f.jobs as unknown as {webJobProjectionReady:boolean}).webJobProjectionReady=false;
+  f.jobs.listWebJobs(owner,20);
+  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema").get() as {version:number}).version,4);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_read_grants").get() as {count:number}).count,0);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors").get() as {count:number}).count,0);
+  const columns=f.raw.pragma("table_info(web_job_read_grants)") as Array<{name:string;notnull:number}>;
+  for(const name of ["owner_principal_id","principal_identity_binding_revision","principal_authz_revision"])
+    assert.equal(columns.find(column=>column.name===name)?.notnull,1,name);
 });
 
 test("未知のprojection schema versionはDDL前にfail closedする",t=>{const f=fixture(t),job=f.seed();
   f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:01:00.000Z"));
-  f.raw.exec(`UPDATE web_job_projection_schema SET version=4;
+  f.raw.exec(`UPDATE web_job_projection_schema SET version=5;
     DROP TRIGGER web_job_projection_update;
     CREATE TRIGGER web_job_projection_update AFTER UPDATE ON jobs BEGIN SELECT 1; END;`);
   const before=(f.raw.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get() as {sql:string}).sql;
@@ -254,28 +285,40 @@ test("can_cancelは現行cancel受付状態だけを公開する",t=>{const f=fi
 
 test("observerはcurrent明示grantのjobだけを読めて失効後はnot_foundになる",t=>{const f=fixture(t),job=f.seed();
   const observer:WebJobReadIdentity={...owner,principal_id:"observer",authorization_kind:"granted"};
-  f.jobs.listWebJobs(owner,20);
-  f.raw.prepare(`INSERT INTO web_job_read_grants
-    (grant_id,job_id,instance_id,tenant_id,principal_id,grant_revision,state,expires_at,created_at,updated_at)
-    VALUES(?,?,?,?,?,1,'active',?,?,?)`).run("grant-1",job,observer.instance_id,observer.tenant_id,observer.principal_id,
-      "2026-09-22T00:00:00.000Z","2026-09-21T00:00:00.000Z","2026-09-21T00:00:00.000Z");
+  const grantInput={operation_id:"grant_issue_1",operation:"grant" as const,job_id:job,expected_owner_principal_id:owner.principal_id,
+    principal_id:observer.principal_id,principal_identity_binding_revision:observer.identity_binding_revision,
+    principal_authz_revision:observer.authz_revision,expected_grant_revision:0,expires_at:"2026-09-22T00:00:00.000Z"};
+  assert.throws(()=>f.jobs.mutateWebJobReadGrant(grantInput,undefined,new Date("2026-09-21T00:00:00.000Z")),/not_found/);
+  assert.throws(()=>f.jobs.mutateWebJobReadGrant(grantInput,registryPrincipal({...observer,identity_binding_revision:2}),new Date("2026-09-21T00:00:00.000Z")),/not_found/);
+  assert.throws(()=>f.jobs.mutateWebJobReadGrant(grantInput,registryPrincipal(observer,{state:"revoked"}),new Date("2026-09-21T00:00:00.000Z")),/not_found/);
+  assert.throws(()=>f.jobs.mutateWebJobReadGrant(grantInput,registryPrincipal(observer,{observer:false}),new Date("2026-09-21T00:00:00.000Z")),/not_found/);
+  const issued=f.jobs.mutateWebJobReadGrant(grantInput,registryPrincipal(observer),new Date("2026-09-21T00:00:00.000Z"));assert.equal(issued.outcome,"created");
+  assert.deepEqual(f.jobs.mutateWebJobReadGrant(grantInput,undefined,new Date("2026-09-21T00:01:00.000Z")),{...issued,outcome:"reused"});
+  assert.throws(()=>f.jobs.mutateWebJobReadGrant({...grantInput,principal_authz_revision:2},registryPrincipal({...observer,authz_revision:2}),new Date("2026-09-21T00:01:00.000Z")),/idempotency/);
   const broker=new WebJobReadBroker(readAuth(observer,["job:read:granted"]) as never,f.jobs);
   const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});assert.equal(detail.status,"succeeded");
   if(detail.status!=="succeeded"||detail.kind!=="detail")return;
+  const stalePrincipal=new WebJobReadBroker(readAuth({...observer,authz_revision:2},["job:read:granted"]) as never,f.jobs);
+  assert.deepEqual(stalePrincipal.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),
+    {status:"denied",reason:"not_found"});
   const bound=f.raw.prepare("SELECT grant_id,grant_revision FROM web_job_projection_cursors WHERE resource_id=?").get(job);
-  assert.deepEqual(bound,{grant_id:"grant-1",grant_revision:1});
-  f.raw.prepare("UPDATE web_job_read_grants SET state='revoked',grant_revision=2,updated_at=? WHERE grant_id='grant-1'").run("2026-09-21T00:02:00.000Z");
+  assert.deepEqual(bound,{grant_id:issued.grant_id,grant_revision:1});
+  const {expires_at:_expires,...grantBinding}=grantInput;
+  const revoked=f.jobs.mutateWebJobReadGrant({...grantBinding,operation_id:"grant_revoke_1",operation:"revoke",expected_grant_revision:1},undefined,
+    new Date("2026-09-21T00:02:00.000Z"));assert.equal(revoked.grant_revision,2);
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),{status:"denied",reason:"not_found"});
-  f.raw.prepare("UPDATE web_job_read_grants SET state='active',grant_revision=3,updated_at=? WHERE grant_id='grant-1'").run("2026-09-21T00:03:00.000Z");
+  const regranted=f.jobs.mutateWebJobReadGrant({...grantInput,operation_id:"grant_issue_2",expected_grant_revision:2},registryPrincipal(observer),
+    new Date("2026-09-21T00:03:00.000Z"));assert.equal(regranted.grant_revision,3);
   assert.throws(()=>f.jobs.listWebJobChanges(observer,job,detail.event_cursor,50,new Date("2026-09-21T00:03:01.000Z")),/cursor/);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_read_grant_mutations").get() as {count:number}).count,3);
+  assert.throws(()=>f.raw.prepare("DELETE FROM web_job_read_grant_mutations").run(),/immutable/);
 });
 
 test("grantとcursor期限は認証transactionの保護時刻で評価する",t=>{const f=fixture(t),job=f.seed();
   const observer:WebJobReadIdentity={...owner,principal_id:"clocked",authorization_kind:"granted"};f.jobs.listWebJobs(owner,20);
-  f.raw.prepare(`INSERT INTO web_job_read_grants
-    (grant_id,job_id,instance_id,tenant_id,principal_id,grant_revision,state,expires_at,created_at,updated_at)
-    VALUES(?,?,?,?,?,1,'active',?,?,?)`).run("grant-clock",job,observer.instance_id,observer.tenant_id,observer.principal_id,
-      "2026-09-21T00:01:30.000Z","2026-09-21T00:00:00.000Z","2026-09-21T00:00:00.000Z");
+  f.jobs.mutateWebJobReadGrant({operation_id:"grant_clock_1",operation:"grant",job_id:job,expected_owner_principal_id:owner.principal_id,
+    principal_id:observer.principal_id,principal_identity_binding_revision:observer.identity_binding_revision,
+    principal_authz_revision:observer.authz_revision,expected_grant_revision:0,expires_at:"2026-09-21T00:01:30.000Z"},registryPrincipal(observer),new Date("2026-09-21T00:00:00.000Z"));
   const broker=new WebJobReadBroker(readAuth(observer,["job:read:granted"],"2026-09-21T00:02:00.000Z") as never,f.jobs);
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),
     {status:"denied",reason:"not_found"});
@@ -299,10 +342,9 @@ test("ownとgrantedの両scopeは両方のjobをunionしcursorへbindする",t=>
   const dual:WebJobReadIdentity={...owner,principal_id:"dual",authorization_kind:"own_or_granted"};
   const ownJob=f.seed(dual,"running","2026-09-21T00:00:01.000Z"),grantedJob=f.seed(owner,"running","2026-09-21T00:00:00.000Z");
   f.jobs.listWebJobs(owner,20);
-  f.raw.prepare(`INSERT INTO web_job_read_grants
-    (grant_id,job_id,instance_id,tenant_id,principal_id,grant_revision,state,expires_at,created_at,updated_at)
-    VALUES(?,?,?,?,?,1,'active',?,?,?)`).run("grant-dual",grantedJob,dual.instance_id,dual.tenant_id,dual.principal_id,
-      "2026-09-22T00:00:00.000Z","2026-09-21T00:00:00.000Z","2026-09-21T00:00:00.000Z");
+  f.jobs.mutateWebJobReadGrant({operation_id:"grant_dual_1",operation:"grant",job_id:grantedJob,expected_owner_principal_id:owner.principal_id,
+    principal_id:dual.principal_id,principal_identity_binding_revision:dual.identity_binding_revision,principal_authz_revision:dual.authz_revision,
+    expected_grant_revision:0,expires_at:"2026-09-22T00:00:00.000Z"},registryPrincipal(dual),new Date("2026-09-21T00:00:00.000Z"));
   const broker=new WebJobReadBroker(readAuth(dual,["job:read:own","job:read:granted"]) as never,f.jobs);
   const list=broker.execute({codec_version:1,operation:"list",method:"GET",target:"/api/jobs?limit=1",context:"context",limit:1});
   assert.equal(list.status,"succeeded");if(list.status!=="succeeded"||list.kind!=="list")return;
@@ -311,7 +353,9 @@ test("ownとgrantedの両scopeは両方のjobをunionしcursorへbindする",t=>
   const second=broker.execute({codec_version:1,operation:"list",method:"GET",target:`/api/jobs?limit=1&cursor=${encodeURIComponent(next)}`,
     context:"context",limit:1,cursor:next});
   assert.equal(second.status,"succeeded");if(second.status==="succeeded"&&second.kind==="list")assert.deepEqual(second.items.map(item=>item.job_id),[grantedJob]);
-  f.raw.prepare("UPDATE web_job_read_grants SET state='revoked',grant_revision=2 WHERE grant_id='grant-dual'").run();
+  f.jobs.mutateWebJobReadGrant({operation_id:"grant_dual_revoke",operation:"revoke",job_id:grantedJob,expected_owner_principal_id:owner.principal_id,
+    principal_id:dual.principal_id,principal_identity_binding_revision:dual.identity_binding_revision,principal_authz_revision:dual.authz_revision,
+    expected_grant_revision:1},undefined,new Date("2026-09-21T00:01:00.000Z"));
   const after=broker.execute({codec_version:1,operation:"list",method:"GET",target:"/api/jobs",context:"context"});
   assert.equal(after.status,"succeeded");if(after.status==="succeeded"&&after.kind==="list")assert.deepEqual(after.items.map(item=>item.job_id),[ownJob]);
 });

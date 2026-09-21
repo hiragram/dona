@@ -1,6 +1,6 @@
 # Web内部APIの単一UDS gateway
 
-`WebInternalGateway`は、BFF policyの一つの`dispatcher_socket_path`へ4種類の固定protocolを接続する。読取・session確認・login/失効操作・job commandを同じowner-only socketで処理する。ブラウザ向けlistenerや任意URLへのproxyではない。
+`WebInternalGateway`は、BFF policyの一つの`dispatcher_socket_path`へ固定protocolを接続する。読取・session確認・login/失効操作・job commandとlocal operator用のjob read grant更新を同じowner-only socketで処理する。ブラウザ向けlistenerや任意URLへのproxyではない。
 
 | protocol | 固定path | 固定Host | body上限 |
 | --- | --- | --- | --- |
@@ -8,8 +8,9 @@
 | [認証準備の読取](web-auth-read-service.md) | `/v1/web/auth/read` | `dona-web-auth-read` | 32 KiB |
 | [login・失効write](web-auth-write-service.md) | `/v1/web/auth/write` | `dona-web-auth-write` | 32 KiB |
 | [job submit・cancel](web-command-api.md) | `/v1/web/command` | `dona-web-command` | 128 KiB |
+| job read grant更新 | `/v1/admin/web-job-read-grants` | `dona-web-job-read-grants` | 16 KiB |
 
-pathとHostの組をserverの固定表から選び、各protocol固有のaudience・MAC domain・body/response bindingを検証する。別protocolのproofを転用できない。未知path、query、余分なheader、chunked body、upgrade、CONNECT、Expectを拒否する。routeやhandlerのcaller指定、外部への転送、汎用repository操作は受け付けない。
+pathとHostの組をserverの固定表から選び、BFF用protocolは各protocol固有のaudience・MAC domain・body/response bindingを検証する。別protocolのproofを転用できない。grant更新はBFFへ渡さない32-byte operator keyでexact bodyをdomain-separated HMAC認証するlocal operator経路であり、BFF service proofやbrowser sessionをauthorityとして受け付けず、audit-verified registry projectionを内部で取得する。operator key未設定時はrouteを起動せず、誤ったproofはrepositoryやDispatcher DBへ到達させない。未知path、query、余分なheader、chunked body、upgrade、CONNECT、Expectを拒否する。routeやhandlerのcaller指定、外部への転送、汎用repository操作は受け付けない。
 
 一つのlistenerが最大32接続を共有し、socketごとに1 request、whole request期限は最大5秒。parentはowner-only 0700、socketはowner-only 0600とし、実行時にもinodeと権限を照合する。scopeとrepositoryの設定が一致しない場合は起動しない。認証後・repository操作前・署名応答前にも接続期限とsocketを確認する。
 

@@ -366,6 +366,16 @@ export class WebAuthRepository {
     });
   }
 
+  /** Local operator projection only. The caller still owns resource-level
+   * authorization; this supplies one current audit-verified registry row. */
+  lookupPrincipalById(principalId:string) {
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(principalId))throw new WebStateError();
+    return this.audit.readVerifiedState(verified=>{
+      const state=this.load(verified)?.state;if(!state)throw new WebStateError();
+      return state.principals.find(value=>value.principal_id===principalId)??null;
+    });
+  }
+
   /** Verified local data only, never online authentication or resource authority.
    * Caller must supply all retained cookie index keys needed by current rows. */
   lookupSession(cookieIndexes: WebIndexCandidate[]) {

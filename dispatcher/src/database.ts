@@ -26,6 +26,7 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import type { RegistryPrincipal } from "./web/domain.js";
 import {
   canonicalJobPayloadSha256,
   jobCreationObjectiveBytesFromWorkspace,
@@ -171,7 +172,7 @@ function assertSupportedWebJobProjectionSchema(db: Database.Database): void {
   const schemaExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_job_projection_schema'").get();
   if (schemaExists) {
     const versions = db.prepare("SELECT version FROM web_job_projection_schema").all() as Array<{ version: number }>;
-    if (versions.length !== 1 || versions[0]!.version > 3) throw new Error("web_job_projection_schema_unsupported");
+    if (versions.length !== 1 || versions[0]!.version > 4) throw new Error("web_job_projection_schema_unsupported");
   }
 }
 
@@ -230,7 +231,10 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       job_id         TEXT NOT NULL,
       instance_id    TEXT NOT NULL,
       tenant_id      TEXT NOT NULL,
+      owner_principal_id TEXT NOT NULL,
       principal_id   TEXT NOT NULL,
+      principal_identity_binding_revision INTEGER NOT NULL CHECK (principal_identity_binding_revision>0),
+      principal_authz_revision INTEGER NOT NULL CHECK (principal_authz_revision>0),
       grant_revision INTEGER NOT NULL CHECK (grant_revision>0),
       state          TEXT NOT NULL CHECK (state IN ('active','revoked')),
       expires_at     TEXT NOT NULL,
@@ -240,6 +244,34 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS web_job_read_grants_principal_idx
       ON web_job_read_grants(instance_id,tenant_id,principal_id,state,expires_at,job_id);
+    CREATE TABLE IF NOT EXISTS web_job_read_grant_mutations (
+      sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id      TEXT NOT NULL UNIQUE,
+      canonical_sha256  TEXT NOT NULL CHECK (length(canonical_sha256)=64),
+      operation         TEXT NOT NULL CHECK (operation IN ('grant','revoke')),
+      grant_id          TEXT NOT NULL,
+      job_id            TEXT NOT NULL,
+      instance_id       TEXT NOT NULL,
+      tenant_id         TEXT NOT NULL,
+      owner_principal_id TEXT NOT NULL,
+      principal_id      TEXT NOT NULL,
+      principal_identity_binding_revision INTEGER NOT NULL,
+      principal_authz_revision INTEGER NOT NULL,
+      previous_revision INTEGER NOT NULL CHECK (previous_revision>=0),
+      grant_revision    INTEGER NOT NULL CHECK (grant_revision>0),
+      state             TEXT NOT NULL CHECK (state IN ('active','revoked')),
+      expires_at        TEXT NOT NULL,
+      occurred_at       TEXT NOT NULL
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS web_job_read_grant_mutations_no_update
+      BEFORE UPDATE ON web_job_read_grant_mutations BEGIN SELECT RAISE(ABORT,'web_job_read_grant_audit_immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS web_job_read_grant_mutations_no_delete
+      BEFORE DELETE ON web_job_read_grant_mutations BEGIN SELECT RAISE(ABORT,'web_job_read_grant_audit_immutable'); END;
+    CREATE TABLE IF NOT EXISTS web_job_read_grant_clock (
+      singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+      effective_utc TEXT NOT NULL
+    ) STRICT;
+    INSERT OR IGNORE INTO web_job_read_grant_clock(singleton,effective_utc) VALUES(1,'1970-01-01T00:00:00.000Z');
     CREATE TRIGGER IF NOT EXISTS web_job_projection_insert
       AFTER INSERT ON jobs WHEN new.source='web' BEGIN
         INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
@@ -252,7 +284,7 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       END;
   `);
   const upgrade = () => {
-    const current = db.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1")
+    let current = db.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1")
       .get() as { version: number } | undefined;
     if ((current?.version ?? 0) < 3) {
       const cursorColumns = db.pragma("table_info(web_job_projection_cursors)") as Array<{ name: string }>;
@@ -279,6 +311,31 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       `);
       db.prepare(`INSERT INTO web_job_projection_schema(singleton,version) VALUES(1,3)
         ON CONFLICT(singleton) DO UPDATE SET version=excluded.version`).run();
+      current={version:3};
+    }
+    if ((current?.version ?? 0) < 4) {
+      // v3 grants did not bind the authoritative owner or principal revisions.
+      // They cannot be upgraded safely, so invalidate them and every cursor that
+      // could carry their evidence while atomically publishing the v4 marker.
+      db.exec(`
+        DROP INDEX IF EXISTS web_job_read_grants_principal_idx;
+        ALTER TABLE web_job_read_grants RENAME TO web_job_read_grants_v3;
+        CREATE TABLE web_job_read_grants (
+          grant_id TEXT PRIMARY KEY,job_id TEXT NOT NULL,instance_id TEXT NOT NULL,tenant_id TEXT NOT NULL,
+          owner_principal_id TEXT NOT NULL,principal_id TEXT NOT NULL,
+          principal_identity_binding_revision INTEGER NOT NULL CHECK (principal_identity_binding_revision>0),
+          principal_authz_revision INTEGER NOT NULL CHECK (principal_authz_revision>0),
+          grant_revision INTEGER NOT NULL CHECK (grant_revision>0),state TEXT NOT NULL CHECK (state IN ('active','revoked')),
+          expires_at TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+          UNIQUE(job_id,instance_id,tenant_id,principal_id)
+        ) STRICT;
+        CREATE INDEX web_job_read_grants_principal_idx
+          ON web_job_read_grants(instance_id,tenant_id,principal_id,state,expires_at,job_id);
+        DROP TABLE web_job_read_grants_v3;
+        DELETE FROM web_job_projection_cursors;
+        INSERT INTO web_job_projection_schema(singleton,version) VALUES(1,4)
+          ON CONFLICT(singleton) DO UPDATE SET version=excluded.version;
+      `);
     }
     db.exec(`
       DROP TRIGGER IF EXISTS web_job_projection_update;
@@ -551,7 +608,47 @@ export interface WebJobReadIdentity {
   instance_id: string;
   tenant_id: string;
   principal_id: string;
+  identity_binding_revision: number;
+  authz_revision: number;
   authorization_kind: "own" | "granted" | "own_or_granted";
+}
+export interface WebJobReadGrantMutation {
+  operation_id: string;
+  operation: "grant" | "revoke";
+  job_id: string;
+  expected_owner_principal_id: string;
+  principal_id: string;
+  principal_identity_binding_revision: number;
+  principal_authz_revision: number;
+  expected_grant_revision: number;
+  expires_at?: string;
+}
+export function parseWebJobReadGrantMutation(value:unknown):WebJobReadGrantMutation {
+  if(!value||typeof value!=="object"||Array.isArray(value))throw new WebJobReadGrantError("invalid");
+  const raw=value as Record<string,unknown>,allowed=["schema_version","operation_id","operation","job_id","expected_owner_principal_id",
+    "principal_id","principal_identity_binding_revision","principal_authz_revision","expected_grant_revision","expires_at"];
+  if(Object.keys(raw).some(key=>!allowed.includes(key))||raw.schema_version!==1||typeof raw.operation_id!=="string"
+    ||(raw.operation!=="grant"&&raw.operation!=="revoke")||typeof raw.job_id!=="string"||typeof raw.expected_owner_principal_id!=="string"
+    ||typeof raw.principal_id!=="string"||typeof raw.principal_identity_binding_revision!=="number"
+    ||typeof raw.principal_authz_revision!=="number"||typeof raw.expected_grant_revision!=="number"
+    ||(raw.operation==="grant"?typeof raw.expires_at!=="string":raw.expires_at!==undefined))throw new WebJobReadGrantError("invalid");
+  return{operation_id:raw.operation_id,operation:raw.operation,job_id:raw.job_id,expected_owner_principal_id:raw.expected_owner_principal_id,
+    principal_id:raw.principal_id,principal_identity_binding_revision:raw.principal_identity_binding_revision,
+    principal_authz_revision:raw.principal_authz_revision,expected_grant_revision:raw.expected_grant_revision,
+    ...(raw.operation==="grant"?{expires_at:raw.expires_at as string}:{})};
+}
+export interface WebJobReadGrantResult {
+  outcome: "created" | "updated" | "revoked" | "reused";
+  grant_id: string;
+  grant_revision: number;
+  state: "active" | "revoked";
+  expires_at: string;
+  occurred_at: string;
+}
+export class WebJobReadGrantError extends Error {
+  constructor(readonly code:"invalid"|"not_found"|"revision_conflict"|"idempotency_conflict"|"state_conflict"){
+    super(`web_job_read_grant_${code}`);this.name="WebJobReadGrantError";
+  }
 }
 export interface WebJobPage {
   rows: JobRow[];
@@ -1117,6 +1214,89 @@ export class DispatcherDatabase {
       )`).run(at.toISOString(),remaining).changes:0;
       return { events, cursors };
     })();
+  }
+
+  private webJobReadGrantCanonical(input:WebJobReadGrantMutation):{expires:string|null;sha256:string}{
+    const id=/^[A-Za-z0-9_-]{1,128}$/;
+    if((input.operation!=="grant"&&input.operation!=="revoke")||!id.test(input.operation_id)||!id.test(input.job_id)
+      ||!id.test(input.expected_owner_principal_id)||!id.test(input.principal_id)
+      || !Number.isSafeInteger(input.principal_identity_binding_revision)||input.principal_identity_binding_revision<1
+      || !Number.isSafeInteger(input.principal_authz_revision)||input.principal_authz_revision<1
+      || !Number.isSafeInteger(input.expected_grant_revision)||input.expected_grant_revision<0)
+      throw new WebJobReadGrantError("invalid");
+    const expires=input.expires_at??null;
+    if(input.operation==="grant"?expires===null||!Number.isFinite(Date.parse(expires))||new Date(expires).toISOString()!==expires:expires!==null)
+      throw new WebJobReadGrantError("invalid");
+    return{expires,sha256:createHash("sha256").update(stableStringify({...input,expires_at:expires})).digest("hex")};
+  }
+
+  reconcileWebJobReadGrant(input:WebJobReadGrantMutation):WebJobReadGrantResult|undefined{
+    this.ensureWebJobProjectionReady();const {sha256}=this.webJobReadGrantCanonical(input);
+    const prior=this.db.prepare("SELECT * FROM web_job_read_grant_mutations WHERE operation_id=?").get(input.operation_id) as
+      ({canonical_sha256:string;grant_id:string;grant_revision:number;state:"active"|"revoked";expires_at:string;occurred_at:string}|undefined);
+    if(!prior)return undefined;if(prior.canonical_sha256!==sha256)throw new WebJobReadGrantError("idempotency_conflict");
+    return{outcome:"reused",grant_id:prior.grant_id,grant_revision:prior.grant_revision,state:prior.state,expires_at:prior.expires_at,occurred_at:prior.occurred_at};
+  }
+
+  mutateWebJobReadGrant(input:WebJobReadGrantMutation,currentGrantee:RegistryPrincipal|undefined,at=new Date()):WebJobReadGrantResult {
+    this.ensureWebJobProjectionReady();if(!Number.isFinite(at.getTime()))throw new WebJobReadGrantError("invalid");
+    const {expires,sha256:canonicalSha256}=this.webJobReadGrantCanonical(input),id=/^[A-Za-z0-9_-]{1,128}$/;
+    return this.db.transaction(()=>{
+      const prior=this.db.prepare("SELECT * FROM web_job_read_grant_mutations WHERE operation_id=?").get(input.operation_id) as
+        ({canonical_sha256:string;grant_id:string;grant_revision:number;state:"active"|"revoked";expires_at:string;occurred_at:string}|undefined);
+      if(prior){if(prior.canonical_sha256!==canonicalSha256)throw new WebJobReadGrantError("idempotency_conflict");
+        return{outcome:"reused" as const,grant_id:prior.grant_id,grant_revision:prior.grant_revision,state:prior.state,expires_at:prior.expires_at,occurred_at:prior.occurred_at};}
+      const clock=this.db.prepare("SELECT effective_utc FROM web_job_read_grant_clock WHERE singleton=1").get() as {effective_utc:string};
+      const effective=new Date(Math.max(at.getTime(),Date.parse(clock.effective_utc))).toISOString();
+      if(expires!==null&&(Date.parse(expires)<=Date.parse(effective)||Date.parse(expires)-Date.parse(effective)>30*24*60*60*1000))
+        throw new WebJobReadGrantError("invalid");
+      const owner=this.db.prepare(`SELECT jobs.actor_id AS owner_principal_id,jobs.workspace_id AS tenant_id,
+          json_extract(source_event.subject_json,'$.instance_id') AS instance_id,
+          json_extract(source_event.subject_json,'$.tenant_id') AS subject_tenant_id,
+          json_extract(source_event.subject_json,'$.principal_id') AS subject_principal_id
+        FROM jobs JOIN events source_event ON source_event.event_id=jobs.source_event_id
+        WHERE jobs.job_id=? AND jobs.source='web' AND source_event.source='web' AND json_valid(source_event.subject_json)`)
+        .get(input.job_id) as {owner_principal_id:string;tenant_id:string;instance_id:string;subject_tenant_id:string;subject_principal_id:string}|undefined;
+      if(!owner||!id.test(owner.instance_id)||owner.owner_principal_id!==input.expected_owner_principal_id
+        ||owner.subject_principal_id!==owner.owner_principal_id||owner.subject_tenant_id!==owner.tenant_id)throw new WebJobReadGrantError("not_found");
+      if(input.operation==="grant"&&(!currentGrantee||currentGrantee.instance_id!==owner.instance_id||currentGrantee.tenant_id!==owner.tenant_id
+        ||currentGrantee.principal_id!==input.principal_id||currentGrantee.state!=="active"||!currentGrantee.role_ids.includes("observer")
+        ||!currentGrantee.scopes.includes("job:read:granted")||currentGrantee.identity_binding_revision!==input.principal_identity_binding_revision
+        ||currentGrantee.authz_revision!==input.principal_authz_revision))throw new WebJobReadGrantError("not_found");
+      const current=this.db.prepare(`SELECT grant_id,grant_revision,state,expires_at,created_at,
+          principal_identity_binding_revision,principal_authz_revision FROM web_job_read_grants
+        WHERE job_id=? AND instance_id=? AND tenant_id=? AND principal_id=?`).get(input.job_id,owner.instance_id,owner.tenant_id,input.principal_id) as
+        ({grant_id:string;grant_revision:number;state:"active"|"revoked";expires_at:string;created_at:string;
+          principal_identity_binding_revision:number;principal_authz_revision:number}|undefined);
+      if((current?.grant_revision??0)!==input.expected_grant_revision)throw new WebJobReadGrantError("revision_conflict");
+      let grantId:string,revision:number,state:"active"|"revoked",expiry:string,outcome:"created"|"updated"|"revoked";
+      if(input.operation==="grant"){
+        grantId=current?.grant_id??`wgr_${ulid()}`;revision=(current?.grant_revision??0)+1;state="active";expiry=expires!;outcome=current?"updated":"created";
+        if(current)this.db.prepare(`UPDATE web_job_read_grants SET owner_principal_id=?,principal_identity_binding_revision=?,principal_authz_revision=?,
+          grant_revision=?,state='active',expires_at=?,updated_at=? WHERE grant_id=?`).run(owner.owner_principal_id,input.principal_identity_binding_revision,
+          input.principal_authz_revision,revision,expiry,effective,grantId);
+        else this.db.prepare(`INSERT INTO web_job_read_grants
+          (grant_id,job_id,instance_id,tenant_id,owner_principal_id,principal_id,principal_identity_binding_revision,principal_authz_revision,
+            grant_revision,state,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,'active',?,?,?)`)
+          .run(grantId,input.job_id,owner.instance_id,owner.tenant_id,owner.owner_principal_id,input.principal_id,
+            input.principal_identity_binding_revision,input.principal_authz_revision,expiry,effective,effective);
+      }else{
+        if(!current)throw new WebJobReadGrantError("not_found");if(current.state==="revoked")throw new WebJobReadGrantError("state_conflict");
+        if(current.principal_identity_binding_revision!==input.principal_identity_binding_revision
+          ||current.principal_authz_revision!==input.principal_authz_revision)throw new WebJobReadGrantError("revision_conflict");
+        grantId=current.grant_id;revision=current.grant_revision+1;state="revoked";expiry=current.expires_at;outcome="revoked";
+        this.db.prepare(`UPDATE web_job_read_grants SET owner_principal_id=?,grant_revision=?,state='revoked',updated_at=? WHERE grant_id=?`)
+          .run(owner.owner_principal_id,revision,effective,grantId);
+      }
+      this.db.prepare(`INSERT INTO web_job_read_grant_mutations
+        (operation_id,canonical_sha256,operation,grant_id,job_id,instance_id,tenant_id,owner_principal_id,principal_id,
+          principal_identity_binding_revision,principal_authz_revision,previous_revision,grant_revision,state,expires_at,occurred_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(input.operation_id,canonicalSha256,input.operation,grantId,input.job_id,owner.instance_id,
+          owner.tenant_id,owner.owner_principal_id,input.principal_id,input.principal_identity_binding_revision,input.principal_authz_revision,
+          input.expected_grant_revision,revision,state,expiry,effective);
+      this.db.prepare("UPDATE web_job_read_grant_clock SET effective_utc=? WHERE singleton=1").run(effective);
+      return{outcome,grant_id:grantId,grant_revision:revision,state,expires_at:expiry,occurred_at:effective};
+    }).immediate();
   }
 
   getJobGroup(sourceEventId: string): JobGroupRow | undefined {
@@ -1952,18 +2132,22 @@ export class DispatcherDatabase {
       AND ((? IN ('own','own_or_granted') AND jobs.actor_id=? AND json_extract(source_event.subject_json,'$.principal_id')=?)
         OR (? IN ('granted','own_or_granted') AND EXISTS (SELECT 1 FROM web_job_read_grants grant_row
           WHERE grant_row.job_id=jobs.job_id AND grant_row.instance_id=? AND grant_row.tenant_id=?
-            AND grant_row.principal_id=? AND grant_row.state='active' AND grant_row.expires_at>?)))`;
+            AND grant_row.principal_id=? AND grant_row.principal_identity_binding_revision=? AND grant_row.principal_authz_revision=?
+            AND grant_row.state='active' AND grant_row.expires_at>?)))`;
   }
 
   private webJobAccessParameters(identity: WebJobReadIdentity, now: string): unknown[] {
     return [identity.tenant_id, identity.instance_id, identity.tenant_id,
       identity.authorization_kind, identity.principal_id, identity.principal_id,
-      identity.authorization_kind, identity.instance_id, identity.tenant_id, identity.principal_id, now];
+      identity.authorization_kind, identity.instance_id, identity.tenant_id, identity.principal_id,
+      identity.identity_binding_revision,identity.authz_revision,now];
   }
 
   private assertWebReadIdentity(identity: WebJobReadIdentity): void {
     for (const value of [identity.instance_id, identity.tenant_id, identity.principal_id])
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("web_job_read_invalid");
+    if(!Number.isSafeInteger(identity.identity_binding_revision)||identity.identity_binding_revision<1
+      ||!Number.isSafeInteger(identity.authz_revision)||identity.authz_revision<1)throw new Error("web_job_read_invalid");
     if (!['own','granted','own_or_granted'].includes(identity.authorization_kind)) throw new Error("web_job_read_invalid");
   }
 
@@ -2013,8 +2197,10 @@ export class DispatcherDatabase {
       if(owned)return null;
     }
     const grant=this.db.prepare(`SELECT grant_id,grant_revision FROM web_job_read_grants
-      WHERE job_id=? AND instance_id=? AND tenant_id=? AND principal_id=? AND state='active' AND expires_at>?`)
-      .get(jobId,identity.instance_id,identity.tenant_id,identity.principal_id,now) as {grant_id:string;grant_revision:number}|undefined;
+      WHERE job_id=? AND instance_id=? AND tenant_id=? AND principal_id=? AND principal_identity_binding_revision=? AND principal_authz_revision=?
+        AND state='active' AND expires_at>?`)
+      .get(jobId,identity.instance_id,identity.tenant_id,identity.principal_id,identity.identity_binding_revision,identity.authz_revision,now) as
+      {grant_id:string;grant_revision:number}|undefined;
     if(!grant)throw new Error("web_job_cursor_invalid");return grant;
   }
 

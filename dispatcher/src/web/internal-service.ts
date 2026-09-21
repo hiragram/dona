@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import type net from "node:net";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { parseWebJobReadGrantMutation, WebJobReadGrantError } from "../database.js";
 import { WebAuthRepository, type WebStoreResult } from "./repository.js";
 import { authWriteResultSchema, writeTransactionId } from "./write-shapes.js";
 import * as sessionAuth from "./service-auth.js";
@@ -17,8 +18,10 @@ import { maximumWebCommandBodyBytes, parseWebCommandInput, signWebCommandRespons
 import type { WebCommandBroker } from "./command-broker.js";
 
 const kinds = ["session", "read", "write", "command", "job_read"] as const;
+const webJobReadGrantPath="/v1/admin/web-job-read-grants",webJobReadGrantHost="dona-web-job-read-grants",maximumWebJobReadGrantBodyBytes=16384;
 type Kind = typeof kinds[number];
 type Mode = Kind | "all";
+export type WebJobReadGrantOperatorKey=()=>Uint8Array;
 const protocols = Object.freeze({
   session: Object.freeze({ path: sessionAuth.webSessionServicePath, host: sessionAuth.webSessionServiceHost,
     maximum: sessionAuth.maximumServiceBodyBytes, type: "application/vnd.dona.web-session-response" }),
@@ -76,7 +79,8 @@ export class WebInternalService {
   private readonly scope: ServiceScope;
   constructor(private readonly socketPath: string, scope: ServiceScope, private readonly repository: WebAuthRepository,
     private readonly credentials: WebServiceCredentialLookup, private readonly now: () => string, private readonly deadlineMs: number, private readonly mode: Mode,
-    private readonly commands?: WebCommandBroker, private readonly jobReads?: WebJobReadBroker) {
+    private readonly commands?: WebCommandBroker, private readonly jobReads?: WebJobReadBroker,
+    private readonly grantOperatorKey?:WebJobReadGrantOperatorKey) {
     this.scope = serviceScopeSchema.parse(scope);
     if (mode !== "all" && !kinds.includes(mode)) throw new WebServiceError();
     if (!(repository instanceof WebAuthRepository) || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 5000) throw new WebServiceError();
@@ -128,6 +132,32 @@ export class WebInternalService {
   private assertRequestReady(started: number, request: http.IncomingMessage, response: http.ServerResponse): void {
     if (performance.now() - started >= this.deadlineMs || request.socket.destroyed || response.destroyed) throw new WebServiceError();
     this.assertEndpoint();
+  }
+  private async processGrant(request:http.IncomingMessage,response:http.ServerResponse,started:number):Promise<void>{
+    if(this.mode!=="all"||!this.jobReads)throw new WebServiceError();
+    const headers=new Map<string,string>();
+    for(let index=0;index<request.rawHeaders.length;index+=2){const name=request.rawHeaders[index]!.toLowerCase(),value=request.rawHeaders[index+1]!;
+      if(!["host","content-type","content-length","connection","x-dona-operator-proof"].includes(name)||headers.has(name))throw new WebServiceError();headers.set(name,value);}
+    const length=headers.get("content-length"),proof=headers.get("x-dona-operator-proof");
+    if(request.method!=="POST"||request.url!==webJobReadGrantPath||request.httpVersion!=="1.1"||headers.get("host")!==webJobReadGrantHost
+      ||headers.get("content-type")!=="application/json"||headers.get("connection")!=="close"||!length||!/^[1-9][0-9]{0,4}$/.test(length)
+      ||Number(length)>maximumWebJobReadGrantBodyBytes)throw new WebServiceError();
+    const raw=await body(request,Number(length),maximumWebJobReadGrantBodyBytes);this.assertRequestReady(started,request,response);
+    const key=this.grantOperatorKey?.(),actual=proof&&/^[A-Za-z0-9_-]{43}$/.test(proof)?Buffer.from(proof,"base64url"):Buffer.alloc(0);
+    if(!(key instanceof Uint8Array)||key.byteLength!==32||actual.length!==32||!timingSafeEqual(actual,
+      createHmac("sha256",key).update("dona.web-job-read-grant.operator.v1\0").update(raw,"utf8").digest()))throw new WebServiceError();
+    try{
+      let decoded:unknown;try{decoded=JSON.parse(raw);}catch{throw new WebJobReadGrantError("invalid");}
+      const result=this.jobReads.mutateGrant(parseWebJobReadGrantMutation(decoded));this.assertRequestReady(started,request,response);
+      const encoded=Buffer.from(JSON.stringify({schema_version:1,...result}));response.writeHead(200,{"content-type":"application/json",
+        "content-length":String(encoded.length),connection:"close"});response.end(encoded);
+    }catch(error){
+      if(!(error instanceof WebJobReadGrantError))throw error;
+      this.assertRequestReady(started,request,response);
+      const status=error.code==="not_found"?404:["revision_conflict","idempotency_conflict","state_conflict"].includes(error.code)?409:400;
+      const encoded=Buffer.from(JSON.stringify({error:{code:`web_job_read_grant_${error.code}`,message:"Web job read grant request was rejected"}}));
+      response.writeHead(status,{"content-type":"application/json","content-length":String(encoded.length),connection:"close"});response.end(encoded);
+    }
   }
   private async process(kind: Kind, raw: string, proof: string, started: number, request: http.IncomingMessage, response: http.ServerResponse): Promise<string> {
     switch (kind) {
@@ -200,6 +230,7 @@ export class WebInternalService {
     const started = performance.now();
     try {
       this.assertEndpoint();
+      if(request.url===webJobReadGrantPath){await this.processGrant(request,response,started);return;}
       const headers = requestHeaders(request, this.mode), protocol = protocols[headers.kind];
       const raw = await body(request, headers.length, protocol.maximum);
       this.assertRequestReady(started, request, response);

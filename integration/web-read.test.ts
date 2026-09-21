@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import https from "node:https";
-import type { IncomingMessage } from "node:http";
+import http, { type IncomingMessage } from "node:http";
 import test from "node:test";
 import { createRequire } from "node:module";
+import { createHmac } from "node:crypto";
 import { DispatcherDatabase } from "../dispatcher/src/database.js";
 import { WebJobReadBroker } from "../dispatcher/src/web/job-read-broker.js";
 import { tempConfig } from "../dispatcher/test/helpers.js";
@@ -13,8 +14,50 @@ import { loginOidcFixture } from "../sources/web/test/login-oidc-fixture.js";
 import { certificate, request, tlsPolicy, tlsProvider } from "../sources/web/test/tls-fixture.js";
 import { fixture } from "./web-auth-fixture.js";
 import { scope } from "../dispatcher/test/web/fixtures.js";
+import { encodeWebAuthState } from "../dispatcher/src/web/model.js";
 const Database=createRequire(import.meta.url)("../dispatcher/node_modules/better-sqlite3") as new(path:string)=>{
   pragma(value:string):unknown;prepare(sql:string):{run(...values:unknown[]):unknown};close():void};
+function operatorGrant(socketPath:string,key:Uint8Array,payload:Record<string,unknown>){const encoded=Buffer.from(JSON.stringify(payload));
+  return new Promise<{status:number;body:Record<string,unknown>}>((resolve,reject)=>{const request=http.request({socketPath,method:"POST",
+    path:"/v1/admin/web-job-read-grants",agent:false,headers:{host:"dona-web-job-read-grants","content-type":"application/json",
+      "content-length":String(encoded.length),connection:"close","x-dona-operator-proof":createHmac("sha256",key)
+        .update("dona.web-job-read-grant.operator.v1\0").update(encoded).digest("base64url")}},response=>{const chunks:Buffer[]=[];response.on("data",chunk=>chunks.push(chunk));
+      response.once("error",reject);response.once("end",()=>resolve({status:response.statusCode??0,body:JSON.parse(Buffer.concat(chunks).toString()) as Record<string,unknown>}));});
+    request.once("error",reject);request.end(encoded);});}
+
+test("local operator grantは監査済みcurrent observerだけを許可しregistry不調後もrevokeできる",async t=>{
+  const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));const jobs=new DispatcherDatabase(config.databasePath);t.after(()=>jobs.close());
+  const raw=new Database(config.databasePath);raw.pragma("foreign_keys=ON");t.after(()=>raw.close());
+  const created="2026-09-19T00:00:00.000Z",event=jobs.enqueue({schema_version:1,source:"web",external_event_id:"grant-integration",
+    type:"web_job_submit",occurred_at:created,subject:{workspace_id:scope.tenant_id,actor_id:"principal",...scope,principal_id:"principal"},
+    payload:{},reply_target:null} as never).row;
+  const job=jobs.createJob({source_event_id:event.event_id,job_key:"grant",objective:"private",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const configured=await tlsPolicy(),operatorKey=Buffer.alloc(32,0x64);const f=await fixture(t,configured,
+    {jobReads:repository=>new WebJobReadBroker(repository,jobs),grantOperatorKey:()=>operatorKey});
+  const observer={codec_version:1 as const,...scope,principal_id:"observer",state:"active" as const,revoke_generation:1,
+    identity_binding_revision:3,authz_revision:5,role_ids:["observer" as const],scopes:["job:read:granted" as const]};
+  f.transaction.runPrepared("fixture_grant_observer",(_mark,verified)=>{const before=f.readState(),prior=encodeWebAuthState(before);
+    assert.equal(verified.resource_bindings.find(binding=>binding.resource_id==="web_auth_state")?.resource_digest,prior.digest);
+    const next=encodeWebAuthState({...before,principals:[...before.principals,observer].sort((a,b)=>a.principal_id.localeCompare(b.principal_id))});
+    return{event:{scope,actor:{kind:"system" as const,id:"fixture_registry_seed"},action:"identity_change" as const,operation:"identity.change.v1" as const,
+      resource_id:"web_auth_state",outcome:"succeeded" as const,reason:"none" as const,session_ref:null,receipt_id:null,attempt_id:null,
+      policy_revision:1,binding_revision:3,authz_revision:5},resource_digest:next.digest,
+      mutation:()=>{f.db.prepare("UPDATE web_auth_state SET state_json=? WHERE instance_id=? AND tenant_id=?").run(next.canonical,scope.instance_id,scope.tenant_id);return null;}};});
+  const issue={schema_version:1,operation_id:"grant_runtime_issue",operation:"grant",job_id:job.job_id,expected_owner_principal_id:"principal",
+    principal_id:"observer",principal_identity_binding_revision:3,principal_authz_revision:5,expected_grant_revision:0,
+    expires_at:"2026-09-22T00:00:00.000Z"};
+  await assert.rejects(operatorGrant(f.socket,Buffer.alloc(32,0x65),issue));
+  const issued=await operatorGrant(f.socket,operatorKey,issue);assert.equal(issued.status,200);assert.equal(issued.body.outcome,"created");
+  assert.equal((await operatorGrant(f.socket,operatorKey,issue)).body.outcome,"reused");
+  const state=f.readState(),tampered=encodeWebAuthState({...state,principals:state.principals.map(row=>row.principal_id==="observer"?{...row,authz_revision:6}:row)});
+  f.db.prepare("UPDATE web_auth_state SET state_json=? WHERE instance_id=? AND tenant_id=?").run(tampered.canonical,scope.instance_id,scope.tenant_id);
+  await assert.rejects(operatorGrant(f.socket,operatorKey,{...issue,operation_id:"grant_runtime_regrant",expected_grant_revision:1,principal_authz_revision:6}));
+  assert.equal((await operatorGrant(f.socket,operatorKey,issue)).body.outcome,"reused");
+  const conflict=await operatorGrant(f.socket,operatorKey,{...issue,principal_authz_revision:6});assert.equal(conflict.status,409);
+  assert.equal((conflict.body.error as Record<string,unknown>).code,"web_job_read_grant_idempotency_conflict");
+  const revoked=await operatorGrant(f.socket,operatorKey,{...issue,operation_id:"grant_runtime_revoke",operation:"revoke",expected_grant_revision:1,expires_at:undefined});
+  assert.equal(revoked.status,200);assert.equal(revoked.body.state,"revoked");assert.equal(revoked.body.grant_revision,2);
+});
 
 test("TLSからprincipal-scoped snapshotとSSE再接続へ収束しprivate fieldを返さない",async t=>{
   const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));const jobs=new DispatcherDatabase(config.databasePath);t.after(()=>jobs.close());

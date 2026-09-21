@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { DispatcherDatabase, WebJobReadIdentity } from "../database.js";
+import type { DispatcherDatabase, WebJobReadGrantMutation, WebJobReadIdentity } from "../database.js";
 import type { JobProgressPhase, JobRow } from "../types.js";
 import type { WebAuthRepository, WebJobReadIngressResult } from "./repository.js";
 import { webJobProjectionSchema, type WebJobProjection, type WebJobReadInput, type WebJobReadResult } from "./job-read-wire.js";
@@ -12,6 +12,11 @@ const artifact=(value:unknown,index:number)=>{if(!value||typeof value!=="object"
   return{name:`artifact-${index+1}`,kind,...(media?{media_type:media}:{}),...(size!==null?{size_bytes:size}:{})};};
 export class WebJobReadBroker {
   constructor(private readonly auth:WebAuthRepository,private readonly database:DispatcherDatabase,private readonly progress?:WebJobProgressLookup){}
+  mutateGrant(input:WebJobReadGrantMutation,at=new Date()) {
+    const reconciled=this.database.reconcileWebJobReadGrant(input);if(reconciled)return reconciled;
+    const current=input.operation==="grant"?this.auth.lookupPrincipalById(input.principal_id)??undefined:undefined;
+    return this.database.mutateWebJobReadGrant(input,current,at);
+  }
   execute(input:WebJobReadInput):WebJobReadResult {
     let authority:Extract<WebJobReadIngressResult,{status:"succeeded"}>|undefined;
     const operation=input.operation==="list"?"web.job_list.v1":input.operation==="detail"?"web.job_read.v1":"web.sse_subscribe.v1";
@@ -31,7 +36,8 @@ export class WebJobReadBroker {
     const authorization_kind=owns&&granted?"own_or_granted":owns?"own":granted?"granted":null;
     if(!authorization_kind)return finish({status:"denied",reason:"scope_denied"},"denied","scope_denied");
     const identity:WebJobReadIdentity={instance_id:ingress.principal.instance_id,tenant_id:ingress.principal.tenant_id,
-      principal_id:ingress.principal.principal_id,authorization_kind};
+      principal_id:ingress.principal.principal_id,identity_binding_revision:ingress.principal.identity_binding_revision,
+      authz_revision:ingress.principal.authz_revision,authorization_kind};
     const url=new URL(input.target,"https://dona.invalid");
     if(input.operation==="list"){
       if(url.pathname!=="/api/jobs"||url.searchParams.size>2||url.searchParams.get("cursor")!==(input.cursor??null)

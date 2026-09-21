@@ -16,12 +16,14 @@ import { controllerFixture } from "../sources/web/test/auth-controller-fixture.j
 import { fixturePolicy, fixtureSecret } from "../sources/web/test/fixtures.js";
 import type { WebJobReadBroker } from "../dispatcher/src/web/job-read-broker.js";
 import type { WebCommandBroker } from "../dispatcher/src/web/command-broker.js";
+import type { WebJobReadGrantOperatorKey } from "../dispatcher/src/web/internal-service.js";
 
 // Real SQLite, audited repository, private UDS and BFF clients. IdP, protected
 // clock/anchor/key material and TLS-listener classification are fixtures only.
 export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePolicy(), brokers?: {
   commands?: (repository: WebAuthRepository) => WebCommandBroker;
   jobReads?: (repository: WebAuthRepository) => WebJobReadBroker;
+  grantOperatorKey?:WebJobReadGrantOperatorKey;
 }) {
   const db = setup(t), local = controllerFixture({ ...policy, ...scope });
   db.store.initialize("initialize"); db.seedRegistry();
@@ -48,7 +50,7 @@ export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePo
   const lookup = (version: number) => version === 1 ? credential : undefined;
   const repository = new WebAuthRepository(db.db, db.providers, scope, version => version === 1 ? local.keys.context() : undefined);
   const gateway = new WebInternalGateway(socket, scope, repository, lookup, local.now, 5000,
-    brokers?.commands?.(repository), brokers?.jobReads?.(repository)); await gateway.start();
+    brokers?.commands?.(repository), brokers?.jobReads?.(repository),brokers?.grantOperatorKey); await gateway.start();
   t.after(async () => { await gateway.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   let online: Record<string, unknown> = { active: true, sub: "subject-A", client_id: local.policy.oidc.client_id,
     aud: local.policy.oidc.access_token_audience, exp: Date.parse(local.initial) / 1000 + 300 }, idpCalls = 0;

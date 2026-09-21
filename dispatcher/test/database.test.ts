@@ -315,7 +315,8 @@ describe("DispatcherDatabase", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
-    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1", authorization_kind: "own" as const };
+    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1",
+      identity_binding_revision:1,authz_revision:1,authorization_kind: "own" as const };
     const fixture = new Database(config.databasePath);
     fixture.prepare("UPDATE events SET source='web',subject_json=? WHERE event_id='evt-source-running'")
       .run(JSON.stringify(owner));
@@ -345,9 +346,9 @@ describe("DispatcherDatabase", () => {
   test("未知のweb projection schemaではv2 jobs rebuild前にfail closedする", async () => {
     const { root, config } = await tempConfig(); roots.push(root); await createSchemaV2Fixture(config.databasePath);
     const v2 = new DispatcherDatabase(config.databasePath);
-    v2.listWebJobs({ instance_id:"instance",tenant_id:"T_TEST",principal_id:"U-1",authorization_kind:"own" },20);
+    v2.listWebJobs({ instance_id:"instance",tenant_id:"T_TEST",principal_id:"U-1",identity_binding_revision:1,authz_revision:1,authorization_kind:"own" },20);
     v2.close();
-    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=4").run();
+    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=5").run();
     const before = fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get();
     assert.throws(() => migrateDispatcherDatabase(fixture,()=>{},false,3),/schema_unsupported/);
     assert.deepEqual(fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get(),before);

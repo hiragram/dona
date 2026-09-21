@@ -4,6 +4,8 @@
 
 Web job read modelは、認証済みBFFがDispatcherのprincipal-scoped UDSを介して利用するread projectionである。browserが送るjob ID、cursor、`Last-Event-ID`、header内のactor情報はauthorityにしない。BFFがonline identity確認後に署名したingress contextをDispatcherのcurrent Web sessionへ再照合し、`job:read:own`ではpersisted ownerが一致する`source=web` job、`job:read:granted`ではcurrentな明示grantが一致するjobだけをfilterしてからpaginationする。両scopeがあるprincipalには両集合のunionを返す。grantはjob・instance・tenant・principal・revision・active/revoked状態・期限へ結合し、失効・期限切れ・別principalのgrantを未知jobと同じく不可視にする。
 
+明示grantのissue/regrant/revokeはbrowser routeやBFF credentialへ公開しない。Web auth repositoryとjob read brokerが接続され、BFFへ渡さないoperator専用HMAC keyを設定したowner-only internal gatewayの固定local-operator routeだけが受け付ける。issue/regrantは保護audit commitmentで検証したcurrent Web registry上のactive observer、`job:read:granted` scope、granteeの`identity_binding_revision`・`authz_revision`を照合してから、Dispatcher DBのpersisted Web job owner、期待grant revision、30日以内の期限を同じgrant transactionで照合する。server生成grant ID、CAS更新、idempotency receipt、immutable mutation auditは同じimmediate transactionで確定し、応答喪失時は同じ`operation_id`とcanonical payloadでread-backする。不存在・失効済み・scope不一致のgrantee、future/stale revision、別payloadでの再利用、stale grant revision、owner不一致は拒否する。revokeは保存済みgrant bindingとCASを照合するため、grantee失効やregistry read障害後もactive grantをfail-closedで閉じられる。
+
 本実装はjob submit/cancel、session/auth core、CSRF/origin、approval、artifact content downloadを変更しない。production listenerの有効化やlive provider検証も行わない。
 
 ## 公開projection
@@ -27,6 +29,7 @@ one-shotかつbody上限付きなので、slow consumerはTLS listenerの既存�
 - cursorが保持するsequenceより古いeventがretentionで失われた場合は、欠落を成功扱いせず`reset_required`を返す。clientは完全snapshotを再取得し、新しいdetail cursorから再開する。
 - Dispatcher UDS、署名response、current access確認、DB query、最終auditのいずれかが失敗した場合、BFFはstale cacheや旧APIへfallbackせず`identity_unavailable`にする。list/detail/SSEはsession auditに加えて専用operationでsuccess・resource不可視・cursor拒否・内部失敗の最終outcomeを記録し、応答直前にもcurrent session revisionを再照合する。
 - grant・cursorの期限判定とprogressの受信時刻にはsession ingressが確定したrollback-protectedな`effective_utc`を使い、OS wall clock巻戻りで失効済みauthorityを復活させない。未知のprojection schema versionはtriggerや`jobs` tableへDDLを行う前に拒否する。
+- grant mutation時刻はDispatcher DB内の単調watermarkから後退させず、issue/revoke記録は更新・削除不可のaudit rowとしてgrant変更と同時commitする。revision binding導入時はprojection schemaをversion 4へ上げ、revision evidenceを持たないversion 3 grantと既存cursorをfail-closedで破棄するため、旧binaryへのrollbackもversion markerで拒否される。local operator routeは通常のbrowser session、principal header、CSRF tokenをgrant authorityへ昇格させない。
 - event件数、cursor件数、最古event時刻、reset発生数を運用metric候補とする。private identity、job本文、Result summary、cursor token自体はlog/metricへ出さない。
 
 ## 検証
