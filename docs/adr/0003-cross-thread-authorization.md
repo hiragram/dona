@@ -19,11 +19,13 @@
 
 ## 証跡と永続境界
 
-principal proofの署名対象はcanonical JSONの`version, key_id, event_id, attempt, tenant_id, workspace_id, principal_kind, principal_id, issued_at, expires_at, nonce`である。`principal_kind` v1は`human`だけをowner-wide操作へ許可し、bot/service/schedule/unknownはdenyする。proof本文、署名、credentialは一般auditへ残さず、検証後はdigest、key ID、decision code、consumed timestampだけを保持する。
+principal proofの署名対象は`version, key_id, event_id, attempt, tenant_id, workspace_id, principal_kind, principal_id, issued_at, expires_at, nonce`である。署名bytesはUTF-8 JSON、object keyを全階層でASCII昇順、空白・末尾LFなしとする。`version`と`attempt`はsafe integerの10進表記、時刻はUTC秒精度の`YYYY-MM-DDTHH:mm:ssZ`、文字列はJSON標準escapeとし、浮動小数、重複key、未知fieldを拒否する。署名はHMAC-SHA-256の32-byte digestで比較はconstant-time、key materialは32 byte以上とする。fixtureの短いsample keyはgolden vector検算専用でproductionに使わない。`principal_kind` v1は`human`だけをowner-wide操作へ許可し、bot/service/schedule/unknownはdenyする。proof本文、署名、credentialは一般auditへ残さず、検証後はdigest、key ID、decision code、consumed timestampだけを保持する。
 
 永続bindingは元eventのimmutable identity、verified principal、proof digest、binding revision、created/revoked timestampsを持つ。eventの再送は同じattempt identityならidempotent、異なるprincipalやdigestならconflictとして隔離する。restart後もbindingとnonce消費を同じtransactionで読める必要があり、process memoryだけを正本にしない。
 
-grantのtyped intentは次のoperation catalogから選ぶ。`read_own_human_waits`、`read_exact_job_status`、`read_bounded_result`、`steer_exact_job`、`cancel_exact_job`、`resolve_origin_ref`は別権限であり、前者から後者を推論しない。Approval ADRが承認を要求するoperationは、そのapproval receiptも同じresource revisionへbindしなければdenyする。
+grantのtyped intentは次のoperation catalogから選ぶ。`read_own_human_waits`、`read_exact_job_status`、`read_bounded_result`、`steer_exact_job`、`cancel_exact_job`、`resolve_origin_ref`は別権限であり、前者から後者を推論しない。
+
+v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exact_job`と`cancel_exact_job`はIssue #15のsupervisor approval domainへ接続し、次のtyped receiptを必須とする。receiptは`version, receipt_id, issuer_kind, issuer_id, tenant_id, principal_id, resource_kind, resource_id, resource_revision, operation, issued_at, expires_at, policy_revision, nonce`を上記と同じcanonical encodingで署名する。issuerは`supervisor`だけ、expiryは発行から5分以内かつexclusive、operationとresource revisionは完全一致、一度だけ消費する。missing、unknown issuer、期限切れ、revision/operation不一致、#15の実装が未提供の場合は`approval_unavailable`でdenyし、read grantから補完しない。将来、対象operationまたはissuerを変える場合は新contract versionと#15側の合意が必要である。
 
 ## 認可decision table
 
