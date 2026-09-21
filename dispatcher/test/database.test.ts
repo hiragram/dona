@@ -1417,6 +1417,8 @@ describe("DispatcherDatabase", () => {
     assert.equal((raw.prepare("SELECT job_key FROM jobs WHERE job_id=?").get(job.job_id) as {job_key:string}).job_key,"bridge-key");
     assert.equal((raw.prepare("SELECT notification_mode FROM job_groups WHERE source_event_id=?").get(event.event_id) as {notification_mode:string}).notification_mode,"legacy");
     assert.equal((raw.prepare("SELECT stopped_at FROM legacy_job_agents_to_stop WHERE job_id=?").get(job.job_id) as {stopped_at:string}).stopped_at,event.updated_at);
+    assert.deepEqual(raw.prepare("SELECT owner_kind,resource_kind FROM job_authorization_bindings WHERE job_id=?").get(job.job_id),
+      {owner_kind:"unknown",resource_kind:"unknown"});
     assert.equal((raw.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name LIKE 'schedule%'").get() as {count:number}).count,schedulerTables);
     assert.equal(raw.pragma("integrity_check", { simple: true }), "ok");
     assert.deepEqual(raw.pragma("foreign_key_check"), []);
