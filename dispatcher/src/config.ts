@@ -4,6 +4,8 @@ import path from "node:path";
 
 export interface DispatcherConfig {
   socketPath: string;
+  agentSocketPath: string;
+  agentCredentialPath: string;
   databasePath: string;
   resultsDir: string;
   herdrSession: string;
@@ -107,6 +109,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
   }
   return {
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
+    agentSocketPath: expandHome(env.DONA_AGENT_SOCKET_PATH ?? path.join(base, "run", "dispatcher-agent.sock")),
+    agentCredentialPath: expandHome(env.DONA_AGENT_CREDENTIAL_PATH ?? path.join(base, "run", "dispatcher-agent.token")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),
     resultsDir: expandHome(env.DONA_RESULTS_DIR ?? path.join(base, "results")),
     herdrSession: nonEmpty(env.HERDR_SESSION, "dona", "HERDR_SESSION"),

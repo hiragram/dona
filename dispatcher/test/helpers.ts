@@ -18,6 +18,8 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
     root,
     config: {
       socketPath: path.join(root, "run", "dispatcher.sock"),
+      agentSocketPath: path.join(root, "run", "dispatcher-agent.sock"),
+      agentCredentialPath: path.join(root, "run", "dispatcher-agent.token"),
       databasePath: path.join(root, "dona.sqlite3"),
       resultsDir: path.join(root, "results"),
       herdrSession: "dona",

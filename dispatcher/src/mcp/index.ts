@@ -12,7 +12,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger("dona_dispatcher_mcp", { stderrOnly: true });
   const server = createDispatcherMcpServer(
-    new DispatcherApiClient(config.socketPath, Math.max(config.jobCommandTimeoutMs + 5_000, 140_000)),
+    new DispatcherApiClient(config.agentSocketPath, Math.max(config.jobCommandTimeoutMs + 5_000, 140_000), config.agentCredentialPath),
     logger,
   );
   await server.connect(new StdioServerTransport());

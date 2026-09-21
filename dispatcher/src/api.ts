@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
+import { agentBodyEventOperations, agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
@@ -91,6 +92,12 @@ async function socketIsAlive(socketPath: string, timeoutMs = 500): Promise<boole
   });
 }
 
+function agentRouteEventId(url: URL): string | undefined {
+  const match = /^\/v1\/(?:events|scheduled-jobs|job-notifications)\/([^/]+)\/(?:jobs|delegate|access|authorize)$/.exec(url.pathname);
+  if (match) return decodeURIComponent(match[1]!);
+  return url.searchParams.get("source_event_id") ?? undefined;
+}
+
 export interface ApiWorkerState {
   isRunning(): boolean;
   isHealthy?(): boolean;
@@ -125,12 +132,16 @@ export interface ApiJobProgressResolver {
 
 export class DispatcherApi {
   private server: http.Server | undefined;
+  private agentServer: http.Server | undefined;
+  private ownsAgentSocket = false;
+  private ownsAgentCredential = false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
   private readonly schedules: ScheduleApiService;
+  private readonly verifiedAgentContexts = new WeakMap<IncomingMessage, AgentExecutionContext>();
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -145,6 +156,7 @@ export class DispatcherApi {
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
+    private readonly agentContexts?: AgentContextManager,
   ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
@@ -152,6 +164,8 @@ export class DispatcherApi {
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
     await fs.chmod(path.dirname(this.config.socketPath), 0o700);
+    await fs.mkdir(path.dirname(this.config.agentSocketPath), { recursive: true, mode: 0o700 });
+    await fs.chmod(path.dirname(this.config.agentSocketPath), 0o700);
     await fs.mkdir(this.config.resultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.resultsDir, 0o700);
     try {
@@ -175,6 +189,28 @@ export class DispatcherApi {
       });
     });
     await fs.chmod(this.config.socketPath, 0o600);
+    if (this.agentContexts) {
+      try {
+        await fs.lstat(this.config.agentSocketPath);
+        if (await socketIsAlive(this.config.agentSocketPath)) throw new Error(`Another agent API is already listening on ${this.config.agentSocketPath}`);
+        await fs.unlink(this.config.agentSocketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await this.agentContexts.initialize();
+      this.ownsAgentCredential = true;
+      this.agentServer = http.createServer((request, response) => void this.handle(request, response, true));
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => reject(error);
+        this.agentServer!.once("error", onError);
+        this.agentServer!.listen(this.config.agentSocketPath, () => {
+          this.agentServer!.off("error", onError);
+          this.ownsAgentSocket = true;
+          resolve();
+        });
+      });
+      await fs.chmod(this.config.agentSocketPath, 0o600);
+    }
     this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
   }
 
@@ -199,24 +235,50 @@ export class DispatcherApi {
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
+    const ownsAgentSocket = this.ownsAgentSocket;
     if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
       });
     }
+    if (this.agentServer?.listening) {
+      await new Promise<void>((resolve, reject) => {
+        this.agentServer!.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+    this.agentServer = undefined;
+    this.ownsAgentSocket = false;
+    if (this.ownsAgentCredential) await this.agentContexts?.revoke();
+    this.ownsAgentCredential = false;
     this.server = undefined;
-    if (!ownsSocket) return;
-    try {
-      await fs.unlink(this.config.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (ownsSocket) {
+      try {
+        await fs.unlink(this.config.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (ownsAgentSocket) {
+      try { await fs.unlink(this.config.agentSocketPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     this.logger.info("Dispatcher API stopped");
   }
 
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async handle(request: IncomingMessage, response: ServerResponse, agentPlane = false): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (agentPlane) {
+        const operation = agentOperation(request.method, url);
+        const token = typeof request.headers["x-dona-agent-token"] === "string" ? request.headers["x-dona-agent-token"] : undefined;
+        const eventId = typeof request.headers["x-dona-source-event-id"] === "string" ? request.headers["x-dona-source-event-id"] : undefined;
+        const context = operation ? this.agentContexts?.authorize(token, eventId, operation) : undefined;
+        const routeEventId = agentRouteEventId(url);
+        if (!context || (routeEventId !== undefined && !this.agentContexts?.allowsRouteEvent(context, operation!, routeEventId))) {
+          throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+        }
+        this.verifiedAgentContexts.set(request, context);
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -712,6 +774,14 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
+      const agentContext = this.verifiedAgentContexts.get(request);
+      if (agentContext) {
+        const event = this.database.get(agentContext.event_id);
+        const target = event?.reply_target_json ? JSON.parse(event.reply_target_json) as Record<string, unknown> : undefined;
+        if (target?.workspace_id !== workspaceId || target.channel_id !== channelId || target.thread_ts !== threadTs) {
+          throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+        }
+      }
       const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
       sendJson(response, 200, {
         schema_version: 1,
@@ -798,10 +868,22 @@ export class DispatcherApi {
       throw new BodyTooLargeError();
     }
     const body = await readBody(request, this.config.requestMaxBytes);
+    let input: unknown;
     try {
-      return JSON.parse(body.toString("utf8"));
+      input = JSON.parse(body.toString("utf8"));
     } catch {
       throw new RequestValidationError("Request body must be valid JSON");
     }
+    const context = this.verifiedAgentContexts.get(request);
+    const operation = agentOperation(request.method, new URL(request.url ?? "/", "http://localhost"));
+    if (context && operation && agentBodyEventOperations.has(operation)) {
+      const sourceEventId = input && typeof input === "object" && !Array.isArray(input)
+        ? (input as Record<string, unknown>).source_event_id
+        : undefined;
+      if (sourceEventId !== context.event_id) {
+        throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+      }
+    }
+    return input;
   }
 }
