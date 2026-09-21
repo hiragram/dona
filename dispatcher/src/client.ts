@@ -66,6 +66,17 @@ export class DispatcherApiClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`, input);
   }
+  sendWorkerInstruction(jobId:string,input:unknown):Promise<Record<string,unknown>> {
+    return this.request("POST",`/v1/jobs/${encodeURIComponent(jobId)}/messages/instructions`,input);
+  }
+  getWorkerMessage(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({source_event_id:sourceEventId});
+    return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}?${query}`);
+  }
+  reconcileWorkerMessage(jobId:string,sourceEventId:string,producer:"worker"|"dona-main",idempotencyKey:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({source_event_id:sourceEventId,producer,idempotency_key:idempotencyKey});
+    return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/reconcile?${query}`);
+  }
   previewSchedule(input: unknown) { return this.request("POST", "/v1/schedules/preview", input); }
   createSchedule(input: unknown) { return this.request("POST", "/v1/schedules", input); }
   getSchedule(scheduleId: string, sourceEventId: string) { return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}?source_event_id=${encodeURIComponent(sourceEventId)}`); }

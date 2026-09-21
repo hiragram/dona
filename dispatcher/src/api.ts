@@ -14,6 +14,7 @@ import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
 import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
 import { ScheduleError } from "./scheduler/errors.js";
+import { WorkerMessageError } from "./worker-messaging.js";
 import {
   jobKeyPattern,
   parseCancelJobRequest,
@@ -192,7 +193,7 @@ export class DispatcherApi {
     this.shuttingDown = true;
   }
 
-  private readiness(): { ready: boolean; scheduler: Record<string, unknown> } {
+  private readiness(): { ready: boolean; scheduler: Record<string, unknown>; worker_messaging: Record<string, unknown> } {
     let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
       (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
     let operations: ReturnType<DispatcherDatabase["scheduler"]["operationalSnapshot"]> | undefined;
@@ -203,7 +204,10 @@ export class DispatcherApi {
     const scheduler = this.schedulerState?.operationalState();
     ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
       operations.stale_claims === 0 && operations.retention_overdue === 0;
-    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations } };
+    let workerMessaging: Record<string, unknown>;
+    try { workerMessaging = this.database.workerMessages.operationalSnapshot(); }
+    catch { workerMessaging = { protocol_version: 1, degraded: true, error_code: "worker_message_storage_unavailable" }; }
+    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations }, worker_messaging: workerMessaging };
   }
 
   async stop(): Promise<void> {
@@ -233,7 +237,7 @@ export class DispatcherApi {
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
         const health = this.readiness();
-        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler });
+        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler, worker_messaging: health.worker_messaging });
         return;
       }
       if (request.method === "GET" && url.pathname === "/metrics/scheduler") {
@@ -256,6 +260,7 @@ export class DispatcherApi {
           app_schema_write: appSchema.write,
           config: 1,
           scheduler: health.scheduler,
+          worker_messaging: health.worker_messaging,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;
@@ -511,6 +516,11 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
         sendJson(response, error.status, errorBody(error.code, error.message,error.details));
+      } else if (error instanceof WorkerMessageError) {
+        const status = error.code === "job_not_found" || error.code === "delivery_not_found" ? 404
+          : error.code === "job_binding_mismatch" ? 403
+            : error.code.startsWith("invalid_") || error.code === "worker_message_too_large" ? 400 : 409;
+        sendJson(response, status, errorBody(error.code, error.message));
       } else if (error instanceof ScheduleApiError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
       } else if (error instanceof Error && error.name === "ZodError") {
@@ -709,6 +719,68 @@ export class DispatcherApi {
         jobs: candidates.slice(0,100),
         truncated: candidates.length > 100,
       });
+      return;
+    }
+    const messageCollection = /^\/v1\/jobs\/([^/]+)\/messages\/(reports|instructions)$/.exec(url.pathname);
+    if (request.method === "POST" && messageCollection) {
+      const jobId = decodeURIComponent(messageCollection[1]!);
+      const input = await this.readJson(request);
+      const result = messageCollection[2] === "reports"
+        ? this.database.workerMessages.appendReport(jobId, input)
+        : this.database.workerMessages.appendInstruction(jobId, input);
+      if (messageCollection[2] === "reports") {
+        try { this.database.workerMessages.publishPendingReports(); }
+        catch { this.logger.warn("Worker message delivery deferred after durable acceptance", {
+          error_code:"worker_message_delivery_deferred",
+        }); }
+        this.worker.wake();
+      }
+      sendJson(response, result.outcome === "created" ? 202 : 200, {
+        schema_version: 1,
+        outcome: result.outcome,
+        message: this.database.workerMessages.project(result.message),
+        receipt: { receipt_id: result.receipt_id, kind: "accepted" },
+      });
+      return;
+    }
+    const messageReconcile = /^\/v1\/jobs\/([^/]+)\/messages\/reconcile$/.exec(url.pathname);
+    if (request.method === "GET" && messageReconcile) {
+      const producer = url.searchParams.get("producer");
+      if (producer !== "worker" && producer !== "dona-main") throw new ApiRequestError(400, "invalid_request", "producer is invalid");
+      const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+      const idempotencyKey = url.searchParams.get("idempotency_key") ?? "";
+      sendJson(response, 200, { schema_version: 1, ...this.database.workerMessages.reconcile(decodeURIComponent(messageReconcile[1]!), sourceEventId, producer, idempotencyKey) });
+      return;
+    }
+    const messageRead = /^\/v1\/jobs\/([^/]+)\/messages\/(msg_[0-9a-hjkmnp-tv-z]{26})$/.exec(url.pathname);
+    if (request.method === "GET" && messageRead) {
+      const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+      const row = this.database.workerMessages.getMessage(decodeURIComponent(messageRead[1]!), messageRead[2]!, sourceEventId);
+      if (!row) throw new WorkerMessageError("job_not_found", "message was not found for this job binding");
+      sendJson(response, 200, { schema_version: 1, message: { ...this.database.workerMessages.project(row), payload: JSON.parse(row.payload_json) } });
+      return;
+    }
+    const deliveryClaim = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/claim$/.exec(url.pathname);
+    if (request.method === "POST" && deliveryClaim) {
+      const input = await this.readJson(request) as Record<string, unknown>;
+      if ((input.consumer !== "worker" && input.consumer !== "dona-main") || typeof input.source_event_id !== "string" ||
+        typeof input.lease_owner !== "string" || !Number.isSafeInteger(input.limit) || !Number.isSafeInteger(input.lease_ms)) {
+        throw new ApiRequestError(400, "invalid_request", "delivery claim is invalid");
+      }
+      const deliveries = this.database.workerMessages.claim(decodeURIComponent(deliveryClaim[1]!), input.source_event_id, input.consumer,
+        input.lease_owner, input.limit as number, input.lease_ms as number);
+      sendJson(response, 200, { schema_version: 1, deliveries });
+      return;
+    }
+    const deliveryAck = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/(dlv_[0-9a-hjkmnp-tv-z]{26})\/ack$/.exec(url.pathname);
+    if (request.method === "POST" && deliveryAck) {
+      const input = await this.readJson(request) as Record<string, unknown>;
+      if (typeof input.source_event_id !== "string" || typeof input.lease_owner !== "string" || typeof input.lease_token !== "string" || !Number.isSafeInteger(input.fence)) {
+        throw new ApiRequestError(400, "invalid_request", "delivery acknowledgement is invalid");
+      }
+      const result = this.database.workerMessages.acknowledge(decodeURIComponent(deliveryAck[1]!), input.source_event_id, deliveryAck[2]!,
+        input.lease_owner, input.lease_token, input.fence as number);
+      sendJson(response, 200, { schema_version: 1, ...result });
       return;
     }
     const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel)|\/live-session-receipts\/([^/]+))?$/.exec(url.pathname);

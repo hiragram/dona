@@ -41,6 +41,7 @@ import {
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
   jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
+import { migrateWorkerMessaging, WorkerMessageRepository } from "./worker-messaging.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -376,6 +377,7 @@ export function migrateDispatcherDatabase(
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
+  readonly workerMessages: WorkerMessageRepository;
   private readonly schemaWrite: 2 | 3;
   private readonly migrationHook: DispatcherMigrationHook;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
@@ -401,6 +403,7 @@ export class DispatcherDatabase {
         migrateDispatcherDatabase(this.db, this.migrationHook, true, this.schemaWrite);
         migrateScheduler(this.db, this.migrationHook, true);
         migrateLiveSession(this.db);
+        migrateWorkerMessaging(this.db);
       }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
@@ -457,6 +460,7 @@ export class DispatcherDatabase {
         return true;
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
+    this.workerMessages = new WorkerMessageRepository(this.db);
   }
 
   close(): void {

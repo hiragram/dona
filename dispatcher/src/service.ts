@@ -17,6 +17,7 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
+import { WorkerMessagePublisher } from "./worker-messaging.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -46,6 +47,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
   const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const workerMessagePublisher = new WorkerMessagePublisher(database.workerMessages,()=>worker.wake(),Math.min(config.queuePollMs,30_000),
+    () => apiLogger.warn("Worker message publication deferred", { error_code: "worker_message_publication_deferred" }));
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),
@@ -81,6 +84,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     {
       async quiesce() {
         await scheduler.stop();
+        workerMessagePublisher.stop();
         await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
@@ -120,6 +124,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       }
     }
     worker.start();
+    workerMessagePublisher.start();
     scheduler.start();
     reminderPublisher.start();
     jobSupervisor.start();
@@ -128,6 +133,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (scheduler.isRunning()) await scheduler.stop();
+    workerMessagePublisher.stop();
     if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
     await api.stop();
@@ -147,6 +153,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         api.beginShutdown();
         await api.stop();
         await scheduler.stop();
+        workerMessagePublisher.stop();
         await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();

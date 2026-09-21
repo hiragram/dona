@@ -26,6 +26,9 @@ export interface DispatcherJobClient {
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
+  sendWorkerInstruction?(jobId:string,input:unknown):Promise<Record<string,unknown>>;
+  getWorkerMessage?(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>>;
+  reconcileWorkerMessage?(jobId:string,sourceEventId:string,producer:"worker"|"dona-main",idempotencyKey:string):Promise<Record<string,unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
@@ -70,6 +73,14 @@ const jobObjective = z.string().refine(value => value.trim().length > 0, "must c
 );
 const displayName = z.string().min(1).max(512).describe("objectiveやIssue titleから推測せず、利用者が明示した表示専用の短い作業名");
 const issueNumber = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const workerMessageId=z.string().regex(/^msg_[0-9a-hjkmnp-tv-z]{26}$/);
+const workerMessageKey=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+const workerMessageTime=z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+const workerInstructionPayload=z.discriminatedUnion("operation",[
+  z.object({operation:z.literal("answer"),text:z.string().min(1).max(4_000)}).strict(),
+  z.object({operation:z.literal("add_condition"),text:z.string().min(1).max(4_000)}).strict(),
+  z.object({operation:z.literal("change_priority"),priority:z.enum(["low","normal","high","urgent"]),reason:z.string().min(1).max(4_000).optional()}).strict(),
+]);
 
 function displayInput(
   shortName: string | undefined,
@@ -362,6 +373,37 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     } catch (error) {
       return failure(error, logger, "cancel_job");
     }
+  });
+
+  server.registerTool("send_worker_instruction", {
+    title:"Send typed worker instruction",
+    description:"同じthreadに属する明示jobへtyped instructionをdurableに記録します。raw command、path、URL、environment、credentialを操作能力へ変換しません。timeout時は再送せずreconcile_worker_messageで照合します。",
+    inputSchema:{job_id:jobId,source_event_id:eventId,producer_sequence:z.number().int().positive(),idempotency_key:workerMessageKey,
+      occurred_at:workerMessageTime,correlation_message_id:workerMessageId.optional(),conversation_revision:z.number().int().nonnegative().optional(),payload:workerInstructionPayload},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({job_id,...input})=>{
+    try {if(!client.sendWorkerInstruction)throw new Error("Worker messaging is unavailable");return success(await client.sendWorkerInstruction(job_id,{schema_version:1,...input}));}
+    catch(error){return failure(error,logger,"send_worker_instruction");}
+  });
+
+  server.registerTool("get_worker_message", {
+    title:"Get worker message",
+    description:"現在eventと同じthreadへserver-side bindingされたmessage本文をboundedに取得します。message IDの所持だけでは認可しません。",
+    inputSchema:{job_id:jobId,source_event_id:eventId,message_id:workerMessageId},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({job_id,source_event_id,message_id})=>{
+    try {if(!client.getWorkerMessage)throw new Error("Worker messaging is unavailable");return success(await client.getWorkerMessage(job_id,message_id,source_event_id));}
+    catch(error){return failure(error,logger,"get_worker_message");}
+  });
+
+  server.registerTool("reconcile_worker_message", {
+    title:"Reconcile worker message",
+    description:"write timeoutやdisconnect後に同じwriteを再送せず、job binding・producer・idempotency keyでdurable receiptとdelivery stateを照合します。",
+    inputSchema:{job_id:jobId,source_event_id:eventId,producer:z.enum(["worker","dona-main"]),idempotency_key:workerMessageKey},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({job_id,source_event_id,producer,idempotency_key})=>{
+    try {if(!client.reconcileWorkerMessage)throw new Error("Worker messaging is unavailable");return success(await client.reconcileWorkerMessage(job_id,source_event_id,producer,idempotency_key));}
+    catch(error){return failure(error,logger,"reconcile_worker_message");}
   });
 
   server.registerTool("plan_self_update", {
