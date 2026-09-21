@@ -13,9 +13,9 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, headers, body: JSON.stringify(body) });
 }
 
-async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
+async function fixture(page: Page, options: { submitUnknown?: boolean; submitIdentityUnavailable?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; pauseCancel?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean } = {}) {
+  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; pauseCancel?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; listUnavailableAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
     result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend\u061cmore", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
@@ -33,12 +33,13 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
     if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;if(options.pauseSecondSession&&sessionReads===2)await options.pauseSecondSession;await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
     if(url.pathname==="/api/session/logout"&&request.method()==="POST"){logoutWrites++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.logoutUnknown){await fulfill(route,{error:"durability_unavailable"},503);return;}await route.fulfill({status:204,body:""});return;}
     if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);await fulfill(route,{revoked:true});return;}
-    if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList; if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
+    if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList; if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listUnavailableAfterFirst&&listReads>1){await fulfill(route,{error:"identity_unavailable"},503);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
       await fulfill(route, { items: options.pauseFirstAlphaDetail||options.multipleJobs ? [job(),job({job_id:"job_beta"})] : [snapshot], next_cursor: null }); return; }
     if (url.pathname === "/api/jobs" && request.method() === "POST") {
       submitWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect(body).toMatchObject({ workspace: { kind: "scratch" } });
       expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/); if (options.pauseSubmit) await options.pauseSubmit;
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
+      if(options.submitIdentityUnavailable){await fulfill(route,{error:"identity_unavailable"},503);return;}
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
     }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0&&id==="job_alpha"){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":options.detailAfterCancelStatus===404?"not_found":"identity_unavailable"},options.detailAfterCancelStatus);return;}if(options.detailAfterEventStatus&&eventReads>0){await fulfill(route,{error:"identity_unavailable"},options.detailAfterEventStatus);return;}
@@ -86,7 +87,7 @@ test("送信中の二重操作を止め、receipt確認後だけ作成済みjob�
 test("成功receipt後の一覧read失敗を受付不明へ戻さない", async ({ page }) => {
   const f = await fixture(page, { listFailsAfterSubmit: true }); await page.goto(policy.origin + "/");
   await page.getByLabel("依頼内容").fill("受理後のread失敗を確認する"); await page.getByRole("button", { name: "依頼を送信" }).click();
-  await expect(page.getByRole("heading", { name: "job_created" })).toBeVisible(); expect(f.submitWrites).toBe(1); expect(f.errors).toEqual([]);
+  await expect(page.getByRole("status")).toContainText("依頼の受付は確認済み");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();expect(f.submitWrites).toBe(1); expect(f.errors).toEqual([]);
 });
 
 test("依頼全体が64 KiBを超える場合は送信前に止める", async ({ page }) => {
@@ -105,6 +106,10 @@ test("submitのacceptance unknownは再POSTせず一覧をread-only再取得す�
 test("submit受付不明後のreconcileが403ならprivate表示を消去する",async({page})=>{
   const f=await fixture(page,{submitUnknown:true,listDeniedAfterFirst:true});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("失効を確認する");await page.getByRole("button",{name:"依頼を送信"}).click();
   await expect(page.getByRole("status")).toContainText("受付結果は不明です");await expect(page.getByRole("button",{name:/job_alpha/})).toBeHidden();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("submitのidentity unavailable 503は受付不明としてread-only照合する",async({page})=>{
+  const f=await fixture(page,{submitIdentityUnavailable:true});await page.goto(policy.origin+"/");await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();const before=f.listReads;await page.getByLabel("依頼内容").fill("内部応答喪失を確認する");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("status")).toContainText("受付結果が不明です");expect(f.submitWrites).toBe(1);expect(f.listReads).toBe(before+1);expect(f.errors).toEqual([]);
 });
 
 test("cancelはexact jobをdialogで確認し結果不明でも再POSTしない", async ({ page }) => {
@@ -138,6 +143,10 @@ test("granted readだけのprincipalは作成直後のjob detailを開かない"
 test("一覧更新で403なら以前のprivate一覧を消去する", async ({ page }) => {
   const f=await fixture(page,{listDeniedAfterFirst:true});await page.goto(policy.origin+"/");await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();
   await page.getByRole("button",{name:"一覧を更新"}).click();await expect(page.getByRole("status")).toContainText("以前の内容は表示していません");await expect(page.getByRole("button",{name:/job_alpha/})).toBeHidden();expect(f.errors).toEqual([]);
+});
+
+test("一覧更新の503でも以前のprivate一覧を消去する",async({page})=>{
+  const f=await fixture(page,{listUnavailableAfterFirst:true});await page.goto(policy.origin+"/");await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();await page.getByRole("button",{name:"一覧を更新"}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");await expect(page.getByRole("heading",{name:"ジョブ"})).toBeHidden();expect(f.errors).toEqual([]);
 });
 
 test("reloadとback/forwardはbrowser cacheでなくsessionとdurable detailを再取得する", async ({ page }) => {
@@ -206,7 +215,11 @@ test("取消dialogのjobからnavigationしたら送信せずdialogを閉じる"
 
 test("cancel成功receipt後のdetail失敗を取消失敗へ戻さない",async({page})=>{
   const f=await fixture(page,{detailAfterCancelStatus:503});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();
-  await expect(page.getByRole("status")).toContainText("取消受付は確認済みですが");expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+  await expect(page.getByRole("status")).toContainText("取消受付は確認済みですが");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("cancel受付不明後の503でも以前のdetailを消去する",async({page})=>{
+  const f=await fixture(page,{cancelUnknown:true,detailAfterCancelStatus:503});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await expect(page.getByRole("status")).toContainText("取消の受付結果は不明です");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("cancel受付不明後のreconcileが403ならprivate表示を消去する",async({page})=>{
@@ -241,6 +254,12 @@ test("古いboot応答はbfcache復帰後の新しいsession表示を消去し�
 
 test("bfcache復帰のsession再確認中は以前のprincipalを表示しない",async({page})=>{
   let release!:()=>void;const pauseSecondSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondSession});await page.goto(policy.origin+"/");await expect(page.locator("#principal")).toHaveText("principal-fixture");await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect(page.locator("#principal")).toHaveText("確認中");release();await expect(page.locator("#principal")).toHaveText("principal-fixture");expect(f.errors).toEqual([]);
+});
+
+test("tabを隠すとprivate表示を消し復帰時にsessionとresourceを再取得する",async({page})=>{
+  const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("private draft");const beforeSession=f.sessionReads,beforeList=f.listReads;
+  await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");
+  await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
 });
 
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
