@@ -380,8 +380,8 @@ export class HumanWaitRepository {
         .get(`job:${completion.job_id}`,`group:${job.source_event_id}`,`notification:${completion.job_id}:${completion.job_status}`,runDedupe) as HumanWaitItemRow | undefined : undefined;
       if (!job || !cause || (cause.resource_kind==="job" && !["blocked","needs_review"].includes(job.status))) return false;
       if(cause.session_settlement_verified===1)return true;
-      const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
-        WHERE item_id=? AND state='open'`).run(settledAt,settledAt,cause.item_id).changes;
+      const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1
+        WHERE item_id=? AND state='open'`).run(cause.item_id).changes;
       if(changed!==1)return false;
       return true;
     }).immediate();
@@ -448,6 +448,17 @@ export class HumanWaitRepository {
         AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)`).get(row.resource_id,row.aux_id)!==undefined;
       return this.db.prepare(`SELECT 1 FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
         WHERE o.outbox_id=? AND o.status='needs_review' AND o.kind!='slack.work_result.post' AND r.revision=s.revision`).get(row.resource_id)!==undefined;
+    };
+    const obsoleteScheduleRevision=(row:Candidate):boolean=>{
+      if(row.kind==="run")return this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
+        WHERE r.run_id=? AND r.revision!=s.revision`).get(row.resource_id)!==undefined;
+      if(row.kind==="completion")return this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedules s
+        ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id') WHERE c.job_id=? AND c.job_status=?
+        AND json_extract(c.owner_json,'$.kind')='schedule' AND s.revision!=COALESCE(json_extract(c.owner_json,'$.revision'),1)`)
+        .get(row.resource_id,row.aux_id)!==undefined;
+      if(row.kind==="outbox")return this.db.prepare(`SELECT 1 FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
+        WHERE o.outbox_id=? AND r.revision!=s.revision`).get(row.resource_id)!==undefined;
+      return false;
     };
     const derivedProjectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection)=>
       Object.entries(expected).some(([key,value])=>key!=="source_revision"&&item[key as keyof HumanWaitItemRow]!==value);
@@ -517,9 +528,10 @@ export class HumanWaitRepository {
               expected.owner_principal_id,expected.decision_actor_kind,expected.decision_kind,expected.resource_kind,expected.resource_id,expected.parent_resource_id,
               expected.resource_revision,expected.reason_code,row.source_revision,settlement,row.source_revision,row.source_revision,item.item_id,input.snapshotRevision).changes;
           } else if(item&&!shouldOpen) {
+            const stale=quarantinedAlready||obsoleteScheduleRevision(row);
             changed=this.db.prepare(`UPDATE human_wait_items SET state=?,resolved_at=?,stale_at=?,updated_at=?,source_revision=?,retain_until=datetime(?,'+30 days')
-              WHERE item_id=? AND state='open' AND julianday(source_revision)<=julianday(?)`).run(quarantinedAlready?"stale":"resolved",
-              quarantinedAlready?null:row.source_revision,quarantinedAlready?row.source_revision:null,row.source_revision,row.source_revision,row.source_revision,item.item_id,input.snapshotRevision).changes;
+              WHERE item_id=? AND state='open' AND julianday(source_revision)<=julianday(?)`).run(stale?"stale":"resolved",
+              stale?null:row.source_revision,stale?row.source_revision:null,row.source_revision,row.source_revision,row.source_revision,item.item_id,input.snapshotRevision).changes;
           }
           if(changed===1)repaired++;
         }
@@ -536,7 +548,16 @@ export class HumanWaitRepository {
         }
       }
     }).immediate();
-    const digest=createHash("sha256").update(JSON.stringify({cursor:input.cursor??null,next,scanned:page.length,repaired,quarantined,snapshot:input.snapshotRevision})).digest("hex");
+    const projectionPlan=page.map(row=>{
+      const expected=expectedProjection(row);
+      return {dedupe_key:row.dedupe_key,source_revision:row.source_revision,desired_open:currentDesiredOpen(row),expected:expected?{
+        tenant_id:expected.tenant_id,workspace_id:expected.workspace_id,owner_kind:expected.owner_kind,owner_principal_kind:expected.owner_principal_kind,
+        owner_principal_id:expected.owner_principal_id,decision_actor_kind:expected.decision_actor_kind,decision_kind:expected.decision_kind,
+        resource_kind:expected.resource_kind,resource_id:expected.resource_id,parent_resource_id:expected.parent_resource_id,
+        resource_revision:expected.resource_revision,reason_code:expected.reason_code,source_revision:expected.source_revision}:null};
+    });
+    const digest=createHash("sha256").update(JSON.stringify({cursor:input.cursor??null,next,scanned:page.length,repaired,quarantined,
+      snapshot:input.snapshotRevision,projection_plan:projectionPlan})).digest("hex");
     return {dry_run:input.dryRun,scanned:page.length,repaired,quarantined,next_cursor:next,snapshot_revision:input.snapshotRevision,digest};
   }
 

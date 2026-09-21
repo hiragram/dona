@@ -203,6 +203,7 @@ test("session waitはdurable causeとverified suspended settlementの両方が�
     completed_at:transitionAt.toISOString() }, "/tmp/human-wait-session-source.json", transitionAt);
   const notification = database.enqueueJobNotification(job.job_id, new Date(transitionAt.getTime()+1_000)).row;
   const settledAt = new Date(transitionAt.getTime()+2_000).toISOString();
+  const sourceRevisionBeforeSettlement=database.humanWaits.listInternal()[0]!.source_revision;
   const receipt={provider_verified:true as const,event_id:notification.event_id,workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
     desired_session_status:"suspended" as const,session_status:"suspended" as const};
   assert.equal(database.humanWaits.recordVerifiedSessionSettlement({...receipt,session_status:"active"}, settledAt), false);
@@ -212,6 +213,8 @@ test("session waitはdurable causeとverified suspended settlementの両方が�
   assert.equal(waits.length, 1);
   assert.equal(waits[0]?.session_settlement_verified, 1);
   assert.equal(waits[0]?.owner_principal_id, "U_WAIT");
+  assert.equal(waits[0]?.source_revision,sourceRevisionBeforeSettlement);
+  assert.equal(database.humanWaits.repair({dryRun:true,limit:500,snapshotRevision:new Date(transitionAt.getTime()+3_000).toISOString()}).repaired,0);
   const auditDb=new Database(config.databasePath);
   const reopened=(auditDb.prepare("SELECT count(*) AS count FROM human_wait_audit WHERE item_id=? AND transition='reopened'")
     .get(waits[0]!.item_id) as {count:number}).count;
@@ -232,6 +235,13 @@ test("repairはbounded cursorとsnapshot fenceを持ちdry-runでは予定件数
   assert.deepEqual({dry:dry.dry_run,scanned:dry.scanned,repaired:dry.repaired},{dry:true,scanned:1,repaired:1});
   assert.equal(database.humanWaits.listInternal().length,0);
   assert.match(dry.digest,/^[0-9a-f]{64}$/);
+  const changedRaw=new Database(config.databasePath);
+  changedRaw.exec("DROP TRIGGER human_wait_job_update");
+  changedRaw.prepare("UPDATE jobs SET last_error_code='steer_acceptance_unknown' WHERE job_id=?").run(job.job_id);
+  changedRaw.close();
+  const changedPlan=database.humanWaits.repair({dryRun:true,limit:1,cursor:`group:${source.event_id}`,snapshotRevision:snapshot});
+  assert.equal(changedPlan.repaired,1);
+  assert.notEqual(changedPlan.digest,dry.digest);
   assert.throws(() => database.humanWaits.repair({dryRun:false,limit:501,snapshotRevision:snapshot}),/limit/);
   database.close();
 });
@@ -450,7 +460,16 @@ test("旧schedule revisionから後発するneeds_reviewをopenにしない", ()
     const columns=(harness.raw.prepare("PRAGMA table_info(schedule_revisions)").all() as Array<{name:string}>).map(({name})=>name);
     harness.raw.prepare(`INSERT INTO schedule_revisions(${columns.join(",")}) SELECT ${columns.map(name=>name==="revision"?"2":name).join(",")}
       FROM schedule_revisions WHERE schedule_id=? AND revision=1`).run(run.schedule_id);
+    harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
+    harness.raw.prepare("UPDATE connector_outbox SET status='needs_review',updated_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
+    assert.equal(harness.database.humanWaits.listInternal().length,2);
     harness.raw.prepare("UPDATE schedules SET revision=2,updated_at='2026-09-05T00:02:00Z' WHERE schedule_id=?").run(run.schedule_id);
+    assert.equal(harness.database.humanWaits.listInternal().length,0);
+    harness.raw.prepare("UPDATE human_wait_items SET state='open',stale_at=NULL WHERE resource_revision=1").run();
+    const repaired=harness.database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:"2026-09-05T00:04:00.000Z"});
+    assert.equal(repaired.repaired,2);
+    assert.equal(harness.database.humanWaits.listInternal().length,0);
+    assert.equal(harness.database.humanWaits.listInternal("stale").length,2);
     harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
     harness.raw.prepare("UPDATE connector_outbox SET status='needs_review',updated_at='2026-09-05T00:03:00Z' WHERE run_id=?").run(runId);
     assert.equal(harness.database.humanWaits.listInternal().length,0);
