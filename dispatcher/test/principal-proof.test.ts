@@ -75,7 +75,9 @@ describe("verified principal binding", () => {
     database.close();
     database = new DispatcherDatabase(config.databasePath);
     assert.equal(database.getVerifiedPrincipalBinding(first.row.event_id)?.principal_id, "U_TEST");
-    assert.throws(() => database.enqueue(envelope, new Date("2026-09-21T00:01:40Z"), { ...proof, proof_sha256: "0".repeat(64) }), PrincipalBindingConflictError);
+    const retry = { ...proof, attempt:2, nonce:"retry-proof-nonce-0002", proof_sha256:"0".repeat(64) };
+    assert.equal(database.enqueue(envelope, new Date("2026-09-21T00:01:40Z"), retry).duplicate,true);
+    assert.throws(() => database.enqueue(envelope, new Date("2026-09-21T00:01:50Z"), { ...retry, principal_id:"U_OTHER", proof_sha256:"1".repeat(64) }), PrincipalBindingConflictError);
     assert.equal(database.list().length, 1);
     database.close();
   });

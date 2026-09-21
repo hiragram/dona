@@ -28,7 +28,7 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
-import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, readVerifiedPrincipalBinding, type VerifiedPrincipalBindingRow } from "./principal-binding.js";
+import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, type VerifiedPrincipalBindingRow } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
@@ -482,6 +482,7 @@ export class DispatcherDatabase {
           existing.reply_target_json !== replyTargetJson;
         const binding=legacySlackBinding(existing);
         if(binding) insertEventJobBinding(this.db,existing.event_id,binding);
+        if (verifiedPrincipal && mismatch) throw new PrincipalBindingConflictError();
         if (verifiedPrincipal) persistVerifiedPrincipalBinding(this.db, existing.event_id, verifiedPrincipal, timestamp);
         return { row: existing, duplicate: true, payloadMismatch: mismatch };
       }

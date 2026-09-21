@@ -31,7 +31,7 @@ function ingressHeaders(body: unknown): Record<string, string> {
     expires_at: new Date(proofIssued.getTime() + 120_000).toISOString().replace(/\.000Z$/, "Z"),
     issued_at: proofIssued.toISOString().replace(/\.000Z$/, "Z"),
     key_id: principalProofKeyId(testInternalToken),
-    nonce: `test-${createHash("sha256").update(envelope.external_event_id).digest("hex").slice(0, 24)}`,
+    nonce: `test-${createHash("sha256").update(`${envelope.external_event_id}:${String(envelope.trace?.ingress_attempt)}`).digest("hex").slice(0, 24)}`,
     principal_id: envelope.subject.actor_id,
     principal_kind: "human",
     tenant_id: envelope.subject.workspace_id,
@@ -173,35 +173,34 @@ describe("DispatcherApi", () => {
     database.close();
   });
 
-  test("rejects unauthenticated Slack、forged internal source、conflicting duplicate proof", async () => {
+  test("rejects unauthenticated Slack、forged internal source、conflicting duplicate payload", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
     await api.start();
     const unauthenticated = eventEnvelope("Ev-unauthenticated");
-    assert.equal((await request(config.socketPath, "POST", "/v1/events", unauthenticated, "application/json", {
+    const unauthenticatedStatus = (await request(config.socketPath, "POST", "/v1/events", unauthenticated, "application/json", {
       "x-dona-slack-principal-proof": "",
       "x-dona-slack-principal-signature": "",
-    })).status, 403);
-    assert.equal(database.getByExternalId("slack", "Ev-unauthenticated"), undefined);
+    })).status;
+    const unauthenticatedRow = database.getByExternalId("slack", "Ev-unauthenticated");
 
     const forged = { ...eventEnvelope("Ev-forged-completion"), source: "dona_job" };
-    assert.equal((await request(config.socketPath, "POST", "/v1/events", forged)).status, 403);
-    assert.equal(database.getByExternalId("dona_job", "Ev-forged-completion"), undefined);
+    const forgedStatus = (await request(config.socketPath, "POST", "/v1/events", forged)).status;
+    const forgedRow = database.getByExternalId("dona_job", "Ev-forged-completion");
 
     const duplicate = eventEnvelope("Ev-proof-conflict");
-    assert.equal((await request(config.socketPath, "POST", "/v1/events", duplicate)).status, 202);
-    const headers = ingressHeaders(duplicate);
-    const proof = JSON.parse(Buffer.from(headers["x-dona-slack-principal-proof"]!, "base64url").toString("utf8")) as Record<string, unknown>;
-    proof.nonce = "test-conflicting-proof-nonce";
-    const raw = stableStringify(proof);
-    const conflict = await request(config.socketPath, "POST", "/v1/events", duplicate, "application/json", {
-      "x-dona-slack-principal-proof": Buffer.from(raw).toString("base64url"),
-      "x-dona-slack-principal-signature": createHmac("sha256", testInternalToken).update(raw).digest("base64url"),
-    });
+    const firstStatus = (await request(config.socketPath, "POST", "/v1/events", duplicate)).status;
+    const retry = structuredClone(duplicate); retry.trace = { ingress_attempt:2 };
+    const retryStatus = (await request(config.socketPath,"POST","/v1/events",retry)).status;
+    const changed = structuredClone(retry); changed.payload.text = "tampered";
+    const conflict = await request(config.socketPath, "POST", "/v1/events", changed);
+    await api.stop(); database.close();
+    assert.equal(unauthenticatedStatus,403); assert.equal(unauthenticatedRow,undefined);
+    assert.equal(forgedStatus,403); assert.equal(forgedRow,undefined);
+    assert.equal(firstStatus,202); assert.equal(retryStatus,200);
     assert.equal(conflict.status, 409);
     assert.equal((conflict.body.error as {code:string}).code, "principal_binding_conflict");
-    await api.stop(); database.close();
   });
 
   test("creates and reads a durable background job over UDS", async () => {
