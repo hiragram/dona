@@ -138,6 +138,31 @@ test("web cancelは初回Result照合を待ち高速完了jobをcancellingへ戻
   await supervisor.stop(); database.close();
 });
 
+test("web cancelはstalled promptの復旧後にworker終了を待たず実行できる", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  config.jobPromptReconcileMs = 100; config.jobPromptReconcilePollMs = 5;
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "c".repeat(64), objective: "stalled prompt cancel", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  let gets = 0, cancelCalls = 0, releaseWait!: () => void;
+  const waiting = new Promise<void>(resolve => { releaseWait = resolve; });
+  const runtime = fakeRuntime({
+    async prepare() { return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async get() { gets++; return { ...ok(gets === 1 ? "idle" : "working"), agentIdentity: "agent", stateChangeSeq: gets === 1 ? 10 : 11 }; },
+    async prompt() { return failed("agent_prompt_stalled"); },
+    async wait() { await waiting; return ok("done"); },
+    async cancel() { cancelCalls++; releaseWait(); return ok("done"); },
+  });
+  const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined); supervisor.start();
+  await waitFor(() => database.getJob(job.job_id)?.status === "running");
+  const cancelled = await Promise.race([
+    supervisor.cancelWeb(job.job_id, owner),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cancel remained behind startup barrier")), 100)),
+  ]);
+  assert.equal(cancelled.row.status, "cancelled"); assert.equal(cancelCalls, 1);
+  await supervisor.stop(); database.close();
+});
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });

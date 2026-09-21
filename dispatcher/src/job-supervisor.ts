@@ -534,7 +534,7 @@ export class JobSupervisor {
     }
     if (!prompted.ok) {
       if (prompted.timedOut || prompted.errorCode === "agent_prompt_stalled") {
-        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted);
+        await this.reconcileStalledPrompt(dispatching, promptBaseline ?? prompted, startupReady);
         return;
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
@@ -578,7 +578,11 @@ export class JobSupervisor {
     }
   }
 
-  private async reconcileStalledPrompt(row: JobRow, initial: HerdrCommandResult): Promise<void> {
+  private async reconcileStalledPrompt(
+    row: JobRow,
+    initial: HerdrCommandResult,
+    startupReady: () => void = () => {},
+  ): Promise<void> {
     const startedAt = this.clock.now();
     const deadline = startedAt + this.config.jobPromptReconcileMs;
     let nextTick = startedAt;
@@ -655,7 +659,7 @@ export class JobSupervisor {
           this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
           return;
         }
-        await this.monitor(this.database.getJob(row.job_id)!);
+        await this.monitor(this.database.getJob(row.job_id)!, startupReady);
         return;
       }
     }
