@@ -49,6 +49,9 @@ test("command応答はrequest proofへbindしたMACがない限り受理しな�
   assert.deepEqual(verifyWebCommandResponse(proof, requestProof, body, scope, () => credential, now), result);
   assert.throws(() => verifyWebCommandResponse(proof.slice(0, -1) + "A", requestProof, body, scope, () => credential, now));
   assert.throws(() => verifyWebCommandResponse(JSON.stringify(result), requestProof, body, scope, () => credential, now));
+  for (const invalid of [{ ...credential, purpose: "other" }, { ...credential, version: 2 }, { ...credential, tenant_id: "other" },
+    { ...credential, activated_at: "2026-09-19T00:00:02.000Z" }, { ...credential, signing_expires_at: now }])
+    assert.throws(() => verifyWebCommandResponse(proof, requestProof, body, scope, () => invalid as typeof credential, now));
 });
 
 test("command入力のidentity・source・URL・path・token注入とoversizeをUDS送信前に拒否する", async () => {

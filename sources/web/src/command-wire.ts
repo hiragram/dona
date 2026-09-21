@@ -46,8 +46,11 @@ export function verifyWebCommandResponse(proof: string, requestProof: string, re
     const requestPart = requestProof.split(".")[0]!, requestText = Buffer.from(requestPart, "base64url").toString("utf8");
     const request = claimsSchema.parse(JSON.parse(requestText));
     if (Buffer.from(requestPart, "base64url").toString("base64url") !== requestPart || JSON.stringify(request) !== requestText) throw Error();
-    const credential = lookup(request.key_version), parts = proof.split(".");
-    if (!credential || credential.state === "revoked" || parts.length !== 2) throw Error();
+    const credential = lookup(request.key_version), parts = proof.split("."), issued = Date.parse(request.issued_at);
+    if (!credential || credential.purpose !== "web_bff_service" || credential.version !== request.key_version
+      || credential.state === "revoked" || credential.instance_id !== scope.instance_id || credential.tenant_id !== scope.tenant_id
+      || !(credential.secret instanceof Uint8Array) || credential.secret.byteLength !== 32
+      || issued < Date.parse(credential.activated_at) || issued >= Date.parse(credential.signing_expires_at) || parts.length !== 2) throw Error();
     const actual = Buffer.from(parts[1]!, "base64url"), expected = createHmac("sha256", credential.secret)
       .update("dona.web-command.response.v1\0").update(parts[0]!).digest();
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw Error();

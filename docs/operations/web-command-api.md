@@ -8,7 +8,7 @@ command requestはCSRF、same-origin、固定route、署名済みingress context
 
 ## submitとreceipt
 
-browserは256-bitの`request_id`を送るが、これをjob keyとして保存しない。Web Adapterが検証済みinstance・tenant・principal・sessionと保護されたcontext keyから64桁のidempotency keyを導出する。Dispatcherはobjectiveとworkspaceのcanonical payload digestをdurable receiptへ保存し、同じkey・同じpayloadを`reused`、同じkey・異なるpayloadを`idempotency_conflict`にする。
+browserは256-bitの`request_id`を送るが、これをjob keyとして保存しない。Web Adapterが検証済みinstance・tenant・principal・sessionと、そのsessionへ固定されたretained `web_cookie_index` keyから64桁のidempotency keyを導出する。context keyのrotationでは導出結果を変えず、sessionが有効な間は対応するcookie index keyをverification用に保持する。Dispatcherはobjectiveとworkspaceのcanonical payload digestをdurable receiptへ保存し、同じkey・同じpayloadを`reused`、同じkey・異なるpayloadを`idempotency_conflict`にする。
 
 成功したsubmitはreply targetを持たない`source=web`の内部event、既存`jobs` table、既存worker admission、既存Result pathを使う。Web用のin-memory queueや別job engineは作らない。terminal jobはSlack/Dona通知eventを作らず、元のreply-free eventをcompletion fenceとして記録する。read modelとSSEは別Issueの責務である。
 

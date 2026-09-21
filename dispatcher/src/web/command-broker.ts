@@ -58,7 +58,10 @@ export class WebCommandBroker {
       if (!candidate) return { status: "denied", reason: "not_found" };
       if (candidate.source !== "web") return { status: "denied", reason: "scheduled_policy" };
       try { this.database.assertWebJobOwner(jobId, identity); }
-      catch { return { status: "denied", reason: "owner_mismatch" }; }
+      catch (error) {
+        if (error instanceof Error && error.message === "web_job_owner_mismatch") return { status: "denied", reason: "owner_mismatch" };
+        throw error;
+      }
       if (["completed", "failed", "needs_review"].includes(candidate.status)) return { status: "denied", reason: "terminal" };
       let result;
       try { result = await this.jobs.cancelWeb(jobId, identity); }
