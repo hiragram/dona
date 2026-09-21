@@ -203,6 +203,18 @@ describe("DispatcherApi", () => {
     assert.equal((conflict.body.error as {code:string}).code, "principal_binding_conflict");
   });
 
+  test("fallback受信時刻だけが変わるSlack再配送を同一eventとして受理する",async()=>{
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath),api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);
+    await api.start();
+    const first=eventEnvelope("Ev-received-at-retry");first.occurred_at="2026-09-21T00:00:00.000Z";
+    first.trace={ingress_attempt:1,occurred_at_source:"received_at"};
+    const second=structuredClone(first);second.occurred_at="2026-09-21T00:00:05.000Z";second.trace={ingress_attempt:2,occurred_at_source:"received_at"};
+    const firstStatus=(await request(config.socketPath,"POST","/v1/events",first)).status;
+    const retryStatus=(await request(config.socketPath,"POST","/v1/events",second)).status;
+    await api.stop();database.close();assert.equal(firstStatus,202);assert.equal(retryStatus,200);
+  });
+
   test("creates and reads a durable background job over UDS", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

@@ -20,6 +20,15 @@ export interface VerifiedPrincipalBindingRow {
   revoked_at: string | null;
 }
 
+export interface VerifiedPrincipalProofConsumptionRow {
+  proof_sha256:string;
+  nonce:string;
+  event_id:string;
+  event_attempt:number;
+  key_id:string;
+  consumed_at:string;
+}
+
 export class PrincipalBindingConflictError extends Error {
   readonly code = "principal_binding_conflict";
   constructor() { super("Verified principal binding conflicts with durable evidence"); this.name = "PrincipalBindingConflictError"; }
@@ -53,6 +62,7 @@ export function migrateVerifiedPrincipalBindings(db: Database.Database): void {
       nonce TEXT NOT NULL UNIQUE,
       event_id TEXT NOT NULL REFERENCES verified_principal_bindings(event_id) ON DELETE CASCADE,
       event_attempt INTEGER NOT NULL CHECK(event_attempt>0),
+      key_id TEXT NOT NULL,
       consumed_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS verified_principal_owner_idx
@@ -107,15 +117,15 @@ export function persistVerifiedPrincipalBinding(db: Database.Database, eventId: 
 }
 
 function consumeProof(db: Database.Database,eventId:string,proof:VerifiedSlackPrincipalProof,consumedAt:string):void {
-  const existing=db.prepare("SELECT event_id,nonce,event_attempt FROM verified_principal_proof_consumptions WHERE proof_sha256=?")
-    .get(proof.proof_sha256) as {event_id:string;nonce:string;event_attempt:number}|undefined;
+  const existing=db.prepare("SELECT event_id,nonce,event_attempt,key_id FROM verified_principal_proof_consumptions WHERE proof_sha256=?")
+    .get(proof.proof_sha256) as {event_id:string;nonce:string;event_attempt:number;key_id:string}|undefined;
   if(existing) {
-    if(existing.event_id!==eventId||existing.nonce!==proof.nonce||existing.event_attempt!==proof.attempt) throw new PrincipalBindingConflictError();
+    if(existing.event_id!==eventId||existing.nonce!==proof.nonce||existing.event_attempt!==proof.attempt||existing.key_id!==proof.key_id) throw new PrincipalBindingConflictError();
     return;
   }
   try {
-    db.prepare("INSERT INTO verified_principal_proof_consumptions(proof_sha256,nonce,event_id,event_attempt,consumed_at) VALUES(?,?,?,?,?)")
-      .run(proof.proof_sha256,proof.nonce,eventId,proof.attempt,consumedAt);
+    db.prepare("INSERT INTO verified_principal_proof_consumptions(proof_sha256,nonce,event_id,event_attempt,key_id,consumed_at) VALUES(?,?,?,?,?,?)")
+      .run(proof.proof_sha256,proof.nonce,eventId,proof.attempt,proof.key_id,consumedAt);
   } catch(error) {
     if(error instanceof Error&&error.message.includes("UNIQUE constraint failed")) throw new PrincipalBindingConflictError();
     throw error;
@@ -124,4 +134,8 @@ function consumeProof(db: Database.Database,eventId:string,proof:VerifiedSlackPr
 
 export function readVerifiedPrincipalBinding(db: Database.Database, eventId: string): VerifiedPrincipalBindingRow | undefined {
   return db.prepare("SELECT * FROM verified_principal_bindings WHERE event_id=?").get(eventId) as VerifiedPrincipalBindingRow | undefined;
+}
+
+export function readVerifiedPrincipalProofConsumption(db:Database.Database,proofSha256:string):VerifiedPrincipalProofConsumptionRow|undefined {
+  return db.prepare("SELECT * FROM verified_principal_proof_consumptions WHERE proof_sha256=?").get(proofSha256) as VerifiedPrincipalProofConsumptionRow|undefined;
 }

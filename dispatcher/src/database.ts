@@ -28,7 +28,7 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
-import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, type VerifiedPrincipalBindingRow } from "./principal-binding.js";
+import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, type VerifiedPrincipalBindingRow, type VerifiedPrincipalProofConsumptionRow } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
@@ -473,10 +473,13 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
       if (existing) {
+        const existingTrace = existing.trace_json ? JSON.parse(existing.trace_json) as Record<string,unknown> : undefined;
+        const unstableOccurredAt = existingTrace?.occurred_at_source === "received_at"
+          && envelope.trace?.occurred_at_source === "received_at";
         const mismatch =
           existing.schema_version !== envelope.schema_version ||
           existing.event_type !== envelope.type ||
-          existing.occurred_at !== envelope.occurred_at ||
+          existing.occurred_at !== envelope.occurred_at && !unstableOccurredAt ||
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
@@ -522,6 +525,10 @@ export class DispatcherDatabase {
 
   getVerifiedPrincipalBinding(eventId: string): VerifiedPrincipalBindingRow | undefined {
     return readVerifiedPrincipalBinding(this.db, eventId);
+  }
+
+  getVerifiedPrincipalProofConsumption(proofSha256:string):VerifiedPrincipalProofConsumptionRow|undefined {
+    return readVerifiedPrincipalProofConsumption(this.db,proofSha256);
   }
 
   get(eventId: string): EventRow | undefined {

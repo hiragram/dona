@@ -184,5 +184,10 @@ describe("normalizeSlackEvent", () => {
     assert.ok(result);
     assert.equal(result.usedReceivedAt, true);
     assert.equal(result.envelope.occurred_at, receivedAt.toISOString());
+    assert.equal(result.envelope.trace?.occurred_at_source,"received_at");
+  });
+
+  test("human actorを証明できないmessageを意図的なignoreへ分類する",()=>{
+    assert.equal(normalizeSlackEvent(payload({event:{type:"message",channel:"C1",ts:"1.0",text:"unknown"}})),null);
   });
 });

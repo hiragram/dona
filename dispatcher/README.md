@@ -139,13 +139,15 @@ herdr --session dona agent get dona-main
 
 ## 手動疎通
 
-workerを動かさず受付だけを確認したい場合は、`DONA_HERDR_PATH`に存在しないコマンドを設定するとイベントは`retryable_failed`になります。通常の疎通は次のとおりです。
+workerを動かさず受付だけを確認したい場合は、`DONA_HERDR_PATH`に存在しないコマンドを設定するとイベントは`retryable_failed`になります。通常の疎通は、次のJSONをowner-privateな一時fileへ保存し、Slack Adapter packageの補助commandから行います。補助commandはowner-privateなingress keyを読み、短命なprincipal proofを付けてUDSへ送信します。keyや署名を標準出力へ表示しません。
 
 ```sh
-curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
-  -X POST http://localhost/v1/events \
-  -H 'Content-Type: application/json' \
-  -d '{
+chmod 600 /tmp/dona-manual-event.json
+npm --prefix ../sources/slack exec -- tsx src/manual-ingress.ts < /tmp/dona-manual-event.json
+```
+
+```json
+{
     "schema_version": 1,
     "source": "slack",
     "external_event_id": "manual-test-001",
@@ -157,14 +159,15 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" 
       "thread_ts": "1756722030.123456",
       "actor_id": "U_TEST"
     },
-    "payload": { "text": "外部プロセスからの疎通テストです" },
+    "payload": { "text": "ローカル疎通テストです" },
     "reply_target": {
       "kind": "slack_thread",
       "workspace_id": "T_TEST",
       "channel_id": "C_TEST",
       "thread_ts": "1756722030.123456"
-    }
-  }'
+    },
+    "trace": { "ingress_attempt": 1 }
+}
 ```
 
 health check:

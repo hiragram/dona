@@ -173,6 +173,11 @@ describe("SlackSocketAdapter", () => {
     );
     await waitFor(() => acked);
     assert.equal(calls, 0);
+    acked=false;
+    client.emit("slack_event",socketEnvelope("env-no-actor",async()=>void(acked=true),{
+      ...eventBody(),event:{type:"message",channel:"C123",channel_type:"channel",ts:"1756722030.123456",text:"unknown"},
+    }));
+    await waitFor(()=>acked);assert.equal(calls,0);
     await adapter.stop();
   });
 

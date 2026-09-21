@@ -91,6 +91,7 @@ export function normalizeSlackEvent(
   if (event.bot_id !== undefined || (subtype !== undefined && subtype !== "file_share")) return null;
   const botUserIds = ownBotUserIds(input.authorizations);
   const actorId = nonEmptyString(event.user);
+  if (!actorId) return null;
   if (actorId && botUserIds.has(actorId)) return null;
 
   const channelId = nonEmptyString(event.channel);
@@ -117,7 +118,7 @@ export function normalizeSlackEvent(
     channel_id: channelId,
     thread_ts: threadTs,
   };
-  if (actorId) subject.actor_id = actorId;
+  subject.actor_id = actorId;
   if (channelType && slackChannelTypes.has(channelType)) subject.channel_type = channelType;
   const payload: Record<string, unknown> = { text };
   const eventTs = nonEmptyString(event.event_ts) ?? messageTs;
@@ -140,5 +141,6 @@ export function normalizeSlackEvent(
     },
   };
   if (socketEnvelopeId) envelope.trace = { socket_envelope_id: socketEnvelopeId };
+  if (occurredAt === undefined) envelope.trace = { ...envelope.trace, occurred_at_source:"received_at" };
   return { envelope, usedReceivedAt: occurredAt === undefined };
 }
