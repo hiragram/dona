@@ -18,6 +18,7 @@ import {
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
 import { ensurePrivateToken } from "./private-token.js";
+import { AgentContextManager } from "./agent-context.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   // The target release performs this before becoming ready, so updates driven by
@@ -45,11 +46,12 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
+  const agentContexts = new AgentContextManager(database, config.agentCredentialPath);
   let jobSupervisor!: JobSupervisor;
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake(), agentContexts);
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),
@@ -96,6 +98,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     undefined,
     () => scheduler.wake(),
     scheduler,
+    agentContexts,
   );
 
   try {

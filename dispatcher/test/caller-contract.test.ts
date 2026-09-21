@@ -10,6 +10,7 @@ import { buildJobPrompt } from "../src/job-prompt.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
 import { createDispatcherMcpServer } from "../src/mcp/server.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
+import { agentPurposeOperations } from "../src/agent-context.js";
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -83,7 +84,7 @@ for (const rejection of ["validation", "conflict", "limit", "timeout"] as const)
 test("MCP thread candidates, explicit control and cross-thread rejection preserve sibling identity", async () => {
   const f = await fixture();
   try {
-    const thread = { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
+    const thread = { source_event_id: f.source, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" };
     assert.deepEqual((await f.call("list_thread_jobs", thread)).data.jobs, []);
     const input = { source_event_id: f.source, objective: "do not execute $(cat /private/token)", workspace_kind: "scratch" };
     const one = (await f.call("delegate_job", { ...input, job_key: "one" })).data.job.job_id;
@@ -174,7 +175,7 @@ test("MCP bounds thread projection and signals possible omitted candidates", asy
   const f = await fixture();
   try {
     f.uds.listThreadJobs = async () => ({ jobs: Array.from({ length: 101 }, (_, i) => ({ job_id: `candidate-${i}`, objective: "secret", result_json: "secret", workspace_path: "/private" })) });
-    const result = await f.call("list_thread_jobs", { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
+    const result = await f.call("list_thread_jobs", { source_event_id: f.source, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
     assert.equal(result.data.jobs.length, 100);
     assert.equal(result.data.truncated, true);
     assert.doesNotMatch(JSON.stringify(result.data), /private|secret/);
@@ -197,7 +198,7 @@ for (const status of ["blocked", "needs_review"] as const) {
       assert.match(result.last_error_message, /Human approval is required; acceptance unknown/);
       assert.ok(result.last_error_message.length <= 2_000);
       assert.doesNotMatch(result.last_error_message, /private|hidden-value|https:|job_/);
-      assert.equal((await f.call("list_thread_jobs", { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" })).data.jobs[0].last_error_message, undefined);
+      assert.equal((await f.call("list_thread_jobs", { source_event_id: f.source, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" })).data.jobs[0].last_error_message, undefined);
     } finally { await f.close(); }
   });
 }
@@ -211,6 +212,9 @@ test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisi
     const dispatcherConfig = config.split("[mcp_servers.dona_dispatcher]")[1]!;
     const enabled = JSON.parse(dispatcherConfig.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
     const advertised = (await f.client.listTools()).tools.map(tool => tool.name);
+    const policyInventory = [...new Set(Object.values(agentPurposeOperations).flat())].sort();
+    assert.deepEqual([...enabled].sort(), policyInventory);
+    assert.deepEqual([...advertised].sort(), policyInventory);
     for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access"]) {
       assert.ok(enabled.includes(name), name); assert.ok(advertised.includes(name), name);
     }
@@ -250,7 +254,7 @@ test("実DBからMCPまで99件・100件・101件の候補を正確に区別す�
       const source=f.database.enqueue(eventEnvelope(`candidate-${i}`)).row;
       f.database.createJob({source_event_id:source.event_id,objective:"確認",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir);
       if (i>=98) {
-        const result=await f.call("list_thread_jobs",thread);
+        const result=await f.call("list_thread_jobs",{source_event_id:source.event_id,...thread});
         assert.equal(result.error,undefined);
         assert.equal(result.data.jobs.length,Math.min(i+1,100));
         assert.equal(result.data.truncated,i===100);

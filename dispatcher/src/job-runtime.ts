@@ -40,10 +40,11 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const resultDirectory=path.dirname(row.result_path);
   const expectedResultPath=path.join(config.jobResultsDir,row.job_id,"result.json");
   if(row.result_path!==expectedResultPath) throw new Error("Job result path does not match the Dispatcher-generated job path");
+  const effectiveDisabledMcpServers = [...new Set([...disabledMcpServers, "dona_dispatcher"])];
   const args = row.source==="dona_schedule"
     ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
-        ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
-    : ["--add-dir", resultDirectory];
+        ...effectiveDisabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
+    : ["--add-dir", resultDirectory, "-c", "mcp_servers.dona_dispatcher.enabled=false"];
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
