@@ -1,6 +1,5 @@
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
-const { syncBuiltinESMExports } = require("node:module");
 const nodeTest = require("node:test");
 const path = require("node:path");
 const process = require("node:process");
@@ -26,16 +25,7 @@ if (isTestWorker && metricsScope === 2) {
   const waitArray = new Int32Array(new SharedArrayBuffer(4));
   let sequence = 0;
 
-  const registrations = new Map();
-  const originalTest = nodeTest.test;
-
-  function callerIdentity(name) {
-    const stack = new Error().stack?.split("\n").slice(2) ?? [];
-    const caller = stack.find((line) => !line.includes("case-checkpoint.cjs")) ?? "unknown";
-    const position = /:(\d+):(\d+)\)?$/.exec(caller);
-    if (!position) throw new Error("case checkpoint source position is unavailable");
-    return createHash("sha256").update(`${file}\0${position[1]}:${position[2]}\0${name}`).digest("hex").slice(0, 12);
-  }
+  const occurrences = new Map();
 
   function marker(action, identity, elapsedMs, requireAcknowledgement = false) {
     const elapsed = elapsedMs === undefined ? "" : ` elapsed_ms=${Math.min(999_999_999, Math.max(0, Math.round(elapsedMs)))}`;
@@ -53,39 +43,21 @@ if (isTestWorker && metricsScope === 2) {
     throw new Error("case checkpoint parent acknowledgement timed out");
   }
 
-  function wrapRegistration(register) {
-    const wrapped = function checkpointedTest(...args) {
-      const callbackIndex = args.findIndex((value) => typeof value === "function");
-      if (callbackIndex < 0) return register.apply(this, args);
-      const body = args[callbackIndex];
-      const name = typeof args[0] === "string" ? args[0] : body.name || "anonymous";
-      const digest = callerIdentity(name);
-      const occurrence = (registrations.get(digest) ?? 0) + 1;
-      registrations.set(digest, occurrence);
-      const identity = `${digest}#${occurrence}`;
-      args[callbackIndex] = async function checkpointedBody(...bodyArgs) {
-        const startedAt = performance.now();
-        marker("case-start", identity, undefined, true);
-        try {
-          const result = await body.apply(this, bodyArgs);
-          marker("case-finish", identity, performance.now() - startedAt);
-          return result;
-        } catch (error) {
-          marker("case-fail", identity, performance.now() - startedAt);
-          throw error;
-        }
-      };
-      return register.apply(this, args);
-    };
-    Object.assign(wrapped, register);
-    return wrapped;
-  }
-
-  const wrappedTest = wrapRegistration(originalTest);
-  wrappedTest.skip = wrapRegistration(originalTest.skip);
-  wrappedTest.todo = wrapRegistration(originalTest.todo);
-  wrappedTest.only = wrapRegistration(originalTest.only);
-  nodeTest.test = wrappedTest;
-  nodeTest.it = wrappedTest;
-  syncBuiltinESMExports();
+  // A preload-owned beforeEach runs before file and suite hooks without wrapping
+  // test registration. That preserves callback arity and Node's source metadata,
+  // and it also covers TestContext.test() subtests. TestContext.after() runs only
+  // after body and afterEach cleanup have settled, so a synchronous hook stall
+  // intentionally leaves this identity unfinished. The Node 24 TestContext passed
+  // getter includes hook failures without exposing the error text.
+  nodeTest.beforeEach((context) => {
+    const fullName = context.fullName;
+    if (!fullName || Buffer.byteLength(fullName) > 16 * 1024) throw new Error("case checkpoint full name is invalid");
+    const digest = createHash("sha256").update(`${file}\0${fullName}`).digest("hex").slice(0, 12);
+    const occurrence = (occurrences.get(digest) ?? 0) + 1;
+    occurrences.set(digest, occurrence);
+    const identity = `${digest}#${occurrence}`;
+    const startedAt = performance.now();
+    marker("case-start", identity, undefined, true);
+    context.after(() => marker(context.passed === true ? "case-finish" : "case-fail", identity, performance.now() - startedAt));
+  });
 }

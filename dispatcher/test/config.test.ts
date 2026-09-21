@@ -106,9 +106,10 @@ describe("job resource config", () => {
     assert.match(caseCheckpoint, /metricsScope === 2/);
     assert.match(caseCheckpoint, /fs\.appendFileSync\(eventsPath,/);
     assert.match(caseCheckpoint, /case checkpoint parent acknowledgement timed out/);
+    assert.match(caseCheckpoint, /nodeTest\.beforeEach\(\(context\) =>/);
     assert.match(caseCheckpoint, /marker\("case-start", identity, undefined, true\)/);
-    assert.match(caseCheckpoint, /marker\("case-finish", identity/);
-    assert.match(caseCheckpoint, /marker\("case-fail", identity/);
+    assert.match(caseCheckpoint, /context\.passed === true \? "case-finish" : "case-fail"/);
+    assert.doesNotMatch(caseCheckpoint, /nodeTest\.test\s*=/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
     assert.match(runner, /process-metrics\.cjs/);
     const metrics = fs.readFileSync(new URL("./process-metrics.cjs", import.meta.url), "utf8");
@@ -377,6 +378,85 @@ describe("job resource config", () => {
     assert.equal(fs.existsSync(canary), false);
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
     assert.notEqual(result.status, 0);
+  });
+
+  test("beforeEachとafterEachの同期停止を実行中caseとして保持する", async () => {
+    const runStalledHook = async (hook: "beforeEach" | "afterEach", nonce: string) => {
+      const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-hook-`);
+      const fixture = `${temporaryDirectory}/hook.test.mjs`;
+      fs.writeFileSync(fixture, [
+        `import { ${hook}, test } from "node:test";`,
+        `${hook}(() => { process.on("SIGTERM", () => {}); while (true) {} });`,
+        'test("hook-stall", () => {});',
+      ].join("\n"));
+      const markers: string[] = [];
+      const checkpointChannel = await createCaseCheckpointChannel({ nonce, file: `test/${hook}.test.ts`, onMarker: (marker) => markers.push(marker) });
+      const environment: NodeJS.ProcessEnv = {
+        ...process.env,
+        DONA_DISPATCHER_TEST_FILE: `test/${hook}.test.ts`,
+        DONA_CASE_CHECKPOINT_NONCE: nonce,
+        DONA_CASE_CHECKPOINT_DIR: checkpointChannel.directory,
+        DONA_PROCESS_METRICS_NONCE: nonce,
+        NODE_OPTIONS: `--require=${JSON.stringify(fileURLToPath(new URL("./case-checkpoint.cjs", import.meta.url)))} --require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`,
+      };
+      sanitizeNestedTestEnvironment(environment);
+      const child = spawn(tsx, ["--test", fixture], { env: environment, detached: true, stdio: ["ignore", "ignore", "ignore"] });
+      try {
+        const deadline = Date.now() + 2_000;
+        while (!markers.some((marker) => marker.includes(" case-start ")) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 1);
+        assert.equal(markers.some((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ")), false);
+      } finally {
+        await stopTestProcessGroup(child);
+        await checkpointChannel.close();
+        fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+      }
+    };
+    await runStalledHook("beforeEach", "6123456789abcdef0123456789abcdef");
+    await runStalledHook("afterEach", "7123456789abcdef0123456789abcdef");
+  });
+
+  test("callbackとTestContext subtestを保ち元のsource位置を報告する", async () => {
+    const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-api-`);
+    const fixture = `${temporaryDirectory}/source.test.mjs`;
+    fs.writeFileSync(fixture, [
+      'import { afterEach, describe, test } from "node:test";',
+      'test("callback", (_t, done) => done());',
+      'test("parent", async (t) => { await t.test("child", () => {}); });',
+      'test("source-location", () => { throw new Error("expected fixture failure"); });',
+      'describe("hook failure", () => {',
+      '  afterEach(() => { throw new Error("expected afterEach failure"); });',
+      '  test("hook-failure", () => {});',
+      '});',
+    ].join("\n"));
+    const nonce = "8123456789abcdef0123456789abcdef";
+    const markers: string[] = [];
+    const checkpointChannel = await createCaseCheckpointChannel({ nonce, file: "test/source.test.ts", onMarker: (marker) => markers.push(marker) });
+    const environment: NodeJS.ProcessEnv = {
+      ...process.env,
+      DONA_DISPATCHER_TEST_FILE: "test/source.test.ts",
+      DONA_CASE_CHECKPOINT_NONCE: nonce,
+      DONA_CASE_CHECKPOINT_DIR: checkpointChannel.directory,
+      DONA_PROCESS_METRICS_NONCE: nonce,
+      NODE_OPTIONS: `--require=${JSON.stringify(fileURLToPath(new URL("./case-checkpoint.cjs", import.meta.url)))} --require=${JSON.stringify(fileURLToPath(new URL("./process-metrics.cjs", import.meta.url)))}`,
+    };
+    sanitizeNestedTestEnvironment(environment);
+    const child = spawn(tsx, ["--test", fixture], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.setEncoding("utf8"); child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.setEncoding("utf8"); child.stderr.on("data", (chunk) => { output += chunk; });
+    const status = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    await checkpointChannel.close();
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    assert.notEqual(status, 0);
+    assert.match(output, /✔ callback/);
+    assert.match(output, /source\.test\.mjs:4:\d+/);
+    assert.doesNotMatch(output, /test at .*case-checkpoint\.cjs/);
+    assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 5);
+    assert.equal(markers.filter((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ")).length, 5);
+    assert.equal(markers.filter((marker) => marker.includes(" case-fail ")).length, 2);
   });
 
   test("file wrapper停止をleaf caseとして記録しない", async () => {
