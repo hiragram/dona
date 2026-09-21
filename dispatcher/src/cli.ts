@@ -113,22 +113,26 @@ async function main(): Promise<void> {
     if(command==="reconcile-notification") {
       if(args[3]==="not_sent") {
         const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId,args.includes("--resume")),settlement=database.notificationSessionSettlementRequest(eventId);
-        const settledAt=new Date();
+        let settledAt:Date;
         if(settlement) {
           const evidence=await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement) as {event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;session_status:"active"|"suspended"|null};
-          database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt);
-        }
+          settledAt=new Date();
+          if(settlement.desired_session_status==="suspended"&&!database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt))
+            throw new Error("job_notification_session_settlement_not_recorded");
+        } else settledAt=new Date();
         console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,settledAt,claim),null,2));return;
       }
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6]==="--resume"?undefined:args[6];
       const claim=database.claimNotificationReconciliation(eventId,args.includes("--resume"));
       const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
       if(!verification) throw new Error("scheduled_notification_verification_unavailable");
-      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); const settledAt=new Date();
+      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); let settledAt:Date;
       if(verification.desired_session_status) {
         const evidence=await verifier.settle(verification);
-        database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt);
-      }
+        settledAt=new Date();
+        if(verification.desired_session_status==="suspended"&&!database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt))
+          throw new Error("job_notification_session_settlement_not_recorded");
+      } else settledAt=new Date();
       console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})},settledAt,claim),null,2));
       return;
     }

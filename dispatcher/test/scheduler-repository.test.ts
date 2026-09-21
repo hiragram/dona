@@ -81,6 +81,7 @@ test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
   assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM pragma_table_info('schedule_runs') WHERE name='wait_reason'").get() as {n:number}).n,1);
   reopened.close();
   raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
@@ -987,6 +988,9 @@ test("delegated blockedとredaction拒否はDona eventだけを一意に生成�
     }
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
+  const runWait=dispatcher.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${run.run_id}`)!;
+  assert.deepEqual({reason:runWait.reason_code,decision:runWait.decision_kind},mode==="blocked"
+    ?{reason:"human_input",decision:"provide_input"}:{reason:"invalid_result",decision:"review_result"});
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
     assert.equal(raw.prepare("SELECT 1 FROM connector_outbox WHERE run_id=?").get(run.run_id),undefined);
     assert.equal((raw.prepare("SELECT count(*) AS n FROM events WHERE source='dona_job' AND external_event_id=?").get(`${job.job_id}:${mode === "blocked" ? "blocked" : "needs_review"}`) as {n:number}).n,1);

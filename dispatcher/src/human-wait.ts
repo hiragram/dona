@@ -229,23 +229,23 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         decision_actor_kind,decision_kind,resource_kind,resource_id,parent_resource_id,resource_revision,reason_code,
         origin_ref,source_revision,state,session_settlement_verified,opened_at,updated_at,resolved_at,stale_at,retain_until)
       SELECT 'wait_'||lower(hex(randomblob(16))),'run:'||NEW.run_id,s.tenant_id,s.tenant_id,'schedule','human',s.owner_id,
-        'owner',CASE WHEN NEW.reason='ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END,
+        'owner',CASE COALESCE(NEW.wait_reason,NEW.reason) WHEN 'human_input' THEN 'provide_input' WHEN 'invalid_result' THEN 'review_result' WHEN 'ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END,
         'schedule_run',NEW.run_id,NEW.schedule_id,NEW.revision,
-        CASE WHEN NEW.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END,
+        CASE WHEN COALESCE(NEW.wait_reason,NEW.reason) IN ('human_input','invalid_result','ambiguous_write') THEN COALESCE(NEW.wait_reason,NEW.reason) ELSE 'operator_review_unknown' END,
         'origin_'||lower(hex(randomblob(16))),COALESCE(NEW.terminal_at,NEW.created_at),'open',0,
         COALESCE(NEW.terminal_at,NEW.created_at),COALESCE(NEW.terminal_at,NEW.created_at),NULL,NULL,datetime(COALESCE(NEW.terminal_at,NEW.created_at),'+30 days')
       FROM schedules s WHERE s.schedule_id=NEW.schedule_id AND NEW.status='needs_review' AND s.revision=NEW.revision
         AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='run:'||NEW.run_id)
       ON CONFLICT(dedupe_key) DO NOTHING;
     END;
-    CREATE TRIGGER IF NOT EXISTS human_wait_schedule_run_update AFTER UPDATE OF status,reason,terminal_at ON schedule_runs BEGIN
+    CREATE TRIGGER IF NOT EXISTS human_wait_schedule_run_update AFTER UPDATE OF status,reason,wait_reason,terminal_at ON schedule_runs BEGIN
       INSERT INTO human_wait_items(item_id,dedupe_key,tenant_id,workspace_id,owner_kind,owner_principal_kind,owner_principal_id,
         decision_actor_kind,decision_kind,resource_kind,resource_id,parent_resource_id,resource_revision,reason_code,
         origin_ref,source_revision,state,session_settlement_verified,opened_at,updated_at,resolved_at,stale_at,retain_until)
       SELECT 'wait_'||lower(hex(randomblob(16))),'run:'||NEW.run_id,s.tenant_id,s.tenant_id,'schedule','human',s.owner_id,
-        'owner',CASE WHEN NEW.reason='ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END,
+        'owner',CASE COALESCE(NEW.wait_reason,NEW.reason) WHEN 'human_input' THEN 'provide_input' WHEN 'invalid_result' THEN 'review_result' WHEN 'ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END,
         'schedule_run',NEW.run_id,NEW.schedule_id,NEW.revision,
-        CASE WHEN NEW.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END,
+        CASE WHEN COALESCE(NEW.wait_reason,NEW.reason) IN ('human_input','invalid_result','ambiguous_write') THEN COALESCE(NEW.wait_reason,NEW.reason) ELSE 'operator_review_unknown' END,
         'origin_'||lower(hex(randomblob(16))),COALESCE(NEW.terminal_at,s.updated_at),'open',0,
         COALESCE(NEW.terminal_at,s.updated_at),COALESCE(NEW.terminal_at,s.updated_at),NULL,NULL,datetime(COALESCE(NEW.terminal_at,s.updated_at),'+30 days')
       FROM schedules s WHERE s.schedule_id=NEW.schedule_id AND NEW.status='needs_review' AND s.revision=NEW.revision
@@ -293,7 +293,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
           WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
           WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),NULL,NULL,NEW.content_delete_at
       WHERE json_extract(NEW.owner_json,'$.kind')='schedule' AND NEW.notification_state='needs_review' AND
-        (NEW.job_status IN ('blocked','needs_review') OR NEW.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','needs_review','dead_letter'))) AND EXISTS (
+        (NEW.job_status IN ('blocked','needs_review') OR NEW.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','blocked','needs_review','dead_letter'))) AND EXISTS (
         SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
           AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)) AND NOT EXISTS (
         SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status)
@@ -312,7 +312,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
           WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),'+30 days')
       WHERE dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status AND state='open' AND (
         NEW.notification_state!='needs_review' OR (NEW.job_status NOT IN ('blocked','needs_review') AND NEW.notification_event_id IS NOT NULL AND NOT EXISTS (
-          SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','needs_review','dead_letter'))) OR NOT EXISTS (
+          SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','blocked','needs_review','dead_letter'))) OR NOT EXISTS (
           SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
             AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)));
     END;
@@ -384,7 +384,7 @@ export class HumanWaitRepository {
       const owner=JSON.parse(completion.owner_json) as {kind?:unknown;run_id?:unknown};
       const runDedupe=owner.kind==="schedule"&&typeof owner.run_id==="string"?`run:${owner.run_id}`:"";
       const cause = job ? this.db.prepare(`SELECT * FROM human_wait_items WHERE state='open' AND
-        dedupe_key IN (?,?,?,?) ORDER BY CASE resource_kind WHEN 'notification' THEN 0 WHEN 'schedule_run' THEN 1 WHEN 'job_group' THEN 2 ELSE 3 END LIMIT 1`)
+        dedupe_key IN (?,?,?,?) ORDER BY CASE resource_kind WHEN 'schedule_run' THEN 0 WHEN 'notification' THEN 1 WHEN 'job_group' THEN 2 ELSE 3 END LIMIT 1`)
         .get(`job:${completion.job_id}`,`group:${job.source_event_id}`,`notification:${completion.job_id}:${completion.job_status}`,runDedupe) as HumanWaitItemRow | undefined : undefined;
       if (!job || !cause || Date.parse(settledAt)<Date.parse(cause.opened_at) ||
         (cause.resource_kind==="job" && !["blocked","needs_review"].includes(job.status))) return false;
@@ -427,9 +427,9 @@ export class HumanWaitRepository {
         g.updated_at AS source_revision FROM job_groups g JOIN jobs j USING(source_event_id) LEFT JOIN job_authorization_bindings a USING(job_id)
         WHERE g.source_event_id=? GROUP BY g.source_event_id`).get(row.resource_id) as ExpectedProjection|undefined;
       if(row.kind==="run")return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
-        'owner' AS decision_actor_kind,CASE WHEN r.reason='ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END AS decision_kind,
+        'owner' AS decision_actor_kind,CASE COALESCE(r.wait_reason,r.reason) WHEN 'human_input' THEN 'provide_input' WHEN 'invalid_result' THEN 'review_result' WHEN 'ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END AS decision_kind,
         'schedule_run' AS resource_kind,r.run_id AS resource_id,r.schedule_id AS parent_resource_id,r.revision AS resource_revision,
-        CASE WHEN r.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END AS reason_code,
+        CASE WHEN COALESCE(r.wait_reason,r.reason) IN ('human_input','invalid_result','ambiguous_write') THEN COALESCE(r.wait_reason,r.reason) ELSE 'operator_review_unknown' END AS reason_code,
         CASE WHEN julianday(COALESCE(r.terminal_at,r.created_at))>=julianday(s.updated_at) THEN COALESCE(r.terminal_at,r.created_at) ELSE s.updated_at END AS source_revision
         FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
       if(row.kind==="completion")return this.db.prepare(`SELECT json_extract(owner_json,'$.tenant_id') AS tenant_id,json_extract(owner_json,'$.tenant_id') AS workspace_id,
@@ -456,7 +456,7 @@ export class HumanWaitRepository {
       if(row.kind==="completion")return this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedules s
         ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id') WHERE c.job_id=? AND c.job_status=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review'
-        AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=c.notification_event_id AND e.status IN ('completed','needs_review','dead_letter')))
+        AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=c.notification_event_id AND e.status IN ('completed','blocked','needs_review','dead_letter')))
         AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)`).get(row.resource_id,row.aux_id)!==undefined;
       return this.db.prepare(`SELECT 1 FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
         WHERE o.outbox_id=? AND o.status='needs_review' AND o.kind!='slack.work_result.post' AND r.revision=s.revision`).get(row.resource_id)!==undefined;
@@ -489,7 +489,7 @@ export class HumanWaitRepository {
       UNION ALL SELECT 'completion:'||c.job_id||':'||c.job_status,'completion',c.job_id,COALESCE(c.notification_event_id,c.job_id),c.job_status,
         MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
           WHERE r.job_id=c.job_id AND o.completion_job_status=c.job_status),c.materialized_at),COALESCE(e.updated_at,c.materialized_at),c.materialized_at),CASE WHEN json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review'
-          AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR e.status IN ('completed','needs_review','dead_letter')) AND EXISTS (
+          AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR e.status IN ('completed','blocked','needs_review','dead_letter')) AND EXISTS (
           SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
             AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)) THEN 1 ELSE 0 END,
         'notification:'||c.job_id||':'||c.job_status FROM job_completion_results c LEFT JOIN events e ON e.event_id=c.notification_event_id

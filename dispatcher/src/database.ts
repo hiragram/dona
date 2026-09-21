@@ -1423,9 +1423,12 @@ export class DispatcherDatabase {
     if(binding.owner.kind==="schedule") {
       const scheduleAt=new Date(Math.floor(Date.parse(completedAt)/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
+      const reviewReason=job.status==="blocked"?"human_input":
+        ["invalid_result","invalid_result_agent_stop_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")?"invalid_result":
+        ["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","steer_acceptance_unknown","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown"].includes(job.last_error_code??"")?"ambiguous_write":"operator_review_unknown";
       if(next==="needs_review"||job.status==="blocked") {
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
-        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id,reviewReason);
       } else if(next==="cancelled"&&this.scheduler.getRun(binding.owner.run_id)?.status==="needs_review") {
         this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt);
@@ -1438,7 +1441,7 @@ export class DispatcherDatabase {
       } catch(error) {
         if(!(error instanceof Error)||error.message!=="content_requires_redaction") throw error;
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review',notification_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
-        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id,"invalid_result");
       }
     }
     if(binding.destination.kind==="none") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
