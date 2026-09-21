@@ -43,6 +43,11 @@ export interface HumanWaitRepairResult {
   snapshot_revision: string;
   digest: string;
 }
+
+export interface HumanWaitScanCursor {
+  updated_at: string;
+  item_id: string;
+}
 export interface VerifiedHumanWaitSessionSettlement {
   provider_verified: true;
   event_id: string;
@@ -117,6 +122,10 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS human_wait_schema(
       singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS human_wait_owner_revisions(
+      tenant_id TEXT NOT NULL,workspace_id TEXT NOT NULL,principal_id TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK(revision>0),PRIMARY KEY(tenant_id,workspace_id,principal_id)
+    );
     CREATE TABLE IF NOT EXISTS human_wait_items(
       item_id TEXT PRIMARY KEY CHECK(item_id GLOB 'wait_*'),
       dedupe_key TEXT NOT NULL UNIQUE,
@@ -166,6 +175,26 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       VALUES(NEW.item_id,NEW.reason_code,NEW.source_revision,
         CASE NEW.state WHEN 'open' THEN 'reopened' WHEN 'resolved' THEN 'resolved' ELSE 'stale' END,
         'system',NEW.updated_at);
+    END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_insert AFTER INSERT ON human_wait_items
+      WHEN NEW.owner_kind='human_verified' AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
+      INSERT INTO human_wait_owner_revisions VALUES(NEW.tenant_id,NEW.workspace_id,NEW.owner_principal_id,1)
+        ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_update_old AFTER UPDATE ON human_wait_items
+      WHEN OLD.owner_kind='human_verified' AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
+      INSERT INTO human_wait_owner_revisions VALUES(OLD.tenant_id,OLD.workspace_id,OLD.owner_principal_id,1)
+        ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_update_new AFTER UPDATE ON human_wait_items
+      WHEN NEW.owner_kind='human_verified' AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
+      INSERT INTO human_wait_owner_revisions VALUES(NEW.tenant_id,NEW.workspace_id,NEW.owner_principal_id,1)
+        ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_delete AFTER DELETE ON human_wait_items
+      WHEN OLD.owner_kind='human_verified' AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
+      INSERT INTO human_wait_owner_revisions VALUES(OLD.tenant_id,OLD.workspace_id,OLD.owner_principal_id,1)
+        ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_job_insert AFTER INSERT ON jobs BEGIN
       ${openJobSql};
@@ -351,6 +380,10 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         WHERE r.run_id=NEW.run_id AND r.revision!=s.revision));
     END;
     INSERT OR IGNORE INTO human_wait_schema VALUES(1,1);
+    INSERT OR IGNORE INTO human_wait_owner_revisions(tenant_id,workspace_id,principal_id,revision)
+      SELECT tenant_id,workspace_id,owner_principal_id,1 FROM human_wait_items
+      WHERE owner_kind='human_verified' AND tenant_id IS NOT NULL AND workspace_id IS NOT NULL AND owner_principal_id IS NOT NULL
+      GROUP BY tenant_id,workspace_id,owner_principal_id;
   `);
   const marker = db.prepare("SELECT version FROM human_wait_schema WHERE singleton=1").get() as {version:number}|undefined;
   if (marker?.version !== 1) throw new Error("unsupported_human_wait_schema");
@@ -361,6 +394,35 @@ export class HumanWaitRepository {
 
   get(itemId: string): HumanWaitItemRow | undefined {
     return this.db.prepare("SELECT * FROM human_wait_items WHERE item_id=?").get(itemId) as HumanWaitItemRow | undefined;
+  }
+
+  getByOriginRef(originRef: string): HumanWaitItemRow | undefined {
+    return this.db.prepare(`SELECT i.* FROM human_wait_items i WHERE i.origin_ref=? AND i.state='open' AND NOT EXISTS (
+      SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key=i.dedupe_key)`).get(originRef) as HumanWaitItemRow | undefined;
+  }
+
+  ownerRevision(input:{tenantId:string;workspaceId:string;principalId:string}):number {
+    const row=this.db.prepare(`SELECT revision FROM human_wait_owner_revisions
+      WHERE tenant_id=? AND workspace_id=? AND principal_id=?`).get(input.tenantId,input.workspaceId,input.principalId) as {revision:number}|undefined;
+    if(!row)return 1;
+    if(!Number.isSafeInteger(row.revision)||row.revision<1)throw new Error("human_wait_owner_revision_unavailable");
+    return row.revision;
+  }
+
+  scanOwnerOpen(input:{tenantId:string;workspaceId:string;principalId:string;limit:number;after?:HumanWaitScanCursor}):HumanWaitItemRow[] {
+    if(!Number.isSafeInteger(input.limit)||input.limit<1||input.limit>500)throw new Error("human_wait_scan_limit_invalid");
+    const after=input.after;
+    if(after&&(!Number.isFinite(Date.parse(after.updated_at))||!/^wait_[a-f0-9]{32}$/.test(after.item_id)))
+      throw new Error("human_wait_scan_cursor_invalid");
+    return this.db.prepare(`SELECT i.* FROM human_wait_items i
+      WHERE i.state='open' AND i.owner_kind='human_verified' AND i.owner_principal_kind='human'
+        AND i.tenant_id=? AND i.workspace_id=? AND i.owner_principal_id=?
+        AND (? IS NULL OR i.updated_at<? OR (i.updated_at=? AND i.item_id<?))
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key=i.dedupe_key)
+      ORDER BY i.updated_at DESC,i.item_id DESC LIMIT ?`).all(
+        input.tenantId,input.workspaceId,input.principalId,
+        after?.updated_at??null,after?.updated_at??null,after?.updated_at??null,after?.item_id??null,input.limit,
+      ) as HumanWaitItemRow[];
   }
 
   listInternal(state: HumanWaitState = "open"): HumanWaitItemRow[] {

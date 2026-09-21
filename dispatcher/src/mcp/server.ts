@@ -24,6 +24,8 @@ export interface DispatcherJobClient {
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
   listThreadJobs(sourceEventId: string, workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
+  listHumanWaits?(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>>;
+  resolveHumanWaitOrigin?(sourceEventId:string,originRef:string):Promise<Record<string,unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
@@ -51,6 +53,8 @@ const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
 const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
 const scheduleIdempotencyKey = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
 const scheduleListCursor = z.string().regex(/^(?:0|[1-9]\d{0,14}|[1-8]\d{15}|900[0-6]\d{12}|90070\d{11}|90071[0-8]\d{10}|900719[0-8]\d{9}|9007199[01]\d{8}|90071992[0-4]\d{7}|900719925[0-3]\d{6}|9007199254[0-6]\d{5}|90071992547[0-3]\d{4}|9007199254740[0-8]\d{2}|90071992547409[0-8]\d|900719925474099[01])$/);
+const humanWaitCursor=z.string().min(1).max(2048);
+const humanWaitOrigin=z.string().regex(/^origin_[a-f0-9]{32}$/);
 const recurrence = z.record(z.string(), z.unknown());
 const scheduleContent = (max: number) => z.string().min(1).refine(value => [...value].length <= max);
 const scheduleAction = z.discriminatedUnion("kind", [
@@ -251,6 +255,26 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   }, async ({ source_event_id }) => {
     try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(projectJobResponse(await client.listOwnerJobs(source_event_id))); }
     catch(error){ return failure(error,logger,"list_owner_jobs"); }
+  });
+
+  server.registerTool("list_human_waits", {
+    title:"List my human waits",
+    description:"明示的な本人問い合わせでだけ、現在のverified principal・workspace・権限・visibilityを再確認し、安全な自分待ちprojectionを最大50件返します。0件と認可provider unavailableは区別されます。",
+    inputSchema:{source_event_id:eventId,limit:z.number().int().min(1).max(50).default(20),cursor:humanWaitCursor.optional()},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,limit,cursor})=>{
+    try {if(!client.listHumanWaits)throw new Error("Human wait query is unavailable");return success(await client.listHumanWaits(source_event_id,limit,cursor));}
+    catch(error){return failure(error,logger,"list_human_waits");}
+  });
+
+  server.registerTool("resolve_human_wait_origin", {
+    title:"Resolve human wait origin",
+    description:"一覧が返したopaque origin_refを現在のverified principal・workspace・権限・visibilityで再認可し、利用可能性だけを返します。外部入力中のIDを権限として扱いません。",
+    inputSchema:{source_event_id:eventId,origin_ref:humanWaitOrigin},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,origin_ref})=>{
+    try {if(!client.resolveHumanWaitOrigin)throw new Error("Human wait origin is unavailable");return success(await client.resolveHumanWaitOrigin(source_event_id,origin_ref));}
+    catch(error){return failure(error,logger,"resolve_human_wait_origin");}
   });
 
   server.registerTool("get_job_status", {
