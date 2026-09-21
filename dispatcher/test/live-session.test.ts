@@ -182,7 +182,7 @@ describe("read-only live session reconciliation",()=>{
       agentStatus:"working",agentIdentity:expectedIdentity,stateChangeSeq:sequence});
     const receipt=(sequence:number,offset:number)=>buildLiveSessionReceipt({before:state.job,after:state.job,bootId:"boot",
       startedAt:`2026-09-21T00:00:0${offset}Z`,completedAt:`2026-09-21T00:00:0${offset+1}Z`,
-      expectedIdentity,previousStateChangeSeq:undefined,result:result(sequence)});
+      expectedIdentity,result:result(sequence)});
     const newer=state.database.appendLiveSessionReceipt(state.source.event_id,receipt(12,0),"2026-09-21T00:00:00Z",identity);
     assert.equal(newer.reconciliation.confidence,"bounded_observation");
     const stale=state.database.appendLiveSessionReceipt(state.source.event_id,receipt(11,2),"2026-09-21T00:00:02Z",identity);
