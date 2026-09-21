@@ -29,6 +29,14 @@ import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
+import {
+  insertLiveSessionReceipt,
+  migrateLiveSession,
+  projectLiveSessionReceipt,
+  type LiveSessionIdentityRow,
+  type LiveSessionReceiptProjection,
+  type LiveSessionReceiptRow,
+} from "./live-session.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
   jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
@@ -391,6 +399,7 @@ export class DispatcherDatabase {
       this.db.transaction(() => {
         migrateDispatcherDatabase(this.db, this.migrationHook, true, this.schemaWrite);
         migrateScheduler(this.db, this.migrationHook, true);
+        migrateLiveSession(this.db);
       }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
@@ -819,8 +828,11 @@ export class DispatcherDatabase {
   }
 
   markJobRuntimeCleaned(jobId: string): void {
-    this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
-      WHERE job_id=? AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId);
+    this.db.transaction(()=>{
+      const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
+        WHERE job_id=? AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
+      if(changed===1)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+    }).immediate();
   }
 
   getJobGroup(sourceEventId: string): JobGroupRow | undefined {
@@ -931,10 +943,43 @@ export class DispatcherDatabase {
     return this.getJobRequired(jobId);
   }
 
-  setJobRuntime(jobId: string, herdrWorkspaceId: string, herdrPaneId: string): void {
-    const changed=this.db.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=? AND status IN ('preparing','cancelling')")
-      .run(herdrWorkspaceId,herdrPaneId,jobId).changes;
-    if(changed!==1)throw new Error(`Job ${jobId} is no longer preparing or cancelling`);
+  setJobRuntime(jobId: string, herdrWorkspaceId: string, herdrPaneId: string, agentSessionId?: string, at = new Date()): void {
+    if (agentSessionId !== undefined && (agentSessionId.length < 1 || agentSessionId.length > 512)) throw new Error("Herdr agent session identity is invalid");
+    this.db.transaction(() => {
+      const changed=this.db.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=? AND status IN ('preparing','cancelling')")
+        .run(herdrWorkspaceId,herdrPaneId,jobId).changes;
+      if(changed!==1)throw new Error(`Job ${jobId} is no longer preparing or cancelling`);
+      this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      if (agentSessionId !== undefined) this.db.prepare(`INSERT INTO job_live_session_identities(
+        job_id,identity_version,herdr_agent_session_id,recorded_at) VALUES(?,1,?,?)`)
+        .run(jobId,agentSessionId,at.toISOString());
+    }).immediate();
+  }
+
+  getJobLiveSessionIdentity(jobId: string): LiveSessionIdentityRow | undefined {
+    return this.db.prepare("SELECT * FROM job_live_session_identities WHERE job_id=?").get(jobId) as LiveSessionIdentityRow | undefined;
+  }
+
+  appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string): void {
+    this.db.transaction(() => insertLiveSessionReceipt(this.db,sourceEventId,receipt,startedAt)).immediate();
+  }
+
+  getLiveSessionReceipt(jobId: string, receiptId: string): LiveSessionReceiptProjection | undefined {
+    const row=this.db.prepare("SELECT * FROM live_session_query_receipts WHERE job_id=? AND receipt_id=?")
+      .get(jobId,receiptId) as LiveSessionReceiptRow | undefined;
+    return row ? projectLiveSessionReceipt(row) : undefined;
+  }
+
+  liveSessionRetentionPlan(cutoff: string): { receipt_rows: number } {
+    const receipt_rows=(this.db.prepare("SELECT count(*) AS count FROM live_session_query_receipts WHERE created_at<=?")
+      .get(cutoff) as {count:number}).count;
+    return {receipt_rows};
+  }
+
+  purgeLiveSessionReceipts(cutoff: string): { receipt_rows: number } {
+    const plan=this.liveSessionRetentionPlan(cutoff);
+    this.db.prepare("DELETE FROM live_session_query_receipts WHERE created_at<=?").run(cutoff);
+    return plan;
   }
 
   beginJobDispatch(jobId: string, at = new Date()): JobRow {

@@ -8,6 +8,7 @@ import type { DispatcherConfig } from "./config.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
+import type { LiveSessionReceiptProjection } from "./live-session.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
@@ -100,6 +101,17 @@ export interface ApiJobController {
   wake(): void;
   steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult>;
   cancel(jobId: string, sourceEventId: string, reason?: string): Promise<JobControlResult>;
+  observeLiveSession?(jobId:string,sourceEventId?:string):Promise<LiveSessionReceiptProjection>;
+  getLiveSessionReceipt?(jobId:string,receiptId:string):LiveSessionReceiptProjection|undefined;
+}
+
+function projectLiveJobResponse(job:Record<string,unknown>,receipt:LiveSessionReceiptProjection):Record<string,unknown>{
+  const safeKeys=["job_id","source_event_id","job_key","status","created_at","updated_at","completed_at","dispatch_started_at","prompt_accepted_at","last_error_code","steer_event_id","steer_state","completion_event_id","notification_state","notification_authorization_phase"];
+  const safeJob=Object.fromEntries(safeKeys.filter(key=>key in job).map(key=>[key,job[key]]));
+  return {schema_version:1,job:safeJob,live_session:receipt.live_session,reconciliation:receipt.reconciliation,
+    receipt:{receipt_id:receipt.receipt_id,observed_at:receipt.observed_at,boot_id:receipt.boot_id,
+      durable_status_before:receipt.durable_status_before,durable_status_after:receipt.durable_status_after,
+      result_present_before:receipt.result_present_before,result_present_after:receipt.result_present_after}};
 }
 
 export interface ApiUpdateClient {
@@ -699,10 +711,21 @@ export class DispatcherApi {
       });
       return;
     }
-    const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel))?$/.exec(url.pathname);
+    const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel)|\/live-session-receipts\/([^/]+))?$/.exec(url.pathname);
     if (!match) throw new ApiRequestError(404, "not_found", "Route not found");
     const jobId = match[1]!;
     const action = match[2];
+    const liveReceiptId=match[3];
+    if(request.method==="GET"&&liveReceiptId){
+      const job=this.database.getJob(jobId);
+      if(!job)throw new ApiRequestError(404,"job_not_found",`Job ${jobId} was not found`);
+      const sourceEventId=url.searchParams.get("source_event_id");
+      if(sourceEventId===null||!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId))throw new ApiRequestError(400,"invalid_request","valid source_event_id is required");
+      try{this.database.assertJobSourceMatchesThread(jobId,sourceEventId);}catch{throw new ApiRequestError(403,"job_thread_mismatch","Job does not belong to the event thread");}
+      const receipt=this.jobs.getLiveSessionReceipt?.(jobId,liveReceiptId);
+      if(!receipt)throw new ApiRequestError(404,"live_session_receipt_not_found","Live session receipt was not found");
+      sendJson(response,200,projectLiveJobResponse({...job,...this.database.jobNotificationState(jobId)},receipt));return;
+    }
     if (request.method === "GET" && !action) {
       const job = this.database.getJob(jobId);
       if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
@@ -718,7 +741,14 @@ export class DispatcherApi {
           throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
         }
       }
-      sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      const includeLive=url.searchParams.get("include_live_session");
+      if(includeLive!==null&&includeLive!=="true"&&includeLive!=="false")throw new ApiRequestError(400,"invalid_request","include_live_session must be true or false");
+      const projected={...job,...this.database.jobNotificationState(jobId)};
+      if(includeLive==="true"){
+        if(!this.jobs.observeLiveSession)throw new ApiRequestError(503,"live_session_unavailable","Live session observation is unavailable");
+        try{sendJson(response,200,projectLiveJobResponse(projected,await this.jobs.observeLiveSession(jobId,sourceEventId)));}
+        catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
+      }else sendJson(response, 200, { schema_version: 1, job: projected });
       return;
     }
     if (request.method === "POST" && action === "steer") {

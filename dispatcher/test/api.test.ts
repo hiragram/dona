@@ -11,6 +11,8 @@ import type { Logger } from "../src/logger.js";
 import { UpdaterClientError } from "../src/updater-client.js";
 import { canonicalJobPayloadSha256, parseCreateJobRequest, stableStringify } from "../src/validation.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
+import { JobSupervisor } from "../src/job-supervisor.js";
+import type { JobAgentRuntime } from "../src/job-runtime.js";
 
 const roots: string[] = [];
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -79,6 +81,31 @@ function requestAndDropResponseBody(socketPath: string, route: string, body: unk
 }
 
 describe("DispatcherApi", () => {
+  test("live session opt-inをthreadへbindしdurable receiptを再読する",async()=>{
+    const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-live-api")).row;
+    const other=database.enqueue({...eventEnvelope("Ev-live-api-other"),subject:{...eventEnvelope("x").subject,thread_ts:"1756722030.999999"},reply_target:{...eventEnvelope("x").reply_target,thread_ts:"1756722030.999999"}}).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"PRIVATE",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w-private","p-private","s-private");database.beginJobDispatch(job.job_id);database.markJobNeedsReview(job.job_id,"prompt_acceptance_unknown","unknown");
+    const calls:string[]=[];const runtime:JobAgentRuntime={async prepare(){throw new Error("unused");},async get(agent){calls.push("get");return {ok:true,stdout:"RAW PRIVATE",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working",agentIdentity:JSON.stringify(["w-private","p-private",agent,"s-private"]),stateChangeSeq:5};},async prompt(){calls.push("prompt");throw new Error("forbidden");},async wait(){throw new Error("forbidden");},async cancel(){throw new Error("forbidden");}};
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>{});const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},supervisor,config,logger);await api.start();try{
+    const durable=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}`);
+    assert.equal(durable.status,200);assert.equal("live_session" in durable.body,false);assert.deepEqual(calls,[]);
+    const denied=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.event_id}&include_live_session=true`);
+    assert.equal(denied.status,403);assert.deepEqual(calls,[]);
+    const live=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}&include_live_session=true`);
+    assert.equal(live.status,200);assert.equal((live.body.live_session as {identity_match:boolean}).identity_match,true);assert.deepEqual(calls,["get"]);
+    assert.doesNotMatch(JSON.stringify(live.body),/w-private|p-private|s-private|RAW PRIVATE/);
+    const receiptId=(live.body.receipt as {receipt_id:string}).receipt_id;
+    const reread=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/live-session-receipts/${receiptId}?source_event_id=${source.event_id}`);
+    assert.equal(reread.status,200);assert.deepEqual(reread.body.live_session,live.body.live_session);assert.deepEqual(calls,["get"]);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}&include_live_session=yes`)).status,400);
+    const original=database.appendLiveSessionReceipt.bind(database);database.appendLiveSessionReceipt=()=>{throw new Error("audit unavailable");};
+    const failed=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${source.event_id}&include_live_session=true`);
+    assert.equal(failed.status,503);assert.equal((failed.body.error as {code:string}).code,"live_session_audit_unavailable");
+    assert.doesNotMatch(JSON.stringify(failed.body),/audit unavailable/);database.appendLiveSessionReceipt=original;
+    }finally{await api.stop();database.close();}
+  });
   test("bounds live access confirmation by the signed receipt lifetime", () => {
     const issuedAt="2026-09-08T00:00:00.000Z",issued=Date.parse(issuedAt);
     assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued),119_000);
