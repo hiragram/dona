@@ -92,9 +92,9 @@ export class HumanWaitQueryService {
       if(visible.length>input.limit)break;
     }
     if(this.waits.ownerRevision(revisionScope)!==readRevision)throw new HumanWaitQueryError("human_wait_cursor_invalid");
-    const page=visible.slice(0,input.limit),hasMore=visible.length>input.limit||rows.length>this.internalScanMax;
-    const last=page.at(-1),scanLast=candidates.at(-1);
-    const continuation=visible.length>input.limit?last:scanLast;
+    if(rows.length>this.internalScanMax&&visible.length<=input.limit)throw new HumanWaitQueryError("human_wait_query_unavailable");
+    const page=visible.slice(0,input.limit),hasMore=visible.length>input.limit;
+    const continuation=page.at(-1);
     return {schema_version:1,items:page.map(item=>({item_id:item.item_id,category:item.resource_kind,reason:item.reason_code,
       decision:item.decision_kind,state:"open",opened_at:item.opened_at,updated_at:item.updated_at,
       origin:{available:true,origin_ref:item.origin_ref},revision:item.resource_revision})),has_more:hasMore,
