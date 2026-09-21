@@ -83,12 +83,12 @@ const openJobSql = `
     CASE WHEN a.owner_kind='human_verified' THEN a.principal_id WHEN json_extract(r.owner_json,'$.kind')='schedule' THEN json_extract(r.owner_json,'$.owner_id') END,
     CASE WHEN NEW.status='blocked' THEN 'owner' ELSE 'operator' END,
     CASE WHEN NEW.status='blocked' THEN 'provide_input'
-      WHEN NEW.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'reconcile_write'
+      WHEN NEW.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','steer_acceptance_unknown','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'reconcile_write'
       WHEN NEW.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'review_result'
       ELSE 'operator_review' END,
     'job',NEW.job_id,NEW.source_event_id,COALESCE(a.resource_revision,a.binding_revision,1),
     CASE WHEN NEW.status='blocked' THEN 'human_input'
-      WHEN NEW.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'ambiguous_write'
+      WHEN NEW.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','steer_acceptance_unknown','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'ambiguous_write'
       WHEN NEW.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'invalid_result'
       ELSE 'operator_review_unknown' END,
     'origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,
@@ -96,7 +96,7 @@ const openJobSql = `
   FROM (SELECT 1) seed
   LEFT JOIN job_authorization_bindings a ON a.job_id=NEW.job_id
   LEFT JOIN job_owner_bindings r ON r.job_id=NEW.job_id
-  WHERE NEW.status IN ('blocked','needs_review') AND NOT EXISTS (
+  WHERE NEW.status IN ('blocked','needs_review') AND COALESCE(json_extract(r.owner_json,'$.kind'),'')!='schedule' AND NOT EXISTS (
     SELECT 1 FROM job_groups g WHERE g.source_event_id=NEW.source_event_id
       AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL)
   ON CONFLICT(dedupe_key) DO UPDATE SET
@@ -172,7 +172,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         source_revision=NEW.updated_at,retain_until=datetime(NEW.updated_at,'+30 days')
       WHERE dedupe_key='job:'||NEW.job_id AND (NEW.status NOT IN ('blocked','needs_review') OR EXISTS (
         SELECT 1 FROM job_groups g WHERE g.source_event_id=NEW.source_event_id
-          AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL))
+          AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL) OR EXISTS (
+        SELECT 1 FROM job_owner_bindings b WHERE b.job_id=NEW.job_id AND json_extract(b.owner_json,'$.kind')='schedule'))
         AND state='open';
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_job_binding_insert AFTER INSERT ON job_authorization_bindings BEGIN
@@ -197,8 +198,11 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id)
       WHERE j.source_event_id=NEW.source_event_id AND NEW.attention_event_id IS NOT NULL AND NEW.all_terminal_event_id IS NULL
       HAVING COUNT(*)>0
-      ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
-        resolved_at=NULL,stale_at=NULL,retain_until=excluded.retain_until;
+      ON CONFLICT(dedupe_key) DO UPDATE SET tenant_id=excluded.tenant_id,workspace_id=excluded.workspace_id,
+        owner_kind=excluded.owner_kind,owner_principal_kind=excluded.owner_principal_kind,owner_principal_id=excluded.owner_principal_id,
+        decision_actor_kind=excluded.decision_actor_kind,decision_kind=excluded.decision_kind,resource_revision=excluded.resource_revision,
+        reason_code=excluded.reason_code,source_revision=excluded.source_revision,state='open',session_settlement_verified=0,
+        updated_at=excluded.updated_at,resolved_at=NULL,stale_at=NULL,retain_until=excluded.retain_until;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at,
         retain_until=datetime(NEW.updated_at,'+30 days')
       WHERE parent_resource_id=NEW.source_event_id AND resource_kind='job' AND state='open'
@@ -269,8 +273,15 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
           AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1))
       ON CONFLICT(dedupe_key) DO UPDATE SET resource_id=excluded.resource_id,source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
-      UPDATE human_wait_items SET state='resolved',resolved_at=NEW.materialized_at,updated_at=NEW.materialized_at,source_revision=NEW.materialized_at,
-        retain_until=datetime(NEW.materialized_at,'+30 days')
+      UPDATE human_wait_items SET state='resolved',
+        resolved_at=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
+        updated_at=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
+        source_revision=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
+        retain_until=datetime(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),'+30 days')
       WHERE dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status AND state='open' AND (
         NEW.notification_state!='needs_review' OR NOT EXISTS (
           SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
@@ -320,7 +331,8 @@ export class HumanWaitRepository {
   }
 
   listInternal(state: HumanWaitState = "open"): HumanWaitItemRow[] {
-    return this.db.prepare("SELECT * FROM human_wait_items WHERE state=? ORDER BY updated_at,item_id").all(state) as HumanWaitItemRow[];
+    return this.db.prepare(`SELECT * FROM human_wait_items i WHERE state=? AND NOT EXISTS (
+      SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key=i.dedupe_key) ORDER BY updated_at,item_id`).all(state) as HumanWaitItemRow[];
   }
 
   recordVerifiedSessionSettlement(receipt: VerifiedHumanWaitSessionSettlement, settledAt: string): boolean {
@@ -356,7 +368,8 @@ export class HumanWaitRepository {
     type Candidate={source_key:string;kind:"job"|"group"|"run"|"completion"|"outbox";resource_id:string;projected_resource_id:string;aux_id:string|null;source_revision:string;desired_open:number;dedupe_key:string};
     const rows = this.db.prepare(`SELECT * FROM (
       SELECT 'job:'||j.job_id AS source_key,'job' AS kind,j.job_id AS resource_id,j.job_id AS projected_resource_id,NULL AS aux_id,j.updated_at AS source_revision,
-        CASE WHEN j.status IN ('blocked','needs_review') AND NOT EXISTS (SELECT 1 FROM job_groups g WHERE g.source_event_id=j.source_event_id AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL) THEN 1 ELSE 0 END AS desired_open,
+        CASE WHEN j.status IN ('blocked','needs_review') AND NOT EXISTS (SELECT 1 FROM job_groups g WHERE g.source_event_id=j.source_event_id AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM job_owner_bindings b WHERE b.job_id=j.job_id AND json_extract(b.owner_json,'$.kind')='schedule') THEN 1 ELSE 0 END AS desired_open,
         'job:'||j.job_id AS dedupe_key FROM jobs j
       UNION ALL SELECT 'group:'||g.source_event_id,'group',g.source_event_id,g.source_event_id,NULL,g.updated_at,
         CASE WHEN g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL THEN 1 ELSE 0 END,'group:'||g.source_event_id FROM job_groups g
@@ -379,9 +392,10 @@ export class HumanWaitRepository {
       for(const row of page) {
         const item=this.db.prepare("SELECT state,source_revision,resource_id FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string;resource_id:string}|undefined;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
-        const shouldOpen=row.desired_open===1;
+        const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
+        const shouldOpen=row.desired_open===1&&!quarantinedAlready;
         if((shouldOpen&&!item)||(item&&shouldOpen&&(item.state!=="open"||item.resource_id!==row.projected_resource_id))||(item&&!shouldOpen&&item.state==="open")) repaired++;
-        const malformed=this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
+        const malformed=!quarantinedAlready&&this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
           (origin_ref LIKE '%/%' OR reason_code NOT IN ('human_input','ambiguous_write','invalid_result','notification_reconcile','operator_review_unknown'))`).get(row.dedupe_key);
         if(malformed) quarantined++;
       }
@@ -389,7 +403,8 @@ export class HumanWaitRepository {
     if(!input.dryRun) this.db.transaction(()=>{
       for(const row of page) {
         const item=this.db.prepare("SELECT state,source_revision,resource_id FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string;resource_id:string}|undefined;
-        const shouldOpen=row.desired_open===1;
+        const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
+        const shouldOpen=row.desired_open===1&&!quarantinedAlready;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
         if((shouldOpen&&!item)||(item&&shouldOpen&&(item.state!=="open"||item.resource_id!==row.projected_resource_id))||(item&&!shouldOpen&&item.state==="open")) {
           let changed=0;
@@ -402,9 +417,17 @@ export class HumanWaitRepository {
           else changed=this.db.prepare("UPDATE connector_outbox SET updated_at=updated_at WHERE outbox_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
           if(changed===1)repaired++;
         }
-        const malformed=this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
+        const malformed=!quarantinedAlready&&this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
           (origin_ref LIKE '%/%' OR reason_code NOT IN ('human_input','ambiguous_write','invalid_result','notification_reconcile','operator_review_unknown'))`).get(row.dedupe_key);
-        if(malformed){this.db.prepare("INSERT OR REPLACE INTO human_wait_quarantine VALUES(?,?,?,?)").run(row.dedupe_key,"invalid_projection",row.source_revision,input.snapshotRevision);quarantined++;}
+        if(malformed){
+          this.db.prepare("INSERT OR REPLACE INTO human_wait_quarantine VALUES(?,?,?,?)").run(row.dedupe_key,"invalid_projection",row.source_revision,input.snapshotRevision);
+          this.db.prepare(`UPDATE human_wait_items SET state='stale',stale_at=?,updated_at=?,source_revision=?,retain_until=datetime(?,'+30 days')
+            WHERE dedupe_key=? AND state='open'`).run(input.snapshotRevision,input.snapshotRevision,row.source_revision,input.snapshotRevision,row.dedupe_key);
+          this.db.prepare(`INSERT INTO human_wait_audit(item_id,reason_class,source_revision,transition,actor_class,created_at)
+            SELECT item_id,'invalid_projection',?,'quarantined','operator',? FROM human_wait_items WHERE dedupe_key=?`)
+            .run(row.source_revision,input.snapshotRevision,row.dedupe_key);
+          quarantined++;
+        }
       }
     }).immediate();
     const digest=createHash("sha256").update(JSON.stringify({cursor:input.cursor??null,next,scanned:page.length,repaired,quarantined,snapshot:input.snapshotRevision})).digest("hex");
@@ -415,10 +438,10 @@ export class HumanWaitRepository {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error("human_wait_purge_limit_invalid");
     if (!Number.isFinite(Date.parse(before)) || new Date(Date.parse(before)).toISOString() !== before) throw new Error("human_wait_purge_time_invalid");
     return this.db.transaction(() => {
-      const ids=this.db.prepare(`SELECT item_id,source_revision FROM human_wait_items WHERE state!='open' AND retain_until<=?
+      const ids=this.db.prepare(`SELECT item_id,source_revision FROM human_wait_items WHERE state!='open' AND julianday(retain_until)<=julianday(?)
         ORDER BY retain_until,item_id LIMIT ?`).all(before,limit) as Array<{item_id:string;source_revision:string}>;
       const audit=this.db.prepare("INSERT INTO human_wait_audit(item_id,reason_class,source_revision,transition,actor_class,created_at) VALUES(?,'retention',?,'purged','operator',?)");
-      const remove=this.db.prepare("DELETE FROM human_wait_items WHERE item_id=? AND state!='open' AND retain_until<=?");
+      const remove=this.db.prepare("DELETE FROM human_wait_items WHERE item_id=? AND state!='open' AND julianday(retain_until)<=julianday(?)");
       for(const {item_id,source_revision} of ids){audit.run(item_id,source_revision,before);remove.run(item_id,before);}
       return ids.length;
     }).immediate();
