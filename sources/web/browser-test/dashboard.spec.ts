@@ -15,10 +15,10 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 
 async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; logoutUnknown?: boolean } = {}) {
+  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; pauseCancel?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
-    result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
+    result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend\u061cmore", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
   let current = job(), sessionReads = 0, listReads = 0, detailReads = 0, alphaDetailReads = 0, submitWrites = 0, cancelWrites = 0, eventReads = 0, logoutWrites = 0, logoutStatusReads = 0;
   page.on("pageerror", error => errors.push(error.message));
   await page.context().route("**/*", async route => {
@@ -30,7 +30,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
     if (url.origin !== policy.origin) { errors.push("unexpected external request"); await route.abort(); return; }
     if (url.pathname === "/") { await route.fulfill(dashboardPage()); return; }
     if (url.pathname === "/login") { await route.fulfill({ status: 200, contentType: "text/html", body: "<!doctype html><title>login</title>" }); return; }
-    if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
+    if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;if(options.pauseSecondSession&&sessionReads===2)await options.pauseSecondSession;await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
     if(url.pathname==="/api/session/logout"&&request.method()==="POST"){logoutWrites++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.logoutUnknown){await fulfill(route,{error:"durability_unavailable"},503);return;}await route.fulfill({status:204,body:""});return;}
     if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);await fulfill(route,{revoked:true});return;}
     if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList; if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
@@ -41,7 +41,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
     }
-    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":options.detailAfterCancelStatus===404?"not_found":"identity_unavailable"},options.detailAfterCancelStatus);return;}
+    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0&&id==="job_alpha"){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":options.detailAfterCancelStatus===404?"not_found":"identity_unavailable"},options.detailAfterCancelStatus);return;}if(options.detailAfterEventStatus&&eventReads>0){await fulfill(route,{error:"identity_unavailable"},options.detailAfterEventStatus);return;}
       if(id==="job_alpha"){alphaDetailReads++;if(options.pauseFirstAlphaDetail&&alphaDetailReads===1)await options.pauseFirstAlphaDetail;if(options.firstAlphaDetailStatus&&alphaDetailReads===1){await fulfill(route,{error:"not_found"},options.firstAlphaDetailStatus);return;}}
       await fulfill(route, { job: options.pauseFirstAlphaDetail||options.multipleJobs?job({job_id:id,...(id==="job_alpha"?{error_code:alphaDetailReads===1?"old_projection":"new_projection"}:{})}):current, event_cursor: cursor }); return; }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/events$/.test(url.pathname)) {
@@ -51,7 +51,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
         body: `id: ${cursor}\nevent: ${event}\ndata: ${JSON.stringify({ job: current })}\n\n` }); return;
     }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/cancel$/.test(url.pathname)) {
-      cancelWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      cancelWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/);if(options.pauseCancel)await options.pauseCancel;
       if (options.cancelUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       if (options.cancelReason) { await fulfill(route, { error: options.cancelReason }, options.cancelReason === "owner_mismatch" ? 403 : 409); return; }
       current = job({ status: "cancelling", control: { can_cancel: false } }); await fulfill(route, { status: "succeeded", outcome: "cancelled", receipt_id: "cancel", job: { job_id: "job_alpha", status: "cancelling" } }); return;
@@ -70,7 +70,7 @@ test("login後にdurable一覧・詳細・SSEを表示しuntrusted Resultをlite
   await expect.poll(() => f.eventReads).toBeGreaterThan(0);
   await expect(page.getByText("完了", { exact: true })).toBeVisible();
   await expect(page.locator("pre.summary")).toContainText("<img src=x onerror=alert(1)>");
-  await expect(page.locator("pre.summary")).toContainText("\\u202eend"); expect(await page.locator("img").count()).toBe(0);
+  await expect(page.locator("pre.summary")).toContainText("\\u202eend\\u061cmore"); expect(await page.locator("img").count()).toBe(0);
   expect(f.calls.find(call => call.path.endsWith("/events"))?.lastEventId).toBe(cursor);
   expect(await page.locator("script").count()).toBe(1); expect(f.errors).toEqual([]);
 });
@@ -156,6 +156,10 @@ test("SSE切断はstaleを明示してdetailから再接続し、cancel競合も
   await expect(page.getByRole("status")).toContainText("取消を受け付けられませんでした"); expect(f.cancelWrites).toBe(1); expect(f.eventReads).toBeGreaterThan(1); expect(f.errors).toEqual([]);
 });
 
+test("SSE切断後のdetail再検証失敗では以前のsnapshotを消去する",async({page})=>{
+  const f=await fixture(page,{firstEventAbort:true,detailAfterEventStatus:503});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました",{timeout:5000});await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page.locator("#job-list button")).toHaveCount(0);expect(f.errors).toEqual([]);
+});
+
 test("SSEで認可を失ったらprivate detailを消去する", async ({ page }) => {
   const f = await fixture(page, { eventDeniedStatus: 403 }); await page.goto(policy.origin + "/"); await page.getByRole("button", { name: /job_alpha/ }).click();
   await expect(page.getByRole("status")).toContainText("以前の内容は表示していません"); await expect(page.getByRole("heading", { name: "job_alpha" })).toBeHidden();
@@ -214,6 +218,10 @@ for(const cancelUnknown of [false,true])test(`cancel${cancelUnknown?"受付不�
   const f=await fixture(page,{cancelUnknown,detailAfterCancelStatus:404});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
+for(const cancelUnknown of [false,true])test(`cancel${cancelUnknown?"受付不明":"成功"}後の古い404を現在の選択へ適用しない`,async({page})=>{
+  let release!:()=>void;const pauseCancel=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{multipleJobs:true,cancelUnknown,pauseCancel,detailAfterCancelStatus:404});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await page.evaluate(()=>{history.pushState({job:"job_beta"},"","#job=job_beta");dispatchEvent(new PopStateEvent("popstate"));});await expect(page.getByRole("heading",{name:"job_beta"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"job_beta"})).toBeVisible();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
 test("terminal detailではSSEを開始せずerror codeとfocusを表示する", async ({ page }) => {
   const f=await fixture(page);await page.goto(policy.origin+"/");
   await page.evaluate(()=>{history.replaceState(null,"","/");});
@@ -229,6 +237,10 @@ test("logout応答喪失は再POSTせずstatusを一度だけ照合してlogin�
 
 test("古いboot応答はbfcache復帰後の新しいsession表示を消去しない",async({page})=>{
   let release!:()=>void;const pauseFirstSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseFirstSession});await page.goto(policy.origin+"/");await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();expect(f.sessionReads).toBe(2);expect(f.errors).toEqual([]);
+});
+
+test("bfcache復帰のsession再確認中は以前のprincipalを表示しない",async({page})=>{
+  let release!:()=>void;const pauseSecondSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondSession});await page.goto(policy.origin+"/");await expect(page.locator("#principal")).toHaveText("principal-fixture");await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect(page.locator("#principal")).toHaveText("確認中");release();await expect(page.locator("#principal")).toHaveText("principal-fixture");expect(f.errors).toEqual([]);
 });
 
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
