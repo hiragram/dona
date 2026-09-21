@@ -28,6 +28,7 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { JobAuthorizationBindingRepository, migrateJobAuthorizationBindings } from "./job-authorization-binding.js";
+import { dropHumanWaitTriggersForCoreMigration, HumanWaitRepository, migrateHumanWaitReadModel } from "./human-wait.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, type VerifiedPrincipalBindingRow, type VerifiedPrincipalProofConsumptionRow } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
@@ -245,6 +246,7 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   const migrateV3 = () => {
+    dropHumanWaitTriggersForCoreMigration(db);
     const hasLegacyStopMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
     db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
@@ -384,6 +386,7 @@ export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   readonly jobAuthorization: JobAuthorizationBindingRepository;
+  readonly humanWaits: HumanWaitRepository;
   private readonly schemaWrite: 2 | 3;
   private readonly migrationHook: DispatcherMigrationHook;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
@@ -427,6 +430,7 @@ export class DispatcherDatabase {
         this.db.transaction(() => {
           migrateJobRouting(this.db);
           migrateJobAuthorizationBindings(this.db);
+          migrateHumanWaitReadModel(this.db);
         }).immediate();
       } catch(error) {
         for(const moved of movedResults.reverse()) if(fs.existsSync(moved.to)&&!fs.existsSync(moved.from)) fs.renameSync(moved.to,moved.from);
@@ -449,6 +453,7 @@ export class DispatcherDatabase {
             .run(nowUtc(),row.event_id);
         }
       }
+      this.humanWaits = new HumanWaitRepository(this.db);
     } catch (error) {
       this.db.close();
       throw error;

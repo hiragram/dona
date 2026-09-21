@@ -201,6 +201,8 @@ npm exec -- tsx src/cli.ts job show job_...
 
 ## 状態と復旧
 
+owner-wideな人間判断待ちは、既存job/group/schedule/notification正本と同じtransactionで`human_wait_items`へ安全なallowlist projectionとして同期します。自由文、Result、objective、private destinationは複写せず、legacy ownerは`unknown`のままです。bounded repair、restart、retentionの詳細は[owner-wide human wait read model 運用契約](../docs/operations/human-wait-read-model.md)を参照してください。外部queryとSlack表示は後続Issueが所有し、この内部tableを直接開示しません。
+
 - `queued` / `retryable_failed`: sequence先頭から再開します。先頭イベントがbackoff中なら後続を追い越しません。
 - `waiting_agent`: Result Envelopeとagent状態の確認を再開し、promptは再送しません。
 - prompt受理後にagentが見つからない状態が`DONA_AGENT_MISSING_GRACE_MS`（既定5秒）を超えた場合は、二重投入を避けて`needs_review`へ移します。
