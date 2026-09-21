@@ -209,14 +209,16 @@ export function createSlackMcpServer(
   server.registerTool("check_user_channel_access", {
     title: "Check current Slack access",
     description: "外部write直前に、指定userが現在もworkspaceに存在し対象channelのmemberであることを確認します。照会失敗は許可として扱いません。",
-    inputSchema: { workspace: workspaceSchema, channel_id: channelSchema, user_id: userSchema,event_id:z.string().min(1).max(128).optional() },
+    inputSchema: { workspace: workspaceSchema, channel_id: channelSchema, user_id: userSchema,event_id:z.string().min(1).max(128).optional(),
+      required_role:z.enum(["member","admin","owner"]).default("member") },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async ({workspace,channel_id,user_id,event_id}) => {
+  }, async ({workspace,channel_id,user_id,event_id,required_role}) => {
     try {
       const connection=registry.get(workspace);
       if(!connection.client.hasChannelMember) throw new SlackApiError("access_check_unavailable","Current membership check is unavailable");
       if (!event_id) throw new SlackApiError("access_unavailable", "Current Slack access could not be verified");
-      const evidence = await verifyCurrentSlackAccess(connection.client, connection.teamId, { eventId:event_id, channelId:channel_id, userId:user_id });
+      const evidence = await verifyCurrentSlackAccess(connection.client, connection.teamId,
+        { eventId:event_id, channelId:channel_id, userId:user_id, requiredRole:required_role });
       if(!signAccessReceipt) throw new SlackApiError("access_unavailable","Current Slack access could not be verified");
       return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized:true,
         channel_kind:evidence.channel_kind,channel_user_id:evidence.channel_user_id,access_receipt:signAccessReceipt(evidence)});

@@ -81,6 +81,11 @@ export interface SlackUser {
   isBot: boolean;
   isAppUser: boolean;
   isDeleted: boolean;
+  isAdmin?: boolean;
+  isOwner?: boolean;
+  isPrimaryOwner?: boolean;
+  isRestricted?: boolean;
+  isUltraRestricted?: boolean;
 }
 
 export interface SlackUserPage {
@@ -213,6 +218,11 @@ function userFromResponse(user: {
   is_bot?: boolean;
   is_app_user?: boolean;
   deleted?: boolean;
+  is_admin?: boolean;
+  is_owner?: boolean;
+  is_primary_owner?: boolean;
+  is_restricted?: boolean;
+  is_ultra_restricted?: boolean;
   profile?: { display_name?: string; real_name?: string; title?: string };
 }): SlackUser {
   return {
@@ -229,6 +239,11 @@ function userFromResponse(user: {
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
     isDeleted: user.deleted ?? false,
+    isAdmin: user.is_admin ?? false,
+    isOwner: user.is_owner ?? false,
+    isPrimaryOwner: user.is_primary_owner ?? false,
+    isRestricted: user.is_restricted ?? false,
+    isUltraRestricted: user.is_ultra_restricted ?? false,
   };
 }
 

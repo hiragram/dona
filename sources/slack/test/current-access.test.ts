@@ -53,7 +53,21 @@ describe("Slack current access verifier", () => {
     const mpim=await verifyCurrentSlackAccess(provider({channel:{id:"G_MPIM",isPrivate:true,isMpim:true}}),"T_HOME",
       {eventId:"evt_mpim",channelId:"G_MPIM",userId:"U_OWNER"});
     assert.equal(mpim.destination_kind,"mpim");
+    const privateChannel=await verifyCurrentSlackAccess(provider({channel:{id:"C_PRIVATE",isPrivate:true}}),"T_HOME",
+      {eventId:"evt_private",channelId:"C_PRIVATE",userId:"U_OWNER"});
+    assert.equal(privateChannel.destination_kind,"private_channel");
     await denied(provider({channel:{isMember:true},member:false}));
+  });
+
+  test("current roleを検証し、originとdisclosure destinationを別証跡へ束縛する",async()=>{
+    await assert.rejects(()=>verifyCurrentSlackAccess(provider({user:{isAdmin:false,isOwner:false}}),"T_HOME",
+      {eventId:"evt_1",channelId:"C_PRIVATE",userId:"U_OWNER",requiredRole:"admin"}),
+    (error:unknown)=>error instanceof SlackApiError&&error.errorCode==="access_unavailable");
+    const admin=await verifyCurrentSlackAccess(provider({user:{isAdmin:true}}),"T_HOME",
+      {eventId:"evt_1",channelId:"C_PRIVATE",userId:"U_OWNER",requiredRole:"admin"});
+    const disclosure=await verifyCurrentSlackAccess(provider({channel:{id:"C_DISCLOSURE"}}),"T_HOME",
+      {eventId:"evt_1",channelId:"C_DISCLOSURE",userId:"U_OWNER"});
+    assert.equal(admin.required_role,"admin");assert.notEqual(admin.destination_id,disclosure.destination_id);
   });
 
   test("positive cacheを持たず、revoke・provider障害・restart相当を次の照会へ即時反映する", async () => {
