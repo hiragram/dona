@@ -75,35 +75,19 @@ function success(data: Record<string, unknown>) {
   };
 }
 
-// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
-function projectJobError(row: Record<string, unknown>): string | null {
-  if (typeof row.last_error_message !== "string") return null;
-  let message = row.last_error_message;
-  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
-    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
-    .sort((a, b) => b.length - a.length);
-  for (const value of privateValues) message = message.split(value).join("[redacted]");
-  return message
-    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
-    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
-    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
-    .slice(0, 2_000);
-}
-
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
-function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
+function projectJobResponse(response: Record<string, unknown>): Record<string, unknown> {
   const project = (value: unknown) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const row = value as Record<string, unknown>;
     const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id", "notification_state", "notification_authorization_phase"];
-    if (includeResult) keys.push("result_json");
-    return {
-      ...Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]])),
-      ...(includeResult ? { last_error_message: projectJobError(row) } : {}),
-    };
+    return Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]]));
   };
   return {
     schema_version: 1,
+    ...(typeof response.source_event_id === "string" ? { source_event_id: response.source_event_id } : {}),
+    ...(["matched", "conflict", "not_found", "unverified_legacy"].includes(String(response.reconciliation))
+      ? { reconciliation: response.reconciliation } : {}),
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
@@ -219,7 +203,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
     try {
       const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined;
-      if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
+      if (!reconciliationRequested) return success(projectJobResponse(await client.listEventJobs(source_event_id, job_key)));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
       }
@@ -236,11 +220,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
         objective,
         workspace,
       });
-      return success(await client.listEventJobs(
+      return success(projectJobResponse(await client.listEventJobs(
         source_event_id,
         job_key,
         canonicalJobPayloadSha256(canonicalRequest),
-      ));
+      )));
     } catch (error) {
       return failure(error, logger, "list_event_jobs");
     }
@@ -265,18 +249,18 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     inputSchema: { source_event_id: eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ source_event_id }) => {
-    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
+    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(projectJobResponse(await client.listOwnerJobs(source_event_id))); }
     catch(error){ return failure(error,logger,"list_owner_jobs"); }
   });
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。group通知では現在の通知event_idを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで、許可済みの状態projectionと制御receiptだけを取得します。Result本文や自由文errorは返しません。group通知では認証済みpurpose専用projectionを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ job_id, source_event_id }) => {
     try {
-      return success(projectJobResponse(await client.getJob(job_id, source_event_id), true));
+      return success(projectJobResponse(await client.getJob(job_id, source_event_id)));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }

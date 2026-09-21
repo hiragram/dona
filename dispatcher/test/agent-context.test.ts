@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 
 import { AgentContextManager } from "../src/agent-context.js";
+import { AgentReadAuthorization } from "../src/agent-read-authorization.js";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherApiClient, DispatcherClientError } from "../src/client.js";
 import { DispatcherDatabase } from "../src/database.js";
@@ -124,6 +125,95 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     assert.equal(resumed.event_id, completion.event_id);
     assert.notEqual(resumedCredential.token, completionCredential.token);
     assert.ok(restarted.authorize(resumedCredential.token, completion.event_id, "get_job_status"));
+    await assert.rejects(() => client.listOwnerJobs(completion.event_id), (error: unknown) =>
+      error instanceof DispatcherClientError && error.statusCode === 403);
+  } finally {
+    await api.stop(); database.close();
+  }
+});
+
+test("agent read境界は認可後だけallowlist投影し不可視と不存在を同形にする", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  config.agentSocketPath = path.join(root, "a", "a.sock");
+  config.agentCredentialPath = path.join(root, "a", "a.token");
+  const database = new DispatcherDatabase(config.databasePath);
+  const envelope = eventEnvelope("agent-read-source");
+  const source = database.enqueue(envelope, new Date(), proof(envelope.external_event_id)).row;
+  const dispatching = database.beginDispatch(source.event_id, path.join(config.resultsDir, `${source.event_id}.json`));
+  const contexts = new AgentContextManager(database, config.agentCredentialPath, 60_000);
+  const hidden = new Set<string>();
+  const restrictedAudit: unknown[] = [];
+  const reads = new AgentReadAuthorization({ authorize: () => true }, {
+    authorize: input => {
+      const origin = input.disclosure_origin as { destination?: { channel_id?: string } };
+      const destination = input.disclosure_destination as { channel_id?: string };
+      return !hidden.has(input.job_id) && origin.destination?.channel_id === destination.channel_id;
+    },
+  }, { record: value => restrictedAudit.push(value) });
+  const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts, reads);
+  await api.start();
+  try {
+    await contexts.issue(dispatching);
+    const client = new DispatcherApiClient(config.agentSocketPath, 1_000, config.agentCredentialPath);
+    const first = (await client.createJob({ source_event_id: source.event_id, job_key: "first", objective: "PRIVATE-CANARY", workspace: { kind: "scratch" } })).job as { job_id: string };
+    const second = (await client.createJob({ source_event_id: source.event_id, job_key: "second", objective: "other", workspace: { kind: "scratch" } })).job as { job_id: string };
+    database.markJobBlocked(first.job_id, "PRIVATE-CANARY-error", ["queued"]);
+    const beforeReads = [database.getJob(first.job_id), database.getJob(second.job_id)];
+
+    const visible = (await client.getJob(first.job_id, source.event_id)).job as Record<string, unknown>;
+    assert.equal(visible.status, "blocked");
+    assert.equal(visible.last_error_code, "agent_blocked");
+    assert.equal(visible.result_json, undefined);
+    assert.equal(visible.last_error_message, undefined);
+    assert.doesNotMatch(JSON.stringify(visible), /PRIVATE-CANARY/);
+
+    hidden.add(first.job_id);
+    const listed = await client.listEventJobs(source.event_id);
+    assert.deepEqual((listed.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
+    assert.equal(listed.truncated, undefined);
+    assert.doesNotMatch(JSON.stringify(listed), /PRIVATE-CANARY/);
+
+    let hiddenError: DispatcherClientError | undefined;
+    let missingError: DispatcherClientError | undefined;
+    try { await client.getJob(first.job_id, source.event_id); } catch (error) { hiddenError = error as DispatcherClientError; }
+    try { await client.getJob("job_01j00000000000000000000000", source.event_id); } catch (error) { missingError = error as DispatcherClientError; }
+    assert.equal(hiddenError?.statusCode, 404);
+    assert.deepEqual(hiddenError?.body, missingError?.body);
+    assert.deepEqual(hiddenError?.body, { schema_version: 1, error: { code: "not_available", message: "Resource is not available" } });
+    const digest = "a".repeat(64);
+    assert.equal((await client.listEventJobs(source.event_id, "first", digest)).reconciliation, "not_found");
+    assert.equal((await client.listEventJobs(source.event_id, "missing", digest)).reconciliation, "not_found");
+
+    await assert.rejects(() => client.listThreadJobs(source.event_id, "T_TEST", "C_OTHER", "1756722030.123456"),
+      (error: unknown) => error instanceof DispatcherClientError && error.statusCode === 403);
+    assert.deepEqual([database.getJob(first.job_id), database.getJob(second.job_id)], beforeReads);
+    assert.doesNotMatch(JSON.stringify(restrictedAudit), /PRIVATE-CANARY/);
+    assert.ok(restrictedAudit.some(value => (value as {reason?:string}).reason === "visibility_unavailable"));
+
+    for (let index = 0; index < 101; index++) {
+      const extraEnvelope = eventEnvelope(`agent-read-hidden-${index}`);
+      const extra = database.enqueue(extraEnvelope, new Date(Date.now() + index + 1), proof(extraEnvelope.external_event_id)).row;
+      const row = database.createJob({ source_event_id: extra.event_id, job_key: "hidden", objective: "hidden",
+        workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      hidden.add(row.job_id);
+    }
+    const deepThread = await client.listThreadJobs(source.event_id, "T_TEST", "C_TEST", "1756722030.123456");
+    assert.deepEqual((deepThread.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
+    assert.equal(deepThread.truncated, false);
+    const deepOwner = await client.listOwnerJobs(source.event_id);
+    assert.deepEqual((deepOwner.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
+    assert.equal(deepOwner.truncated, false);
+
+    const completionEnvelope = {
+      ...eventEnvelope("agent-read-completion"), source: "dona_job" as const, type: "job_completed",
+      subject: { source_event_id: source.event_id }, trace: { source_event_id: source.event_id },
+    };
+    const completion = database.enqueue(completionEnvelope).row;
+    await contexts.issue(database.beginDispatch(completion.event_id, path.join(config.resultsDir, `${completion.event_id}.json`)));
+    const internal = await client.listEventJobs(source.event_id);
+    assert.equal((internal.jobs as unknown[]).length, 2);
+    assert.doesNotMatch(JSON.stringify(internal), /PRIVATE-CANARY|result_json|last_error_message|last_error_code/);
   } finally {
     await api.stop(); database.close();
   }

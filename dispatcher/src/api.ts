@@ -6,9 +6,11 @@ import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
 import { agentBodyEventOperations, agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
+import { AgentReadAuthorization, projectAuthorizedJob, projectCompletionJob, type AgentReadSurface } from "./agent-read-authorization.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
+import type { JobRow } from "./types.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
@@ -28,6 +30,7 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+const agentReadCandidateScanMax = 1_000;
 async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
   const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
   return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
@@ -142,6 +145,7 @@ export class DispatcherApi {
   private quiesceError: string | undefined;
   private readonly schedules: ScheduleApiService;
   private readonly verifiedAgentContexts = new WeakMap<IncomingMessage, AgentExecutionContext>();
+  private readonly agentReads: AgentReadAuthorization;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -157,7 +161,11 @@ export class DispatcherApi {
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
     private readonly agentContexts?: AgentContextManager,
-  ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
+    agentReads?: AgentReadAuthorization,
+  ) {
+    this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); });
+    this.agentReads = agentReads ?? new AgentReadAuthorization();
+  }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
 
@@ -345,13 +353,27 @@ export class DispatcherApi {
         if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
           throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
         }
+        const context = this.verifiedAgentContexts.get(request);
+        const storedJobs = this.database.listEventJobs(sourceEventId, jobKey);
+        const jobs = context?.purpose === "job_completion"
+          ? storedJobs.map(row => {
+            const job = this.database.getJob(row.job_id);
+            return job ? projectCompletionJob(job) : undefined;
+          }).filter((row): row is Record<string, unknown> => row !== undefined)
+          : context
+            ? storedJobs.map(row => this.database.getJob(row.job_id)).filter((row): row is JobRow => row !== undefined)
+              .filter(row => this.agentJobAllowed(request, "list_event_jobs", row)).map(projectAuthorizedJob)
+            : storedJobs;
+        const reconciliation = canonicalPayloadSha256 !== undefined && jobKey !== undefined
+          ? context?.purpose === "human_command" && jobs.length === 0
+            ? "not_found"
+            : this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256)
+          : undefined;
         sendJson(response, 200, {
           schema_version: 1,
           source_event_id: sourceEventId,
-          jobs: this.database.listEventJobs(sourceEventId, jobKey),
-          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
-            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
-            : {}),
+          jobs,
+          ...(reconciliation !== undefined ? { reconciliation } : {}),
         });
         return;
       }
@@ -717,6 +739,39 @@ export class DispatcherApi {
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 
+  private agentDisclosureDestination(context: AgentExecutionContext): unknown {
+    const event = this.database.get(context.event_id);
+    if (!event?.reply_target_json) return undefined;
+    try { return JSON.parse(event.reply_target_json) as unknown; }
+    catch { return undefined; }
+  }
+
+  private agentJobAllowed(request: IncomingMessage, surface: AgentReadSurface, job: JobRow): boolean {
+    const context = this.verifiedAgentContexts.get(request);
+    if (!context || context.purpose !== "human_command") return false;
+    const binding = this.database.jobAuthorization.readJob(job.job_id);
+    const owner = binding?.principal_binding_event_id
+      ? this.database.getVerifiedPrincipalBinding(binding.principal_binding_event_id)
+      : undefined;
+    const ownerBindingCurrent = binding !== undefined && owner !== undefined && owner.revoked_at === null &&
+      owner.proof_sha256 === binding.ingress_proof_sha256 && owner.tenant_id === binding.tenant_id &&
+      owner.workspace_id === binding.workspace_id && owner.principal_kind === binding.principal_kind &&
+      owner.principal_id === binding.principal_id;
+    return this.agentReads.authorize({
+      context,
+      operation: "read_exact_job_status",
+      surface,
+      job,
+      binding,
+      owner_binding_current: ownerBindingCurrent,
+      disclosure_destination: this.agentDisclosureDestination(context),
+    }).allowed;
+  }
+
+  private notAvailable(): ApiRequestError {
+    return new ApiRequestError(404, "not_available", "Resource is not available");
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -762,10 +817,21 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
       const sourceEventId=url.searchParams.get("source_event_id");
       if(sourceEventId){
-        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId).map(
-          ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
-            ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}))});}
-        catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
+        const context = this.verifiedAgentContexts.get(request);
+        try {
+          const rows = this.database.listOwnerJobs(sourceEventId, context ? agentReadCandidateScanMax + 1 : 100);
+          const scanned = context ? rows.slice(0, agentReadCandidateScanMax) : rows;
+          const jobs = context
+            ? scanned.filter(row => this.agentJobAllowed(request, "list_owner_jobs", row)).map(projectAuthorizedJob)
+            : scanned.map(({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+              ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}));
+          sendJson(response,200,{schema_version:1,jobs:jobs.slice(0,100),
+            ...(context ? { truncated: jobs.length > 100 || rows.length > agentReadCandidateScanMax } : {})});
+        }
+        catch {
+          if (context) sendJson(response, 200, { schema_version: 1, jobs: [] });
+          else throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");
+        }
         return;
       }
       const workspaceId = url.searchParams.get("workspace_id");
@@ -782,11 +848,16 @@ export class DispatcherApi {
           throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
         }
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs,
+        agentContext ? agentReadCandidateScanMax + 1 : 101);
+      const scanned = agentContext ? candidates.slice(0, agentReadCandidateScanMax) : candidates;
+      const visible = agentContext
+        ? scanned.filter(row => this.agentJobAllowed(request, "list_thread_jobs", row))
+        : scanned;
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
-        truncated: candidates.length > 100,
+        jobs: agentContext ? visible.slice(0, 100).map(projectAuthorizedJob) : visible.slice(0,100),
+        truncated: visible.length > 100 || (agentContext !== undefined && candidates.length > agentReadCandidateScanMax),
       });
       return;
     }
@@ -795,21 +866,32 @@ export class DispatcherApi {
     const jobId = match[1]!;
     const action = match[2];
     if (request.method === "GET" && !action) {
-      const job = this.database.getJob(jobId);
-      if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
       const sourceEventId = url.searchParams.get("source_event_id");
       if (sourceEventId === null) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
-      if (sourceEventId !== null) {
-        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
-          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
-        }
-        try {
-          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
-        } catch {
-          throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
-        }
+      if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+        throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
       }
-      sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      const job = this.database.getJob(jobId);
+      const context = this.verifiedAgentContexts.get(request);
+      if (!job) {
+        if (context) throw this.notAvailable();
+        throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      }
+      try {
+        this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
+      } catch {
+        if (context) throw this.notAvailable();
+        throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
+      }
+      if (context?.purpose === "job_completion") {
+        sendJson(response, 200, { schema_version: 1, job: projectCompletionJob(job) });
+        return;
+      }
+      if (context && !this.agentJobAllowed(request, "get_job_status", job)) {
+        throw this.notAvailable();
+      }
+      const responseJob = {...job,...this.database.jobNotificationState(jobId)} as JobRow;
+      sendJson(response, 200, { schema_version: 1, job: context ? projectAuthorizedJob(responseJob) : responseJob });
       return;
     }
     if (request.method === "POST" && action === "steer") {
