@@ -166,6 +166,24 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
     WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
 `);}
+function ensureWebCommandSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS web_command_receipts (
+      receipt_id       TEXT PRIMARY KEY,
+      instance_id      TEXT NOT NULL,
+      tenant_id        TEXT NOT NULL,
+      principal_id     TEXT NOT NULL,
+      operation        TEXT NOT NULL CHECK (operation IN ('submit', 'cancel')),
+      canonical_sha256 TEXT NOT NULL CHECK (length(canonical_sha256) = 64),
+      job_id            TEXT NOT NULL REFERENCES jobs(job_id),
+      source_event_id   TEXT NOT NULL REFERENCES events(event_id),
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS web_command_receipts_owner_idx
+      ON web_command_receipts(instance_id, tenant_id, principal_id, updated_at);
+  `);
+}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -354,6 +372,25 @@ export function migrateDispatcherDatabase(
     ensureJobsWorkspaceJobIndex(db);
     ensureJobsStatusJobIndex(db);
   }
+  ensureWebCommandSchema(db);
+}
+
+export interface WebCommandIdentity {
+  instance_id: string;
+  tenant_id: string;
+  principal_id: string;
+}
+export interface WebCommandReceipt {
+  receipt_id: string;
+  instance_id: string;
+  tenant_id: string;
+  principal_id: string;
+  operation: "submit" | "cancel";
+  canonical_sha256: string;
+  job_id: string;
+  source_event_id: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export class DispatcherDatabase {
@@ -533,16 +570,14 @@ export class DispatcherDatabase {
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
     const subject = JSON.parse(sourceEvent.subject_json) as Record<string, unknown>;
-    const workspaceId = stringValue(replyTarget.workspace_id);
-    const channelId = stringValue(replyTarget.channel_id);
-    const threadTs = stringValue(replyTarget.thread_ts);
-    if (
-      sourceEvent.source !== "slack" ||
-      stringValue(replyTarget.kind) !== "slack_thread" ||
-      !workspaceId ||
-      !channelId ||
-      !threadTs
-    ) {
+    const webSource = sourceEvent.source === "web" && sourceEvent.reply_target_json === null;
+    const workspaceId = webSource ? stringValue(subject.tenant_id) : stringValue(replyTarget.workspace_id);
+    const channelId = webSource ? undefined : stringValue(replyTarget.channel_id);
+    const threadTs = webSource ? undefined : stringValue(replyTarget.thread_ts);
+    if ((!webSource && (
+      sourceEvent.source !== "slack" || stringValue(replyTarget.kind) !== "slack_thread" ||
+      !workspaceId || !channelId || !threadTs
+    )) || (webSource && (!workspaceId || !stringValue(subject.instance_id) || !stringValue(subject.principal_id)))) {
       throw new Error(`Event ${sourceEvent.event_id} does not have a Slack thread reply target`);
     }
 
@@ -683,7 +718,7 @@ export class DispatcherDatabase {
         workspaceId,
         channelId,
         threadTs,
-        stringValue(subject.actor_id),
+        webSource ? stringValue(subject.principal_id) : stringValue(subject.actor_id),
         parsedRequest.objective,
         workspaceJson,
         timestamp,
@@ -695,6 +730,84 @@ export class DispatcherDatabase {
       );
       return { row: this.getJobRequired(jobId), outcome: "created", duplicate: false };
     }).immediate();
+  }
+
+  createWebJob(input: WebCommandIdentity & { idempotency_key: string; objective: string; workspace: CreateJobRequest["workspace"] },
+    workspaceRoot: string, resultDir: string, at = new Date()): { outcome: "created" | "reused"; row: JobRow; receipt: WebCommandReceipt } {
+    if (!/^[0-9a-f]{64}$/.test(input.idempotency_key)) throw new Error("web_command_invalid");
+    for (const value of [input.instance_id, input.tenant_id, input.principal_id]) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("web_command_invalid");
+    }
+    const parsed = parseCreateJobRequest({ source_event_id: "evt_00000000000000000000000000", objective: input.objective, workspace: input.workspace });
+    const canonical = canonicalJobPayloadSha256(parsed);
+    const receiptId = `web_submit_${input.idempotency_key}`;
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id = ?")
+        .get(receiptId) as WebCommandReceipt | undefined;
+      if (existing) {
+        if (existing.operation !== "submit" || existing.canonical_sha256 !== canonical || existing.instance_id !== input.instance_id
+          || existing.tenant_id !== input.tenant_id || existing.principal_id !== input.principal_id) throw new JobCreationError("job_idempotency_conflict", "Web command receipt conflicts with the canonical payload");
+        return { outcome: "reused" as const, row: this.getJobRequired(existing.job_id), receipt: existing };
+      }
+      const active = this.db.prepare(`SELECT COUNT(*) AS count FROM jobs
+        WHERE source='web' AND workspace_id=? AND actor_id=?
+          AND status NOT IN ('blocked','completed','failed','cancelled','needs_review')`)
+        .get(input.tenant_id, input.principal_id) as { count: number };
+      if (active.count >= this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded",
+        "Web owner active-job limit exceeded", { resource: "jobs_per_event", current: active.count,
+          attempted: active.count + 1, maximum: this.jobAdmissionLimits.jobsPerEventMax });
+      const timestamp = at.toISOString();
+      const source = this.enqueue({ schema_version: 1, source: "web", external_event_id: `command:${input.idempotency_key}`,
+        type: "web_job_submit", occurred_at: timestamp, subject: { instance_id: input.instance_id, tenant_id: input.tenant_id,
+          principal_id: input.principal_id }, payload: { canonical_payload_sha256: canonical }, reply_target: null }, at);
+      if (source.duplicate || source.payloadMismatch) throw new JobCreationError("job_idempotency_conflict", "Web command event conflicts with the canonical payload");
+      const created = this.createJob({ source_event_id: source.row.event_id, objective: parsed.objective, workspace: parsed.workspace }, workspaceRoot, resultDir, at);
+      this.db.prepare("UPDATE events SET status='completed', completed_at=?, updated_at=? WHERE event_id=? AND status='queued'")
+        .run(timestamp, timestamp, source.row.event_id);
+      this.db.prepare("UPDATE job_groups SET sealed_at=?, updated_at=? WHERE source_event_id=? AND sealed_at IS NULL")
+        .run(timestamp, timestamp, source.row.event_id);
+      this.db.prepare(`INSERT INTO web_command_receipts
+        (receipt_id,instance_id,tenant_id,principal_id,operation,canonical_sha256,job_id,source_event_id,created_at,updated_at)
+        VALUES (?,?,?,?, 'submit', ?,?,?,?,?)`).run(receiptId, input.instance_id, input.tenant_id, input.principal_id,
+          canonical, created.row.job_id, source.row.event_id, timestamp, timestamp);
+      const receipt = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt;
+      return { outcome: "created" as const, row: created.row, receipt };
+    }).immediate();
+  }
+
+  getWebCommandReceipt(receiptId: string, identity: WebCommandIdentity): WebCommandReceipt | undefined {
+    const row = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt | undefined;
+    return row && row.instance_id === identity.instance_id && row.tenant_id === identity.tenant_id
+      && row.principal_id === identity.principal_id ? row : undefined;
+  }
+
+  assertWebJobOwner(jobId: string, identity: WebCommandIdentity): JobRow {
+    const job = this.getJobRequired(jobId), event = this.getRequired(job.source_event_id);
+    const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+    if (job.source !== "web" || event.source !== "web" || stringValue(subject.instance_id) !== identity.instance_id
+      || stringValue(subject.tenant_id) !== identity.tenant_id || stringValue(subject.principal_id) !== identity.principal_id) {
+      throw new Error("web_job_owner_mismatch");
+    }
+    return job;
+  }
+
+  recordWebCancelReceipt(receiptId: string, canonicalSha256: string, identity: WebCommandIdentity, jobId: string, at = new Date()): WebCommandReceipt {
+    if (!/^web_cancel_[0-9a-f]{64}$/.test(receiptId) || !/^[0-9a-f]{64}$/.test(canonicalSha256)) throw new Error("web_command_invalid");
+    const job = this.assertWebJobOwner(jobId, identity), timestamp = at.toISOString();
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt | undefined;
+      if (existing) {
+        if (existing.operation !== "cancel" || existing.canonical_sha256 !== canonicalSha256 || existing.job_id !== jobId
+          || existing.instance_id !== identity.instance_id || existing.tenant_id !== identity.tenant_id || existing.principal_id !== identity.principal_id)
+          throw new Error("web_command_conflict");
+        return existing;
+      }
+      this.db.prepare(`INSERT INTO web_command_receipts
+        (receipt_id,instance_id,tenant_id,principal_id,operation,canonical_sha256,job_id,source_event_id,created_at,updated_at)
+        VALUES (?,?,?,?, 'cancel', ?,?,?,?,?)`).run(receiptId, identity.instance_id, identity.tenant_id, identity.principal_id,
+          canonicalSha256, jobId, job.source_event_id, timestamp, timestamp);
+      return this.db.prepare("SELECT * FROM web_command_receipts WHERE receipt_id=?").get(receiptId) as WebCommandReceipt;
+    })();
   }
 
   getJob(jobId: string): JobRow | undefined {
@@ -1126,6 +1239,16 @@ export class DispatcherDatabase {
     return this.getJobRequired(jobId);
   }
 
+  beginWebJobCancellation(jobId: string, identity: WebCommandIdentity): JobRow {
+    const row = this.assertWebJobOwner(jobId, identity);
+    if (row.status === "cancelled") return row;
+    if (!["queued", "retryable_failed", "running", "blocked"].includes(row.status)) {
+      throw new Error(`web_job_terminal:${row.status}`);
+    }
+    this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+    return this.getJobRequired(jobId);
+  }
+
   markJobCancelled(jobId: string, reason: string, at = new Date()): void {
     this.updateJob(jobId, ["cancelling"], "cancelled", {
       completed_at: at.toISOString(),
@@ -1176,6 +1299,11 @@ export class DispatcherDatabase {
         throw new Error(`Job group ${job.source_event_id} is not sealed`);
       }
       const sourceEvent = this.getRequired(job.source_event_id);
+      if (sourceEvent.source === "web") {
+        if (!job.completion_event_id) this.db.prepare("UPDATE jobs SET completion_event_id=?, updated_at=? WHERE job_id=?")
+          .run(sourceEvent.event_id, timestamp, jobId);
+        return { row: sourceEvent, duplicate: job.completion_event_id !== null, payloadMismatch: false };
+      }
       const result = job.result_json ? JSON.parse(job.result_json) as Record<string, unknown> : null;
       const snapshot = group.notification_mode === "grouped"
         ? this.buildJobGroupSnapshot(job.source_event_id, group, job)

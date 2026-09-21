@@ -9,6 +9,7 @@ import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
 import type { JobRow } from "./types.js";
+import type { WebCommandIdentity } from "./database.js";
 import type { JobProgressCoordinator } from "./job-progress.js";
 
 class WakeSignal {
@@ -243,6 +244,25 @@ export class JobSupervisor {
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
+      return { row: this.database.getJob(jobId)!, duplicate: false };
+    });
+  }
+
+  cancelWeb(jobId: string, identity: WebCommandIdentity, reason = "Cancelled by verified web owner"): Promise<JobControlResult> {
+    return this.serialized(jobId, async () => {
+      const before = this.database.assertWebJobOwner(jobId, identity);
+      if (before.status === "cancelled") return { row: before, duplicate: true };
+      const cancelling = this.database.beginWebJobCancellation(jobId, identity);
+      if (["queued", "retryable_failed"].includes(before.status)) {
+        this.database.markJobCancelled(jobId, reason); this.wake();
+        return { row: this.database.getJob(jobId)!, duplicate: false };
+      }
+      const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
+      if (!cancelled.ok) {
+        this.database.markJobNeedsReview(jobId, cancelled.errorCode ?? "cancel_acceptance_unknown", commandMessage(cancelled));
+        this.wake(); throw new Error("web_cancel_acceptance_unknown");
+      }
+      this.database.markJobCancelled(jobId, reason); this.trackCancelledWorkerCleanup(cancelling); this.wake();
       return { row: this.database.getJob(jobId)!, duplicate: false };
     });
   }
