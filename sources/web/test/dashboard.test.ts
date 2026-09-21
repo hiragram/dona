@@ -50,3 +50,21 @@ test("失効済みdashboard navigationだけsession cookieを消去してlogin�
   assert.deepEqual(JSON.parse(json.body), { error: "session_revoked" });
   assert.equal(json.headers.location, undefined);
 });
+
+test("IdP障害中のdashboard navigationはlocal logoutを持つsafe shellを返す", async () => {
+  const dashboard = controllerFixture();
+  dashboard.connections.oidc.introspect = async () => { throw Error("provider unavailable private detail"); };
+  const page = await dashboard.controller.handle(dashboard.request("/"));
+  assert.equal(page.status, 503);
+  assert.equal(page.headers["content-type"], "text/html; charset=utf-8");
+  assert.equal(page.headers["cache-control"], "no-store");
+  assert.match(page.body, /id="logout"/);
+  assert.match(page.body, /id="private-view" hidden/);
+  assert.ok(!page.body.includes(dashboard.cookie) && !page.body.includes(dashboard.token) && !page.body.includes("provider unavailable"));
+
+  const api = controllerFixture();
+  api.connections.oidc.introspect = async () => { throw Error("provider unavailable private detail"); };
+  const json = await api.controller.handle(api.request("/api/session"));
+  assert.equal(json.status, 503);
+  assert.deepEqual(JSON.parse(json.body), { error: "identity_unavailable" });
+});

@@ -89,13 +89,14 @@ test("実TLS・署名UDS・共有監査でnavigation activityを確定しpollで
   assert.equal(f.idpCalls(),3);
 });
 
-test("navigation確定後の応答喪失を503にしactivity writeを再送しない", async t => {
+test("navigation確定後の応答喪失は503 safe shellを返しactivity writeを再送しない", async t => {
   const f=await start(t), confirm=f.connections.session.confirm.bind(f.connections.session);let calls=0;
   f.connections.session.confirm=async (...args)=>{calls++;await confirm(...args);throw Error("fixture response lost");};
   f.setNow("2026-09-19T00:00:02.000Z");const sequence=f.audit.verify().sequence;
   const result=await request(f.policy,"/","GET",{cookie:"__Host-dona_session="+f.local.cookie,"sec-fetch-site":"same-origin",
     "sec-fetch-mode":"navigate","sec-fetch-dest":"document","sec-fetch-user":"?1"});
-  assert.equal(result.status,503);assert.deepEqual(JSON.parse(result.body),{error:"identity_unavailable"});
+  assert.equal(result.status,503);assert.equal(result.headers["content-type"],"text/html; charset=utf-8");
+  assert.match(result.body,/id="logout"/);assert.match(result.body,/id="private-view" hidden/);assert.ok(!result.body.includes("fixture response lost"));
   assert.equal(result.headers["set-cookie"],undefined);assert.equal(calls,1);
   assert.equal(f.readState().sessions[0]!.state.last_activity_at,f.local.now());assert.equal(f.audit.verify().sequence,sequence+1);
 });

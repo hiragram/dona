@@ -20,7 +20,7 @@ export const dashboardScript = String.raw`(() => {
   const form = byId("submit-form"), submitButton = byId("submit-button"), refreshButton = byId("refresh-button");
   const workspace = byId("workspace-kind"), repositoryField = byId("repository-field"), baseField = byId("base-field");
   const cancelDialog = byId("cancel-dialog"), cancelConfirm = byId("cancel-confirm"), cancelTarget = byId("cancel-target");
-  let csrf = null, selected = null, eventCursor = null, streamAbort = null, generation = 0, selectionGeneration = 0, listGeneration = 0, submitGeneration = 0, cancelGeneration = 0, refreshGeneration = 0, privateVisible = false, canReadJobs = false, canReadOwnJobs = false, cancelPending = null, visibilitySuspended = false, visibilityBootPending = false, pendingSubmit = false, submitRecoveryNeeded = false, pendingCancel = false, pendingCancelJob = null, cancelWritePending = false, cancelRecoveryNeeded = false, cancelRecoveryRunning = false, loggingOut = false;
+  let csrf = null, selected = null, eventCursor = null, streamAbort = null, generation = 0, selectionGeneration = 0, listGeneration = 0, submitGeneration = 0, cancelGeneration = 0, refreshGeneration = 0, privateVisible = false, canReadJobs = false, canReadOwnJobs = false, cancelPending = null, visibilitySuspended = false, resumeBootPending = false, pendingSubmit = false, submitRecoveryNeeded = false, pendingCancel = false, pendingCancelJob = null, cancelWritePending = false, cancelRecoveryNeeded = false, cancelRecoveryRunning = false, loggingOut = false;
   const token = value => typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
   const jobId = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
   const requestId = () => { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); let text = ""; for (const byte of bytes) text += String.fromCharCode(byte); return btoa(text).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,""); };
@@ -59,6 +59,7 @@ export const dashboardScript = String.raw`(() => {
   };
   const datum = (term, value) => { const box = el("div","datum"), dt = el("dt",null,term), dd = el("dd",null,value); box.append(dt,dd); return box; };
   const renderDetail = (job, moveFocus = false) => {
+    if(!job.control.can_cancel&&cancelPending===job.job_id)closeCancelDialog();
     if (!validJob(job)) throw Error("projection_invalid"); detail.replaceChildren();
     const heading = el("div","detail-head"), titleBox = el("div"), eyebrow = el("p","intro","ジョブ詳細"), title = el("h2",null,cleanText(job.job_id)); title.id = "detail-title"; title.tabIndex = -1; titleBox.append(eyebrow,title);
     const connection = el("p","connection","最新状態を確認済み"); connection.id = "connection-state"; connection.dataset.state = "live"; heading.append(titleBox,connection);
@@ -109,13 +110,14 @@ export const dashboardScript = String.raw`(() => {
   const boot = async () => { if(loggingOut)return;const turn=++generation;clearPrivate();announce("セッションと最新のジョブを確認しています。");try{const session=await api("/api/session");if(turn!==generation||loggingOut)return;if(!token(session.csrf_token)||!session.principal||!Array.isArray(session.principal.scopes))throw Error("session_unverified");csrf=session.csrf_token;byId("principal").textContent=cleanText(session.principal.principal_id);
     const scopes=new Set(session.principal.scopes),canRead=scopes.has("job:read:own")||scopes.has("job:read:granted"),canSubmit=scopes.has("job:submit");canReadJobs=canRead;canReadOwnJobs=scopes.has("job:read:own");byId("submit-panel").hidden=!canSubmit;byId("list-card").hidden=!canRead;
     if(canRead)await loadList();if(turn!==generation||loggingOut)return;privateVisible=true;view.hidden=false;announce(pendingSubmit?"復帰前の依頼を送信中です。同じ操作は再実行しません。":pendingCancel?"復帰前の取消を処理中です。同じ操作は再実行しません。":canRead?"最新状態を表示しています。":canSubmit?"依頼を送信できます。":"このアカウントに表示可能なジョブ操作はありません。",pendingSubmit||pendingCancel?"warning":canRead||canSubmit?"success":"info");const match=/^#job=([A-Za-z0-9_-]{1,128})$/.exec(location.hash);if(match&&canRead)await openJob(match[1],false);await recoverPendingSubmit();await recoverPendingCancel();}catch(error){if(turn!==generation||loggingOut)return;failSession(error);} };
+  const resumeBoot = () => { if(loggingOut||resumeBootPending)return;resumeBootPending=true;visibilitySuspended=false;boot().finally(()=>setTimeout(()=>{resumeBootPending=false;},0)); };
   workspace.addEventListener("change",()=>{const github=workspace.value==="github";repositoryField.hidden=!github;baseField.hidden=!github;byId("repository").required=github;});
   form.addEventListener("submit",submit);refreshButton.addEventListener("click",async()=>{const operation=++refreshGeneration;refreshButton.disabled=true;try{if(!await loadList())return;announce("一覧を更新しました。","success");}catch(error){if(operation!==refreshGeneration)return;if(error?.status===401||error?.status===403)failSession(error);else failRevalidation("一覧を再検証できないため、以前の内容は消去しました。");}finally{if(operation===refreshGeneration)refreshButton.disabled=false;}});
   cancelConfirm.addEventListener("click",cancel);byId("cancel-close").addEventListener("click",closeCancelDialog);
   byId("logout").addEventListener("click",async()=>{if(loggingOut)return;loggingOut=true;generation++;let logoutCsrf=csrf;clearPrivate();if(!logoutCsrf)try{const value=await api("/api/session/csrf",{method:"POST",headers:{"content-type":"application/json"},body:"{}"});if(!token(value?.csrf_token))throw Error("csrf_unverified");logoutCsrf=value.csrf_token;}catch{loggingOut=false;return announce("ローカルのログアウト準備を確認できません。自動では再試行しません。","error");}announce("ログアウトを確認しています。");try{const response=await fetch("/api/session/logout",{method:"POST",credentials:"same-origin",cache:"no-store",redirect:"error",referrerPolicy:"no-referrer",headers:{"content-type":"application/json","x-dona-csrf":logoutCsrf},body:"{}"});if(response.status!==204)throw Error("logout_unknown");location.replace("/login");}catch{announce("ログアウト結果が不明です。同じ操作を再送せず、状態を確認しています。","warning");try{const status=await api("/api/session/logout-status",{method:"POST",headers:{"content-type":"application/json","x-dona-csrf":logoutCsrf},body:"{}"});if(status?.revoked===true){location.replace("/login");return;}if(status?.revoked===false){loggingOut=false;await boot();announce("ログアウトが未反映であることを確認しました。必要ならログアウトをもう一度実行してください。","warning");return;}}catch{}announce("ログアウト結果が不明です。同じ操作を再送せず、状態確認が必要です。","warning");}});
   addEventListener("popstate",()=>{if(!privateVisible||!canReadJobs){selectionGeneration++;closeCancelDialog();selected=null;streamAbort?.abort();detail.hidden=true;byId("list-card").hidden=true;return;}const match=/^#job=([A-Za-z0-9_-]{1,128})$/.exec(location.hash);if(match)openJob(match[1],false);else{selectionGeneration++;closeCancelDialog();selected=null;streamAbort?.abort();detail.hidden=true;byId("list-card").hidden=false;}});
-  addEventListener("pagehide",()=>{generation++;streamAbort?.abort();});addEventListener("pageshow",event=>{if(event.persisted){clearPrivate();boot();}});
-  document.addEventListener("visibilitychange",()=>{if(document.hidden){visibilitySuspended=true;generation++;clearPrivate();}else if(visibilitySuspended&&!loggingOut){visibilitySuspended=false;visibilityBootPending=true;boot().finally(()=>setTimeout(()=>{visibilityBootPending=false;},0));}});addEventListener("focus",()=>{if(document.hidden||loggingOut||visibilityBootPending)return;visibilitySuspended=false;boot();});
+  addEventListener("pagehide",()=>{generation++;streamAbort?.abort();});addEventListener("pageshow",event=>{if(event.persisted)resumeBoot();});
+  document.addEventListener("visibilitychange",()=>{if(document.hidden){visibilitySuspended=true;generation++;clearPrivate();}else if(visibilitySuspended)resumeBoot();});addEventListener("focus",()=>{if(document.hidden||loggingOut||resumeBootPending)return;visibilitySuspended=false;boot();});
   boot();
 })();
 `;
@@ -130,4 +132,8 @@ export function dashboardPage(): BrowserAuthResponse {
     + dashboardScript + '</script></body></html>';
   return { status: 200, headers: { ...privateHeaders, "content-type": "text/html; charset=utf-8",
     "content-security-policy": `${privateHeaders["content-security-policy"]}; style-src 'sha256-${styleHash}'; script-src 'sha256-${scriptHash}'; connect-src 'self'` }, body };
+}
+
+export function dashboardFailurePage(): BrowserAuthResponse {
+  return { ...dashboardPage(), status: 503 };
 }

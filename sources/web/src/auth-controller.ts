@@ -18,7 +18,7 @@ import type { WebJobReadClient } from "./job-read-client.js";
 import { maximumWebJobBrowserBodyBytes } from "./job-read-wire.js";
 import type { WebCommandClient } from "./command-client.js";
 import { deriveWebIdempotencyKey, parseBrowserCommand } from "./browser-command.js";
-import { dashboardPage } from "./dashboard.js";
+import { dashboardFailurePage, dashboardPage } from "./dashboard.js";
 
 type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
@@ -283,7 +283,9 @@ export class WebAuthController {
           if (result.status !== "denied" || result.reason !== failure.reason) throw Error();
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
-      return dashboard && failure.status === 401 ? loginRedirect() : response(failure.status, { error: failure.publicReason });
+      if (dashboard && failure.status === 401) return loginRedirect();
+      if (dashboard && failure.status === 503) return dashboardFailurePage();
+      return response(failure.status, { error: failure.publicReason });
     }
   }
 }
