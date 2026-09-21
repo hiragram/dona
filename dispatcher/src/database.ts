@@ -27,6 +27,7 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import { JobAuthorizationBindingRepository, migrateJobAuthorizationBindings } from "./job-authorization-binding.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
 import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, type VerifiedPrincipalBindingRow, type VerifiedPrincipalProofConsumptionRow } from "./principal-binding.js";
 import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
@@ -369,6 +370,7 @@ export function migrateDispatcherDatabase(
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
+  readonly jobAuthorization: JobAuthorizationBindingRepository;
   private readonly schemaWrite: 2 | 3;
   private readonly migrationHook: DispatcherMigrationHook;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
@@ -410,6 +412,7 @@ export class DispatcherDatabase {
           fs.renameSync(row.result_path,backup); movedResults.push({from:row.result_path,to:backup});
         }
         migrateJobRouting(this.db);
+        migrateJobAuthorizationBindings(this.db);
       } catch(error) {
         for(const moved of movedResults.reverse()) if(fs.existsSync(moved.to)&&!fs.existsSync(moved.from)) fs.renameSync(moved.to,moved.from);
         throw error;
@@ -435,6 +438,7 @@ export class DispatcherDatabase {
       this.db.close();
       throw error;
     }
+    this.jobAuthorization = new JobAuthorizationBindingRepository(this.db);
     this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at), undefined, (jobId,resultPath) => {
       const legacy=path.basename(resultPath)===`${jobId}.json`;
       const isolated=path.basename(resultPath)==="result.json"&&path.basename(path.dirname(resultPath))===jobId;
@@ -696,6 +700,7 @@ export class DispatcherDatabase {
       );
       this.db.prepare(`INSERT INTO job_owner_bindings(job_id,source_event_id,owner_json,destination_json)
         SELECT ?,event_id,owner_json,destination_json FROM event_job_bindings WHERE event_id=?`).run(jobId,sourceEvent.event_id);
+      this.jobAuthorization.captureJob(jobId, sourceEvent.event_id, at);
       if (binding.owner.kind === "schedule") {
         const scheduleAt = new Date(Math.floor(at.getTime() / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
         try {
