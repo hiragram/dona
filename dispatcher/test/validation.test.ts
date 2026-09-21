@@ -130,6 +130,20 @@ describe("job creation validation", () => {
     assert.equal(canonicalJobPayloadSha256(first), canonicalJobPayloadSha256(second));
   });
 
+  test("表示入力を実行payloadのcanonical hashから分離し構造化Issue参照を保持する", () => {
+    const request = parseCreateJobRequest({
+      source_event_id: "evt_source",
+      objective: "investigate",
+      workspace: { kind: "github", repository: "owner/repo" },
+      display: { short_name: "短い作業名", issue: { repository: "owner/repo", number: 87 } },
+    });
+    assert.deepEqual(request.display, { short_name: "短い作業名", issue: { repository: "owner/repo", number: 87 } });
+    assert.equal(
+      canonicalJobPayloadSha256(request),
+      canonicalJobPayloadSha256(parseCreateJobRequest({ ...request, display: undefined })),
+    );
+  });
+
   test("counts objective characters independently from UTF-8 bytes", () => {
     const base = {
       source_event_id: "evt_source",

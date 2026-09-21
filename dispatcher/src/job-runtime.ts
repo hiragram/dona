@@ -8,6 +8,7 @@ import type { DispatcherConfig } from "./config.js";
 import type { AgentStatus, HerdrCommandResult } from "./herdr.js";
 import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
 import type { JobRow } from "./types.js";
+import { jobWorkspaceLabel } from "./job-display-label.js";
 
 export interface PreparedJobRuntime {
   herdrWorkspaceId: string;
@@ -472,7 +473,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     return this.herdr([
       "workspace", "create",
       "--cwd", row.workspace_path,
-      "--label", row.agent_name,
+      "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name),
       "--no-focus",
     ], this.config.jobCommandTimeoutMs + 5_000, signal);
   }
@@ -512,7 +513,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     if (await exists(path.join(row.workspace_path, ".git"))) {
       await this.verifyExistingWorktreeIdentity(row, repositoryPath, signal);
       return this.herdr([
-        "workspace", "create", "--cwd", row.workspace_path, "--label", row.agent_name, "--no-focus",
+        "workspace", "create", "--cwd", row.workspace_path, "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name), "--no-focus",
       ], this.config.jobCommandTimeoutMs + 5_000, signal);
     }
     const persistedBaseRef = `refs/dona/bases/${row.job_id}`;
@@ -530,7 +531,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         "--branch", `dona/${row.job_id}`,
         "--base", persistedBaseSha,
         "--path", row.workspace_path,
-        "--label", row.agent_name,
+        "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name),
         "--no-focus",
       ], 120_000, signal);
       if (!created.ok) throw commandError("Herdr worktree creation failed", created);
@@ -748,7 +749,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       "--branch", `dona/${row.job_id}`,
       "--base", baseSha,
       "--path", row.workspace_path,
-      "--label", row.agent_name,
+      "--label", jobWorkspaceLabel(row.workspace_json, row.agent_name),
       "--no-focus",
     ], 120_000, signal);
     if (!created.ok) throw commandError("Herdr worktree creation failed", created);

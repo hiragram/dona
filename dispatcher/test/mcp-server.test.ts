@@ -122,6 +122,9 @@ describe("Dona Dispatcher MCP server", () => {
           workspace_kind: "github",
           repository: "owner/repo",
           base_ref: "main",
+          display_name: "短い作業名",
+          issue_repository: "owner/repo",
+          issue_number: 87,
         },
       });
       assert.equal(result.isError, undefined);
@@ -132,6 +135,7 @@ describe("Dona Dispatcher MCP server", () => {
           job_key: "repo.audit",
           objective: "調査してPRを作る",
           workspace: { kind: "github", repository: "owner/repo", base_ref: "main" },
+          display: { short_name: "短い作業名", issue: { repository: "owner/repo", number: 87 } },
         }],
       }]);
 

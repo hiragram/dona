@@ -12,6 +12,7 @@ import type {
   ResultEnvelope,
   SteerJobRequest,
 } from "./types.js";
+import { jobDisplayMetadataKey } from "./job-display-label.js";
 
 const jsonObject = z.record(z.string(), z.unknown());
 const utcRfc3339 = z
@@ -138,6 +139,10 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("scratch") }).strip(),
   z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
 ]);
+const jobDisplaySchema = z.object({
+  short_name: z.string().min(1).max(512),
+  issue: z.object({ repository, number: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().optional(),
+}).strict();
 const jobCreationMetadataSchema = z.object({
   canonical_payload_sha256: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
@@ -158,6 +163,7 @@ const createJobSchema = z.object({
     `must be at most ${jobObjectiveCharacterMax} characters`,
   ),
   workspace: jobWorkspaceSchema,
+  display: jobDisplaySchema.optional(),
 }).strip();
 
 const steerJobSchema = z.object({
@@ -248,7 +254,10 @@ export function parseCreateJobRequest(input: unknown, preserveObjective = false)
 }
 
 export function canonicalJobPayload(request: CreateJobRequest): CanonicalJobPayload {
-  return { objective: request.objective, workspace: request.workspace };
+  return {
+    objective: request.objective,
+    workspace: request.workspace,
+  };
 }
 
 export function canonicalJobPayloadSha256(request: CreateJobRequest): string {
@@ -261,6 +270,7 @@ export function serializeJobWorkspace(
   workspace: JobWorkspace,
   canonicalPayloadSha256: string,
   objectiveUtf8Bytes?: number,
+  displayLabel?: string,
 ): string {
   return stableStringify({
     ...workspace,
@@ -268,6 +278,7 @@ export function serializeJobWorkspace(
     ...(objectiveUtf8Bytes === undefined
       ? {}
       : { [jobResourceMetadataKey]: { objective_utf8_bytes: objectiveUtf8Bytes } }),
+    ...(displayLabel === undefined ? {} : { [jobDisplayMetadataKey]: { label: displayLabel } }),
   });
 }
 

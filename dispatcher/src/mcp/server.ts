@@ -68,6 +68,24 @@ const jobObjective = z.string().refine(value => value.trim().length > 0, "must c
   (value) => Array.from(value.trim()).length <= jobObjectiveCharacterMax,
   `must be at most ${jobObjectiveCharacterMax} characters`,
 );
+const displayName = z.string().min(1).max(512).describe("objectiveやIssue titleから推測せず、利用者が明示した表示専用の短い作業名");
+const issueNumber = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+
+function displayInput(
+  shortName: string | undefined,
+  issueRepository: string | undefined,
+  number: number | undefined,
+): Record<string, unknown> | undefined {
+  if (shortName === undefined && issueRepository === undefined && number === undefined) return undefined;
+  if (shortName === undefined) throw new Error("display_name is required when an Issue display reference is specified");
+  if ((issueRepository === undefined) !== (number === undefined)) {
+    throw new Error("issue_repository and issue_number must be specified together");
+  }
+  return {
+    short_name: shortName,
+    ...(issueRepository === undefined ? {} : { issue: { repository: issueRepository, number } }),
+  };
+}
 
 function success(data: Record<string, unknown>) {
   return {
@@ -167,16 +185,20 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
+      display_name: displayName.optional(),
+      issue_repository: repository.optional().describe("表示prefixに使う構造化Issue参照。workspace repositoryと一致する場合だけ採用"),
+      issue_number: issueNumber.optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
       if (workspace_kind === "github" && !repo) throw new Error("repository is required for a GitHub job");
       if (workspace_kind === "scratch" && (repo || base_ref)) throw new Error("repository/base_ref are only valid for a GitHub job");
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
-      const response = await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace });
+      const display = displayInput(display_name, issue_repository, issue_number);
+      const response = await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace, ...(display ? { display } : {}) });
       const data = projectJobResponse(response);
       const job = data.job as Record<string, unknown> | undefined;
       if (job && typeof job.job_id === "string" && (response.outcome === "created" || response.outcome === "reused")) {
@@ -218,11 +240,14 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       workspace_kind: z.enum(["scratch", "github"]).optional(),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
+      display_name: displayName.optional(),
+      issue_repository: repository.optional(),
+      issue_number: issueNumber.optional(),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
-      const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined;
+      const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined || display_name !== undefined || issue_repository !== undefined || issue_number !== undefined;
       if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
@@ -234,11 +259,13 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
+      const display = displayInput(display_name, issue_repository, issue_number);
       const canonicalRequest = parseCreateJobRequest({
         source_event_id,
         ...(job_key === legacyJobKey ? {} : { job_key }),
         objective,
         workspace,
+        ...(display ? { display } : {}),
       });
       return success(await client.listEventJobs(
         source_event_id,
