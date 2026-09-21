@@ -47,7 +47,8 @@ test("command応答はrequest proofへbindしたMACがない限り受理しな�
   const payload = Buffer.from(JSON.stringify(response)).toString("base64url"), proof = payload + "." + createHmac("sha256", credential.secret)
     .update("dona.web-command.response.v1\0").update(payload).digest("base64url");
   assert.deepEqual(verifyWebCommandResponse(proof, requestProof, body, scope, () => credential, now), result);
-  const tampered = proof.slice(0, -1) + (proof.endsWith("A") ? "B" : "A");
+  const [signedPayload, signature] = proof.split(".");
+  const tampered = `${signedPayload}.${signature![0] === "A" ? "B" : "A"}${signature!.slice(1)}`;
   assert.throws(() => verifyWebCommandResponse(tampered, requestProof, body, scope, () => credential, now));
   assert.throws(() => verifyWebCommandResponse(JSON.stringify(result), requestProof, body, scope, () => credential, now));
   for (const invalid of [{ ...credential, purpose: "other" }, { ...credential, version: 2 }, { ...credential, tenant_id: "other" },
