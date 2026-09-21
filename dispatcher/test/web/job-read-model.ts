@@ -180,14 +180,25 @@ test("retentionは削除済みweb jobのanchorとtombstoneをwatermarkへ畳み�
   const after=f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number};assert.equal(after.count,0);
 });
 
-test("runtime maintenanceは24時間超のeventを1回1000件まで回収する",t=>{const f=fixture(t),job=f.seed();
+test("runtime maintenanceはtransactionを1000件に制限してyieldしながらbacklogを解消する",async t=>{const f=fixture(t),job=f.seed();
   f.jobs.listWebJobs(owner,20);const insert=f.raw.prepare("INSERT INTO web_job_projection_events(job_id,event_kind,created_at) VALUES(?,'progress',?)");
-  f.raw.transaction(()=>{for(let index=0;index<1200;index++)insert.run(job,"2026-09-21T00:00:01.000Z");})();
-  const errors:unknown[]=[];const stop=startWebJobProjectionMaintenance(f.jobs,error=>errors.push(error),()=>new Date("2026-09-23T00:00:02.000Z"));stop();
+  const insertCursor=f.raw.prepare(`INSERT INTO web_job_projection_cursors
+    (cursor_digest,cursor_kind,instance_id,tenant_id,principal_id,authorization_kind,grant_id,grant_revision,resource_id,snapshot_sequence,after_created_at,after_job_id,expires_at,created_at)
+    VALUES(?,'list','instance','tenant','principal','own',NULL,NULL,NULL,0,NULL,NULL,'2026-09-21T00:00:00.000Z','2026-09-21T00:00:00.000Z')`);
+  f.raw.transaction(()=>{for(let index=0;index<2200;index++)insert.run(job,"2026-09-21T00:00:01.000Z");})();
+  f.raw.transaction(()=>{for(let index=0;index<1200;index++)insertCursor.run(index.toString(16).padStart(64,"0"));})();
+  const first=maintainWebJobProjection(f.jobs,new Date("2026-09-23T00:00:02.000Z"));
+  assert.equal(first.events+first.cursors,1000);
+  const errors:unknown[]=[];const stop=startWebJobProjectionMaintenance(f.jobs,error=>errors.push(error),()=>new Date("2026-09-23T00:00:02.000Z"));
+  for(let attempt=0;attempt<10;attempt++){
+    const events=(f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count;
+    const cursors=(f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors").get() as {count:number}).count;
+    if(events===1&&cursors===0)break;await new Promise<void>(resolve=>setImmediate(resolve));
+  }
+  stop();
   assert.deepEqual(errors,[]);
-  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count,201);
-  const second=maintainWebJobProjection(f.jobs,new Date("2026-09-23T00:00:02.000Z"));assert.equal(second.events,200);
   assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count,1);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors").get() as {count:number}).count,0);
 });
 
 test("brokerはResultとartifactをallowlist projectionしprogress更新をdurable eventへ収束させる",t=>{const f=fixture(t),job=f.seed();

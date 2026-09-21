@@ -1111,9 +1111,10 @@ export class DispatcherDatabase {
       const events = this.db.prepare(`DELETE FROM web_job_projection_events WHERE sequence IN (${eligible})`).run(cutoff,limit).changes;
       if(candidate.sequence!==null)this.db.prepare(`UPDATE web_job_projection_retention SET pruned_through_sequence=MAX(pruned_through_sequence,?) WHERE singleton=1`)
         .run(candidate.sequence);
-      const cursors = this.db.prepare(`DELETE FROM web_job_projection_cursors WHERE cursor_digest IN (
+      const remaining=limit-events;
+      const cursors = remaining>0?this.db.prepare(`DELETE FROM web_job_projection_cursors WHERE cursor_digest IN (
         SELECT cursor_digest FROM web_job_projection_cursors WHERE expires_at<=? ORDER BY expires_at,cursor_digest LIMIT ?
-      )`).run(at.toISOString(),limit).changes;
+      )`).run(at.toISOString(),remaining).changes:0;
       return { events, cursors };
     })();
   }
