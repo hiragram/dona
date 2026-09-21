@@ -59,6 +59,7 @@ export class ProcessRunner {
       let truncated = false;
       const checkpoints = new ProcessCheckpointTracker();
       let timedOut = false;
+      let readinessFailed = false;
       let settled = false;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
@@ -100,10 +101,10 @@ export class ProcessRunner {
         if (closedCode === undefined || settled) return;
         settled = true;
         const outputCheckpoint = checkpoints.checkpoint();
-        const cleanupStatus = timedOut
+        const cleanupStatus = timedOut || readinessFailed
           ? `term=${termOutcome},kill=${killOutcome},closed=yes`
           : "term=not-sent,kill=not-sent,closed=yes";
-        const diagnosticLog = finishDiagnostic(timedOut || closedCode !== 0);
+        const diagnosticLog = finishDiagnostic(timedOut || readinessFailed || closedCode !== 0);
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -112,6 +113,7 @@ export class ProcessRunner {
           output_truncated: truncated,
           ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
           ...(exitSignal ? { exit_signal: exitSignal } : {}),
+          ...(readinessFailed ? { spawn_error: "readiness_failed" } : {}),
           cleanup_status: cleanupStatus,
           ...(diagnosticLog ? { diagnostic_log: diagnosticLog } : {}),
         });
@@ -150,10 +152,14 @@ export class ProcessRunner {
         poll();
       };
       let timer: NodeJS.Timeout | undefined;
-      const timeOut = (): void => {
-        if (settled || timedOut) return;
-        timedOut = true;
-        checkpoints.freezeTimeout();
+      const terminate = (reason: "timeout" | "readiness_failed"): void => {
+        if (settled || timedOut || readinessFailed) return;
+        if (reason === "timeout") {
+          timedOut = true;
+          checkpoints.freezeTimeout();
+        } else {
+          readinessFailed = true;
+        }
         termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
@@ -161,8 +167,9 @@ export class ProcessRunner {
           finishAfterGroupCleanup();
         }, 1_000);
       };
+      const timeOut = (): void => terminate("timeout");
       const armCommandTimeout = (timeoutMs: number): void => {
-        if (settled || timedOut) return;
+        if (settled || timedOut || readinessFailed) return;
         if (timer) clearTimeout(timer);
         timer = setTimeout(timeOut, timeoutMs);
         timer.unref();
@@ -173,7 +180,7 @@ export class ProcessRunner {
         void options.timeoutStartAfter.then(() => {
           const remainingMs = Math.max(0, options.timeoutMs - (Date.now() - timeoutStartedAt));
           armCommandTimeout(Math.min(options.timeoutAfterReadyMs!, remainingMs));
-        }, timeOut);
+        }, () => terminate("readiness_failed"));
       }
       child.once("error", (error) => {
         if (timer) clearTimeout(timer);

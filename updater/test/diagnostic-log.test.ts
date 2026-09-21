@@ -9,7 +9,7 @@ import { UpdateDatabase } from "../src/database.js";
 import { ProcessRunner } from "../src/process.js";
 import { currentSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
-async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
@@ -418,6 +418,7 @@ test("timeout cleanup and signal exit both finalize their bound diagnostics", as
       diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test-timeout" } },
     });
     assert.equal(timedOut.timed_out, true);
+    assert.equal(timedOut.spawn_error, undefined);
     assert.equal(timedOut.exit_signal, "SIGKILL");
     assert.equal(timedOut.cleanup_status, "term=group-sent,kill=group-sent,closed=yes");
     assert.equal(timedOut.diagnostic_log?.capture_state, "complete");

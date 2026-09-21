@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { ProcessCheckpointTracker } from "../src/process-checkpoint.js";
 import { ProcessRunner } from "../src/process.js";
 
-async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
@@ -45,6 +45,21 @@ test("ProcessRunner bounds a fixture readiness handshake independently", () => {
   );
 });
 
+test("ProcessRunner reports readiness failure separately from timeout", async () => {
+  const result = await new ProcessRunner().run(process.execPath, ["-e", `
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+  `], {
+    timeoutMs: 5_000,
+    outputLimitBytes: 1_024,
+    timeoutStartAfter: Promise.reject(new Error("fixture failed before ready")),
+    timeoutAfterReadyMs: 50,
+  });
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error, "readiness_failed");
+  assert.match(result.cleanup_status ?? "", /^term=group-sent,kill=(?:group-sent|unavailable),closed=yes$/);
+});
+
 test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-process-cleanup-"));
   const pidPath = path.join(root, "child.pid");
@@ -71,6 +86,7 @@ test("ProcessRunner waits for process-group SIGKILL cleanup after timeout", asyn
       timeoutAfterReadyMs: 50,
     });
     assert.equal(result.timed_out, true);
+    assert.equal(result.spawn_error, undefined);
     const childPid = Number(await fs.readFile(pidPath, "utf8"));
     assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
   } finally {
@@ -137,6 +153,7 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
       timeoutAfterReadyMs: 50,
     });
     assert.equal(result.timed_out, true);
+    assert.equal(result.spawn_error, undefined);
     assert.equal(result.output_truncated, true);
     assert.equal(
       result.output_checkpoint,
