@@ -285,7 +285,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at
-      WHERE dedupe_key='outbox:'||NEW.outbox_id AND NEW.status!='needs_review' AND state='open';
+      WHERE dedupe_key='outbox:'||NEW.outbox_id AND (NEW.status!='needs_review' OR NEW.kind='slack.work_result.post') AND state='open';
     END;
     INSERT OR IGNORE INTO human_wait_schema VALUES(1,1);
   `);

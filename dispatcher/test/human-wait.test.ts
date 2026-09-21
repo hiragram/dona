@@ -234,6 +234,12 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
         'needs_review',0,available_at,created_at,updated_at,content_delete_at,'failed'
       FROM connector_outbox WHERE outbox_id=?`).run(outbox.outbox_id);
     assert.equal(harness.database.humanWaits.listInternal().some(item=>item.dedupe_key==='outbox:out_work_result_review'),false);
+    harness.raw.prepare("UPDATE human_wait_items SET dedupe_key='outbox:out_work_result_review',resource_id='out_work_result_review' WHERE dedupe_key=?")
+      .run(`outbox:${outbox.outbox_id}`);
+    const legacyRepair=harness.database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:"2026-09-05T00:03:00.000Z"});
+    assert.equal(legacyRepair.repaired>=2,true);
+    assert.equal(harness.database.humanWaits.listInternal().some(item=>item.dedupe_key==='outbox:out_work_result_review'),false);
+    assert.equal(harness.database.humanWaits.listInternal("resolved").some(item=>item.dedupe_key==='outbox:out_work_result_review'),true);
     harness.raw.prepare("DELETE FROM human_wait_items").run();
     const repaired=harness.database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:"2026-09-05T00:03:00.000Z"});
     assert.equal(repaired.repaired>=2,true);
