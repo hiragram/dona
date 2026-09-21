@@ -65,9 +65,13 @@ test("cursor改ざんとprincipal/grant/read revision変更はfallbackせず拒�
     assert.throws(()=>query.list({context,destination,limit:1,cursor:invalid}),
       (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
   }
-  const fresh=service(new FakeWaits([row("a","2026-09-21T00:00:03.000Z"),row("b","2026-09-21T00:00:02.000Z")])).list({context,destination,limit:1}).next_cursor!;
+  const freshService=service(new FakeWaits([row("a","2026-09-21T00:00:03.000Z"),row("b","2026-09-21T00:00:02.000Z")]));
+  const fresh=freshService.list({context,destination,limit:1,cursorScope:"presentation"}).next_cursor!;
   assert.throws(()=>service(new FakeWaits(waits.rows)).list({context:{...context,event_id:"evt_01J00000000000000000000001"},destination,limit:1,cursor:fresh}),
     (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
+  const continued=service(new FakeWaits(waits.rows)).list({context:{...context,event_id:"evt_01J00000000000000000000001"},
+    destination,limit:1,cursor:fresh,cursorScope:"presentation",allowCrossEventCursor:true});
+  assert.equal(continued.items[0]?.item_id,row("b","2026-09-21T00:00:02.000Z").item_id);
   assert.throws(()=>service(new FakeWaits(waits.rows)).list({context,destination:{...destination,channel_id:"C_OTHER"},limit:1,cursor:fresh}),
     (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
 });

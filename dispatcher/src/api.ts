@@ -334,9 +334,10 @@ export class DispatcherApi {
             if(!/^(?:[1-9]|[1-4][0-9]|50)$/.test(rawLimit))throw new ApiRequestError(400,"invalid_request","limit is invalid");
             if(url.pathname==="/v1/human-waits/presentation") {
               const event=this.database.get(context.event_id);
-              if(!event||!hasExplicitOwnHumanWaitIntent(event))throw new HumanWaitPresentationError();
-              const page=service.list({context,destination:this.agentDisclosureDestination(context),limit:Math.min(Number(rawLimit),10),
-                ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})});
+              const continuation=url.searchParams.has("cursor");
+              if(!event||!hasExplicitOwnHumanWaitIntent(event,{continuation}))throw new HumanWaitPresentationError();
+              const page=service.list({context,destination:this.agentDisclosureDestination(context),limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
+                ...(continuation?{cursor:url.searchParams.get("cursor")!,allowCrossEventCursor:true}:{})});
               sendJson(response,200,{schema_version:1,...renderHumanWaits(page)});
             } else sendJson(response,200,service.list({context,destination:this.agentDisclosureDestination(context),limit:Number(rawLimit),
               ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})}));

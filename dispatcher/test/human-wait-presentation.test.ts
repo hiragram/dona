@@ -28,6 +28,9 @@ describe("自分待ちSlack表示",()=>{
   test("本人のtop-level明示問い合わせだけを受理する",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 私の待ちを一覧で見せて")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちの次を表示して","message","im")),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im"),{continuation:true}),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示して田中さんへ送って","message","im"),{continuation:true}),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちを一覧で見せて","message","channel")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("> 私の待ちを一覧で見せて\n了解です")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("```\n自分待ちを一覧で見せて\n```\n確認します")),false);
