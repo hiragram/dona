@@ -30,10 +30,14 @@ describe("自分待ちSlack表示",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちの次を表示して","message","im")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im"),{continuation:true}),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","channel"),{continuation:true}),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","group"),{continuation:true}),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示して田中さんへ送って","message","im"),{continuation:true}),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちを一覧で見せて","message","channel"),{continuation:true}),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちを一覧で見せて","message","channel")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("> 私の待ちを一覧で見せて\n了解です")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("```\n自分待ちを一覧で見せて\n```\n確認します")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> `私の待ちを一覧で見せて`って入力すればいいですか？")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("田中さんの待ちを一覧で見せて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent({...event("私の待ちを一覧で見せて"),source:"dona_job"}),false);
   });

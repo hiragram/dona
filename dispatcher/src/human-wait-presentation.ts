@@ -16,17 +16,18 @@ function unquotedText(value:string):string {
   return value.split(/\r?\n/).filter(line=>{
     if(line.trim().startsWith("```")){fenced=!fenced;return false;}
     return !fenced&&!line.trimStart().startsWith(">");
-  }).join("\n").replace(/<@[A-Z0-9]+>/g," ").trim();
+  }).join("\n").replace(/`[^`\r\n]*`/g," ").replace(/<@[A-Z0-9]+>/g," ").trim();
 }
 
 export function hasExplicitOwnHumanWaitIntent(event:EventRow,input:{continuation?:boolean}={}):boolean {
   if(event.source!=="slack"||!(event.event_type==="app_mention"||event.event_type==="message"))return false;
   const subject=record(event.subject_json),payload=record(event.payload_json);
   if(!subject||!payload||typeof payload.text!=="string")return false;
-  if(event.event_type==="message"&&subject.channel_type!=="im")return false;
   const text=unquotedText(payload.text).normalize("NFKC");
   if(!text||text.length>500)return false;
-  if(input.continuation&&/^(?:(?:次|続き)(?:を)?(?:表示|見せて|みせて|お願い|おねがい)?(?:してください|して|ください)?|(?:next|more)(?:\s+(?:page|please))?)[。.!！?？]*$/iu.test(text))return true;
+  const continuationRequest=/^(?:(?:次|続き)(?:を)?(?:表示|見せて|みせて|お願い|おねがい)?(?:してください|して|ください)?|(?:next|more)(?:\s+(?:page|please))?)[。.!！?？]*$/iu.test(text);
+  if(event.event_type==="message"&&subject.channel_type!=="im")return input.continuation===true&&continuationRequest;
+  if(input.continuation&&continuationRequest)return true;
   const self=/(?:今|現在)?\s*(?:自分|僕|ぼく|私|わたし)(?:が)?(?:対応)?待ち|(?:自分|僕|ぼく|私|わたし)の(?:対応)?待ち|waiting\s+on\s+me|my\s+(?:human\s+)?waits?/iu.test(text);
   const request=/(?:一覧|見せ|みせ|教え|おしえ|確認|ある|あります|何|どれ|次|続きを|表示)|(?:list|show|what|any|next|more)/iu.test(text);
   return self&&request;
