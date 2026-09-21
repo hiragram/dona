@@ -93,10 +93,9 @@ async function socketIsAlive(socketPath: string, timeoutMs = 500): Promise<boole
 }
 
 function agentRouteEventId(url: URL): string | undefined {
-  const query = url.searchParams.get("source_event_id");
-  if (query !== null) return query;
   const match = /^\/v1\/(?:events|scheduled-jobs|job-notifications)\/([^/]+)\/(?:jobs|delegate|access|authorize)$/.exec(url.pathname);
-  return match ? decodeURIComponent(match[1]!) : undefined;
+  if (match) return decodeURIComponent(match[1]!);
+  return url.searchParams.get("source_event_id") ?? undefined;
 }
 
 export interface ApiWorkerState {
@@ -134,6 +133,8 @@ export interface ApiJobProgressResolver {
 export class DispatcherApi {
   private server: http.Server | undefined;
   private agentServer: http.Server | undefined;
+  private ownsAgentSocket = false;
+  private ownsAgentCredential = false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
@@ -163,6 +164,8 @@ export class DispatcherApi {
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
     await fs.chmod(path.dirname(this.config.socketPath), 0o700);
+    await fs.mkdir(path.dirname(this.config.agentSocketPath), { recursive: true, mode: 0o700 });
+    await fs.chmod(path.dirname(this.config.agentSocketPath), 0o700);
     await fs.mkdir(this.config.resultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.resultsDir, 0o700);
     try {
@@ -187,7 +190,6 @@ export class DispatcherApi {
     });
     await fs.chmod(this.config.socketPath, 0o600);
     if (this.agentContexts) {
-      await this.agentContexts.initialize();
       try {
         await fs.lstat(this.config.agentSocketPath);
         if (await socketIsAlive(this.config.agentSocketPath)) throw new Error(`Another agent API is already listening on ${this.config.agentSocketPath}`);
@@ -195,12 +197,15 @@ export class DispatcherApi {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
+      await this.agentContexts.initialize();
+      this.ownsAgentCredential = true;
       this.agentServer = http.createServer((request, response) => void this.handle(request, response, true));
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error): void => reject(error);
         this.agentServer!.once("error", onError);
         this.agentServer!.listen(this.config.agentSocketPath, () => {
           this.agentServer!.off("error", onError);
+          this.ownsAgentSocket = true;
           resolve();
         });
       });
@@ -230,6 +235,7 @@ export class DispatcherApi {
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
+    const ownsAgentSocket = this.ownsAgentSocket;
     if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
@@ -241,16 +247,21 @@ export class DispatcherApi {
       });
     }
     this.agentServer = undefined;
-    await this.agentContexts?.revoke();
+    this.ownsAgentSocket = false;
+    if (this.ownsAgentCredential) await this.agentContexts?.revoke();
+    this.ownsAgentCredential = false;
     this.server = undefined;
-    if (!ownsSocket) return;
-    try {
-      await fs.unlink(this.config.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (ownsSocket) {
+      try {
+        await fs.unlink(this.config.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
-    try { await fs.unlink(this.config.agentSocketPath); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (ownsAgentSocket) {
+      try { await fs.unlink(this.config.agentSocketPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
     this.logger.info("Dispatcher API stopped");
   }
 
@@ -263,7 +274,7 @@ export class DispatcherApi {
         const eventId = typeof request.headers["x-dona-source-event-id"] === "string" ? request.headers["x-dona-source-event-id"] : undefined;
         const context = operation ? this.agentContexts?.authorize(token, eventId, operation) : undefined;
         const routeEventId = agentRouteEventId(url);
-        if (!context || (routeEventId !== undefined && routeEventId !== context.event_id)) {
+        if (!context || (routeEventId !== undefined && !this.agentContexts?.allowsRouteEvent(context, operation!, routeEventId))) {
           throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
         }
         this.verifiedAgentContexts.set(request, context);

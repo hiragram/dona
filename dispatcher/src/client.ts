@@ -37,7 +37,7 @@ export class DispatcherApiClient {
     if (jobKey !== undefined) query.set("job_key", jobKey);
     if (canonicalPayloadSha256 !== undefined) query.set("canonical_payload_sha256", canonicalPayloadSha256);
     const suffix = query.size === 0 ? "" : `?${query}`;
-    return this.request("GET", `/v1/events/${encodeURIComponent(sourceEventId)}/jobs${suffix}`, undefined, sourceEventId);
+    return this.request("GET", `/v1/events/${encodeURIComponent(sourceEventId)}/jobs${suffix}`, undefined, sourceEventId, true);
   }
 
   authorizeJobNotification(eventId:string,receipt?:string):Promise<Record<string,unknown>> {
@@ -91,7 +91,13 @@ export class DispatcherApiClient {
     return this.request("POST", "/v1/self-update/cancel", input, sourceEventId(input));
   }
 
-  private async request(method: string, route: string, body?: unknown, claimedEventId?: string): Promise<Record<string, unknown>> {
+  private async request(
+    method: string,
+    route: string,
+    body?: unknown,
+    claimedEventId?: string,
+    allowRelatedTarget = false,
+  ): Promise<Record<string, unknown>> {
     const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     let agentHeaders: Record<string, string> = {};
     if (this.agentCredentialPath) {
@@ -99,8 +105,10 @@ export class DispatcherApiClient {
       try { raw = JSON.parse(await fs.readFile(this.agentCredentialPath, "utf8")) as {token?:unknown;event_id?:unknown}; }
       catch { throw new DispatcherClientError(403, "Agent context is unavailable"); }
       if (typeof raw.token !== "string" || typeof raw.event_id !== "string") throw new DispatcherClientError(undefined, "Agent context is unavailable");
-      if (!claimedEventId || claimedEventId !== raw.event_id) throw new DispatcherClientError(403, "Agent event context mismatch");
-      agentHeaders = { "x-dona-agent-token": raw.token, "x-dona-source-event-id": claimedEventId };
+      if (!claimedEventId || (!allowRelatedTarget && claimedEventId !== raw.event_id)) {
+        throw new DispatcherClientError(403, "Agent event context mismatch");
+      }
+      agentHeaders = { "x-dona-agent-token": raw.token, "x-dona-source-event-id": raw.event_id };
     }
     return new Promise((resolve, reject) => {
       const request = http.request({

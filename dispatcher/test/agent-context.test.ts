@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 
@@ -47,6 +48,8 @@ function rawRequest(socketPath: string, route: string, headers: Record<string, s
 
 test("agent専用transportはcurrent event/attemptとpurposeを固定しrestartで失効する", async () => {
   const { root, config } = await tempConfig(); roots.push(root);
+  config.agentSocketPath = path.join(root, "a", "a.sock");
+  config.agentCredentialPath = path.join(root, "a", "a.token");
   const database = new DispatcherDatabase(config.databasePath);
   const envelope = eventEnvelope("agent-context-source");
   const source = database.enqueue(envelope, new Date(), proof(envelope.external_event_id)).row;
@@ -56,6 +59,8 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts);
   await api.start();
   try {
+    assert.equal((await fs.stat(path.dirname(config.agentSocketPath))).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(config.agentSocketPath)).mode & 0o777, 0o600);
     const client = new DispatcherApiClient(config.agentSocketPath, 1_000, config.agentCredentialPath);
     await assert.rejects(() => client.listOwnerJobs(source.event_id), /Agent context is unavailable/);
     const context = await contexts.issue(dispatching);
@@ -70,9 +75,13 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     const other = database.enqueue(otherEnvelope, new Date(Date.now() + 1), proof(otherEnvelope.external_event_id)).row;
     await assert.rejects(() => client.listOwnerJobs(other.event_id), (error: unknown) =>
       error instanceof DispatcherClientError && error.statusCode === 403);
+    await assert.rejects(() => client.listEventJobs(other.event_id), (error: unknown) =>
+      error instanceof DispatcherClientError && error.statusCode === 403);
 
     const credential = JSON.parse(await fs.readFile(config.agentCredentialPath, "utf8")) as {token:string;event_id:string};
     const headers = { "x-dona-agent-token": credential.token, "x-dona-source-event-id": credential.event_id };
+    assert.equal(await rawRequest(config.agentSocketPath,
+      `/v1/events/${encodeURIComponent(other.event_id)}/jobs?source_event_id=${encodeURIComponent(source.event_id)}`, headers), 403);
     assert.equal(contexts.authorize(credential.token, source.event_id, "list_owner_jobs", new Date(context.expires_at)), undefined);
     assert.equal(await rawRequest(config.agentSocketPath, "/v1/admin/update-safety", headers), 403);
     assert.equal(contexts.authorize(credential.token, source.event_id, "authorize_job_notification"), undefined);
@@ -93,6 +102,7 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     const completionCredential = JSON.parse(await fs.readFile(config.agentCredentialPath, "utf8")) as {token:string;event_id:string};
     assert.ok(contexts.authorize(completionCredential.token, completion.event_id, "get_job_status"));
     assert.equal(contexts.authorize(completionCredential.token, completion.event_id, "delegate_job"), undefined);
+    assert.deepEqual((await client.listEventJobs(source.event_id)).jobs, []);
 
     const restarted = new AgentContextManager(database, config.agentCredentialPath);
     await restarted.initialize();
@@ -100,5 +110,29 @@ test("agent専用transportはcurrent event/attemptとpurposeを固定しrestart�
     await assert.rejects(() => fs.access(config.agentCredentialPath));
   } finally {
     await api.stop(); database.close();
+  }
+});
+
+test("起動に失敗したprocessは既存agent socketとcredentialを削除しない", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  await fs.mkdir(path.dirname(config.agentSocketPath), { recursive: true, mode: 0o700 });
+  await fs.writeFile(config.agentCredentialPath, "foreign-credential\n", { mode: 0o600 });
+  const foreign = net.createServer(socket => socket.end());
+  await new Promise<void>((resolve, reject) => {
+    foreign.once("error", reject);
+    foreign.listen(config.agentSocketPath, resolve);
+  });
+  const database = new DispatcherDatabase(config.databasePath);
+  const contexts = new AgentContextManager(database, config.agentCredentialPath, 60_000);
+  const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts);
+  try {
+    await assert.rejects(() => api.start(), /Another agent API is already listening/);
+    await api.stop();
+    assert.equal(await fs.readFile(config.agentCredentialPath, "utf8"), "foreign-credential\n");
+    assert.equal((await fs.lstat(config.agentSocketPath)).isSocket(), true);
+  } finally {
+    await new Promise<void>(resolve => foreign.close(() => resolve()));
+    database.close();
   }
 });

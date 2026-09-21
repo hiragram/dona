@@ -2,7 +2,7 @@
 
 ## 境界
 
-`dona-main`が使うDispatcher MCPは、管理用`dispatcher.sock`ではなくagent専用`dispatcher-agent.sock`へ接続する。Dispatcher workerはprompt直前に、現在のevent ID、dispatch attempt、verified human principal、tenant/workspace、purpose、失効時刻、policy revisionへ束縛した短命credentialを発行する。MCP clientは各requestでcredentialとcaller指定の`source_event_id`を送り、Dispatcherはserver-side sessionと完全一致した場合だけ処理する。
+`dona-main`が使うDispatcher MCPは、管理用`dispatcher.sock`ではなくagent専用`dispatcher-agent.sock`へ接続する。Dispatcher workerはprompt直前に、現在のevent ID、dispatch attempt、verified human principal、tenant/workspace、purpose、失効時刻、policy revisionへ束縛した短命credentialを発行する。MCP clientは各requestでcredentialとcredentialから読んだ認証用event IDを送り、Dispatcherはserver-side sessionと完全一致した場合だけ処理する。toolの対象event IDはこれと別に検証し、通常は現在eventとの一致を要求する。
 
 credentialはowner-only fileへ置き、値をprompt、model output、通常log、auditへ記録しない。新しいattemptの発行で旧credentialを置換し、terminal result、停止、再起動で削除する。Dispatcher再起動後はprocess memoryのsessionが空になるため、残存credentialだけでは認可されない。
 
@@ -19,4 +19,4 @@ credentialはowner-only fileへ置き、値をprompt、model output、通常log�
 
 正本は`dispatcher/src/agent-context.ts`の`agentPurposeOperations`である。`.codex/config.toml`のtool allowlistはこの集合の和と一致させる。background job workerは親agentのcapabilityを継承せず、`dona_dispatcher` MCPを常に無効化する。
 
-`list_thread_jobs`と`get_self_update_status`を含む全toolは現在の`source_event_id`を明示する。tool説明やmodelの遵守は認可根拠にせず、source-event swap、別attempt、期限切れ、purpose違反、context欠落、agent socketからの管理routeを一律denyする。
+`list_thread_jobs`と`get_self_update_status`を含む全toolは現在の`source_event_id`を明示する。唯一、`job_completion`の`list_event_jobs`はgroup完了集約のため、durableな完了通知の`subject.source_event_id`または`trace.source_event_id`と一致する元eventを一覧対象にできる。queryでpath上の対象eventを上書きできず、他purposeや無関係なeventへの横断はdenyする。tool説明やmodelの遵守は認可根拠にせず、source-event swap、別attempt、期限切れ、purpose違反、context欠落、agent socketからの管理routeを一律denyする。

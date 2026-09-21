@@ -104,6 +104,21 @@ export class AgentContextManager {
     const { token_sha256: _secret, ...context } = active;
     return context;
   }
+
+  allowsRouteEvent(context: AgentExecutionContext, operation: string, targetEventId: string): boolean {
+    if (targetEventId === context.event_id) return true;
+    if (context.purpose !== "job_completion" || operation !== "list_event_jobs") return false;
+    const event = this.database.get(context.event_id);
+    if (!event || event.source !== "dona_job") return false;
+    try {
+      const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+      const trace = event.trace_json ? JSON.parse(event.trace_json) as Record<string, unknown> : undefined;
+      const sourceEventId = subject.source_event_id ?? trace?.source_event_id;
+      return sourceEventId === targetEventId;
+    } catch {
+      return false;
+    }
+  }
 }
 
 export function agentOperation(method: string | undefined, url: URL): string | undefined {
