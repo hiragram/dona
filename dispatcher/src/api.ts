@@ -206,7 +206,10 @@ export class DispatcherApi {
       operations.stale_claims === 0 && operations.retention_overdue === 0;
     let workerMessaging: Record<string, unknown>;
     try { workerMessaging = this.database.workerMessages.operationalSnapshot(); }
-    catch { workerMessaging = { protocol_version: 1, degraded: true, error_code: "worker_message_storage_unavailable" }; }
+    catch {
+      ready = false;
+      workerMessaging = { protocol_version: 1, degraded: true, error_code: "worker_message_storage_unavailable" };
+    }
     return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations }, worker_messaging: workerMessaging };
   }
 

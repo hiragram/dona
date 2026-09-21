@@ -170,14 +170,19 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS worker_message_delivery_claim_idx
       ON worker_message_deliveries(consumer, state, available_at, created_at);
 
-    CREATE TRIGGER IF NOT EXISTS worker_message_terminal_worker_deliveries
+    DROP TRIGGER IF EXISTS worker_message_terminal_worker_deliveries;
+    DROP TRIGGER IF EXISTS worker_message_terminal_deliveries;
+    CREATE TRIGGER worker_message_terminal_deliveries
     AFTER UPDATE OF status ON jobs
     WHEN NEW.status IN ('completed','failed','cancelled') AND OLD.status <> NEW.status
     BEGIN
       UPDATE worker_message_deliveries
       SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=NEW.updated_at
-      WHERE consumer='worker' AND state IN ('pending','leased')
+      WHERE state IN ('pending','leased')
         AND message_id IN (SELECT message_id FROM worker_messages WHERE job_id=NEW.job_id);
+      UPDATE worker_message_cadence
+      SET pending_message_id=NULL,updated_at=NEW.updated_at
+      WHERE job_id=NEW.job_id;
     END;
 
     CREATE TABLE IF NOT EXISTS worker_message_receipts (
@@ -316,8 +321,15 @@ export class WorkerMessageRepository {
     const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
     if(!job)return undefined;
     this.assertAuthorized(job,sourceEventId);
-    return this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND message_id=?")
+    const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND message_id=?")
       .get(jobId, messageId) as WorkerMessageRow | undefined;
+    if(message?.direction==="worker_to_dona"){
+      const delivery=this.db.prepare("SELECT event_id FROM worker_message_deliveries WHERE message_id=? AND consumer='dona-main'")
+        .get(messageId) as {event_id:string|null}|undefined;
+      if(!delivery?.event_id||delivery.event_id!==sourceEventId)
+        throw new WorkerMessageError("job_binding_mismatch","source event is not the notification event for this message");
+    }
+    return message;
   }
 
   reconcile(jobId: string, sourceEventId: string, producer: "worker" | "dona-main", idempotencyKey: string) {
@@ -347,6 +359,11 @@ export class WorkerMessageRepository {
         WHERE consumer=? AND state='leased' AND lease_expires_at<=?`).run(now, consumer, now);
       const candidates = this.db.prepare(`SELECT d.delivery_id FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
         WHERE m.job_id=? AND d.consumer=? AND d.state='pending' AND d.available_at<=?
+          AND NOT EXISTS (
+            SELECT 1 FROM worker_messages prior JOIN worker_message_deliveries prior_delivery USING(message_id)
+            WHERE prior.job_id=m.job_id AND prior.producer=m.producer AND prior.producer_sequence<m.producer_sequence
+              AND prior_delivery.consumer=d.consumer AND prior_delivery.state IN ('pending','leased')
+          )
         ORDER BY m.producer_sequence,d.available_at,d.created_at,d.delivery_id LIMIT ?`).all(jobId, consumer, now, limit) as Array<{delivery_id:string}>;
       return candidates.map(({ delivery_id }) => {
         const token = `lease_${ulid(at.getTime()).toLowerCase()}_${randomBytes(16).toString("hex")}`;
@@ -421,9 +438,17 @@ export class WorkerMessageRepository {
       const now = at.toISOString();
       this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=?
         WHERE consumer='dona-main' AND state='leased' AND lease_expires_at<=?`).run(now, now);
+      this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
+        lease_expires_at=NULL,updated_at=? WHERE consumer='dona-main' AND state IN ('pending','leased') AND message_id IN
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        .run(now);
+      this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        .run(now);
       const rows = this.db.prepare(`SELECT d.delivery_id,d.message_id,m.job_id,m.source_event_id,m.workspace_id,m.channel_id,m.thread_ts,m.kind,m.payload_json,m.occurred_at,j.status
         FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
         WHERE d.consumer='dona-main' AND d.state='pending' AND d.available_at<=?
+          AND j.status NOT IN ('completed','failed','cancelled')
           AND m.workspace_id IS NOT NULL AND m.channel_id IS NOT NULL AND m.thread_ts IS NOT NULL
         ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT ?`).all(now, limit) as Array<{
           delivery_id:string;message_id:string;job_id:string;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null;
@@ -514,7 +539,10 @@ export class WorkerMessageRepository {
     const cutoff = new Date(at.getTime() - workerMessageRetentionDays * 86_400_000).toISOString();
     return this.db.transaction(() => {
       this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
-        lease_expires_at=NULL,updated_at=? WHERE consumer='worker' AND state IN ('pending','leased') AND message_id IN
+        lease_expires_at=NULL,updated_at=? WHERE state IN ('pending','leased') AND message_id IN
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        .run(at.toISOString());
+      this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
         (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
         .run(at.toISOString());
       this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN

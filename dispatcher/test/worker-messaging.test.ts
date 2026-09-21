@@ -109,8 +109,13 @@ describe("worker messaging ledger",()=>{
       for(const sequence of [1,2]) database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:sequence,idempotency_key:`ordered-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
         payload:{operation:"add_condition",text:`condition ${sequence}`}},at);
-      const claimed=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-ordered",2,10_000,new Date("2026-09-21T00:00:11Z"));
-      assert.deepEqual(claimed.map(value=>value.delivery.producer_sequence),[1,2]);
+      const first=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-ordered",2,10_000,new Date("2026-09-21T00:00:11Z"));
+      assert.deepEqual(first.map(value=>value.delivery.producer_sequence),[1]);
+      assert.deepEqual(database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-overlap",1,10_000,new Date("2026-09-21T00:00:12Z")),[]);
+      database.workerMessages.acknowledgeWorker(job.job_id,source.event_id,first[0]!.delivery.delivery_id,"runtime-ordered",
+        first[0]!.lease_token,first[0]!.delivery.fence,new Date("2026-09-21T00:00:12Z"));
+      const second=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-ordered",2,10_000,new Date("2026-09-21T00:00:13Z"));
+      assert.deepEqual(second.map(value=>value.delivery.producer_sequence),[2]);
     } finally { database.close(); }
   });
 
@@ -124,6 +129,11 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-09-21T00:00:11Z")),0);
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as {delivery:{state:string}}).delivery.state,"pending");
       assert.equal(database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`),undefined);
+      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:00:12Z"},job.result_path);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as {delivery:{state:string}}).delivery.state,"superseded");
+      assert.equal(database.workerMessages.operationalSnapshot(new Date("2026-09-21T00:00:13Z")).pending_deliveries,0);
     } finally { database.close(); }
   });
 
@@ -268,6 +278,14 @@ test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
   const created=bridge.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
   bridge.close();
 
+  const legacyBridge=new Database(config.databasePath);
+  legacyBridge.exec(`
+    ALTER TABLE worker_message_deliveries DROP COLUMN delivered_lease_owner;
+    ALTER TABLE worker_message_deliveries DROP COLUMN delivered_lease_token_sha256;
+    ALTER TABLE worker_message_deliveries DROP COLUMN delivered_fence;
+  `);
+  legacyBridge.close();
+
   const activation=new Database(config.databasePath);
   activation.pragma("foreign_keys = ON");
   migrateDispatcherDatabase(activation,()=>{},false,3);
@@ -310,7 +328,9 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     sqlite.close();
     assert.deepEqual(JSON.parse(internal.payload_json),{schema_version:1,message_id:messageId,job_id:job.job_id,source_event_id:source.event_id,kind:"checkpoint"});
     assert.doesNotMatch(internal.payload_json,/checkpoint 1/);
-    const read=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/${messageId}?source_event_id=${source.event_id}`);
+    const sourceRead=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/${messageId}?source_event_id=${source.event_id}`);
+    assert.equal(sourceRead.status,403);
+    const read=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/${messageId}?source_event_id=${internal.event_id}`);
     assert.equal(read.status,200); assert.equal(((read.body.message as {payload:{kind:string}}).payload.kind),"checkpoint");
     const reconcile=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`);
     assert.equal(reconcile.status,200); assert.equal(reconcile.body.reconciliation,"matched");
@@ -325,6 +345,10 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(forbiddenAck.status,409);
     const health=await request(config.socketPath,"GET","/health/ready");
     assert.equal((health.body.worker_messaging as {protocol_version:number}).protocol_version,1);
+    database.workerMessages.operationalSnapshot=()=>{throw new Error("worker message storage unavailable");};
+    const unavailable=await request(config.socketPath,"GET","/health/ready");
+    assert.equal(unavailable.status,503);
+    assert.equal((unavailable.body.worker_messaging as {error_code:string}).error_code,"worker_message_storage_unavailable");
   } finally { await api.stop(); database.close(); }
 });
 

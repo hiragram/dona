@@ -334,11 +334,39 @@ export function migrateDispatcherDatabase(
     if (hasWorkerMessages) {
       migrateWorkerMessaging(db);
       db.exec(`
-        INSERT INTO worker_messages SELECT * FROM preserved_worker_messages_v3;
-        INSERT INTO worker_message_deliveries SELECT * FROM preserved_worker_message_deliveries_v3;
-        INSERT INTO worker_message_receipts SELECT * FROM preserved_worker_message_receipts_v3;
-        INSERT INTO worker_message_cadence SELECT * FROM preserved_worker_message_cadence_v3;
-        INSERT INTO worker_message_workspace_cadence SELECT * FROM preserved_worker_message_workspace_cadence_v3;
+        INSERT INTO worker_messages (
+          message_id, schema_version, job_id, source_event_id, workspace_id, channel_id, thread_ts,
+          direction, kind, producer, producer_sequence, idempotency_key, payload_json, payload_sha256,
+          correlation_message_id, conversation_revision, occurred_at, accepted_at
+        ) SELECT
+          message_id, schema_version, job_id, source_event_id, workspace_id, channel_id, thread_ts,
+          direction, kind, producer, producer_sequence, idempotency_key, payload_json, payload_sha256,
+          correlation_message_id, conversation_revision, occurred_at, accepted_at
+        FROM preserved_worker_messages_v3;
+        INSERT INTO worker_message_deliveries (
+          delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,
+          lease_expires_at, fence, attempt_count, delivered_at, delivered_lease_owner,
+          delivered_lease_token_sha256, delivered_fence, event_id, created_at, updated_at
+        ) SELECT
+          delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,
+          lease_expires_at, fence, attempt_count, delivered_at, delivered_lease_owner,
+          delivered_lease_token_sha256, delivered_fence, event_id, created_at, updated_at
+        FROM preserved_worker_message_deliveries_v3;
+        INSERT INTO worker_message_receipts (
+          receipt_id, message_id, delivery_id, receipt_kind, consumer, created_at
+        ) SELECT receipt_id, message_id, delivery_id, receipt_kind, consumer, created_at
+        FROM preserved_worker_message_receipts_v3;
+        INSERT INTO worker_message_cadence (
+          job_id, minimum_interval_ms, silence_interval_ms, last_report_at, last_delivery_at,
+          silence_due_at, pending_message_id, generation, updated_at
+        ) SELECT
+          job_id, minimum_interval_ms, silence_interval_ms, last_report_at, last_delivery_at,
+          silence_due_at, pending_message_id, generation, updated_at
+        FROM preserved_worker_message_cadence_v3;
+        INSERT INTO worker_message_workspace_cadence (
+          workspace_id, minimum_interval_ms, last_delivery_at, updated_at
+        ) SELECT workspace_id, minimum_interval_ms, last_delivery_at, updated_at
+        FROM preserved_worker_message_workspace_cadence_v3;
         DROP TABLE preserved_worker_messages_v3;
         DROP TABLE preserved_worker_message_deliveries_v3;
         DROP TABLE preserved_worker_message_receipts_v3;
