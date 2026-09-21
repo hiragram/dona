@@ -347,7 +347,7 @@ describe("DispatcherDatabase", () => {
     const v2 = new DispatcherDatabase(config.databasePath);
     v2.listWebJobs({ instance_id:"instance",tenant_id:"T_TEST",principal_id:"U-1",authorization_kind:"own" },20);
     v2.close();
-    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=3").run();
+    const fixture = new Database(config.databasePath); fixture.prepare("UPDATE web_job_projection_schema SET version=4").run();
     const before = fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get();
     assert.throws(() => migrateDispatcherDatabase(fixture,()=>{},false,3),/schema_unsupported/);
     assert.deepEqual(fixture.prepare("SELECT sql,rootpage FROM sqlite_master WHERE type='table' AND name='jobs'").get(),before);

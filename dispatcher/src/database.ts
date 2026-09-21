@@ -171,7 +171,7 @@ function assertSupportedWebJobProjectionSchema(db: Database.Database): void {
   const schemaExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_job_projection_schema'").get();
   if (schemaExists) {
     const versions = db.prepare("SELECT version FROM web_job_projection_schema").all() as Array<{ version: number }>;
-    if (versions.length !== 1 || versions[0]!.version > 2) throw new Error("web_job_projection_schema_unsupported");
+    if (versions.length !== 1 || versions[0]!.version > 3) throw new Error("web_job_projection_schema_unsupported");
   }
 }
 
@@ -200,12 +200,15 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       tenant_id         TEXT NOT NULL,
       principal_id      TEXT NOT NULL,
       authorization_kind TEXT NOT NULL CHECK (authorization_kind IN ('own','granted','own_or_granted')),
+      grant_id          TEXT,
+      grant_revision    INTEGER CHECK (grant_revision>0 OR grant_revision IS NULL),
       resource_id       TEXT,
       snapshot_sequence INTEGER NOT NULL,
       after_created_at  TEXT,
       after_job_id      TEXT,
       expires_at        TEXT NOT NULL,
-      created_at        TEXT NOT NULL
+      created_at        TEXT NOT NULL,
+      CHECK ((grant_id IS NULL) = (grant_revision IS NULL))
     ) STRICT;
     CREATE INDEX IF NOT EXISTS web_job_projection_cursors_expiry_idx
       ON web_job_projection_cursors(expires_at);
@@ -251,9 +254,9 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
   const upgrade = () => {
     const current = db.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1")
       .get() as { version: number } | undefined;
-    if ((current?.version ?? 0) < 2) {
+    if ((current?.version ?? 0) < 3) {
       const cursorColumns = db.pragma("table_info(web_job_projection_cursors)") as Array<{ name: string }>;
-      if (!cursorColumns.some(column => column.name === "authorization_kind")) db.exec(`
+      if (!["authorization_kind","grant_id","grant_revision"].every(name=>cursorColumns.some(column=>column.name===name))) db.exec(`
         DROP TABLE web_job_projection_cursors;
         CREATE TABLE web_job_projection_cursors (
           cursor_digest      TEXT PRIMARY KEY CHECK (length(cursor_digest)=64),
@@ -262,16 +265,19 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
           tenant_id          TEXT NOT NULL,
           principal_id       TEXT NOT NULL,
           authorization_kind TEXT NOT NULL CHECK (authorization_kind IN ('own','granted','own_or_granted')),
+          grant_id           TEXT,
+          grant_revision     INTEGER CHECK (grant_revision>0 OR grant_revision IS NULL),
           resource_id        TEXT,
           snapshot_sequence  INTEGER NOT NULL,
           after_created_at   TEXT,
           after_job_id       TEXT,
           expires_at         TEXT NOT NULL,
-          created_at         TEXT NOT NULL
+          created_at         TEXT NOT NULL,
+          CHECK ((grant_id IS NULL) = (grant_revision IS NULL))
         ) STRICT;
         CREATE INDEX web_job_projection_cursors_expiry_idx ON web_job_projection_cursors(expires_at);
       `);
-      db.prepare(`INSERT INTO web_job_projection_schema(singleton,version) VALUES(1,2)
+      db.prepare(`INSERT INTO web_job_projection_schema(singleton,version) VALUES(1,3)
         ON CONFLICT(singleton) DO UPDATE SET version=excluded.version`).run();
     }
     db.exec(`
@@ -568,6 +574,8 @@ interface WebProjectionCursorRow {
   tenant_id: string;
   principal_id: string;
   authorization_kind: "own" | "granted" | "own_or_granted";
+  grant_id: string | null;
+  grant_revision: number | null;
   resource_id: string | null;
   snapshot_sequence: number;
   after_created_at: string | null;
@@ -1090,20 +1098,22 @@ export class DispatcherDatabase {
     })();
   }
 
-  pruneWebJobProjection(before: Date, at = new Date()): { events: number; cursors: number } {
+  pruneWebJobProjection(before: Date, at = new Date(), limit = 1000): { events: number; cursors: number } {
     this.ensureWebJobProjectionReady();
-    if (!Number.isFinite(before.getTime()) || before.getTime() > at.getTime()) throw new Error("web_job_retention_invalid");
+    if (!Number.isFinite(before.getTime()) || before.getTime() > at.getTime()
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 10000) throw new Error("web_job_retention_invalid");
     return this.db.transaction(() => {
-      const cutoff=before.toISOString(),candidate=this.db.prepare(`SELECT MAX(projection.sequence) AS sequence FROM web_job_projection_events projection
+      const cutoff=before.toISOString(),eligible=`SELECT projection.sequence FROM web_job_projection_events projection
         WHERE projection.created_at<? AND (NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.job_id=projection.job_id)
-          OR projection.sequence<>(SELECT MIN(anchor.sequence) FROM web_job_projection_events anchor WHERE anchor.job_id=projection.job_id))`)
-        .get(cutoff) as {sequence:number|null};
-      const events = this.db.prepare(`DELETE FROM web_job_projection_events WHERE sequence IN (SELECT projection.sequence FROM web_job_projection_events projection
-        WHERE projection.created_at<? AND (NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.job_id=projection.job_id)
-          OR projection.sequence<>(SELECT MIN(anchor.sequence) FROM web_job_projection_events anchor WHERE anchor.job_id=projection.job_id)))`).run(cutoff).changes;
+          OR projection.sequence<>(SELECT MIN(anchor.sequence) FROM web_job_projection_events anchor WHERE anchor.job_id=projection.job_id))
+        ORDER BY projection.sequence LIMIT ?`;
+      const candidate=this.db.prepare(`SELECT MAX(sequence) AS sequence FROM (${eligible})`).get(cutoff,limit) as {sequence:number|null};
+      const events = this.db.prepare(`DELETE FROM web_job_projection_events WHERE sequence IN (${eligible})`).run(cutoff,limit).changes;
       if(candidate.sequence!==null)this.db.prepare(`UPDATE web_job_projection_retention SET pruned_through_sequence=MAX(pruned_through_sequence,?) WHERE singleton=1`)
         .run(candidate.sequence);
-      const cursors = this.db.prepare("DELETE FROM web_job_projection_cursors WHERE expires_at<=?").run(at.toISOString()).changes;
+      const cursors = this.db.prepare(`DELETE FROM web_job_projection_cursors WHERE cursor_digest IN (
+        SELECT cursor_digest FROM web_job_projection_cursors WHERE expires_at<=? ORDER BY expires_at,cursor_digest LIMIT ?
+      )`).run(at.toISOString(),limit).changes;
       return { events, cursors };
     })();
   }
@@ -1964,14 +1974,15 @@ export class DispatcherDatabase {
   private issueWebProjectionCursor(kind: "list"|"events", identity: WebJobReadIdentity, resourceId: string | null,
     snapshot: number, afterCreated: string | null, afterJob: string | null, at: Date, ttlMs: number): string {
     const token = randomBytes(32).toString("base64url"), digest = createHash("sha256").update(token).digest("hex");
+    const grant = kind === "events" && resourceId ? this.webJobGrantEvidence(resourceId, identity, at.toISOString()) : null;
     this.db.prepare(`DELETE FROM web_job_projection_cursors WHERE cursor_digest IN (
       SELECT cursor_digest FROM web_job_projection_cursors WHERE expires_at<=?
       ORDER BY expires_at,cursor_digest LIMIT 128
     )`).run(at.toISOString());
     this.db.prepare(`INSERT INTO web_job_projection_cursors
-      (cursor_digest,cursor_kind,instance_id,tenant_id,principal_id,authorization_kind,resource_id,snapshot_sequence,after_created_at,after_job_id,expires_at,created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(digest, kind, identity.instance_id, identity.tenant_id, identity.principal_id, identity.authorization_kind,
-        resourceId, snapshot, afterCreated, afterJob, new Date(at.getTime() + ttlMs).toISOString(), at.toISOString());
+      (cursor_digest,cursor_kind,instance_id,tenant_id,principal_id,authorization_kind,grant_id,grant_revision,resource_id,snapshot_sequence,after_created_at,after_job_id,expires_at,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(digest, kind, identity.instance_id, identity.tenant_id, identity.principal_id, identity.authorization_kind,
+        grant?.grant_id??null,grant?.grant_revision??null,resourceId, snapshot, afterCreated, afterJob, new Date(at.getTime() + ttlMs).toISOString(), at.toISOString());
     return token;
   }
 
@@ -1986,7 +1997,24 @@ export class DispatcherDatabase {
       || row.principal_id !== identity.principal_id || row.authorization_kind !== identity.authorization_kind
       || row.resource_id !== resourceId || row.expires_at <= now)
       throw new Error("web_job_cursor_invalid");
+    const grant=kind==="events"&&resourceId?this.webJobGrantEvidence(resourceId,identity,now):null;
+    if(row.grant_id!==(grant?.grant_id??null)||row.grant_revision!==(grant?.grant_revision??null))throw new Error("web_job_cursor_invalid");
     return row;
+  }
+
+  private webJobGrantEvidence(jobId:string,identity:WebJobReadIdentity,now:string):{grant_id:string;grant_revision:number}|null {
+    if(identity.authorization_kind!=="granted"){
+      const owned=this.db.prepare(`SELECT 1 FROM jobs JOIN events source_event ON source_event.event_id=jobs.source_event_id
+        WHERE jobs.job_id=? AND jobs.source='web' AND source_event.source='web' AND jobs.workspace_id=? AND jobs.actor_id=?
+          AND json_valid(source_event.subject_json) AND json_extract(source_event.subject_json,'$.instance_id')=?
+          AND json_extract(source_event.subject_json,'$.tenant_id')=? AND json_extract(source_event.subject_json,'$.principal_id')=?`)
+        .get(jobId,identity.tenant_id,identity.principal_id,identity.instance_id,identity.tenant_id,identity.principal_id);
+      if(owned)return null;
+    }
+    const grant=this.db.prepare(`SELECT grant_id,grant_revision FROM web_job_read_grants
+      WHERE job_id=? AND instance_id=? AND tenant_id=? AND principal_id=? AND state='active' AND expires_at>?`)
+      .get(jobId,identity.instance_id,identity.tenant_id,identity.principal_id,now) as {grant_id:string;grant_revision:number}|undefined;
+    if(!grant)throw new Error("web_job_cursor_invalid");return grant;
   }
 
   private getJobRequired(jobId: string): JobRow {

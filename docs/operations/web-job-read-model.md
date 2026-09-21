@@ -8,7 +8,7 @@ Web job read modelは、認証済みBFFがDispatcherのprincipal-scoped UDSを�
 
 ## 公開projection
 
-- 一覧は最大50件、`created_at DESC, job_id DESC`のstable orderingと15分のopaque cursorを使う。cursorはprincipal、owner/grantedのauthorization kind、snapshot high-water、次page境界へ永続bindし、別principal・別authorization kindへの持ち替え、改変、期限切れを拒否する。
+- 一覧は最大50件、`created_at DESC, job_id DESC`のstable orderingと15分のopaque cursorを使う。cursorはprincipal、owner/grantedのauthorization kind、snapshot high-water、次page境界へ永続bindし、別principal・別authorization kindへの持ち替え、改変、期限切れを拒否する。granted jobのevent cursorは発行時の`grant_id`・`grant_revision`にもbindし、revoke後に新revisionで再付与されても旧cursorを復活させない。
 - 詳細はstatus、時刻、標準化済みprogress、terminal Resultの固定summary、安全なartifact metadata、cancel eligibilityだけを返す。
 - `objective`、raw Result summary/output/actions、DB row、workspace/result path、runtime identity、private URLは返さない。terminal summaryはResult statusから`完了`または`失敗`だけを生成する。artifact名は入力値を公開せずordinalな`artifact-N`へ置換し、固定`kind`、妥当なmedia type、sizeだけをallowlistする。
 - 別owner jobと未知jobは同じ`not_found`として扱い、不可視件数をpage size、cursor、error差へ反映しない。
@@ -23,7 +23,7 @@ one-shotかつbody上限付きなので、slow consumerはTLS listenerの既存�
 
 ## retention・障害時の扱い
 
-- event ledgerの削除は`pruneWebJobProjection`で時刻境界を明示して行う。存在するWeb jobはlist cursor用の最初のanchorだけを保持し、削除済みjobのanchor/tombstoneはwatermark更新後に削除する。cursor期限切れはmaintenanceに加え、新しいcursorを発行する通常runtime経路でもexpiry indexから固定上限ずつ回収する。
+- event ledgerはDispatcher runtimeが起動時と1時間ごとにmaintenanceし、24時間を超えた対象を1回1000件まで削除する。存在するWeb jobはlist cursor用の最初のanchorだけを保持し、削除済みjobのanchor/tombstoneはwatermark更新後に削除する。cursor期限切れはmaintenanceに加え、新しいcursorを発行する通常runtime経路でもexpiry indexから固定上限ずつ回収する。
 - cursorが保持するsequenceより古いeventがretentionで失われた場合は、欠落を成功扱いせず`reset_required`を返す。clientは完全snapshotを再取得し、新しいdetail cursorから再開する。
 - Dispatcher UDS、署名response、current access確認、DB query、最終auditのいずれかが失敗した場合、BFFはstale cacheや旧APIへfallbackせず`identity_unavailable`にする。list/detail/SSEはsession auditに加えて専用operationでsuccess・resource不可視・cursor拒否・内部失敗の最終outcomeを記録し、応答直前にもcurrent session revisionを再照合する。
 - grant・cursorの期限判定とprogressの受信時刻にはsession ingressが確定したrollback-protectedな`effective_utc`を使い、OS wall clock巻戻りで失効済みauthorityを復活させない。未知のprojection schema versionはtriggerや`jobs` tableへDDLを行う前に拒否する。

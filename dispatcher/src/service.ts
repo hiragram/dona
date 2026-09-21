@@ -13,6 +13,7 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
+import { startWebJobProjectionMaintenance } from "./web/job-read-maintenance.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -75,6 +76,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     updateNotificationWorker,
     jobProgress,
   );
+  let stopWebJobProjectionMaintenance:(()=>void)|undefined;
 
   try {
     await api.start();
@@ -102,7 +104,11 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     worker.start();
     jobSupervisor.start();
     updateNotificationWorker.start();
+    stopWebJobProjectionMaintenance=startWebJobProjectionMaintenance(database,error=>apiLogger.warn("Web job projection maintenance failed",{
+      error_code:"web_job_projection_maintenance_failed",error_message:error instanceof Error?error.message:String(error),
+    }));
   } catch (error) {
+    stopWebJobProjectionMaintenance?.();
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
     if (worker.isRunning()) await worker.stop();
@@ -119,6 +125,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       stopping = true;
       apiLogger.info("Graceful shutdown started", { signal });
       try {
+        stopWebJobProjectionMaintenance?.();
         api.beginShutdown();
         await api.stop();
         await updateNotificationWorker.stop();

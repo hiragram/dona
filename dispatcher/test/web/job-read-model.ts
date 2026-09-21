@@ -6,6 +6,7 @@ import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 import { DispatcherDatabase, type WebJobReadIdentity } from "../../src/database.js";
 import { WebJobReadBroker } from "../../src/web/job-read-broker.js";
+import { maintainWebJobProjection, startWebJobProjectionMaintenance } from "../../src/web/job-read-maintenance.js";
 import type { JobProgressPhase } from "../../src/types.js";
 
 const owner:WebJobReadIdentity={instance_id:"instance",tenant_id:"tenant",principal_id:"principal",authorization_kind:"own"};
@@ -107,15 +108,34 @@ test("旧cursor schemaと旧update triggerをtransactionalにupgradeする",t=>{
   const columns=f.raw.pragma("table_info(web_job_projection_cursors)") as Array<{name:string}>;
   assert.equal(columns.some(column=>column.name==="authorization_kind"),true);
   assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors WHERE cursor_digest=?").get("a".repeat(64)) as {count:number}).count,0);
-  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1").get() as {version:number}).version,2);
+  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1").get() as {version:number}).version,3);
   const trigger=(f.raw.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get() as {sql:string}).sql;
   assert.equal(trigger.includes("old.status IS NOT new.status"),true);
   assert.equal(trigger.includes("old.result_json"),false);
 });
 
+test("version 2 cursor schemaはgrant evidence追加時に旧cursorをinvalid化する",t=>{const f=fixture(t),job=f.seed();
+  f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:01:00.000Z"));
+  f.raw.exec(`DROP TABLE web_job_projection_cursors;
+    CREATE TABLE web_job_projection_cursors (
+      cursor_digest TEXT PRIMARY KEY,cursor_kind TEXT NOT NULL,instance_id TEXT NOT NULL,tenant_id TEXT NOT NULL,
+      principal_id TEXT NOT NULL,authorization_kind TEXT NOT NULL,resource_id TEXT,snapshot_sequence INTEGER NOT NULL,
+      after_created_at TEXT,after_job_id TEXT,expires_at TEXT NOT NULL,created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX web_job_projection_cursors_expiry_idx ON web_job_projection_cursors(expires_at);
+    INSERT INTO web_job_projection_cursors VALUES('${"b".repeat(64)}','events','instance','tenant','principal','own','${job}',0,NULL,NULL,'2026-09-22T00:00:00.000Z','2026-09-21T00:00:00.000Z');
+    UPDATE web_job_projection_schema SET version=2;`);
+  (f.jobs as unknown as {webJobProjectionReady:boolean}).webJobProjectionReady=false;
+  f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:02:00.000Z"));
+  const columns=f.raw.pragma("table_info(web_job_projection_cursors)") as Array<{name:string}>;
+  assert.equal(columns.some(column=>column.name==="grant_revision"),true);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_cursors WHERE cursor_digest=?").get("b".repeat(64)) as {count:number}).count,0);
+  assert.equal((f.raw.prepare("SELECT version FROM web_job_projection_schema").get() as {version:number}).version,3);
+});
+
 test("未知のprojection schema versionはDDL前にfail closedする",t=>{const f=fixture(t),job=f.seed();
   f.jobs.webJobEventCursor(owner,job,new Date("2026-09-21T00:01:00.000Z"));
-  f.raw.exec(`UPDATE web_job_projection_schema SET version=3;
+  f.raw.exec(`UPDATE web_job_projection_schema SET version=4;
     DROP TRIGGER web_job_projection_update;
     CREATE TRIGGER web_job_projection_update AFTER UPDATE ON jobs BEGIN SELECT 1; END;`);
   const before=(f.raw.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get() as {sql:string}).sql;
@@ -158,6 +178,16 @@ test("retentionは削除済みweb jobのanchorとtombstoneをwatermarkへ畳み�
   const before=f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number};assert.equal(before.count,2);
   const pruned=f.jobs.pruneWebJobProjection(new Date("2026-09-22T00:00:00.000Z"),new Date("2026-09-22T00:00:01.000Z"));assert.equal(pruned.events,2);
   const after=f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number};assert.equal(after.count,0);
+});
+
+test("runtime maintenanceは24時間超のeventを1回1000件まで回収する",t=>{const f=fixture(t),job=f.seed();
+  f.jobs.listWebJobs(owner,20);const insert=f.raw.prepare("INSERT INTO web_job_projection_events(job_id,event_kind,created_at) VALUES(?,'progress',?)");
+  f.raw.transaction(()=>{for(let index=0;index<1200;index++)insert.run(job,"2026-09-21T00:00:01.000Z");})();
+  const errors:unknown[]=[];const stop=startWebJobProjectionMaintenance(f.jobs,error=>errors.push(error),()=>new Date("2026-09-23T00:00:02.000Z"));stop();
+  assert.deepEqual(errors,[]);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count,201);
+  const second=maintainWebJobProjection(f.jobs,new Date("2026-09-23T00:00:02.000Z"));assert.equal(second.events,200);
+  assert.equal((f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number}).count,1);
 });
 
 test("brokerはResultとartifactをallowlist projectionしprogress更新をdurable eventへ収束させる",t=>{const f=fixture(t),job=f.seed();
@@ -220,8 +250,13 @@ test("observerはcurrent明示grantのjobだけを読めて失効後はnot_found
       "2026-09-22T00:00:00.000Z","2026-09-21T00:00:00.000Z","2026-09-21T00:00:00.000Z");
   const broker=new WebJobReadBroker(readAuth(observer,["job:read:granted"]) as never,f.jobs);
   const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});assert.equal(detail.status,"succeeded");
+  if(detail.status!=="succeeded"||detail.kind!=="detail")return;
+  const bound=f.raw.prepare("SELECT grant_id,grant_revision FROM web_job_projection_cursors WHERE resource_id=?").get(job);
+  assert.deepEqual(bound,{grant_id:"grant-1",grant_revision:1});
   f.raw.prepare("UPDATE web_job_read_grants SET state='revoked',grant_revision=2,updated_at=? WHERE grant_id='grant-1'").run("2026-09-21T00:02:00.000Z");
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),{status:"denied",reason:"not_found"});
+  f.raw.prepare("UPDATE web_job_read_grants SET state='active',grant_revision=3,updated_at=? WHERE grant_id='grant-1'").run("2026-09-21T00:03:00.000Z");
+  assert.throws(()=>f.jobs.listWebJobChanges(observer,job,detail.event_cursor,50,new Date("2026-09-21T00:03:01.000Z")),/cursor/);
 });
 
 test("grantとcursor期限は認証transactionの保護時刻で評価する",t=>{const f=fixture(t),job=f.seed();
