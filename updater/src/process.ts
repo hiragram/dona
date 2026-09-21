@@ -61,6 +61,7 @@ export class ProcessRunner {
       child.stdout.on("data", (chunk: Buffer) => void (stdout = append(stdout, chunk)));
       child.stderr.on("data", (chunk: Buffer) => void (stderr = append(stderr, chunk)));
       let hardKillTimer: NodeJS.Timeout | undefined;
+      let cleanupPollTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       const finish = (): void => {
         if (closedCode === undefined) return;
@@ -84,25 +85,48 @@ export class ProcessRunner {
         }
         child.kill(signal);
       };
+      const finishAfterGroupCleanup = (): void => {
+        if (!child.pid) { finish(); return; }
+        const deadline = Date.now() + 1_000;
+        const poll = (): void => {
+          try {
+            process.kill(-child.pid!, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+              cleanupPollTimer = undefined;
+              finish();
+              return;
+            }
+          }
+          if (Date.now() >= deadline) {
+            cleanupPollTimer = undefined;
+            finish();
+            return;
+          }
+          cleanupPollTimer = setTimeout(poll, 20);
+        };
+        poll();
+      };
       const timer = setTimeout(() => {
         timedOut = true;
         signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
           signalGroup("SIGKILL");
           hardKillTimer = undefined;
-          finish();
+          finishAfterGroupCleanup();
         }, 1_000);
       }, options.timeoutMs);
       timer.unref();
       child.once("error", (error) => {
         clearTimeout(timer);
         if (hardKillTimer) clearTimeout(hardKillTimer);
+        if (cleanupPollTimer) clearTimeout(cleanupPollTimer);
         reject(error);
       });
       child.once("close", (code) => {
         clearTimeout(timer);
         closedCode = code;
-        if (!hardKillTimer) finish();
+        if (!hardKillTimer && !cleanupPollTimer) finish();
       });
     });
   }
