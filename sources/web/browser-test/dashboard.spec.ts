@@ -13,11 +13,12 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, headers, body: JSON.stringify(body) });
 }
 
-async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean; scopes?: string[] } = {}) {
+async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
+  scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch" } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
-  let current = options.unsafeResult ? job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
-    result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } }) : job();
-  let listReads = 0, submitWrites = 0, cancelWrites = 0, eventReads = 0;
+  const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
+    result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
+  let current = job(), listReads = 0, detailReads = 0, submitWrites = 0, cancelWrites = 0, eventReads = 0;
   page.on("pageerror", error => errors.push(error.message));
   await page.context().route("**/*", async route => {
     const request = route.request(), url = new URL(request.url()), requestHeaders = await request.allHeaders();
@@ -36,19 +37,22 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
     }
-    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { await fulfill(route, { job: current, event_cursor: cursor }); return; }
+    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++; await fulfill(route, { job: current, event_cursor: cursor }); return; }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/events$/.test(url.pathname)) {
-      eventReads++; expect(requestHeaders["last-event-id"]).toBe(cursor); await route.fulfill({ status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" },
-        body: `id: ${cursor}\nevent: heartbeat\ndata: ${JSON.stringify({ job: current })}\n\n` }); return;
+      eventReads++; expect(requestHeaders["last-event-id"]).toBe(cursor); if (options.firstEventAbort && eventReads === 1) { await route.abort("failed"); return; }
+      const event = options.unsafeResult && eventReads === 1 ? "job" : "heartbeat"; if (event === "job") current = unsafeTerminal;
+      await route.fulfill({ status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" },
+        body: `id: ${cursor}\nevent: ${event}\ndata: ${JSON.stringify({ job: current })}\n\n` }); return;
     }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/cancel$/.test(url.pathname)) {
       cancelWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/);
       if (options.cancelUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
+      if (options.cancelReason) { await fulfill(route, { error: options.cancelReason }, options.cancelReason === "owner_mismatch" ? 403 : 409); return; }
       current = job({ status: "cancelling", control: { can_cancel: false } }); await fulfill(route, { status: "succeeded", outcome: "cancelled", receipt_id: "cancel", job: { job_id: "job_alpha", status: "cancelling" } }); return;
     }
     errors.push("unexpected route: " + url.pathname); await route.abort();
   });
-  return { calls, errors, get listReads() { return listReads; }, get submitWrites() { return submitWrites; }, get cancelWrites() { return cancelWrites; }, get eventReads() { return eventReads; } };
+  return { calls, errors, get listReads() { return listReads; }, get detailReads() { return detailReads; }, get submitWrites() { return submitWrites; }, get cancelWrites() { return cancelWrites; }, get eventReads() { return eventReads; } };
 }
 
 test("login後にdurable一覧・詳細・SSEを表示しuntrusted Resultをliteral表示する", async ({ page }) => {
@@ -57,9 +61,10 @@ test("login後にdurable一覧・詳細・SSEを表示しuntrusted Resultをlite
   await expect(page.getByRole("button", { name: /job_alpha/ })).toBeVisible();
   await page.getByRole("button", { name: /job_alpha/ }).click();
   await expect(page.getByRole("heading", { name: "job_alpha" })).toBeVisible();
+  await expect.poll(() => f.eventReads).toBeGreaterThan(0);
+  await expect(page.getByText("完了", { exact: true })).toBeVisible();
   await expect(page.locator("pre.summary")).toContainText("<img src=x onerror=alert(1)>");
   await expect(page.locator("pre.summary")).toContainText("\\u202eend"); expect(await page.locator("img").count()).toBe(0);
-  await expect.poll(() => f.eventReads).toBeGreaterThan(0);
   expect(f.calls.find(call => call.path.endsWith("/events"))?.lastEventId).toBe(cursor);
   expect(await page.locator("script").count()).toBe(1); expect(f.errors).toEqual([]);
 });
@@ -92,12 +97,33 @@ test("current scopeがないrouteの操作を表示せずAPIも呼ばない", as
   expect(f.listReads).toBe(0); expect(f.submitWrites).toBe(0); expect(f.errors).toEqual([]);
 });
 
+test("reloadとback/forwardはbrowser cacheでなくsessionとdurable detailを再取得する", async ({ page }) => {
+  const f = await fixture(page); await page.goto(policy.origin + "/"); await expect(page.getByRole("button", { name: /job_alpha/ })).toBeVisible();
+  const beforeReload = f.listReads; await page.reload(); await expect(page.getByRole("button", { name: /job_alpha/ })).toBeVisible(); expect(f.listReads).toBe(beforeReload + 1);
+  await page.getByRole("button", { name: /job_alpha/ }).click(); await expect(page.getByRole("heading", { name: "job_alpha" })).toBeVisible();
+  await page.getByRole("button", { name: "一覧へ戻る" }).click(); await expect(page.getByRole("heading", { name: "ジョブ" })).toBeVisible();
+  const beforeBack = f.detailReads; await page.goBack(); await expect(page.getByRole("heading", { name: "job_alpha" })).toBeVisible(); expect(f.detailReads).toBeGreaterThan(beforeBack);
+  await page.goForward(); await expect(page.getByRole("heading", { name: "ジョブ" })).toBeVisible(); expect(f.errors).toEqual([]);
+});
+
+test("SSE切断はstaleを明示してdetailから再接続し、cancel競合も再writeしない", async ({ page }) => {
+  const f = await fixture(page, { firstEventAbort: true, cancelReason: "terminal" }); await page.goto(policy.origin + "/"); await page.getByRole("button", { name: /job_alpha/ }).click();
+  await expect(page.getByText(/接続が切れました|最新状態を確認できません/)).toBeVisible(); await expect.poll(() => f.detailReads, { timeout: 4000 }).toBeGreaterThan(1);
+  await page.getByRole("button", { name: "このジョブを取り消す" }).click(); await page.getByRole("button", { name: "取消を送信" }).click();
+  await expect(page.getByRole("status")).toContainText("取消を受け付けられませんでした"); expect(f.cancelWrites).toBe(1); expect(f.eventReads).toBeGreaterThan(1); expect(f.errors).toEqual([]);
+});
+
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
   test(`keyboard・200%文字・主要viewportで操作を維持する: ${viewport.width}`, async ({ page }) => {
     await page.setViewportSize(viewport); const f = await fixture(page); await page.goto(policy.origin + "/");
     await page.keyboard.press("Tab"); await expect(page.getByRole("link", { name: "本文へ移動" })).toBeFocused();
     await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    const audit = await page.evaluate(() => ({ unlabeled: [...document.querySelectorAll("button,input,textarea,select")].filter(element => {
+      const input = element as HTMLInputElement, label = input.id && document.querySelector(`label[for="${input.id}"]`);
+      return element.tagName === "BUTTON" ? !(element.textContent ?? "").trim() : !label && !element.getAttribute("aria-label"); }).length,
+      columns: getComputedStyle(document.getElementById("private-view")!).gridTemplateColumns.split(" ").length }));
+    expect(audit.unlabeled).toBe(0); expect(audit.columns).toBe(viewport.width <= 860 ? 1 : 2);
     const submit = page.getByRole("button", { name: "依頼を送信" }); await submit.scrollIntoViewIfNeeded(); expect((await submit.boundingBox())!.height).toBeGreaterThanOrEqual(44);
     expect(f.errors).toEqual([]);
   });
