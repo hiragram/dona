@@ -41,6 +41,8 @@ round recordには少なくとも次を保持する。
 
 reaction、review、commentのauthorはGitHub responseのlogin/type/app associationなどからCodex integrationと確認できるactorだけに限定する。trigger以前、別SHA、別actorのreaction・review・commentをcurrent roundの証拠にしない。Codex actorの`eyes`がある間や同じroundが未完了の間、duplicate `@codex review`を投稿しない。
 
+Codex security reviewと通常のcode reviewは別のsignalとして分類する。security reviewだけがusage limitにより未実行だったことを明示するartifactは通常reviewのfailure、finding、pending、clean signalのいずれにも数えず、通常のcode review roundを継続する。このartifactを無視できるのはsecurity review由来であることとusage limitによる未実行をactor、本文、関連workflowなどから一意に確認できる場合だけであり、通常reviewの`+1`またはno-major-issues/no-findingsを代替しない。通常reviewとの区別が曖昧なartifactや通常review自身のusage limitは無視せず、clean evidence不足として停止する。
+
 exact trigger集合、reaction、review/comment集合、head/base SHA、default branch、title/body hash、merge-target contract hash、closing relationship hash、closing issue scope hash、CI check runの`status`/`conclusion`、commit status contextの`state`のいずれかが変化した時点で`last_state_change_at`を更新する。`queued`から`in_progress`、`pending`から`success`などterminal前後の遷移もstate changeである。30分変化がなければstalledとして停止する。trigger ID/URL、target head/base SHA、最後に観測した全sourceと時刻を報告し、自動retriggerしない。
 
 ## round結果を判定する
@@ -49,6 +51,7 @@ exact trigger集合、reaction、review/comment集合、head/base SHA、default 
 - **findings:** target SHAに対する新しいCodex reviewまたはinline commentがfindingを含む場合も、Codex actorの`eyes`消失とterminal review/completionを確認するまでfeedback処理やhead変更を始めない。terminal後にreviewsとinline commentsをもう一度paginationし、全finding集合を固定してから処理する。
 - **superseded:** Pull Request head SHA、base ref、base SHA、repository default branch ref、title hash、body hash、merge-target contract hash、closing relationship hash、closing issue scope hashのいずれかがround recordから変わった。旧roundをclean扱いしない。base ref/SHAまたはdefault branch refが変わった場合は新しいexact base SHAから標準templateを再取得し、merge-target contractとautomatic closing reference条件を再評価してtitle／本文をreconcile・再取得・検証する。title/body hash、merge-target contract hash、closing relationship hash、closing issue scope hashのいずれかだけが変わった場合もcurrent template、task事実、current Issue内容の完了条件へreconcileする。current head/base/default-branch/title/body/merge-target contract/closing relationship/closing issue scope identityを固定し直した後にfresh roundを作る。
 - **stalled:** 30分state変化がない。duplicate triggerを書かず、人間によるretrigger判断を待つ。
+- **security review usage limit:** security reviewだけがusage limitで未実行と一意に確認できる場合は、そのartifactを通常roundの結果から除外する。通常reviewのclean signal、current identity、CI、未解決findingの完了条件は省略しない。
 
 clean signalだけでProjectを更新しない。`SKILL.md`の完了条件（current head/base CI等を含む）が揃った後に、[Issue lifecycle手順](../../../../docs/operations/github-project-issue-lifecycle.md)で担当Issueだけを`Merge Ready`へ更新・再読する。足場PRのcleanでEpicを進めない。
 

@@ -200,6 +200,24 @@ test("stalled roundはduplicate triggerなしで停止する", async () => {
   ]);
 });
 
+test("security reviewのusage limitは通常code reviewと分離する", async () => {
+  const reviewRound = await read(".agents/skills/code-submission-review-cycle/references/review-round.md");
+  const polling = section(reviewRound, "30〜60秒間隔で全sourceをpollする");
+  const decision = section(reviewRound, "round結果を判定する");
+
+  assertContract(polling, "security review usage limit boundary", [
+    /security review.*通常のcode review.*別のsignal/,
+    /security reviewだけ.*usage limit.*未実行.*通常reviewのfailure.*finding.*pending.*clean signal.*数えず/,
+    /security review由来.*usage limitによる未実行.*一意に確認/,
+    /通常reviewの`\+1`.*no-major-issues\/no-findings.*代替しない/,
+    /通常review自身のusage limit.*無視せず.*clean evidence不足.*停止/,
+  ]);
+  assertContract(decision, "security review does not weaken completion", [
+    /security reviewだけ.*usage limit.*未実行.*通常roundの結果から除外/,
+    /通常reviewのclean signal.*current identity.*CI.*未解決finding.*省略しない/,
+  ]);
+});
+
 test("feedback後は各inline threadへdirect replyしてからfresh roundへ進む", async () => {
   const reviewRound = await read(".agents/skills/code-submission-review-cycle/references/review-round.md");
   const feedback = section(reviewRound, "feedbackを処理する");
