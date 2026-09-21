@@ -14,10 +14,11 @@ import { subjectLookupIndexes } from "../sources/web/src/identity-index.js";
 import { WebAuthController } from "../sources/web/src/auth-controller.js";
 import { controllerFixture } from "../sources/web/test/auth-controller-fixture.js";
 import { fixturePolicy, fixtureSecret } from "../sources/web/test/fixtures.js";
+import type { WebCommandBroker } from "../dispatcher/src/web/command-broker.js";
 
 // Real SQLite, audited repository, private UDS and BFF clients. IdP, protected
 // clock/anchor/key material and TLS-listener classification are fixtures only.
-export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePolicy()) {
+export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePolicy(), commands?: (repository: WebAuthRepository) => WebCommandBroker) {
   const db = setup(t), local = controllerFixture({ ...policy, ...scope });
   db.store.initialize("initialize"); db.seedRegistry();
   const indexes = subjectLookupIndexes({ ...scope, issuer: local.policy.oidc.issuer, subject: "subject-A" }, local.keys.identities())
@@ -42,7 +43,7 @@ export async function fixture(t: Parameters<typeof setup>[0], policy = fixturePo
     activated_at: "2026-09-01T00:00:00.000Z", signing_expires_at: "2026-11-01T00:00:00.000Z", secret: Buffer.alloc(32, 0x77) };
   const lookup = (version: number) => version === 1 ? credential : undefined;
   const repository = new WebAuthRepository(db.db, db.providers, scope, version => version === 1 ? local.keys.context() : undefined);
-  const gateway = new WebInternalGateway(socket, scope, repository, lookup, local.now); await gateway.start();
+  const gateway = new WebInternalGateway(socket, scope, repository, lookup, local.now, 5000, commands?.(repository)); await gateway.start();
   t.after(async () => { await gateway.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   let online: Record<string, unknown> = { active: true, sub: "subject-A", client_id: local.policy.oidc.client_id,
     aud: local.policy.oidc.access_token_audience, exp: Date.parse(local.initial) / 1000 + 300 }, idpCalls = 0;

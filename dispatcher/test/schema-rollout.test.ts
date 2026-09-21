@@ -7,6 +7,7 @@ import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
+import { migrateDispatcherDatabase } from "../src/database.js";
 import { markDatabasePayloadHistory, verifyDatabasePayloadHistory } from "../src/payload-backup-boundary.js";
 import { installWebAuthSchema, verifyWebAuthSchema } from "../src/web/schema.js";
 
@@ -132,6 +133,14 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   db.exec("ALTER TABLE jobs ADD COLUMN job_key TEXT NOT NULL DEFAULT 'legacy-default'");
   db.prepare("UPDATE jobs SET job_key = ? WHERE job_id = ?")
     .run("research.primary", "job_01m1es03xy5cf8d9pm5cwx4srv");
+  migrateDispatcherDatabase(db, () => {}, false, 2);
+  db.prepare(`INSERT INTO web_command_receipts (
+    receipt_id, instance_id, tenant_id, principal_id, operation, canonical_sha256,
+    job_id, source_event_id, created_at, updated_at
+  ) VALUES (?, 'instance', 'tenant', 'principal', 'submit', ?, ?, ?, ?, ?)`).run(
+    `web_submit_${"a".repeat(64)}`, "b".repeat(64), "job_01m1es03xy5cf8d9pm5cwx4srv",
+    "evt_01M1ES03XY5CF8D9PM5CWX4SRV", at, at,
+  );
   const wal = await fs.stat(`${databasePath}-wal`);
   assert.ok(wal.size > 0, "fixture must have committed pages in a live WAL");
 
@@ -148,6 +157,9 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   assert.equal(receipt.preservation.job_completions?.before, 1);
   assert.equal(receipt.preservation.job_completions?.after, 1);
   assert.equal(receipt.preservation.job_completions?.before_digest, receipt.preservation.job_completions?.after_digest);
+  assert.equal(receipt.preservation.web_command_receipts?.before, 1);
+  assert.equal(receipt.preservation.web_command_receipts?.after, 1);
+  assert.equal(receipt.preservation.web_command_receipts?.before_digest, receipt.preservation.web_command_receipts?.after_digest);
 
   const restored = new Database(backupPath, { readonly: true });
   assert.equal(restored.pragma("user_version", { simple: true }), 2);
@@ -157,6 +169,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   assert.equal(migrated.pragma("user_version", { simple: true }), 3);
   assert.equal(migrated.prepare("SELECT result_json FROM jobs").pluck().get(), '{"status":"completed"}');
   assert.equal(migrated.prepare("SELECT job_key FROM jobs").pluck().get(), "research.primary");
+  assert.equal(migrated.prepare("SELECT receipt_id FROM web_command_receipts").pluck().get(), `web_submit_${"a".repeat(64)}`);
   migrated.close();
 
   const legacyReceiptPath = path.join(root, "legacy-false-receipt.json");

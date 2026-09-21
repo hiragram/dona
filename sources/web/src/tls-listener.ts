@@ -124,27 +124,28 @@ export class WebLoopbackTlsListener {
     const named = (name: string) => headers.filter(([key]) => key.toLowerCase() === name).map(([, value]) => value);
     const lengths = named("content-length");
     if (request.httpVersion !== "1.1" || headers.length > 128 || named("transfer-encoding").length || named("expect").length
-      || named("upgrade").length || lengths.length > 1 || (lengths.length === 1 && !/^(?:0|[1-9][0-9]?)$/.test(lengths[0]!))) { fail(); return; }
+      || named("upgrade").length || lengths.length > 1 || (lengths.length === 1 && !/^(?:0|[1-9][0-9]{0,5})$/.test(lengths[0]!))) { fail(); return; }
     const size = lengths.length ? Number(lengths[0]) : 0;
-    if (size > 64 || (request.method === "POST" && lengths.length !== 1)) { fail(); return; }
-    let controller: "public" | "login" | "auth";
+    if (size > 65536 || (request.method === "POST" && lengths.length !== 1)) { fail(); return; }
+    let controller: "public" | "login" | "auth", routeId = "asset";
     const method = request.method ?? "", target = request.url ?? "";
     try {
       if (method === "GET" && target === "/assets/login.js") controller = "public";
       else {
-        const route = matchWebRoute(method, target);
+        const route = matchWebRoute(method, target); routeId = route.id;
         if (["login", "login_complete"].includes(route.id)) controller = "public";
         else if (["prelogin_csrf", "login_start", "login_callback"].includes(route.id)) controller = "login";
-        else if (["dashboard", "session", "local_csrf", "logout", "logout_status"].includes(route.id)) controller = "auth";
+        else if (["dashboard", "session", "local_csrf", "logout", "logout_status", "job_submit", "job_cancel"].includes(route.id)) controller = "auth";
         else throw Error();
       }
     } catch { request.resume(); this.respond(response, errorReply(404)); return; }
+    if (size > (["job_submit", "job_cancel"].includes(routeId) ? 65536 : 64)) { fail(); return; }
     let bytes = 0, invalid = false;
     const parts: Buffer[] = [];
     request.on("data", (part: Buffer) => {
       bytes += part.length;
       if (invalid) return;
-      if (bytes > size || bytes > 64) { invalid = true; parts.length = 0; socket.destroy(); return; }
+      if (bytes > size || bytes > 65536) { invalid = true; parts.length = 0; socket.destroy(); return; }
       parts.push(part);
     });
     request.once("end", () => {

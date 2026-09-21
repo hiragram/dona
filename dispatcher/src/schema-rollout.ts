@@ -44,14 +44,20 @@ const preservedCounts = {
 } as const;
 
 export function countSnapshot(db: Database.Database): Record<string, number> {
-  return Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
+  const snapshot = Object.fromEntries(Object.entries(preservedCounts).map(([name, sql]) => [
     name,
     (db.prepare(sql).get() as { count: number }).count,
   ]));
+  const hasWebReceipts = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='web_command_receipts'").get() !== undefined;
+  return { ...snapshot, web_command_receipts: hasWebReceipts
+    ? (db.prepare("SELECT COUNT(*) AS count FROM web_command_receipts").get() as { count: number }).count : 0 };
 }
 
 export function contentSnapshot(db: Database.Database): Record<string, string> {
-  const digestRows = (table: "events" | "jobs", orderBy: string): string => {
+  const digestRows = (table: "events" | "jobs" | "web_command_receipts", orderBy: string): string => {
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(table) === undefined) {
+      return crypto.createHash("sha256").update("[]").digest("hex");
+    }
     const columns = (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name);
     const canonicalColumns = [...columns];
     if (table === "jobs" && !columns.includes("job_key")) {
@@ -65,7 +71,13 @@ export function contentSnapshot(db: Database.Database): Record<string, string> {
     const rows = db.prepare(`SELECT ${projection} FROM ${table} ORDER BY ${orderBy}`).all();
     return crypto.createHash("sha256").update(JSON.stringify(rows)).digest("hex");
   };
-  return { events: digestRows("events", "sequence"), jobs: digestRows("jobs", "job_id") };
+  return { events: digestRows("events", "sequence"), jobs: digestRows("jobs", "job_id"),
+    web_command_receipts: digestRows("web_command_receipts", "receipt_id") };
+}
+
+function preservationDigestName(name: string): "events" | "jobs" | "web_command_receipts" {
+  if (name === "web_command_receipts") return name;
+  return name === "events" || name.startsWith("event_") ? "events" : "jobs";
 }
 
 export function verifyDatabase(db: Database.Database, expectedVersion: number): void {
@@ -104,7 +116,7 @@ export function assertReceiptMatchesDatabases(
     receipt.preservation[name]?.before !== receipt.preservation[name]?.after ||
     receipt.preservation[name]?.before_digest !== receipt.preservation[name]?.after_digest ||
     receipt.preservation[name]?.before !== backupCounts[name] ||
-    receipt.preservation[name]?.before_digest !== backupDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]
+    receipt.preservation[name]?.before_digest !== backupDigests[preservationDigestName(name)]
   )) throw new Error("schema_rollout_receipt_state_mismatch");
 }
 
@@ -187,8 +199,8 @@ export async function migrateV2ToV3WithBackup(input: {
       const afterDigests = contentSnapshot(source);
       preservation = Object.fromEntries(Object.keys(before).map((name) => [name, {
         before: before[name]!, after: after[name]!,
-        before_digest: beforeDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
-        after_digest: afterDigests[name === "events" || name.startsWith("event_") ? "events" : "jobs"]!,
+        before_digest: beforeDigests[preservationDigestName(name)]!,
+        after_digest: afterDigests[preservationDigestName(name)]!,
       }]));
       if (Object.values(preservation).some(({ before: left, after: right, before_digest: leftDigest, after_digest: rightDigest }) =>
         left !== right || leftDigest !== rightDigest)) {
