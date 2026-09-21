@@ -13,8 +13,16 @@ export const workerMessagePayloadUtf8ByteMax = 16_384;
 export const workerMessageRetentionDays = 30;
 export const workerMessageLeaseMaxMs = 300_000;
 
-const utcRfc3339 = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/)
-  .refine((value) => !Number.isNaN(Date.parse(value)), "must be UTC RFC 3339");
+const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
+  .refine((value) => {
+    const match=utcRfc3339Pattern.exec(value);
+    const parsed=new Date(value);
+    if(!match||Number.isNaN(parsed.getTime()))return false;
+    const [,year,month,day,hour,minute,second]=match.map(Number);
+    return parsed.getUTCFullYear()===year&&parsed.getUTCMonth()+1===month&&parsed.getUTCDate()===day
+      &&parsed.getUTCHours()===hour&&parsed.getUTCMinutes()===minute&&parsed.getUTCSeconds()===second;
+  }, "must be a real UTC RFC 3339 date-time");
 const identifier = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const safeText = z.string().trim().min(1).max(4_000);
 const reportPayload = z.discriminatedUnion("kind", [
@@ -362,7 +370,7 @@ export class WorkerMessageRepository {
         }
         return { delivery: row, outcome: "reused" as const };
       }
-      if (row.state !== "leased" || row.lease_owner !== leaseOwner || row.lease_token_sha256 !== tokenSha || row.fence !== fence || !row.lease_expires_at || row.lease_expires_at < now) {
+      if (row.state !== "leased" || row.lease_owner !== leaseOwner || row.lease_token_sha256 !== tokenSha || row.fence !== fence || !row.lease_expires_at || row.lease_expires_at <= now) {
         throw new WorkerMessageError("delivery_fence_mismatch", "delivery lease is not current");
       }
       this.db.prepare(`UPDATE worker_message_deliveries SET state='delivered',delivered_at=?,delivered_lease_owner=?,

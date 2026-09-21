@@ -15,7 +15,7 @@ Worker Messaging は、worker と dona-main の途中経過・質問・判断を
 - unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。
 - instructionはtyped operationであり、raw shell、path、URL、environment、credentialをcommand capabilityとして受け付けない。
 - `producer_sequence`はjob・producerごとに1から単調増加する。gapは`worker_message_sequence_gap`、未記録の巻き戻しは`worker_message_sequence_rollback`。
-- `idempotency_key`はjob・producerごとに一意。同一sequence・key・payload・occurred_atは`reused`、異なるcanonical messageは`worker_message_idempotency_conflict`。
+- `idempotency_key`はjob・producerごとに一意。`source_event_id`、`producer_sequence`、key、payload、`correlation_message_id`、`conversation_revision`、`occurred_at`がすべて同一なら`reused`、いずれかが異なるcanonical messageは`worker_message_idempotency_conflict`。
 - jobが`completed`、`failed`、`cancelled`になった後の新規messageは`worker_message_terminal_fence`で拒否する。既にcommit済みのmessageとreceiptはread-only reconcileできる。
 - retentionは30日。terminal jobに属し、pending／leased deliveryを持たないmessageだけを削除できる。
 

@@ -38,6 +38,8 @@ describe("worker messaging ledger",()=>{
     try {
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),unknown:true}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),occurred_at:"2026-02-31T00:00:00Z"}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),payload:{kind:"decision_request",question:"界".repeat(4_000),options:Array.from({length:8},()=>"界".repeat(1_000))}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_too_large");
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,report(source.event_id,2)),
@@ -77,6 +79,11 @@ describe("worker messaging ledger",()=>{
     const replay=database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-1",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:14Z"));
     assert.equal(replay.outcome,"reused");
     assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-2",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:14Z")),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
+    database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+      idempotency_key:"instruction-expiry",occurred_at:"2026-09-21T00:00:15Z",payload:{operation:"answer",text:"境界"}},new Date("2026-09-21T00:00:15Z"));
+    const expiryClaim=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-1",1,1_000,new Date("2026-09-21T00:00:15Z"));
+    assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,expiryClaim[0]!.delivery.delivery_id,"runtime-1",expiryClaim[0]!.lease_token,expiryClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:16Z")),
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
     database.close();
 
