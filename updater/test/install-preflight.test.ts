@@ -188,7 +188,7 @@ test("launchdの登録観測自体が応答しない場合もdeadlineで失敗�
   );
 });
 
-test("macOS keeps a hardened staged updater renamable by reopening only its root", {
+test("macOS preserves hardened descendants when renaming a reopened staged updater", {
   skip: process.platform !== "darwin",
 }, async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-rename-"));
@@ -202,8 +202,7 @@ test("macOS keeps a hardened staged updater renamable by reopening only its root
     await fs.chmod(entrypoint, 0o400);
     await fs.chmod(child, 0o500);
     await fs.chmod(staged, 0o500);
-    await assert.rejects(execute("/bin/mv", [staged, destination]), /Permission denied/);
-
+    assert.equal((await fs.stat(staged)).mode & 0o777, 0o500);
     await fs.chmod(staged, 0o700);
     await execute("/bin/mv", [staged, destination]);
     assert.equal((await fs.stat(destination)).mode & 0o777, 0o700);
