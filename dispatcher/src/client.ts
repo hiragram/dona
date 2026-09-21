@@ -23,9 +23,13 @@ export class DispatcherApiClient {
     return this.request("POST", `/v1/scheduled-jobs/${encodeURIComponent(eventId)}/delegate`, {}, eventId);
   }
 
-  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>> {
-    const query = sourceEventId === undefined ? "" : `?${new URLSearchParams({ source_event_id: sourceEventId })}`;
-    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}${query}`, undefined, sourceEventId);
+  getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>> {
+    const params=new URLSearchParams();
+    if(sourceEventId!==undefined)params.set("source_event_id",sourceEventId);
+    if(options?.includeLiveSession)params.set("include_live_session","true");
+    const query=params.size===0?"":`?${params}`;
+    if(options?.liveSessionReceiptId)return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/live-session-receipts/${encodeURIComponent(options.liveSessionReceiptId)}${query}`,undefined,sourceEventId);
+    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}${query}`,undefined,sourceEventId);
   }
 
   listEventJobs(

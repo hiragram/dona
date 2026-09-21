@@ -14,7 +14,7 @@ import {
 export interface DispatcherJobClient {
   createJob(input: unknown): Promise<Record<string, unknown>>;
   delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
-  getJob(jobId: string, sourceEventId?: string): Promise<Record<string, unknown>>;
+  getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>>;
   listEventJobs(
     sourceEventId: string,
     jobKey?: string,
@@ -44,6 +44,7 @@ export interface DispatcherJobClient {
 
 const eventId = z.string().regex(/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i).describe("現在処理中のDona event_id");
 const jobId = z.string().regex(/^job_[0-9a-hjkmnp-tv-z]{26}$/).describe("delegate_jobが返したjob_id");
+const liveSessionReceiptId=z.string().regex(/^lsr_[0-9a-f]{32}$/);
 const slackId = z.string().min(1).max(64);
 const threadTs = z.string().regex(/^\d+\.\d+$/);
 const repository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/);
@@ -72,6 +73,24 @@ const jobObjective = z.string().refine(value => value.trim().length > 0, "must c
   (value) => Array.from(value.trim()).length <= jobObjectiveCharacterMax,
   `must be at most ${jobObjectiveCharacterMax} characters`,
 );
+const displayName = z.string().min(1).max(512).describe("objectiveやIssue titleから推測せず、利用者が明示した表示専用の短い作業名");
+const issueNumber = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+
+function displayInput(
+  shortName: string | undefined,
+  issueRepository: string | undefined,
+  number: number | undefined,
+): Record<string, unknown> | undefined {
+  if (shortName === undefined && issueRepository === undefined && number === undefined) return undefined;
+  if (shortName === undefined) throw new Error("display_name is required when an Issue display reference is specified");
+  if ((issueRepository === undefined) !== (number === undefined)) {
+    throw new Error("issue_repository and issue_number must be specified together");
+  }
+  return {
+    short_name: shortName,
+    ...(issueRepository === undefined ? {} : { issue: { repository: issueRepository, number } }),
+  };
+}
 
 function success(data: Record<string, unknown>) {
   return {
@@ -97,6 +116,9 @@ function projectJobResponse(response: Record<string, unknown>): Record<string, u
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
     ...(Array.isArray(response.jobs) ? { jobs: response.jobs.slice(0, 100).map(project), truncated: response.truncated === true || response.jobs.length > 100 } : {}),
+    ...(response.live_session&&typeof response.live_session==="object"&&!Array.isArray(response.live_session)?{live_session:response.live_session}:{}),
+    ...(response.reconciliation&&typeof response.reconciliation==="object"&&!Array.isArray(response.reconciliation)?{reconciliation:response.reconciliation}:{}),
+    ...(response.receipt&&typeof response.receipt==="object"&&!Array.isArray(response.receipt)?{receipt:response.receipt}:{}),
   };
 }
 
@@ -152,16 +174,20 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       workspace_kind: z.enum(["scratch", "github"]),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
+      display_name: displayName.optional(),
+      issue_repository: repository.optional().describe("表示prefixに使う構造化Issue参照。workspace repositoryと一致する場合だけ採用"),
+      issue_number: issueNumber.optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
       if (workspace_kind === "github" && !repo) throw new Error("repository is required for a GitHub job");
       if (workspace_kind === "scratch" && (repo || base_ref)) throw new Error("repository/base_ref are only valid for a GitHub job");
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
-      const response = await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace });
+      const display = displayInput(display_name, issue_repository, issue_number);
+      const response = await client.createJob({ source_event_id, ...(job_key ? { job_key } : {}), objective, workspace, ...(display ? { display } : {}) });
       const data = projectJobResponse(response);
       const job = data.job as Record<string, unknown> | undefined;
       if (job && typeof job.job_id === "string" && (response.outcome === "created" || response.outcome === "reused")) {
@@ -203,11 +229,14 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       workspace_kind: z.enum(["scratch", "github"]).optional(),
       repository: repository.optional().describe("workspace_kind=githubのとき必須のowner/repo"),
       base_ref: z.string().min(1).max(255).optional(),
+      display_name: displayName.optional(),
+      issue_repository: repository.optional(),
+      issue_number: issueNumber.optional(),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref }) => {
+  }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
-      const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined;
+      const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined || display_name !== undefined || issue_repository !== undefined || issue_number !== undefined;
       if (!reconciliationRequested) return success(projectJobResponse(await client.listEventJobs(source_event_id, job_key)));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
@@ -219,11 +248,13 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       const workspace = workspace_kind === "scratch"
         ? { kind: "scratch" as const }
         : { kind: "github" as const, repository: repo!, ...(base_ref ? { base_ref } : {}) };
+      const display = displayInput(display_name, issue_repository, issue_number);
       const canonicalRequest = parseCreateJobRequest({
         source_event_id,
         ...(job_key === legacyJobKey ? {} : { job_key }),
         objective,
         workspace,
+        ...(display ? { display } : {}),
       });
       return success(projectJobResponse(await client.listEventJobs(
         source_event_id,
@@ -290,12 +321,17 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで、許可済みの状態projectionと制御receiptだけを取得します。Result本文や自由文errorは返しません。group通知では認証済みpurpose専用projectionを使います。create/steer/cancel/promptの曖昧応答はread-only reconcileし、blind retryしません。",
-    inputSchema: { job_id: jobId, source_event_id: eventId },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ job_id, source_event_id }) => {
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで、認可済み状態と制御receiptの安全なprojectionだけを取得します。include_live_sessionは保存済みexact identityへのbounded queryと監査receipt追記を行います。Result本文、自由文error、runtime identityは返しません。曖昧応答は永続状態で照合し、blind retryしません。",
+    inputSchema: { job_id: jobId, source_event_id: eventId,
+      include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
+      live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, async ({ job_id, source_event_id, include_live_session, live_session_receipt_id }) => {
     try {
-      return success(projectJobResponse(await client.getJob(job_id, source_event_id)));
+      if(include_live_session===true&&live_session_receipt_id)throw new Error("include_live_session and live_session_receipt_id are mutually exclusive");
+      const options=include_live_session===true||live_session_receipt_id?{includeLiveSession:include_live_session===true,
+        ...(live_session_receipt_id?{liveSessionReceiptId:live_session_receipt_id}:{})}:undefined;
+      return success(projectJobResponse(await client.getJob(job_id, source_event_id,options)));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }

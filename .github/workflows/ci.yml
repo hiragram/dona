@@ -48,7 +48,7 @@ jobs:
           - component: sources/slack
             runner: macos-26
           - component: updater
-            runner: ubuntu-24.04
+            runner: macos-26
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -67,6 +67,11 @@ jobs:
       - name: Run tests
         run: npm test
         working-directory: ${{ matrix.component }}
+
+      - name: Repeat updater process race regression
+        if: matrix.component == 'updater'
+        run: for attempt in 1 2 3 4 5; do npm run test:process-race; done
+        working-directory: updater
 
       - name: Run typecheck
         run: npm run typecheck

@@ -1260,6 +1260,8 @@ test("scheduleのgeneric job_key誤付与は確定拒否として原因を残し
   dispatcher.recordScheduleJobAccess(run.event_id!,{workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",issued_at:new Date(due).toISOString(),nonce:"key_nonce"},new Date(due));
   assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,job_key:"wrong.key",objective,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)),
     error=>error instanceof ScheduledJobCreationError&&error.code==="scheduled_scope_mismatch");
+  assert.throws(()=>dispatcher.createJob({source_event_id:run.event_id!,objective,workspace:{kind:"scratch"},display:{short_name:"caller supplied"}},"/tmp/jobs","/tmp/results",new Date(due)),
+    error=>error instanceof ScheduledJobCreationError&&error.code==="scheduled_scope_mismatch");
   dispatcher.recordScheduledDelegationRejection(run.event_id!,"scheduled_scope_mismatch",new Date(due));
   dispatcher.saveFailedResult(run.event_id!,{schema_version:1,event_id:run.event_id!,status:"failed",summary:"委任は確定拒否されました",actions:[],completed_at:due},resultPath,new Date(due));
   assert.equal(raw.prepare("SELECT count(*) FROM jobs WHERE source_event_id=?").pluck().get(run.event_id),0);
