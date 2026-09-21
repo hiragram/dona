@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 
 import type { DiagnosticLogIdentity, CommandResult } from "./types.js";
 import type { DiagnosticCaptureSession, DiagnosticLogStore } from "./diagnostic-log.js";
+import { ProcessCheckpointTracker } from "./process-checkpoint.js";
 
 export interface RunOptions {
   cwd?: string;
@@ -9,6 +10,10 @@ export interface RunOptions {
   outputLimitBytes: number;
   env?: Readonly<Record<string, string>>;
   diagnostic?: { store: DiagnosticLogStore; identity: DiagnosticLogIdentity };
+  /** Test fixtures may shorten the timeout after the child reports ready. */
+  timeoutStartAfter?: Promise<void>;
+  /** The post-readiness timeout; timeoutMs remains the absolute upper bound. */
+  timeoutAfterReadyMs?: number;
 }
 
 export function minimalEnvironment(extra: Readonly<Record<string, string>> = {}): Record<string, string> {
@@ -26,6 +31,12 @@ export class ProcessRunner {
   run(executable: string, args: readonly string[], options: RunOptions): Promise<CommandResult> {
     if (!executable.startsWith("/") || args.some((arg) => arg.includes("\0"))) {
       throw new Error("Executable and argv must be validated before execution");
+    }
+    if (options.timeoutStartAfter && (!options.timeoutAfterReadyMs || options.timeoutAfterReadyMs <= 0)) {
+      throw new Error("timeoutAfterReadyMs is required with timeoutStartAfter");
+    }
+    if (!options.timeoutStartAfter && options.timeoutAfterReadyMs !== undefined) {
+      throw new Error("timeoutStartAfter is required with timeoutAfterReadyMs");
     }
     return new Promise((resolve) => {
       let diagnostic: DiagnosticCaptureSession | undefined;
@@ -46,83 +57,18 @@ export class ProcessRunner {
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
-      let checkpointBuffer = "";
-      let outputCheckpoint: string | undefined;
-      let checkpointNonce: string | undefined;
-      let currentFile: string | undefined;
-      let fileState: string | undefined;
-      let lastFinished: string | undefined;
-      let metrics: string | undefined;
-      const unfinishedCases = new Set<string>();
+      const checkpoints = new ProcessCheckpointTracker();
       let timedOut = false;
+      let readinessFailed = false;
       let settled = false;
-      let timeoutCheckpoint: string | undefined;
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
-      const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)(?: elapsed_ms=(\d{1,9}))?(?: load=(\d+\.\d{3}))?$/;
-      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail|terminal)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)(?: elapsed_ms=(\d{1,9}))?$/;
-      const metricsMarker = /^\[dispatcher-test:([a-f0-9]{32})\] metrics scope=2;(node=\d+\/\d+,git=\d+\/\d+,shell=\d+\/\d+,other=\d+\/\d+;active=\d+;overhead_us=\d+)$/;
-      const refreshCheckpoint = (): void => {
-        if (timeoutCheckpoint) {
-          outputCheckpoint = timeoutCheckpoint;
-          return;
-        }
-        const pending = [...unfinishedCases].at(-1);
-        const unfinished = pending ?? currentFile ?? "none";
-        outputCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; unfinished=${unfinished}${metrics ? `; ${metrics}` : ""}`;
-      };
-      const inspectCheckpoints = (chunk: Buffer<ArrayBufferLike>): void => {
-        const lines = (checkpointBuffer + chunk.toString("utf8")).split(/\r?\n/);
-        checkpointBuffer = (lines.pop() ?? "").slice(-256);
-        for (const line of lines) {
-          const metricsMatch = metricsMarker.exec(line);
-          if (metricsMatch && metricsMatch[1] === checkpointNonce) {
-            metrics = `metrics=${metricsMatch[2]}`;
-            refreshCheckpoint();
-            continue;
-          }
-          const fileMatch = marker.exec(line);
-          if (fileMatch) {
-            const nonce = fileMatch[1];
-            const action = fileMatch[2];
-            const identity = fileMatch[3];
-            if (!nonce || !action || !identity) continue;
-            if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
-            if (nonce !== checkpointNonce) continue;
-            if (action === "file-start") {
-              metrics = undefined;
-              unfinishedCases.clear();
-            }
-            fileState = `${action} ${identity}${fileMatch[4] ? ` elapsed_ms=${fileMatch[4]}` : ""}${fileMatch[5] ? ` load=${fileMatch[5]}` : ""}`;
-            if (action === "file-start") currentFile = identity;
-            else {
-              if (!lastFinished) lastFinished = fileState;
-              currentFile = undefined;
-              if (action === "file-finish") unfinishedCases.clear();
-              checkpointNonce = undefined;
-            }
-            refreshCheckpoint();
-            continue;
-          }
-          const testMatch = caseMarker.exec(line);
-          const nonce = testMatch?.[1];
-          const action = testMatch?.[2];
-          const identity = testMatch?.[3];
-          if (!nonce || nonce !== checkpointNonce || !action || !identity) continue;
-          if (action === "case-start") unfinishedCases.add(identity);
-          else {
-            unfinishedCases.delete(identity);
-            lastFinished = `${action} ${identity}${testMatch[4] ? ` elapsed_ms=${testMatch[4]}` : ""}`;
-          }
-          refreshCheckpoint();
-        }
-      };
       const append = (
         current: Buffer<ArrayBufferLike>,
         chunk: Buffer<ArrayBufferLike>,
         inspect: boolean,
       ): Buffer<ArrayBufferLike> => {
-        if (inspect) inspectCheckpoints(chunk);
+        if (inspect) checkpoints.inspect(chunk);
         if (current.length >= options.outputLimitBytes) {
           truncated = true;
           return current;
@@ -154,10 +100,11 @@ export class ProcessRunner {
       const finish = (): void => {
         if (closedCode === undefined || settled) return;
         settled = true;
-        const cleanupStatus = timedOut
+        const outputCheckpoint = checkpoints.checkpoint();
+        const cleanupStatus = timedOut || readinessFailed
           ? `term=${termOutcome},kill=${killOutcome},closed=yes`
           : "term=not-sent,kill=not-sent,closed=yes";
-        const diagnosticLog = finishDiagnostic(timedOut || closedCode !== 0);
+        const diagnosticLog = finishDiagnostic(timedOut || readinessFailed || closedCode !== 0);
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -166,6 +113,7 @@ export class ProcessRunner {
           output_truncated: truncated,
           ...(outputCheckpoint ? { output_checkpoint: outputCheckpoint } : {}),
           ...(exitSignal ? { exit_signal: exitSignal } : {}),
+          ...(readinessFailed ? { spawn_error: "readiness_failed" } : {}),
           cleanup_status: cleanupStatus,
           ...(diagnosticLog ? { diagnostic_log: diagnosticLog } : {}),
         });
@@ -203,22 +151,39 @@ export class ProcessRunner {
         };
         poll();
       };
-      const timer = setTimeout(() => {
-        timedOut = true;
-        const pending = [...unfinishedCases].at(-1);
-        const unfinished = pending ?? currentFile ?? "none";
-        timeoutCheckpoint = `file=${fileState ?? "none"}; last_finish=${lastFinished ?? "none"}; timeout=${unfinished}${metrics ? `; ${metrics}` : ""}`;
-        outputCheckpoint = timeoutCheckpoint;
+      let timer: NodeJS.Timeout | undefined;
+      const terminate = (reason: "timeout" | "readiness_failed"): void => {
+        if (settled || timedOut || readinessFailed) return;
+        if (reason === "timeout") {
+          timedOut = true;
+          checkpoints.freezeTimeout();
+        } else {
+          readinessFailed = true;
+        }
         termOutcome = signalGroup("SIGTERM");
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
           finishAfterGroupCleanup();
         }, 1_000);
-      }, options.timeoutMs);
-      timer.unref();
+      };
+      const timeOut = (): void => terminate("timeout");
+      const armCommandTimeout = (timeoutMs: number): void => {
+        if (settled || timedOut || readinessFailed) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(timeOut, timeoutMs);
+        timer.unref();
+      };
+      const timeoutStartedAt = Date.now();
+      armCommandTimeout(options.timeoutMs);
+      if (options.timeoutStartAfter) {
+        void options.timeoutStartAfter.then(() => {
+          const remainingMs = Math.max(0, options.timeoutMs - (Date.now() - timeoutStartedAt));
+          armCommandTimeout(Math.min(options.timeoutAfterReadyMs!, remainingMs));
+        }, () => terminate("readiness_failed"));
+      }
       child.once("error", (error) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (hardKillTimer) clearTimeout(hardKillTimer);
         if (cleanupPollTimer) clearTimeout(cleanupPollTimer);
         if (settled) return;
@@ -236,7 +201,7 @@ export class ProcessRunner {
         });
       });
       child.once("close", (code, signal) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
         if (!hardKillTimer && !cleanupPollTimer) finish();
