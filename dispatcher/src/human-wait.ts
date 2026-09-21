@@ -367,7 +367,7 @@ export class HumanWaitRepository {
       const cause = job ? this.db.prepare(`SELECT * FROM human_wait_items WHERE state='open' AND
         dedupe_key IN (?,?,?,?) ORDER BY CASE resource_kind WHEN 'notification' THEN 0 WHEN 'schedule_run' THEN 1 WHEN 'job_group' THEN 2 ELSE 3 END LIMIT 1`)
         .get(`job:${completion.job_id}`,`group:${job.source_event_id}`,`notification:${completion.job_id}:${completion.job_status}`,runDedupe) as HumanWaitItemRow | undefined : undefined;
-      if (!job || !cause || (cause.resource_kind!=="job_group" && !["blocked","needs_review"].includes(job.status))) return false;
+      if (!job || !cause || (cause.resource_kind==="job" && !["blocked","needs_review"].includes(job.status))) return false;
       if(cause.session_settlement_verified===1)return true;
       const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
         WHERE item_id=? AND state='open'`).run(settledAt,settledAt,cause.item_id).changes;

@@ -397,17 +397,22 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-work-dedupe",harness.input("work.read_only",false,due),due);
     const run=harness.raw.prepare("SELECT event_id FROM schedule_runs WHERE run_id=?").get(runId) as {event_id:string};
     const result=new FakeJobRuntime().run(harness,run.event_id,"inspect");
+    const completion=harness.raw.prepare("SELECT notification_event_id,destination_json FROM job_completion_results WHERE job_id=?")
+      .get(result.job_id) as {notification_event_id:string;destination_json:string};
+    const destination=JSON.parse(completion.destination_json) as {target:{workspace_id:string;channel_id:string;thread_ts:string}};
+    const settlement={provider_verified:true as const,event_id:completion.notification_event_id,
+      workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,
+      desired_session_status:"suspended" as const,session_status:"suspended" as const};
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(result.job_id);
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:01:01.000Z"),true);
+    assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)?.session_settlement_verified,1);
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE job_id=?").run(result.job_id);
     harness.raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='steer_acceptance_unknown',updated_at='2026-09-05T00:02:00Z' WHERE job_id=?").run(result.job_id);
     harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',terminal_at='2026-09-05T00:02:00Z' WHERE run_id=?").run(runId);
     const open=harness.database.humanWaits.listInternal();
     assert.equal(open.some(item=>item.dedupe_key===`job:${result.job_id}`),false);
     assert.equal(open.filter(item=>item.dedupe_key===`run:${runId}`).length,1);
-    const completion=harness.raw.prepare("SELECT notification_event_id,destination_json FROM job_completion_results WHERE job_id=?")
-      .get(result.job_id) as {notification_event_id:string;destination_json:string};
-    const destination=JSON.parse(completion.destination_json) as {target:{workspace_id:string;channel_id:string;thread_ts:string}};
-    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:completion.notification_event_id,
-      workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,
-      desired_session_status:"suspended",session_status:"suspended"},"2026-09-05T00:02:01.000Z"),true);
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:02:01.000Z"),true);
     assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${runId}`)?.session_settlement_verified,1);
   } finally { harness.close(); }
 });
