@@ -9,6 +9,7 @@ import type { DispatcherConfig } from "../src/config.js";
 import type { HerdrCommandResult } from "../src/herdr.js";
 import type { JobAgentRuntime } from "../src/job-runtime.js";
 import { JobSupervisor } from "../src/job-supervisor.js";
+import { JobResultNotFoundError } from "../src/job-result.js";
 import { jobProgressPath } from "../src/job-prompt.js";
 import type { Logger } from "../src/logger.js";
 import type { JobRow } from "../src/types.js";
@@ -173,6 +174,47 @@ test("ownerはworker消失を確認できるneeds_reviewをcancelしてquotaを�
   const cancelled = await supervisor.cancelWeb(job.job_id, owner);
   assert.equal(cancelled.row.status, "cancelled"); assert.equal(cancelled.row.last_error_code, "cancelled");
   database.close();
+});
+
+test("terminal Result回収中のweb cancelは同じjob lockで直列化する", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "e".repeat(64), objective: "result cancel race", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  let releaseWait!: () => void, releaseRead!: () => void, readStarted!: () => void, cancelCalls = 0, reads = 0;
+  const waiting = new Promise<void>(resolve => { releaseWait = resolve; });
+  const reading = new Promise<void>(resolve => { releaseRead = resolve; });
+  const started = new Promise<void>(resolve => { readStarted = resolve; });
+  const runtime = fakeRuntime({
+    async prepare() { await fs.mkdir(config.jobResultsDir, { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
+    async prompt() { return ok("working"); }, async wait() { await waiting; return ok("done"); },
+    async cancel() { cancelCalls++; return ok("done"); },
+  });
+  const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined, undefined, undefined, async resultPath => {
+    reads++; if (reads === 1) throw new JobResultNotFoundError(resultPath); readStarted(); await reading;
+    return { schema_version: 1, job_id: job.job_id, status: "completed", summary: "done", completed_at: new Date().toISOString() };
+  }); supervisor.start();
+  await waitFor(() => database.getJob(job.job_id)?.status === "running");
+  releaseWait(); await started;
+  const cancelling = supervisor.cancelWeb(job.job_id, owner); await new Promise(resolve => setTimeout(resolve, 10)); assert.equal(cancelCalls, 0);
+  releaseRead();
+  await assert.rejects(cancelling, /web_job_terminal:completed/);
+  assert.equal(database.getJob(job.job_id)?.status, "completed"); assert.equal(cancelCalls, 0);
+  await supervisor.stop(); database.close();
+});
+
+test("acceptance不明のweb cancel再送はruntimeへ再writeしない", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "f".repeat(64), objective: "unknown cancel", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  markRunning(database, job.job_id); let cancelCalls = 0;
+  const supervisor = new JobSupervisor(database, fakeRuntime({ async cancel() { cancelCalls++; return failed("timeout", true); } }), config, logger, () => undefined);
+  await assert.rejects(supervisor.cancelWeb(job.job_id, owner), /web_cancel_acceptance_unknown/);
+  assert.equal(database.getJob(job.job_id)?.last_error_code, "web_cancel_acceptance_unknown");
+  await assert.rejects(supervisor.cancelWeb(job.job_id, owner), /web_cancel_acceptance_unknown/);
+  assert.equal(cancelCalls, 1); database.close();
 });
 
 afterEach(async () => {

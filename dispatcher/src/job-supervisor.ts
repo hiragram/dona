@@ -121,6 +121,7 @@ export class JobSupervisor {
     private readonly wakeEventWorker: () => void,
     private progress?: JobProgressCoordinator,
     private readonly clock: SupervisorClock = systemClock,
+    private readonly readResult: typeof readJobResultEnvelope = readJobResultEnvelope,
   ) {}
 
   isRunning(): boolean {
@@ -255,6 +256,9 @@ export class JobSupervisor {
       await this.active.get(jobId)?.startup;
       const before = this.database.assertWebJobOwner(jobId, identity);
       if (before.status === "cancelled") return { row: before, duplicate: true };
+      if (before.status === "needs_review" && before.last_error_code === "web_cancel_acceptance_unknown") {
+        throw new Error("web_cancel_acceptance_unknown");
+      }
       const cancelling = this.database.beginWebJobCancellation(jobId, identity);
       if (["queued", "retryable_failed"].includes(before.status)) {
         this.database.markJobCancelled(jobId, reason); this.wake();
@@ -267,7 +271,7 @@ export class JobSupervisor {
           this.database.markJobCancelled(jobId, reason); this.wake();
           return { row: this.database.getJob(jobId)!, duplicate: false };
         }
-        this.database.markJobNeedsReview(jobId, cancelled.errorCode ?? "cancel_acceptance_unknown", commandMessage(cancelled));
+        this.database.markJobNeedsReview(jobId, "web_cancel_acceptance_unknown", commandMessage(cancelled));
         this.wake(); throw new Error("web_cancel_acceptance_unknown");
       }
       this.database.markJobCancelled(jobId, reason); this.trackCancelledWorkerCleanup(cancelling); this.wake();
@@ -689,7 +693,7 @@ export class JobSupervisor {
 
   private async tryCompleteAfterUnknownAcceptance(row: JobRow): Promise<boolean> {
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.markJobRunning(row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       return true;
@@ -730,29 +734,22 @@ export class JobSupervisor {
     try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
     finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
-    if (["cancelling", "cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return;
-    if (!waited.ok) {
-      if (waited.timedOut || waited.errorCode === "timeout") {
-        this.logger.debug("Background job remains active", {
-          job_id: row.job_id,
-          job_status: "running",
-        });
+    await this.serialized(row.job_id, async () => {
+      if (["cancelling", "cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return;
+      if (!waited.ok) {
+        if (waited.timedOut || waited.errorCode === "timeout") {
+          this.logger.debug("Background job remains active", { job_id: row.job_id, job_status: "running" });
+          return;
+        }
+        this.database.markJobNeedsReview(row.job_id, waited.errorCode ?? "agent_wait_failed", commandMessage(waited));
         return;
       }
-      this.database.markJobNeedsReview(
-        row.job_id,
-        waited.errorCode ?? "agent_wait_failed",
-        commandMessage(waited),
-      );
-      return;
-    }
-    if (waited.agentStatus === "blocked") {
-      this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
-      return;
-    }
-    if (["idle", "done"].includes(waited.agentStatus ?? "")) {
-      await this.tryComplete(row, true);
-    }
+      if (waited.agentStatus === "blocked") {
+        this.database.markJobBlocked(row.job_id, "Background agent is waiting for approval or human input");
+        return;
+      }
+      if (["idle", "done"].includes(waited.agentStatus ?? "")) await this.tryComplete(row, true);
+    });
     } finally { startupReady(); }
   }
 
@@ -766,7 +763,7 @@ export class JobSupervisor {
   private async tryComplete(row: JobRow, terminalAgentState: boolean): Promise<boolean> {
     let completed: JobRow;
     try {
-      const result = await readJobResultEnvelope(row.result_path, row.job_id);
+      const result = await this.readResult(row.result_path, row.job_id);
       this.database.saveJobResult(row.job_id, result, row.result_path);
       completed = this.database.getJob(row.job_id)!;
     } catch (error) {
