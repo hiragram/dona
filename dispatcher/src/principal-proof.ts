@@ -43,6 +43,12 @@ function singleHeader(value: string | string[] | undefined): string {
   return value;
 }
 
+function canonicalUtcSeconds(value:string):number|undefined {
+  const parsed=Date.parse(value);
+  if(!Number.isFinite(parsed)) return undefined;
+  return new Date(parsed).toISOString().replace(".000Z","Z")===value?parsed:undefined;
+}
+
 export function verifySlackPrincipalProof(
   envelope: EventEnvelope,
   proofHeader: string | string[] | undefined,
@@ -77,8 +83,8 @@ export function verifySlackPrincipalProof(
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
     throw new PrincipalProofError("principal_proof_invalid");
   }
-  const issued = Date.parse(parsed.data.issued_at), expires = Date.parse(parsed.data.expires_at), current = now.getTime();
-  if (issued > current || current >= expires || expires - issued <= 0 || expires - issued > 120_000) {
+  const issued=canonicalUtcSeconds(parsed.data.issued_at),expires=canonicalUtcSeconds(parsed.data.expires_at),current=now.getTime();
+  if (issued===undefined || expires===undefined || !Number.isFinite(current) || issued > current || current >= expires || expires - issued <= 0 || expires - issued > 120_000) {
     throw new PrincipalProofError("principal_proof_expired");
   }
   const subject = envelope.subject;

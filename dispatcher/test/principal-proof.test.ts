@@ -53,6 +53,10 @@ describe("Slack principal proof verifier", () => {
     const rotated = signed(envelope, {}, "old-key-that-is-no-longer-active-00000000");
     assert.throws(() => verifySlackPrincipalProof(envelope, rotated.proof, rotated.signature, testInternalToken, new Date("2026-09-21T00:01:00Z")),
       (error: unknown) => error instanceof PrincipalProofError && error.code === "principal_proof_invalid");
+    for(const timestamp of ["2026-13-01T00:00:00Z","2026-02-31T00:00:00Z"]) {
+      assert.throws(()=>verified(envelope,{issued_at:timestamp}),
+        (error:unknown)=>error instanceof PrincipalProofError&&error.code==="principal_proof_expired");
+    }
   });
 
   test("non-canonical raw JSONと重複keyをparse前相当で拒否する", () => {
@@ -65,13 +69,13 @@ describe("Slack principal proof verifier", () => {
 });
 
 describe("verified principal binding", () => {
-  test("eventと同一transactionで保存し、restart後も同一proofだけをidempotentに受理する", async () => {
+  test("eventと同一transactionで保存し、同一proof replayを拒否して新しい再配送proofを受理する", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const envelope = eventEnvelope("Ev-proof-durable"), proof = verified(envelope);
     let database = new DispatcherDatabase(config.databasePath);
     const first = database.enqueue(envelope, new Date("2026-09-21T00:01:00Z"), proof);
     assert.equal(database.getVerifiedPrincipalBinding(first.row.event_id)?.proof_sha256, proof.proof_sha256);
-    assert.equal(database.enqueue(envelope, new Date("2026-09-21T00:01:30Z"), proof).duplicate, true);
+    assert.throws(()=>database.enqueue(envelope,new Date("2026-09-21T00:01:30Z"),proof),PrincipalBindingConflictError);
     database.close();
     database = new DispatcherDatabase(config.databasePath);
     assert.equal(database.getVerifiedPrincipalBinding(first.row.event_id)?.principal_id, "U_TEST");

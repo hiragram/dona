@@ -119,10 +119,7 @@ export function persistVerifiedPrincipalBinding(db: Database.Database, eventId: 
 function consumeProof(db: Database.Database,eventId:string,proof:VerifiedSlackPrincipalProof,consumedAt:string):void {
   const existing=db.prepare("SELECT event_id,nonce,event_attempt,key_id FROM verified_principal_proof_consumptions WHERE proof_sha256=?")
     .get(proof.proof_sha256) as {event_id:string;nonce:string;event_attempt:number;key_id:string}|undefined;
-  if(existing) {
-    if(existing.event_id!==eventId||existing.nonce!==proof.nonce||existing.event_attempt!==proof.attempt||existing.key_id!==proof.key_id) throw new PrincipalBindingConflictError();
-    return;
-  }
+  if(existing) throw new PrincipalBindingConflictError();
   try {
     db.prepare("INSERT INTO verified_principal_proof_consumptions(proof_sha256,nonce,event_id,event_attempt,key_id,consumed_at) VALUES(?,?,?,?,?,?)")
       .run(proof.proof_sha256,proof.nonce,eventId,proof.attempt,proof.key_id,consumedAt);
