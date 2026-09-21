@@ -5,7 +5,7 @@ export const jobDisplayMetadataKey = "__dona_job_display";
 
 const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const unsafeFormatting = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-const urlLike = /(?:\b[A-Za-z][A-Za-z0-9+.-]*:\/\/|\bwww\.)/u;
+const urlLike = /(?:\b[A-Za-z][A-Za-z0-9+.-]*:|\bwww\.)/u;
 const privatePathLike = /[\\/]/u;
 const secretLike = /(?:^|[^A-Za-z0-9])(?:bearer|token|password|passwd|secret|api[ _-]?key|authorization)(?:$|[^A-Za-z0-9])/iu;
 const credentialLike = /(?:gh[pousr]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-[A-Za-z0-9][A-Za-z0-9_-]{11,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/u;
