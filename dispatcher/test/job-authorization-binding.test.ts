@@ -53,7 +53,7 @@ function evidence(sourceEventId: string, suffix = "1", resourceRevision = 3): Ve
     authorization_principal_event_id: sourceEventId, tenant_id: "T_TEST", workspace_id: "T_TEST",
     principal_kind: "human", principal_id: "U_TEST", permission: "bind_exact_task",
     verified_at: "2026-09-21T00:01:00.000Z", expires_at: "2026-09-21T00:03:00.000Z",
-    task: { provider: "github", repository_node_id: "R_kgDOULBeiA", task_node_id: "I_kwDOULBeiM7task1",
+    task: { provider: "github", repository_full_name: "hiragram/dona", repository_node_id: "R_kgDOULBeiA", task_node_id: "I_kwDOULBeiM7task1",
       task_number: 164, resource_revision: resourceRevision },
   };
 }
@@ -85,6 +85,22 @@ test("new jobはverified principal、ingress、origin、exact GitHub taskを同�
     { provider_verified: true, evidence: evidence(source.event_id, "5", 4) }, verifier, audit,
     { ...auditContext, transaction_id: "bind_transaction_snapshot_2" }, new Date("2026-09-21T00:02:01.000Z"));
   assert.equal(database.jobAuthorization.readJob(job.job_id)?.resource_revision, 3);
+  database.close();
+});
+
+test("verified exact taskと異なるrepositoryのjobをinsert前に拒否する", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const envelope = eventEnvelope("Ev-job-repository-mismatch");
+  const source = database.enqueue(envelope, new Date("2026-09-21T00:01:00.000Z"), proof(envelope.external_event_id)).row;
+  database.jobAuthorization.bindEventTask(source.event_id, 0,
+    { provider_verified: true, evidence: evidence(source.event_id) }, verifier, audit,
+    { ...auditContext, transaction_id: "bind_repository_mismatch" }, new Date("2026-09-21T00:01:30.000Z"));
+  assert.throws(() => database.createJob({ source_event_id: source.event_id, job_key: "wrong-repository", objective: "確認する",
+    workspace: { kind: "github", repository: "hiragram/other", base_ref: "main" } },
+  config.jobsWorkspaceRoot, config.jobResultsDir, new Date("2026-09-21T00:02:00.000Z")),
+  (error: unknown) => error instanceof Error && "code" in error && error.code === "job_task_repository_mismatch");
+  assert.equal(database.listJobs().length, 0);
   database.close();
 });
 

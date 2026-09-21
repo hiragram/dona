@@ -71,7 +71,7 @@ const jobsRunnableFairIndexSql = `
 
 export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
 export class JobCreationError extends Error {
-  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded", message: string,
+  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded" | "job_task_repository_mismatch", message: string,
     readonly limitDetails?: { resource: "jobs_per_event" | "objective_utf8_bytes_per_event"; current: number; attempted: number; maximum: number }) {
     super(message); this.name = "JobCreationError";
   }
@@ -704,6 +704,12 @@ export class DispatcherDatabase {
         const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
         if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
+      }
+
+      const exactTask = this.jobAuthorization.readEventTask(sourceEvent.event_id);
+      if (exactTask?.status === "active" && (parsedRequest.workspace.kind !== "github" ||
+        parsedRequest.workspace.repository !== exactTask.repository_full_name)) {
+        throw new JobCreationError("job_task_repository_mismatch", "Job workspace does not match the verified exact-task repository");
       }
 
       if (this.schemaWrite === 2 && parsedRequest.job_key !== undefined) throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");

@@ -10,8 +10,10 @@ import { stableStringify } from "./validation.js";
 const opaqueId = z.string().regex(/^[A-Za-z0-9_-]{8,128}$/);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString() === value);
+const repositoryFullName = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$/);
 const taskSchema = z.strictObject({
   provider: z.literal("github"),
+  repository_full_name: repositoryFullName,
   repository_node_id: opaqueId,
   task_node_id: opaqueId,
   task_number: z.number().int().positive(),
@@ -45,6 +47,7 @@ export interface TaskBindingAuditContext {
 export interface EventTaskBindingRow {
   event_id: string;
   provider: "github";
+  repository_full_name: string;
   repository_node_id: string;
   task_node_id: string;
   task_number: number;
@@ -93,6 +96,7 @@ export function migrateJobAuthorizationBindings(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS event_task_bindings (
       event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
       provider TEXT NOT NULL CHECK(provider='github'),
+      repository_full_name TEXT NOT NULL,
       repository_node_id TEXT NOT NULL,
       task_node_id TEXT NOT NULL,
       task_number INTEGER NOT NULL CHECK(task_number>0),
@@ -199,7 +203,8 @@ export class JobAuthorizationBindingRepository {
       principal.principal_id !== evidence.principal_id) throw new TaskBindingConflictError();
     const existing = this.readEventTask(eventId);
     const sameEvidence = existing?.authorization_evidence_sha256 === evidence.evidence_sha256;
-    const sameTask = existing?.provider === evidence.task.provider && existing.repository_node_id === evidence.task.repository_node_id &&
+    const sameTask = existing?.provider === evidence.task.provider && existing.repository_full_name === evidence.task.repository_full_name &&
+      existing.repository_node_id === evidence.task.repository_node_id &&
       existing.task_node_id === evidence.task.task_node_id && existing.task_number === evidence.task.task_number &&
       existing.resource_revision === evidence.task.resource_revision && existing.status === "active";
     if (sameEvidence && sameTask) return existing;
@@ -240,20 +245,25 @@ export class JobAuthorizationBindingRepository {
       expectedCurrent, () => {
       const current = this.readEventTask(eventId);
       if (!current) {
-        this.db.prepare(`INSERT INTO event_task_bindings VALUES(?,?,?,?,?,?,?,?,1,'active',?,?,NULL)`).run(
-          eventId,evidence.task.provider,evidence.task.repository_node_id,evidence.task.task_node_id,evidence.task.task_number,
+        this.db.prepare(`INSERT INTO event_task_bindings(
+          event_id,provider,repository_full_name,repository_node_id,task_node_id,task_number,resource_revision,
+          authorization_principal_event_id,authorization_evidence_sha256,binding_revision,status,created_at,updated_at,revoked_at)
+          VALUES(?,?,?,?,?,?,?,?,?,1,'active',?,?,NULL)`).run(
+          eventId,evidence.task.provider,evidence.task.repository_full_name,evidence.task.repository_node_id,evidence.task.task_node_id,evidence.task.task_number,
           evidence.task.resource_revision,eventId,evidence.evidence_sha256,now,now);
         return this.readEventTask(eventId)!;
       }
-      const changed = this.db.prepare(`UPDATE event_task_bindings SET task_number=?,resource_revision=?,authorization_evidence_sha256=?,
+      const changed = this.db.prepare(`UPDATE event_task_bindings SET repository_full_name=?,task_number=?,resource_revision=?,authorization_evidence_sha256=?,
         binding_revision=binding_revision+1,updated_at=? WHERE event_id=? AND binding_revision=? AND status='active'`).run(
-        evidence.task.task_number,evidence.task.resource_revision,evidence.evidence_sha256,now,eventId,expectedBindingRevision).changes;
+        evidence.task.repository_full_name,evidence.task.task_number,evidence.task.resource_revision,evidence.evidence_sha256,
+        now,eventId,expectedBindingRevision).changes;
       if (changed !== 1) throw new TaskBindingConflictError();
       return this.readEventTask(eventId)!;
     });
     if (appended.applied) return appended.result;
     const raced = this.readEventTask(eventId);
     if (raced?.authorization_evidence_sha256 === evidence.evidence_sha256 && raced.provider === evidence.task.provider &&
+      raced.repository_full_name === evidence.task.repository_full_name &&
       raced.repository_node_id === evidence.task.repository_node_id && raced.task_node_id === evidence.task.task_node_id &&
       raced.task_number === evidence.task.task_number && raced.resource_revision === evidence.task.resource_revision &&
       raced.status === "active") return raced;

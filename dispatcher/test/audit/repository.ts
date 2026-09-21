@@ -275,3 +275,27 @@ test("finalize直後の別connection appendを直列化し、確定済み業務�
     assert.equal(repository.verify().sequence, 2);
   } finally { otherDb.close(); }
 });
+
+test("verify中はwriter lockでDB snapshotと外部anchorの対応を固定する", (t) => {
+  const { filename, store, repository } = setup(t);
+  repository.append("tx_first", 1, event, () => {});
+  const otherDb = new Database(filename); otherDb.pragma("busy_timeout = 0");
+  try {
+    const other = new AuditRepository(otherDb, store, keys);
+    const read = store.read.bind(store);
+    let attempted = false; let blocked = false;
+    store.read = () => {
+      if (!attempted) {
+        attempted = true;
+        try { other.append("tx_during_verify", 1, event, () => {}); }
+        catch (error) { assert.ok(error instanceof AuditIntegrityError); blocked = true; }
+      }
+      return read();
+    };
+    assert.equal(repository.verify().sequence, 1);
+    assert.equal(attempted, true); assert.equal(blocked, true);
+    store.read = read;
+    other.append("tx_after_verify", 1, event, () => {});
+    assert.equal(repository.verify().sequence, 2);
+  } finally { otherDb.close(); }
+});

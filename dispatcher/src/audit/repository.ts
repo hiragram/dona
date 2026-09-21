@@ -113,7 +113,7 @@ export class AuditRepository {
   verify(): AuditAnchor {
     return guard(() => {
       if (this.db.inTransaction) throw new AuditIntegrityError();
-      return this.db.transaction(() => this.verifyInside())();
+      return this.db.transaction(() => this.verifyInside()).immediate();
     });
   }
 
