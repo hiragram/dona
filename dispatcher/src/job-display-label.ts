@@ -4,7 +4,7 @@ export const jobDisplayLabelMaxCodePoints = 48;
 export const jobDisplayMetadataKey = "__dona_job_display";
 
 const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
-const unsafeFormatting = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const unsafeFormatting = /[\p{Cc}\p{Cf}]/gu;
 const urlLike = /(?:[A-Za-z][A-Za-z0-9+.-]*:|www\.)/u;
 const privatePathLike = /[\\/]/u;
 const secretLike = /(?:^|[^A-Za-z0-9])(?:bearer|token|password|passwd|secret|api[ _-]?key|private[ _-]?key|authorization)(?:$|[^A-Za-z0-9])/iu;

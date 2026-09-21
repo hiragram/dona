@@ -57,6 +57,7 @@ describe("Herdr workspace表示ラベル", () => {
       String.raw`C:\Users\example\secret.txt`,
       "token=sk-example-secret",
       "GITHUB_TOKEN=abcdefghijklmnopqrstuv",
+      "GITHUB_TOK\u200bEN=abcdefghijklmnopqrstuv",
       "build_secret=abcdefghijklmnopqrstuv",
       "my_api_key=abcdefghijklmnopqrstuv",
       "SSH_PRIVATE_KEY=YWJjZGVmZ2hpamtsbW5vcA==",
