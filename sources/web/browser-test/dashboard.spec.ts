@@ -221,6 +221,10 @@ test("SSE切断はstaleを明示してdetailから再接続し、cancel競合も
   await expect(page.getByRole("status")).toContainText("取消を受け付けられませんでした"); expect(f.cancelWrites).toBe(1); expect(f.eventReads).toBeGreaterThan(1); expect(f.errors).toEqual([]);
 });
 
+test("詳細更新後に一覧へ戻ると一覧projectionを再取得する",async({page})=>{
+  const f=await fixture(page,{unsafeResult:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await expect(page.getByText("完了").first()).toBeVisible();const before=f.listReads;await page.getByRole("button",{name:"一覧へ戻る"}).click();await expect.poll(()=>f.listReads).toBe(before+1);const item=page.getByRole("button",{name:/job_alpha/});await expect(item.locator(".status")).toHaveText("完了");expect(f.errors).toEqual([]);
+});
+
 test("SSE切断後のdetail再検証失敗では以前のsnapshotを消去する",async({page})=>{
   const f=await fixture(page,{firstEventAbort:true,detailAfterEventStatus:503});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました",{timeout:5000});await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page.locator("#job-list button")).toHaveCount(0);expect(f.errors).toEqual([]);
 });
