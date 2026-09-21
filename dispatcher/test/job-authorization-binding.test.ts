@@ -79,6 +79,10 @@ test("new jobはverified principal、ingress、origin、exact GitHub taskを同�
     resourceRevision: 3, policyRevision: 1, bindingRevision: 1, taskBindingRevision: 1,
   });
   assert.equal(JSON.parse(binding.disclosure_origin_json).destination.kind, "slack_thread");
+  database.jobAuthorization.bindEventTask(source.event_id, 1,
+    { provider_verified: true, evidence: evidence(source.event_id, "5", 4) }, verifier, audit,
+    { ...auditContext, transaction_id: "bind_transaction_snapshot_2" }, new Date("2026-09-21T00:02:01.000Z"));
+  assert.equal(database.jobAuthorization.readJob(job.job_id)?.resource_revision, 3);
   database.close();
 });
 
@@ -104,6 +108,7 @@ test("共有auditのDB外CASとtask bindingを同じtransactionで確定する",
   const bound = bindings.bindEventTask(source.event_id, 0, { provider_verified: true, evidence: evidence(source.event_id) },
     verifier, realAudit, { ...auditContext, transaction_id: "bind_with_shared_audit" }, new Date("2026-09-21T00:01:30.000Z"));
   assert.equal(bound.binding_revision, 1); assert.equal(realAudit.verify().sequence, 1);
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
   db.close();
   dispatcher = new DispatcherDatabase(config.databasePath);
   assert.equal(dispatcher.jobAuthorization.readEventTask(source.event_id)?.task_number, 164);

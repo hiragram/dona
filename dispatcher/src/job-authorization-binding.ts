@@ -131,10 +131,28 @@ export function migrateJobAuthorizationBindings(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS event_task_resource_idx
       ON event_task_bindings(repository_node_id,task_node_id,resource_revision);
+    CREATE UNIQUE INDEX IF NOT EXISTS event_task_evidence_idx
+      ON event_task_bindings(authorization_evidence_sha256);
     CREATE INDEX IF NOT EXISTS job_authorization_owner_idx
       ON job_authorization_bindings(tenant_id,workspace_id,principal_kind,principal_id,job_id);
     CREATE TRIGGER IF NOT EXISTS job_authorization_binding_immutable BEFORE UPDATE ON job_authorization_bindings
       BEGIN SELECT RAISE(ABORT,'job_authorization_binding_immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS job_authorization_source_match BEFORE INSERT ON job_authorization_bindings
+      WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE job_id=NEW.job_id AND source_event_id=NEW.source_event_id)
+      BEGIN SELECT RAISE(ABORT,'job_authorization_source_mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS job_authorization_principal_complete BEFORE INSERT ON job_authorization_bindings
+      WHEN (NEW.owner_kind='human_verified' AND (NEW.principal_binding_event_id IS NULL OR NEW.ingress_proof_sha256 IS NULL
+        OR NEW.tenant_id IS NULL OR NEW.workspace_id IS NULL OR NEW.principal_kind IS NULL OR NEW.principal_id IS NULL))
+        OR (NEW.owner_kind!='human_verified' AND (NEW.principal_binding_event_id IS NOT NULL OR NEW.ingress_proof_sha256 IS NOT NULL
+        OR NEW.tenant_id IS NOT NULL OR NEW.workspace_id IS NOT NULL OR NEW.principal_kind IS NOT NULL OR NEW.principal_id IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'job_authorization_principal_incomplete'); END;
+    CREATE TRIGGER IF NOT EXISTS job_authorization_task_match BEFORE INSERT ON job_authorization_bindings
+      WHEN NEW.resource_kind='github_issue' AND NOT EXISTS (
+        SELECT 1 FROM event_task_bindings t WHERE t.event_id=NEW.source_event_id AND t.status='active'
+          AND t.repository_node_id=NEW.repository_node_id AND t.task_node_id=NEW.task_node_id
+          AND t.task_number=NEW.task_number AND t.resource_revision=NEW.resource_revision
+          AND t.binding_revision=NEW.task_binding_revision)
+      BEGIN SELECT RAISE(ABORT,'job_authorization_task_mismatch'); END;
     INSERT OR IGNORE INTO job_authorization_binding_schema(singleton,version) VALUES(1,1);
   `);
   const marker = db.prepare("SELECT version FROM job_authorization_binding_schema WHERE singleton=1").get() as {version:number}|undefined;
