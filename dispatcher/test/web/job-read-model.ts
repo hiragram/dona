@@ -275,12 +275,15 @@ test("別principalと未知jobを同じnot_found projectionにする",t=>{const 
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:"/api/jobs/job_missing",context:"context"}),{status:"denied",reason:"not_found"});
 });
 
-test("can_cancelは現行cancel受付状態だけを公開する",t=>{const f=fixture(t);
-  const broker=new WebJobReadBroker(readAuth(owner) as never,f.jobs);
+test("can_cancelはowner・scope・現行cancel受付状態を満たす場合だけ公開する",t=>{const f=fixture(t);
+  const broker=new WebJobReadBroker(readAuth(owner,["job:read:own","job:cancel:own"]) as never,f.jobs);
   for(const [status,expected] of [["queued",true],["preparing",true],["dispatching",true],["retryable_failed",true],["running",true],["blocked",true],["needs_review",true],["cancelling",false],["completed",false]] as const){
     const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
     assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
   }
+  const withoutScope=new WebJobReadBroker(readAuth(owner,["job:read:own"]) as never,f.jobs);
+  const ownJob=f.seed(owner,"running"),ownDetail=withoutScope.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${ownJob}`,context:"context"});
+  assert.equal(ownDetail.status,"succeeded");if(ownDetail.status==="succeeded"&&ownDetail.kind==="detail")assert.equal(ownDetail.job.control.can_cancel,false);
 });
 
 test("observerはcurrent明示grantのjobだけを読めて失効後はnot_foundになる",t=>{const f=fixture(t),job=f.seed();
@@ -298,6 +301,7 @@ test("observerはcurrent明示grantのjobだけを読めて失効後はnot_found
   const broker=new WebJobReadBroker(readAuth(observer,["job:read:granted"]) as never,f.jobs);
   const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});assert.equal(detail.status,"succeeded");
   if(detail.status!=="succeeded"||detail.kind!=="detail")return;
+  assert.equal(detail.job.control.can_cancel,false);
   const stalePrincipal=new WebJobReadBroker(readAuth({...observer,authz_revision:2},["job:read:granted"]) as never,f.jobs);
   assert.deepEqual(stalePrincipal.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),
     {status:"denied",reason:"not_found"});
