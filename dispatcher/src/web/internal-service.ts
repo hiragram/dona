@@ -176,7 +176,7 @@ export class WebInternalService {
       case "command": {
         if (!this.commands) throw new WebServiceError();
         verifyWebCommandProof(proof, raw, this.scope, this.credentials, this.now());
-        const input = parseWebCommandInput(raw); this.assertRequestReady(started, request, response);
+        const input = parseWebCommandInput(raw, proof, this.credentials); this.assertRequestReady(started, request, response);
         const result = await this.commands.execute(input); this.assertRequestReady(started, request, response);
         return signWebCommandResponse(proof, raw, result, this.scope, this.credentials, this.now());
       }

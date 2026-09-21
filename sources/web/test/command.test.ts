@@ -8,7 +8,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { controllerFixture } from "./auth-controller-fixture.js";
 import { deriveWebIdempotencyKey } from "../src/browser-command.js";
 import { WebCommandClient } from "../src/command-client.js";
-import { encodeWebCommandInput, signWebCommandProof, verifyWebCommandResponse } from "../src/command-wire.js";
+import { encodeWebCommandInput, sealWebCommandInput, signWebCommandProof, verifyWebCommandResponse } from "../src/command-wire.js";
 
 function commandRequest(f: ReturnType<typeof controllerFixture>, target: string, value: unknown) {
   const request = f.request(target, "POST"); request.body = Buffer.from(JSON.stringify(value)); return request;
@@ -59,6 +59,18 @@ test("command応答はrequest proofへbindしたMACがない限り受理しな�
   for (const invalid of [{ ...credential, purpose: "other" }, { ...credential, version: 2 }, { ...credential, tenant_id: "other" },
     { ...credential, activated_at: "2026-09-19T00:00:02.000Z" }, { ...credential, signing_expires_at: now }])
     assert.throws(() => verifyWebCommandResponse(proof, requestProof, body, scope, () => invalid as typeof credential, now));
+});
+
+test("command wireはsocket接続前にbrowser本文を認証付き暗号化する", () => {
+  const credential = { purpose: "web_bff_service" as const, version: 1, state: "active" as const,
+    instance_id: "instance", tenant_id: "tenant", activated_at: "2026-09-01T00:00:00.000Z",
+    signing_expires_at: "2026-11-01T00:00:00.000Z", secret: Buffer.alloc(32, 7) };
+  const input = { codec_version: 1 as const, operation: "submit" as const, method: "POST" as const, target: "/api/jobs",
+    context: "signed-context", browser_body: Buffer.from(JSON.stringify({ objective: "private objective", workspace: { kind: "scratch" } })).toString("base64url"),
+    idempotency_key: "a".repeat(64) };
+  const first = sealWebCommandInput(input, credential), second = sealWebCommandInput(input, credential);
+  assert.notEqual(first, second); assert.ok(!first.includes("private objective")); assert.ok(!first.includes(input.browser_body));
+  const envelope = JSON.parse(first); assert.deepEqual(Object.keys(envelope), ["codec_version", "key_version", "nonce", "ciphertext", "tag"]);
 });
 
 test("command入力のidentity・source・URL・path・token注入とoversizeをUDS送信前に拒否する", async () => {

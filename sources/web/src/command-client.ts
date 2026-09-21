@@ -2,7 +2,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import type { ServiceScope, WebServiceCredential, WebServiceCredentialLookup } from "./service-auth.js";
-import { encodeWebCommandInput, maximumWebCommandBodyBytes, signWebCommandProof, verifyWebCommandResponse,
+import { maximumWebCommandBodyBytes, sealWebCommandInput, signWebCommandProof, verifyWebCommandResponse,
   webCommandServiceHost, webCommandServicePath, WebCommandWireError, type WebCommandInput, type WebCommandResult } from "./command-wire.js";
 
 function socketIdentity(socketPath: string): { dev: number; ino: number } {
@@ -21,7 +21,8 @@ export class WebCommandClient {
     private readonly now: () => string, private readonly deadlineMs = 5000) {}
   execute(input: WebCommandInput): Promise<WebCommandResult> {
     let raw: string, proof: string, before: { dev: number; ino: number };
-    try { raw = encodeWebCommandInput(input); proof = signWebCommandProof(raw, this.scope, this.signing(), this.now()); before = socketIdentity(this.socketPath); }
+    try { const credential = this.signing(); raw = sealWebCommandInput(input, credential);
+      proof = signWebCommandProof(raw, this.scope, credential, this.now()); before = socketIdentity(this.socketPath); }
     catch { return Promise.reject(new WebCommandWireError()); }
     return new Promise((resolve, reject) => {
       let settled = false, request: http.ClientRequest | undefined; const finish = (result?: WebCommandResult) => {

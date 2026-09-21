@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { ServiceScope, WebServiceCredentialLookup } from "./service-auth.js";
 
@@ -30,9 +30,24 @@ const responseSchema = z.strictObject({ codec_version: z.literal(1), key_version
   request_nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/), request_body_digest: digest, request_proof_digest: digest,
   issued_at: z.string().datetime(), expires_at: z.string().datetime(), result: webCommandResultSchema });
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-export function parseWebCommandInput(raw: string): WebCommandInput {
-  try { if (Buffer.byteLength(raw) > maximumWebCommandBodyBytes) throw Error(); const value = webCommandInputSchema.parse(JSON.parse(raw));
-    if (JSON.stringify(value) !== raw) throw Error(); return value; } catch { throw new WebCommandWireError(); }
+const sealedInputSchema = z.strictObject({ codec_version: z.literal(1), key_version: z.number().int().min(1),
+  nonce: z.string().regex(/^[A-Za-z0-9_-]{16}$/), ciphertext: z.string().min(1).max(180000), tag: z.string().regex(/^[A-Za-z0-9_-]{22}$/) });
+export function parseWebCommandInput(raw: string, proof: string, lookup: WebServiceCredentialLookup): WebCommandInput {
+  try {
+    if (Buffer.byteLength(raw) > maximumWebCommandBodyBytes) throw Error();
+    const envelope = sealedInputSchema.parse(JSON.parse(raw)); if (JSON.stringify(envelope) !== raw) throw Error();
+    const proofPart = proof.split(".")[0]!, claims = claimsSchema.parse(JSON.parse(Buffer.from(proofPart, "base64url").toString("utf8")));
+    const credential = lookup(envelope.key_version);
+    if (claims.key_version !== envelope.key_version || !credential || credential.purpose !== "web_bff_service"
+      || credential.state === "revoked" || !(credential.secret instanceof Uint8Array) || credential.secret.byteLength !== 32) throw Error();
+    const header = { codec_version: envelope.codec_version, key_version: envelope.key_version };
+    const key = createHmac("sha256", credential.secret).update("dona.web-command.input.encryption-key.v1\0").digest();
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.nonce, "base64url"));
+    decipher.setAAD(Buffer.from(`dona.web-command.input.v1\0${JSON.stringify(header)}`));
+    decipher.setAuthTag(Buffer.from(envelope.tag, "base64url"));
+    const plaintext = Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, "base64url")), decipher.final()]).toString("utf8");
+    const value = webCommandInputSchema.parse(JSON.parse(plaintext)); if (JSON.stringify(value) !== plaintext) throw Error(); return value;
+  } catch { throw new WebCommandWireError(); }
 }
 export function verifyWebCommandProof(proof: string, raw: string, scope: ServiceScope, lookup: WebServiceCredentialLookup, now: string): void {
   try {

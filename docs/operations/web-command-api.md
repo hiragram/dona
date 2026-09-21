@@ -4,7 +4,7 @@
 
 Web Adapterは`POST /api/jobs`と`POST /api/jobs/:job_id/cancel`だけをcommand routeとして公開する。browser本文の`source`、principal、tenant、workspace path、token、callback URLは受理しない。principalとtenantは、online IdP照合後の現行sessionをDispatcherが再検証した結果だけから取得する。
 
-command requestはCSRF、same-origin、固定route、署名済みingress context、owner-only UDS、BFF service proofを順に通る。UDSのMAC検証だけでは権限にならず、Dispatcherの`WebAuthRepository`が現行revisionと一回限りnonceを監査transactionで確定してからcommand brokerへprincipalを渡す。
+command requestはCSRF、same-origin、固定route、署名済みingress context、認証付き暗号化、owner-only UDS、BFF service proofを順に通る。browser本文はsocket接続前にservice credentialで暗号化し、同一UID processによるsocket path差し替えでも平文を渡さない。UDSのMAC検証だけでは権限にならず、Dispatcherの`WebAuthRepository`が現行revisionと一回限りnonceを監査transactionで確定してからcommand brokerへprincipalを渡す。
 
 ## submitとreceipt
 

@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { ServiceScope, WebServiceCredential, WebServiceCredentialLookup } from "./service-auth.js";
 
@@ -27,6 +27,21 @@ const responseSchema = z.strictObject({ codec_version: z.literal(1), key_version
 export function encodeWebCommandInput(input: unknown): string {
   try { const raw = JSON.stringify(webCommandInputSchema.parse(input)); if (Buffer.byteLength(raw) > maximumWebCommandBodyBytes) throw Error(); return raw; }
   catch { throw new WebCommandWireError(); }
+}
+export function sealWebCommandInput(input: unknown, credential: WebServiceCredential): string {
+  try {
+    const plaintext = encodeWebCommandInput(input), nonce = randomBytes(12);
+    if (credential.purpose !== "web_bff_service" || credential.state !== "active"
+      || !(credential.secret instanceof Uint8Array) || credential.secret.byteLength !== 32) throw Error();
+    const header = { codec_version: 1 as const, key_version: credential.version };
+    const key = createHmac("sha256", credential.secret).update("dona.web-command.input.encryption-key.v1\0").digest();
+    const cipher = createCipheriv("aes-256-gcm", key, nonce);
+    cipher.setAAD(Buffer.from(`dona.web-command.input.v1\0${JSON.stringify(header)}`));
+    const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    const raw = JSON.stringify({ ...header, nonce: nonce.toString("base64url"), ciphertext: ciphertext.toString("base64url"),
+      tag: cipher.getAuthTag().toString("base64url") });
+    if (Buffer.byteLength(raw) > maximumWebCommandBodyBytes) throw Error(); return raw;
+  } catch { throw new WebCommandWireError(); }
 }
 export function signWebCommandProof(raw: string, scope: ServiceScope, credential: WebServiceCredential, now: string): string {
   try {
