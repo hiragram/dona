@@ -11,8 +11,10 @@ import * as readAuth from "./read-auth.js";
 import * as writeAuth from "./write-auth.js";
 import { serviceScopeSchema, WebServiceError, type ServiceScope, type WebServiceCredentialLookup } from "./service-auth.js";
 import type { AuthWriteResult } from "./write-auth.js";
+import { maximumWebJobReadBodyBytes, parseWebJobReadInput, signWebJobReadResponse, verifyWebJobReadProof } from "./job-read-wire.js";
+import type { WebJobReadBroker } from "./job-read-broker.js";
 
-const kinds = ["session", "read", "write"] as const;
+const kinds = ["session", "read", "write", "job_read"] as const;
 type Kind = typeof kinds[number];
 type Mode = Kind | "all";
 const protocols = Object.freeze({
@@ -22,6 +24,8 @@ const protocols = Object.freeze({
     maximum: readAuth.maximumServiceBodyBytes, type: "application/vnd.dona.web-auth-read-response" }),
   write: Object.freeze({ path: writeAuth.webAuthWritePath, host: writeAuth.webAuthWriteHost,
     maximum: writeAuth.maximumServiceBodyBytes, type: "application/vnd.dona.web-auth-write-response" }),
+  job_read: Object.freeze({ path: "/v1/web/jobs/read", host: "dona-web-job-read",
+    maximum: maximumWebJobReadBodyBytes, type: "application/vnd.dona.web-job-read-response" }),
 });
 
 function privateParent(socketPath: string): void {
@@ -67,7 +71,8 @@ export class WebInternalService {
   private readonly sockets = new Set<net.Socket>();
   private readonly scope: ServiceScope;
   constructor(private readonly socketPath: string, scope: ServiceScope, private readonly repository: WebAuthRepository,
-    private readonly credentials: WebServiceCredentialLookup, private readonly now: () => string, private readonly deadlineMs: number, private readonly mode: Mode) {
+    private readonly credentials: WebServiceCredentialLookup, private readonly now: () => string, private readonly deadlineMs: number, private readonly mode: Mode,
+    private readonly jobReads?: WebJobReadBroker) {
     this.scope = serviceScopeSchema.parse(scope);
     if (mode !== "all" && !kinds.includes(mode)) throw new WebServiceError();
     if (!(repository instanceof WebAuthRepository) || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 5000) throw new WebServiceError();
@@ -167,6 +172,15 @@ export class WebInternalService {
         const reply: AuthWriteResult = authWriteResultSchema.parse({ operation: input.operation, result });
         this.assertRequestReady(started, request, response);
         return writeAuth.signServiceResponse(proof, raw, reply, this.scope, this.credentials, this.now());
+      }
+      case "job_read": {
+        if (!this.jobReads) throw new WebServiceError();
+        verifyWebJobReadProof(proof, raw, this.scope, this.credentials, this.now());
+        const input = parseWebJobReadInput(raw);
+        this.assertRequestReady(started, request, response);
+        const result = this.jobReads.execute(input);
+        this.assertRequestReady(started, request, response);
+        return signWebJobReadResponse(proof, raw, result, this.scope, this.credentials, this.now());
       }
       default: throw new WebServiceError();
     }

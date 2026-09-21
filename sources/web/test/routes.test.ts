@@ -20,8 +20,9 @@ test('自動pollとSSEはuser activityにせずapproval decisionは独立step-up
  const route=matchWebRoute('POST','/api/approvals/a/decision');assert.equal(route.gate,'approval_step_up');assert.equal(route.capability,'approval');assert.deepEqual(route.resource,{kind:'approval',id:'a'});
  assert.equal(matchWebRoute('GET','/').activity,'user_navigation');
 });
-test('OIDC callback以外へqueryを許可せずlogin完了案内はpublicのままにする',()=>{
+test('OIDC callbackとjob一覧だけqueryを許可しlogin完了案内はpublicのままにする',()=>{
  assert.equal(matchWebRoute('GET','/oidc/callback?code=fixture&state=fixture').gate,'login_callback');
+ assert.equal(matchWebRoute('GET','/api/jobs?limit=20').id,'job_list');
  assert.equal(matchWebRoute('GET','/login/complete').gate,'public');assert.equal(matchWebRoute('GET','/login/complete').activity,'none');
  for(const target of ['/login?next=external','/login/complete?code=fixture','/?session=fixture'])assert.throws(()=>matchWebRoute('GET',target),WebRouteError);
 });

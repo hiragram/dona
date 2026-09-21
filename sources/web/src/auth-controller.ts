@@ -14,18 +14,20 @@ import type { OidcProtocol } from "./oidc.js";
 import type { WebAuthReadClient } from "./auth-read-client.js";
 import type { WebAuthWriteClient } from "./auth-write-client.js";
 import type { WebSessionClient } from "./session-client.js";
+import type { WebJobReadClient } from "./job-read-client.js";
+import { maximumWebJobBrowserBodyBytes } from "./job-read-wire.js";
 
 type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
 type Reason = "identity_invalid" | "identity_unavailable" | "identity_mismatch" | "session_invalid" | "session_revoked"
   | "session_expired" | "origin_invalid" | "csrf_invalid" | "cookie_invalid" | "cookie_ambiguous";
-type Status = 200 | 204 | 400 | 401 | 403 | 404 | 503;
+type Status = 200 | 204 | 400 | 401 | 403 | 404 | 409 | 503;
 export interface BrowserAuthRequest {
   method: string; target: string; headers: RawHeaders; body: Uint8Array;
   /** Trusted TLS/proxy listener result, never a request field/header. */
   transportVerified: boolean;
 }
-export interface BrowserAuthResponse { status: Status; headers: Record<string, string>; body: string }
+export interface BrowserAuthResponse { status: Status; headers: Record<string, string>; body: string; maximumBodyBytes?: number }
 /** Current protected inventory, not browser input or an environment fallback. */
 export interface BrowserAuthKeys {
   cookies(): { retained_versions: readonly number[]; keys: readonly SessionProtectionKey[] };
@@ -40,6 +42,7 @@ export interface BrowserAuthConnections {
   write: Pick<WebAuthWriteClient, "mutate">;
   session: Pick<WebSessionClient, "confirm">;
   oidc: Pick<OidcProtocol, "introspect">;
+  jobRead?: Pick<WebJobReadClient, "execute">;
 }
 class AuthFailure extends Error {
   constructor(readonly status: Status, readonly reason: Reason, readonly publicReason: Reason | "durability_unavailable" = reason) { super(reason); }
@@ -56,10 +59,12 @@ function failure(reason: SessionDenial): AuthFailure {
   if (reason === "clock_anomaly") return new AuthFailure(503, "identity_unavailable");
   return new AuthFailure(401, reason === "revision_mismatch" ? "session_revoked" : reason);
 }
-function response(status: Status, value?: unknown, clear = false): BrowserAuthResponse {
+function response(status: Status, value?: unknown, clear = false, maximumBodyBytes?: number): BrowserAuthResponse {
   return { status, headers: { ...privateHeaders, ...(status === 204 ? {} : { "content-type": "application/json; charset=utf-8" }),
-    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 ? "" : JSON.stringify(value) };
+    ...(clear ? { "set-cookie": clearBrowserCookie("session") } : {}) }, body: status === 204 ? "" : JSON.stringify(value), ...(maximumBodyBytes?{maximumBodyBytes}:{}) };
 }
+function eventResponse(event:string,id:string,value:unknown):BrowserAuthResponse {const body=`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(value)}\n\n`;
+  return{status:200,headers:{...privateHeaders,"content-type":"text/event-stream; charset=utf-8","x-accel-buffering":"no"},body,maximumBodyBytes:maximumWebJobBrowserBodyBytes};}
 
 /** Browser session endpoints only. No listener, login fallback, job/approval
  * capability or UI is created by this controller. Every async boundary must
@@ -121,7 +126,15 @@ export class WebAuthController {
       assertBrowserBoundary(this.policy, request.headers, request.transportVerified);
       let route;
       try { route = matchWebRoute(request.method, request.target); } catch { throw new AuthFailure(404, "session_invalid"); }
-      if (!["dashboard", "session", "local_csrf", "logout", "logout_status"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
+      if (!["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events"].includes(route.id)) throw new AuthFailure(404, "session_invalid");
+      let jobCursor:string|undefined,jobLimit:number|undefined;
+      if(route.id==="job_list"){
+        const url=new URL(request.target,this.policy.origin),keys=[...url.searchParams.keys()];
+        if(keys.some(key=>!["cursor","limit"].includes(key))||new Set(keys).size!==keys.length)throw new AuthFailure(400,"session_invalid");
+        const rawCursor=url.searchParams.get("cursor"),rawLimit=url.searchParams.get("limit");
+        if(rawCursor!==null){if(!/^[A-Za-z0-9_-]{43}$/.test(rawCursor))throw new AuthFailure(400,"session_invalid");jobCursor=rawCursor;}
+        if(rawLimit!==null){jobLimit=Number(rawLimit);if(!/^[1-9][0-9]?$/.test(rawLimit)||jobLimit>50)throw new AuthFailure(400,"session_invalid");}
+      }
       if (route.method === "POST") {
         assertSameOrigin(this.policy, request.headers);
         if (singleHeader(request.headers, "content-type") !== "application/json") throw new AuthFailure(400, "session_invalid");
@@ -192,6 +205,19 @@ export class WebAuthController {
         session_ref: session.session_ref, session_generation: session.session_generation, principal_revoke_generation: session.principal_revoke_generation,
         identity_binding_revision: session.identity_binding_revision, authz_revision: session.authz_revision, bff_generation: session.bff_generation };
       const context = signIngressContext(identity, ingressContextRequest(request.method, request.target, request.body), this.keys.context(), issued, new Date(deadline).toISOString());
+      if (["job_list","job_read","job_events"].includes(route.id)) {
+        if (!this.connections.jobRead) throw new AuthFailure(503,"identity_unavailable");
+        let cursor=jobCursor,limit=jobLimit;
+        if(route.id==="job_events") {cursor=singleHeader(request.headers,"last-event-id");if(!cursor||!/^[A-Za-z0-9_-]{43}$/.test(cursor))throw new AuthFailure(400,"session_invalid");}
+        auditAttempted=true;const result=await this.connections.jobRead.execute({codec_version:1,operation:route.id==="job_list"?"list":route.id==="job_read"?"detail":"events",
+          method:"GET",target:request.target,context,...(cursor?{cursor}:{}),...(limit?{limit}:{})});
+        if(Date.parse(now())>=deadline)throw new AuthFailure(503,"identity_unavailable");
+        if(result.status==="denied")return response(result.reason==="not_found"?404:result.reason==="scope_denied"?403:
+          result.reason==="invalid_request"?400:result.reason==="cursor_invalid"?409:503,{error:result.reason});
+        if(result.kind==="events")return eventResponse(result.reset_required?"reset":result.changed?"job":"heartbeat",result.event_cursor,
+          result.reset_required?{reset_required:true}:{job:result.job});
+        return response(200,result.kind==="list"?{items:result.items,next_cursor:result.next_cursor}:{job:result.job,event_cursor:result.event_cursor},false,maximumWebJobBrowserBodyBytes);
+      }
       const target = route.id === "dashboard" ? "/" : "/api/session";
       // Fetch MetadataはBFFでのみ解釈し、選択結果をUDS request全体のMACへ結ぶ。
       // poll/SSEやprogrammatic fetchをuser navigationとして保存しない。
