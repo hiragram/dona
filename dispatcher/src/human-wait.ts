@@ -44,6 +44,7 @@ export interface HumanWaitRepairResult {
   digest: string;
 }
 export interface VerifiedHumanWaitSessionSettlement {
+  provider_verified: true;
   event_id: string;
   workspace_id: string;
   channel_id: string;
@@ -186,8 +187,10 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         CASE WHEN COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN 'human_verified' ELSE 'unknown' END,
         CASE WHEN COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN 'human' END,
         CASE WHEN COUNT(DISTINCT a.principal_id)=1 AND COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN MIN(a.principal_id) END,
-        'owner','operator_review','job_group',NEW.source_event_id,NULL,MAX(COALESCE(a.resource_revision,a.binding_revision,1)),
-        'operator_review_unknown','origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,datetime(NEW.updated_at,'+30 days')
+        'owner',CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'provide_input' ELSE 'operator_review' END,
+        'job_group',NEW.source_event_id,NULL,MAX(COALESCE(a.resource_revision,a.binding_revision,1)),
+        CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'human_input' ELSE 'operator_review_unknown' END,
+        'origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,datetime(NEW.updated_at,'+30 days')
       FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id)
       WHERE j.source_event_id=NEW.source_event_id AND NEW.attention_event_id IS NOT NULL AND NEW.all_terminal_event_id IS NULL
       HAVING COUNT(*)>0
@@ -310,7 +313,7 @@ export class HumanWaitRepository {
       if (!completion) return false;
       const destination=JSON.parse(completion.destination_json) as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown;target?:Record<string,unknown>};
       const target=destination.kind==="slack"?destination.target:destination;
-      if(receipt.desired_session_status!=="suspended"||receipt.session_status!=="suspended"||
+      if(receipt.provider_verified!==true||receipt.desired_session_status!=="suspended"||receipt.session_status!=="suspended"||
         (target?.kind!=="thread"&&target?.kind!=="slack_thread")||
         target.workspace_id!==receipt.workspace_id||target.channel_id!==receipt.channel_id||target.thread_ts!==receipt.thread_ts) return false;
       const job = this.db.prepare("SELECT status,updated_at,source_event_id FROM jobs WHERE job_id=?").get(completion.job_id) as {status:string;updated_at:string;source_event_id:string}|undefined;
@@ -318,6 +321,7 @@ export class HumanWaitRepository {
         dedupe_key IN (?,?) ORDER BY CASE resource_kind WHEN 'job_group' THEN 0 ELSE 1 END LIMIT 1`)
         .get(`job:${completion.job_id}`,`group:${job.source_event_id}`) as HumanWaitItemRow | undefined : undefined;
       if (!job || !["blocked","needs_review"].includes(job.status) || !cause) return false;
+      if(cause.session_settlement_verified===1)return true;
       const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
         WHERE item_id=? AND state='open'`).run(settledAt,settledAt,cause.item_id).changes;
       if(changed!==1)return false;

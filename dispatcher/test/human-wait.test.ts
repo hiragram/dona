@@ -123,6 +123,7 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
   const group = waits.find(item => item.resource_kind === "job_group");
   assert.equal(group?.resource_id, source.event_id);
   assert.equal(group?.owner_principal_id, "U_WAIT");
+  assert.equal(group?.reason_code,"human_input");
   assert.equal(JSON.stringify(group).includes(second.objective), false);
   const terminalEvent=database.enqueue(eventEnvelope("Ev-group-terminal")).row;
   database.claimJobGroupTransition(source.event_id,"all_terminal",terminalEvent.event_id,new Date(transitionAt.getTime()+2_000));
@@ -138,9 +139,10 @@ test("session waitはdurable causeとverified suspended settlementの両方が�
     completed_at:transitionAt.toISOString() }, "/tmp/human-wait-session-source.json", transitionAt);
   const notification = database.enqueueJobNotification(job.job_id, new Date(transitionAt.getTime()+1_000)).row;
   const settledAt = new Date(transitionAt.getTime()+2_000).toISOString();
-  const receipt={event_id:notification.event_id,workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
+  const receipt={provider_verified:true as const,event_id:notification.event_id,workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
     desired_session_status:"suspended" as const,session_status:"suspended" as const};
   assert.equal(database.humanWaits.recordVerifiedSessionSettlement({...receipt,session_status:"active"}, settledAt), false);
+  assert.equal(database.humanWaits.recordVerifiedSessionSettlement(receipt, settledAt), true);
   assert.equal(database.humanWaits.recordVerifiedSessionSettlement(receipt, settledAt), true);
   const waits = database.humanWaits.listInternal();
   assert.equal(waits.length, 1);
