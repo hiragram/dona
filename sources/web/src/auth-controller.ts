@@ -18,6 +18,7 @@ import type { WebJobReadClient } from "./job-read-client.js";
 import { maximumWebJobBrowserBodyBytes } from "./job-read-wire.js";
 import type { WebCommandClient } from "./command-client.js";
 import { deriveWebIdempotencyKey, parseBrowserCommand } from "./browser-command.js";
+import { dashboardPage } from "./dashboard.js";
 
 type Index = { key_version: number; digest: string };
 type Snapshot = NonNullable<Extract<AuthReadResult, { operation: "session_lookup" }>["snapshot"]>;
@@ -263,6 +264,7 @@ export class WebAuthController {
       }
       const currentCsrf = this.csrf(snapshot, now());
       if (Date.parse(now()) >= deadline) throw new AuthFailure(503, "identity_unavailable");
+      if (route.id === "dashboard") return dashboardPage();
       return response(200, { principal: confirmation.principal, csrf_token: currentCsrf });
     } catch (error) {
       let failure = error instanceof AuthFailure ? error : error instanceof WebBoundaryError
