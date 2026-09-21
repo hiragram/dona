@@ -53,7 +53,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; submitIde
         body: `id: ${cursor}\nevent: ${event}\ndata: ${JSON.stringify({ job: snapshot })}\n\n` }); return;
     }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/cancel$/.test(url.pathname)) {
-      cancelWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/);if(options.pauseCancel)await options.pauseCancel;cancelSettled=true;
+      cancelWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/);if(options.pauseCancel&&cancelWrites===1)await options.pauseCancel;cancelSettled=true;
       if (options.cancelUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       if (options.cancelReason) { await fulfill(route, { error: options.cancelReason }, options.cancelReason === "owner_mismatch" ? 403 : 409); return; }
       current = job({ status: "cancelling", control: { can_cancel: false } }); await fulfill(route, { status: "succeeded", outcome: "cancelled", receipt_id: "cancel", job: { job_id: "job_alpha", status: "cancelling" } }); return;
@@ -132,8 +132,8 @@ test("cancelはexact jobをdialogで確認し結果不明でも再POSTしない"
 
 test("cancel照合は送信元principalへ戻るまで別principalに消費させない",async({page})=>{
   let release!:()=>void;const pauseCancel=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseCancel,sessionPrincipals:["principal-a","principal-b","principal-a"]});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await expect.poll(()=>f.cancelWrites).toBe(1);
-  await page.evaluate(()=>dispatchEvent(new FocusEvent("blur")));await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.locator("#principal")).toHaveText("principal-b");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeVisible();const before=f.detailReads;release();await page.waitForTimeout(100);expect(f.detailReads).toBe(before);await expect(page.getByRole("status")).not.toContainText("復帰前の取消は受付結果が不明です");
-  await page.evaluate(()=>dispatchEvent(new FocusEvent("blur")));await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.locator("#principal")).toHaveText("principal-a");await expect(page.getByRole("status")).toContainText("復帰前の取消は受付結果が不明です");await expect.poll(()=>f.detailReads).toBeGreaterThan(before);expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+  await page.evaluate(()=>dispatchEvent(new FocusEvent("blur")));await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.locator("#principal")).toHaveText("principal-b");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeVisible();await expect(page.getByRole("button",{name:"このジョブを取り消す"})).toBeEnabled();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await expect.poll(()=>f.cancelWrites).toBe(2);await expect(page.getByRole("status")).toContainText("取消受付を確認しました");const before=f.detailReads;release();await page.waitForTimeout(100);expect(f.detailReads).toBe(before);await expect(page.getByRole("status")).not.toContainText("復帰前の取消は受付結果が不明です");
+  await page.evaluate(()=>dispatchEvent(new FocusEvent("blur")));await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.locator("#principal")).toHaveText("principal-a");await expect(page.getByRole("status")).toContainText("復帰前の取消は受付結果が不明です");await expect.poll(()=>f.detailReads).toBeGreaterThan(before);expect(f.cancelWrites).toBe(2);expect(f.errors).toEqual([]);
 });
 
 test("current scopeがないrouteの操作を表示せずAPIも呼ばない", async ({ page }) => {
@@ -355,8 +355,16 @@ test("無操作中もsessionをactivityなしで再検証する",async({page})=>
   await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});let release!:()=>void;const pauseSecondSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondSession});await page.goto(policy.origin+"/");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();const before=f.sessionReads;await page.clock.fastForward(60001);await expect.poll(()=>f.sessionReads).toBe(before+1);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();release();await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.errors).toEqual([]);
 });
 
-test("session絶対期限ではprivate表示を自動消去する",async({page})=>{
-  await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});const f=await fixture(page,{sessionExpiresAt:"2026-09-21T00:00:01.000Z"});await page.goto(policy.origin+"/");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await page.clock.fastForward(1000);await expect.poll(()=>f.sessionReads).toBe(2);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");expect(f.errors).toEqual([]);
+test("定期session再検証で同じprincipalの編集中draftを復元する",async({page})=>{
+  await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});let release!:()=>void;const pauseSecondSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondSession});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("編集中の依頼");await page.getByLabel("作業場所").selectOption("github");await page.getByLabel("Repository").fill("owner/repository");await page.getByLabel("Base ref（任意）").fill("feature/base");await page.clock.fastForward(60001);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();release();await expect(page.getByLabel("依頼内容")).toHaveValue("編集中の依頼");await expect(page.getByLabel("Repository")).toHaveValue("owner/repository");await expect(page.getByLabel("Base ref（任意）")).toHaveValue("feature/base");expect(f.errors).toEqual([]);
+});
+
+test("定期session再検証でprincipalが変わった場合はdraftを復元しない",async({page})=>{
+  await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});const f=await fixture(page,{sessionPrincipals:["principal-a","principal-b"]});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("principal Aのdraft");await page.clock.fastForward(60001);await expect(page.locator("#principal")).toHaveText("principal-b");await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.errors).toEqual([]);
+});
+
+test("browser時計ではserverが有効と確認したsessionを拒否しない",async({page})=>{
+  await page.clock.install({time:new Date("2099-01-01T00:00:00.000Z")});const f=await fixture(page,{sessionExpiresAt:"2026-09-21T00:00:01.000Z"});await page.goto(policy.origin+"/");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await page.clock.fastForward(60001);await expect.poll(()=>f.sessionReads).toBe(2);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.errors).toEqual([]);
 });
 
 test("window focus復帰だけでもprivate表示を破棄して再検証する",async({page})=>{
