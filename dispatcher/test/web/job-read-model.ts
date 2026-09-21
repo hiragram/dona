@@ -281,6 +281,9 @@ test("can_cancelはowner・scope・現行cancel受付状態を満たす場合だ
     const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
     assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
   }
+  const unknown=f.seed(owner,"needs_review");f.raw.prepare("UPDATE jobs SET last_error_code='web_cancel_acceptance_unknown' WHERE job_id=?").run(unknown);
+  const unknownDetail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${unknown}`,context:"context"});
+  assert.equal(unknownDetail.status,"succeeded");if(unknownDetail.status==="succeeded"&&unknownDetail.kind==="detail")assert.equal(unknownDetail.job.control.can_cancel,false);
   const withoutScope=new WebJobReadBroker(readAuth(owner,["job:read:own"]) as never,f.jobs);
   const ownJob=f.seed(owner,"running"),ownDetail=withoutScope.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${ownJob}`,context:"context"});
   assert.equal(ownDetail.status,"succeeded");if(ownDetail.status==="succeeded"&&ownDetail.kind==="detail")assert.equal(ownDetail.job.control.can_cancel,false);

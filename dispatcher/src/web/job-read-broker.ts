@@ -68,5 +68,6 @@ export class WebJobReadBroker {
         artifacts:Array.isArray(parsed.artifacts)?parsed.artifacts.slice(0,32).map(artifact).filter((value):value is NonNullable<typeof value>=>value!==null):[]};}catch{}
     const candidate=safe(row.last_error_code,64),error=candidate&&/^[a-z0-9_]+$/u.test(candidate)?candidate:null;return webJobProjectionSchema.parse({job_id:row.job_id,status:row.status,created_at:row.created_at,updated_at:row.updated_at,
       completed_at:row.completed_at,progress:progress?{sequence:progress.sequence,phase:progress.phase,updated_at:progress.updated_at}:null,result,error_code:error,
-      control:{can_cancel:row.actor_id===principalId&&scopes.has("job:cancel:own")&&["queued","preparing","dispatching","retryable_failed","running","blocked","needs_review"].includes(row.status)}});}
+      control:{can_cancel:row.actor_id===principalId&&scopes.has("job:cancel:own")&&["queued","preparing","dispatching","retryable_failed","running","blocked","needs_review"].includes(row.status)
+        &&!(row.status==="needs_review"&&error==="web_cancel_acceptance_unknown")}});}
 }
