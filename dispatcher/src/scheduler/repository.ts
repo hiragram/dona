@@ -36,7 +36,7 @@ export type MaterializationDefinition = ScheduleDefinition;
 export interface Run {
   run_id: string; schedule_id: string; revision: number; occurrence_key: string; scheduled_for: string;
   status: "materialized" | "started" | "completed" | "failed" | "cancelled" | "skipped" | "needs_review";
-  reason: string | null; event_id: string | null; job_id: string | null; created_at: string;
+  reason: string | null; wait_reason: string | null; event_id: string | null; job_id: string | null; created_at: string;
   started_at: string | null; terminal_at: string | null;
 }
 export interface ScheduleView extends Schedule {
@@ -607,7 +607,8 @@ export class SchedulerRepository {
     if (!result) throw new Error("run_not_authorized");
     return result;
   }
-  markWorkRunNeedsReview(runId: string, jobId: string, now: string, sourceEventId: string): Run {
+  markWorkRunNeedsReview(runId: string, jobId: string, now: string, sourceEventId: string,
+    reason: "human_input" | "invalid_result" | "ambiguous_write" | "operator_review_unknown" = "ambiguous_write"): Run {
     utc(now); id(jobId); id(sourceEventId);
     return this.db.transaction(() => {
       const run = this.getRun(runId);
@@ -615,7 +616,7 @@ export class SchedulerRepository {
       if(run.status==="needs_review") return run;
       const before = this.get(run.schedule_id)!;
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
-      this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
+      this.db.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',wait_reason=? WHERE run_id=?").run(reason,runId);
       if(run.revision===before.revision) {
         this.suppress(run.schedule_id, at, "cancelled");
         this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND revision=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id,run.revision);
@@ -630,7 +631,7 @@ export class SchedulerRepository {
     utc(now);id(jobId);id(sourceEventId);
     const run=this.getRun(runId);
     if(!run||run.status!=="needs_review"||run.job_id!==jobId||run.event_id!==sourceEventId) return;
-    this.db.prepare("UPDATE schedule_runs SET status='started',reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
+    this.db.prepare("UPDATE schedule_runs SET status='started',reason=NULL,wait_reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
     const schedule=this.get(run.schedule_id);
     if(!schedule||schedule.revision!==run.revision)return;
     const revision=this.revision(schedule);
@@ -677,8 +678,9 @@ export class SchedulerRepository {
       if (!run || run.status !== "materialized" || run.job_id !== null) return;
       const before = this.get(run.schedule_id)!;
       const settledAt=[now,run.created_at,before.created_at,before.updated_at].sort().at(-1)!;
-      this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,terminal_at=? WHERE run_id=?")
-        .run(outcome, outcome === "needs_review" ? "ambiguous_write" : null, outcome === "failed" ? settledAt : null, run.run_id);
+      this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,wait_reason=?,terminal_at=? WHERE run_id=?")
+        .run(outcome, outcome === "needs_review" ? "ambiguous_write" : null, outcome === "needs_review" ? "ambiguous_write" : null,
+          outcome === "failed" ? settledAt : null, run.run_id);
       if (outcome === "needs_review") {
         this.db.prepare("UPDATE schedules SET state='needs_review',updated_at=? WHERE schedule_id=?").run(settledAt, run.schedule_id);
         this.retireRevisions(run.schedule_id, settledAt);
@@ -699,7 +701,7 @@ export class SchedulerRepository {
       const before = this.get(run.schedule_id)!;
       this.checked(before.schedule_id, before.revision, actor);
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
-      this.db.prepare("UPDATE schedule_runs SET status=?, reason=?, terminal_at=? WHERE run_id=?")
+      this.db.prepare("UPDATE schedule_runs SET status=?,reason=?,wait_reason=NULL,terminal_at=? WHERE run_id=?")
         .run(outcome, outcome === "cancelled" ? "cancelled" : null, at, runId);
       this.audit(before, this.get(run.schedule_id)!, `reconcile_work_${outcome}`, actor, at, undefined, this.getRun(runId)!);
       this.completeIfDrained(run.schedule_id, at);
@@ -900,7 +902,7 @@ export class SchedulerRepository {
       .run(add(ambiguousAt, 604800), ambiguousAt, row.outbox_id);
     this.suppress(run.schedule_id, ambiguousAt, "cancelled");
     if (row.kind === "slack.reminder.post") {
-      this.db.prepare("UPDATE schedule_runs SET status = 'needs_review', reason = 'ambiguous_write' WHERE run_id = ?").run(run.run_id);
+      this.db.prepare("UPDATE schedule_runs SET status='needs_review',reason='ambiguous_write',wait_reason='ambiguous_write' WHERE run_id=?").run(run.run_id);
     }
     this.db.prepare("UPDATE schedules SET state = 'needs_review', updated_at = ? WHERE schedule_id = ? AND state NOT IN ('cancelled','completed')").run(ambiguousAt, run.schedule_id);
     this.retireRevisions(run.schedule_id, ambiguousAt);
