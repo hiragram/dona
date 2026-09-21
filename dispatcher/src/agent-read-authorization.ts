@@ -7,6 +7,8 @@ export const agentReadSurfaces = [
   "list_thread_jobs",
   "list_owner_jobs",
   "get_job_status",
+  "list_human_waits",
+  "resolve_human_wait_origin",
 ] as const;
 
 export const agentReadGrantOperations = [
@@ -37,7 +39,7 @@ export interface AgentReadGrantInput {
   principal_id: string;
   job_id: string;
   source_event_id: string;
-  resource_kind: JobAuthorizationBindingRow["resource_kind"];
+  resource_kind: JobAuthorizationBindingRow["resource_kind"] | "job" | "job_group" | "notification" | "agent_session";
   repository_node_id: string | null;
   task_node_id: string | null;
   resource_revision: number | null;
@@ -46,6 +48,7 @@ export interface AgentReadGrantInput {
 
 export interface AgentReadGrantPort {
   authorize(input: Readonly<AgentReadGrantInput>): boolean;
+  revision?(input: Readonly<{operation:AgentReadGrantOperation;surface:AgentReadSurface;tenant_id:string;workspace_id:string;principal_id:string;policy_revision:number}>): string;
 }
 
 export interface AgentReadVisibilityInput {
@@ -62,6 +65,7 @@ export interface AgentReadVisibilityInput {
 
 export interface AgentReadVisibilityPort {
   authorize(input: Readonly<AgentReadVisibilityInput>): boolean;
+  revision?(input: Readonly<{operation:AgentReadGrantOperation;surface:AgentReadSurface;event_id:string;tenant_id:string;workspace_id:string;principal_id:string;disclosure_destination:unknown}>): string;
 }
 
 export interface RestrictedAgentReadAudit {
@@ -78,6 +82,7 @@ export interface RestrictedAgentReadAudit {
 
 export interface AgentReadDecision {
   allowed: boolean;
+  provider_failed?: boolean;
   authority: { allowed: boolean; reason: "none" | AgentReadDenyReason };
   disclosure: { allowed: boolean; reason: "none" | AgentReadDenyReason };
 }
@@ -176,6 +181,57 @@ export class AgentReadAuthorization {
       allowed = false;
     }
     return { allowed, authority, disclosure };
+  }
+
+  snapshot(input: Readonly<{context:AgentExecutionContext;operation:AgentReadGrantOperation;surface:AgentReadSurface;
+    disclosure_destination:unknown}>): {grant_revision:string;visibility_revision:string;policy_revision:number}|undefined {
+    if(input.context.purpose!=="human_command"||input.context.policy_revision!==this.policyRevision||input.disclosure_destination===undefined||
+      !this.grant.revision||!this.visibility.revision)return undefined;
+    try {
+      const common={operation:input.operation,surface:input.surface,tenant_id:input.context.tenant_id,
+        workspace_id:input.context.workspace_id,principal_id:input.context.principal_id,policy_revision:this.policyRevision};
+      const grantRevision=this.grant.revision(common);
+      const visibilityRevision=this.visibility.revision({...common,event_id:input.context.event_id,
+        disclosure_destination:input.disclosure_destination});
+      if(!/^[A-Za-z0-9_.:-]{1,160}$/.test(grantRevision)||!/^[A-Za-z0-9_.:-]{1,160}$/.test(visibilityRevision))return undefined;
+      return {grant_revision:grantRevision,visibility_revision:visibilityRevision,policy_revision:this.policyRevision};
+    } catch { return undefined; }
+  }
+
+  authorizeResource(input: Readonly<{context:AgentExecutionContext;operation:AgentReadGrantOperation;surface:AgentReadSurface;
+    resource:{item_id:string;source_event_id:string;resource_kind:AgentReadGrantInput["resource_kind"];resource_id:string;
+      resource_revision:number;owner_kind:"human_verified"|"schedule"|"unknown";owner_principal_kind:"human"|null;
+      owner_principal_id:string|null;tenant_id:string|null;workspace_id:string|null;owner_binding_current:boolean;disclosure_origin:unknown};
+    disclosure_destination:unknown}>):AgentReadDecision {
+    const {context,resource}=input;
+    let authorityReason:"none"|AgentReadDenyReason="none",providerFailed=false;
+    if(!resource.owner_binding_current)authorityReason="binding_unavailable";
+    else if(resource.owner_kind==="unknown"||resource.owner_principal_kind!=="human"||resource.owner_principal_id===null||
+      resource.tenant_id===null||resource.workspace_id===null)authorityReason="owner_not_human";
+    else if(resource.tenant_id!==context.tenant_id||resource.owner_principal_id!==context.principal_id)authorityReason="principal_mismatch";
+    else if(resource.workspace_id!==context.workspace_id)authorityReason="workspace_mismatch";
+    else if(context.policy_revision!==this.policyRevision)authorityReason="policy_revision_mismatch";
+    else try {
+      if(!this.grant.authorize({operation:input.operation,surface:input.surface,tenant_id:context.tenant_id,
+        workspace_id:context.workspace_id,principal_id:context.principal_id,job_id:resource.resource_id,
+        source_event_id:resource.source_event_id,resource_kind:resource.resource_kind,repository_node_id:null,task_node_id:null,
+        resource_revision:resource.resource_revision,policy_revision:this.policyRevision}))authorityReason="grant_unavailable";
+    } catch {authorityReason="grant_unavailable";providerFailed=true;}
+    const authority={allowed:authorityReason==="none",reason:authorityReason} as AgentReadDecision["authority"];
+    let disclosureReason:"none"|AgentReadDenyReason=authority.allowed?"none":authority.reason;
+    if(authority.allowed&&input.disclosure_destination===undefined)disclosureReason="destination_unavailable";
+    else if(authority.allowed)try {
+      if(!this.visibility.authorize({operation:input.operation,surface:input.surface,event_id:context.event_id,
+        tenant_id:context.tenant_id,workspace_id:context.workspace_id,principal_id:context.principal_id,
+        job_id:resource.resource_id,disclosure_origin:resource.disclosure_origin,disclosure_destination:input.disclosure_destination}))
+        disclosureReason="visibility_unavailable";
+    } catch {disclosureReason="visibility_unavailable";providerFailed=true;}
+    let disclosure={allowed:authority.allowed&&disclosureReason==="none",reason:disclosureReason} as AgentReadDecision["disclosure"];
+    let allowed=authority.allowed&&disclosure.allowed;
+    try {this.audit.record({event_id:context.event_id,job_id:resource.item_id,operation:input.operation,surface:input.surface,
+      outcome:allowed?"allowed":"denied",reason:allowed?"none":disclosure.reason,policy_revision:this.policyRevision});}
+    catch {disclosure={allowed:false,reason:"audit_unavailable"};allowed=false;providerFailed=true;}
+    return {allowed,authority,disclosure,...(providerFailed?{provider_failed:true}:{})};
   }
 }
 

@@ -143,12 +143,13 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
   const contexts = new AgentContextManager(database, config.agentCredentialPath, 60_000);
   const hidden = new Set<string>();
   const restrictedAudit: unknown[] = [];
-  const reads = new AgentReadAuthorization({ authorize: () => true }, {
+  const reads = new AgentReadAuthorization({ authorize: () => true,revision:()=>"grant-1" }, {
     authorize: input => {
-      const origin = input.disclosure_origin as { destination?: { channel_id?: string } };
+      const origin = input.disclosure_origin as { kind?:string;destination?: { channel_id?: string } };
       const destination = input.disclosure_destination as { channel_id?: string };
-      return !hidden.has(input.job_id) && origin.destination?.channel_id === destination.channel_id;
+      return !hidden.has(input.job_id) && (origin.kind==="human_wait_origin"||origin.destination?.channel_id === destination.channel_id);
     },
+    revision:()=>"visibility-1",
   }, { record: value => restrictedAudit.push(value) });
   const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
     undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts, reads);
@@ -168,7 +169,16 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.equal(visible.last_error_message, undefined);
     assert.doesNotMatch(JSON.stringify(visible), /PRIVATE-CANARY/);
 
+    const waits=await client.listHumanWaits(source.event_id,20);
+    assert.equal((waits.items as unknown[]).length,1);
+    assert.doesNotMatch(JSON.stringify(waits),/PRIVATE-CANARY|resource_id|source_event_id/);
+    const originRef=((waits.items as Array<{origin:{origin_ref:string}}>)[0]!).origin.origin_ref;
+    assert.equal((await client.resolveHumanWaitOrigin(source.event_id,originRef)).status,"available");
+
     hidden.add(first.job_id);
+    assert.deepEqual((await client.listHumanWaits(source.event_id,20)).items,[]);
+    await assert.rejects(()=>client.resolveHumanWaitOrigin(source.event_id,originRef),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===404);
     const listed = await client.listEventJobs(source.event_id);
     assert.deepEqual((listed.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
     assert.equal(listed.truncated, undefined);

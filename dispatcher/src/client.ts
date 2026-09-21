@@ -60,6 +60,15 @@ export class DispatcherApiClient {
     return this.request("GET", `/v1/jobs?${new URLSearchParams({ source_event_id: sourceEventId })}`, undefined, sourceEventId);
   }
 
+  listHumanWaits(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({limit:String(limit),...(cursor?{cursor}:{})});
+    return this.request("GET",`/v1/human-waits?${query}`,undefined,sourceEventId);
+  }
+
+  resolveHumanWaitOrigin(sourceEventId:string,originRef:string):Promise<Record<string,unknown>> {
+    return this.request("GET",`/v1/human-waits/origins/${encodeURIComponent(originRef)}`,undefined,sourceEventId);
+  }
+
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/steer`, input, sourceEventId(input));
   }

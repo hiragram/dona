@@ -39,6 +39,8 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "listOwnerJobs", args: [sourceEventId] });
         return { schema_version: 1, jobs: [] };
       },
+      async listHumanWaits(...args) { calls.push({method:"listHumanWaits",args}); return {schema_version:1,items:[],has_more:false}; },
+      async resolveHumanWaitOrigin(...args) { calls.push({method:"resolveHumanWaitOrigin",args}); return {schema_version:1,status:"available"}; },
       async steerJob(jobId, input) {
         calls.push({ method: "steerJob", args: [jobId, input] });
         return { schema_version: 1, job: { job_id: jobId, status: "running" } };
@@ -85,6 +87,8 @@ describe("Dona Dispatcher MCP server", () => {
         "list_event_jobs",
         "list_thread_jobs",
         "list_owner_jobs",
+        "list_human_waits",
+        "resolve_human_wait_origin",
         "get_job_status",
         "authorize_job_notification",
         "record_schedule_job_access",
