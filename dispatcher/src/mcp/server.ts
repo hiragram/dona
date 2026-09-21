@@ -28,7 +28,7 @@ export interface DispatcherJobClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   sendWorkerInstruction?(jobId:string,input:unknown):Promise<Record<string,unknown>>;
   getWorkerMessage?(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>>;
-  reconcileWorkerMessage?(jobId:string,sourceEventId:string,producer:"worker"|"dona-main",idempotencyKey:string):Promise<Record<string,unknown>>;
+  reconcileWorkerMessage?(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
@@ -400,11 +400,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("reconcile_worker_message", {
     title:"Reconcile worker message",
-    description:"write timeoutやdisconnect後に同じwriteを再送せず、job binding・producer・idempotency keyでdurable receiptとdelivery stateを照合します。",
-    inputSchema:{job_id:jobId,source_event_id:eventId,producer:z.enum(["worker","dona-main"]),idempotency_key:workerMessageKey},
+    description:"Donaからworkerへのwriteがtimeoutまたはdisconnectした後に再送せず、job bindingとidempotency keyでdurable receiptとdelivery stateを照合します。worker reportはjob固有runtime identityを伴うworker HTTP経路で照合します。",
+    inputSchema:{job_id:jobId,source_event_id:eventId,idempotency_key:workerMessageKey},
     annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
-  },async({job_id,source_event_id,producer,idempotency_key})=>{
-    try {if(!client.reconcileWorkerMessage)throw new Error("Worker messaging is unavailable");return success(await client.reconcileWorkerMessage(job_id,source_event_id,producer,idempotency_key));}
+  },async({job_id,source_event_id,idempotency_key})=>{
+    try {if(!client.reconcileWorkerMessage)throw new Error("Worker messaging is unavailable");return success(await client.reconcileWorkerMessage(job_id,source_event_id,idempotency_key));}
     catch(error){return failure(error,logger,"reconcile_worker_message");}
   });
 

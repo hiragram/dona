@@ -57,8 +57,8 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "getWorkerMessage", args: [jobId, messageId, sourceEventId] });
         return { schema_version: 1, message: { message_id: messageId } };
       },
-      async reconcileWorkerMessage(jobId, sourceEventId, producer, idempotencyKey) {
-        calls.push({ method: "reconcileWorkerMessage", args: [jobId, sourceEventId, producer, idempotencyKey] });
+      async reconcileWorkerMessage(jobId, sourceEventId, idempotencyKey) {
+        calls.push({ method: "reconcileWorkerMessage", args: [jobId, sourceEventId, idempotencyKey] });
         return { schema_version: 1, reconciliation: "matched" };
       },
       async planSelfUpdate(input) {
@@ -200,10 +200,10 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(message.isError,undefined);
       assert.deepEqual(calls.at(-1),{method:"getWorkerMessage",args:["job_01m1es03xy5cf8d9pm5cwx4srv",messageId,"evt_01M1ES03XY5CF8D9PM5CWX4SRV"]});
       const reconciled=await client.callTool({name:"reconcile_worker_message",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
-        source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",producer:"dona-main",idempotency_key:"instruction-1"}});
+        source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",idempotency_key:"instruction-1"}});
       assert.equal(reconciled.isError,undefined);
       assert.deepEqual(calls.at(-1),{method:"reconcileWorkerMessage",args:["job_01m1es03xy5cf8d9pm5cwx4srv",
-        "evt_01M1ES03XY5CF8D9PM5CWX4SRV","dona-main","instruction-1"]});
+        "evt_01M1ES03XY5CF8D9PM5CWX4SRV","instruction-1"]});
       const preview = await client.callTool({ name: "preview_schedule", arguments: {
         source_event_id: "evt_01M1ES03XY5CF8D9PM5CWX4SRV",
         definition: { recurrence: { version: 1, kind: "once", at: "2026-09-08T00:00:00Z" }, action: { kind: "reminder", body: "確認" } },

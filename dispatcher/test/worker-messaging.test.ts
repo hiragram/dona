@@ -429,6 +429,30 @@ test("worker-facing APIは同じownerのsibling runtimeを拒否する",async()=
   } finally {await api.stop();database.close();}
 });
 
+test("worker reportはterminal cleanup後も元runtimeでread-only reconcileできる",async()=>{
+  const {database,source,job,config}=await fixture();
+  bindRuntime(database,job.job_id,"runtime-terminal-reconcile");
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger); await api.start();
+  try {
+    const created=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,
+      report(source.event_id),{"x-dona-worker-runtime":"runtime-terminal-reconcile"});
+    assert.equal(created.status,202);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",
+      completed_at:"2026-09-21T00:00:04Z"},job.result_path);
+    database.markJobRuntimeCleaned(job.job_id);
+    assert.equal(database.getJobLiveSessionIdentity(job.job_id),undefined);
+    const reconciled=await request(config.socketPath,"GET",
+      `/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,
+      undefined,{"x-dona-worker-runtime":"runtime-terminal-reconcile"});
+    assert.equal(reconciled.status,200);
+    assert.equal(reconciled.body.reconciliation,"matched");
+    const rejected=await request(config.socketPath,"GET",
+      `/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,
+      undefined,{"x-dona-worker-runtime":"runtime-foreign"});
+    assert.equal(rejected.status,403);
+  } finally {await api.stop();database.close();}
+});
+
 test("既存DBへのadditive migrationはrow・user_version・FKを保持する",async()=>{
   const {database,source,job,config}=await fixture();
   database.close();

@@ -147,6 +147,13 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS worker_messages_job_idx ON worker_messages(job_id, accepted_at, message_id);
     CREATE INDEX IF NOT EXISTS worker_messages_retention_idx ON worker_messages(accepted_at, message_id);
 
+    CREATE TABLE IF NOT EXISTS worker_message_runtime_identities (
+      job_id                   TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+      runtime_identity_sha256  TEXT NOT NULL CHECK (length(runtime_identity_sha256) = 64),
+      first_seen_at            TEXT NOT NULL,
+      PRIMARY KEY(job_id, runtime_identity_sha256)
+    );
+
     CREATE TABLE IF NOT EXISTS worker_message_deliveries (
       delivery_id          TEXT PRIMARY KEY,
       message_id           TEXT NOT NULL REFERENCES worker_messages(message_id) ON DELETE CASCADE,
@@ -231,7 +238,12 @@ export class WorkerMessageRepository {
 
   appendWorkerReport(jobId: string, runtimeIdentity: string, raw: unknown, at = new Date()) {
     this.assertWorkerRuntime(jobId, runtimeIdentity);
-    return this.appendReport(jobId, raw, at);
+    return this.db.transaction(() => {
+      const result=this.appendReport(jobId, raw, at);
+      this.db.prepare(`INSERT OR IGNORE INTO worker_message_runtime_identities(job_id,runtime_identity_sha256,first_seen_at)
+        VALUES(?,?,?)`).run(jobId,sha256(runtimeIdentity),at.toISOString());
+      return result;
+    }).immediate();
   }
 
   appendReport(jobId: string, raw: unknown, at = new Date()) {
@@ -450,7 +462,7 @@ export class WorkerMessageRepository {
   }
 
   reconcileWorker(jobId:string,sourceEventId:string,runtimeIdentity:string,idempotencyKey:string) {
-    this.assertWorkerRuntime(jobId,runtimeIdentity);
+    this.assertWorkerReconciliationRuntime(jobId,runtimeIdentity);
     return this.reconcile(jobId,sourceEventId,"worker",idempotencyKey);
   }
 
@@ -584,10 +596,13 @@ export class WorkerMessageRepository {
           AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased'))
           AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=m.message_id))`)
         .run(at.toISOString(),cutoff);
-      return this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
+      const deleted=this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
         (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
         AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))
         AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=worker_messages.message_id)`).run(cutoff).changes;
+      this.db.prepare(`DELETE FROM worker_message_runtime_identities WHERE NOT EXISTS
+        (SELECT 1 FROM worker_messages WHERE worker_messages.job_id=worker_message_runtime_identities.job_id AND producer='worker')`).run();
+      return deleted;
     }).immediate();
   }
 
@@ -619,6 +634,17 @@ export class WorkerMessageRepository {
     const identity=this.db.prepare("SELECT herdr_agent_session_id FROM job_live_session_identities WHERE job_id=?")
       .get(jobId) as {herdr_agent_session_id:string}|undefined;
     if(!identity||identity.herdr_agent_session_id!==runtimeIdentity)
+      throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
+  }
+
+  private assertWorkerReconciliationRuntime(jobId:string,runtimeIdentity:string):void {
+    if(typeof runtimeIdentity!=="string"||runtimeIdentity.length<1||runtimeIdentity.length>512)
+      throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity is invalid");
+    const current=this.db.prepare("SELECT 1 FROM job_live_session_identities WHERE job_id=? AND herdr_agent_session_id=?")
+      .get(jobId,runtimeIdentity);
+    const historical=this.db.prepare("SELECT 1 FROM worker_message_runtime_identities WHERE job_id=? AND runtime_identity_sha256=?")
+      .get(jobId,sha256(runtimeIdentity));
+    if(!current&&!historical)
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
   }
 

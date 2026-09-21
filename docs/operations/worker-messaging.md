@@ -12,7 +12,7 @@ Worker Messaging は、worker と dona-main の途中経過・質問・判断を
 - worker report kind は `checkpoint`、`question`、`risk`、`decision_request` のclosed enum。
 - dona-main instruction operation は `answer`、`add_condition`、`change_priority` のclosed enum。
 - message全体は UTF-8 で16 KiB以下。本文は4,000文字以下、decision optionは各1,000文字・最大8件。
-- unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing report／claim／ACK／reconcileは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。
+- unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing report／claim／ACKは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。worker reportのread-only reconcileだけは、commit済みreportと同じruntime identityのSHA-256をretention期間中保持してterminal cleanup後も照合できるようにする。raw identityは履歴へ保存しない。
 - instructionはtyped operationであり、raw shell、path、URL、environment、credentialをcommand capabilityとして受け付けない。
 - `producer_sequence`はjob・producerごとに1から単調増加する。gapは`worker_message_sequence_gap`、未記録の巻き戻しは`worker_message_sequence_rollback`。
 - `idempotency_key`はjob・producerごとに一意。`source_event_id`、`producer_sequence`、key、payload、`correlation_message_id`、`conversation_revision`、`occurred_at`がすべて同一なら`reused`、いずれかが異なるcanonical messageは`worker_message_idempotency_conflict`。
@@ -37,7 +37,7 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - `GET /v1/jobs/{job_id}/messages/reconcile`: receiptとdelivery stateをread-only照合する。
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
-- MCPは`send_worker_instruction`、`get_worker_message`、`reconcile_worker_message`を公開する。
+- MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
 - `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`として相関message ID、次のproducer sequence、conversation revisionを返す。後続の人間回答はcurrent event bindingで`answer`へ変換し、通常のfree-form steerへ落とさない。
 
 ## 障害対応

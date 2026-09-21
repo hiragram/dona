@@ -73,8 +73,8 @@ export class DispatcherApiClient {
     const query=new URLSearchParams({source_event_id:sourceEventId});
     return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}?${query}`);
   }
-  reconcileWorkerMessage(jobId:string,sourceEventId:string,producer:"worker"|"dona-main",idempotencyKey:string):Promise<Record<string,unknown>> {
-    const query=new URLSearchParams({source_event_id:sourceEventId,producer,idempotency_key:idempotencyKey});
+  reconcileWorkerMessage(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({source_event_id:sourceEventId,producer:"dona-main",idempotency_key:idempotencyKey});
     return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/reconcile?${query}`);
   }
   previewSchedule(input: unknown) { return this.request("POST", "/v1/schedules/preview", input); }
