@@ -964,8 +964,19 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT * FROM job_live_session_identities WHERE job_id=?").get(jobId) as LiveSessionIdentityRow | undefined;
   }
 
-  appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string): void {
-    this.db.transaction(() => insertLiveSessionReceipt(this.db,sourceEventId,receipt,startedAt)).immediate();
+  appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string, identity?:LiveSessionIdentityRow): void {
+    this.db.transaction(() => {
+      insertLiveSessionReceipt(this.db,sourceEventId,receipt,startedAt);
+      const sequence=receipt.live_session.state_change_seq;
+      if(identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
+        const changed=this.db.prepare(`UPDATE job_live_session_identities SET max_state_change_seq=CASE
+          WHEN max_state_change_seq IS NULL OR max_state_change_seq<? THEN ? ELSE max_state_change_seq END
+          WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
+          .run(sequence,sequence,identity.job_id,identity.recorded_at,identity.herdr_agent_session_id,
+            identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name).changes;
+        if(changed!==1)throw new Error("Live session identity generation changed before audit append");
+      }
+    }).immediate();
   }
 
   getLiveSessionReceipt(jobId: string, receiptId: string): LiveSessionReceiptProjection | undefined {
@@ -974,11 +985,15 @@ export class DispatcherDatabase {
     return row ? projectLiveSessionReceipt(row) : undefined;
   }
 
-  latestLiveSessionStateChangeSeq(jobId: string, identityRecordedAt: string): number | undefined {
-    const row=this.db.prepare(`SELECT MAX(state_change_seq) AS state_change_seq FROM live_session_query_receipts
-      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL
-      `).get(jobId,identityRecordedAt) as {state_change_seq:number|null}|undefined;
-    return row?.state_change_seq ?? undefined;
+  latestLiveSessionStateChangeSeq(jobId: string, identity:LiveSessionIdentityRow): number | undefined {
+    const current=this.db.prepare(`SELECT max_state_change_seq FROM job_live_session_identities
+      WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
+      .get(jobId,identity.recorded_at,identity.herdr_agent_session_id,identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name) as {max_state_change_seq:number|null}|undefined;
+    const receipt=this.db.prepare(`SELECT MAX(state_change_seq) AS state_change_seq FROM live_session_query_receipts
+      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL`)
+      .get(jobId,identity.recorded_at) as {state_change_seq:number|null}|undefined;
+    const values=[current?.max_state_change_seq,receipt?.state_change_seq].filter((value):value is number=>value!==null&&value!==undefined);
+    return values.length>0?Math.max(...values):undefined;
   }
 
   liveSessionRetentionPlan(cutoff: string): { receipt_rows: number } {

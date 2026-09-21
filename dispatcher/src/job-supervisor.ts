@@ -141,14 +141,20 @@ export class JobSupervisor {
     }
     const after=this.database.getJob(jobId);
     if(!after)throw new Error(`Job ${jobId} disappeared during live observation`);
+    const storedIdentityAfter=this.database.getJobLiveSessionIdentity(jobId);
+    const identityGenerationKey=(identity:typeof storedIdentity):string=>JSON.stringify(identity?[identity.job_id,identity.identity_version,
+      identity.herdr_agent_session_id,identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name,identity.recorded_at]:null);
+    const identityGenerationChanged=identityGenerationKey(storedIdentityAfter)!==identityGenerationKey(storedIdentity)
+      || expectedLiveSessionIdentity(after,storedIdentityAfter)!==expectedIdentity;
     const completedAt=new Date().toISOString();
-    const previousStateChangeSeq=storedIdentity
-      ? this.database.latestLiveSessionStateChangeSeq(jobId,storedIdentity.recorded_at)
+    const previousStateChangeSeq=storedIdentity&&!identityGenerationChanged
+      ? this.database.latestLiveSessionStateChangeSeq(jobId,storedIdentity)
       : undefined;
     const receipt=buildLiveSessionReceipt({before,after,bootId:this.liveSessionBootId,startedAt,completedAt,
       ...(sourceEventId?{sourceEventId}:{}),...(expectedIdentity?{expectedIdentity}:{}),
+      ...(identityGenerationChanged?{identityGenerationChanged:true}:{}),
       ...(previousStateChangeSeq===undefined?{}:{previousStateChangeSeq}),...(result?{result}:{})});
-    this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt);
+    this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt,identityGenerationChanged?undefined:storedIdentity);
     return receipt;
   }
 

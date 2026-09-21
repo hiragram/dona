@@ -35,6 +35,7 @@ export interface LiveSessionIdentityRow {
   herdr_workspace_id: string | null;
   herdr_pane_id: string | null;
   agent_name: string | null;
+  max_state_change_seq: number | null;
   recorded_at: string;
 }
 
@@ -93,6 +94,7 @@ export interface LiveSessionObservationInput {
   startedAt: string;
   completedAt: string;
   expectedIdentity?: string;
+  identityGenerationChanged?: boolean;
   previousStateChangeSeq?: number;
   result?: HerdrCommandResult;
 }
@@ -112,9 +114,10 @@ export function migrateLiveSession(db: Database.Database): void {
       job_id TEXT PRIMARY KEY,
       identity_version INTEGER NOT NULL CHECK (identity_version = 1),
       herdr_agent_session_id TEXT NOT NULL CHECK (length(herdr_agent_session_id) BETWEEN 1 AND 512),
-      herdr_workspace_id TEXT NOT NULL,
-      herdr_pane_id TEXT NOT NULL,
-      agent_name TEXT NOT NULL,
+      herdr_workspace_id TEXT,
+      herdr_pane_id TEXT,
+      agent_name TEXT,
+      max_state_change_seq INTEGER CHECK (max_state_change_seq >= 0 OR max_state_change_seq IS NULL),
       recorded_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS live_session_query_receipts (
@@ -151,6 +154,7 @@ export function migrateLiveSession(db: Database.Database): void {
   for (const column of ["herdr_workspace_id", "herdr_pane_id", "agent_name"] as const) {
     if (!identityColumns.has(column)) db.exec(`ALTER TABLE job_live_session_identities ADD COLUMN ${column} TEXT`);
   }
+  if (!identityColumns.has("max_state_change_seq")) db.exec("ALTER TABLE job_live_session_identities ADD COLUMN max_state_change_seq INTEGER CHECK (max_state_change_seq >= 0 OR max_state_change_seq IS NULL)");
 }
 
 export function expectedLiveSessionIdentity(job: JobRow, identity: LiveSessionIdentityRow | undefined): string | undefined {
@@ -169,7 +173,7 @@ function classifyQuery(result: HerdrCommandResult | undefined, expectedIdentity:
   if (!result) return { queryStatus: "dispatcher_restarted", sessionState: null, identityMatch: null, sequence: null };
   if (result.aborted) return { queryStatus: "dispatcher_restarted", sessionState: null, identityMatch: null, sequence: null };
   if (result.timedOut) return { queryStatus: "query_timeout", sessionState: null, identityMatch: null, sequence: null };
-  if (!result.ok && ["agent_not_found", "not_found"].includes(result.errorCode ?? "")) {
+  if (!result.ok && ["agent_not_found", "agent_not_running", "not_found"].includes(result.errorCode ?? "")) {
     return { queryStatus: "agent_not_found", sessionState: null, identityMatch: null, sequence: null };
   }
   if (!result.ok) return { queryStatus: "transport_unavailable", sessionState: null, identityMatch: null, sequence: null };
@@ -193,6 +197,10 @@ function reconcile(input: LiveSessionObservationInput, query: ReturnType<typeof 
   const reasons = [`durable_${input.after.status}`, `live_${query.queryStatus}`];
   if (input.before.status !== input.after.status || Boolean(input.before.result_json) !== Boolean(input.after.result_json)) {
     reasons.push("durable_changed_during_query");
+  }
+  if (input.identityGenerationChanged) {
+    reasons.push("identity_generation_changed_during_query");
+    return { state: "unknown", confidence: "fail_closed", reasonCodes: reasons, safeNextAction: "do_not_retry" };
   }
   if (query.queryStatus === "not_addressable") {
     return { state: "not_addressable", confidence: "fail_closed", reasonCodes: reasons, safeNextAction: "do_not_retry" };
@@ -238,7 +246,8 @@ function reconcile(input: LiveSessionObservationInput, query: ReturnType<typeof 
 }
 
 export function buildLiveSessionReceipt(input: LiveSessionObservationInput): LiveSessionReceiptProjection {
-  const query = classifyQuery(input.result, input.expectedIdentity);
+  const classified = classifyQuery(input.result, input.expectedIdentity);
+  const query = input.identityGenerationChanged ? {...classified,identityMatch:null} : classified;
   const decision = reconcile(input, query);
   const duration = Math.max(0, Date.parse(input.completedAt) - Date.parse(input.startedAt));
   return {

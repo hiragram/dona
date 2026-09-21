@@ -65,6 +65,7 @@ describe("read-only live session reconciliation",()=>{
       ["mismatch",{ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working",agentIdentity:JSON.stringify(["other","pane-private","agent","session-private"]),stateChangeSeq:1},"observed","identity_conflict"],
       ["timeout",{ok:false,stdout:"",stderr:"secret",exitCode:null,timedOut:true,aborted:false},"query_timeout","unknown"],
       ["absent",{ok:false,stdout:"",stderr:"secret",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"},"agent_not_found","session_absent"],
+      ["stopped",{ok:false,stdout:"",stderr:"secret",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_running"},"agent_not_found","session_absent"],
       ["malformed",{ok:true,stdout:"secret",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working"},"malformed_response","unknown"],
     ] as const){
       const current=await addressableJob();const calls:string[]=[];
@@ -139,9 +140,17 @@ describe("read-only live session reconciliation",()=>{
       INSERT INTO job_live_session_identities VALUES('job_old',1,'session-old','2026-09-21T00:00:00Z');`);
     migrateLiveSession(raw);
     const columns=new Set((raw.prepare("PRAGMA table_info(job_live_session_identities)").all() as Array<{name:string}>).map(row=>row.name));
-    assert.equal(columns.has("herdr_workspace_id"),true);assert.equal(columns.has("herdr_pane_id"),true);assert.equal(columns.has("agent_name"),true);
-    const migrated=raw.prepare("SELECT herdr_workspace_id,herdr_pane_id,agent_name FROM job_live_session_identities").get() as Record<string,unknown>;
-    assert.deepEqual(migrated,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null});raw.close();
+    assert.equal(columns.has("herdr_workspace_id"),true);assert.equal(columns.has("herdr_pane_id"),true);assert.equal(columns.has("agent_name"),true);assert.equal(columns.has("max_state_change_seq"),true);
+    const migrated=raw.prepare("SELECT herdr_workspace_id,herdr_pane_id,agent_name,max_state_change_seq FROM job_live_session_identities").get() as Record<string,unknown>;
+    assert.deepEqual(migrated,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null,max_state_change_seq:null});raw.close();
+  });
+
+  test("fresh schemaは旧version 1 writerの4列INSERTを許可する",()=>{
+    const raw=new Database(":memory:");migrateLiveSession(raw);
+    assert.doesNotThrow(()=>raw.prepare(`INSERT INTO job_live_session_identities(
+      job_id,identity_version,herdr_agent_session_id,recorded_at) VALUES(?,1,?,?)`).run("job_old","session-old","2026-09-21T00:00:00Z"));
+    const row=raw.prepare("SELECT herdr_workspace_id,herdr_pane_id,agent_name,max_state_change_seq FROM job_live_session_identities").get() as Record<string,unknown>;
+    assert.deepEqual(row,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null,max_state_change_seq:null});raw.close();
   });
 
   test("並行queryは独立したappend-only receiptを作る",async()=>{
@@ -174,5 +183,32 @@ describe("read-only live session reconciliation",()=>{
     const supervisor=new JobSupervisor(reopened,runtimeWith(()=>{throw new Error("must not query stale identity");},calls),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     assert.equal(receipt.live_session.query_status,"not_addressable");assert.deepEqual(calls,[]);reopened.close();
+  });
+
+  test("query中にidentity世代が変わった観測はfail closedにする",async()=>{
+    const state=await addressableJob();const calls:string[]=[];
+    const supervisor=new JobSupervisor(state.database,runtimeWith(agentName=>{
+      const raw=new Database(state.config.databasePath);
+      raw.transaction(()=>{
+        raw.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=?").run("workspace-new","pane-new",state.job.job_id);
+        raw.prepare(`UPDATE job_live_session_identities SET herdr_agent_session_id=?,herdr_workspace_id=?,herdr_pane_id=?,recorded_at=? WHERE job_id=?`)
+          .run("session-new","workspace-new","pane-new","2026-09-21T01:00:00Z",state.job.job_id);
+      })();raw.close();
+      return {ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,agentStatus:"working",
+        agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:20};
+    },calls),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(receipt.reconciliation.state,"unknown");assert.equal(receipt.reconciliation.confidence,"fail_closed");
+    assert.equal(receipt.live_session.identity_match,null);assert.ok(receipt.reconciliation.reason_codes.includes("identity_generation_changed_during_query"));state.database.close();
+  });
+
+  test("retentionでreceiptを削除してもidentity世代のsequence high-waterを保持する",async()=>{
+    const state=await addressableJob();const calls:string[]=[];let sequence=12;
+    const supervisor=new JobSupervisor(state.database,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:sequence}),calls),state.config,logger,()=>{});
+    await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(state.database.purgeLiveSessionReceipts("9999-01-01T00:00:00Z").receipt_rows,1);
+    sequence=11;const regressed=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(regressed.reconciliation.state,"unknown");assert.ok(regressed.reconciliation.reason_codes.includes("state_sequence_regressed"));state.database.close();
   });
 });
