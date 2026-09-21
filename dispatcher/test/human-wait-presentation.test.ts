@@ -43,6 +43,8 @@ describe("自分待ちSlack表示",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 「私の待ちを一覧で見せて」と言えばいいですか？")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> ＂私の待ちを一覧で見せて＂と入力すればいいですか？")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event('<@U_BOT> "my waits list" と入力しますか？')),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("There is a bug in my waits list.")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("Please show me my waits.")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち受け画面を見せて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち時間を教えて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ちにはバグがあります。直してください")),false);
@@ -55,7 +57,7 @@ describe("自分待ちSlack表示",()=>{
   test("safe fieldだけからbounded日本語表示とopaque actionを作る",()=>{
     const rendered=renderHumanWaits({items:[item()],has_more:true,next_cursor:"opaque.cursor"},new Date("2026-09-21T12:00:00Z"));
     assert.equal(rendered.status,"ok");
-    assert.match(rendered.text,/自分待ちは1件/);
+    assert.match(rendered.text,/自分待ちはこのページに1件/);
     assert.match(rendered.text,/バックグラウンド作業 — 入力待ち（1時間、次: 入力する）/);
     assert.match(rendered.text,/「次を表示」/);
     assert.doesNotMatch(rendered.text,/wait_|origin_|PRIVATE|objective|error/);

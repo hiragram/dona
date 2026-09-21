@@ -412,9 +412,20 @@ export class HumanWaitRepository {
       JOIN jobs j USING(job_id) WHERE j.job_id=? AND j.source_event_id=?`).all(item.resource_id,item.parent_resource_id) as Array<{destination_json:string}>;
     else if(item.resource_kind==="job_group") rows=this.db.prepare(`SELECT b.destination_json FROM job_owner_bindings b
       JOIN jobs j USING(job_id) WHERE j.source_event_id=? ORDER BY j.job_id`).all(item.resource_id) as Array<{destination_json:string}>;
-    else if(item.resource_kind==="schedule_run") rows=this.db.prepare(`SELECT v.target_json AS destination_json FROM schedule_runs r
-      JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
-      WHERE r.run_id=? AND r.schedule_id=? AND r.revision=?`).all(item.resource_id,item.parent_resource_id,item.resource_revision) as Array<{destination_json:string}>;
+    else if(item.resource_kind==="schedule_run") {
+      const schedule=this.db.prepare(`SELECT v.target_json,v.authorization_id FROM schedule_runs r
+        JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+        WHERE r.run_id=? AND r.schedule_id=? AND r.revision=?`).get(item.resource_id,item.parent_resource_id,item.resource_revision) as {target_json:string;authorization_id:string}|undefined;
+      if(schedule) {
+        let target:unknown;
+        try{target=JSON.parse(schedule.target_json) as unknown;}catch{return undefined;}
+        if(target&&typeof target==="object"&&!Array.isArray(target)&&(target as {kind?:unknown}).kind==="none") {
+          const eventId=schedule.authorization_id.replace(/:\d+$/u,"");
+          rows=this.db.prepare("SELECT reply_target_json AS destination_json FROM events WHERE event_id=? AND source='slack' AND reply_target_json IS NOT NULL")
+            .all(eventId) as Array<{destination_json:string}>;
+        } else rows=[{destination_json:schedule.target_json}];
+      }
+    }
     else if(item.resource_kind==="notification") {
       rows=this.db.prepare(`SELECT o.target_json AS destination_json FROM connector_outbox o JOIN schedule_runs r USING(run_id)
         WHERE o.outbox_id=? AND r.run_id=? AND r.revision=?`).all(item.resource_id,item.parent_resource_id,item.resource_revision) as Array<{destination_json:string}>;

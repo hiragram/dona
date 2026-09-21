@@ -35,7 +35,7 @@ export function hasExplicitOwnHumanWaitIntent(event:EventRow,input:{continuation
     const tail=text.slice(japanese.index+japanese[0].length).trim();
     return /^(?:になっている(?:もの|項目)(?:は)?|(?:を|の|は|が|について)?\s*(?:(?:一覧|リスト)(?:で|を)?\s*(?:表示(?:して)?|見せて|みせて|教えて|おしえて|確認(?:したい|させて))?|(?:次|続き)(?:を)?(?:表示(?:して)?|見せて|みせて|お願い|おねがい)?|(?:何|どれ)(?:が)?(?:ありますか|ある(?:の|か)?|ですか)?|(?:ありますか|ある[?？]|表示して|見せて|みせて|教えて|おしえて|確認させて)))[。.!！?？]*$/u.test(tail);
   }
-  return /(?:waiting\s+on\s+me|my\s+(?:human\s+)?waits?)\b\s*(?:list|show|what|any|next|more)\b[.!?]*$/iu.test(text);
+  return /^(?:(?:please\s+)?(?:list|show)(?:\s+me)?\s+(?:what(?:'s|\s+is)?\s+)?(?:waiting\s+on\s+me|my\s+(?:human\s+)?waits?)|(?:what|which)(?:\s+items?)?\s+(?:is|are)\s+(?:waiting\s+on\s+me|in\s+my\s+(?:human\s+)?waits?)|(?:waiting\s+on\s+me|my\s+(?:human\s+)?waits?)\s*(?:list|show|what|any|next|more))\b[.!?]*$/iu.test(text);
 }
 
 const category:Record<HumanWaitProjection["category"],string>={
@@ -65,8 +65,9 @@ export function renderHumanWaits(input:{items:HumanWaitProjection[];has_more:boo
   if(items.length===0&&!input.has_more)return {status:"empty",text:"現在確認できる自分待ちはありません。",actions:[],has_more:false};
   const lines=items.map((item,index)=>`${index+1}. ${category[item.category]} — ${reason[item.reason]}（${elapsed(item.updated_at,now)}、次: ${decision[item.decision]}）`);
   const suffix=input.has_more?"\n続きがあります。「次を表示」と明示してください。":"";
-  let text=`現在確認できる自分待ちは${items.length}件です。\n${lines.join("\n")}${suffix}`;
-  if(text.length>1800)text=`現在確認できる自分待ちは${items.length}件です。\n${lines.slice(0,5).join("\n")}\n表示上限に達しました。`;
+  const count=input.has_more?`現在確認できる自分待ちはこのページに${items.length}件です。`:`現在確認できる自分待ちは${items.length}件です。`;
+  let text=`${count}\n${lines.join("\n")}${suffix}`;
+  if(text.length>1800)text=`${count}\n${lines.slice(0,5).join("\n")}\n表示上限に達しました。`;
   return {status:"ok",text,actions:items.map((item,index)=>({position:index+1,origin_ref:item.origin.origin_ref,revision:item.revision})),
     has_more:input.has_more,...(input.next_cursor?{next_cursor:input.next_cursor}:{})};
 }

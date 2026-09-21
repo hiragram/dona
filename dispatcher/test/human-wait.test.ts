@@ -393,6 +393,20 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
   } finally { harness.close(); }
 });
 
+test("通知なしschedule runは承認threadを開示元として再解決する",()=>{
+  const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
+  try {
+    const due="2026-09-05T00:01:00Z",input=harness.input("work.read_only",false,due);
+    input.target={kind:"none"};
+    const runId=harness.materialize("human-wait-no-notify",input,due);
+    harness.raw.prepare("UPDATE schedule_runs SET status='needs_review',wait_reason='human_input',terminal_at=? WHERE run_id=?").run(due,runId);
+    const wait=harness.database.humanWaits.listInternal()[0]!;
+    assert.deepEqual(harness.database.humanWaits.disclosureDestination(wait),{
+      kind:"slack_thread",workspace_id:"T_GATE",channel_id:"C_GATE",thread_ts:"1.000001",
+    });
+  } finally {harness.close();}
+});
+
 test("schedule notificationは後から確定したeventへ追随する", () => {
   const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
   try {
