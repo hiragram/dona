@@ -6,7 +6,7 @@ import { AuditRepository } from "../audit/repository.js";
 import type { AuditEvent, VerifiedAuditState } from "../audit/codec.js";
 import { ApprovalTransaction, type ApprovalTransactionProviders } from "../approval/transaction.js";
 import type { ClockMark } from "../approval/clock.js";
-import { evaluateSession, type RegistryPrincipal } from "./domain.js";
+import { evaluateSession, type RegistryPrincipal, type WebPrincipal } from "./domain.js";
 import { encodeWebAuthState, decodeWebAuthState, encodeWebPayload, verifyWebPayload, webPayloadBinding, webStateScopeSchema,
   WebStateError, type WebAuthState, type WebStateScope, type StoredWebLogin, type StoredWebPayload, type StoredWebSession } from "./model.js";
 import { restartWebAuthState, pruneExpiredWebState } from "./lifecycle.js";
@@ -19,7 +19,9 @@ export type WebIndexCandidate = z.infer<typeof indexSchema>;
 export const webAuthDenialReasonSchema = z.enum(["identity_invalid", "identity_unavailable", "identity_mismatch", "session_invalid",
   "session_revoked", "session_expired", "origin_invalid", "csrf_invalid", "cookie_invalid", "cookie_ambiguous"]);
 export type WebAuthDenialReason = z.infer<typeof webAuthDenialReasonSchema>;
-export type WebStoreResult = SessionIngressResult | { status: "denied"; reason: AuditEvent["reason"] }
+export type WebJobReadIngressResult = {status:"denied";reason:AuditEvent["reason"]}
+  | {status:"succeeded";kind:"job_read_session_verified";principal:WebPrincipal;session_ref:string;effective_utc:string};
+export type WebStoreResult = SessionIngressResult | WebJobReadIngressResult | { status: "denied"; reason: AuditEvent["reason"] }
   | { status: "succeeded"; kind: "initialized" | "restarted" | "login_created" | "session_created" | "revoked" | "expired"; generation: number }
   | { status: "succeeded"; kind: "login_consumed"; login: StoredWebLogin; payload: StoredWebPayload; receipt_id: string };
 type Plan = { next: WebAuthState | undefined; payloads: StoredWebPayload[]; result: WebStoreResult; principal?: RegistryPrincipal; session_ref?:string|null };
@@ -145,6 +147,47 @@ export class WebAuthRepository {
         if(!session)throw new WebStateError();this.payload(session);
       }
       return {next:plan.next,result:plan.result,payloads:[],session_ref:plan.session_ref,...(plan.principal?{principal:plan.principal}:{})};
+    });
+  }
+
+  /** Job-read-specific extension. The generic session result and auth semantics
+   * remain unchanged; this returns only server-derived clock/session evidence. */
+  verifyJobReadIngress(transactionId:string,token:string,method:unknown,target:unknown,body:Uint8Array):WebJobReadIngressResult {
+    return this.commit(transactionId,"web.session.v1",null,(state,mark)=>{
+      if(!state)return deny(state,"deployment_invalid");
+      if(!this.contextKeys)return deny(state,"identity_unavailable");
+      const plan=prepareSessionIngress(state,token,method,target,body,mark.effective_utc,this.contextKeys);
+      if(plan.result.status==="denied")return{next:plan.next,result:plan.result,payloads:[],session_ref:plan.session_ref,
+        ...(plan.principal?{principal:plan.principal}:{})};
+      const session=state.sessions.find(row=>row.state.session_ref===plan.session_ref);
+      if(!session)throw new WebStateError();this.payload(session);
+      return{next:plan.next,result:{status:"succeeded",kind:"job_read_session_verified",principal:plan.result.principal,
+        session_ref:session.state.session_ref,effective_utc:mark.effective_utc},payloads:[],session_ref:session.state.session_ref,
+        ...(plan.principal?{principal:plan.principal}:{})};
+    }) as WebJobReadIngressResult;
+  }
+
+  auditJobReadOutcome(transactionId:string,authority:Extract<WebJobReadIngressResult,{status:"succeeded"}>,
+    operation:"web.job_list.v1"|"web.job_read.v1"|"web.sse_subscribe.v1",resourceId:string,
+    outcome:"succeeded"|"denied"|"failed",reason:"none"|"resource_not_visible"|"scope_denied"|"invalid_input"|"unavailable"):boolean {
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(resourceId))throw new WebStateError();
+    return this.transaction.runPrepared(transactionId,(mark,verified)=>{
+      const loaded=this.load(verified)?.state;if(!loaded)throw new WebStateError();
+      const storedPrincipal=loaded.principals.find(row=>row.principal_id===authority.principal.principal_id);
+      const session=loaded.sessions.find(row=>row.state.session_ref===authority.session_ref);
+      const decision=storedPrincipal&&session?evaluateSession(storedPrincipal,session.state,
+        {instance_id:loaded.instance_id,tenant_id:loaded.tenant_id,bff_generation:loaded.bff_generation},mark.effective_utc):null;
+      const current=decision?.allowed===true&&decision.principal.instance_id===authority.principal.instance_id
+        &&decision.principal.tenant_id===authority.principal.tenant_id
+        &&decision.principal.principal_id===authority.principal.principal_id
+        &&decision.principal.identity_binding_revision===authority.principal.identity_binding_revision
+        &&decision.principal.authz_revision===authority.principal.authz_revision;
+      const event:Omit<AuditEvent,"occurred_at">={scope:this.scope,actor:{kind:"principal",id:authority.principal.principal_id},
+        action:"web_authorize",operation,resource_id:resourceId,outcome:current?outcome:"denied",
+        reason:current?reason:(decision?.allowed===false?decision.reason:"session_invalid"),session_ref:authority.session_ref,
+        receipt_id:transactionId,attempt_id:null,policy_revision:1,binding_revision:authority.principal.identity_binding_revision,
+        authz_revision:authority.principal.authz_revision};
+      return{event,resource_digest:null,mutation:()=>current};
     });
   }
 
@@ -320,6 +363,16 @@ export class WebAuthRepository {
       if (matches.size > 1) throw new WebStateError();
       const principal = state.principals.find(value => matches.has(value.principal_id));
       return principal ? { principal, bff_generation: state.bff_generation } : null;
+    });
+  }
+
+  /** Local operator projection only. The caller still owns resource-level
+   * authorization; this supplies one current audit-verified registry row. */
+  lookupPrincipalById(principalId:string) {
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(principalId))throw new WebStateError();
+    return this.audit.readVerifiedState(verified=>{
+      const state=this.load(verified)?.state;if(!state)throw new WebStateError();
+      return state.principals.find(value=>value.principal_id===principalId)??null;
     });
   }
 

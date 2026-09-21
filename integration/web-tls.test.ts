@@ -110,7 +110,7 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
     jobs.markJobCancelled(jobId, "fixture"); return { row: jobs.getJob(jobId)!, duplicate: before.status === "cancelled" || row.status === "cancelled" };
   } };
   const configuredPolicy = await tlsPolicy();
-  const f = await fixture(t, configuredPolicy, repository => new WebCommandBroker(repository, jobs, controls as never, config));
+  const f = await fixture(t, configuredPolicy, { commands: repository => new WebCommandBroker(repository, jobs, controls as never, config) });
   const policy = f.local.policy;
   const command = new WebCommandClient(f.socket, scope, () => f.credential, f.lookup, f.local.now); let loseResponse = false;
   let mismatchOperation = false;

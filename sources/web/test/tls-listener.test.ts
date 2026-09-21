@@ -22,7 +22,7 @@ test("実TLSで公開ページと固定assetを返し未知経路を認証サー
     assert.equal(reply.status, 200); assert.equal(reply.headers["cache-control"], "no-store"); assert.equal(reply.headers["referrer-policy"], "no-referrer");
     assert.equal(reply.headers.connection, "close"); assert.equal(reply.headers["content-length"], String(Buffer.byteLength(reply.body)));
   }
-  for (const target of ["/login?private=value", "/assets/%6cogin.js", "/api/jobs", "/api/approvals/fixture", "/../login"])
+  for (const target of ["/login?private=value", "/assets/%6cogin.js", "/api/approvals/fixture", "/../login"])
     assert.equal((await request(policy, target)).status, 404);
   assert.deepEqual(composition.calls, []);
   assert.equal((await request(policy, "/login", "GET", { host: "other.invalid" })).status, 400);

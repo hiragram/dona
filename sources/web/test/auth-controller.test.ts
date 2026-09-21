@@ -70,7 +70,7 @@ test("Host・Origin・Fetch Metadata・cookie・bodyの不正はprivate data取�
     header(f.request(), "cookie", "__Host-dona_session=" + f.cookie + "; __Host-dona_session=" + f.cookie),
     header(f.request(), "cookie", "__Host-dona_session=invalid"), header(f.request(), "cookie"),
     { ...f.request("/api/session/logout", "POST"), body: Buffer.from('{"principal_id":"other"}') },
-    header(f.request("/api/session/logout", "POST"), "content-type", "text/plain"), f.request("/api/jobs"),
+    header(f.request("/api/session/logout", "POST"), "content-type", "text/plain"), f.request("/api/jobs?actor_id=other"),
   ];
   for (let i = 0; i < variants(controllerFixture()).length; i++) {
     const f = controllerFixture(), result = await f.controller.handle(variants(f)[i]!); privateFailure(result);
@@ -251,4 +251,21 @@ test("古いBFFは新世代のsessionを採用せず現行BFFだけが旧cookie�
   const current=new WebAuthController(f.policy,f.connections,f.keys,f.now,2);
   assert.equal((await current.handle(f.request("/api/session/logout","POST"))).status,204);
   assert.throws(()=>new WebAuthController(f.policy,f.connections,f.keys,f.now,0));
+});
+
+test("SSE cursorはLast-Event-IDをbrowser境界で検証し期限切れだけ409へ写像する",async()=>{
+  for(const mode of ["missing","malformed","duplicate","expired"] as const){const f=controllerFixture();let reads=0;
+    f.connections.jobRead={execute:async()=>{reads++;return{status:"denied",reason:"cursor_invalid"};}};
+    let request=f.request("/api/jobs/job_1/events");
+    if(mode==="malformed")request=header(request,"last-event-id","bad");
+    if(mode==="duplicate")request={...request,headers:[...request.headers,["last-event-id","a".repeat(43)],["last-event-id","b".repeat(43)]]};
+    if(mode==="expired")request=header(request,"last-event-id","a".repeat(43));
+    const result=await f.controller.handle(request);assert.equal(result.status,mode==="expired"?409:mode==="duplicate"?403:400,mode);assert.equal(reads,mode==="expired"?1:0,mode);
+  }
+});
+
+test("job read内部障害はidentity_unavailableへ正規化する",async()=>{const f=controllerFixture();
+  f.connections.jobRead={execute:async()=>({status:"denied",reason:"internal_error"})};
+  const result=await f.controller.handle(f.request("/api/jobs"));
+  assert.equal(result.status,503);assert.equal(result.body,'{"error":"identity_unavailable"}');privateFailure(result);
 });

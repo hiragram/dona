@@ -23,7 +23,7 @@ export interface WebTlsComposition {
 }
 const maximumConnections = 32, maximumControllers = 32;
 const handshakeMs = 5000, secureLifetimeMs = 10000;
-type Reply = { status: number; headers: Record<string, string | string[]>; body: string };
+type Reply = { status: number; headers: Record<string, string | string[]>; body: string; maximumBodyBytes?: number };
 const errorReply = (status: number): Reply => ({ status, headers: { ...privateHeaders, "content-type": "application/json; charset=utf-8" },
   body: JSON.stringify({ error: status === 404 ? "not_found" : status === 503 ? "web_unavailable" : "request_invalid" }) });
 
@@ -106,7 +106,7 @@ export class WebLoopbackTlsListener {
     response.once("error", () => response.destroy());
     if (response.destroyed || !response.socket || response.socket.destroyed || response.headersSent) return;
     try {
-      if (Buffer.byteLength(reply.body) > 131072) throw Error();
+      if (Buffer.byteLength(reply.body) > (reply.maximumBodyBytes ?? 131072)) throw Error();
       response.shouldKeepAlive = false;
       response.writeHead(reply.status, { ...reply.headers, "cache-control": "no-store", "referrer-policy": "no-referrer",
         connection: "close", "content-length": String(Buffer.byteLength(reply.body)) });
@@ -135,7 +135,7 @@ export class WebLoopbackTlsListener {
         const route = matchWebRoute(method, target); routeId = route.id;
         if (["login", "login_complete"].includes(route.id)) controller = "public";
         else if (["prelogin_csrf", "login_start", "login_callback"].includes(route.id)) controller = "login";
-        else if (["dashboard", "session", "local_csrf", "logout", "logout_status", "job_submit", "job_cancel"].includes(route.id)) controller = "auth";
+        else if (["dashboard", "session", "local_csrf", "logout", "logout_status", "job_list", "job_read", "job_events", "job_submit", "job_cancel"].includes(route.id)) controller = "auth";
         else throw Error();
       }
     } catch { request.resume(); this.respond(response, errorReply(404)); return; }
