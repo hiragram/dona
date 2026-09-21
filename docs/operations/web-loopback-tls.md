@@ -4,7 +4,7 @@
 
 `WebLoopbackTlsListener`は#141の部分対応として、loopback/direct_tlsの固定policyを既存の公開ページ・ログイン・セッションcontrollerへ接続する。importではlistenせず、明示`start()`を一度だけ実行する。`close()`は同じPromiseを返し、終了後やbind失敗後に同じinstanceを再起動しない。
 
-`private`/`internet`のproxy_udsはこのlistenerでは起動を拒否する。汎用handler、任意proxy、job/approval routeは追加しない。`/`は既存の認証済みprincipal JSONであり、完成したdashboard HTMLではない。
+`private`/`internet`のproxy_udsはこのlistenerでは起動を拒否する。汎用handlerや任意proxyは追加しない。認証済み`GET /`は固定CSPのdashboard HTMLを返し、同一originの`/api/session`、principalに許可されたjob一覧・詳細・SSE・submit・cancel、local logoutだけを固定routeとして扱う。approval操作はこのdashboardの対応範囲に含めない。
 
 ## 証明書と保護時刻
 
@@ -26,7 +26,7 @@ socket切断・期限到達は、既に受理された監査mutationの取消を
 
 ## 検証
 
-合成証明書をNode clientの`ca`へ明示し、実TLSで公開ページ、固定asset、拒否応答、曖昧HTTP、起動/終了、handshake/body期限、切断後のcontroller上限を確認する。実SQLite・native extension・共有監査repository・私有UDSへの結合テストでは、login rotation、local logout、曖昧cookie、session作成の応答喪失を検証する。自動pollやsession確認でactivityを更新しない既存境界を維持する。
+合成証明書をNode clientの`ca`へ明示し、実TLSで公開ページ、認証済みdashboard、固定asset、拒否応答、曖昧HTTP、起動/終了、handshake/body期限、切断後のcontroller上限を確認する。実SQLite・native extension・共有監査repository・私有UDSへの結合テストでは、login rotation、local logout、principal-scoped job read・SSE・submit、曖昧cookie、session作成とwriteの応答喪失を検証する。自動pollやsession確認でactivityを更新しない既存境界を維持する。
 
 fixtureのIdP fetch、保護鍵、anchor、clockは実providerではない。OSのtrust設定、実IdP、WebAuthn、production credential配備、稼働runtime起動は未検証であり、このPRでは操作しない。既存Playwrightテストはnetwork mockによるUI検証で、信頼済みbrowser TLSの証拠とは分ける。
 
