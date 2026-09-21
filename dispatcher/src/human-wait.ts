@@ -381,7 +381,7 @@ export class HumanWaitRepository {
     if (!Number.isFinite(Date.parse(input.snapshotRevision)) || new Date(Date.parse(input.snapshotRevision)).toISOString() !== input.snapshotRevision) throw new Error("human_wait_snapshot_invalid");
     type Candidate={source_key:string;kind:"job"|"group"|"run"|"completion"|"outbox";resource_id:string;projected_resource_id:string;aux_id:string|null;source_revision:string;desired_open:number;dedupe_key:string};
     type ExpectedProjection=Pick<HumanWaitItemRow,"tenant_id"|"workspace_id"|"owner_kind"|"owner_principal_kind"|"owner_principal_id"|
-      "decision_actor_kind"|"decision_kind"|"resource_kind"|"resource_id"|"parent_resource_id"|"resource_revision"|"reason_code">;
+      "decision_actor_kind"|"decision_kind"|"resource_kind"|"resource_id"|"parent_resource_id"|"resource_revision"|"reason_code"|"source_revision">;
     const expectedProjection=(row:Candidate):ExpectedProjection|undefined=>{
       if(row.kind==="job")return this.db.prepare(`SELECT
         CASE WHEN a.owner_kind='human_verified' THEN a.tenant_id WHEN json_extract(b.owner_json,'$.kind')='schedule' THEN json_extract(b.owner_json,'$.tenant_id') END AS tenant_id,
@@ -394,7 +394,8 @@ export class HumanWaitRepository {
           WHEN j.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'review_result' ELSE 'operator_review' END AS decision_kind,
         'job' AS resource_kind,j.job_id AS resource_id,j.source_event_id AS parent_resource_id,COALESCE(a.resource_revision,a.binding_revision,1) AS resource_revision,
         CASE WHEN j.status='blocked' THEN 'human_input' WHEN j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','steer_acceptance_unknown','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'ambiguous_write'
-          WHEN j.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'invalid_result' ELSE 'operator_review_unknown' END AS reason_code
+          WHEN j.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'invalid_result' ELSE 'operator_review_unknown' END AS reason_code,
+        j.updated_at AS source_revision
         FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id) LEFT JOIN job_owner_bindings b USING(job_id) WHERE j.job_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
       if(row.kind==="group")return this.db.prepare(`SELECT MIN(a.tenant_id) AS tenant_id,MIN(a.workspace_id) AS workspace_id,
         CASE WHEN COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN 'human_verified' ELSE 'unknown' END AS owner_kind,
@@ -402,25 +403,28 @@ export class HumanWaitRepository {
         CASE WHEN COUNT(DISTINCT a.principal_id)=1 AND COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN MIN(a.principal_id) END AS owner_principal_id,
         'owner' AS decision_actor_kind,CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'provide_input' ELSE 'operator_review' END AS decision_kind,
         'job_group' AS resource_kind,j.source_event_id AS resource_id,NULL AS parent_resource_id,MAX(COALESCE(a.resource_revision,a.binding_revision,1)) AS resource_revision,
-        CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'human_input' ELSE 'operator_review_unknown' END AS reason_code
-        FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id) WHERE j.source_event_id=? GROUP BY j.source_event_id`).get(row.resource_id) as ExpectedProjection|undefined;
+        CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'human_input' ELSE 'operator_review_unknown' END AS reason_code,
+        g.updated_at AS source_revision FROM job_groups g JOIN jobs j USING(source_event_id) LEFT JOIN job_authorization_bindings a USING(job_id)
+        WHERE g.source_event_id=? GROUP BY g.source_event_id`).get(row.resource_id) as ExpectedProjection|undefined;
       if(row.kind==="run")return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
         'owner' AS decision_actor_kind,CASE WHEN r.reason='ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END AS decision_kind,
         'schedule_run' AS resource_kind,r.run_id AS resource_id,r.schedule_id AS parent_resource_id,r.revision AS resource_revision,
-        CASE WHEN r.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END AS reason_code
+        CASE WHEN r.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END AS reason_code,
+        CASE WHEN julianday(COALESCE(r.terminal_at,r.created_at))>=julianday(s.updated_at) THEN COALESCE(r.terminal_at,r.created_at) ELSE s.updated_at END AS source_revision
         FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
       if(row.kind==="completion")return this.db.prepare(`SELECT json_extract(owner_json,'$.tenant_id') AS tenant_id,json_extract(owner_json,'$.tenant_id') AS workspace_id,
         'schedule' AS owner_kind,'human' AS owner_principal_kind,json_extract(owner_json,'$.owner_id') AS owner_principal_id,'owner' AS decision_actor_kind,
         'reconcile_write' AS decision_kind,'notification' AS resource_kind,COALESCE(notification_event_id,job_id) AS resource_id,job_id AS parent_resource_id,
-        COALESCE(json_extract(owner_json,'$.revision'),1) AS resource_revision,'notification_reconcile' AS reason_code
+        COALESCE(json_extract(owner_json,'$.revision'),1) AS resource_revision,'notification_reconcile' AS reason_code,
+        COALESCE((SELECT updated_at FROM events WHERE event_id=notification_event_id),materialized_at) AS source_revision
         FROM job_completion_results WHERE job_id=? AND job_status=?`).get(row.resource_id,row.aux_id) as ExpectedProjection|undefined;
       return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
         'owner' AS decision_actor_kind,'reconcile_write' AS decision_kind,'notification' AS resource_kind,o.outbox_id AS resource_id,o.run_id AS parent_resource_id,
-        r.revision AS resource_revision,'ambiguous_write' AS reason_code FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
+        r.revision AS resource_revision,'ambiguous_write' AS reason_code,o.updated_at AS source_revision FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
         WHERE o.outbox_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
     };
     const derivedProjectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection)=>
-      Object.entries(expected).some(([key,value])=>item[key as keyof HumanWaitItemRow]!==value);
+      Object.entries(expected).some(([key,value])=>key!=="source_revision"&&item[key as keyof HumanWaitItemRow]!==value);
     const projectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection,row:Candidate)=>
       item.source_revision!==row.source_revision||derivedProjectionMismatch(item,expected);
     const rows = this.db.prepare(`SELECT * FROM (
@@ -452,6 +456,7 @@ export class HumanWaitRepository {
         const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
         const shouldOpen=row.desired_open===1&&!quarantinedAlready;
         const expected=expectedProjection(row);
+        if(expected&&Date.parse(expected.source_revision)!==Date.parse(row.source_revision)) continue;
         if((shouldOpen&&!item)||(item&&shouldOpen&&expected&&(item.state!=="open"||projectionMismatch(item,expected,row)))||(item&&!shouldOpen&&item.state==="open")) repaired++;
         const malformed=!quarantinedAlready&&this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
           (origin_ref LIKE '%/%' OR reason_code NOT IN ('human_input','ambiguous_write','invalid_result','notification_reconcile','operator_review_unknown'))`).get(row.dedupe_key);
@@ -465,6 +470,7 @@ export class HumanWaitRepository {
         const shouldOpen=row.desired_open===1&&!quarantinedAlready;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
         const expected=expectedProjection(row);
+        if(expected&&Date.parse(expected.source_revision)!==Date.parse(row.source_revision)) continue;
         const needsRepair=(shouldOpen&&!item)||(item&&shouldOpen&&expected&&(item.state!=="open"||projectionMismatch(item,expected,row)))||(item&&!shouldOpen&&item.state==="open");
         if(needsRepair) {
           let changed=0;
