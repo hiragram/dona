@@ -15,7 +15,7 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 
 async function fixture(page: Page, options: { submitUnknown?: boolean; submitIdentityUnavailable?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; pauseCancel?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; listUnavailableAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean } = {}) {
+  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; secondListUnavailable?: boolean; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; pauseCancel?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; listUnavailableAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
     result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend\u061cmore", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
@@ -33,7 +33,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; submitIde
     if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;if(options.pauseSecondSession&&sessionReads===2)await options.pauseSecondSession;await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
     if(url.pathname==="/api/session/logout"&&request.method()==="POST"){logoutWrites++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.logoutUnknown){await fulfill(route,{error:"durability_unavailable"},503);return;}await route.fulfill({status:204,body:""});return;}
     if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);await fulfill(route,{revoked:true});return;}
-    if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList; if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listUnavailableAfterFirst&&listReads>1){await fulfill(route,{error:"identity_unavailable"},503);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
+    if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList;if(options.secondListUnavailable&&listReads===2){await fulfill(route,{error:"identity_unavailable"},503);return;} if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listUnavailableAfterFirst&&listReads>1){await fulfill(route,{error:"identity_unavailable"},503);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
       await fulfill(route, { items: options.pauseFirstAlphaDetail||options.multipleJobs ? [job(),job({job_id:"job_beta"})] : [snapshot], next_cursor: null }); return; }
     if (url.pathname === "/api/jobs" && request.method() === "POST") {
       submitWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect(body).toMatchObject({ workspace: { kind: "scratch" } });
@@ -82,6 +82,11 @@ test("送信中の二重操作を止め、receipt確認後だけ作成済みjob�
   await page.getByLabel("依頼内容").fill("安全に調査する"); const button = page.getByRole("button", { name: "依頼を送信" }); await button.click();
   await expect(button).toBeDisabled(); await button.evaluate(element => (element as HTMLButtonElement).click()); expect(f.submitWrites).toBe(1);
   release(); await expect(page.getByRole("heading", { name: "job_created" })).toBeVisible(); expect(f.submitWrites).toBe(1); expect(f.errors).toEqual([]);
+});
+
+test("tab復帰後に古いsubmit receiptを新しいsession表示へ適用しない",async({page})=>{
+  let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("古いsessionの依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);
+  await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"job_created"})).toBeHidden();await expect(page.getByRole("button",{name:"依頼を送信"})).toBeEnabled();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("成功receipt後の一覧read失敗を受付不明へ戻さない", async ({ page }) => {
@@ -177,13 +182,17 @@ test("SSEで認可を失ったらprivate detailを消去する", async ({ page }
 
 test("SSEでgrant失効の404ならstale detailと一覧を消去する",async({page})=>{
   const f=await fixture(page,{eventDeniedStatus:404});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");
-  await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page.getByRole("button",{name:/job_alpha/})).toBeHidden();expect(f.eventReads).toBe(1);expect(f.errors).toEqual([]);
+  await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page.getByRole("button",{name:/job_alpha/})).toBeHidden();await expect(page).toHaveURL(policy.origin+"/");expect(f.eventReads).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("遅い旧一覧応答はsubmit後の新しい一覧を上書きしない",async({page})=>{
   let release!:()=>void;const pauseSecondList=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondList});await page.goto(policy.origin+"/");
   await page.getByRole("button",{name:"一覧を更新"}).click({noWaitAfter:true});await page.getByLabel("依頼内容").fill("新しい依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("heading",{name:"job_created"})).toBeVisible();
   await page.getByRole("button",{name:"一覧へ戻る"}).click();release();await page.waitForTimeout(100);await expect(page.getByRole("button",{name:/job_created/})).toBeVisible();expect(f.errors).toEqual([]);
+});
+
+test("遅い旧一覧の503はsubmit後の新しい一覧を消去しない",async({page})=>{
+  let release!:()=>void;const pauseSecondList=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondList,secondListUnavailable:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:"一覧を更新"}).click({noWaitAfter:true});await page.getByLabel("依頼内容").fill("新しい依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("heading",{name:"job_created"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"job_created"})).toBeVisible();expect(f.errors).toEqual([]);
 });
 
 test("bfcache復帰時に前principalの未送信formを初期化する",async({page})=>{
@@ -260,6 +269,10 @@ test("tabを隠すとprivate表示を消し復帰時にsessionとresourceを再�
   const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("private draft");const beforeSession=f.sessionReads,beforeList=f.listReads;
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
+});
+
+test("window focus復帰だけでもprivate表示を破棄して再検証する",async({page})=>{
+  const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("focus前のdraft");const beforeSession=f.sessionReads,beforeList=f.listReads;await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.getByLabel("依頼内容")).toHaveValue("");await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
 });
 
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
