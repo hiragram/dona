@@ -527,6 +527,38 @@ export class DispatcherDatabase {
     return readVerifiedPrincipalBinding(this.db, eventId);
   }
 
+  getAgentPrincipalBinding(eventId: string): VerifiedPrincipalBindingRow | undefined {
+    const visited = new Set<string>();
+    let currentId: string | undefined = eventId;
+    while (currentId && !visited.has(currentId)) {
+      visited.add(currentId);
+      const direct = readVerifiedPrincipalBinding(this.db, currentId);
+      if (direct) return direct;
+      const event = this.get(currentId);
+      if (!event) return undefined;
+      if (event.source === "dona_job") {
+        const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+        const trace = event.trace_json ? JSON.parse(event.trace_json) as Record<string, unknown> : undefined;
+        const source = subject.source_event_id ?? trace?.source_event_id;
+        currentId = typeof source === "string" ? source : undefined;
+        continue;
+      }
+      if (event.source === "dona_schedule") {
+        const authorization = this.db.prepare(`
+          SELECT v.authorization_id
+          FROM schedule_runs r
+          JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+          WHERE r.event_id=?
+        `).get(currentId) as { authorization_id: string } | undefined;
+        const match = authorization?.authorization_id.match(/^(evt_[0-9A-HJKMNP-TV-Z]{26})(?::\d+)?$/i);
+        currentId = match?.[1];
+        continue;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
   getVerifiedPrincipalProofConsumption(proofSha256:string):VerifiedPrincipalProofConsumptionRow|undefined {
     return readVerifiedPrincipalProofConsumption(this.db,proofSha256);
   }

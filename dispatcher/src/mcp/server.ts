@@ -22,13 +22,13 @@ export interface DispatcherJobClient {
   ): Promise<Record<string, unknown>>;
   authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
-  listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
+  listThreadJobs(sourceEventId: string, workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
-  getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
+  getSelfUpdateStatus(sourceEventId: string, requestId?: string): Promise<Record<string, unknown>>;
   cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   previewSchedule(input: unknown): Promise<Record<string, unknown>>;
   createSchedule(input: unknown): Promise<Record<string, unknown>>;
@@ -249,11 +249,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("list_thread_jobs", {
     title: "List Slack thread jobs",
     description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
-    inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
+    inputSchema: { source_event_id: eventId, workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ workspace_id, channel_id, thread_ts }) => {
+  }, async ({ source_event_id, workspace_id, channel_id, thread_ts }) => {
     try {
-      return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
+      return success(projectJobResponse(await client.listThreadJobs(source_event_id, workspace_id, channel_id, thread_ts)));
     } catch (error) {
       return failure(error, logger, "list_thread_jobs");
     }
@@ -362,11 +362,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("get_self_update_status", {
     title: "Get Dona self-update status",
     description: "update state、lease/fence、SHA、health、rollback可否、outbox、boundedな失敗診断stateを取得します。",
-    inputSchema: { request_id: updateRequestId.optional() },
+    inputSchema: { source_event_id: eventId, request_id: updateRequestId.optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ request_id }) => {
+  }, async ({ source_event_id, request_id }) => {
     try {
-      return success(await client.getSelfUpdateStatus(request_id));
+      return success(await client.getSelfUpdateStatus(source_event_id, request_id));
     } catch (error) {
       return failure(error, logger, "get_self_update_status");
     }

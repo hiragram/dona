@@ -56,8 +56,8 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "applySelfUpdate", args: [input] });
         return { schema_version: 1, accepted: true };
       },
-      async getSelfUpdateStatus(requestId) {
-        calls.push({ method: "getSelfUpdateStatus", args: [requestId] });
+      async getSelfUpdateStatus(sourceEventId, requestId) {
+        calls.push({ method: "getSelfUpdateStatus", args: [sourceEventId, requestId] });
         return { schema_version: 1, updates: [] };
       },
       async cancelSelfUpdate(input) {

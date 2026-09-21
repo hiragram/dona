@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase, JobCreationError } from "../src/database.js";
+import { AgentContextManager } from "../src/agent-context.js";
 import type { HerdrClient, HerdrCommandResult } from "../src/herdr.js";
 import type { Logger } from "../src/logger.js";
 import { DispatcherWorker } from "../src/worker.js";
@@ -41,6 +42,31 @@ function promptFields(prompt: string): { eventId: string; resultPath: string } {
 }
 
 describe("DispatcherWorker", () => {
+  test("verified bindingのないlegacy waiting eventはpromptを再送せず再認可待ちにする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    await fs.mkdir(config.resultsDir, { recursive: true });
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-legacy-waiting")).row;
+    const dispatching = database.beginDispatch(event.event_id, path.join(config.resultsDir, `${event.event_id}.json`));
+    database.markWaiting(event.event_id);
+    let waitCount = 0;
+    const herdr: HerdrClient = {
+      async get() { throw new Error("must not get"); },
+      async prompt() { throw new Error("must not prompt"); },
+      async wait() { waitCount += 1; return ok("working"); },
+    };
+    const contexts = new AgentContextManager(database, config.agentCredentialPath);
+    const worker = new DispatcherWorker(database, herdr, config, logger, undefined, () => {}, contexts);
+    await (worker as unknown as { resumeWaiting(row: typeof dispatching): Promise<void> }).resumeWaiting({
+      ...dispatching, status: "waiting_agent",
+    });
+    const held = database.get(event.event_id);
+    assert.equal(waitCount, 0);
+    assert.equal(held?.status, "waiting_agent");
+    assert.equal(held?.last_error_code, "agent_context_reauthorization_required");
+    database.close();
+  });
+
   for(const preflight of [failed("unavailable"),ok("blocked")]) test(`keeps running when ${preflight.ok?"blocked":"failed"} preflight arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);

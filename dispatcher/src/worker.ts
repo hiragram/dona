@@ -9,6 +9,7 @@ import { buildEventPrompt, envelopeFromRow } from "./prompt.js";
 import { readResultEnvelope, ResultNotFoundError } from "./result.js";
 import type { EventRow } from "./types.js";
 import type { JobNotificationVerifier } from "./job-notification-verifier.js";
+import { AgentPrincipalUnavailableError, type AgentContextManager } from "./agent-context.js";
 
 class WakeSignal {
   private resolver: (() => void) | undefined;
@@ -55,6 +56,7 @@ export class DispatcherWorker {
     private readonly logger: Logger,
     private readonly notificationVerifier?:JobNotificationVerifier,
     private readonly wakeJobSupervisor: () => void = () => {},
+    private readonly agentContexts?: AgentContextManager,
   ) {}
 
   isRunning(): boolean {
@@ -174,16 +176,24 @@ export class DispatcherWorker {
 
     const dispatching = this.database.beginDispatch(row.event_id, resultPath);
     if(dispatching.status==="completed") return;
+    try { await this.agentContexts?.issue(dispatching); }
+    catch (error) {
+      await this.agentContexts?.revoke(dispatching.event_id);
+      this.database.markNeedsReview(dispatching.event_id, "agent_context_unavailable", error instanceof Error ? error.message : String(error));
+      this.logCurrentTransition(dispatching, started);
+      return;
+    }
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     const afterPrompt=this.database.get(row.event_id);
-    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) return;
+    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) { await this.agentContexts?.revoke(row.event_id); return; }
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
         row.event_id,
         "prompt_interrupted",
         "Dispatcher stopped while prompt acceptance was unknown",
       );
+      await this.agentContexts?.revoke(row.event_id);
       this.logCurrentTransition(dispatching, started);
       return;
     }
@@ -197,6 +207,7 @@ export class DispatcherWorker {
             "prompt_acceptance_unknown",
             "Agent became unavailable after the event advanced during prompt submission",
           );
+          await this.agentContexts?.revoke(row.event_id);
           this.logCurrentTransition(dispatching, started);
           return;
         }
@@ -206,6 +217,7 @@ export class DispatcherWorker {
           commandMessage(prompted),
           this.config.maxAttempts,
         );
+        await this.agentContexts?.revoke(row.event_id);
         this.logTransition(dispatching, updated, started);
         return;
       } else {
@@ -214,13 +226,14 @@ export class DispatcherWorker {
           prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_unknown"),
           commandMessage(prompted),
         );
+        await this.agentContexts?.revoke(row.event_id);
       }
       this.logCurrentTransition(dispatching, started);
       return;
     }
 
     if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
-    else if(afterPrompt?.status!=="waiting_agent") return;
+    else if(afterPrompt?.status!=="waiting_agent") { await this.agentContexts?.revoke(row.event_id); return; }
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
@@ -229,11 +242,32 @@ export class DispatcherWorker {
   private async resumeWaiting(row: EventRow): Promise<void> {
     if (!row.result_path) {
       this.database.markNeedsReview(row.event_id, "missing_result_path", "waiting_agent event has no result path");
+      await this.agentContexts?.revoke(row.event_id);
       return;
     }
 
     const existing = await this.tryComplete(row, false);
     if (existing) return;
+    try {
+      await this.agentContexts?.ensure(row);
+    } catch (error) {
+      await this.agentContexts?.revoke(row.event_id);
+      if (error instanceof AgentPrincipalUnavailableError) {
+        if (row.last_error_code !== error.code) {
+          this.database.recordWaitingError(row.event_id, error.code, error.message);
+          this.logger.warn("Waiting event requires authenticated ingress replay before agent context can resume", {
+            event_id: row.event_id,
+            sequence: row.sequence,
+            status_to: "waiting_agent",
+            error_code: error.code,
+          });
+        }
+        return;
+      }
+      this.database.markNeedsReview(row.event_id, "agent_context_unavailable",
+        error instanceof Error ? error.message : String(error));
+      return;
+    }
     const started = Date.now();
     const waited = await this.herdr.wait(this.abortController.signal);
     if(this.database.get(row.event_id)?.status!=="waiting_agent") return;
@@ -296,8 +330,9 @@ export class DispatcherWorker {
       const result = await readResultEnvelope(row.result_path!, row.event_id);
       const verification=this.database.notificationVerificationRequest(row.event_id,result);
       const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.settle(verification):undefined):undefined;
-      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
+    if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
       else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
+      await this.agentContexts?.revoke(row.event_id);
       this.logCurrentTransition(row, Date.now());
       return true;
     } catch (error) {
@@ -310,6 +345,7 @@ export class DispatcherWorker {
         error instanceof ResultNotFoundError ? "result_missing" : "invalid_result",
         error instanceof Error ? error.message : String(error),
       );
+      await this.agentContexts?.revoke(row.event_id);
       this.logCurrentTransition(row, Date.now());
       return true;
     }
