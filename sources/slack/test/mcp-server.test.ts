@@ -95,7 +95,7 @@ class FakeSlackClient implements SlackApiClient {
       stateKnown: true,
     };
   }
-  async getThread(): Promise<SlackThread> {
+  async getThread(_channelId?:string,_threadTs?:string,_limit?:number,_cursor?:string): Promise<SlackThread> {
     return {
       messages: [
         {
@@ -407,6 +407,22 @@ describe("Dona Slack MCP server", () => {
       assert.equal(result.isError,true);
       assert.match(JSON.stringify(result.structuredContent),/slack_post_acceptance_unknown/);
       assert.equal(unknown.posts.length,0);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    class DuplicatePagesClient extends AmbiguousClient {
+      override async getThread(_channelId?:string,_threadTs?:string,_limit?:number,cursor?:string):Promise<SlackThread> {
+        const identity=`dona-wait-${createHash("sha256").update(`${input.event_id}\0${input.idempotency_key}`).digest("hex").slice(0,32)}`;
+        return {messages:[{ts:cursor?"3.4":"2.3",userId:"U_BOT",text:input.text,fileIds:[],reactions:[],blockIds:[identity]}],
+          hasMore:cursor===undefined,...(cursor===undefined?{nextCursor:"page-2"}:{})};
+      }
+    }
+    const duplicatePages=new DuplicatePagesClient();
+    pair=await run(duplicatePages);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,true);
+      assert.match(JSON.stringify(result.structuredContent),/slack_post_identity_conflict/);
+      assert.equal(duplicatePages.posts.length,0);
     } finally {await pair.client.close();await pair.server.close();}
   });
 });

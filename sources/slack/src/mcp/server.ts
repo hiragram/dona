@@ -5,7 +5,7 @@ import * as z from "zod/v4";
 
 import type { SlackLogger } from "../logger.js";
 import { verifyCurrentSlackAccess, type SlackCurrentAccessEvidence } from "../current-access.js";
-import { SlackApiError, type SlackFileInfo } from "../slack-api.js";
+import { SlackApiError, type SlackFileInfo, type SlackThreadMessage } from "../slack-api.js";
 import type { SlackWorkspaceRegistry } from "../workspace-registry.js";
 
 const workspaceSchema = z
@@ -570,6 +570,7 @@ export function createSlackMcpServer(
       const operation=(async():Promise<Record<string,unknown>>=>{
         const find=async()=>{
           let cursor: string|undefined;
+          let found:SlackThreadMessage|undefined;
           const seenCursors=new Set<string>();
           for(let page=0;page<10;page++){
             const thread=await connection.client.getThread(channel_id,thread_ts,100,cursor);
@@ -577,9 +578,9 @@ export function createSlackMcpServer(
             if(matches.some(message=>!((connection.botId&&message.botId===connection.botId)||
               (connection.botUserId&&message.userId===connection.botUserId))))
               throw new SlackApiError("slack_post_identity_conflict","Presentation identity block belongs to another author");
-            if(matches.length>1)throw new SlackApiError("slack_post_identity_conflict","Multiple presentation identity blocks were observed");
-            if(matches[0])return matches[0];
-            if(!thread.hasMore)return undefined;
+            if(matches.length>1||(found&&matches.length===1))throw new SlackApiError("slack_post_identity_conflict","Multiple presentation identity blocks were observed");
+            if(matches[0])found=matches[0];
+            if(!thread.hasMore)return found;
             if(!thread.nextCursor||seenCursors.has(thread.nextCursor))
               throw new SlackApiError("slack_post_reconcile_unavailable","Presentation reconciliation cursor is unavailable");
             seenCursors.add(thread.nextCursor);
