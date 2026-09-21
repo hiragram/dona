@@ -35,7 +35,19 @@ describe("Herdr workspace表示ラベル", () => {
   });
 
   test("空白、URL、private path、secret相当、Issue参照不一致をfallbackに送る", () => {
-    for (const value of [" \n\u0000 ", "https://private.invalid/task", "/Users/example/private", "token=sk-example-secret"]) {
+    for (const value of [
+      " \n\u0000 ",
+      "https://private.invalid/task",
+      "/Users/example/private",
+      "/workspace/dona/.env",
+      "../../.ssh/id_rsa",
+      String.raw`\\server\share\secret.txt`,
+      String.raw`C:\Users\example\secret.txt`,
+      "token=sk-example-secret",
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      ["xoxb", "123456789012", "abcdefghijklmnop"].join("-"),
+      "-----BEGIN PRIVATE KEY-----",
+    ]) {
       assert.equal(normalizeJobDisplayName(value), undefined);
       assert.equal(createJobDisplayLabel({ short_name: value }, { kind: "scratch" }), undefined);
     }
