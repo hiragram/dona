@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import { DispatcherDatabase, JobCreationError } from "../src/database.js";
+import { AgentContextManager } from "../src/agent-context.js";
 import type { HerdrClient, HerdrCommandResult } from "../src/herdr.js";
 import type { Logger } from "../src/logger.js";
 import { DispatcherWorker } from "../src/worker.js";
@@ -41,6 +42,31 @@ function promptFields(prompt: string): { eventId: string; resultPath: string } {
 }
 
 describe("DispatcherWorker", () => {
+  test("verified bindingのないlegacy waiting eventはpromptを再送せず再認可待ちにする", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    await fs.mkdir(config.resultsDir, { recursive: true });
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-legacy-waiting")).row;
+    const dispatching = database.beginDispatch(event.event_id, path.join(config.resultsDir, `${event.event_id}.json`));
+    database.markWaiting(event.event_id);
+    let waitCount = 0;
+    const herdr: HerdrClient = {
+      async get() { throw new Error("must not get"); },
+      async prompt() { throw new Error("must not prompt"); },
+      async wait() { waitCount += 1; return ok("working"); },
+    };
+    const contexts = new AgentContextManager(database, config.agentCredentialPath);
+    const worker = new DispatcherWorker(database, herdr, config, logger, undefined, () => {}, contexts);
+    await (worker as unknown as { resumeWaiting(row: typeof dispatching): Promise<void> }).resumeWaiting({
+      ...dispatching, status: "waiting_agent",
+    });
+    const held = database.get(event.event_id);
+    assert.equal(waitCount, 0);
+    assert.equal(held?.status, "waiting_agent");
+    assert.equal(held?.last_error_code, "agent_context_reauthorization_required");
+    database.close();
+  });
+
   for(const preflight of [failed("unavailable"),ok("blocked")]) test(`keeps running when ${preflight.ok?"blocked":"failed"} preflight arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);
@@ -93,6 +119,41 @@ describe("DispatcherWorker", () => {
     const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},config,logger);
     const completed=await (worker as unknown as {tryComplete(row:typeof event,terminal:boolean):Promise<boolean>}).tryComplete({...event,status:"waiting_agent",result_path:resultPath},true);
     assert.equal(completed,true); assert.equal(database.get(event.event_id)?.last_error_code,"notification_delivery_ambiguous");
+    database.close();
+  });
+
+  test("terminal result remains completed when agent credential cleanup fails",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-cleanup-after-terminal")).row;
+    const resultPath=path.join(config.resultsDir,`${event.event_id}.json`);
+    database.beginDispatch(event.event_id,resultPath); database.markWaiting(event.event_id);
+    await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event.event_id,status:"completed",summary:"ok",
+      actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));
+    const warnings:unknown[]=[];
+    const cleanupLogger:Logger={debug(){},info(){},warn(message,fields){warnings.push({message,fields});},error(){}};
+    const contexts={async revoke(){throw new Error("cleanup failed");}} as unknown as AgentContextManager;
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},
+      config,cleanupLogger,undefined,()=>{},contexts);
+    const completed=await (worker as unknown as {tryComplete(row:typeof event,terminal:boolean):Promise<boolean>})
+      .tryComplete({...event,status:"waiting_agent",result_path:resultPath},true);
+    assert.equal(completed,true); assert.equal(database.get(event.event_id)?.status,"completed");
+    assert.match(JSON.stringify(warnings),/agent_context_cleanup_failed/);
+    database.close();
+  });
+
+  for(const phase of ["issue","ensure"] as const)test(`${phase}失敗後のcredential cleanup失敗はworkerを停止しない`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-cleanup-${phase}`)).row;
+    const contexts={async issue(){throw new Error("issue failed");},async ensure(){throw new Error("ensure failed");},
+      async revoke(){throw new Error("cleanup failed");}} as unknown as AgentContextManager;
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},
+      config,logger,undefined,()=>{},contexts);
+    if(phase==="issue")await (worker as unknown as {dispatch(row:typeof event):Promise<void>}).dispatch(event);
+    else {
+      const dispatching=database.beginDispatch(event.event_id,path.join(config.resultsDir,`${event.event_id}.json`));database.markWaiting(event.event_id);
+      await (worker as unknown as {resumeWaiting(row:typeof event):Promise<void>}).resumeWaiting({...dispatching,status:"waiting_agent"});
+    }
+    assert.equal(database.get(event.event_id)?.status,"needs_review");
     database.close();
   });
 

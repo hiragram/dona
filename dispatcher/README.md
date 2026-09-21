@@ -94,7 +94,7 @@ schedule操作は、呼出し元が指定したworkspace・actor・返信先を�
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
 - `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合。元の`objective`とworkspaceも渡すとcanonical payloadの`matched` / `conflict`を判定
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
-- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。状態と結果を取得。`include_live_session: true`で保存済みexact identityだけをboundedに観測し、`live_session_receipt_id`で既存receiptを再読
+- `get_job_status`: 現在の`source_event_id`と明示`job_id`を照合し、agent向けには認可済みstatus/receipt projectionだけを取得。`include_live_session: true`では保存済みexact identityだけをboundedに観測し、`live_session_receipt_id`で既存receiptを再読する。Result本文、自由文error、runtime identityは返さない
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
 - `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
@@ -120,7 +120,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
-明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約するため、owner 1件の`payload.result`だけを全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`の認証済みcompletion projectionで全jobのstatusを列挙します。`get_job_status`はResult本文を返さず、限定Result開示は別operationの責務です。owner 1件の`payload.result`を全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
 
 ### background jobのAgent Status進捗
 
@@ -145,13 +145,15 @@ herdr --session dona agent get dona-main
 
 ## 手動疎通
 
-workerを動かさず受付だけを確認したい場合は、`DONA_HERDR_PATH`に存在しないコマンドを設定するとイベントは`retryable_failed`になります。通常の疎通は次のとおりです。
+workerを動かさず受付だけを確認したい場合は、`DONA_HERDR_PATH`に存在しないコマンドを設定するとイベントは`retryable_failed`になります。通常の疎通は、次のJSONをowner-privateな一時fileへ保存し、Slack Adapter packageの補助commandから行います。補助commandはowner-privateなingress keyを読み、短命なprincipal proofを付けてUDSへ送信します。keyや署名を標準出力へ表示しません。
 
 ```sh
-curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
-  -X POST http://localhost/v1/events \
-  -H 'Content-Type: application/json' \
-  -d '{
+chmod 600 /tmp/dona-manual-event.json
+npm --prefix ../sources/slack exec -- tsx src/manual-ingress.ts < /tmp/dona-manual-event.json
+```
+
+```json
+{
     "schema_version": 1,
     "source": "slack",
     "external_event_id": "manual-test-001",
@@ -163,14 +165,15 @@ curl --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" 
       "thread_ts": "1756722030.123456",
       "actor_id": "U_TEST"
     },
-    "payload": { "text": "外部プロセスからの疎通テストです" },
+    "payload": { "text": "ローカル疎通テストです" },
     "reply_target": {
       "kind": "slack_thread",
       "workspace_id": "T_TEST",
       "channel_id": "C_TEST",
       "thread_ts": "1756722030.123456"
-    }
-  }'
+    },
+    "trace": { "ingress_attempt": 1 }
+}
 ```
 
 health check:
@@ -204,9 +207,21 @@ npm exec -- tsx src/cli.ts job live-session-retention
 npm exec -- tsx src/cli.ts job live-session-retention --apply --force
 ```
 
+### Human-wait read model repair
+
+Migration前から存在するwait正本をbounded batchで補修する。全batchで同じsnapshotを固定し、`next_cursor`が`null`になるまで返されたcursorを次の呼び出しへ渡す。最初にdry-runし、同じsnapshot/cursor/limitで確認後だけ`--apply --force`を付ける。
+
+```bash
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100 --apply --force
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --cursor '<next_cursor>' --limit 100
+```
+
 `blocked`または`needs_review`のretryには`--force`が必要です。Herdr画面、結果ファイル、構造化ログを確認し、二重実行の可能性を理解した場合だけ実行してください。
 
 ## 状態と復旧
+
+owner-wideな人間判断待ちは、既存job/group/schedule/notification正本と同じtransactionで`human_wait_items`へ安全なallowlist projectionとして同期します。自由文、Result、objective、private destinationは複写せず、legacy ownerは`unknown`のままです。bounded repair、restart、retentionの詳細は[owner-wide human wait read model 運用契約](../docs/operations/human-wait-read-model.md)を参照してください。外部queryとSlack表示は後続Issueが所有し、この内部tableを直接開示しません。
 
 - `queued` / `retryable_failed`: sequence先頭から再開します。先頭イベントがbackoff中なら後続を追い越しません。
 - `waiting_agent`: Result Envelopeとagent状態の確認を再開し、promptは再送しません。

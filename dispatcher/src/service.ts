@@ -1,5 +1,5 @@
 import type { DispatcherConfig } from "./config.js";
-import { DispatcherApi } from "./api.js";
+import { confirmScheduleAccess, DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
@@ -17,8 +17,14 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
+import { ensurePrivateToken, readPrivateToken } from "./private-token.js";
+import { AgentContextManager } from "./agent-context.js";
+import { createHumanWaitAgentReadAuthorization } from "./agent-read-authorization.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
+  // The target release performs this before becoming ready, so updates driven by
+  // an older stable updater also provision the adapter/Dispatcher credential.
+  await ensurePrivateToken(config.slackIngressTokenPath);
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, {
@@ -41,11 +47,12 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     agentName: config.agentName,
     waitTimeoutMs: config.agentWaitTimeoutMs,
   });
+  const agentContexts = new AgentContextManager(database, config.agentCredentialPath);
   let jobSupervisor!: JobSupervisor;
   let jobProgress = jobProgressStore
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
-  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake(), agentContexts);
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),
@@ -92,6 +99,18 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     undefined,
     () => scheduler.wake(),
     scheduler,
+    agentContexts,
+    createHumanWaitAgentReadAuthorization(database),
+    {
+      async authorize(input) {
+        const token=await readPrivateToken(config.updateInternalTokenPath);
+        if(!token)return false;
+        try {
+          await confirmScheduleAccess(config.slackAdapterSocketPath,token,input,45_000);
+          return true;
+        } catch { return false; }
+      },
+    },
   );
 
   try {

@@ -8,6 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { KeychainStore } from "../src/keychain.js";
 import type { SlackLogger } from "../src/logger.js";
 import { createSlackMcpServer } from "../src/mcp/server.js";
+import { SlackApiError } from "../src/slack-api.js";
 import type {
   SlackApiClient,
   SlackAgentSessionStatus,
@@ -41,6 +42,7 @@ class FakeSlackClient implements SlackApiClient {
     replyBroadcast: boolean;
     mrkdwn?: boolean;
     parse?: "none";
+    identityBlockId?: string;
   }> = [];
   readonly sessionStatuses: Array<{
     channelId: string;
@@ -63,6 +65,7 @@ class FakeSlackClient implements SlackApiClient {
           isArchived: false,
           isMember: true,
           isShared: false,
+          visibilityKnown: true,
         },
       ],
     };
@@ -75,6 +78,7 @@ class FakeSlackClient implements SlackApiClient {
       isArchived: false,
       isMember: true,
       isShared: false,
+      visibilityKnown: true,
     };
   }
   async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
@@ -84,13 +88,15 @@ class FakeSlackClient implements SlackApiClient {
   async getUser(): Promise<SlackUser> {
     return {
       id: "U1",
+      teamId: "T123",
       displayName: "Test User",
       isBot: false,
       isAppUser: false,
       isDeleted: false,
+      stateKnown: true,
     };
   }
-  async getThread(): Promise<SlackThread> {
+  async getThread(_channelId?:string,_threadTs?:string,_limit?:number,_cursor?:string): Promise<SlackThread> {
     return {
       messages: [
         {
@@ -99,8 +105,16 @@ class FakeSlackClient implements SlackApiClient {
         text: "external message",
         fileIds: ["F123"],
         blockIds: [],
-        reactions: [{ name: "eyes", count: 1, userIds: ["U1"] }],
+          reactions: [{ name: "eyes", count: 1, userIds: ["U1"] }],
         },
+        ...this.posts.map((post,index)=>({
+          ts:`2.${index+3}`,
+          userId:"U_BOT",
+          text:post.text,
+          fileIds:[],
+          reactions:[],
+          blockIds:post.identityBlockId?[post.identityBlockId]:[],
+        })),
       ],
       hasMore: false,
     };
@@ -193,6 +207,7 @@ describe("Dona Slack MCP server", () => {
           "get_file",
           "set_agent_session_status",
           "post_message",
+          "post_message_once",
           "add_reaction",
         ],
       );
@@ -201,8 +216,15 @@ describe("Dona Slack MCP server", () => {
         true,
       );
       const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1",event_id:"evt_test"}});
-      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null,
-        access_receipt:JSON.stringify({event_id:"evt_test",workspace_id:"T123",channel_id:"C123",user_id:"U1",channel_kind:"other",channel_user_id:null})});
+      const access=accessResult.structuredContent as Record<string,unknown>;
+      assert.deepEqual({workspace:access.workspace,workspace_id:access.workspace_id,channel_id:access.channel_id,user_id:access.user_id,
+        authorized:access.authorized,channel_kind:access.channel_kind,channel_user_id:access.channel_user_id},
+      {workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null});
+      const accessReceipt=JSON.parse(String(access.access_receipt)) as Record<string,unknown>;
+      assert.equal(accessReceipt.event_id,"evt_test");
+      assert.equal(accessReceipt.status,"current");
+      assert.equal(accessReceipt.destination_kind,"public_channel");
+      assert.equal(typeof accessReceipt.visibility_revision,"string");
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
@@ -303,6 +325,27 @@ describe("Dona Slack MCP server", () => {
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
 
+      const presentationInput = {
+        workspace:"company", channel_id:"C123", thread_ts:"1.2", text:"現在確認できる自分待ちはありません。",
+        event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7", idempotency_key:"human-waits.page-1",
+      };
+      const presented=await client.callTool({name:"post_message_once",arguments:presentationInput});
+      assert.equal(presented.isError,undefined);
+      const postsAfterPresentation=fake.posts.length;
+      const duplicate=await client.callTool({name:"post_message_once",arguments:presentationInput});
+      assert.equal(duplicate.isError,undefined);
+      assert.equal(fake.posts.length,postsAfterPresentation);
+      assert.equal((duplicate.structuredContent as Record<string,unknown>).duplicate,true);
+      assert.equal((duplicate.structuredContent as Record<string,unknown>).reconciled,true);
+      const concurrentInput={...presentationInput,idempotency_key:"human-waits.concurrent"};
+      const beforeConcurrent=fake.posts.length;
+      const concurrent=await Promise.all([
+        client.callTool({name:"post_message_once",arguments:concurrentInput}),
+        client.callTool({name:"post_message_once",arguments:concurrentInput}),
+      ]);
+      assert.ok(concurrent.every(result=>result.isError===undefined));
+      assert.equal(fake.posts.length,beforeConcurrent+1);
+
       const fileResult = await client.callTool({
         name: "get_file",
         arguments: { workspace: "company", file_id: "F123" },
@@ -320,5 +363,82 @@ describe("Dona Slack MCP server", () => {
       await client.close();
       await server.close();
     }
+  });
+
+  test("acceptance unknownをread-backだけで照合し、未確認なら再送しない",async()=>{
+    class AmbiguousClient extends FakeSlackClient {
+      accepted=true;
+      override async postMessage(input:Parameters<FakeSlackClient["postMessage"]>[0]):Promise<SlackPostResult> {
+        if(this.accepted)await super.postMessage(input);
+        throw new Error("connection lost");
+      }
+    }
+    const run=async(fake:FakeSlackClient)=>{
+      const registry=await SlackWorkspaceRegistry.load(["company"],new MemoryKeychain(),logger,()=>fake);
+      const server=createSlackMcpServer(registry,logger,input=>JSON.stringify(input));
+      const client=new Client({name:"test-client",version:"1.0.0"});
+      const [clientTransport,serverTransport]=InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverTransport),client.connect(clientTransport)]);
+      return {server,client};
+    };
+    const input={workspace:"company",channel_id:"C123",thread_ts:"1.2",text:"安全な表示",
+      event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",idempotency_key:"human-waits.page-1"};
+    const accepted=new AmbiguousClient();
+    let pair=await run(accepted);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,undefined);
+      assert.equal((result.structuredContent as Record<string,unknown>).reconciled,true);
+      assert.equal(accepted.posts.length,1);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    // 新しいMCP processでもSlack側のidentity blockをread-backして重複投稿しない。
+    pair=await run(accepted);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,undefined);
+      assert.equal((result.structuredContent as Record<string,unknown>).duplicate,true);
+      assert.equal(accepted.posts.length,1);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    const unknown=new AmbiguousClient();unknown.accepted=false;
+    pair=await run(unknown);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,true);
+      assert.match(JSON.stringify(result.structuredContent),/slack_post_acceptance_unknown/);
+      assert.equal(unknown.posts.length,0);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    class RejectedClient extends FakeSlackClient {
+      override async postMessage():Promise<SlackPostResult> {
+        throw new SlackApiError("restricted_action","Slack rejected the presentation");
+      }
+    }
+    const rejected=new RejectedClient();
+    pair=await run(rejected);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,true);
+      assert.match(JSON.stringify(result.structuredContent),/restricted_action/);
+      assert.doesNotMatch(JSON.stringify(result.structuredContent),/slack_post_acceptance_unknown/);
+      assert.equal(rejected.posts.length,0);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    class DuplicatePagesClient extends AmbiguousClient {
+      override async getThread(_channelId?:string,_threadTs?:string,_limit?:number,cursor?:string):Promise<SlackThread> {
+        const identity=`dona-wait-${createHash("sha256").update(`${input.event_id}\0${input.idempotency_key}`).digest("hex").slice(0,32)}`;
+        return {messages:[{ts:cursor?"3.4":"2.3",userId:"U_BOT",text:input.text,fileIds:[],reactions:[],blockIds:[identity]}],
+          hasMore:cursor===undefined,...(cursor===undefined?{nextCursor:"page-2"}:{})};
+      }
+    }
+    const duplicatePages=new DuplicatePagesClient();
+    pair=await run(duplicatePages);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,true);
+      assert.match(JSON.stringify(result.structuredContent),/slack_post_identity_conflict/);
+      assert.equal(duplicatePages.posts.length,0);
+    } finally {await pair.client.close();await pair.server.close();}
   });
 });

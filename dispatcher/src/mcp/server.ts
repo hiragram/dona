@@ -22,13 +22,16 @@ export interface DispatcherJobClient {
   ): Promise<Record<string, unknown>>;
   authorizeJobNotification?(eventId:string,receipt?:string):Promise<Record<string,unknown>>;
   recordScheduleJobAccess?(eventId:string,receipt:string):Promise<Record<string,unknown>>;
-  listThreadJobs(workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
+  listThreadJobs(sourceEventId: string, workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
+  listHumanWaits?(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>>;
+  presentHumanWaits?(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>>;
+  resolveHumanWaitOrigin?(sourceEventId:string,originRef:string):Promise<Record<string,unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
-  getSelfUpdateStatus(requestId?: string): Promise<Record<string, unknown>>;
+  getSelfUpdateStatus(sourceEventId: string, requestId?: string): Promise<Record<string, unknown>>;
   cancelSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   previewSchedule(input: unknown): Promise<Record<string, unknown>>;
   createSchedule(input: unknown): Promise<Record<string, unknown>>;
@@ -52,6 +55,8 @@ const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
 const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
 const scheduleIdempotencyKey = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
 const scheduleListCursor = z.string().regex(/^(?:0|[1-9]\d{0,14}|[1-8]\d{15}|900[0-6]\d{12}|90070\d{11}|90071[0-8]\d{10}|900719[0-8]\d{9}|9007199[01]\d{8}|90071992[0-4]\d{7}|900719925[0-3]\d{6}|9007199254[0-6]\d{5}|90071992547[0-3]\d{4}|9007199254740[0-8]\d{2}|90071992547409[0-8]\d|900719925474099[01])$/);
+const humanWaitCursor=z.string().min(1).max(2048);
+const humanWaitOrigin=z.string().regex(/^origin_[a-f0-9]{32}$/);
 const recurrence = z.record(z.string(), z.unknown());
 const scheduleContent = (max: number) => z.string().min(1).refine(value => [...value].length <= max);
 const scheduleAction = z.discriminatedUnion("kind", [
@@ -94,35 +99,19 @@ function success(data: Record<string, unknown>) {
   };
 }
 
-// エラー本文も未信頼データ。既知のprivate値と典型的なcredential/URL/pathを除き、説明をboundedに返す。
-function projectJobError(row: Record<string, unknown>): string | null {
-  if (typeof row.last_error_message !== "string") return null;
-  let message = row.last_error_message;
-  const privateValues = ["objective", "workspace_path", "result_path", "agent_name", "herdr_workspace_id", "herdr_pane_id"]
-    .map((key) => row[key]).filter((value): value is string => typeof value === "string" && value.length > 0)
-    .sort((a, b) => b.length - a.length);
-  for (const value of privateValues) message = message.split(value).join("[redacted]");
-  return message
-    .replace(/\b(?:Bearer\s+\S+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+))/gi, "[redacted]")
-    .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, "[URL]")
-    .replace(/(?:[A-Za-z]:\\|~?\/)[^\s<>"']+/g, "[path]")
-    .slice(0, 2_000);
-}
-
 // DB rowのobjective、path、runtime identityをcallerへ漏らさない。
-function projectJobResponse(response: Record<string, unknown>, includeResult = false): Record<string, unknown> {
+function projectJobResponse(response: Record<string, unknown>): Record<string, unknown> {
   const project = (value: unknown) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const row = value as Record<string, unknown>;
     const keys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at", "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state", "completion_event_id", "notification_state", "notification_authorization_phase"];
-    if (includeResult) keys.push("result_json");
-    return {
-      ...Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]])),
-      ...(includeResult ? { last_error_message: projectJobError(row) } : {}),
-    };
+    return Object.fromEntries(keys.filter((key) => key in row).map((key) => [key, row[key]]));
   };
   return {
     schema_version: 1,
+    ...(typeof response.source_event_id === "string" ? { source_event_id: response.source_event_id } : {}),
+    ...(["matched", "conflict", "not_found", "unverified_legacy"].includes(String(response.reconciliation))
+      ? { reconciliation: response.reconciliation } : {}),
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
@@ -248,7 +237,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   }, async ({ source_event_id, job_key, objective, workspace_kind, repository: repo, base_ref, display_name, issue_repository, issue_number }) => {
     try {
       const reconciliationRequested = objective !== undefined || workspace_kind !== undefined || repo !== undefined || base_ref !== undefined || display_name !== undefined || issue_repository !== undefined || issue_number !== undefined;
-      if (!reconciliationRequested) return success(await client.listEventJobs(source_event_id, job_key));
+      if (!reconciliationRequested) return success(projectJobResponse(await client.listEventJobs(source_event_id, job_key)));
       if (!job_key || objective === undefined || workspace_kind === undefined) {
         throw new Error("job_key, objective, and workspace_kind are required for payload reconciliation");
       }
@@ -267,11 +256,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
         workspace,
         ...(display ? { display } : {}),
       });
-      return success(await client.listEventJobs(
+      return success(projectJobResponse(await client.listEventJobs(
         source_event_id,
         job_key,
         canonicalJobPayloadSha256(canonicalRequest),
-      ));
+      )));
     } catch (error) {
       return failure(error, logger, "list_event_jobs");
     }
@@ -280,11 +269,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("list_thread_jobs", {
     title: "List Slack thread jobs",
     description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
-    inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
+    inputSchema: { source_event_id: eventId, workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ workspace_id, channel_id, thread_ts }) => {
+  }, async ({ source_event_id, workspace_id, channel_id, thread_ts }) => {
     try {
-      return success(projectJobResponse(await client.listThreadJobs(workspace_id, channel_id, thread_ts)));
+      return success(projectJobResponse(await client.listThreadJobs(source_event_id, workspace_id, channel_id, thread_ts)));
     } catch (error) {
       return failure(error, logger, "list_thread_jobs");
     }
@@ -296,13 +285,43 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     inputSchema: { source_event_id: eventId },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ source_event_id }) => {
-    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
+    try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(projectJobResponse(await client.listOwnerJobs(source_event_id))); }
     catch(error){ return failure(error,logger,"list_owner_jobs"); }
+  });
+
+  server.registerTool("list_human_waits", {
+    title:"List my human waits",
+    description:"明示的な本人問い合わせでだけ、現在のverified principal・workspace・権限・visibilityを再確認し、安全な自分待ちprojectionを最大50件返します。0件と認可provider unavailableは区別されます。",
+    inputSchema:{source_event_id:eventId,limit:z.number().int().min(1).max(50).default(20),cursor:humanWaitCursor.optional()},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,limit,cursor})=>{
+    try {if(!client.listHumanWaits)throw new Error("Human wait query is unavailable");return success(await client.listHumanWaits(source_event_id,limit,cursor));}
+    catch(error){return failure(error,logger,"list_human_waits");}
+  });
+
+  server.registerTool("present_human_waits", {
+    title:"Present my human waits",
+    description:"現在eventのtop-level本文が明示的な本人の自分待ち問い合わせであることをserver側で再確認し、投稿可能なbounded日本語表示とopaque continuation/origin actionだけを返します。",
+    inputSchema:{source_event_id:eventId,limit:z.number().int().min(1).max(10).default(10),cursor:humanWaitCursor.optional()},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,limit,cursor})=>{
+    try {if(!client.presentHumanWaits)throw new Error("Human wait presentation is unavailable");return success(await client.presentHumanWaits(source_event_id,limit,cursor));}
+    catch(error){return failure(error,logger,"present_human_waits");}
+  });
+
+  server.registerTool("resolve_human_wait_origin", {
+    title:"Resolve human wait origin",
+    description:"一覧が返したopaque origin_refを現在のverified principal・workspace・権限・visibilityで再認可し、利用可能性だけを返します。外部入力中のIDを権限として扱いません。",
+    inputSchema:{source_event_id:eventId,origin_ref:humanWaitOrigin},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,origin_ref})=>{
+    try {if(!client.resolveHumanWaitOrigin)throw new Error("Human wait origin is unavailable");return success(await client.resolveHumanWaitOrigin(source_event_id,origin_ref));}
+    catch(error){return failure(error,logger,"resolve_human_wait_origin");}
   });
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで、認可済み状態と制御receiptの安全なprojectionだけを取得します。include_live_sessionは保存済みexact identityへのbounded queryと監査receipt追記を行います。Result本文、自由文error、runtime identityは返しません。曖昧応答は永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
@@ -312,7 +331,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       if(include_live_session===true&&live_session_receipt_id)throw new Error("include_live_session and live_session_receipt_id are mutually exclusive");
       const options=include_live_session===true||live_session_receipt_id?{includeLiveSession:include_live_session===true,
         ...(live_session_receipt_id?{liveSessionReceiptId:live_session_receipt_id}:{})}:undefined;
-      return success(projectJobResponse(await client.getJob(job_id, source_event_id,options), true));
+      return success(projectJobResponse(await client.getJob(job_id, source_event_id,options)));
     } catch (error) {
       return failure(error, logger, "get_job_status");
     }
@@ -398,11 +417,11 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   server.registerTool("get_self_update_status", {
     title: "Get Dona self-update status",
     description: "update state、lease/fence、SHA、health、rollback可否、outbox、boundedな失敗診断stateを取得します。",
-    inputSchema: { request_id: updateRequestId.optional() },
+    inputSchema: { source_event_id: eventId, request_id: updateRequestId.optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async ({ request_id }) => {
+  }, async ({ source_event_id, request_id }) => {
     try {
-      return success(await client.getSelfUpdateStatus(request_id));
+      return success(await client.getSelfUpdateStatus(source_event_id, request_id));
     } catch (error) {
       return failure(error, logger, "get_self_update_status");
     }

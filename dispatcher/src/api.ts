@@ -5,15 +5,22 @@ import net from "node:net";
 import path from "node:path";
 
 import type { DispatcherConfig } from "./config.js";
-import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
+import { agentBodyEventOperations, agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
+import { AgentReadAuthorization, projectAuthorizedJob, projectCompletionJob, type AgentReadSurface } from "./agent-read-authorization.js";
+import { HumanWaitQueryError, HumanWaitQueryService } from "./human-wait-query.js";
+import { hasExplicitOwnHumanWaitIntent, HumanWaitPresentationError, renderHumanWaits } from "./human-wait-presentation.js";
+import { dispatcherSchemaCompatibility, JobCreationError, JobOwnerUnavailableError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
+import type { JobRow } from "./types.js";
 import type { LiveSessionReceiptProjection } from "./live-session.js";
 import { envelopeFromRow } from "./prompt.js";
 import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
 import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
 import { ScheduleError } from "./scheduler/errors.js";
+import { PrincipalBindingConflictError } from "./principal-binding.js";
+import { PrincipalProofError, verifySlackPrincipalProof } from "./principal-proof.js";
 import {
   jobKeyPattern,
   parseCancelJobRequest,
@@ -26,7 +33,8 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
-async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
+const agentReadCandidateScanMax = 1_000;
+export async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
   const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
   return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
     const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
@@ -90,6 +98,12 @@ async function socketIsAlive(socketPath: string, timeoutMs = 500): Promise<boole
   });
 }
 
+function agentRouteEventId(url: URL): string | undefined {
+  const match = /^\/v1\/(?:events|scheduled-jobs|job-notifications)\/([^/]+)\/(?:jobs|delegate|access|authorize)$/.exec(url.pathname);
+  if (match) return decodeURIComponent(match[1]!);
+  return url.searchParams.get("source_event_id") ?? undefined;
+}
+
 export interface ApiWorkerState {
   isRunning(): boolean;
   isHealthy?(): boolean;
@@ -124,6 +138,19 @@ export interface ApiUpdateClient {
 export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
+
+export interface ApiHumanWaitAccessVerifier {
+  authorize(input: { event_id: string; workspace_id: string; channel_id: string; user_id: string }): Promise<boolean>;
+}
+
+const agentUpdateStatusKeys = [
+  "request_id", "state", "current_sha", "target_sha", "previous_sha", "policy_version",
+  "rollback_compatible", "last_error_code", "created_at", "updated_at", "completed_at", "observed_active_sha",
+] as const;
+
+function projectAgentUpdateStatus(update: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(agentUpdateStatusKeys.filter(key => key in update).map(key => [key, update[key]]));
+}
 export interface ApiSchedulerState {
   operationalState(): { running: boolean; last_purge_at: string | null };
 }
@@ -135,12 +162,17 @@ export interface ApiJobProgressResolver {
 
 export class DispatcherApi {
   private server: http.Server | undefined;
+  private agentServer: http.Server | undefined;
+  private ownsAgentSocket = false;
+  private ownsAgentCredential = false;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
   private quiesceComplete = false;
   private quiesceError: string | undefined;
   private readonly schedules: ScheduleApiService;
+  private readonly verifiedAgentContexts = new WeakMap<IncomingMessage, AgentExecutionContext>();
+  private readonly agentReads: AgentReadAuthorization;
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -155,13 +187,21 @@ export class DispatcherApi {
     scheduleNow: () => Date = () => new Date(),
     wakeScheduler: () => void = () => {},
     private readonly schedulerState?: ApiSchedulerState,
-  ) { this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); }); }
+    private readonly agentContexts?: AgentContextManager,
+    agentReads?: AgentReadAuthorization,
+    private readonly humanWaitAccess?: ApiHumanWaitAccessVerifier,
+  ) {
+    this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); });
+    this.agentReads = agentReads ?? new AgentReadAuthorization();
+  }
 
   disableJobProgress(): void { this.jobProgress = undefined; }
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
     await fs.chmod(path.dirname(this.config.socketPath), 0o700);
+    await fs.mkdir(path.dirname(this.config.agentSocketPath), { recursive: true, mode: 0o700 });
+    await fs.chmod(path.dirname(this.config.agentSocketPath), 0o700);
     await fs.mkdir(this.config.resultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.resultsDir, 0o700);
     try {
@@ -185,6 +225,28 @@ export class DispatcherApi {
       });
     });
     await fs.chmod(this.config.socketPath, 0o600);
+    if (this.agentContexts) {
+      try {
+        await fs.lstat(this.config.agentSocketPath);
+        if (await socketIsAlive(this.config.agentSocketPath)) throw new Error(`Another agent API is already listening on ${this.config.agentSocketPath}`);
+        await fs.unlink(this.config.agentSocketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await this.agentContexts.initialize();
+      this.ownsAgentCredential = true;
+      this.agentServer = http.createServer((request, response) => void this.handle(request, response, true));
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => reject(error);
+        this.agentServer!.once("error", onError);
+        this.agentServer!.listen(this.config.agentSocketPath, () => {
+          this.agentServer!.off("error", onError);
+          this.ownsAgentSocket = true;
+          resolve();
+        });
+      });
+      await fs.chmod(this.config.agentSocketPath, 0o600);
+    }
     this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
   }
 
@@ -209,24 +271,50 @@ export class DispatcherApi {
   async stop(): Promise<void> {
     this.beginShutdown();
     const ownsSocket = this.server?.listening === true;
+    const ownsAgentSocket = this.ownsAgentSocket;
     if (this.server?.listening) {
       await new Promise<void>((resolve, reject) => {
         this.server!.close((error) => (error ? reject(error) : resolve()));
       });
     }
+    if (this.agentServer?.listening) {
+      await new Promise<void>((resolve, reject) => {
+        this.agentServer!.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+    this.agentServer = undefined;
+    this.ownsAgentSocket = false;
+    if (this.ownsAgentCredential) await this.agentContexts?.revoke();
+    this.ownsAgentCredential = false;
     this.server = undefined;
-    if (!ownsSocket) return;
-    try {
-      await fs.unlink(this.config.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (ownsSocket) {
+      try {
+        await fs.unlink(this.config.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (ownsAgentSocket) {
+      try { await fs.unlink(this.config.agentSocketPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     this.logger.info("Dispatcher API stopped");
   }
 
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async handle(request: IncomingMessage, response: ServerResponse, agentPlane = false): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if (agentPlane) {
+        const operation = agentOperation(request.method, url);
+        const token = typeof request.headers["x-dona-agent-token"] === "string" ? request.headers["x-dona-agent-token"] : undefined;
+        const eventId = typeof request.headers["x-dona-source-event-id"] === "string" ? request.headers["x-dona-source-event-id"] : undefined;
+        const context = operation ? this.agentContexts?.authorize(token, eventId, operation) : undefined;
+        const routeEventId = agentRouteEventId(url);
+        if (!context || (routeEventId !== undefined && !this.agentContexts?.allowsRouteEvent(context, operation!, routeEventId))) {
+          throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+        }
+        this.verifiedAgentContexts.set(request, context);
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
@@ -258,6 +346,44 @@ export class DispatcherApi {
           scheduler: health.scheduler,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
+        return;
+      }
+      if (request.method === "GET" && (url.pathname === "/v1/human-waits" || url.pathname==="/v1/human-waits/presentation" || /^\/v1\/human-waits\/origins\/[^/]+$/.test(url.pathname))) {
+        const context=this.verifiedAgentContexts.get(request);
+        if(!context||context.purpose!=="human_command")throw new ApiRequestError(403,"agent_context_unavailable","Agent operation is not available");
+        const secret=await readPrivateToken(this.config.slackIngressTokenPath);
+        if(!secret)throw new ApiRequestError(503,"human_wait_query_unavailable","Human wait query is unavailable");
+        const service=new HumanWaitQueryService(this.database.humanWaits,this.agentReads,createHash("sha256").update(secret).digest());
+        try {
+          const destination=await this.authorizedHumanWaitDestination(context);
+          if(url.pathname==="/v1/human-waits"||url.pathname==="/v1/human-waits/presentation") {
+            const rawLimit=url.searchParams.get("limit")??"20";
+            if(!/^(?:[1-9]|[1-4][0-9]|50)$/.test(rawLimit))throw new ApiRequestError(400,"invalid_request","limit is invalid");
+            const event=this.database.get(context.event_id);
+            const presentation=url.pathname==="/v1/human-waits/presentation";
+            const continuation=presentation&&url.searchParams.has("cursor");
+            if(!event||!hasExplicitOwnHumanWaitIntent(event,{continuation}))throw new HumanWaitPresentationError();
+            if(url.pathname==="/v1/human-waits/presentation") {
+              const page=service.list({context,destination,limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
+                ...(continuation?{cursor:url.searchParams.get("cursor")!,allowCrossEventCursor:true}:{})});
+              sendJson(response,200,{schema_version:1,...renderHumanWaits(page,new Date(event.occurred_at))});
+            } else sendJson(response,200,service.list({context,destination,limit:Number(rawLimit),
+              ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})}));
+          } else {
+            let originRef:string;
+            try { originRef=decodeURIComponent(url.pathname.split("/").at(-1)!); }
+            catch { throw new HumanWaitQueryError("human_wait_origin_unavailable"); }
+            sendJson(response,200,service.resolveOrigin({context,destination,originRef}));
+          }
+        } catch(error) {
+          if(error instanceof HumanWaitPresentationError)throw new ApiRequestError(403,error.code,"Human wait presentation requires an explicit owner request");
+          if(error instanceof HumanWaitQueryError) {
+            if(error.code==="human_wait_cursor_invalid")throw new ApiRequestError(409,error.code,"Human wait cursor is no longer valid");
+            if(error.code==="human_wait_origin_unavailable")throw new ApiRequestError(404,error.code,"Human wait origin is unavailable");
+            throw new ApiRequestError(503,error.code,"Human wait query is unavailable");
+          }
+          throw error;
+        }
         return;
       }
       if (request.method === "GET" && url.pathname === "/v1/internal/job-progress") {
@@ -293,13 +419,27 @@ export class DispatcherApi {
         if (canonicalPayloadSha256 !== undefined && jobKey === undefined) {
           throw new ApiRequestError(400, "invalid_request", "job_key is required for payload reconciliation");
         }
+        const context = this.verifiedAgentContexts.get(request);
+        const storedJobs = this.database.listEventJobs(sourceEventId, jobKey);
+        const jobs = context?.purpose === "job_completion"
+          ? storedJobs.map(row => {
+            const job = this.database.getJob(row.job_id);
+            return job ? projectCompletionJob(job) : undefined;
+          }).filter((row): row is Record<string, unknown> => row !== undefined)
+          : context
+            ? storedJobs.map(row => this.database.getJob(row.job_id)).filter((row): row is JobRow => row !== undefined)
+              .filter(row => this.agentJobAllowed(request, "list_event_jobs", row)).map(projectAuthorizedJob)
+            : storedJobs;
+        const reconciliation = canonicalPayloadSha256 !== undefined && jobKey !== undefined
+          ? context?.purpose === "human_command" && jobs.length === 0
+            ? "not_found"
+            : this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256)
+          : undefined;
         sendJson(response, 200, {
           schema_version: 1,
           source_event_id: sourceEventId,
-          jobs: this.database.listEventJobs(sourceEventId, jobKey),
-          ...(canonicalPayloadSha256 !== undefined && jobKey !== undefined
-            ? { reconciliation: this.database.reconcileEventJob(sourceEventId, jobKey, canonicalPayloadSha256) }
-            : {}),
+          jobs,
+          ...(reconciliation !== undefined ? { reconciliation } : {}),
         });
         return;
       }
@@ -466,10 +606,29 @@ export class DispatcherApi {
       }
       const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
+      if (envelope.source !== "slack") {
+        throw new ApiRequestError(403, "unverified_ingress", "External event source is not accepted");
+      }
+      let verifiedPrincipal;
+      const acceptedAt = new Date();
+      try {
+        const key = await readPrivateToken(this.config.slackIngressTokenPath);
+        if (!key) throw new PrincipalProofError("principal_proof_missing");
+        verifiedPrincipal = verifySlackPrincipalProof(envelope, request.headers["x-dona-slack-principal-proof"],
+          request.headers["x-dona-slack-principal-signature"], key, acceptedAt);
+      } catch (error) {
+        if (error instanceof PrincipalProofError) {
+          throw new ApiRequestError(403, "unverified_ingress", "Slack ingress authentication failed");
+        }
+        throw error;
+      }
       let result;
       try {
-        result = this.database.enqueue(envelope);
+        result = this.database.enqueue(envelope, acceptedAt, verifiedPrincipal);
       } catch (error) {
+        if (error instanceof PrincipalBindingConflictError) {
+          throw new ApiRequestError(409, error.code, "Slack ingress evidence conflicts with the persisted event");
+        }
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
         );
@@ -570,7 +729,27 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/self-update/status") {
       const requestId = url.searchParams.get("request_id") ?? undefined;
       if (requestId && !/^upd_[0-9a-hjkmnp-tv-z]{26}$/.test(requestId)) throw new ApiRequestError(400, "invalid_request", "request_id is invalid");
-      sendJson(response, 200, await this.updates.status(requestId));
+      const context=this.verifiedAgentContexts.get(request);
+      if(!context){sendJson(response,200,await this.updates.status(requestId));return;}
+      if(!requestId)throw this.notAvailable();
+      let status:Record<string,unknown>;
+      try { status=await this.updates.status(requestId); }
+      catch { throw this.notAvailable(); }
+      const update=status.update;
+      if(!update||typeof update!=="object"||Array.isArray(update))throw this.notAvailable();
+      const row=update as Record<string,unknown>;
+      let allowed=context.purpose==="human_command"&&row.source_event_id===context.event_id;
+      if(context.purpose==="update_completion"){
+        const event=this.database.get(context.event_id);
+        try {
+          const subject=event?JSON.parse(event.subject_json) as Record<string,unknown>:undefined;
+          const replyTarget=event?.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+          allowed=event?.source==="dona_update"&&subject?.request_id===requestId&&
+            typeof row.reply_target_json==="string"&&stableStringify(JSON.parse(row.reply_target_json))===stableStringify(replyTarget);
+        } catch { allowed=false; }
+      }
+      if(!allowed||row.request_id!==requestId)throw this.notAvailable();
+      sendJson(response,200,{schema_version:1,update:projectAgentUpdateStatus(row)});
       return;
     }
     if (request.method === "POST" && url.pathname === "/v1/self-update/cancel") {
@@ -646,6 +825,53 @@ export class DispatcherApi {
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 
+  private agentDisclosureDestination(context: AgentExecutionContext): unknown {
+    const event = this.database.get(context.event_id);
+    if (!event?.reply_target_json) return undefined;
+    try { return JSON.parse(event.reply_target_json) as unknown; }
+    catch { return undefined; }
+  }
+
+  private async authorizedHumanWaitDestination(context: AgentExecutionContext): Promise<Record<string, unknown>> {
+    const destination=this.agentDisclosureDestination(context);
+    if(!destination||typeof destination!=="object"||Array.isArray(destination))throw new HumanWaitQueryError("human_wait_query_unavailable");
+    const value=destination as Record<string,unknown>;
+    if(typeof value.workspace_id!=="string"||typeof value.channel_id!=="string"||value.workspace_id!==context.workspace_id||
+      !this.humanWaitAccess)throw new HumanWaitQueryError("human_wait_query_unavailable");
+    try {
+      const allowed=await this.humanWaitAccess.authorize({event_id:context.event_id,workspace_id:value.workspace_id,
+        channel_id:value.channel_id,user_id:context.principal_id});
+      if(!allowed)throw new Error("current_access_unavailable");
+      return value;
+    } catch { throw new HumanWaitQueryError("human_wait_query_unavailable"); }
+  }
+
+  private agentJobAllowed(request: IncomingMessage, surface: AgentReadSurface, job: JobRow): boolean {
+    const context = this.verifiedAgentContexts.get(request);
+    if (!context || context.purpose !== "human_command") return false;
+    const binding = this.database.jobAuthorization.readJob(job.job_id);
+    const owner = binding?.principal_binding_event_id
+      ? this.database.getVerifiedPrincipalBinding(binding.principal_binding_event_id)
+      : undefined;
+    const ownerBindingCurrent = binding !== undefined && owner !== undefined && owner.revoked_at === null &&
+      owner.proof_sha256 === binding.ingress_proof_sha256 && owner.tenant_id === binding.tenant_id &&
+      owner.workspace_id === binding.workspace_id && owner.principal_kind === binding.principal_kind &&
+      owner.principal_id === binding.principal_id;
+    return this.agentReads.authorize({
+      context,
+      operation: "read_exact_job_status",
+      surface,
+      job,
+      binding,
+      owner_binding_current: ownerBindingCurrent,
+      disclosure_destination: this.agentDisclosureDestination(context),
+    }).allowed;
+  }
+
+  private notAvailable(): ApiRequestError {
+    return new ApiRequestError(404, "not_available", "Resource is not available");
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -691,10 +917,25 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/jobs") {
       const sourceEventId=url.searchParams.get("source_event_id");
       if(sourceEventId){
-        try{sendJson(response,200,{schema_version:1,jobs:this.database.listOwnerJobs(sourceEventId).map(
-          ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
-            ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}))});}
-        catch{throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");}
+        const context = this.verifiedAgentContexts.get(request);
+        try {
+          const rows = this.database.listOwnerJobs(sourceEventId, context ? agentReadCandidateScanMax + 1 : 100);
+          if(context&&rows.length>agentReadCandidateScanMax)throw new ApiRequestError(503,"owner_query_unavailable","Owner job query is unavailable");
+          const scanned = context ? rows.slice(0, agentReadCandidateScanMax) : rows;
+          const jobs = context
+            ? scanned.filter(row => this.agentJobAllowed(request, "list_owner_jobs", row)).map(projectAuthorizedJob)
+            : scanned.map(({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+              ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}));
+          sendJson(response,200,{schema_version:1,jobs:jobs.slice(0,100),
+            ...(context ? { truncated: jobs.length > 100 } : {})});
+        }
+        catch(error) {
+          if(error instanceof ApiRequestError)throw error;
+          if(error instanceof JobOwnerUnavailableError){
+            if(context)sendJson(response,200,{schema_version:1,jobs:[],truncated:false});
+            else throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");
+          } else throw new ApiRequestError(503,"owner_query_unavailable","Owner job query is unavailable");
+        }
         return;
       }
       const workspaceId = url.searchParams.get("workspace_id");
@@ -703,11 +944,25 @@ export class DispatcherApi {
       if (!workspaceId || !channelId || !threadTs) {
         throw new ApiRequestError(400, "invalid_request", "workspace_id, channel_id, and thread_ts are required");
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const agentContext = this.verifiedAgentContexts.get(request);
+      if (agentContext) {
+        const event = this.database.get(agentContext.event_id);
+        const target = event?.reply_target_json ? JSON.parse(event.reply_target_json) as Record<string, unknown> : undefined;
+        if (target?.workspace_id !== workspaceId || target.channel_id !== channelId || target.thread_ts !== threadTs) {
+          throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+        }
+      }
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs,
+        agentContext ? agentReadCandidateScanMax + 1 : 101);
+      if(agentContext&&candidates.length>agentReadCandidateScanMax)throw new ApiRequestError(503,"thread_query_unavailable","Thread job query is unavailable");
+      const scanned = agentContext ? candidates.slice(0, agentReadCandidateScanMax) : candidates;
+      const visible = agentContext
+        ? scanned.filter(row => this.agentJobAllowed(request, "list_thread_jobs", row))
+        : scanned;
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
-        truncated: candidates.length > 100,
+        jobs: agentContext ? visible.slice(0, 100).map(projectAuthorizedJob) : visible.slice(0,100),
+        truncated: visible.length > 100,
       });
       return;
     }
@@ -718,31 +973,53 @@ export class DispatcherApi {
     const liveReceiptId=match[3];
     if(request.method==="GET"&&liveReceiptId){
       const job=this.database.getJob(jobId);
-      if(!job)throw new ApiRequestError(404,"job_not_found",`Job ${jobId} was not found`);
+      const context=this.verifiedAgentContexts.get(request);
+      if(!job){
+        if(context)throw this.notAvailable();
+        throw new ApiRequestError(404,"job_not_found",`Job ${jobId} was not found`);
+      }
       const sourceEventId=url.searchParams.get("source_event_id");
       if(sourceEventId===null||!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId))throw new ApiRequestError(400,"invalid_request","valid source_event_id is required");
-      try{this.database.assertJobSourceMatchesThread(jobId,sourceEventId);}catch{throw new ApiRequestError(403,"job_thread_mismatch","Job does not belong to the event thread");}
+      try{this.database.assertJobSourceMatchesThread(jobId,sourceEventId);}catch{
+        if(context)throw this.notAvailable();
+        throw new ApiRequestError(403,"job_thread_mismatch","Job does not belong to the event thread");
+      }
+      if(context?.purpose==="job_completion"||context&&!this.agentJobAllowed(request,"get_job_status",job))throw this.notAvailable();
       const receipt=this.jobs.getLiveSessionReceipt?.(jobId,liveReceiptId);
-      if(!receipt)throw new ApiRequestError(404,"live_session_receipt_not_found","Live session receipt was not found");
+      if(!receipt){
+        if(context)throw this.notAvailable();
+        throw new ApiRequestError(404,"live_session_receipt_not_found","Live session receipt was not found");
+      }
       sendJson(response,200,projectLiveJobResponse({...job,...this.database.jobNotificationState(jobId)},receipt));return;
     }
     if (request.method === "GET" && !action) {
-      const job = this.database.getJob(jobId);
-      if (!job) throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
       const sourceEventId = url.searchParams.get("source_event_id");
       if (sourceEventId === null) throw new ApiRequestError(400,"invalid_request","source_event_id is required");
-      if (sourceEventId !== null) {
-        if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
-          throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
-        }
-        try {
-          this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
-        } catch {
-          throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
-        }
+      if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(sourceEventId)) {
+        throw new ApiRequestError(400, "invalid_request", "source_event_id is invalid");
       }
       const includeLive=url.searchParams.get("include_live_session");
       if(includeLive!==null&&includeLive!=="true"&&includeLive!=="false")throw new ApiRequestError(400,"invalid_request","include_live_session must be true or false");
+      const job = this.database.getJob(jobId);
+      const context = this.verifiedAgentContexts.get(request);
+      if (!job) {
+        if (context) throw this.notAvailable();
+        throw new ApiRequestError(404, "job_not_found", `Job ${jobId} was not found`);
+      }
+      try {
+        this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
+      } catch {
+        if (context) throw this.notAvailable();
+        throw new ApiRequestError(403, "job_thread_mismatch", "Job does not belong to the event thread");
+      }
+      if (context?.purpose === "job_completion") {
+        if(includeLive==="true")throw this.notAvailable();
+        sendJson(response, 200, { schema_version: 1, job: projectCompletionJob(job) });
+        return;
+      }
+      if (context && !this.agentJobAllowed(request, "get_job_status", job)) {
+        throw this.notAvailable();
+      }
       if(includeLive==="true"){
         if(!this.jobs.observeLiveSession)throw new ApiRequestError(503,"live_session_unavailable","Live session observation is unavailable");
         try{
@@ -752,7 +1029,10 @@ export class DispatcherApi {
           sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      }else{
+        const responseJob = {...job,...this.database.jobNotificationState(jobId)} as JobRow;
+        sendJson(response, 200, { schema_version: 1, job: context ? projectAuthorizedJob(responseJob) : responseJob });
+      }
       return;
     }
     if (request.method === "POST" && action === "steer") {
@@ -811,10 +1091,22 @@ export class DispatcherApi {
       throw new BodyTooLargeError();
     }
     const body = await readBody(request, this.config.requestMaxBytes);
+    let input: unknown;
     try {
-      return JSON.parse(body.toString("utf8"));
+      input = JSON.parse(body.toString("utf8"));
     } catch {
       throw new RequestValidationError("Request body must be valid JSON");
     }
+    const context = this.verifiedAgentContexts.get(request);
+    const operation = agentOperation(request.method, new URL(request.url ?? "/", "http://localhost"));
+    if (context && operation && agentBodyEventOperations.has(operation)) {
+      const sourceEventId = input && typeof input === "object" && !Array.isArray(input)
+        ? (input as Record<string, unknown>).source_event_id
+        : undefined;
+      if (sourceEventId !== context.event_id) {
+        throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
+      }
+    }
+    return input;
   }
 }

@@ -20,12 +20,19 @@ async function main(): Promise<void> {
   const config = loadAdapterConfig();
   const keychain = new MacOSKeychainStore();
   const logger = createSlackLogger(config.logLevel);
-  const sockets: WorkspaceSocket[] = [];
+  const resolvedTokens = new Map<string, Awaited<ReturnType<typeof resolveSlackTokens>>>();
 
   for (const workspace of config.workspaces) {
     const tokens = await resolveSlackTokens(workspace, keychain, promptSecret);
+    resolvedTokens.set(workspace, tokens);
+  }
+  const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
+  const sockets: WorkspaceSocket[] = [];
+  for (const workspace of config.workspaces) {
+    const tokens = resolvedTokens.get(workspace)!;
     sockets.push({
       workspace,
+      teamId: registry.get(workspace).teamId,
       client: new SocketModeClient({
         appToken: tokens.appToken,
         logger: createSocketSdkLogger(logger, config.logLevel),
@@ -40,8 +47,8 @@ async function main(): Promise<void> {
     connectTimeoutMs: config.dispatcherConnectTimeoutMs,
     timeoutMs: config.dispatcherTimeoutMs,
     internalTokenPath: config.updateInternalTokenPath,
+    ingressTokenPath: config.slackIngressTokenPath,
   });
-  const registry = await SlackWorkspaceRegistry.load(config.workspaces, keychain, logger);
   const updateNotifications = new SlackUpdateNotificationReporter(registry);
   const adapter = new SlackSocketAdapter(sockets, dispatcher, config, logger);
   const health = new SlackHealthServer(

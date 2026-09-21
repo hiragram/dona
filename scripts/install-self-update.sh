@@ -437,6 +437,11 @@ if [[ ! -f "$CONTROL_ROOT/dispatcher.token" ]]; then
   chmod 600 "$CONTROL_ROOT/dispatcher.token.tmp"
   /bin/mv "$CONTROL_ROOT/dispatcher.token.tmp" "$CONTROL_ROOT/dispatcher.token"
 fi
+if [[ ! -f "$CONTROL_ROOT/slack-ingress.token" ]]; then
+  /usr/bin/openssl rand -hex 32 > "$CONTROL_ROOT/slack-ingress.token.tmp"
+  chmod 600 "$CONTROL_ROOT/slack-ingress.token.tmp"
+  /bin/mv "$CONTROL_ROOT/slack-ingress.token.tmp" "$CONTROL_ROOT/slack-ingress.token"
+fi
 
 if [[ ! -f "$CONFIG_ROOT/slack.env" && -f "$REPOSITORY_DIR/sources/slack/.env" ]]; then
   /bin/cp "$REPOSITORY_DIR/sources/slack/.env" "$CONFIG_ROOT/slack.env"

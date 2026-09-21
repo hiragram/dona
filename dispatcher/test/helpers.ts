@@ -5,12 +5,21 @@ import path from "node:path";
 import type { DispatcherConfig } from "../src/config.js";
 import type { EventEnvelope } from "../src/types.js";
 
+export const testInternalToken = "dispatcher-test-token-that-is-long-enough-for-authentication";
+
 export async function tempConfig(): Promise<{ root: string; config: DispatcherConfig }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-dispatcher-test-"));
+  const tokenPath = path.join(root, "update-control", "dispatcher.token");
+  const ingressTokenPath = path.join(root, "update-control", "slack-ingress.token");
+  await fs.mkdir(path.dirname(tokenPath), { recursive: true, mode: 0o700 });
+  await fs.writeFile(tokenPath, testInternalToken, { mode: 0o600 });
+  await fs.writeFile(ingressTokenPath, testInternalToken, { mode: 0o600 });
   return {
     root,
     config: {
       socketPath: path.join(root, "run", "dispatcher.sock"),
+      agentSocketPath: path.join(root, "run", "dispatcher-agent.sock"),
+      agentCredentialPath: path.join(root, "run", "dispatcher-agent.token"),
       databasePath: path.join(root, "dona.sqlite3"),
       resultsDir: path.join(root, "results"),
       herdrSession: "dona",
@@ -36,7 +45,8 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
       ghPath: "gh",
       gitPath: "git",
       updaterSocketPath: path.join(root, "update-control", "updater.sock"),
-      updateInternalTokenPath: path.join(root, "update-control", "dispatcher.token"),
+      updateInternalTokenPath: tokenPath,
+      slackIngressTokenPath: ingressTokenPath,
     updateNotificationDatabasePath: path.join(root, "update-notifications.sqlite3"),
     jobProgressDatabasePath: path.join(root, "job-progress.sqlite3"),
       slackAdapterSocketPath: path.join(root, "run", "slack-adapter.sock"),
@@ -65,6 +75,7 @@ export function eventEnvelope(externalEventId: string): EventEnvelope {
       channel_id: "C_TEST",
       thread_ts: "1756722030.123456",
     },
+    trace: { ingress_attempt: 1 },
   };
 }
 

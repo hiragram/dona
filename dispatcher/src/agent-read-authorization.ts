@@ -1,0 +1,305 @@
+import { createHash } from "node:crypto";
+
+import type { AgentExecutionContext } from "./agent-context.js";
+import type { DispatcherDatabase } from "./database.js";
+import type { JobAuthorizationBindingRow } from "./job-authorization-binding.js";
+import type { JobRow } from "./types.js";
+import { stableStringify } from "./validation.js";
+
+export const agentReadSurfaces = [
+  "list_event_jobs",
+  "list_thread_jobs",
+  "list_owner_jobs",
+  "get_job_status",
+  "list_human_waits",
+  "resolve_human_wait_origin",
+] as const;
+
+export const agentReadGrantOperations = [
+  "read_own_human_waits",
+  "read_exact_job_status",
+  "read_bounded_result",
+  "resolve_origin_ref",
+] as const;
+
+export type AgentReadSurface = (typeof agentReadSurfaces)[number];
+export type AgentReadGrantOperation = (typeof agentReadGrantOperations)[number];
+export type AgentReadDenyReason =
+  | "binding_unavailable"
+  | "owner_not_human"
+  | "principal_mismatch"
+  | "workspace_mismatch"
+  | "policy_revision_mismatch"
+  | "grant_unavailable"
+  | "destination_unavailable"
+  | "visibility_unavailable"
+  | "audit_unavailable";
+
+export interface AgentReadGrantInput {
+  operation: AgentReadGrantOperation;
+  surface: AgentReadSurface;
+  tenant_id: string;
+  workspace_id: string;
+  principal_id: string;
+  job_id: string;
+  source_event_id: string;
+  resource_kind: JobAuthorizationBindingRow["resource_kind"] | "job" | "job_group" | "notification" | "agent_session";
+  repository_node_id: string | null;
+  task_node_id: string | null;
+  resource_revision: number | null;
+  policy_revision: number;
+}
+
+export interface AgentReadGrantPort {
+  authorize(input: Readonly<AgentReadGrantInput>): boolean;
+  revision?(input: Readonly<{operation:AgentReadGrantOperation;surface:AgentReadSurface;tenant_id:string;workspace_id:string;principal_id:string;policy_revision:number}>): string;
+}
+
+export interface AgentReadVisibilityInput {
+  operation: AgentReadGrantOperation;
+  surface: AgentReadSurface;
+  event_id: string;
+  tenant_id: string;
+  workspace_id: string;
+  principal_id: string;
+  job_id: string;
+  disclosure_origin: unknown;
+  disclosure_destination: unknown;
+}
+
+export interface AgentReadVisibilityPort {
+  authorize(input: Readonly<AgentReadVisibilityInput>): boolean;
+  revision?(input: Readonly<{operation:AgentReadGrantOperation;surface:AgentReadSurface;event_id:string;tenant_id:string;workspace_id:string;principal_id:string;disclosure_destination:unknown}>): string;
+}
+
+export interface RestrictedAgentReadAudit {
+  record(input: Readonly<{
+    event_id: string;
+    job_id: string;
+    operation: AgentReadGrantOperation;
+    surface: AgentReadSurface;
+    outcome: "allowed" | "denied";
+    reason: "none" | AgentReadDenyReason;
+    policy_revision: number;
+  }>): void;
+}
+
+export interface AgentReadDecision {
+  allowed: boolean;
+  provider_failed?: boolean;
+  authority: { allowed: boolean; reason: "none" | AgentReadDenyReason };
+  disclosure: { allowed: boolean; reason: "none" | AgentReadDenyReason };
+}
+
+export const denyAgentReadGrantPort: AgentReadGrantPort = { authorize: () => false };
+export const denyAgentReadVisibilityPort: AgentReadVisibilityPort = { authorize: () => false };
+const noAgentReadAudit: RestrictedAgentReadAudit = { record() {} };
+
+function parseOrigin(value: string): unknown {
+  try { return JSON.parse(value) as unknown; }
+  catch { return undefined; }
+}
+
+export class AgentReadAuthorization {
+  constructor(
+    private readonly grant: AgentReadGrantPort = denyAgentReadGrantPort,
+    private readonly visibility: AgentReadVisibilityPort = denyAgentReadVisibilityPort,
+    private readonly audit: RestrictedAgentReadAudit = noAgentReadAudit,
+    private readonly policyRevision = 1,
+  ) {}
+
+  authorize(input: Readonly<{
+    context: AgentExecutionContext;
+    operation: AgentReadGrantOperation;
+    surface: AgentReadSurface;
+    job: JobRow;
+    binding: JobAuthorizationBindingRow | undefined;
+    owner_binding_current: boolean;
+    disclosure_destination: unknown;
+  }>): AgentReadDecision {
+    const { context, operation, surface, job, binding } = input;
+    let authorityReason: "none" | AgentReadDenyReason = "none";
+    if (!binding || !input.owner_binding_current || binding.job_id !== job.job_id || binding.source_event_id !== job.source_event_id) {
+      authorityReason = "binding_unavailable";
+    } else if (binding.owner_kind !== "human_verified" || binding.principal_kind !== "human" || binding.principal_id === null) {
+      authorityReason = "owner_not_human";
+    } else if (binding.tenant_id !== context.tenant_id || binding.principal_id !== context.principal_id) {
+      authorityReason = "principal_mismatch";
+    } else if (binding.workspace_id !== context.workspace_id || job.workspace_id !== context.workspace_id) {
+      authorityReason = "workspace_mismatch";
+    } else if (binding.policy_revision !== this.policyRevision || context.policy_revision !== this.policyRevision) {
+      authorityReason = "policy_revision_mismatch";
+    } else {
+      try {
+        if (!this.grant.authorize({
+          operation,
+          surface,
+          tenant_id: context.tenant_id,
+          workspace_id: context.workspace_id,
+          principal_id: context.principal_id,
+          job_id: job.job_id,
+          source_event_id: job.source_event_id,
+          resource_kind: binding.resource_kind,
+          repository_node_id: binding.repository_node_id,
+          task_node_id: binding.task_node_id,
+          resource_revision: binding.resource_revision,
+          policy_revision: this.policyRevision,
+        })) authorityReason = "grant_unavailable";
+      } catch { authorityReason = "grant_unavailable"; }
+    }
+
+    const authority = { allowed: authorityReason === "none", reason: authorityReason } as const;
+    let disclosureReason: "none" | AgentReadDenyReason = authority.allowed ? "none" : authority.reason;
+    if (authority.allowed && input.disclosure_destination === undefined) disclosureReason = "destination_unavailable";
+    else if (authority.allowed && binding) {
+      try {
+        if (!this.visibility.authorize({
+          operation,
+          surface,
+          event_id: context.event_id,
+          tenant_id: context.tenant_id,
+          workspace_id: context.workspace_id,
+          principal_id: context.principal_id,
+          job_id: job.job_id,
+          disclosure_origin: parseOrigin(binding.disclosure_origin_json),
+          disclosure_destination: input.disclosure_destination,
+        })) disclosureReason = "visibility_unavailable";
+      } catch { disclosureReason = "visibility_unavailable"; }
+    }
+    let disclosure: AgentReadDecision["disclosure"] = {
+      allowed: authority.allowed && disclosureReason === "none", reason: disclosureReason,
+    };
+    let allowed = authority.allowed && disclosure.allowed;
+    try {
+      this.audit.record({
+        event_id: context.event_id,
+        job_id: job.job_id,
+        operation,
+        surface,
+        outcome: allowed ? "allowed" : "denied",
+        reason: allowed ? "none" : disclosure.reason,
+        policy_revision: this.policyRevision,
+      });
+    } catch {
+      disclosure = { allowed: false, reason: "audit_unavailable" };
+      allowed = false;
+    }
+    return { allowed, authority, disclosure };
+  }
+
+  snapshot(input: Readonly<{context:AgentExecutionContext;operation:AgentReadGrantOperation;surface:AgentReadSurface;
+    disclosure_destination:unknown}>): {grant_revision:string;visibility_revision:string;policy_revision:number}|undefined {
+    if(input.context.purpose!=="human_command"||input.context.policy_revision!==this.policyRevision||input.disclosure_destination===undefined||
+      !this.grant.revision||!this.visibility.revision)return undefined;
+    try {
+      const common={operation:input.operation,surface:input.surface,tenant_id:input.context.tenant_id,
+        workspace_id:input.context.workspace_id,principal_id:input.context.principal_id,policy_revision:this.policyRevision};
+      const grantRevision=this.grant.revision(common);
+      const visibilityRevision=this.visibility.revision({...common,event_id:input.context.event_id,
+        disclosure_destination:input.disclosure_destination});
+      if(!/^[A-Za-z0-9_.:-]{1,160}$/.test(grantRevision)||!/^[A-Za-z0-9_.:-]{1,160}$/.test(visibilityRevision))return undefined;
+      return {grant_revision:grantRevision,visibility_revision:visibilityRevision,policy_revision:this.policyRevision};
+    } catch { return undefined; }
+  }
+
+  authorizeResource(input: Readonly<{context:AgentExecutionContext;operation:AgentReadGrantOperation;surface:AgentReadSurface;
+    resource:{item_id:string;source_event_id:string;resource_kind:AgentReadGrantInput["resource_kind"];resource_id:string;
+      resource_revision:number;owner_kind:"human_verified"|"schedule"|"unknown";owner_principal_kind:"human"|null;
+      owner_principal_id:string|null;tenant_id:string|null;workspace_id:string|null;owner_binding_current:boolean;disclosure_origin:unknown};
+    disclosure_destination:unknown}>):AgentReadDecision {
+    const {context,resource}=input;
+    let authorityReason:"none"|AgentReadDenyReason="none",providerFailed=false;
+    if(!resource.owner_binding_current)authorityReason="binding_unavailable";
+    else if(resource.owner_kind==="unknown"||resource.owner_principal_kind!=="human"||resource.owner_principal_id===null||
+      resource.tenant_id===null||resource.workspace_id===null)authorityReason="owner_not_human";
+    else if(resource.tenant_id!==context.tenant_id||resource.owner_principal_id!==context.principal_id)authorityReason="principal_mismatch";
+    else if(resource.workspace_id!==context.workspace_id)authorityReason="workspace_mismatch";
+    else if(context.policy_revision!==this.policyRevision)authorityReason="policy_revision_mismatch";
+    else try {
+      if(!this.grant.authorize({operation:input.operation,surface:input.surface,tenant_id:context.tenant_id,
+        workspace_id:context.workspace_id,principal_id:context.principal_id,job_id:resource.resource_id,
+        source_event_id:resource.source_event_id,resource_kind:resource.resource_kind,repository_node_id:null,task_node_id:null,
+        resource_revision:resource.resource_revision,policy_revision:this.policyRevision}))authorityReason="grant_unavailable";
+    } catch {authorityReason="grant_unavailable";providerFailed=true;}
+    const authority={allowed:authorityReason==="none",reason:authorityReason} as AgentReadDecision["authority"];
+    let disclosureReason:"none"|AgentReadDenyReason=authority.allowed?"none":authority.reason;
+    if(authority.allowed&&input.disclosure_destination===undefined)disclosureReason="destination_unavailable";
+    else if(authority.allowed)try {
+      if(!this.visibility.authorize({operation:input.operation,surface:input.surface,event_id:context.event_id,
+        tenant_id:context.tenant_id,workspace_id:context.workspace_id,principal_id:context.principal_id,
+        job_id:resource.resource_id,disclosure_origin:resource.disclosure_origin,disclosure_destination:input.disclosure_destination}))
+        disclosureReason="visibility_unavailable";
+    } catch {disclosureReason="visibility_unavailable";providerFailed=true;}
+    let disclosure={allowed:authority.allowed&&disclosureReason==="none",reason:disclosureReason} as AgentReadDecision["disclosure"];
+    let allowed=authority.allowed&&disclosure.allowed;
+    try {this.audit.record({event_id:context.event_id,job_id:resource.item_id,operation:input.operation,surface:input.surface,
+      outcome:allowed?"allowed":"denied",reason:allowed?"none":disclosure.reason,policy_revision:this.policyRevision});}
+    catch {disclosure={allowed:false,reason:"audit_unavailable"};allowed=false;providerFailed=true;}
+    return {allowed,authority,disclosure,...(providerFailed?{provider_failed:true}:{})};
+  }
+}
+
+export function createHumanWaitAgentReadAuthorization(database:DispatcherDatabase):AgentReadAuthorization {
+  const grant:AgentReadGrantPort={
+    authorize:input=>(input.operation==="read_own_human_waits"&&input.surface==="list_human_waits")||
+      (input.operation==="resolve_origin_ref"&&input.surface==="resolve_human_wait_origin"),
+    revision:input=>{
+      if(!((input.operation==="read_own_human_waits"&&input.surface==="list_human_waits")||
+        (input.operation==="resolve_origin_ref"&&input.surface==="resolve_human_wait_origin")))throw new Error("grant_unavailable");
+      return `human-wait-grant-v1:${input.operation}`;
+    },
+  };
+  const currentDestination=(input:{event_id:string;tenant_id:string;workspace_id:string;principal_id:string;destination:unknown})=>{
+    const event=database.get(input.event_id),principal=database.getAgentPrincipalBinding(input.event_id);
+    if(!event||event.source!=="slack"||!event.reply_target_json||!principal||principal.revoked_at!==null||
+      principal.tenant_id!==input.tenant_id||principal.workspace_id!==input.workspace_id||principal.principal_id!==input.principal_id)return false;
+    try {return stableStringify(JSON.parse(event.reply_target_json) as unknown)===stableStringify(input.destination);}
+    catch{return false;}
+  };
+  const destinationChannel=(value:unknown):{workspace_id:string;channel_id:string}|undefined=>{
+    if(!value||typeof value!=="object"||Array.isArray(value))return undefined;
+    const outer=value as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown;target?:unknown};
+    const raw=outer.kind==="slack"?outer.target:outer;
+    if(!raw||typeof raw!=="object"||Array.isArray(raw))return undefined;
+    const target=raw as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown};
+    if(!["slack_thread","thread","channel","owner_dm"].includes(String(target.kind))||
+      typeof target.workspace_id!=="string"||typeof target.channel_id!=="string")return undefined;
+    return {workspace_id:target.workspace_id,channel_id:target.channel_id};
+  };
+  const visibility:AgentReadVisibilityPort={
+    authorize:input=>{
+      if(!currentDestination({...input,destination:input.disclosure_destination}))return false;
+      if(!input.disclosure_origin||typeof input.disclosure_origin!=="object")return false;
+      const origin=input.disclosure_origin as {kind?:unknown;origin_ref?:unknown};
+      if(origin.kind!=="human_wait_origin"||typeof origin.origin_ref!=="string")return false;
+      const item=database.humanWaits.getByOriginRef(origin.origin_ref);
+      const source=item?destinationChannel(database.humanWaits.disclosureDestination(item)):undefined;
+      const current=destinationChannel(input.disclosure_destination);
+      return item!==undefined&&item.resource_id===input.job_id&&database.humanWaits.authorizationCurrent(item)&&source!==undefined&&current!==undefined&&
+        source.workspace_id===current.workspace_id&&source.channel_id===current.channel_id;
+    },
+    revision:input=>{
+      if(!currentDestination({...input,destination:input.disclosure_destination}))throw new Error("visibility_unavailable");
+      return `human-wait-visibility-v1:${createHash("sha256").update(stableStringify({tenant_id:input.tenant_id,
+        workspace_id:input.workspace_id,principal_id:input.principal_id,destination:input.disclosure_destination})).digest("hex")}`;
+    },
+  };
+  return new AgentReadAuthorization(grant,visibility);
+}
+
+const publicJobKeys = [
+  "job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at",
+  "dispatch_started_at", "prompt_accepted_at", "last_error_code", "steer_event_id", "steer_state",
+  "completion_event_id", "notification_state", "notification_authorization_phase",
+] as const;
+
+export function projectAuthorizedJob(job: JobRow): Record<string, unknown> {
+  const row = job as unknown as Record<string, unknown>;
+  return Object.fromEntries(publicJobKeys.filter(key => key in row).map(key => [key, row[key]]));
+}
+
+const completionJobKeys = ["job_id", "source_event_id", "job_key", "status", "created_at", "updated_at", "completed_at"] as const;
+
+export function projectCompletionJob(job: JobRow): Record<string, unknown> {
+  return Object.fromEntries(completionJobKeys.map(key => [key, job[key]]));
+}

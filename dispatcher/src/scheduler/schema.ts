@@ -22,6 +22,10 @@ export function migrateScheduler(
         );
         CREATE INDEX IF NOT EXISTS schedule_claims_lease_idx ON schedule_claims(claim_until, schedule_id);`);
       const columns = db.prepare("SELECT name FROM pragma_table_info('schedules')").all() as Array<{ name: string }>;
+      const runColumns = db.prepare("SELECT name FROM pragma_table_info('schedule_runs')").all() as Array<{ name: string }>;
+      if (runColumns.length > 0 && !runColumns.some(column => column.name === "wait_reason")) {
+        db.exec("ALTER TABLE schedule_runs ADD COLUMN wait_reason TEXT CHECK(wait_reason IN ('human_input','invalid_result','ambiguous_write','operator_review_unknown') OR wait_reason IS NULL)");
+      }
       if (!columns.some(column => column.name === "list_sequence")) {
         db.exec("ALTER TABLE schedules ADD COLUMN list_sequence INTEGER");
       }
@@ -94,6 +98,7 @@ export function migrateScheduler(
         occurrence_key TEXT NOT NULL, scheduled_for TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('materialized','started','completed','failed','cancelled','skipped','needs_review')),
         reason TEXT CHECK(reason IN ('misfire','overlap','authorization_expired','cancelled','revision_replaced','ambiguous_write') OR reason IS NULL),
+        wait_reason TEXT CHECK(wait_reason IN ('human_input','invalid_result','ambiguous_write','operator_review_unknown') OR wait_reason IS NULL),
         event_id TEXT UNIQUE REFERENCES events(event_id), job_id TEXT,
         created_at TEXT NOT NULL, started_at TEXT, terminal_at TEXT,
         UNIQUE(schedule_id, occurrence_key), UNIQUE(schedule_id, scheduled_for),

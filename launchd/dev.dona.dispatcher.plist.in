@@ -16,6 +16,7 @@
     <key>DONA_RELEASE_MANIFEST_PATH</key><string>__RUNTIME_ROOT__/current/release-manifest.json</string>
     <key>DONA_UPDATER_SOCKET_PATH</key><string>__CONTROL_ROOT__/updater.sock</string>
     <key>DONA_UPDATE_INTERNAL_TOKEN_PATH</key><string>__CONTROL_ROOT__/dispatcher.token</string>
+    <key>DONA_SLACK_INGRESS_TOKEN_PATH</key><string>__CONTROL_ROOT__/slack-ingress.token</string>
     <key>DONA_HERDR_PATH</key><string>__HERDR__</string>
     <key>DONA_CODEX_PATH</key><string>__CODEX__</string>
     <key>DONA_GH_PATH</key><string>__GH__</string>

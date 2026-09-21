@@ -34,6 +34,7 @@ function usage(): never {
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher human-wait repair --snapshot REVISION [--cursor CURSOR] [--limit N] [--apply --force]
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -53,13 +54,36 @@ async function main(): Promise<void> {
     await runService(config);
     return;
   }
-  if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
+  if (!["event", "job", "scheduler", "human-wait"].includes(args[0]!)) usage();
   const command = args[1];
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
   try {
+    if(args[0]==="human-wait") {
+      if(command!=="repair")usage();
+      let snapshotRevision:string|undefined,cursor:string|null=null,limit=100,apply=false,force=false;
+      const seen=new Set<string>();
+      for(let index=2;index<args.length;index++){
+        const option=args[index]!;
+        if(seen.has(option))usage();
+        seen.add(option);
+        if(option==="--apply"){apply=true;continue;}
+        if(option==="--force"){force=true;continue;}
+        const value=args[++index];if(!value)usage();
+        if(option==="--snapshot")snapshotRevision=value;
+        else if(option==="--cursor")cursor=value;
+        else if(option==="--limit")limit=Number(value);
+        else usage();
+      }
+      if(!snapshotRevision)usage();
+      const dryRun=!apply;
+      if(!dryRun&&!force)throw new Error("human wait repair apply requires --force; run without --apply for dry-run");
+      if(dryRun&&force)usage();
+      const result=database.humanWaits.repair({dryRun,limit,cursor,snapshotRevision});
+      console.log(JSON.stringify({schema_version:1,...result},null,2));return;
+    }
     if (args[0] === "scheduler") {
       const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
       if (command === "health") { console.log(JSON.stringify(database.scheduler.operationalSnapshot(now), null, 2)); return; }
@@ -146,15 +170,27 @@ async function main(): Promise<void> {
     if(command==="reconcile-notification") {
       if(args[3]==="not_sent") {
         const eventId=eventIdAt(args,2),claim=database.claimNotificationReconciliation(eventId,args.includes("--resume")),settlement=database.notificationSessionSettlementRequest(eventId);
-        if(settlement)await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement);
-        console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,new Date(),claim),null,2));return;
+        let settledAt:Date;
+        if(settlement) {
+          const evidence=await new SlackAdapterJobNotificationVerifier(config).settleSession(settlement) as {event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;session_status:"active"|"suspended"|null};
+          settledAt=new Date();
+          if(settlement.desired_session_status==="suspended"&&!database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt))
+            throw new Error("job_notification_session_settlement_not_recorded");
+        } else settledAt=new Date();
+        console.log(JSON.stringify(database.reconcileScheduledNotificationNotSent(eventId,settledAt,claim),null,2));return;
       }
       const eventId=eventIdAt(args,2),workspaceId=eventIdAt(args,3),channelId=eventIdAt(args,4),messageTs=eventIdAt(args,5),threadTs=args[6]==="--resume"?undefined:args[6];
       const claim=database.claimNotificationReconciliation(eventId,args.includes("--resume"));
       const verification=database.notificationReconciliationVerificationRequest(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})});
       if(!verification) throw new Error("scheduled_notification_verification_unavailable");
-      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); if(verification.desired_session_status)await verifier.settle(verification);
-      console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})},new Date(),claim),null,2));
+      const verifier=new SlackAdapterJobNotificationVerifier(config); await verifier.verify(verification); let settledAt:Date;
+      if(verification.desired_session_status) {
+        const evidence=await verifier.settle(verification);
+        settledAt=new Date();
+        if(verification.desired_session_status==="suspended"&&!database.recordVerifiedNotificationSessionSettlement(eventId,evidence,settledAt))
+          throw new Error("job_notification_session_settlement_not_recorded");
+      } else settledAt=new Date();
+      console.log(JSON.stringify(database.reconcileScheduledNotification(eventId,{workspace_id:workspaceId,channel_id:channelId,message_ts:messageTs,...(threadTs?{thread_ts:threadTs}:{})},settledAt,claim),null,2));
       return;
     }
     if (command === "dead-letter") {

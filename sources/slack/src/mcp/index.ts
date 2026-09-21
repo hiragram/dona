@@ -2,7 +2,6 @@
 import "dotenv/config";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createHmac, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 
 import { loadRuntimeConfig } from "../config.js";
@@ -10,6 +9,7 @@ import { MacOSKeychainStore } from "../keychain.js";
 import { createSlackLogger, sanitizeLogValue } from "../logger.js";
 import { SlackWorkspaceRegistry } from "../workspace-registry.js";
 import { createSlackMcpServer } from "./server.js";
+import { signSlackAccessReceipt } from "../access-receipt.js";
 
 async function main(): Promise<void> {
   const config = loadRuntimeConfig();
@@ -27,10 +27,7 @@ async function main(): Promise<void> {
     throw error;
   });
   if(key!==undefined&&key.length<32) throw new Error("Slack access receipt signing key is invalid");
-  const signer=key===undefined?undefined:(input:{event_id:string;workspace_id:string;channel_id:string;user_id:string;channel_kind:"im"|"other";channel_user_id:string|null})=>{
-    const payload=Buffer.from(JSON.stringify({...input,issued_at:new Date().toISOString(),nonce:randomUUID()})).toString("base64url");
-    return `${payload}.${createHmac("sha256",key).update(payload).digest("base64url")}`;
-  };
+  const signer=key===undefined?undefined:(input: Parameters<typeof signSlackAccessReceipt>[0])=>signSlackAccessReceipt(input,key);
   const server = createSlackMcpServer(registry, logger, signer);
   await server.connect(new StdioServerTransport());
   logger.info("Dona Slack MCP server started", { transport: "stdio" });

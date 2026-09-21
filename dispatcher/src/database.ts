@@ -27,8 +27,12 @@ import type {
 } from "./types.js";
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
+import { JobAuthorizationBindingRepository, migrateJobAuthorizationBindings } from "./job-authorization-binding.js";
+import { dropHumanWaitTriggersForCoreMigration, HumanWaitRepository, migrateHumanWaitReadModel } from "./human-wait.js";
 import { createJobDisplayLabel } from "./job-display-label.js";
 import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
+import { migrateVerifiedPrincipalBindings, persistVerifiedPrincipalBinding, PrincipalBindingConflictError, readVerifiedPrincipalBinding, readVerifiedPrincipalProofConsumption, type VerifiedPrincipalBindingRow, type VerifiedPrincipalProofConsumptionRow } from "./principal-binding.js";
+import type { VerifiedSlackPrincipalProof } from "./principal-proof.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
   insertLiveSessionReceipt,
@@ -77,7 +81,8 @@ const jobsRunnableFairIndexSql = `
 
 export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
 export class JobCreationError extends Error {
-  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded", message: string,
+  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded" |
+    "job_task_repository_mismatch" | "job_task_principal_not_current", message: string,
     readonly limitDetails?: { resource: "jobs_per_event" | "objective_utf8_bytes_per_event"; current: number; attempted: number; maximum: number }) {
     super(message); this.name = "JobCreationError";
   }
@@ -86,6 +91,9 @@ export class ScheduledJobCreationError extends Error {
   constructor(readonly code: string, message: string) {
     super(message); this.name = "ScheduledJobCreationError";
   }
+}
+export class JobOwnerUnavailableError extends Error {
+  constructor() { super("Unknown job owner"); this.name="JobOwnerUnavailableError"; }
 }
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
@@ -250,11 +258,20 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   const migrateV3 = () => {
+    dropHumanWaitTriggersForCoreMigration(db);
     const hasLegacyStopMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
     db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasJobAuthorizationBindings = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_authorization_bindings'").get() !== undefined;
+    if (hasJobAuthorizationBindings) db.exec(`
+      CREATE TEMP TABLE preserved_job_authorization_bindings_v3 AS SELECT * FROM job_authorization_bindings;
+      DROP TRIGGER IF EXISTS job_authorization_binding_immutable;
+      DROP TRIGGER IF EXISTS job_authorization_source_match;
+      DROP TRIGGER IF EXISTS job_authorization_principal_complete;
+      DROP TRIGGER IF EXISTS job_authorization_task_match;
+    `);
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -317,6 +334,10 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
+    if (hasJobAuthorizationBindings) db.exec(`
+      INSERT INTO job_authorization_bindings SELECT * FROM preserved_job_authorization_bindings_v3;
+      DROP TABLE preserved_job_authorization_bindings_v3;
+    `);
     migrationHook("indexes_recreated");
 
     db.exec(`
@@ -376,6 +397,8 @@ export function migrateDispatcherDatabase(
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
+  readonly jobAuthorization: JobAuthorizationBindingRepository;
+  readonly humanWaits: HumanWaitRepository;
   private readonly schemaWrite: 2 | 3;
   private readonly migrationHook: DispatcherMigrationHook;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
@@ -400,6 +423,7 @@ export class DispatcherDatabase {
       this.db.transaction(() => {
         migrateDispatcherDatabase(this.db, this.migrationHook, true, this.schemaWrite);
         migrateScheduler(this.db, this.migrationHook, true);
+        migrateVerifiedPrincipalBindings(this.db);
         migrateLiveSession(this.db);
       }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
@@ -416,7 +440,11 @@ export class DispatcherDatabase {
           if(fs.existsSync(backup)) throw new Error("routing_migration_result_backup_exists");
           fs.renameSync(row.result_path,backup); movedResults.push({from:row.result_path,to:backup});
         }
-        migrateJobRouting(this.db);
+        this.db.transaction(() => {
+          migrateJobRouting(this.db);
+          migrateJobAuthorizationBindings(this.db);
+          migrateHumanWaitReadModel(this.db);
+        }).immediate();
       } catch(error) {
         for(const moved of movedResults.reverse()) if(fs.existsSync(moved.to)&&!fs.existsSync(moved.from)) fs.renameSync(moved.to,moved.from);
         throw error;
@@ -438,10 +466,12 @@ export class DispatcherDatabase {
             .run(nowUtc(),row.event_id);
         }
       }
+      this.humanWaits = new HumanWaitRepository(this.db);
     } catch (error) {
       this.db.close();
       throw error;
     }
+    this.jobAuthorization = new JobAuthorizationBindingRepository(this.db);
     this.scheduler = new SchedulerRepository(this.db, (event, at) => this.enqueue(event, at), undefined, (jobId,resultPath) => {
       const legacy=path.basename(resultPath)===`${jobId}.json`;
       const isolated=path.basename(resultPath)==="result.json"&&path.basename(path.dirname(resultPath))===jobId;
@@ -468,7 +498,7 @@ export class DispatcherDatabase {
     this.db.prepare("UPDATE events SET updated_at = updated_at WHERE 0").run();
   }
 
-  enqueue(envelope: EventEnvelope, at = new Date()): EnqueueResult {
+  enqueue(envelope: EventEnvelope, at = new Date(), verifiedPrincipal?: VerifiedSlackPrincipalProof): EnqueueResult {
     const timestamp = at.toISOString();
     const subjectJson = stableStringify(envelope.subject);
     const payloadJson = stableStringify(envelope.payload);
@@ -480,15 +510,20 @@ export class DispatcherDatabase {
         .prepare("SELECT * FROM events WHERE source = ? AND external_event_id = ?")
         .get(envelope.source, envelope.external_event_id) as EventRow | undefined;
       if (existing) {
+        const existingTrace = existing.trace_json ? JSON.parse(existing.trace_json) as Record<string,unknown> : undefined;
+        const unstableOccurredAt = existingTrace?.occurred_at_source === "received_at"
+          && envelope.trace?.occurred_at_source === "received_at";
         const mismatch =
           existing.schema_version !== envelope.schema_version ||
           existing.event_type !== envelope.type ||
-          existing.occurred_at !== envelope.occurred_at ||
+          existing.occurred_at !== envelope.occurred_at && !unstableOccurredAt ||
           existing.subject_json !== subjectJson ||
           existing.payload_json !== payloadJson ||
           existing.reply_target_json !== replyTargetJson;
         const binding=legacySlackBinding(existing);
         if(binding) insertEventJobBinding(this.db,existing.event_id,binding);
+        if (verifiedPrincipal && mismatch) throw new PrincipalBindingConflictError();
+        if (verifiedPrincipal) persistVerifiedPrincipalBinding(this.db, existing.event_id, verifiedPrincipal, timestamp);
         return { row: existing, duplicate: true, payloadMismatch: mismatch };
       }
 
@@ -520,8 +555,49 @@ export class DispatcherDatabase {
       if (!row) throw new Error("Inserted event could not be read back");
       const binding=legacySlackBinding(row);
       if(binding) insertEventJobBinding(this.db,row.event_id,binding);
+      if (verifiedPrincipal) persistVerifiedPrincipalBinding(this.db, row.event_id, verifiedPrincipal, timestamp);
       return { row, duplicate: false, payloadMismatch: false };
     })();
+  }
+
+  getVerifiedPrincipalBinding(eventId: string): VerifiedPrincipalBindingRow | undefined {
+    return readVerifiedPrincipalBinding(this.db, eventId);
+  }
+
+  getAgentPrincipalBinding(eventId: string): VerifiedPrincipalBindingRow | undefined {
+    const visited = new Set<string>();
+    let currentId: string | undefined = eventId;
+    while (currentId && !visited.has(currentId)) {
+      visited.add(currentId);
+      const direct = readVerifiedPrincipalBinding(this.db, currentId);
+      if (direct) return direct;
+      const event = this.get(currentId);
+      if (!event) return undefined;
+      if (event.source === "dona_job") {
+        const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+        const trace = event.trace_json ? JSON.parse(event.trace_json) as Record<string, unknown> : undefined;
+        const source = subject.source_event_id ?? trace?.source_event_id;
+        currentId = typeof source === "string" ? source : undefined;
+        continue;
+      }
+      if (event.source === "dona_schedule") {
+        const authorization = this.db.prepare(`
+          SELECT v.authorization_id
+          FROM schedule_runs r
+          JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+          WHERE r.event_id=?
+        `).get(currentId) as { authorization_id: string } | undefined;
+        const match = authorization?.authorization_id.match(/^(evt_[0-9A-HJKMNP-TV-Z]{26})(?::\d+)?$/i);
+        currentId = match?.[1];
+        continue;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  getVerifiedPrincipalProofConsumption(proofSha256:string):VerifiedPrincipalProofConsumptionRow|undefined {
+    return readVerifiedPrincipalProofConsumption(this.db,proofSha256);
   }
 
   get(eventId: string): EventRow | undefined {
@@ -651,6 +727,17 @@ export class DispatcherDatabase {
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
 
+      const exactTask = this.jobAuthorization.readEventTask(sourceEvent.event_id);
+      if (exactTask?.status === "active") {
+        const principal = readVerifiedPrincipalBinding(this.db, sourceEvent.event_id);
+        if (!principal || principal.revoked_at !== null) {
+          throw new JobCreationError("job_task_principal_not_current", "Verified exact-task principal is not current");
+        }
+        if (parsedRequest.workspace.kind !== "github" || parsedRequest.workspace.repository !== exactTask.repository_full_name) {
+          throw new JobCreationError("job_task_repository_mismatch", "Job workspace does not match the verified exact-task repository");
+        }
+      }
+
       if (this.schemaWrite === 2 && parsedRequest.job_key !== undefined) throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");
       const jobId = jobAgentName(`job_${ulid(at.getTime()).toLowerCase()}`, parsedRequest.objective);
       const workspacePath = parsedRequest.workspace.kind === "scratch"
@@ -691,6 +778,7 @@ export class DispatcherDatabase {
       );
       this.db.prepare(`INSERT INTO job_owner_bindings(job_id,source_event_id,owner_json,destination_json)
         SELECT ?,event_id,owner_json,destination_json FROM event_job_bindings WHERE event_id=?`).run(jobId,sourceEvent.event_id);
+      this.jobAuthorization.captureJob(jobId, sourceEvent.event_id, at);
       if (binding.owner.kind === "schedule") {
         const scheduleAt = new Date(Math.floor(at.getTime() / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
         try {
@@ -761,7 +849,7 @@ export class DispatcherDatabase {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const completion=!binding?this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined:undefined;
     const ownerJson=binding?stableStringify(binding.owner):completion?.owner_json;
-    if(!ownerJson) throw new Error("Unknown job owner");
+    if(!ownerJson) throw new JobOwnerUnavailableError();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(ownerJson,limit) as JobRow[];
   }
@@ -1423,9 +1511,12 @@ export class DispatcherDatabase {
     if(binding.owner.kind==="schedule") {
       const scheduleAt=new Date(Math.floor(Date.parse(completedAt)/1_000)*1_000).toISOString().replace(".000Z","Z");
       const next=job.status==="completed"?"completed":job.status==="cancelled"?"cancelled":job.status==="needs_review"?"needs_review":"failed";
+      const reviewReason=job.status==="blocked"?"human_input":
+        ["invalid_result","invalid_result_agent_stop_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")?"invalid_result":
+        ["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","steer_acceptance_unknown","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown"].includes(job.last_error_code??"")?"ambiguous_write":"operator_review_unknown";
       if(next==="needs_review"||job.status==="blocked") {
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
-        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id,reviewReason);
       } else if(next==="cancelled"&&this.scheduler.getRun(binding.owner.run_id)?.status==="needs_review") {
         this.scheduler.reconcileWorkRun(binding.owner.run_id,"cancelled",
           {tenant_id:binding.owner.tenant_id,actor_id:"scheduler",role:"admin",source_event_id:job.source_event_id},scheduleAt);
@@ -1438,7 +1529,7 @@ export class DispatcherDatabase {
       } catch(error) {
         if(!(error instanceof Error)||error.message!=="content_requires_redaction") throw error;
         this.db.prepare("UPDATE job_completion_results SET work_state='needs_review',notification_state='needs_review' WHERE job_id=? AND job_status=?").run(job.job_id,job.status);
-        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id);
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,job.job_id,scheduleAt,job.source_event_id,"invalid_result");
       }
     }
     if(binding.destination.kind==="none") return {row:sourceEvent,duplicate:true,payloadMismatch:false};
@@ -1823,6 +1914,14 @@ export class DispatcherDatabase {
     return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:String(target.thread_ts??""),desired_session_status:["blocked","needs_review"].includes(completion.job_status)?"suspended":"active"};
   }
 
+  recordVerifiedNotificationSessionSettlement(eventId:string,evidence:{event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;session_status:"active"|"suspended"|null},settledAt=new Date()):boolean {
+    const request=this.notificationSessionSettlementRequest(eventId);
+    if(!request||request.desired_session_status!=="suspended"||evidence.event_id!==eventId||evidence.workspace_id!==request.workspace_id||
+      evidence.channel_id!==request.channel_id||evidence.thread_ts!==request.thread_ts||evidence.session_status!=="suspended") return false;
+    return this.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:request.event_id,workspace_id:request.workspace_id,
+      channel_id:request.channel_id,thread_ts:request.thread_ts,desired_session_status:"suspended",session_status:"suspended"},settledAt.toISOString());
+  }
+
   claimNotificationReconciliation(eventId:string,resume=false):string {
     const current=this.getRequired(eventId);
     if(current.last_error_code==="operator_notification_reconcile_claimed") {
@@ -1918,6 +2017,8 @@ export class DispatcherDatabase {
       });
       const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.runId) {
+        if(delivery.delivered&&evidence&&this.notificationSessionSettlementRequest(eventId)?.desired_session_status==="suspended"&&
+          !this.recordVerifiedNotificationSessionSettlement(eventId,evidence,acceptedAt)) throw new Error("job_notification_session_settlement_not_recorded");
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
@@ -1949,6 +2050,8 @@ export class DispatcherDatabase {
       }
       const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.delivered) {
+        if(evidence&&this.notificationSessionSettlementRequest(eventId)?.desired_session_status==="suspended"&&
+          !this.recordVerifiedNotificationSessionSettlement(eventId,evidence,acceptedAt)) throw new Error("job_notification_session_settlement_not_recorded");
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
         this.setNotificationState(eventId,"accepted",new Date(result.completed_at));return;
       }

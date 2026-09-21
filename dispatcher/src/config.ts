@@ -4,6 +4,8 @@ import path from "node:path";
 
 export interface DispatcherConfig {
   socketPath: string;
+  agentSocketPath: string;
+  agentCredentialPath: string;
   databasePath: string;
   resultsDir: string;
   herdrSession: string;
@@ -30,6 +32,7 @@ export interface DispatcherConfig {
   gitPath: string;
   updaterSocketPath: string;
   updateInternalTokenPath: string;
+  slackIngressTokenPath: string;
   updateNotificationDatabasePath: string;
   jobProgressDatabasePath: string;
   slackAdapterSocketPath: string;
@@ -106,6 +109,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
   }
   return {
     socketPath: expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock")),
+    agentSocketPath: expandHome(env.DONA_AGENT_SOCKET_PATH ?? path.join(base, "run", "dispatcher-agent.sock")),
+    agentCredentialPath: expandHome(env.DONA_AGENT_CREDENTIAL_PATH ?? path.join(base, "run", "dispatcher-agent.token")),
     databasePath: expandHome(env.DONA_DATABASE_PATH ?? path.join(base, "dona.sqlite3")),
     resultsDir: expandHome(env.DONA_RESULTS_DIR ?? path.join(base, "results")),
     herdrSession: nonEmpty(env.HERDR_SESSION, "dona", "HERDR_SESSION"),
@@ -167,6 +172,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConf
     ),
     updateInternalTokenPath: expandHome(
       env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
+    slackIngressTokenPath: expandHome(
+      env.DONA_SLACK_INGRESS_TOKEN_PATH ?? path.join(base, "update-control", "slack-ingress.token"),
     ),
     updateNotificationDatabasePath: expandHome(
       env.DONA_UPDATE_NOTIFICATION_DATABASE_PATH ?? path.join(base, "update-notifications.sqlite3"),

@@ -35,11 +35,13 @@ const preflightModule = await import(pathToFileURL(preflight).href) as {
 };
 const { waitForLaunchdServiceAbsent } = preflightModule;
 
-test("developer installer atomically creates and shares the access receipt key",async()=>{
+test("developer installer atomically separates update and Slack ingress keys",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
   assert.match(source,/openssl rand -hex 32/);
   assert.match(source,/mv "\$DISPATCHER_TOKEN_PATH\.tmp" "\$DISPATCHER_TOKEN_PATH"/);
   assert.equal(source.match(/<key>DONA_UPDATE_INTERNAL_TOKEN_PATH<\/key>/g)?.length,2);
+  assert.match(source,/mv "\$SLACK_INGRESS_TOKEN_PATH\.tmp" "\$SLACK_INGRESS_TOKEN_PATH"/);
+  assert.equal(source.match(/<key>DONA_SLACK_INGRESS_TOKEN_PATH<\/key>/g)?.length,2);
 });
 
 async function run(mode: string, ...values: string[]): Promise<void> {

@@ -30,6 +30,7 @@ export interface SocketClientLike {
 
 export interface WorkspaceSocket {
   workspace: string;
+  teamId: string;
   client: SocketClientLike;
 }
 
@@ -143,7 +144,7 @@ export class SlackSocketAdapter {
   }
 
   private bind(socket: WorkspaceSocket): void {
-    const { workspace, client } = socket;
+    const { workspace, teamId, client } = socket;
     for (const state of ["connecting", "connected", "reconnecting", "disconnecting", "disconnected"] as const) {
       client.on(state, (error?: unknown) => this.onLifecycle(socket, state, error));
     }
@@ -174,7 +175,7 @@ export class SlackSocketAdapter {
         });
       }
     });
-    client.on("slack_event", (event: SocketEnvelopeEvent) => this.track(this.handleEnvelope(workspace, event)));
+    client.on("slack_event", (event: SocketEnvelopeEvent) => this.track(this.handleEnvelope(workspace, teamId, event)));
   }
 
   private onLifecycle(socket: WorkspaceSocket, state: ConnectionState, error?: unknown): void {
@@ -281,7 +282,7 @@ export class SlackSocketAdapter {
     void tracked.finally(() => this.inFlight.delete(tracked));
   }
 
-  private async handleEnvelope(workspace: string, envelope: SocketEnvelopeEvent): Promise<void> {
+  private async handleEnvelope(workspace: string, teamId: string, envelope: SocketEnvelopeEvent): Promise<void> {
     const started = Date.now();
     const envelopeLogId = shortEnvelopeId(envelope.envelope_id);
     if (this.stopping) {
@@ -318,7 +319,21 @@ export class SlackSocketAdapter {
       await this.ackIgnored(workspace, envelope, started, envelopeLogId);
       return;
     }
+    if (normalized.envelope.subject.workspace_id !== teamId) {
+      this.logger.error("Socket Mode event workspace did not match the authenticated connection", {
+        workspace,
+        slack_envelope_type: envelope.type,
+        slack_envelope_id: envelopeLogId,
+        slack_event_id: normalized.envelope.external_event_id,
+        ack_sent: false,
+        error_code: "workspace_identity_mismatch",
+      });
+      return;
+    }
     const slackEventId = normalized.envelope.external_event_id;
+    const ingressAttempt = Number.isSafeInteger(envelope.retry_num) && (envelope.retry_num ?? -1) >= 0
+      ? envelope.retry_num! + 1 : 1;
+    normalized.envelope.trace = { ...normalized.envelope.trace, ingress_attempt: ingressAttempt };
     if (normalized.usedReceivedAt) {
       this.logger.warn("Slack event timestamp was invalid; receive time was used", {
         workspace,
@@ -331,7 +346,7 @@ export class SlackSocketAdapter {
     let response: DispatcherResponse;
     const dispatchStarted = Date.now();
     try {
-      response = await this.dispatcher.postEvent(normalized.envelope);
+      response = await this.dispatcher.postEvent(normalized.envelope, ingressAttempt, teamId);
     } catch (error) {
       this.logger.error("Dispatcher connection failed; Socket Mode envelope was not acknowledged", {
         workspace,

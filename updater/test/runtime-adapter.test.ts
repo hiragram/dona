@@ -182,6 +182,9 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     await runtime.stopSlack();
     await runtime.stopDispatcher();
     await runtime.startDispatcher();
+    const ingressTokenPath = path.join(policy.control_root, "slack-ingress.token");
+    assert.match((await fs.readFile(ingressTokenPath, "utf8")).trim(), /^[0-9a-f]{64}$/);
+    assert.equal((await fs.stat(ingressTokenPath)).mode & 0o777, 0o600);
     await runtime.startSlack();
     assert.deepEqual(requests, [
       { schema_version: 1, protocol: 1, operation_id: "upd_01m1es03xy5cf8d9pm5cwx4srv", target_sha: targetSha },

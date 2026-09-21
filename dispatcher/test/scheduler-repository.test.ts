@@ -81,6 +81,7 @@ test("新規DB、scheduler schema v1のexpand列、再open、WAL/FK", () => {
   assert.equal(raw.pragma("foreign_keys", { simple: true }), 1);
   assert.equal((raw.prepare("SELECT version FROM scheduler_schema").get() as { version: number }).version, 1);
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'schedule_claims'").get());
+  assert.equal((raw.prepare("SELECT count(*) AS n FROM pragma_table_info('schedule_runs') WHERE name='wait_reason'").get() as {n:number}).n,1);
   reopened.close();
   raw.exec("UPDATE scheduler_schema SET version = 3");
   assert.throws(() => new DispatcherDatabase(filename), /unsupported_scheduler_schema/);
@@ -324,6 +325,9 @@ test("scheduled workをownerへ一意bindingしResultと通知状態を分離す
   const created=createScheduledJob(dispatcher, raw, {source_event_id:event.event_id,objective:work.content,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
   const duplicate=createScheduledJob(dispatcher, raw, {source_event_id:event.event_id,objective:work.content,workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due));
   assert.equal(duplicate.duplicate,true); assert.equal(duplicate.row.job_id,created.row.job_id);
+  const authorization=dispatcher.jobAuthorization.readJob(created.row.job_id);
+  assert.equal(authorization?.owner_kind,"schedule"); assert.equal(authorization?.principal_id,null);
+  assert.equal(authorization?.resource_kind,"schedule_run");
   assert.equal(dispatcher.listOwnerJobs(event.event_id)[0]?.job_id,created.row.job_id);
   assert.throws(()=>dispatcher.appendQueuedJobInstruction(created.row.job_id,event.event_id,"変更"),/cannot be steered/);
   assert.equal(repo.getRun(run.run_id)?.status,"started");
@@ -448,14 +452,16 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET job_status='needs_review',notification_state='needs_review' WHERE job_id=?").run(job.job_id);
+  const settlementAcceptedAt=new Date(Date.parse(dispatcher.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${job.job_id}:needs_review`)!.opened_at)+1_000);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",event_id:completionEventId,workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
-  ],completed_at:due},notificationPath,new Date(due),deliveryEvidence(completionEventId,bodySha,"2.000001","1.000001",due,"suspended"));
+  ],completed_at:due},notificationPath,settlementAcceptedAt,deliveryEvidence(completionEventId,bodySha,"2.000001","1.000001",due,"suspended"));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  assert.equal((raw.prepare("SELECT session_settlement_verified FROM human_wait_items WHERE dedupe_key=?").get(`notification:${job.job_id}:needs_review`) as {session_settlement_verified:number}).session_settlement_verified,1);
   raw.prepare("UPDATE job_completion_results SET job_status='completed' WHERE job_id=?").run(job.job_id);
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);
@@ -876,7 +882,8 @@ test("job開始時の認可拒否はjobだけを戻してrun終端を確定す�
   const run = repo.materialize("start_fence", 1, due, later, due, actor).run;
   raw.prepare("UPDATE schedules SET state='paused' WHERE schedule_id='start_fence'").run();
   assert.throws(() => createScheduledJob(dispatcher, raw, { source_event_id: run.event_id!, objective, workspace: { kind: "scratch" } }, "/tmp/jobs", "/tmp/results", new Date(due)), /no longer authorized/);
-  assert.equal(dispatcher.listJobs().length, 0); assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
+  assert.equal(dispatcher.listJobs().length, 0); assert.equal(count(raw,"job_authorization_bindings"),0);
+  assert.equal(repo.getRun(run.run_id)?.status, "cancelled");
 });
 
 test("scheduled jobはcurrent Slack access receiptを一度だけ記録・消費する", () => {
@@ -925,6 +932,14 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
   raw.prepare("DELETE FROM job_routing_schema").run();
+  raw.prepare("UPDATE job_authorization_binding_schema SET version=2 WHERE singleton=1").run();
+  assert.throws(() => new DispatcherDatabase(filename), /Unsupported job authorization binding schema/);
+  assert.equal(fs.readFileSync(legacyResult,"utf8"),"old result");
+  assert.equal(fs.existsSync(`${legacyResult}.routing-migration-backup`),false);
+  assert.equal((raw.prepare("SELECT count(*) AS count FROM job_routing_schema").get() as {count:number}).count,0);
+  assert.deepEqual(raw.prepare("SELECT status,result_path FROM events WHERE event_id=?").get(run.event_id),
+    {status:"completed",result_path:legacyResult});
+  raw.prepare("UPDATE job_authorization_binding_schema SET version=1 WHERE singleton=1").run();
   const reopened=new DispatcherDatabase(filename); reopened.close();
   assert.equal(fs.existsSync(legacyResult),false);
   assert.equal(fs.readFileSync(`${legacyResult}.routing-migration-backup`,"utf8"),"old result");
@@ -973,6 +988,9 @@ test("delegated blockedとredaction拒否はDona eventだけを一意に生成�
     }
   dispatcher.enqueueJobNotification(job.job_id, new Date(due));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get(mode)?.state, "needs_review");
+  const runWait=dispatcher.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${run.run_id}`)!;
+  assert.deepEqual({reason:runWait.reason_code,decision:runWait.decision_kind},mode==="blocked"
+    ?{reason:"human_input",decision:"provide_input"}:{reason:"invalid_result",decision:"review_result"});
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state, "pending");
     assert.equal(raw.prepare("SELECT 1 FROM connector_outbox WHERE run_id=?").get(run.run_id),undefined);
     assert.equal((raw.prepare("SELECT count(*) AS n FROM events WHERE source='dona_job' AND external_event_id=?").get(`${job.job_id}:${mode === "blocked" ? "blocked" : "needs_review"}`) as {n:number}).n,1);
