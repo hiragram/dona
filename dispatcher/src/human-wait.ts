@@ -98,13 +98,16 @@ const openJobSql = `
   LEFT JOIN job_owner_bindings r ON r.job_id=NEW.job_id
   WHERE NEW.status IN ('blocked','needs_review') AND COALESCE(json_extract(r.owner_json,'$.kind'),'')!='schedule' AND NOT EXISTS (
     SELECT 1 FROM job_groups g WHERE g.source_event_id=NEW.source_event_id
-      AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL)
+      AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL) AND NOT EXISTS (
+    SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='job:'||NEW.job_id)
   ON CONFLICT(dedupe_key) DO UPDATE SET
     tenant_id=excluded.tenant_id,workspace_id=excluded.workspace_id,owner_kind=excluded.owner_kind,
     owner_principal_kind=excluded.owner_principal_kind,owner_principal_id=excluded.owner_principal_id,
     decision_actor_kind=excluded.decision_actor_kind,decision_kind=excluded.decision_kind,
     resource_revision=excluded.resource_revision,reason_code=excluded.reason_code,
-    source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
+    source_revision=excluded.source_revision,state='open',
+    session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,
+    updated_at=excluded.updated_at,
     resolved_at=NULL,stale_at=NULL,retain_until=excluded.retain_until`;
 
 export function migrateHumanWaitReadModel(db: Database.Database): void {
@@ -175,6 +178,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
           AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL) OR EXISTS (
         SELECT 1 FROM job_owner_bindings b WHERE b.job_id=NEW.job_id AND json_extract(b.owner_json,'$.kind')='schedule'))
         AND state='open';
+      UPDATE job_groups SET updated_at=NEW.updated_at WHERE source_event_id=NEW.source_event_id
+        AND attention_event_id IS NOT NULL AND all_terminal_event_id IS NULL;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_job_binding_insert AFTER INSERT ON job_authorization_bindings BEGIN
       UPDATE human_wait_items SET tenant_id=NEW.tenant_id,workspace_id=NEW.workspace_id,
@@ -197,6 +202,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,datetime(NEW.updated_at,'+30 days')
       FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id)
       WHERE j.source_event_id=NEW.source_event_id AND NEW.attention_event_id IS NOT NULL AND NEW.all_terminal_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='group:'||NEW.source_event_id)
       HAVING COUNT(*)>0
       ON CONFLICT(dedupe_key) DO UPDATE SET tenant_id=excluded.tenant_id,workspace_id=excluded.workspace_id,
         owner_kind=excluded.owner_kind,owner_principal_kind=excluded.owner_principal_kind,owner_principal_id=excluded.owner_principal_id,
@@ -226,6 +232,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'origin_'||lower(hex(randomblob(16))),COALESCE(NEW.terminal_at,NEW.created_at),'open',0,
         COALESCE(NEW.terminal_at,NEW.created_at),COALESCE(NEW.terminal_at,NEW.created_at),NULL,NULL,datetime(COALESCE(NEW.terminal_at,NEW.created_at),'+30 days')
       FROM schedules s WHERE s.schedule_id=NEW.schedule_id AND NEW.status='needs_review' AND s.revision=NEW.revision
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='run:'||NEW.run_id)
       ON CONFLICT(dedupe_key) DO NOTHING;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_schedule_run_update AFTER UPDATE OF status,reason,terminal_at ON schedule_runs BEGIN
@@ -239,10 +246,13 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'origin_'||lower(hex(randomblob(16))),COALESCE(NEW.terminal_at,s.updated_at),'open',0,
         COALESCE(NEW.terminal_at,s.updated_at),COALESCE(NEW.terminal_at,s.updated_at),NULL,NULL,datetime(COALESCE(NEW.terminal_at,s.updated_at),'+30 days')
       FROM schedules s WHERE s.schedule_id=NEW.schedule_id AND NEW.status='needs_review' AND s.revision=NEW.revision
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='run:'||NEW.run_id)
       ON CONFLICT(dedupe_key) DO UPDATE SET reason_code=excluded.reason_code,decision_kind=excluded.decision_kind,
         source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,resolved_at=NULL,stale_at=NULL;
-      UPDATE human_wait_items SET state='resolved',resolved_at=COALESCE(NEW.terminal_at,updated_at),updated_at=COALESCE(NEW.terminal_at,updated_at),
-        source_revision=COALESCE(NEW.terminal_at,source_revision),retain_until=datetime(COALESCE(NEW.terminal_at,updated_at),'+30 days')
+      UPDATE human_wait_items SET state='resolved',resolved_at=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        source_revision=COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        retain_until=datetime(COALESCE(NEW.terminal_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')),'+30 days')
       WHERE dedupe_key='run:'||NEW.run_id AND (NEW.status!='needs_review' OR NEW.revision!=(SELECT revision FROM schedules WHERE schedule_id=NEW.schedule_id)) AND state='open';
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_schedule_revision AFTER UPDATE OF revision ON schedules BEGIN
@@ -270,7 +280,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         NEW.materialized_at,COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NULL,NULL,NEW.content_delete_at
       WHERE json_extract(NEW.owner_json,'$.kind')='schedule' AND NEW.notification_state='needs_review' AND EXISTS (
         SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
-          AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1))
+          AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)) AND NOT EXISTS (
+        SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status)
       ON CONFLICT(dedupe_key) DO UPDATE SET resource_id=excluded.resource_id,source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',
@@ -297,6 +308,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         COALESCE(NEW.content_delete_at,datetime(NEW.updated_at,'+30 days'))
       FROM schedule_runs r JOIN schedules s USING(schedule_id)
       WHERE r.run_id=NEW.run_id AND NEW.status='needs_review' AND NEW.kind!='slack.work_result.post' AND s.revision=r.revision
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='outbox:'||NEW.outbox_id)
       ON CONFLICT(dedupe_key) DO NOTHING;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_outbox_update AFTER UPDATE OF status,updated_at ON connector_outbox BEGIN
@@ -309,6 +321,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         COALESCE(NEW.content_delete_at,datetime(NEW.updated_at,'+30 days'))
       FROM schedule_runs r JOIN schedules s USING(schedule_id)
       WHERE r.run_id=NEW.run_id AND NEW.status='needs_review' AND NEW.kind!='slack.work_result.post' AND s.revision=r.revision
+        AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='outbox:'||NEW.outbox_id)
       ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at,
@@ -356,8 +369,6 @@ export class HumanWaitRepository {
       const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
         WHERE item_id=? AND state='open'`).run(settledAt,settledAt,cause.item_id).changes;
       if(changed!==1)return false;
-      this.db.prepare(`INSERT INTO human_wait_audit(item_id,reason_class,source_revision,transition,actor_class,created_at)
-        VALUES(?,?,?,'reopened','system',?)`).run(cause.item_id,cause.reason_code,settledAt,settledAt);
       return true;
     }).immediate();
   }
