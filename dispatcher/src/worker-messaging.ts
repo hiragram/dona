@@ -81,6 +81,9 @@ export interface WorkerMessageDeliveryRow {
   fence: number;
   attempt_count: number;
   delivered_at: string | null;
+  delivered_lease_owner: string | null;
+  delivered_lease_token_sha256: string | null;
+  delivered_fence: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -148,6 +151,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       fence                INTEGER NOT NULL DEFAULT 0,
       attempt_count        INTEGER NOT NULL DEFAULT 0,
       delivered_at        TEXT,
+      delivered_lease_owner TEXT,
+      delivered_lease_token_sha256 TEXT,
+      delivered_fence      INTEGER,
       event_id             TEXT REFERENCES events(event_id),
       created_at           TEXT NOT NULL,
       updated_at           TEXT NOT NULL,
@@ -187,6 +193,9 @@ export function migrateWorkerMessaging(db: Database.Database): void {
   `);
   const deliveryColumns=new Set((db.pragma("table_info(worker_message_deliveries)") as Array<{name:string}>).map(row=>row.name));
   if(!deliveryColumns.has("event_id"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN event_id TEXT REFERENCES events(event_id)");
+  if(!deliveryColumns.has("delivered_lease_owner"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_lease_owner TEXT");
+  if(!deliveryColumns.has("delivered_lease_token_sha256"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_lease_token_sha256 TEXT");
+  if(!deliveryColumns.has("delivered_fence"))db.exec("ALTER TABLE worker_message_deliveries ADD COLUMN delivered_fence INTEGER");
 }
 
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
@@ -216,7 +225,10 @@ export class WorkerMessageRepository {
     const keyExisting = this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND producer=? AND idempotency_key=?")
       .get(jobId, producer, input.idempotency_key) as WorkerMessageRow | undefined;
     if (keyExisting) {
-      if (keyExisting.payload_sha256 !== payloadSha || keyExisting.producer_sequence !== input.producer_sequence || keyExisting.occurred_at !== input.occurred_at) {
+      if (keyExisting.payload_sha256 !== payloadSha || keyExisting.producer_sequence !== input.producer_sequence
+        || keyExisting.occurred_at !== input.occurred_at || keyExisting.source_event_id !== input.source_event_id
+        || keyExisting.correlation_message_id !== (input.correlation_message_id ?? null)
+        || keyExisting.conversation_revision !== (input.conversation_revision ?? null)) {
         throw new WorkerMessageError("worker_message_idempotency_conflict", "idempotency key already has a different canonical message");
       }
       const receipt = this.db.prepare("SELECT receipt_id FROM worker_message_receipts WHERE message_id=? AND receipt_kind='accepted' AND consumer='dispatcher'")
@@ -343,12 +355,19 @@ export class WorkerMessageRepository {
       if(!job)throw new WorkerMessageError("job_not_found","job does not exist");
       this.assertAuthorized(job,sourceEventId);
       if (!bound || bound.job_id !== jobId) throw new WorkerMessageError("job_binding_mismatch", "source event does not own this delivery");
-      if (row.state === "delivered") return { delivery: row, outcome: "reused" as const };
-      if (row.state !== "leased" || row.lease_owner !== leaseOwner || row.lease_token_sha256 !== sha256(leaseToken) || row.fence !== fence || !row.lease_expires_at || row.lease_expires_at < now) {
+      const tokenSha = sha256(leaseToken);
+      if (row.state === "delivered") {
+        if (row.delivered_lease_owner !== leaseOwner || row.delivered_lease_token_sha256 !== tokenSha || row.delivered_fence !== fence) {
+          throw new WorkerMessageError("delivery_fence_mismatch", "delivered receipt does not match the original lease proof");
+        }
+        return { delivery: row, outcome: "reused" as const };
+      }
+      if (row.state !== "leased" || row.lease_owner !== leaseOwner || row.lease_token_sha256 !== tokenSha || row.fence !== fence || !row.lease_expires_at || row.lease_expires_at < now) {
         throw new WorkerMessageError("delivery_fence_mismatch", "delivery lease is not current");
       }
-      this.db.prepare("UPDATE worker_message_deliveries SET state='delivered',delivered_at=?,lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=?")
-        .run(now, now, deliveryId);
+      this.db.prepare(`UPDATE worker_message_deliveries SET state='delivered',delivered_at=?,delivered_lease_owner=?,
+        delivered_lease_token_sha256=?,delivered_fence=?,lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=? WHERE delivery_id=?`)
+        .run(now, leaseOwner, tokenSha, fence, now, deliveryId);
       const receiptId = `rcpt_${ulid(at.getTime()).toLowerCase()}`;
       this.db.prepare("INSERT OR IGNORE INTO worker_message_receipts(receipt_id,message_id,delivery_id,receipt_kind,consumer,created_at) VALUES(?,?,?,'delivered',?,?)")
         .run(receiptId, row.message_id, deliveryId, row.consumer, now);
@@ -470,11 +489,13 @@ export class WorkerMessageRepository {
       this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
         (SELECT m.message_id FROM worker_messages m WHERE m.accepted_at<? AND m.job_id IN
           (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
-          AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased')))`)
+          AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=m.message_id AND d.state IN ('pending','leased'))
+          AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=m.message_id))`)
         .run(at.toISOString(),cutoff);
       return this.db.prepare(`DELETE FROM worker_messages WHERE accepted_at<? AND job_id IN
         (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))
-        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))`).run(cutoff).changes;
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d WHERE d.message_id=worker_messages.message_id AND d.state IN ('pending','leased'))
+        AND NOT EXISTS (SELECT 1 FROM worker_messages child WHERE child.correlation_message_id=worker_messages.message_id)`).run(cutoff).changes;
     }).immediate();
   }
 

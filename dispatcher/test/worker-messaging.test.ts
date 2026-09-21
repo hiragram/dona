@@ -48,6 +48,10 @@ describe("worker messaging ledger",()=>{
       assert.equal(reused.outcome,"reused"); assert.equal(reused.message.message_id,created.message.message_id); assert.equal(reused.receipt_id,created.receipt_id);
       assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),payload:{kind:"checkpoint",summary:"different"}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_idempotency_conflict");
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),conversation_revision:1}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_idempotency_conflict");
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),correlation_message_id:"msg_00000000000000000000000000"}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_idempotency_conflict");
       database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
       database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
       database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:03:00Z"},job.result_path);
@@ -70,6 +74,10 @@ describe("worker messaging ledger",()=>{
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
     const ack=database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-1",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:13Z"));
     assert.equal(ack.outcome,"delivered");
+    const replay=database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-1",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:14Z"));
+    assert.equal(replay.outcome,"reused");
+    assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-2",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:14Z")),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
     database.close();
 
     const restarted=new DispatcherDatabase(config.databasePath);
@@ -119,6 +127,22 @@ describe("worker messaging ledger",()=>{
       sqliteAfterPurge.close();
       reopened.close();
     } finally { try { database.close(); } catch {} }
+  });
+
+  test("retentionは存続する相関messageの親を削除しない",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const parent=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-07-01T00:00:00Z"));
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"instruction-retained",occurred_at:"2026-07-20T00:00:00Z",correlation_message_id:parent.message.message_id,
+        conversation_revision:1,payload:{operation:"answer",text:"継続"}},new Date("2026-07-20T00:00:00Z"));
+      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-07-20T00:01:00Z"},job.result_path);
+      assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-07-20T00:01:00Z")),0);
+      assert.equal(database.workerMessages.purge(new Date("2026-08-02T00:00:00Z")),0);
+      assert.equal(database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1").reconciliation,"matched");
+    } finally { database.close(); }
   });
 
   test("緊急reportは後続の通常reportでcoalescingされない",async()=>{
