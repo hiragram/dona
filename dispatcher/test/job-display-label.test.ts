@@ -38,6 +38,8 @@ describe("Herdr workspace表示ラベル", () => {
     for (const value of [
       " \n\u0000 ",
       "https://private.invalid/task",
+      "ssh://git@internal.example/repo",
+      "git://internal.example/private",
       "/Users/example/private",
       "/workspace/dona/.env",
       "../../.ssh/id_rsa",
@@ -46,6 +48,7 @@ describe("Herdr workspace表示ラベル", () => {
       "token=sk-example-secret",
       "ghp_abcdefghijklmnopqrstuvwxyz123456",
       ["xoxb", "123456789012", "abcdefghijklmnop"].join("-"),
+      ["sk", "abcdefghijklmnopqrstuvwxyz123456"].join("-"),
       "-----BEGIN PRIVATE KEY-----",
     ]) {
       assert.equal(normalizeJobDisplayName(value), undefined);
