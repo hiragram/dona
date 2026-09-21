@@ -388,13 +388,17 @@ describe("job resource config", () => {
     assert.notEqual(result.status, 0);
   });
 
-  test("before・beforeEach・afterEach・t.afterの同期停止を実行中identityとして保持する", async () => {
-    const runStalledHook = async (hook: "before" | "beforeEach" | "afterEach" | "contextAfter", nonce: string) => {
+  test("before・beforeEach・afterEach・test.before・test.after・t.afterの同期停止を実行中identityとして保持する", async () => {
+    const runStalledHook = async (hook: "before" | "beforeEach" | "afterEach" | "staticBefore" | "staticAfter" | "contextAfter", nonce: string) => {
       const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-hook-`);
       const fixture = `${temporaryDirectory}/hook.test.mjs`;
       const source = hook === "contextAfter" ? [
         'import { test } from "node:test";',
         'test("hook-stall", (t) => { t.after(() => { process.on("SIGTERM", () => {}); while (true) {} }); });',
+      ] : hook === "staticBefore" || hook === "staticAfter" ? [
+        'import { test } from "node:test";',
+        `test.${hook === "staticBefore" ? "before" : "after"}(() => { process.on("SIGTERM", () => {}); while (true) {} });`,
+        'test("hook-stall", () => {});',
       ] : [
         `import { ${hook}, test } from "node:test";`,
         `${hook}(() => { process.on("SIGTERM", () => {}); while (true) {} });`,
@@ -414,12 +418,15 @@ describe("job resource config", () => {
       sanitizeNestedTestEnvironment(environment);
       const child = spawn(tsx, ["--test", fixture], { env: environment, detached: true, stdio: ["ignore", "ignore", "ignore"] });
       try {
+        const expectedStarts = hook === "staticAfter" ? 2 : 1;
         const deadline = Date.now() + 2_000;
-        while (!markers.some((marker) => marker.includes(" case-start ")) && Date.now() < deadline) {
+        while (markers.filter((marker) => marker.includes(" case-start ")).length < expectedStarts && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 1);
-        assert.equal(markers.some((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ") || marker.includes(" case-terminal ")), false);
+        const starts = markers.filter((marker) => marker.includes(" case-start "));
+        const terminals = markers.filter((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ") || marker.includes(" case-terminal "));
+        assert.equal(starts.length, expectedStarts, markers.join("\n"));
+        assert.equal(terminals.length, hook === "staticAfter" ? 1 : 0, markers.join("\n"));
       } finally {
         await stopTestProcessGroup(child);
         await checkpointChannel.close();
@@ -430,6 +437,8 @@ describe("job resource config", () => {
     await runStalledHook("beforeEach", "6123456789abcdef0123456789abcdef");
     await runStalledHook("afterEach", "7123456789abcdef0123456789abcdef");
     await runStalledHook("contextAfter", "8123456789abcdef0123456789abcdef");
+    await runStalledHook("staticBefore", "9123456789abcdef0123456789abcdef");
+    await runStalledHook("staticAfter", "a123456789abcdef0123456789abcdef");
   });
 
   test("callbackとTestContext subtestを保ち元のsource位置を報告する", async () => {
