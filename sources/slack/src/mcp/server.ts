@@ -4,6 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
 import type { SlackLogger } from "../logger.js";
+import { verifyCurrentSlackAccess, type SlackCurrentAccessEvidence } from "../current-access.js";
 import { SlackApiError, type SlackFileInfo } from "../slack-api.js";
 import type { SlackWorkspaceRegistry } from "../workspace-registry.js";
 
@@ -93,7 +94,7 @@ function failure(error: unknown, logger: SlackLogger, fields: Record<string, unk
 export function createSlackMcpServer(
   registry: SlackWorkspaceRegistry,
   logger: SlackLogger,
-  signAccessReceipt?: (input:{event_id:string;workspace_id:string;channel_id:string;user_id:string;channel_kind:"im"|"other";channel_user_id:string|null})=>string,
+  signAccessReceipt?: (input: SlackCurrentAccessEvidence)=>string,
 ): McpServer {
   const server = new McpServer(
     { name: "dona-slack", version: "0.1.0" },
@@ -214,13 +215,11 @@ export function createSlackMcpServer(
     try {
       const connection=registry.get(workspace);
       if(!connection.client.hasChannelMember) throw new SlackApiError("access_check_unavailable","Current membership check is unavailable");
-      const user=await connection.client.getUser(user_id);
-      const channel=await connection.client.getChannel(channel_id);
-      const authorized=!user.isDeleted&&!channel.isArchived&&await connection.client.hasChannelMember(channel_id,user_id);
-      const channel_kind=channel.isIm?"im" as const:"other" as const,channel_user_id=channel.isIm?channel.userId??null:null;
-      const receiptInput={event_id:event_id??"",workspace_id:connection.teamId,channel_id,user_id,channel_kind,channel_user_id};
-      if(authorized&&event_id&&!signAccessReceipt) throw new SlackApiError("access_receipt_signing_unavailable","Access receipt signing is unavailable");
-      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized,channel_kind,channel_user_id,...(authorized&&event_id?{access_receipt:signAccessReceipt!(receiptInput)}:{})});
+      if (!event_id) throw new SlackApiError("access_unavailable", "Current Slack access could not be verified");
+      const evidence = await verifyCurrentSlackAccess(connection.client, connection.teamId, { eventId:event_id, channelId:channel_id, userId:user_id });
+      if(!signAccessReceipt) throw new SlackApiError("access_unavailable","Current Slack access could not be verified");
+      return success({workspace,workspace_id:connection.teamId,channel_id,user_id,authorized:true,
+        channel_kind:evidence.channel_kind,channel_user_id:evidence.channel_user_id,access_receipt:signAccessReceipt(evidence)});
     } catch(error) { return failure(error,logger,{tool:"check_user_channel_access",workspace,channel_id,user_id}); }
   });
 

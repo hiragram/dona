@@ -71,6 +71,8 @@ export interface SlackChannelPage {
 
 export interface SlackUser {
   id: string;
+  teamId?: string;
+  updatedAt?: number;
   username?: string;
   displayName?: string;
   realName?: string;
@@ -203,6 +205,8 @@ function channelFromResponse(channel: {
 
 function userFromResponse(user: {
   id?: string;
+  team_id?: string;
+  updated?: number;
   name?: string;
   real_name?: string;
   tz?: string;
@@ -213,6 +217,8 @@ function userFromResponse(user: {
 }): SlackUser {
   return {
     id: nonEmpty(user.id, "user.id"),
+    ...(user.team_id ? { teamId: user.team_id } : {}),
+    ...(user.updated !== undefined ? { updatedAt: user.updated } : {}),
     ...(user.name ? { username: user.name } : {}),
     ...(user.profile?.display_name ? { displayName: user.profile.display_name } : {}),
     ...(user.profile?.real_name ?? user.real_name

@@ -201,8 +201,15 @@ describe("Dona Slack MCP server", () => {
         true,
       );
       const accessResult=await client.callTool({name:"check_user_channel_access",arguments:{workspace:"company",channel_id:"C123",user_id:"U1",event_id:"evt_test"}});
-      assert.deepEqual(accessResult.structuredContent,{workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null,
-        access_receipt:JSON.stringify({event_id:"evt_test",workspace_id:"T123",channel_id:"C123",user_id:"U1",channel_kind:"other",channel_user_id:null})});
+      const access=accessResult.structuredContent as Record<string,unknown>;
+      assert.deepEqual({workspace:access.workspace,workspace_id:access.workspace_id,channel_id:access.channel_id,user_id:access.user_id,
+        authorized:access.authorized,channel_kind:access.channel_kind,channel_user_id:access.channel_user_id},
+      {workspace:"company",workspace_id:"T123",channel_id:"C123",user_id:"U1",authorized:true,channel_kind:"other",channel_user_id:null});
+      const accessReceipt=JSON.parse(String(access.access_receipt)) as Record<string,unknown>;
+      assert.equal(accessReceipt.event_id,"evt_test");
+      assert.equal(accessReceipt.status,"current");
+      assert.equal(accessReceipt.destination_kind,"public_channel");
+      assert.equal(typeof accessReceipt.visibility_revision,"string");
       assert.equal(
         listed.tools.find(({ name }) => name === "post_message")?.annotations?.readOnlyHint,
         false,
