@@ -574,6 +574,7 @@ export class DispatcherDatabase {
     const objectiveUtf8Bytes=Buffer.byteLength(parsedRequest.objective,"utf8");
     const displayLabel = createJobDisplayLabel(parsedRequest.display, parsedRequest.workspace);
     const workspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes,displayLabel);
+    const legacyWorkspaceJson = serializeJobWorkspace(parsedRequest.workspace,canonicalPayloadSha256,objectiveUtf8Bytes);
     const replyTarget = sourceEvent.reply_target_json
       ? JSON.parse(sourceEvent.reply_target_json) as Record<string, unknown>
       : {};
@@ -601,10 +602,10 @@ export class DispatcherDatabase {
       if (existing) {
         const stored=jobCreationPayloadSha256FromWorkspace(JSON.parse(existing.workspace_json));
         if(stored!==undefined&&stored!==canonicalPayloadSha256) throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} already exists with a different canonical payload`);
-        const exactLegacyPayload=parsedRequest.display===undefined && existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
+        const exactLegacyPayload=existing.objective===parsedRequest.objective && stableStringify(parseJobWorkspace(JSON.parse(existing.workspace_json)))===stableStringify(parsedRequest.workspace);
         if(stored===undefined&&!exactLegacyPayload)
           throw new JobCreationError("job_idempotency_conflict",`Job key ${jobKey} does not match the persisted payload`);
-        if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(workspaceJson,existing.job_id);
+        if(stored===undefined&&exactLegacyPayload) this.db.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run(legacyWorkspaceJson,existing.job_id);
         if(binding.owner.kind==="schedule") {
           const authorized=this.db.prepare(`SELECT 1 FROM schedule_runs r JOIN schedules s USING(schedule_id)
             JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision

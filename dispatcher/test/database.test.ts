@@ -1461,7 +1461,10 @@ describe("DispatcherDatabase", () => {
     const request={source_event_id:event.event_id,objective:"legacy",workspace:{kind:"scratch" as const}};
     const job=database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).row;
     const raw=new Database(config.databasePath); raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id=?").run('{"kind":"scratch"}',job.job_id); raw.close();
-    assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    assert.equal(database.createJob({...request,display:{short_name:"新しい表示"}},config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
+    const migratedLegacy=database.getJob(job.job_id)!;
+    assert.equal(jobWorkspaceLabel(migratedLegacy.workspace_json,migratedLegacy.agent_name),job.agent_name);
+    assert.equal((JSON.parse(migratedLegacy.workspace_json) as Record<string,unknown>).__dona_job_display,undefined);
     const followUp=database.enqueue(eventEnvelope("Ev-legacy-reuse-follow-up")).row;
     database.appendQueuedJobInstruction(job.job_id,followUp.event_id,"追加条件");
     assert.equal(database.createJob(request,config.jobsWorkspaceRoot,config.jobResultsDir).outcome,"reused");
