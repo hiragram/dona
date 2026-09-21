@@ -201,11 +201,12 @@ export class AgentReadAuthorization {
   authorizeResource(input: Readonly<{context:AgentExecutionContext;operation:AgentReadGrantOperation;surface:AgentReadSurface;
     resource:{item_id:string;source_event_id:string;resource_kind:AgentReadGrantInput["resource_kind"];resource_id:string;
       resource_revision:number;owner_kind:"human_verified"|"schedule"|"unknown";owner_principal_kind:"human"|null;
-      owner_principal_id:string|null;tenant_id:string|null;workspace_id:string|null;disclosure_origin:unknown};
+      owner_principal_id:string|null;tenant_id:string|null;workspace_id:string|null;owner_binding_current:boolean;disclosure_origin:unknown};
     disclosure_destination:unknown}>):AgentReadDecision {
     const {context,resource}=input;
     let authorityReason:"none"|AgentReadDenyReason="none",providerFailed=false;
-    if(resource.owner_kind==="unknown"||resource.owner_principal_kind!=="human"||resource.owner_principal_id===null||
+    if(!resource.owner_binding_current)authorityReason="binding_unavailable";
+    else if(resource.owner_kind==="unknown"||resource.owner_principal_kind!=="human"||resource.owner_principal_id===null||
       resource.tenant_id===null||resource.workspace_id===null)authorityReason="owner_not_human";
     else if(resource.tenant_id!==context.tenant_id||resource.owner_principal_id!==context.principal_id)authorityReason="principal_mismatch";
     else if(resource.workspace_id!==context.workspace_id)authorityReason="workspace_mismatch";

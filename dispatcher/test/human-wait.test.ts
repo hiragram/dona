@@ -48,6 +48,14 @@ test("blocked jobをverified ownerの安全なwaitへ正規化しterminal transi
   assert.equal(JSON.stringify(wait).includes("PRIVATE-CANARY"), false);
   assert.match(wait!.item_id, /^wait_[0-9a-f]{32}$/);
   assert.match(wait!.origin_ref, /^origin_[0-9a-f]{32}$/);
+  const ownerRevision=database.humanWaits.ownerRevision({tenantId:"T_TEST",workspaceId:"T_TEST",principalId:"U_WAIT"});
+  assert.equal(database.humanWaits.authorizationCurrent(wait!),true);
+  const revokeDb=new Database(config.databasePath);
+  revokeDb.prepare("UPDATE verified_principal_bindings SET revoked_at=? WHERE event_id=?")
+    .run("2026-09-21T00:00:59.000Z",source.event_id);
+  revokeDb.close();
+  assert.equal(database.humanWaits.authorizationCurrent(wait!),false);
+  assert.ok(database.humanWaits.ownerRevision({tenantId:"T_TEST",workspaceId:"T_TEST",principalId:"U_WAIT"})>ownerRevision);
   database.beginJobCancellation(job.job_id, source.event_id);
   database.markJobCancelled(job.job_id, "resolved", new Date("2026-09-21T00:01:00.000Z"));
   assert.equal(database.humanWaits.listInternal().length, 0);
@@ -349,6 +357,9 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
     const open=harness.database.humanWaits.listInternal();
     assert.deepEqual(open.map(item=>item.resource_kind).sort(),["notification","schedule_run"]);
     assert.equal(open.every(item=>item.owner_kind==="schedule"&&item.owner_principal_id==="U_GATE"),true);
+    const ownerOpen=harness.database.humanWaits.scanOwnerOpen({tenantId:"T_GATE",workspaceId:"T_GATE",principalId:"U_GATE",limit:10});
+    assert.equal(ownerOpen.length,2);
+    assert.equal(ownerOpen.every(item=>harness.database.humanWaits.authorizationCurrent(item)),true);
     harness.raw.prepare(`INSERT INTO connector_outbox(outbox_id,run_id,kind,idempotency_key,target_json,content,content_hash,
       status,attempt,available_at,created_at,updated_at,content_delete_at,completion_job_status)
       SELECT 'out_work_result_review',run_id,'slack.work_result.post','work-result-review',target_json,content,content_hash,

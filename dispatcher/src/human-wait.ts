@@ -177,23 +177,28 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'system',NEW.updated_at);
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_insert AFTER INSERT ON human_wait_items
-      WHEN NEW.owner_kind='human_verified' AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
+      WHEN NEW.owner_kind IN ('human_verified','schedule') AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
       INSERT INTO human_wait_owner_revisions VALUES(NEW.tenant_id,NEW.workspace_id,NEW.owner_principal_id,1)
         ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_update_old AFTER UPDATE ON human_wait_items
-      WHEN OLD.owner_kind='human_verified' AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
+      WHEN OLD.owner_kind IN ('human_verified','schedule') AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
       INSERT INTO human_wait_owner_revisions VALUES(OLD.tenant_id,OLD.workspace_id,OLD.owner_principal_id,1)
         ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_update_new AFTER UPDATE ON human_wait_items
-      WHEN NEW.owner_kind='human_verified' AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
+      WHEN NEW.owner_kind IN ('human_verified','schedule') AND NEW.tenant_id IS NOT NULL AND NEW.workspace_id IS NOT NULL AND NEW.owner_principal_id IS NOT NULL BEGIN
       INSERT INTO human_wait_owner_revisions VALUES(NEW.tenant_id,NEW.workspace_id,NEW.owner_principal_id,1)
         ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_delete AFTER DELETE ON human_wait_items
-      WHEN OLD.owner_kind='human_verified' AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
+      WHEN OLD.owner_kind IN ('human_verified','schedule') AND OLD.tenant_id IS NOT NULL AND OLD.workspace_id IS NOT NULL AND OLD.owner_principal_id IS NOT NULL BEGIN
       INSERT INTO human_wait_owner_revisions VALUES(OLD.tenant_id,OLD.workspace_id,OLD.owner_principal_id,1)
+        ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS human_wait_owner_revision_principal_revoke AFTER UPDATE OF revoked_at ON verified_principal_bindings
+      WHEN OLD.revoked_at IS NOT NEW.revoked_at BEGIN
+      INSERT INTO human_wait_owner_revisions VALUES(NEW.tenant_id,NEW.workspace_id,NEW.principal_id,1)
         ON CONFLICT(tenant_id,workspace_id,principal_id) DO UPDATE SET revision=revision+1;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_job_insert AFTER INSERT ON jobs BEGIN
@@ -382,7 +387,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
     INSERT OR IGNORE INTO human_wait_schema VALUES(1,1);
     INSERT OR IGNORE INTO human_wait_owner_revisions(tenant_id,workspace_id,principal_id,revision)
       SELECT tenant_id,workspace_id,owner_principal_id,1 FROM human_wait_items
-      WHERE owner_kind='human_verified' AND tenant_id IS NOT NULL AND workspace_id IS NOT NULL AND owner_principal_id IS NOT NULL
+      WHERE owner_kind IN ('human_verified','schedule') AND tenant_id IS NOT NULL AND workspace_id IS NOT NULL AND owner_principal_id IS NOT NULL
       GROUP BY tenant_id,workspace_id,owner_principal_id;
   `);
   const marker = db.prepare("SELECT version FROM human_wait_schema WHERE singleton=1").get() as {version:number}|undefined;
@@ -409,13 +414,41 @@ export class HumanWaitRepository {
     return row.revision;
   }
 
+  authorizationCurrent(item:HumanWaitItemRow):boolean {
+    if(item.owner_kind==="human_verified"&&item.resource_kind==="job")return this.db.prepare(`SELECT 1 FROM jobs j
+      JOIN job_authorization_bindings a ON a.job_id=j.job_id
+      JOIN verified_principal_bindings p ON p.event_id=a.principal_binding_event_id
+      WHERE j.job_id=? AND j.source_event_id=? AND a.ingress_proof_sha256=p.proof_sha256 AND p.revoked_at IS NULL
+        AND a.owner_kind='human_verified' AND a.tenant_id=? AND a.workspace_id=? AND a.principal_id=?`).get(
+          item.resource_id,item.parent_resource_id,item.tenant_id,item.workspace_id,item.owner_principal_id)!==undefined;
+    if(item.owner_kind==="human_verified"&&item.resource_kind==="job_group") {
+      const row=this.db.prepare(`SELECT COUNT(*) AS total,SUM(CASE WHEN a.owner_kind='human_verified'
+        AND a.tenant_id=? AND a.workspace_id=? AND a.principal_id=? AND a.ingress_proof_sha256=p.proof_sha256
+        AND p.revoked_at IS NULL THEN 1 ELSE 0 END) AS current_count
+        FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id)
+        LEFT JOIN verified_principal_bindings p ON p.event_id=a.principal_binding_event_id WHERE j.source_event_id=?`).get(
+          item.tenant_id,item.workspace_id,item.owner_principal_id,item.resource_id) as {total:number;current_count:number|null};
+      return row.total>0&&row.current_count===row.total;
+    }
+    if(item.owner_kind==="schedule"&&item.resource_kind==="schedule_run")return this.db.prepare(`SELECT 1 FROM schedules s
+      JOIN schedule_runs r USING(schedule_id) WHERE r.run_id=? AND s.schedule_id=? AND s.revision=?
+        AND s.tenant_id=? AND s.owner_id=?`).get(item.resource_id,item.parent_resource_id,item.resource_revision,item.tenant_id,item.owner_principal_id)!==undefined;
+    if(item.owner_kind==="schedule"&&item.resource_kind==="notification")return this.db.prepare(`SELECT 1 FROM schedules s
+      WHERE s.revision=? AND s.tenant_id=? AND s.owner_id=? AND (
+        EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=s.schedule_id AND r.run_id=?) OR
+        EXISTS (SELECT 1 FROM job_owner_bindings b WHERE b.job_id=? AND json_extract(b.owner_json,'$.kind')='schedule'
+          AND json_extract(b.owner_json,'$.schedule_id')=s.schedule_id AND json_extract(b.owner_json,'$.revision')=s.revision))
+      LIMIT 1`).get(item.resource_revision,item.tenant_id,item.owner_principal_id,item.parent_resource_id,item.parent_resource_id)!==undefined;
+    return false;
+  }
+
   scanOwnerOpen(input:{tenantId:string;workspaceId:string;principalId:string;limit:number;after?:HumanWaitScanCursor}):HumanWaitItemRow[] {
-    if(!Number.isSafeInteger(input.limit)||input.limit<1||input.limit>500)throw new Error("human_wait_scan_limit_invalid");
+    if(!Number.isSafeInteger(input.limit)||input.limit<1||input.limit>501)throw new Error("human_wait_scan_limit_invalid");
     const after=input.after;
     if(after&&(!Number.isFinite(Date.parse(after.updated_at))||!/^wait_[a-f0-9]{32}$/.test(after.item_id)))
       throw new Error("human_wait_scan_cursor_invalid");
     return this.db.prepare(`SELECT i.* FROM human_wait_items i
-      WHERE i.state='open' AND i.owner_kind='human_verified' AND i.owner_principal_kind='human'
+      WHERE i.state='open' AND i.owner_kind IN ('human_verified','schedule') AND i.owner_principal_kind='human'
         AND i.tenant_id=? AND i.workspace_id=? AND i.owner_principal_id=?
         AND (? IS NULL OR i.updated_at<? OR (i.updated_at=? AND i.item_id<?))
         AND NOT EXISTS (SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key=i.dedupe_key)

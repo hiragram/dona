@@ -1,8 +1,9 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import type { AgentExecutionContext } from "./agent-context.js";
 import type { AgentReadAuthorization } from "./agent-read-authorization.js";
 import type { HumanWaitItemRow, HumanWaitRepository, HumanWaitScanCursor } from "./human-wait.js";
+import { stableStringify } from "./validation.js";
 
 export class HumanWaitQueryError extends Error {
   constructor(readonly code:"human_wait_query_unavailable"|"human_wait_cursor_invalid"|"human_wait_origin_unavailable") {
@@ -12,7 +13,7 @@ export class HumanWaitQueryError extends Error {
 
 interface CursorPayload extends HumanWaitScanCursor {
   v:1; tenant_id:string; workspace_id:string; principal_id:string; policy_revision:number;
-  grant_revision:string; visibility_revision:string; read_revision:number;
+  event_id:string;destination_sha256:string;grant_revision:string;visibility_revision:string;read_revision:number;
 }
 
 export interface HumanWaitProjection {
@@ -23,7 +24,8 @@ export interface HumanWaitProjection {
 
 function canonical(payload:CursorPayload):string {
   return JSON.stringify({v:payload.v,tenant_id:payload.tenant_id,workspace_id:payload.workspace_id,
-    principal_id:payload.principal_id,policy_revision:payload.policy_revision,grant_revision:payload.grant_revision,
+    principal_id:payload.principal_id,event_id:payload.event_id,destination_sha256:payload.destination_sha256,
+    policy_revision:payload.policy_revision,grant_revision:payload.grant_revision,
     visibility_revision:payload.visibility_revision,read_revision:payload.read_revision,
     updated_at:payload.updated_at,item_id:payload.item_id});
 }
@@ -58,7 +60,7 @@ export class HumanWaitQueryService {
     return {item_id:item.item_id,source_event_id:item.parent_resource_id??item.resource_id,
       resource_kind:item.resource_kind,resource_id:item.resource_id,resource_revision:item.resource_revision,
       owner_kind:item.owner_kind,owner_principal_kind:item.owner_principal_kind,owner_principal_id:item.owner_principal_id,
-      tenant_id:item.tenant_id,workspace_id:item.workspace_id,
+      tenant_id:item.tenant_id,workspace_id:item.workspace_id,owner_binding_current:this.waits.authorizationCurrent(item),
       disclosure_origin:{kind:"human_wait_origin",origin_ref:item.origin_ref,resource_kind:item.resource_kind}} as const;
   }
 
@@ -71,15 +73,18 @@ export class HumanWaitQueryService {
     if(!snapshot)throw new HumanWaitQueryError("human_wait_query_unavailable");
     const revisionScope={tenantId:input.context.tenant_id,workspaceId:input.context.workspace_id,principalId:input.context.principal_id};
     const readRevision=this.waits.ownerRevision(revisionScope);
+    const destinationSha256=createHash("sha256").update(stableStringify(input.destination)).digest("hex");
     const cursor=input.cursor?this.decode(input.cursor):undefined;
     if(cursor&&(cursor.tenant_id!==input.context.tenant_id||cursor.workspace_id!==input.context.workspace_id||
       cursor.principal_id!==input.context.principal_id||cursor.policy_revision!==snapshot.policy_revision||
+      cursor.event_id!==input.context.event_id||cursor.destination_sha256!==destinationSha256||
       cursor.grant_revision!==snapshot.grant_revision||cursor.visibility_revision!==snapshot.visibility_revision||
       cursor.read_revision!==readRevision))throw new HumanWaitQueryError("human_wait_cursor_invalid");
     const rows=this.waits.scanOwnerOpen({tenantId:input.context.tenant_id,workspaceId:input.context.workspace_id,
-      principalId:input.context.principal_id,limit:this.internalScanMax,...(cursor?{after:cursor}:{})});
+      principalId:input.context.principal_id,limit:this.internalScanMax+1,...(cursor?{after:cursor}:{})});
+    const candidates=rows.slice(0,this.internalScanMax);
     const visible:HumanWaitItemRow[]=[];
-    for(const item of rows) {
+    for(const item of candidates) {
       const decision=this.reads.authorizeResource({context:input.context,operation:"read_own_human_waits",surface:"list_human_waits",
         resource:this.resource(item),disclosure_destination:input.destination});
       if(decision.provider_failed)throw new HumanWaitQueryError("human_wait_query_unavailable");
@@ -87,14 +92,17 @@ export class HumanWaitQueryService {
       if(visible.length>input.limit)break;
     }
     if(this.waits.ownerRevision(revisionScope)!==readRevision)throw new HumanWaitQueryError("human_wait_cursor_invalid");
-    if(visible.length<=input.limit&&rows.length===this.internalScanMax)throw new HumanWaitQueryError("human_wait_query_unavailable");
-    const page=visible.slice(0,input.limit),hasMore=visible.length>input.limit,last=page.at(-1);
+    const page=visible.slice(0,input.limit),hasMore=visible.length>input.limit||rows.length>this.internalScanMax;
+    const last=page.at(-1),scanLast=candidates.at(-1);
+    const continuation=visible.length>input.limit?last:scanLast;
     return {schema_version:1,items:page.map(item=>({item_id:item.item_id,category:item.resource_kind,reason:item.reason_code,
       decision:item.decision_kind,state:"open",opened_at:item.opened_at,updated_at:item.updated_at,
       origin:{available:true,origin_ref:item.origin_ref},revision:item.resource_revision})),has_more:hasMore,
-      ...(hasMore&&last?{next_cursor:this.encode({v:1,tenant_id:input.context.tenant_id,workspace_id:input.context.workspace_id,
-        principal_id:input.context.principal_id,policy_revision:snapshot.policy_revision,grant_revision:snapshot.grant_revision,
-        visibility_revision:snapshot.visibility_revision,read_revision:readRevision,updated_at:last.updated_at,item_id:last.item_id})}:{})};
+      ...(hasMore&&continuation?{next_cursor:this.encode({v:1,tenant_id:input.context.tenant_id,workspace_id:input.context.workspace_id,
+        principal_id:input.context.principal_id,event_id:input.context.event_id,destination_sha256:destinationSha256,
+        policy_revision:snapshot.policy_revision,grant_revision:snapshot.grant_revision,
+        visibility_revision:snapshot.visibility_revision,read_revision:readRevision,
+        updated_at:continuation.updated_at,item_id:continuation.item_id})}:{})};
   }
 
   resolveOrigin(input:{context:AgentExecutionContext;destination:unknown;originRef:string}):Record<string,unknown> {

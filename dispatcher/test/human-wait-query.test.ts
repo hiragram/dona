@@ -22,8 +22,10 @@ function row(suffix:string,updated:string):HumanWaitItemRow {
 
 class FakeWaits {
   revision=1;
+  current=true;
   constructor(readonly rows:HumanWaitItemRow[]) {}
   ownerRevision(){return this.revision;}
+  authorizationCurrent(){return this.current;}
   scanOwnerOpen(input:{limit:number;after?:HumanWaitScanCursor}) {
     const after=input.after;
     return this.rows.filter(item=>!after||item.updated_at<after.updated_at||
@@ -63,6 +65,11 @@ test("cursor改ざんとprincipal/grant/read revision変更はfallbackせず拒�
     assert.throws(()=>query.list({context,destination,limit:1,cursor:invalid}),
       (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
   }
+  const fresh=service(new FakeWaits([row("a","2026-09-21T00:00:03.000Z"),row("b","2026-09-21T00:00:02.000Z")])).list({context,destination,limit:1}).next_cursor!;
+  assert.throws(()=>service(new FakeWaits(waits.rows)).list({context:{...context,event_id:"evt_01J00000000000000000000001"},destination,limit:1,cursor:fresh}),
+    (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
+  assert.throws(()=>service(new FakeWaits(waits.rows)).list({context,destination:{...destination,channel_id:"C_OTHER"},limit:1,cursor:fresh}),
+    (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_cursor_invalid");
 });
 
 test("provider failureは0件へ縮退せず、originはcurrent accessで再認可する",()=>{
@@ -77,4 +84,21 @@ test("provider failureは0件へ縮退せず、originはcurrent accessで再認�
   const revoked=service(waits,()=>false);
   assert.throws(()=>revoked.resolveOrigin({context,destination,originRef:waits.rows[0]!.origin_ref}),
     (error:unknown)=>error instanceof HumanWaitQueryError&&error.code==="human_wait_origin_unavailable");
+});
+
+test("schedule ownerを含め、binding失効を拒否し、内部走査上限をcursorで継続する",()=>{
+  const schedule={...row("a","2026-09-21T00:00:03.000Z"),owner_kind:"schedule" as const,
+    resource_kind:"schedule_run" as const,parent_resource_id:"sch_"+"a".repeat(32)};
+  const hidden=row("b","2026-09-21T00:00:02.000Z"),tail=row("c","2026-09-21T00:00:01.000Z");
+  const waits=new FakeWaits([schedule,hidden,tail]);
+  const query=new HumanWaitQueryService(waits as unknown as HumanWaitRepository,new AgentReadAuthorization(
+    {authorize:()=>true,revision:()=>"grant-1"},
+    {authorize:value=>value.job_id!==hidden.resource_id,revision:()=>"visibility-1"},
+  ),Buffer.alloc(32,9),2);
+  const first=query.list({context,destination,limit:1});
+  assert.equal(first.items[0]?.category,"schedule_run");
+  assert.equal(first.has_more,true); assert.ok(first.next_cursor);
+  assert.equal(query.list({context,destination,limit:1,cursor:first.next_cursor}).items[0]?.item_id,tail.item_id);
+  waits.current=false;
+  assert.deepEqual(query.list({context,destination,limit:10}).items,[]);
 });
