@@ -589,7 +589,7 @@ export class DispatcherDatabase {
     }
     if (binding.owner.kind === "schedule") {
       const payload = JSON.parse(sourceEvent.payload_json) as { work?: { objective?: unknown; scope?: unknown; allowed_external_writes?: unknown } };
-      if (parsedRequest.job_key!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
+      if (parsedRequest.job_key!==undefined || parsedRequest.display!==undefined || typeof payload.work?.objective!=="string" || payload.work.objective !== parsedRequest.objective || payload.work.scope !== "read_only" ||
         !Array.isArray(payload.work.allowed_external_writes) || payload.work.allowed_external_writes.length !== 0) {
         throw new ScheduledJobCreationError("scheduled_scope_mismatch", "Scheduled work request does not match its persisted read-only scope");
       }
