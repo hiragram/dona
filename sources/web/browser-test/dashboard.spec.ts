@@ -87,7 +87,7 @@ test("送信中の二重操作を止め、receipt確認後だけ作成済みjob�
 });
 
 test("送信中に編集した次のdraftを成功receiptで消去しない",async({page})=>{
-  let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("送信する依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.getByLabel("依頼内容").fill("次に送信する依頼");await page.getByLabel("作業場所").selectOption("github");await page.getByLabel("Repository").fill("owner/next");release();await expect(page.getByRole("heading",{name:"job_created"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("次に送信する依頼");await expect(page.getByLabel("作業場所")).toHaveValue("github");await expect(page.getByLabel("Repository")).toHaveValue("owner/next");expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
+  let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("送信する依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.getByLabel("依頼内容").fill("次に送信する依頼");await page.getByLabel("作業場所").selectOption("github");await page.getByLabel("Repository").fill("owner/next");await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByLabel("依頼内容")).toHaveValue("次に送信する依頼");await expect(page.getByRole("button",{name:"依頼を送信"})).toBeDisabled();release();await expect(page.getByLabel("依頼内容")).toHaveValue("次に送信する依頼");await expect(page.getByLabel("作業場所")).toHaveValue("github");await expect(page.getByLabel("Repository")).toHaveValue("owner/next");expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("tab復帰後に古いsubmit receiptを新しいsession表示へ適用しない",async({page})=>{
@@ -178,6 +178,10 @@ test("submit専用principalはreceipt後に禁止されたreadを送らない", 
 test("submit専用principalは受付不明後も禁止されたreconcile readを送らない",async({page})=>{
   const f=await fixture(page,{scopes:["job:submit"],submitUnknown:true});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("結果不明を確認する");await page.getByRole("button",{name:"依頼を送信"}).click();
   await expect(page.getByRole("status")).toContainText("受付結果が不明です");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.submitWrites).toBe(1);expect(f.listReads).toBe(0);expect(f.errors).toEqual([]);
+});
+
+test("granted readだけでは受付不明submitの照合lockを解除しない",async({page})=>{
+  const f=await fixture(page,{scopes:["job:submit","job:read:granted"],submitUnknown:true});await page.goto(policy.origin+"/");await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();const before=f.listReads;await page.getByLabel("依頼内容").fill("own readなしの結果不明");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("status")).toContainText("受付結果が不明です");await expect(page.getByRole("button",{name:"依頼を送信"})).toBeDisabled();expect(f.listReads).toBe(before);expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("submit専用principalのpopstateはdetail readや一覧表示を行わない",async({page})=>{
