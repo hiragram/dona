@@ -303,6 +303,9 @@ export function migrateDispatcherDatabase(
     PRAGMA user_version = 2;
   `);
   const migrateV3 = () => {
+    const webProjectionInstalled = db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_job_projection_events'
+    `).get() !== undefined;
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -402,6 +405,7 @@ export function migrateDispatcherDatabase(
       GROUP BY jobs.source_event_id;
     `);
     migrationHook("groups_backfilled");
+    if (webProjectionInstalled) ensureWebJobProjectionSchema(db);
     db.pragma(`user_version = ${targetWrite}`);
   };
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
@@ -422,7 +426,6 @@ export interface WebJobReadIdentity {
 export interface WebJobPage {
   rows: JobRow[];
   next_cursor: string | null;
-  event_cursor: string;
   snapshot_sequence: number;
 }
 export interface WebJobChangePage {
@@ -813,8 +816,7 @@ export class DispatcherDatabase {
       const visible = rows.slice(0, limit), more = rows.length > limit;
       const next = more && visible.length > 0 ? this.issueWebProjectionCursor("list", identity, null, snapshot,
         visible.at(-1)!.created_at, visible.at(-1)!.job_id, at, 15 * 60_000) : null;
-      return { rows: visible, next_cursor: next, event_cursor: this.issueWebProjectionCursor("events", identity, null,
-        snapshot, null, null, at, 60 * 60_000), snapshot_sequence: snapshot };
+      return { rows: visible, next_cursor: next, snapshot_sequence: snapshot };
     })();
   }
 

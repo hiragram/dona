@@ -311,6 +311,37 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
+  test("v2からv3への移行中も既存web projection cursor以後の更新を欠落させない", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1" };
+    const fixture = new Database(config.databasePath);
+    fixture.prepare("UPDATE events SET source='web',subject_json=? WHERE event_id='evt-source-running'")
+      .run(JSON.stringify(owner));
+    fixture.prepare("UPDATE jobs SET source='web' WHERE job_id='job-running'").run();
+    fixture.close();
+
+    const v2 = new DispatcherDatabase(config.databasePath);
+    assert.equal(v2.schemaCompatibility().actual, 2);
+    assert.deepEqual(v2.listWebJobs(owner, 20).rows.map((row) => row.job_id), ["job-running"]);
+    const cursor = v2.webJobEventCursor(owner, "job-running", new Date("2026-09-03T00:10:00.000Z"));
+    v2.close();
+
+    const migration = new Database(config.databasePath);
+    migrateDispatcherDatabase(migration, () => {}, false, 3);
+    migration.prepare("UPDATE jobs SET updated_at=? WHERE job_id='job-running'")
+      .run("2026-09-03T01:00:00.000Z");
+    assert.notEqual(migration.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='web_job_projection_update'").get(), undefined);
+    migration.close();
+
+    const v3 = new DispatcherDatabase(config.databasePath);
+    const changes = v3.listWebJobChanges(owner, "job-running", cursor, 50, new Date("2026-09-03T01:00:01.000Z"));
+    assert.equal(changes.reset_required, false);
+    assert.equal(changes.rows.some((row) => row.event_kind === "updated"), true);
+    v3.close();
+  });
+
   test("rolls back every v2 table-rebuild phase without leaving intermediate schema", async () => {
     for (const failureStep of ["jobs_copied", "indexes_recreated", "groups_backfilled"] satisfies DispatcherMigrationStep[]) {
       const { root, config } = await tempConfig();

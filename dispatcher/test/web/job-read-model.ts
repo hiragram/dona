@@ -24,6 +24,8 @@ test("principalでfilterしてstable cursorをpaginationし後発jobを混ぜな
   const old=f.seed(owner,"running","2026-09-21T00:00:00.000Z"),newer=f.seed(owner,"queued","2026-09-21T00:00:01.000Z");
   f.seed({...owner,principal_id:"other"},"running","2026-09-21T00:00:02.000Z");
   const first=f.jobs.listWebJobs(owner,1,undefined,new Date("2026-09-21T00:01:00.000Z"));assert.deepEqual(first.rows.map(x=>x.job_id),[newer]);assert.ok(first.next_cursor);
+  const cursors=f.raw.prepare("SELECT cursor_kind,COUNT(*) AS count FROM web_job_projection_cursors GROUP BY cursor_kind").all() as Array<{cursor_kind:string;count:number}>;
+  assert.deepEqual(cursors,[{cursor_kind:"list",count:1}]);
   assert.throws(()=>f.jobs.listWebJobs(owner,1,first.next_cursor!.slice(0,-1)+(first.next_cursor!.endsWith("A")?"B":"A"),new Date("2026-09-21T00:01:00.000Z")),/cursor/);
   f.seed(owner,"running","2026-09-21T00:00:03.000Z");
   const second=f.jobs.listWebJobs(owner,1,first.next_cursor!,new Date("2026-09-21T00:01:01.000Z"));assert.deepEqual(second.rows.map(x=>x.job_id),[old]);
@@ -98,4 +100,12 @@ test("別principalと未知jobを同じnot_found projectionにする",t=>{const 
   const auth={verifySessionIngress:()=>({status:"succeeded",kind:"session_verified",principal:{...owner,principal_id:"other"}})},broker=new WebJobReadBroker(auth as never,f.jobs);
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"}),{status:"denied",reason:"not_found"});
   assert.deepEqual(broker.execute({codec_version:1,operation:"detail",method:"GET",target:"/api/jobs/job_missing",context:"context"}),{status:"denied",reason:"not_found"});
+});
+
+test("can_cancelは現行cancel受付状態だけを公開する",t=>{const f=fixture(t);
+  const broker=new WebJobReadBroker({verifySessionIngress:()=>({status:"succeeded",kind:"session_verified",principal:{...owner}})} as never,f.jobs);
+  for(const [status,expected] of [["queued",true],["preparing",false],["dispatching",false],["retryable_failed",true],["running",true],["blocked",true],["completed",false]] as const){
+    const job=f.seed(owner,status);const detail=broker.execute({codec_version:1,operation:"detail",method:"GET",target:`/api/jobs/${job}`,context:"context"});
+    assert.equal(detail.status,"succeeded");if(detail.status==="succeeded"&&detail.kind==="detail")assert.equal(detail.job.control.can_cancel,expected,status);
+  }
 });
