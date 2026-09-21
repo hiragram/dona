@@ -207,7 +207,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       ON CONFLICT(dedupe_key) DO UPDATE SET tenant_id=excluded.tenant_id,workspace_id=excluded.workspace_id,
         owner_kind=excluded.owner_kind,owner_principal_kind=excluded.owner_principal_kind,owner_principal_id=excluded.owner_principal_id,
         decision_actor_kind=excluded.decision_actor_kind,decision_kind=excluded.decision_kind,resource_revision=excluded.resource_revision,
-        reason_code=excluded.reason_code,source_revision=excluded.source_revision,state='open',session_settlement_verified=0,
+        reason_code=excluded.reason_code,source_revision=excluded.source_revision,state='open',
+        session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,
         updated_at=excluded.updated_at,resolved_at=NULL,stale_at=NULL,retain_until=excluded.retain_until;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at,
         retain_until=datetime(NEW.updated_at,'+30 days')
@@ -351,9 +352,9 @@ export class HumanWaitRepository {
   recordVerifiedSessionSettlement(receipt: VerifiedHumanWaitSessionSettlement, settledAt: string): boolean {
     if (!Number.isFinite(Date.parse(settledAt)) || new Date(Date.parse(settledAt)).toISOString() !== settledAt) throw new Error("invalid_session_settlement_time");
     return this.db.transaction(() => {
-      const completion = this.db.prepare(`SELECT job_id,job_status,destination_json FROM job_completion_results WHERE notification_event_id=?
-        UNION ALL SELECT j.job_id,j.status AS job_status,b.destination_json FROM jobs j JOIN job_owner_bindings b USING(job_id)
-          WHERE j.completion_event_id=? LIMIT 1`).get(receipt.event_id,receipt.event_id) as {job_id:string;job_status:string;destination_json:string}|undefined;
+      const completion = this.db.prepare(`SELECT job_id,job_status,destination_json,owner_json FROM job_completion_results WHERE notification_event_id=?
+        UNION ALL SELECT j.job_id,j.status AS job_status,b.destination_json,b.owner_json FROM jobs j JOIN job_owner_bindings b USING(job_id)
+          WHERE j.completion_event_id=? LIMIT 1`).get(receipt.event_id,receipt.event_id) as {job_id:string;job_status:string;destination_json:string;owner_json:string}|undefined;
       if (!completion) return false;
       const destination=JSON.parse(completion.destination_json) as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown;target?:Record<string,unknown>};
       const target=destination.kind==="slack"?destination.target:destination;
@@ -361,9 +362,11 @@ export class HumanWaitRepository {
         (target?.kind!=="thread"&&target?.kind!=="slack_thread")||
         target.workspace_id!==receipt.workspace_id||target.channel_id!==receipt.channel_id||target.thread_ts!==receipt.thread_ts) return false;
       const job = this.db.prepare("SELECT status,updated_at,source_event_id FROM jobs WHERE job_id=?").get(completion.job_id) as {status:string;updated_at:string;source_event_id:string}|undefined;
+      const owner=JSON.parse(completion.owner_json) as {kind?:unknown;run_id?:unknown};
+      const runDedupe=owner.kind==="schedule"&&typeof owner.run_id==="string"?`run:${owner.run_id}`:"";
       const cause = job ? this.db.prepare(`SELECT * FROM human_wait_items WHERE state='open' AND
-        dedupe_key IN (?,?) ORDER BY CASE resource_kind WHEN 'job_group' THEN 0 ELSE 1 END LIMIT 1`)
-        .get(`job:${completion.job_id}`,`group:${job.source_event_id}`) as HumanWaitItemRow | undefined : undefined;
+        dedupe_key IN (?,?,?,?) ORDER BY CASE resource_kind WHEN 'notification' THEN 0 WHEN 'schedule_run' THEN 1 WHEN 'job_group' THEN 2 ELSE 3 END LIMIT 1`)
+        .get(`job:${completion.job_id}`,`group:${job.source_event_id}`,`notification:${completion.job_id}:${completion.job_status}`,runDedupe) as HumanWaitItemRow | undefined : undefined;
       if (!job || !cause || (cause.resource_kind!=="job_group" && !["blocked","needs_review"].includes(job.status))) return false;
       if(cause.session_settlement_verified===1)return true;
       const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
@@ -377,6 +380,49 @@ export class HumanWaitRepository {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 500) throw new Error("human_wait_repair_limit_invalid");
     if (!Number.isFinite(Date.parse(input.snapshotRevision)) || new Date(Date.parse(input.snapshotRevision)).toISOString() !== input.snapshotRevision) throw new Error("human_wait_snapshot_invalid");
     type Candidate={source_key:string;kind:"job"|"group"|"run"|"completion"|"outbox";resource_id:string;projected_resource_id:string;aux_id:string|null;source_revision:string;desired_open:number;dedupe_key:string};
+    type ExpectedProjection=Pick<HumanWaitItemRow,"tenant_id"|"workspace_id"|"owner_kind"|"owner_principal_kind"|"owner_principal_id"|
+      "decision_actor_kind"|"decision_kind"|"resource_kind"|"resource_id"|"parent_resource_id"|"resource_revision"|"reason_code">;
+    const expectedProjection=(row:Candidate):ExpectedProjection|undefined=>{
+      if(row.kind==="job")return this.db.prepare(`SELECT
+        CASE WHEN a.owner_kind='human_verified' THEN a.tenant_id WHEN json_extract(b.owner_json,'$.kind')='schedule' THEN json_extract(b.owner_json,'$.tenant_id') END AS tenant_id,
+        CASE WHEN a.owner_kind='human_verified' THEN a.workspace_id WHEN json_extract(b.owner_json,'$.kind')='schedule' THEN json_extract(b.owner_json,'$.tenant_id') END AS workspace_id,
+        CASE WHEN a.owner_kind='human_verified' THEN 'human_verified' WHEN json_extract(b.owner_json,'$.kind')='schedule' THEN 'schedule' ELSE 'unknown' END AS owner_kind,
+        CASE WHEN a.owner_kind='human_verified' OR json_extract(b.owner_json,'$.kind')='schedule' THEN 'human' END AS owner_principal_kind,
+        CASE WHEN a.owner_kind='human_verified' THEN a.principal_id WHEN json_extract(b.owner_json,'$.kind')='schedule' THEN json_extract(b.owner_json,'$.owner_id') END AS owner_principal_id,
+        CASE WHEN j.status='blocked' THEN 'owner' ELSE 'operator' END AS decision_actor_kind,
+        CASE WHEN j.status='blocked' THEN 'provide_input' WHEN j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','steer_acceptance_unknown','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'reconcile_write'
+          WHEN j.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'review_result' ELSE 'operator_review' END AS decision_kind,
+        'job' AS resource_kind,j.job_id AS resource_id,j.source_event_id AS parent_resource_id,COALESCE(a.resource_revision,a.binding_revision,1) AS resource_revision,
+        CASE WHEN j.status='blocked' THEN 'human_input' WHEN j.last_error_code IN ('ambiguous_prompt_acceptance','prompt_acceptance_unknown','prompt_interrupted','steer_acceptance_unknown','cancel_acceptance_unknown','cancel_exit_unknown','ambiguous_cancel_acceptance','agent_wait_observation_unknown') THEN 'ambiguous_write'
+          WHEN j.last_error_code IN ('invalid_result','invalid_result_agent_stop_unknown','invalid_result_agent_stopped') THEN 'invalid_result' ELSE 'operator_review_unknown' END AS reason_code
+        FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id) LEFT JOIN job_owner_bindings b USING(job_id) WHERE j.job_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
+      if(row.kind==="group")return this.db.prepare(`SELECT MIN(a.tenant_id) AS tenant_id,MIN(a.workspace_id) AS workspace_id,
+        CASE WHEN COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN 'human_verified' ELSE 'unknown' END AS owner_kind,
+        CASE WHEN COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN 'human' END AS owner_principal_kind,
+        CASE WHEN COUNT(DISTINCT a.principal_id)=1 AND COUNT(*)=SUM(CASE WHEN a.owner_kind='human_verified' THEN 1 ELSE 0 END) THEN MIN(a.principal_id) END AS owner_principal_id,
+        'owner' AS decision_actor_kind,CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'provide_input' ELSE 'operator_review' END AS decision_kind,
+        'job_group' AS resource_kind,j.source_event_id AS resource_id,NULL AS parent_resource_id,MAX(COALESCE(a.resource_revision,a.binding_revision,1)) AS resource_revision,
+        CASE WHEN SUM(CASE WHEN j.status='blocked' THEN 1 ELSE 0 END)>0 THEN 'human_input' ELSE 'operator_review_unknown' END AS reason_code
+        FROM jobs j LEFT JOIN job_authorization_bindings a USING(job_id) WHERE j.source_event_id=? GROUP BY j.source_event_id`).get(row.resource_id) as ExpectedProjection|undefined;
+      if(row.kind==="run")return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
+        'owner' AS decision_actor_kind,CASE WHEN r.reason='ambiguous_write' THEN 'reconcile_write' ELSE 'operator_review' END AS decision_kind,
+        'schedule_run' AS resource_kind,r.run_id AS resource_id,r.schedule_id AS parent_resource_id,r.revision AS resource_revision,
+        CASE WHEN r.reason='ambiguous_write' THEN 'ambiguous_write' ELSE 'operator_review_unknown' END AS reason_code
+        FROM schedule_runs r JOIN schedules s USING(schedule_id) WHERE r.run_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
+      if(row.kind==="completion")return this.db.prepare(`SELECT json_extract(owner_json,'$.tenant_id') AS tenant_id,json_extract(owner_json,'$.tenant_id') AS workspace_id,
+        'schedule' AS owner_kind,'human' AS owner_principal_kind,json_extract(owner_json,'$.owner_id') AS owner_principal_id,'owner' AS decision_actor_kind,
+        'reconcile_write' AS decision_kind,'notification' AS resource_kind,COALESCE(notification_event_id,job_id) AS resource_id,job_id AS parent_resource_id,
+        COALESCE(json_extract(owner_json,'$.revision'),1) AS resource_revision,'notification_reconcile' AS reason_code
+        FROM job_completion_results WHERE job_id=? AND job_status=?`).get(row.resource_id,row.aux_id) as ExpectedProjection|undefined;
+      return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
+        'owner' AS decision_actor_kind,'reconcile_write' AS decision_kind,'notification' AS resource_kind,o.outbox_id AS resource_id,o.run_id AS parent_resource_id,
+        r.revision AS resource_revision,'ambiguous_write' AS reason_code FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
+        WHERE o.outbox_id=?`).get(row.resource_id) as ExpectedProjection|undefined;
+    };
+    const derivedProjectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection)=>
+      Object.entries(expected).some(([key,value])=>item[key as keyof HumanWaitItemRow]!==value);
+    const projectionMismatch=(item:HumanWaitItemRow,expected:ExpectedProjection,row:Candidate)=>
+      item.source_revision!==row.source_revision||derivedProjectionMismatch(item,expected);
     const rows = this.db.prepare(`SELECT * FROM (
       SELECT 'job:'||j.job_id AS source_key,'job' AS kind,j.job_id AS resource_id,j.job_id AS projected_resource_id,NULL AS aux_id,j.updated_at AS source_revision,
         CASE WHEN j.status IN ('blocked','needs_review') AND NOT EXISTS (SELECT 1 FROM job_groups g WHERE g.source_event_id=j.source_event_id AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL)
@@ -401,11 +447,12 @@ export class HumanWaitRepository {
     let repaired=0,quarantined=0;
     if(input.dryRun) {
       for(const row of page) {
-        const item=this.db.prepare("SELECT state,source_revision,resource_id FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string;resource_id:string}|undefined;
+        const item=this.db.prepare("SELECT * FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as HumanWaitItemRow|undefined;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
         const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
         const shouldOpen=row.desired_open===1&&!quarantinedAlready;
-        if((shouldOpen&&!item)||(item&&shouldOpen&&(item.state!=="open"||item.resource_id!==row.projected_resource_id))||(item&&!shouldOpen&&item.state==="open")) repaired++;
+        const expected=expectedProjection(row);
+        if((shouldOpen&&!item)||(item&&shouldOpen&&expected&&(item.state!=="open"||projectionMismatch(item,expected,row)))||(item&&!shouldOpen&&item.state==="open")) repaired++;
         const malformed=!quarantinedAlready&&this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
           (origin_ref LIKE '%/%' OR reason_code NOT IN ('human_input','ambiguous_write','invalid_result','notification_reconcile','operator_review_unknown'))`).get(row.dedupe_key);
         if(malformed) quarantined++;
@@ -413,19 +460,35 @@ export class HumanWaitRepository {
     }
     if(!input.dryRun) this.db.transaction(()=>{
       for(const row of page) {
-        const item=this.db.prepare("SELECT state,source_revision,resource_id FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string;resource_id:string}|undefined;
+        const item=this.db.prepare("SELECT * FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as HumanWaitItemRow|undefined;
         const quarantinedAlready=this.db.prepare("SELECT 1 FROM human_wait_quarantine WHERE dedupe_key=?").get(row.dedupe_key)!==undefined;
         const shouldOpen=row.desired_open===1&&!quarantinedAlready;
         if(item&&Date.parse(item.source_revision)>Date.parse(input.snapshotRevision)) continue;
-        if((shouldOpen&&!item)||(item&&shouldOpen&&(item.state!=="open"||item.resource_id!==row.projected_resource_id))||(item&&!shouldOpen&&item.state==="open")) {
+        const expected=expectedProjection(row);
+        const needsRepair=(shouldOpen&&!item)||(item&&shouldOpen&&expected&&(item.state!=="open"||projectionMismatch(item,expected,row)))||(item&&!shouldOpen&&item.state==="open");
+        if(needsRepair) {
           let changed=0;
-          if(row.kind==="job")changed=this.db.prepare("UPDATE jobs SET updated_at=updated_at WHERE job_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
-          else if(row.kind==="group")changed=this.db.prepare("UPDATE job_groups SET updated_at=updated_at WHERE source_event_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
-          else if(row.kind==="run")changed=this.db.prepare(`UPDATE schedule_runs SET status=status WHERE run_id=? AND
-            MAX(julianday(COALESCE(terminal_at,created_at)),julianday((SELECT updated_at FROM schedules WHERE schedule_id=schedule_runs.schedule_id)))<=julianday(?)`).run(row.resource_id,input.snapshotRevision).changes;
-          else if(row.kind==="completion")changed=this.db.prepare(`UPDATE job_completion_results SET notification_state=notification_state,notification_event_id=notification_event_id WHERE job_id=? AND job_status=? AND
-            julianday(COALESCE((SELECT updated_at FROM events WHERE event_id=job_completion_results.notification_event_id),materialized_at))<=julianday(?)`).run(row.resource_id,row.aux_id,input.snapshotRevision).changes;
-          else changed=this.db.prepare("UPDATE connector_outbox SET updated_at=updated_at WHERE outbox_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
+          if(!item&&shouldOpen){
+            if(row.kind==="job")changed=this.db.prepare("UPDATE jobs SET updated_at=updated_at WHERE job_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
+            else if(row.kind==="group")changed=this.db.prepare("UPDATE job_groups SET updated_at=updated_at WHERE source_event_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
+            else if(row.kind==="run")changed=this.db.prepare(`UPDATE schedule_runs SET status=status WHERE run_id=? AND
+              MAX(julianday(COALESCE(terminal_at,created_at)),julianday((SELECT updated_at FROM schedules WHERE schedule_id=schedule_runs.schedule_id)))<=julianday(?)`).run(row.resource_id,input.snapshotRevision).changes;
+            else if(row.kind==="completion")changed=this.db.prepare(`UPDATE job_completion_results SET notification_state=notification_state,notification_event_id=notification_event_id WHERE job_id=? AND job_status=? AND
+              julianday(COALESCE((SELECT updated_at FROM events WHERE event_id=job_completion_results.notification_event_id),materialized_at))<=julianday(?)`).run(row.resource_id,row.aux_id,input.snapshotRevision).changes;
+            else changed=this.db.prepare("UPDATE connector_outbox SET updated_at=updated_at WHERE outbox_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
+          } else if(item&&shouldOpen&&expected) {
+            const settlement= item.state==="open"&&!derivedProjectionMismatch(item,expected)?item.session_settlement_verified:0;
+            changed=this.db.prepare(`UPDATE human_wait_items SET tenant_id=?,workspace_id=?,owner_kind=?,owner_principal_kind=?,owner_principal_id=?,
+              decision_actor_kind=?,decision_kind=?,resource_kind=?,resource_id=?,parent_resource_id=?,resource_revision=?,reason_code=?,source_revision=?,state='open',
+              session_settlement_verified=?,updated_at=?,resolved_at=NULL,stale_at=NULL,retain_until=datetime(?,'+30 days')
+              WHERE item_id=? AND julianday(source_revision)<=julianday(?)`).run(expected.tenant_id,expected.workspace_id,expected.owner_kind,expected.owner_principal_kind,
+              expected.owner_principal_id,expected.decision_actor_kind,expected.decision_kind,expected.resource_kind,expected.resource_id,expected.parent_resource_id,
+              expected.resource_revision,expected.reason_code,row.source_revision,settlement,row.source_revision,row.source_revision,item.item_id,input.snapshotRevision).changes;
+          } else if(item&&!shouldOpen) {
+            changed=this.db.prepare(`UPDATE human_wait_items SET state=?,resolved_at=?,stale_at=?,updated_at=?,source_revision=?,retain_until=datetime(?,'+30 days')
+              WHERE item_id=? AND state='open' AND julianday(source_revision)<=julianday(?)`).run(quarantinedAlready?"stale":"resolved",
+              quarantinedAlready?null:row.source_revision,quarantinedAlready?row.source_revision:null,row.source_revision,row.source_revision,row.source_revision,item.item_id,input.snapshotRevision).changes;
+          }
           if(changed===1)repaired++;
         }
         const malformed=!quarantinedAlready&&this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND

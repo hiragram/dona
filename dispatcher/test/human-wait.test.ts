@@ -148,6 +148,11 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
     workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
     desired_session_status:"suspended",session_status:"suspended"},new Date(transitionAt.getTime()+1_750).toISOString()),true);
   assert.equal(database.humanWaits.get(group!.item_id)?.session_settlement_verified,1);
+  const settlementRaw=new Database(config.databasePath);
+  settlementRaw.prepare("UPDATE jobs SET status='failed',updated_at=? WHERE job_id=?")
+    .run(new Date(transitionAt.getTime()+1_900).toISOString(),second.job_id);
+  settlementRaw.close();
+  assert.equal(database.humanWaits.get(group!.item_id)?.session_settlement_verified,1);
   const terminalEvent=database.enqueue(eventEnvelope("Ev-group-terminal")).row;
   database.claimJobGroupTransition(source.event_id,"all_terminal",terminalEvent.event_id,new Date(transitionAt.getTime()+2_000));
   assert.equal(database.humanWaits.listInternal().length,0);
@@ -228,6 +233,32 @@ test("repairはbounded cursorとsnapshot fenceを持ちdry-runでは予定件数
   assert.equal(database.humanWaits.listInternal().length,0);
   assert.match(dry.digest,/^[0-9a-f]{64}$/);
   assert.throws(() => database.humanWaits.repair({dryRun:false,limit:501,snapshotRevision:snapshot}),/limit/);
+  database.close();
+});
+
+test("repairはopen itemのowner・判断種別・revision差分も正本へ戻す", async () => {
+  const {database,config,job}=await jobFixture("wait.repair-metadata");
+  database.markJobBlocked(job.job_id,"input");
+  const item=database.humanWaits.listInternal()[0]!;
+  const raw=new Database(config.databasePath);
+  raw.prepare(`UPDATE human_wait_items SET owner_principal_id='U_OTHER',decision_actor_kind='operator',decision_kind='operator_review',
+    reason_code='operator_review_unknown',resource_revision=99 WHERE item_id=?`).run(item.item_id);
+  raw.close();
+  const snapshot=new Date(Date.now()+60_000).toISOString();
+  const dry=database.humanWaits.repair({dryRun:true,limit:500,snapshotRevision:snapshot});
+  assert.equal(dry.repaired,1);
+  assert.equal(database.humanWaits.get(item.item_id)?.owner_principal_id,"U_OTHER");
+  const written=database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:snapshot});
+  assert.equal(written.repaired,1);
+  const repaired=database.humanWaits.get(item.item_id)!;
+  assert.deepEqual({owner:repaired.owner_principal_id,actor:repaired.decision_actor_kind,decision:repaired.decision_kind,
+    reason:repaired.reason_code,revision:repaired.resource_revision},{owner:"U_WAIT",actor:"owner",decision:"provide_input",
+    reason:"human_input",revision:1});
+  const revisionRaw=new Database(config.databasePath);
+  revisionRaw.prepare("UPDATE human_wait_items SET session_settlement_verified=1,source_revision='2026-01-01T00:00:00.000Z' WHERE item_id=?").run(item.item_id);
+  revisionRaw.close();
+  assert.equal(database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:snapshot}).repaired,1);
+  assert.equal(database.humanWaits.get(item.item_id)?.session_settlement_verified,1);
   database.close();
 });
 
@@ -371,6 +402,13 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     const open=harness.database.humanWaits.listInternal();
     assert.equal(open.some(item=>item.dedupe_key===`job:${result.job_id}`),false);
     assert.equal(open.filter(item=>item.dedupe_key===`run:${runId}`).length,1);
+    const completion=harness.raw.prepare("SELECT notification_event_id,destination_json FROM job_completion_results WHERE job_id=?")
+      .get(result.job_id) as {notification_event_id:string;destination_json:string};
+    const destination=JSON.parse(completion.destination_json) as {target:{workspace_id:string;channel_id:string;thread_ts:string}};
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:completion.notification_event_id,
+      workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,
+      desired_session_status:"suspended",session_status:"suspended"},"2026-09-05T00:02:01.000Z"),true);
+    assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${runId}`)?.session_settlement_verified,1);
   } finally { harness.close(); }
 });
 
