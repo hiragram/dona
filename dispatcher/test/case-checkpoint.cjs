@@ -1,5 +1,6 @@
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
 const nodeTest = require("node:test");
 const path = require("node:path");
 const process = require("node:process");
@@ -43,21 +44,75 @@ if (isTestWorker && metricsScope === 2) {
     throw new Error("case checkpoint parent acknowledgement timed out");
   }
 
+  function identityFor(value) {
+    if (!value || Buffer.byteLength(value) > 16 * 1024) throw new Error("case checkpoint identity input is invalid");
+    const digest = createHash("sha256").update(`${file}\0${value}`).digest("hex").slice(0, 12);
+    const occurrence = (occurrences.get(digest) ?? 0) + 1;
+    occurrences.set(digest, occurrence);
+    return `${digest}#${occurrence}`;
+  }
+
+  function wrapLifecycleHook(register, kind) {
+    return function checkpointedHook(callback, options) {
+      if (typeof callback !== "function") return register.apply(this, arguments);
+      const run = callback.length >= 2
+        ? function checkpointedCallbackHook(context, done) {
+            const identity = identityFor(`hook:${kind}:${context.name}`);
+            const startedAt = performance.now();
+            marker("case-start", identity, undefined, true);
+            const complete = (error) => {
+              marker(error ? "case-fail" : "case-finish", identity, performance.now() - startedAt);
+              done(error);
+            };
+            try { return callback.call(this, context, complete); }
+            catch (error) { marker("case-fail", identity, performance.now() - startedAt); throw error; }
+          }
+        : async function checkpointedPromiseHook(context) {
+            const identity = identityFor(`hook:${kind}:${context.name}`);
+            const startedAt = performance.now();
+            marker("case-start", identity, undefined, true);
+            try {
+              const result = await callback.call(this, context);
+              marker("case-finish", identity, performance.now() - startedAt);
+              return result;
+            } catch (error) {
+              marker("case-fail", identity, performance.now() - startedAt);
+              throw error;
+            }
+          };
+      return register.call(this, run, options);
+    };
+  }
+
+  nodeTest.before = wrapLifecycleHook(nodeTest.before, "before");
+  nodeTest.after = wrapLifecycleHook(nodeTest.after, "after");
+  syncBuiltinESMExports();
+
   // A preload-owned beforeEach runs before file and suite hooks without wrapping
   // test registration. That preserves callback arity and Node's source metadata,
   // and it also covers TestContext.test() subtests. TestContext.after() runs only
   // after body and afterEach cleanup have settled, so a synchronous hook stall
-  // intentionally leaves this identity unfinished. The Node 24 TestContext passed
-  // getter includes hook failures without exposing the error text.
+  // intentionally leaves this identity unfinished. TestContext.passed includes
+  // hook failures without exposing the error text; a missing future/older getter
+  // falls back to an outcome-neutral terminal and the stable name getter.
   nodeTest.beforeEach((context) => {
-    const fullName = context.fullName;
-    if (!fullName || Buffer.byteLength(fullName) > 16 * 1024) throw new Error("case checkpoint full name is invalid");
-    const digest = createHash("sha256").update(`${file}\0${fullName}`).digest("hex").slice(0, 12);
-    const occurrence = (occurrences.get(digest) ?? 0) + 1;
-    occurrences.set(digest, occurrence);
-    const identity = `${digest}#${occurrence}`;
+    const fullName = typeof context.fullName === "string" ? context.fullName : context.name;
+    const identity = identityFor(`test:${fullName}`);
     const startedAt = performance.now();
     marker("case-start", identity, undefined, true);
-    context.after(() => marker(context.passed === true ? "case-finish" : "case-fail", identity, performance.now() - startedAt));
+    const originalAfter = context.after.bind(context);
+    let afterGeneration = 0;
+    const registerTerminal = (generation) => originalAfter(() => {
+      if (generation !== afterGeneration) return;
+      const action = context.passed === true ? "case-finish" : context.passed === false ? "case-fail" : "case-terminal";
+      marker(action, identity, performance.now() - startedAt);
+    });
+    registerTerminal(afterGeneration);
+    context.after = function checkpointedAfter(...args) {
+      afterGeneration += 1;
+      const result = originalAfter(...args);
+      registerTerminal(afterGeneration);
+      return result;
+    };
   });
 }

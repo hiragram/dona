@@ -60,7 +60,7 @@ export class ProcessRunner {
       let termOutcome = "not-sent";
       let killOutcome = "not-sent";
       const marker = /^\[dispatcher-test:([a-f0-9]{32})\] (file-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts)(?: elapsed_ms=(\d{1,9}))?(?: load=(\d+\.\d{3}))?$/;
-      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)(?: elapsed_ms=(\d{1,9}))?$/;
+      const caseMarker = /^\[dispatcher-test:([a-f0-9]{32})\] (case-(?:start|finish|fail|terminal)) (test\/[A-Za-z0-9._-]+\.test\.ts:[a-f0-9]{12}#\d+)(?: elapsed_ms=(\d{1,9}))?$/;
       const metricsMarker = /^\[dispatcher-test:([a-f0-9]{32})\] metrics scope=2;(node=\d+\/\d+,git=\d+\/\d+,shell=\d+\/\d+,other=\d+\/\d+;active=\d+;overhead_us=\d+)$/;
       const refreshCheckpoint = (): void => {
         if (timeoutCheckpoint) {
@@ -89,13 +89,16 @@ export class ProcessRunner {
             if (!nonce || !action || !identity) continue;
             if (!checkpointNonce && action === "file-start") checkpointNonce = nonce;
             if (nonce !== checkpointNonce) continue;
-            if (action === "file-start") metrics = undefined;
+            if (action === "file-start") {
+              metrics = undefined;
+              unfinishedCases.clear();
+            }
             fileState = `${action} ${identity}${fileMatch[4] ? ` elapsed_ms=${fileMatch[4]}` : ""}${fileMatch[5] ? ` load=${fileMatch[5]}` : ""}`;
             if (action === "file-start") currentFile = identity;
             else {
               if (!lastFinished) lastFinished = fileState;
               currentFile = undefined;
-              unfinishedCases.clear();
+              if (action === "file-finish") unfinishedCases.clear();
               checkpointNonce = undefined;
             }
             refreshCheckpoint();

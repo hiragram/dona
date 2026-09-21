@@ -107,8 +107,13 @@ describe("job resource config", () => {
     assert.match(caseCheckpoint, /fs\.appendFileSync\(eventsPath,/);
     assert.match(caseCheckpoint, /case checkpoint parent acknowledgement timed out/);
     assert.match(caseCheckpoint, /nodeTest\.beforeEach\(\(context\) =>/);
+    assert.match(caseCheckpoint, /nodeTest\.before = wrapLifecycleHook/);
+    assert.match(caseCheckpoint, /nodeTest\.after = wrapLifecycleHook/);
     assert.match(caseCheckpoint, /marker\("case-start", identity, undefined, true\)/);
-    assert.match(caseCheckpoint, /context\.passed === true \? "case-finish" : "case-fail"/);
+    assert.match(caseCheckpoint, /context\.passed === false \? "case-fail" : "case-terminal"/);
+    assert.match(caseCheckpoint, /typeof context\.fullName === "string" \? context\.fullName : context\.name/);
+    assert.match(caseCheckpoint, /generation !== afterGeneration/);
+    assert.match(caseCheckpoint, /context\.after = function checkpointedAfter/);
     assert.doesNotMatch(caseCheckpoint, /nodeTest\.test\s*=/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
     assert.match(runner, /process-metrics\.cjs/);
@@ -321,7 +326,7 @@ describe("job resource config", () => {
       while (markers.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
       await new Promise((resolve) => setTimeout(resolve, 100));
       assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 1);
-      assert.equal(markers.some((marker) => marker.includes("case-finish") || marker.includes("case-fail")), false);
+      assert.equal(markers.some((marker) => marker.includes("case-finish") || marker.includes("case-fail") || marker.includes("case-terminal")), false);
     } finally {
       await stopTestProcessGroup(child);
       await checkpointChannel.close();
@@ -380,15 +385,19 @@ describe("job resource config", () => {
     assert.notEqual(result.status, 0);
   });
 
-  test("beforeEachとafterEachの同期停止を実行中caseとして保持する", async () => {
-    const runStalledHook = async (hook: "beforeEach" | "afterEach", nonce: string) => {
+  test("before・beforeEach・afterEach・t.afterの同期停止を実行中identityとして保持する", async () => {
+    const runStalledHook = async (hook: "before" | "beforeEach" | "afterEach" | "contextAfter", nonce: string) => {
       const temporaryDirectory = fs.mkdtempSync(`${os.tmpdir()}/dona-checkpoint-hook-`);
       const fixture = `${temporaryDirectory}/hook.test.mjs`;
-      fs.writeFileSync(fixture, [
+      const source = hook === "contextAfter" ? [
+        'import { test } from "node:test";',
+        'test("hook-stall", (t) => { t.after(() => { process.on("SIGTERM", () => {}); while (true) {} }); });',
+      ] : [
         `import { ${hook}, test } from "node:test";`,
         `${hook}(() => { process.on("SIGTERM", () => {}); while (true) {} });`,
         'test("hook-stall", () => {});',
-      ].join("\n"));
+      ];
+      fs.writeFileSync(fixture, source.join("\n"));
       const markers: string[] = [];
       const checkpointChannel = await createCaseCheckpointChannel({ nonce, file: `test/${hook}.test.ts`, onMarker: (marker) => markers.push(marker) });
       const environment: NodeJS.ProcessEnv = {
@@ -407,15 +416,17 @@ describe("job resource config", () => {
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
         assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 1);
-        assert.equal(markers.some((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ")), false);
+        assert.equal(markers.some((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ") || marker.includes(" case-terminal ")), false);
       } finally {
         await stopTestProcessGroup(child);
         await checkpointChannel.close();
         fs.rmSync(temporaryDirectory, { recursive: true, force: true });
       }
     };
+    await runStalledHook("before", "5123456789abcdef0123456789abcdef");
     await runStalledHook("beforeEach", "6123456789abcdef0123456789abcdef");
     await runStalledHook("afterEach", "7123456789abcdef0123456789abcdef");
+    await runStalledHook("contextAfter", "8123456789abcdef0123456789abcdef");
   });
 
   test("callbackとTestContext subtestを保ち元のsource位置を報告する", async () => {
@@ -431,7 +442,7 @@ describe("job resource config", () => {
       '  test("hook-failure", () => {});',
       '});',
     ].join("\n"));
-    const nonce = "8123456789abcdef0123456789abcdef";
+    const nonce = "9123456789abcdef0123456789abcdef";
     const markers: string[] = [];
     const checkpointChannel = await createCaseCheckpointChannel({ nonce, file: "test/source.test.ts", onMarker: (marker) => markers.push(marker) });
     const environment: NodeJS.ProcessEnv = {

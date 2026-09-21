@@ -19,7 +19,7 @@ export async function createCaseCheckpointChannel({ nonce, file, onMarker = (mar
   let expectedSequence = 1;
   let failure;
   let draining = Promise.resolve();
-  const markerPattern = new RegExp(`^\\[dispatcher-test:${nonce}\\] case-(?:start|finish|fail) ${file.replaceAll(".", "\\.")}:[a-f0-9]{12}#\\d+(?: elapsed_ms=\\d{1,9})?$`);
+  const markerPattern = new RegExp(`^\\[dispatcher-test:${nonce}\\] case-(?:start|finish|fail|terminal) ${file.replaceAll(".", "\\.")}:[a-f0-9]{12}#\\d+(?: elapsed_ms=\\d{1,9})?$`);
 
   const drain = async () => {
     if (failure) return;

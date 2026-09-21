@@ -180,6 +180,24 @@ test("ProcessRunner preserves the failed case when the file failure follows", as
   );
 });
 
+test("ProcessRunner preserves an unfinished crash identity after file-fail", async () => {
+  const script = `
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:fedcba543210#3\\n');
+    process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-fail test/api.test.ts elapsed_ms=9\\n');
+    process.exitCode = 1;
+  `;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", script], {
+    timeoutMs: 1_000,
+    outputLimitBytes: 1_024,
+  });
+  assert.equal(result.exit_code, 1);
+  assert.equal(
+    result.output_checkpoint,
+    "file=file-fail test/api.test.ts elapsed_ms=9; last_finish=file-fail test/api.test.ts elapsed_ms=9; unfinished=test/api.test.ts:fedcba543210#3",
+  );
+});
+
 test("ProcessRunner binds the next file nonce after the previous file finishes", async () => {
   const script = `
     process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
