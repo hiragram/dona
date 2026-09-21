@@ -424,7 +424,8 @@ export class WorkerMessageRepository {
       const rows = this.db.prepare(`SELECT d.delivery_id,d.message_id,m.job_id,m.source_event_id,m.workspace_id,m.channel_id,m.thread_ts,m.kind,m.payload_json,m.occurred_at,j.status
         FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
         WHERE d.consumer='dona-main' AND d.state='pending' AND d.available_at<=?
-        ORDER BY d.available_at,d.created_at,d.delivery_id LIMIT ?`).all(now, limit) as Array<{
+          AND m.workspace_id IS NOT NULL AND m.channel_id IS NOT NULL AND m.thread_ts IS NOT NULL
+        ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT ?`).all(now, limit) as Array<{
           delivery_id:string;message_id:string;job_id:string;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null;
           kind:WorkerMessageKind;payload_json:string;occurred_at:string;status:JobRow["status"];
         }>;

@@ -127,6 +127,38 @@ describe("worker messaging ledger",()=>{
     } finally { database.close(); }
   });
 
+  test("宛先のない100件が後続の配送可能reportをstarveしない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      for(let sequence=1;sequence<=101;sequence++) database.workerMessages.appendReport(job.job_id,{schema_version:1,
+        source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:`bounded-${sequence}`,
+        occurred_at:"2026-09-21T00:00:00Z",payload:{kind:"question",question:`question ${sequence}`}},
+        new Date(Date.parse("2026-09-21T00:00:00Z")+sequence));
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare(`UPDATE worker_messages SET workspace_id=NULL,channel_id=NULL,thread_ts=NULL
+        WHERE job_id=? AND producer_sequence<=100`).run(job.job_id);
+      sqlite.close();
+      assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-09-21T00:00:01Z")),1);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","bounded-101") as {delivery:{state:string}}).delivery.state,"delivered");
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","bounded-1") as {delivery:{state:string}}).delivery.state,"pending");
+    } finally { database.close(); }
+  });
+
+  test("同時刻のreportをproducer sequence順にevent化する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const at=new Date("2026-09-21T00:00:10Z");
+      const messages=[1,2].map(sequence=>database.workerMessages.appendReport(job.job_id,{schema_version:1,
+        source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:`publish-order-${sequence}`,
+        occurred_at:`2026-09-21T00:00:0${sequence}Z`,payload:{kind:"question",question:`question ${sequence}`}},at).message.message_id);
+      assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:11Z")),2);
+      const sqlite=new Database(config.databasePath);
+      const externalIds=(sqlite.prepare("SELECT external_event_id FROM events WHERE source='dona_message' ORDER BY rowid").all() as Array<{external_event_id:string}>).map(row=>row.external_event_id);
+      sqlite.close();
+      assert.deepEqual(externalIds,messages.map(messageId=>`worker-message:${messageId}`));
+    } finally { database.close(); }
+  });
+
   test("terminal遷移でworker向けpending／leased deliveryをsupersededにする",async()=>{
     const {database,source,job}=await fixture();
     try {
