@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 
-import { AgentContextManager } from "../src/agent-context.js";
+import { agentOperation, AgentContextManager } from "../src/agent-context.js";
 import { AgentReadAuthorization } from "../src/agent-read-authorization.js";
 import { DispatcherApi } from "../src/api.js";
 import { DispatcherApiClient, DispatcherClientError } from "../src/client.js";
@@ -50,6 +50,44 @@ function rawRequest(socketPath: string, route: string, headers: Record<string, s
     request.once("error", reject); request.end(encoded);
   });
 }
+
+test("live session receipt routeをjob status読取として分類する", () => {
+  assert.equal(agentOperation("GET",new URL("http://localhost/v1/jobs/job_01j00000000000000000000000/live-session-receipts/lsr_test")),"get_job_status");
+});
+
+test("agent update statusはcurrent eventへ束縛したallowlistだけを返す", async () => {
+  const {root,config}=await tempConfig(); roots.push(root);
+  config.agentSocketPath=path.join(root,"a","a.sock"); config.agentCredentialPath=path.join(root,"a","a.token");
+  const database=new DispatcherDatabase(config.databasePath);
+  const envelope=eventEnvelope("agent-update-status"),source=database.enqueue(envelope,new Date(),proof(envelope.external_event_id)).row;
+  const dispatching=database.beginDispatch(source.event_id,path.join(config.resultsDir,`${source.event_id}.json`));
+  const contexts=new AgentContextManager(database,config.agentCredentialPath,60_000);
+  const requestId="upd_01m1es03xy5cf8d9pm5cwx4srv";
+  const updates={
+    async plan():Promise<never>{throw new Error("unused");},async apply():Promise<never>{throw new Error("unused");},
+    async cancel():Promise<never>{throw new Error("unused");},
+    async status(id?:string){return {schema_version:1,update:{request_id:id,source_event_id:source.event_id,
+      reply_target_json:source.reply_target_json,state:"needs_review",current_sha:"1".repeat(40),target_sha:"2".repeat(40),
+      previous_sha:null,policy_version:"test",rollback_compatible:1,last_error_code:"safe_code",
+      last_error_message:"PRIVATE-CANARY",approval_id:"PRIVATE-APPROVAL",lease_owner:"PRIVATE-LEASE",
+      created_at:"2026-09-21T00:00:00Z",updated_at:"2026-09-21T00:01:00Z",completed_at:null,observed_active_sha:null},
+      audit:["PRIVATE-AUDIT"],diagnostics:{secret:"PRIVATE-DIAGNOSTIC"}};},
+  };
+  const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger,updates,undefined,undefined,undefined,undefined,undefined,undefined,contexts);
+  await api.start();
+  try {
+    await contexts.issue(dispatching);
+    const client=new DispatcherApiClient(config.agentSocketPath,1_000,config.agentCredentialPath);
+    const status=await client.getSelfUpdateStatus(source.event_id,requestId);
+    assert.equal((status.update as {request_id:string}).request_id,requestId);
+    assert.doesNotMatch(JSON.stringify(status),/PRIVATE-|source_event_id|reply_target_json|approval_id|lease_owner|last_error_message|audit|diagnostics/);
+    await assert.rejects(()=>client.getSelfUpdateStatus(source.event_id),error=>error instanceof DispatcherClientError&&error.statusCode===404);
+    const otherEnvelope=eventEnvelope("agent-update-status-other");
+    const other=database.enqueue(otherEnvelope,new Date(Date.now()+1),proof(otherEnvelope.external_event_id)).row;
+    await contexts.issue(database.beginDispatch(other.event_id,path.join(config.resultsDir,`${other.event_id}.json`)));
+    await assert.rejects(()=>client.getSelfUpdateStatus(other.event_id,requestId),error=>error instanceof DispatcherClientError&&error.statusCode===404);
+  } finally { await api.stop(); database.close(); }
+});
 
 test("agent専用transportはcurrent event/attemptとpurposeを固定しrestartで失効する", async () => {
   const { root, config } = await tempConfig(); roots.push(root);
@@ -143,6 +181,8 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
   const contexts = new AgentContextManager(database, config.agentCredentialPath, 60_000);
   const hidden = new Set<string>();
   const restrictedAudit: unknown[] = [];
+  let currentAccess=true;
+  const accessChecks:Array<Record<string,string>>=[];
   const reads = new AgentReadAuthorization({ authorize: () => true,revision:()=>"grant-1" }, {
     authorize: input => {
       const origin = input.disclosure_origin as { kind?:string;destination?: { channel_id?: string } };
@@ -152,7 +192,8 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     revision:()=>"visibility-1",
   }, { record: value => restrictedAudit.push(value) });
   const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger,
-    undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts, reads);
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, contexts, reads,
+    {async authorize(input){accessChecks.push(input);return currentAccess;}});
   await api.start();
   try {
     await contexts.issue(dispatching);
@@ -178,6 +219,15 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.equal(presentation.status,"ok");
     assert.match(String(presentation.text),/自分待ちは1件/);
     assert.doesNotMatch(JSON.stringify(presentation),/PRIVATE-CANARY|resource_id|source_event_id|item_id/);
+    assert.deepEqual(accessChecks[0],{event_id:source.event_id,workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST"});
+
+    currentAccess=false;
+    await assert.rejects(()=>client.listHumanWaits(source.event_id,20),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===503&&
+        (error.body as {error?:{code?:string}}).error?.code==="human_wait_query_unavailable");
+    await assert.rejects(()=>client.resolveHumanWaitOrigin(source.event_id,originRef),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===503);
+    currentAccess=true;
 
     hidden.add(first.job_id);
     assert.deepEqual((await client.listHumanWaits(source.event_id,20)).items,[]);

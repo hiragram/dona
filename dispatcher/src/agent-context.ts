@@ -155,7 +155,7 @@ export function agentOperation(method: string | undefined, url: URL): string | u
   if (method === "POST" && route === "/v1/jobs") return "delegate_job";
   if (method === "GET" && /^\/v1\/events\/[^/]+\/jobs$/.test(route)) return "list_event_jobs";
   if (method === "GET" && route === "/v1/jobs") return url.searchParams.has("source_event_id") ? "list_owner_jobs" : "list_thread_jobs";
-  if (method === "GET" && /^\/v1\/jobs\/[^/]+$/.test(route)) return "get_job_status";
+  if (method === "GET" && /^\/v1\/jobs\/[^/]+(?:\/live-session-receipts\/[^/]+)?$/.test(route)) return "get_job_status";
   if (method === "GET" && route === "/v1/human-waits") return "list_human_waits";
   if (method === "GET" && route === "/v1/human-waits/presentation") return "present_human_waits";
   if (method === "GET" && /^\/v1\/human-waits\/origins\/[^/]+$/.test(route)) return "resolve_human_wait_origin";

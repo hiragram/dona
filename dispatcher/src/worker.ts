@@ -330,9 +330,9 @@ export class DispatcherWorker {
       const result = await readResultEnvelope(row.result_path!, row.event_id);
       const verification=this.database.notificationVerificationRequest(row.event_id,result);
       const evidence=verification?(this.notificationVerifier?await this.notificationVerifier.settle(verification):undefined):undefined;
-    if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
+      if (result.status === "completed") this.database.saveCompleted(row.event_id, result, row.result_path!,new Date(),evidence);
       else this.database.saveFailedResult(row.event_id, result, row.result_path!,new Date(),evidence);
-      await this.agentContexts?.revoke(row.event_id);
+      await this.revokeAgentContext(row.event_id);
       this.logCurrentTransition(row, Date.now());
       return true;
     } catch (error) {
@@ -345,9 +345,21 @@ export class DispatcherWorker {
         error instanceof ResultNotFoundError ? "result_missing" : "invalid_result",
         error instanceof Error ? error.message : String(error),
       );
-      await this.agentContexts?.revoke(row.event_id);
+      await this.revokeAgentContext(row.event_id);
       this.logCurrentTransition(row, Date.now());
       return true;
+    }
+  }
+
+  private async revokeAgentContext(eventId: string): Promise<void> {
+    try {
+      await this.agentContexts?.revoke(eventId);
+    } catch (error) {
+      this.logger.warn("Agent credential cleanup failed after terminal event settlement", {
+        event_id: eventId,
+        error_code: "agent_context_cleanup_failed",
+        error_message: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

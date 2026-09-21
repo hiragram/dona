@@ -122,6 +122,25 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 
+  test("terminal result remains completed when agent credential cleanup fails",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope("Ev-cleanup-after-terminal")).row;
+    const resultPath=path.join(config.resultsDir,`${event.event_id}.json`);
+    database.beginDispatch(event.event_id,resultPath); database.markWaiting(event.event_id);
+    await fs.writeFile(resultPath,JSON.stringify({schema_version:1,event_id:event.event_id,status:"completed",summary:"ok",
+      actions:[],memory_candidates:[],completed_at:new Date().toISOString()}));
+    const warnings:unknown[]=[];
+    const cleanupLogger:Logger={debug(){},info(){},warn(message,fields){warnings.push({message,fields});},error(){}};
+    const contexts={async revoke(){throw new Error("cleanup failed");}} as unknown as AgentContextManager;
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},
+      config,cleanupLogger,undefined,()=>{},contexts);
+    const completed=await (worker as unknown as {tryComplete(row:typeof event,terminal:boolean):Promise<boolean>})
+      .tryComplete({...event,status:"waiting_agent",result_path:resultPath},true);
+    assert.equal(completed,true); assert.equal(database.get(event.event_id)?.status,"completed");
+    assert.match(JSON.stringify(warnings),/agent_context_cleanup_failed/);
+    database.close();
+  });
+
   for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
     const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;

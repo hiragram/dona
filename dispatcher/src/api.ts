@@ -34,7 +34,7 @@ import {
 
 class BodyTooLargeError extends Error {}
 const agentReadCandidateScanMax = 1_000;
-async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
+export async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
   const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
   return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
     const chunks:Buffer[]=[];response.on("data",(chunk:Buffer)=>chunks.push(chunk));response.on("end",()=>{try {const body=JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string,unknown>;if(response.statusCode!==200||body.authorized!==true)throw new Error("schedule_access_not_confirmed");resolve(body);}catch(error){reject(error);}});
@@ -138,6 +138,19 @@ export interface ApiUpdateClient {
 export interface ApiQuiesceController {
   quiesce(): Promise<void>;
 }
+
+export interface ApiHumanWaitAccessVerifier {
+  authorize(input: { event_id: string; workspace_id: string; channel_id: string; user_id: string }): Promise<boolean>;
+}
+
+const agentUpdateStatusKeys = [
+  "request_id", "state", "current_sha", "target_sha", "previous_sha", "policy_version",
+  "rollback_compatible", "last_error_code", "created_at", "updated_at", "completed_at", "observed_active_sha",
+] as const;
+
+function projectAgentUpdateStatus(update: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(agentUpdateStatusKeys.filter(key => key in update).map(key => [key, update[key]]));
+}
 export interface ApiSchedulerState {
   operationalState(): { running: boolean; last_purge_at: string | null };
 }
@@ -176,6 +189,7 @@ export class DispatcherApi {
     private readonly schedulerState?: ApiSchedulerState,
     private readonly agentContexts?: AgentContextManager,
     agentReads?: AgentReadAuthorization,
+    private readonly humanWaitAccess?: ApiHumanWaitAccessVerifier,
   ) {
     this.schedules = new ScheduleApiService(database, scheduleNow, () => { wakeScheduler(); jobs.wake(); });
     this.agentReads = agentReads ?? new AgentReadAuthorization();
@@ -341,6 +355,7 @@ export class DispatcherApi {
         if(!secret)throw new ApiRequestError(503,"human_wait_query_unavailable","Human wait query is unavailable");
         const service=new HumanWaitQueryService(this.database.humanWaits,this.agentReads,createHash("sha256").update(secret).digest());
         try {
+          const destination=await this.authorizedHumanWaitDestination(context);
           if(url.pathname==="/v1/human-waits"||url.pathname==="/v1/human-waits/presentation") {
             const rawLimit=url.searchParams.get("limit")??"20";
             if(!/^(?:[1-9]|[1-4][0-9]|50)$/.test(rawLimit))throw new ApiRequestError(400,"invalid_request","limit is invalid");
@@ -349,16 +364,16 @@ export class DispatcherApi {
             const continuation=presentation&&url.searchParams.has("cursor");
             if(!event||!hasExplicitOwnHumanWaitIntent(event,{continuation}))throw new HumanWaitPresentationError();
             if(url.pathname==="/v1/human-waits/presentation") {
-              const page=service.list({context,destination:this.agentDisclosureDestination(context),limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
+              const page=service.list({context,destination,limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
                 ...(continuation?{cursor:url.searchParams.get("cursor")!,allowCrossEventCursor:true}:{})});
               sendJson(response,200,{schema_version:1,...renderHumanWaits(page,new Date(event.occurred_at))});
-            } else sendJson(response,200,service.list({context,destination:this.agentDisclosureDestination(context),limit:Number(rawLimit),
+            } else sendJson(response,200,service.list({context,destination,limit:Number(rawLimit),
               ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})}));
           } else {
             let originRef:string;
             try { originRef=decodeURIComponent(url.pathname.split("/").at(-1)!); }
             catch { throw new HumanWaitQueryError("human_wait_origin_unavailable"); }
-            sendJson(response,200,service.resolveOrigin({context,destination:this.agentDisclosureDestination(context),originRef}));
+            sendJson(response,200,service.resolveOrigin({context,destination,originRef}));
           }
         } catch(error) {
           if(error instanceof HumanWaitPresentationError)throw new ApiRequestError(403,error.code,"Human wait presentation requires an explicit owner request");
@@ -714,7 +729,27 @@ export class DispatcherApi {
     if (request.method === "GET" && url.pathname === "/v1/self-update/status") {
       const requestId = url.searchParams.get("request_id") ?? undefined;
       if (requestId && !/^upd_[0-9a-hjkmnp-tv-z]{26}$/.test(requestId)) throw new ApiRequestError(400, "invalid_request", "request_id is invalid");
-      sendJson(response, 200, await this.updates.status(requestId));
+      const context=this.verifiedAgentContexts.get(request);
+      if(!context){sendJson(response,200,await this.updates.status(requestId));return;}
+      if(!requestId)throw this.notAvailable();
+      let status:Record<string,unknown>;
+      try { status=await this.updates.status(requestId); }
+      catch { throw this.notAvailable(); }
+      const update=status.update;
+      if(!update||typeof update!=="object"||Array.isArray(update))throw this.notAvailable();
+      const row=update as Record<string,unknown>;
+      let allowed=context.purpose==="human_command"&&row.source_event_id===context.event_id;
+      if(context.purpose==="update_completion"){
+        const event=this.database.get(context.event_id);
+        try {
+          const subject=event?JSON.parse(event.subject_json) as Record<string,unknown>:undefined;
+          const replyTarget=event?.reply_target_json?JSON.parse(event.reply_target_json):undefined;
+          allowed=event?.source==="dona_update"&&subject?.request_id===requestId&&
+            typeof row.reply_target_json==="string"&&stableStringify(JSON.parse(row.reply_target_json))===stableStringify(replyTarget);
+        } catch { allowed=false; }
+      }
+      if(!allowed||row.request_id!==requestId)throw this.notAvailable();
+      sendJson(response,200,{schema_version:1,update:projectAgentUpdateStatus(row)});
       return;
     }
     if (request.method === "POST" && url.pathname === "/v1/self-update/cancel") {
@@ -795,6 +830,20 @@ export class DispatcherApi {
     if (!event?.reply_target_json) return undefined;
     try { return JSON.parse(event.reply_target_json) as unknown; }
     catch { return undefined; }
+  }
+
+  private async authorizedHumanWaitDestination(context: AgentExecutionContext): Promise<Record<string, unknown>> {
+    const destination=this.agentDisclosureDestination(context);
+    if(!destination||typeof destination!=="object"||Array.isArray(destination))throw new HumanWaitQueryError("human_wait_query_unavailable");
+    const value=destination as Record<string,unknown>;
+    if(typeof value.workspace_id!=="string"||typeof value.channel_id!=="string"||value.workspace_id!==context.workspace_id||
+      !this.humanWaitAccess)throw new HumanWaitQueryError("human_wait_query_unavailable");
+    try {
+      const allowed=await this.humanWaitAccess.authorize({event_id:context.event_id,workspace_id:value.workspace_id,
+        channel_id:value.channel_id,user_id:context.principal_id});
+      if(!allowed)throw new Error("current_access_unavailable");
+      return value;
+    } catch { throw new HumanWaitQueryError("human_wait_query_unavailable"); }
   }
 
   private agentJobAllowed(request: IncomingMessage, surface: AgentReadSurface, job: JobRow): boolean {

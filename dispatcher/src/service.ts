@@ -1,5 +1,5 @@
 import type { DispatcherConfig } from "./config.js";
-import { DispatcherApi } from "./api.js";
+import { confirmScheduleAccess, DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
 import { HerdrProcessClient } from "./herdr.js";
 import { HerdrJobAgentRuntime } from "./job-runtime.js";
@@ -17,7 +17,7 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
-import { ensurePrivateToken } from "./private-token.js";
+import { ensurePrivateToken, readPrivateToken } from "./private-token.js";
 import { AgentContextManager } from "./agent-context.js";
 import { createHumanWaitAgentReadAuthorization } from "./agent-read-authorization.js";
 
@@ -101,6 +101,16 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     scheduler,
     agentContexts,
     createHumanWaitAgentReadAuthorization(database),
+    {
+      async authorize(input) {
+        const token=await readPrivateToken(config.updateInternalTokenPath);
+        if(!token)return false;
+        try {
+          await confirmScheduleAccess(config.slackAdapterSocketPath,token,input,45_000);
+          return true;
+        } catch { return false; }
+      },
+    },
   );
 
   try {
