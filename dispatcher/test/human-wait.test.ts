@@ -165,6 +165,7 @@ test("attention ownership解除時はgroup waitを解消する", async () => {
     .run(new Date(at.getTime()+2_000).toISOString(),source.event_id);
   raw.close();
   assert.equal(database.humanWaits.listInternal().some(item=>item.resource_kind==="job_group"),false);
+  assert.equal(database.humanWaits.listInternal().some(item=>item.dedupe_key===`job:${job.job_id}`),true);
   database.close();
 });
 

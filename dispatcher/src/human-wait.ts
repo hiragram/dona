@@ -208,6 +208,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
       WHERE dedupe_key='group:'||NEW.source_event_id AND state='open'
         AND (NEW.all_terminal_event_id IS NOT NULL OR NEW.attention_event_id IS NULL)
       ;
+      UPDATE jobs SET updated_at=updated_at WHERE source_event_id=NEW.source_event_id
+        AND NEW.attention_event_id IS NULL AND NEW.all_terminal_event_id IS NULL AND status IN ('blocked','needs_review');
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_schedule_run_insert AFTER INSERT ON schedule_runs BEGIN
       INSERT INTO human_wait_items(item_id,dedupe_key,tenant_id,workspace_id,owner_kind,owner_principal_kind,owner_principal_id,
@@ -260,7 +262,8 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         json_extract(NEW.owner_json,'$.tenant_id'),json_extract(NEW.owner_json,'$.tenant_id'),'schedule','human',json_extract(NEW.owner_json,'$.owner_id'),
         'owner','reconcile_write','notification',COALESCE(NEW.notification_event_id,NEW.job_id),NEW.job_id,
         COALESCE(json_extract(NEW.owner_json,'$.revision'),1),'notification_reconcile','origin_'||lower(hex(randomblob(16))),
-        NEW.materialized_at,'open',0,NEW.materialized_at,NEW.materialized_at,NULL,NULL,NEW.content_delete_at
+        COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),'open',0,
+        NEW.materialized_at,COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NULL,NULL,NEW.content_delete_at
       WHERE json_extract(NEW.owner_json,'$.kind')='schedule' AND NEW.notification_state='needs_review' AND EXISTS (
         SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
           AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1))
