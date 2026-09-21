@@ -45,7 +45,7 @@ if (isTestWorker && metricsScope === 2) {
   }
 
   function identityFor(value) {
-    if (!value || Buffer.byteLength(value) > 16 * 1024) throw new Error("case checkpoint identity input is invalid");
+    if (typeof value !== "string" || value.length === 0) throw new Error("case checkpoint identity input is invalid");
     const digest = createHash("sha256").update(`${file}\0${value}`).digest("hex").slice(0, 12);
     const occurrence = (occurrences.get(digest) ?? 0) + 1;
     occurrences.set(digest, occurrence);
@@ -109,9 +109,10 @@ if (isTestWorker && metricsScope === 2) {
     });
     registerTerminal(afterGeneration);
     context.after = function checkpointedAfter(...args) {
-      afterGeneration += 1;
+      const nextGeneration = afterGeneration + 1;
       const result = originalAfter(...args);
-      registerTerminal(afterGeneration);
+      registerTerminal(nextGeneration);
+      afterGeneration = nextGeneration;
       return result;
     };
   });

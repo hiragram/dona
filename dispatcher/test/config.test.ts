@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -114,7 +115,11 @@ describe("job resource config", () => {
     assert.match(caseCheckpoint, /typeof context\.fullName === "string" \? context\.fullName : context\.name/);
     assert.match(caseCheckpoint, /generation !== afterGeneration/);
     assert.match(caseCheckpoint, /context\.after = function checkpointedAfter/);
+    assert.match(caseCheckpoint, /const nextGeneration = afterGeneration \+ 1;[\s\S]*originalAfter\(\.\.\.args\);[\s\S]*afterGeneration = nextGeneration/);
     assert.doesNotMatch(caseCheckpoint, /nodeTest\.test\s*=/);
+    const caseChannel = fs.readFileSync(new URL("./case-checkpoint-channel.mjs", import.meta.url), "utf8");
+    assert.match(caseChannel, /events\.read\(/);
+    assert.doesNotMatch(caseChannel, /readFile\(eventsPath/);
     assert.match(runner, /process\.argv\.slice\(2\)/);
     assert.match(runner, /process-metrics\.cjs/);
     const metrics = fs.readFileSync(new URL("./process-metrics.cjs", import.meta.url), "utf8");
@@ -198,6 +203,19 @@ describe("job resource config", () => {
     }
     assert.match(markers.join("\n"), caseStartPattern);
     assert.deepEqual(cleanupSignals, ["SIGTERM", "SIGKILL"]);
+  });
+
+  test("checkpoint channelは単一drainで増分だけをboundedに処理する", async () => {
+    const nonce = "abcdef0123456789abcdef0123456789";
+    const markers: string[] = [];
+    const channel = await createCaseCheckpointChannel({ nonce, file: "test/burst.test.ts", onMarker: (marker) => markers.push(marker) });
+    const records = Array.from({ length: 4_000 }, (_, index) => {
+      const sequence = index + 1;
+      return `${sequence}\t[dispatcher-test:${nonce}] case-terminal test/burst.test.ts:012345abcdef#${sequence}\n`;
+    }).join("");
+    fs.appendFileSync(path.join(channel.directory, "events"), records);
+    await channel.close();
+    assert.equal(markers.length, 4_000);
   });
 
   test("停止する同期native callへ入る前にも親processがcase identityを確定する", async () => {
@@ -448,6 +466,8 @@ describe("job resource config", () => {
       'import { afterEach, describe, test } from "node:test";',
       'test("callback", (_t, done) => done());',
       'test("parent", async (t) => { await t.test("child", () => {}); });',
+      'test("caught-invalid-after", (t) => { try { t.after(() => {}, { timeout: "bad" }); } catch {} });',
+      'test("x".repeat(17 * 1024), () => {});',
       'test("source-location", () => { throw new Error("expected fixture failure"); });',
       'describe("hook failure", () => {',
       '  afterEach(() => { throw new Error("expected afterEach failure"); });',
@@ -475,10 +495,10 @@ describe("job resource config", () => {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     assert.notEqual(status, 0);
     assert.match(output, /✔ callback/);
-    assert.match(output, /source\.test\.mjs:4:\d+/);
+    assert.match(output, /source\.test\.mjs:6:\d+/);
     assert.doesNotMatch(output, /test at .*case-checkpoint\.cjs/);
-    assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 5);
-    assert.equal(markers.filter((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ")).length, 5);
+    assert.equal(markers.filter((marker) => marker.includes(" case-start ")).length, 7);
+    assert.equal(markers.filter((marker) => marker.includes(" case-finish ") || marker.includes(" case-fail ")).length, 7);
     assert.equal(markers.filter((marker) => marker.includes(" case-fail ")).length, 2);
   });
 

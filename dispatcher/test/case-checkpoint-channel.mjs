@@ -14,20 +14,31 @@ export async function createCaseCheckpointChannel({ nonce, file, onMarker = (mar
   const acknowledgementPath = path.join(directory, "ack");
   await fs.writeFile(eventsPath, "", { mode: 0o600 });
   await fs.writeFile(acknowledgementPath, "", { mode: 0o600 });
+  const events = await fs.open(eventsPath, "r");
   let offset = 0;
   let remainder = "";
   let expectedSequence = 1;
   let failure;
-  let draining = Promise.resolve();
+  let draining;
+  let drainRequested = false;
   const markerPattern = new RegExp(`^\\[dispatcher-test:${nonce}\\] case-(?:start|finish|fail|terminal) ${file.replaceAll(".", "\\.")}:[a-f0-9]{12}#\\d+(?: elapsed_ms=\\d{1,9})?$`);
 
   const drain = async () => {
     if (failure) return;
     try {
-      const contents = await fs.readFile(eventsPath);
-      if (contents.length > channelLimitBytes) throw new Error("case checkpoint channel exceeded its bounded size");
-      const addition = contents.subarray(offset).toString("utf8");
-      offset = contents.length;
+      const stats = await events.stat();
+      if (stats.size > channelLimitBytes) throw new Error("case checkpoint channel exceeded its bounded size");
+      if (stats.size < offset) throw new Error("case checkpoint channel was truncated");
+      const additionSize = stats.size - offset;
+      const additionBuffer = Buffer.alloc(additionSize);
+      let bytesRead = 0;
+      while (bytesRead < additionSize) {
+        const result = await events.read(additionBuffer, bytesRead, additionSize - bytesRead, offset + bytesRead);
+        if (result.bytesRead === 0) break;
+        bytesRead += result.bytesRead;
+      }
+      const addition = additionBuffer.subarray(0, bytesRead).toString("utf8");
+      offset += bytesRead;
       const lines = `${remainder}${addition}`.split(/\r?\n/);
       remainder = lines.pop() ?? "";
       if (Buffer.byteLength(remainder) > 512) throw new Error("case checkpoint record is oversized");
@@ -46,7 +57,16 @@ export async function createCaseCheckpointChannel({ nonce, file, onMarker = (mar
       failure = error;
     }
   };
-  const scheduleDrain = () => { draining = draining.then(drain); };
+  const scheduleDrain = () => {
+    drainRequested = true;
+    if (draining) return;
+    draining = (async () => {
+      while (drainRequested) {
+        drainRequested = false;
+        await drain();
+      }
+    })().finally(() => { draining = undefined; });
+  };
   const timer = setInterval(scheduleDrain, 2);
 
   return {
@@ -55,6 +75,7 @@ export async function createCaseCheckpointChannel({ nonce, file, onMarker = (mar
       clearInterval(timer);
       scheduleDrain();
       await draining;
+      await events.close();
       await fs.rm(directory, { recursive: true, force: true });
       if (failure) throw failure;
     },
