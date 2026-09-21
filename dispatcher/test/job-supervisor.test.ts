@@ -110,7 +110,7 @@ test("web cancelはprepare完了まで待ち作成済みagentだけを停止す�
     async prepare() { await preparing; return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
     async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
     async prompt() { return ok("working"); },
-    async wait() { await waiting; return { ...ok("working"), aborted: true }; },
+    async wait() { await waiting; return ok("done"); },
     async cancel() { cancelCalls++; releaseWait(); return ok("done"); },
   });
   const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined); supervisor.start();

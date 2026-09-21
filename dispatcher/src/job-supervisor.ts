@@ -720,6 +720,7 @@ export class JobSupervisor {
     try { waited = await this.runtime.wait(row.agent_name, this.abortController.signal); }
     finally { keepPolling = false; pollAbort.abort(); await pollProgress; this.abortController.signal.removeEventListener("abort", stopPoll); }
     if (waited.aborted || this.stopping) return;
+    if (["cancelling", "cancelled"].includes(this.database.getJob(row.job_id)?.status ?? "")) return;
     if (!waited.ok) {
       if (waited.timedOut || waited.errorCode === "timeout") {
         this.logger.debug("Background job remains active", {

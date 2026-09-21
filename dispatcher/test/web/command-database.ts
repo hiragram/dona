@@ -65,3 +65,16 @@ test("preparingとdispatchingのweb jobもownerがcancellingへ遷移できる",
     db.markJobCancelled(created.row.job_id, "fixture"); db.close();
   }
 });
+
+test("blockedとneeds_reviewのweb jobもworker解放確認まではowner quotaへ算入する", async t => {
+  for (const [index, status] of ["blocked", "needs_review"].entries()) {
+    const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+    let db = new DispatcherDatabase(config.databasePath, { jobsPerEventMax: 1, jobObjectiveTotalMaxBytes: 400000 });
+    const created = db.createWebJob(input(String(index + 3).repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir); db.close();
+    const raw = new Database(config.databasePath); raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status, created.row.job_id); raw.close();
+    db = new DispatcherDatabase(config.databasePath, { jobsPerEventMax: 1, jobObjectiveTotalMaxBytes: 400000 });
+    assert.throws(() => db.createWebJob(input(String(index + 7).repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir),
+      (error: unknown) => error instanceof JobCreationError && error.code === "job_group_limit_exceeded");
+    db.close();
+  }
+});

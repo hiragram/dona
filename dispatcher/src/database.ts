@@ -763,7 +763,7 @@ export class DispatcherDatabase {
       }
       const active = this.db.prepare(`SELECT COUNT(*) AS count FROM jobs
         WHERE source='web' AND workspace_id=? AND actor_id=?
-          AND status NOT IN ('blocked','completed','failed','cancelled','needs_review')`)
+          AND status NOT IN ('completed','failed','cancelled')`)
         .get(input.tenant_id, input.principal_id) as { count: number };
       if (active.count >= this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded",
         "Web owner active-job limit exceeded", { resource: "jobs_per_event", current: active.count,

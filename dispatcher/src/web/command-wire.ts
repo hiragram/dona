@@ -40,8 +40,12 @@ export function verifyWebCommandProof(proof: string, raw: string, scope: Service
     const text = Buffer.from(parts[0]!, "base64url").toString("utf8"), claims = claimsSchema.parse(JSON.parse(text));
     if (Buffer.from(parts[0]!, "base64url").toString("base64url") !== parts[0] || JSON.stringify(claims) !== text) throw Error();
     const credential = lookup(claims.key_version), at = Date.parse(now), issued = Date.parse(claims.issued_at), expires = Date.parse(claims.expires_at);
-    if (!credential || credential.purpose !== "web_bff_service" || credential.state === "revoked" || credential.instance_id !== scope.instance_id
+    if (!credential || credential.purpose !== "web_bff_service" || credential.version !== claims.key_version
+      || credential.state === "revoked" || credential.instance_id !== scope.instance_id
       || credential.tenant_id !== scope.tenant_id || claims.instance_id !== scope.instance_id || claims.tenant_id !== scope.tenant_id
+      || !(credential.secret instanceof Uint8Array) || credential.secret.byteLength !== 32
+      || Date.parse(credential.signing_expires_at) <= Date.parse(credential.activated_at)
+      || Date.parse(credential.signing_expires_at) - Date.parse(credential.activated_at) > 90 * 24 * 3600 * 1000
       || claims.body_digest !== hash(raw) || at < issued || at >= expires || expires - issued > 10000
       || issued < Date.parse(credential.activated_at) || issued >= Date.parse(credential.signing_expires_at)) throw Error();
     const actual = Buffer.from(parts[1]!, "base64url"), expected = createHmac("sha256", credential.secret)
