@@ -154,7 +154,12 @@ export class WebAuthController {
         catch { throw new AuthFailure(400, "session_invalid"); }
       } else {
         const origin = singleHeader(request.headers, "origin");
-        if (singleHeader(request.headers, "sec-fetch-site") !== "same-origin" || (origin !== undefined && origin !== this.policy.origin))
+        const site = singleHeader(request.headers, "sec-fetch-site");
+        const directDashboard = dashboard && (site === "none" || site === undefined) && origin === undefined
+          && singleHeader(request.headers, "sec-fetch-mode") === "navigate"
+          && singleHeader(request.headers, "sec-fetch-dest") === "document"
+          && singleHeader(request.headers, "sec-fetch-user") === "?1";
+        if (!directDashboard && (site !== "same-origin" || (origin !== undefined && origin !== this.policy.origin)))
           throw new AuthFailure(403, "origin_invalid");
         if (request.body.byteLength !== 0) throw new AuthFailure(400, "session_invalid");
       }

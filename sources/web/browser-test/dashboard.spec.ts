@@ -86,6 +86,10 @@ test("送信中の二重操作を止め、receipt確認後だけ作成済みjob�
   release(); await expect(page.getByRole("heading", { name: "job_created" })).toBeVisible(); expect(f.submitWrites).toBe(1); expect(f.errors).toEqual([]);
 });
 
+test("送信中に編集した次のdraftを成功receiptで消去しない",async({page})=>{
+  let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("送信する依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.getByLabel("依頼内容").fill("次に送信する依頼");await page.getByLabel("作業場所").selectOption("github");await page.getByLabel("Repository").fill("owner/next");release();await expect(page.getByRole("heading",{name:"job_created"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("次に送信する依頼");await expect(page.getByLabel("作業場所")).toHaveValue("github");await expect(page.getByLabel("Repository")).toHaveValue("owner/next");expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
 test("tab復帰後に古いsubmit receiptを新しいsession表示へ適用しない",async({page})=>{
   let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("古いsessionの依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByRole("button",{name:"依頼を送信"})).toBeDisabled();release();await expect(page.getByRole("status")).toContainText("受付結果が不明です");await expect(page.getByRole("heading",{name:"job_created"})).toBeHidden();await expect(page.getByRole("button",{name:/job_created/})).toBeVisible();await expect(page.getByRole("button",{name:"依頼を送信"})).toBeEnabled();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
@@ -398,6 +402,10 @@ test("tabを隠すとprivate表示を消し復帰時にsessionとresourceを再�
   const f=await fixture(page);await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("private draft");const beforeSession=f.sessionReads,beforeList=f.listReads;
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await expect(page.locator("#principal")).toHaveText("確認中");
   await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.sessionReads).toBe(beforeSession+1);expect(f.listReads).toBe(beforeList+1);expect(f.errors).toEqual([]);
+});
+
+test("初期hidden tabは最初にvisibleになるまでsessionとprivate情報を取得しない",async({page})=>{
+  await page.addInitScript(()=>Object.defineProperty(document,"hidden",{configurable:true,value:true}));const f=await fixture(page);await page.goto(policy.origin+"/");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();expect(f.sessionReads).toBe(0);expect(f.listReads).toBe(0);await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.sessionReads).toBe(1);expect(f.listReads).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("visible直後のfocusは復帰bootへまとめる",async({page})=>{

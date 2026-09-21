@@ -50,6 +50,24 @@ test("BFFは同一originの明示dashboard navigationだけをservice activity�
   }
 });
 
+test("dashboardの直接top-level navigationだけFetch Site noneまたは省略を許可する",async()=>{
+  for(const site of ["none",undefined]){
+    const f=controllerFixture(),confirm=f.connections.session.confirm;let observed:boolean|undefined;
+    f.connections.session.confirm=async(input,identity)=>{observed=input.user_navigation;return confirm(input,identity);};
+    let request=header(header(f.request("/"),"origin"),"sec-fetch-site",site);
+    request=header(header(header(request,"sec-fetch-mode","navigate"),"sec-fetch-dest","document"),"sec-fetch-user","?1");
+    const result=await f.controller.handle(request);assert.equal(result.status,200);assert.equal(observed,true);
+  }
+  for(const target of ["/api/session","/"]){
+    const f=controllerFixture();let request=header(header(f.request(target),"origin"),"sec-fetch-site","none");
+    request=header(header(request,"sec-fetch-mode","navigate"),"sec-fetch-dest","document");
+    const result=await f.controller.handle(request);assert.equal(result.status,403);
+  }
+  const f=controllerFixture();let cross=header(header(f.request("/"),"origin","https://other.test"),"sec-fetch-site","none");
+  cross=header(header(header(cross,"sec-fetch-mode","navigate"),"sec-fetch-dest","document"),"sec-fetch-user","?1");
+  assert.equal((await f.controller.handle(cross)).status,403);
+});
+
 test("各session requestでonline照合と現行registryとDispatcher確認を行う", async () => {
   const f = controllerFixture(), before = f.snapshot.session.state.last_activity_at;
   for (let i = 0; i < 2; i++) {
