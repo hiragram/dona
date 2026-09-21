@@ -35,7 +35,7 @@ export const agentPurposeOperations: Record<AgentPurpose, readonly string[]> = {
     "steer_job", "cancel_job", "plan_self_update", "apply_self_update", "get_self_update_status",
     "cancel_self_update", "preview_schedule", "create_schedule", "get_schedule", "list_schedules",
     "update_schedule", "pause_schedule", "resume_schedule", "cancel_schedule", "get_schedule_history",
-    "list_human_waits", "resolve_human_wait_origin",
+    "list_human_waits", "present_human_waits", "resolve_human_wait_origin",
   ],
   job_completion: ["list_event_jobs", "get_job_status", "authorize_job_notification"],
   schedule_work: ["record_schedule_job_access", "delegate_scheduled_work"],
@@ -157,6 +157,7 @@ export function agentOperation(method: string | undefined, url: URL): string | u
   if (method === "GET" && route === "/v1/jobs") return url.searchParams.has("source_event_id") ? "list_owner_jobs" : "list_thread_jobs";
   if (method === "GET" && /^\/v1\/jobs\/[^/]+$/.test(route)) return "get_job_status";
   if (method === "GET" && route === "/v1/human-waits") return "list_human_waits";
+  if (method === "GET" && route === "/v1/human-waits/presentation") return "present_human_waits";
   if (method === "GET" && /^\/v1\/human-waits\/origins\/[^/]+$/.test(route)) return "resolve_human_wait_origin";
   if (method === "POST" && /^\/v1\/jobs\/[^/]+\/(steer|cancel)$/.test(route)) return route.endsWith("/steer") ? "steer_job" : "cancel_job";
   if (method === "POST" && /^\/v1\/scheduled-jobs\/[^/]+\/delegate$/.test(route)) return "delegate_scheduled_work";

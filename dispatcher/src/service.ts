@@ -19,6 +19,7 @@ import {
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
 import { ensurePrivateToken } from "./private-token.js";
 import { AgentContextManager } from "./agent-context.js";
+import { createHumanWaitAgentReadAuthorization } from "./agent-read-authorization.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   // The target release performs this before becoming ready, so updates driven by
@@ -99,6 +100,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => scheduler.wake(),
     scheduler,
     agentContexts,
+    createHumanWaitAgentReadAuthorization(database),
   );
 
   try {

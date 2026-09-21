@@ -65,6 +65,11 @@ export class DispatcherApiClient {
     return this.request("GET",`/v1/human-waits?${query}`,undefined,sourceEventId);
   }
 
+  presentHumanWaits(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({limit:String(limit),...(cursor?{cursor}:{})});
+    return this.request("GET",`/v1/human-waits/presentation?${query}`,undefined,sourceEventId);
+  }
+
   resolveHumanWaitOrigin(sourceEventId:string,originRef:string):Promise<Record<string,unknown>> {
     return this.request("GET",`/v1/human-waits/origins/${encodeURIComponent(originRef)}`,undefined,sourceEventId);
   }

@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
+
 import type { AgentExecutionContext } from "./agent-context.js";
+import type { DispatcherDatabase } from "./database.js";
 import type { JobAuthorizationBindingRow } from "./job-authorization-binding.js";
 import type { JobRow } from "./types.js";
+import { stableStringify } from "./validation.js";
 
 export const agentReadSurfaces = [
   "list_event_jobs",
@@ -233,6 +237,54 @@ export class AgentReadAuthorization {
     catch {disclosure={allowed:false,reason:"audit_unavailable"};allowed=false;providerFailed=true;}
     return {allowed,authority,disclosure,...(providerFailed?{provider_failed:true}:{})};
   }
+}
+
+export function createHumanWaitAgentReadAuthorization(database:DispatcherDatabase):AgentReadAuthorization {
+  const grant:AgentReadGrantPort={
+    authorize:input=>(input.operation==="read_own_human_waits"&&input.surface==="list_human_waits")||
+      (input.operation==="resolve_origin_ref"&&input.surface==="resolve_human_wait_origin"),
+    revision:input=>{
+      if(!((input.operation==="read_own_human_waits"&&input.surface==="list_human_waits")||
+        (input.operation==="resolve_origin_ref"&&input.surface==="resolve_human_wait_origin")))throw new Error("grant_unavailable");
+      return `human-wait-grant-v1:${input.operation}`;
+    },
+  };
+  const currentDestination=(input:{event_id:string;tenant_id:string;workspace_id:string;principal_id:string;destination:unknown})=>{
+    const event=database.get(input.event_id),principal=database.getAgentPrincipalBinding(input.event_id);
+    if(!event||event.source!=="slack"||!event.reply_target_json||!principal||principal.revoked_at!==null||
+      principal.tenant_id!==input.tenant_id||principal.workspace_id!==input.workspace_id||principal.principal_id!==input.principal_id)return false;
+    try {return stableStringify(JSON.parse(event.reply_target_json) as unknown)===stableStringify(input.destination);}
+    catch{return false;}
+  };
+  const destinationChannel=(value:unknown):{workspace_id:string;channel_id:string}|undefined=>{
+    if(!value||typeof value!=="object"||Array.isArray(value))return undefined;
+    const outer=value as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown;target?:unknown};
+    const raw=outer.kind==="slack"?outer.target:outer;
+    if(!raw||typeof raw!=="object"||Array.isArray(raw))return undefined;
+    const target=raw as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown};
+    if(!["slack_thread","thread","channel","owner_dm"].includes(String(target.kind))||
+      typeof target.workspace_id!=="string"||typeof target.channel_id!=="string")return undefined;
+    return {workspace_id:target.workspace_id,channel_id:target.channel_id};
+  };
+  const visibility:AgentReadVisibilityPort={
+    authorize:input=>{
+      if(!currentDestination({...input,destination:input.disclosure_destination}))return false;
+      if(!input.disclosure_origin||typeof input.disclosure_origin!=="object")return false;
+      const origin=input.disclosure_origin as {kind?:unknown;origin_ref?:unknown};
+      if(origin.kind!=="human_wait_origin"||typeof origin.origin_ref!=="string")return false;
+      const item=database.humanWaits.getByOriginRef(origin.origin_ref);
+      const source=item?destinationChannel(database.humanWaits.disclosureDestination(item)):undefined;
+      const current=destinationChannel(input.disclosure_destination);
+      return item!==undefined&&item.resource_id===input.job_id&&database.humanWaits.authorizationCurrent(item)&&source!==undefined&&current!==undefined&&
+        source.workspace_id===current.workspace_id&&source.channel_id===current.channel_id;
+    },
+    revision:input=>{
+      if(!currentDestination({...input,destination:input.disclosure_destination}))throw new Error("visibility_unavailable");
+      return `human-wait-visibility-v1:${createHash("sha256").update(stableStringify({tenant_id:input.tenant_id,
+        workspace_id:input.workspace_id,principal_id:input.principal_id,destination:input.disclosure_destination})).digest("hex")}`;
+    },
+  };
+  return new AgentReadAuthorization(grant,visibility);
 }
 
 const publicJobKeys = [

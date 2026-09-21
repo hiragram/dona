@@ -406,6 +406,36 @@ export class HumanWaitRepository {
       SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key=i.dedupe_key)`).get(originRef) as HumanWaitItemRow | undefined;
   }
 
+  disclosureDestination(item:HumanWaitItemRow):unknown|undefined {
+    let rows:Array<{destination_json:string}>=[];
+    if(item.resource_kind==="job") rows=this.db.prepare(`SELECT b.destination_json FROM job_owner_bindings b
+      JOIN jobs j USING(job_id) WHERE j.job_id=? AND j.source_event_id=?`).all(item.resource_id,item.parent_resource_id) as Array<{destination_json:string}>;
+    else if(item.resource_kind==="job_group") rows=this.db.prepare(`SELECT b.destination_json FROM job_owner_bindings b
+      JOIN jobs j USING(job_id) WHERE j.source_event_id=? ORDER BY j.job_id`).all(item.resource_id) as Array<{destination_json:string}>;
+    else if(item.resource_kind==="schedule_run") {
+      const schedule=this.db.prepare(`SELECT v.target_json,v.authorization_id FROM schedule_runs r
+        JOIN schedule_revisions v ON v.schedule_id=r.schedule_id AND v.revision=r.revision
+        WHERE r.run_id=? AND r.schedule_id=? AND r.revision=?`).get(item.resource_id,item.parent_resource_id,item.resource_revision) as {target_json:string;authorization_id:string}|undefined;
+      if(schedule) {
+        let target:unknown;
+        try{target=JSON.parse(schedule.target_json) as unknown;}catch{return undefined;}
+        if(target&&typeof target==="object"&&!Array.isArray(target)&&(target as {kind?:unknown}).kind==="none") {
+          const eventId=schedule.authorization_id.replace(/:\d+$/u,"");
+          rows=this.db.prepare("SELECT reply_target_json AS destination_json FROM events WHERE event_id=? AND source='slack' AND reply_target_json IS NOT NULL")
+            .all(eventId) as Array<{destination_json:string}>;
+        } else rows=[{destination_json:schedule.target_json}];
+      }
+    }
+    else if(item.resource_kind==="notification") {
+      rows=this.db.prepare(`SELECT o.target_json AS destination_json FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+        WHERE o.outbox_id=? AND r.run_id=? AND r.revision=?`).all(item.resource_id,item.parent_resource_id,item.resource_revision) as Array<{destination_json:string}>;
+      if(rows.length===0) rows=this.db.prepare(`SELECT destination_json FROM job_completion_results
+        WHERE job_id=? AND json_extract(owner_json,'$.revision')=? ORDER BY job_status`).all(item.parent_resource_id,item.resource_revision) as Array<{destination_json:string}>;
+    }
+    if(rows.length===0||rows.some(row=>row.destination_json!==rows[0]!.destination_json))return undefined;
+    try{return JSON.parse(rows[0]!.destination_json) as unknown;}catch{return undefined;}
+  }
+
   ownerRevision(input:{tenantId:string;workspaceId:string;principalId:string}):number {
     const row=this.db.prepare(`SELECT revision FROM human_wait_owner_revisions
       WHERE tenant_id=? AND workspace_id=? AND principal_id=?`).get(input.tenantId,input.workspaceId,input.principalId) as {revision:number}|undefined;

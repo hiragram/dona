@@ -234,7 +234,7 @@ test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisi
     const policyInventory = [...new Set(Object.values(agentPurposeOperations).flat())].sort();
     assert.deepEqual([...enabled].sort(), policyInventory);
     assert.deepEqual([...advertised].sort(), policyInventory);
-    for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","list_human_waits","resolve_human_wait_origin","authorize_job_notification","record_schedule_job_access"]) {
+    for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","list_human_waits","present_human_waits","resolve_human_wait_origin","authorize_job_notification","record_schedule_job_access"]) {
       assert.ok(enabled.includes(name), name); assert.ok(advertised.includes(name), name);
     }
     assert.match(dispatcherConfig,/tool_timeout_sec = 150/);

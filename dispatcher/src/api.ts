@@ -8,6 +8,7 @@ import type { DispatcherConfig } from "./config.js";
 import { agentBodyEventOperations, agentOperation, type AgentContextManager, type AgentExecutionContext } from "./agent-context.js";
 import { AgentReadAuthorization, projectAuthorizedJob, projectCompletionJob, type AgentReadSurface } from "./agent-read-authorization.js";
 import { HumanWaitQueryError, HumanWaitQueryService } from "./human-wait-query.js";
+import { hasExplicitOwnHumanWaitIntent, HumanWaitPresentationError, renderHumanWaits } from "./human-wait-presentation.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
@@ -321,17 +322,25 @@ export class DispatcherApi {
         });
         return;
       }
-      if (request.method === "GET" && (url.pathname === "/v1/human-waits" || /^\/v1\/human-waits\/origins\/[^/]+$/.test(url.pathname))) {
+      if (request.method === "GET" && (url.pathname === "/v1/human-waits" || url.pathname==="/v1/human-waits/presentation" || /^\/v1\/human-waits\/origins\/[^/]+$/.test(url.pathname))) {
         const context=this.verifiedAgentContexts.get(request);
         if(!context||context.purpose!=="human_command")throw new ApiRequestError(403,"agent_context_unavailable","Agent operation is not available");
         const secret=await readPrivateToken(this.config.slackIngressTokenPath);
         if(!secret)throw new ApiRequestError(503,"human_wait_query_unavailable","Human wait query is unavailable");
         const service=new HumanWaitQueryService(this.database.humanWaits,this.agentReads,createHash("sha256").update(secret).digest());
         try {
-          if(url.pathname==="/v1/human-waits") {
+          if(url.pathname==="/v1/human-waits"||url.pathname==="/v1/human-waits/presentation") {
             const rawLimit=url.searchParams.get("limit")??"20";
             if(!/^(?:[1-9]|[1-4][0-9]|50)$/.test(rawLimit))throw new ApiRequestError(400,"invalid_request","limit is invalid");
-            sendJson(response,200,service.list({context,destination:this.agentDisclosureDestination(context),limit:Number(rawLimit),
+            const event=this.database.get(context.event_id);
+            const presentation=url.pathname==="/v1/human-waits/presentation";
+            const continuation=presentation&&url.searchParams.has("cursor");
+            if(!event||!hasExplicitOwnHumanWaitIntent(event,{continuation}))throw new HumanWaitPresentationError();
+            if(url.pathname==="/v1/human-waits/presentation") {
+              const page=service.list({context,destination:this.agentDisclosureDestination(context),limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
+                ...(continuation?{cursor:url.searchParams.get("cursor")!,allowCrossEventCursor:true}:{})});
+              sendJson(response,200,{schema_version:1,...renderHumanWaits(page,new Date(event.occurred_at))});
+            } else sendJson(response,200,service.list({context,destination:this.agentDisclosureDestination(context),limit:Number(rawLimit),
               ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})}));
           } else {
             let originRef:string;
@@ -340,6 +349,7 @@ export class DispatcherApi {
             sendJson(response,200,service.resolveOrigin({context,destination:this.agentDisclosureDestination(context),originRef}));
           }
         } catch(error) {
+          if(error instanceof HumanWaitPresentationError)throw new ApiRequestError(403,error.code,"Human wait presentation requires an explicit owner request");
           if(error instanceof HumanWaitQueryError) {
             if(error.code==="human_wait_cursor_invalid")throw new ApiRequestError(409,error.code,"Human wait cursor is no longer valid");
             if(error.code==="human_wait_origin_unavailable")throw new ApiRequestError(404,error.code,"Human wait origin is unavailable");

@@ -137,7 +137,7 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
   config.agentSocketPath = path.join(root, "a", "a.sock");
   config.agentCredentialPath = path.join(root, "a", "a.token");
   const database = new DispatcherDatabase(config.databasePath);
-  const envelope = eventEnvelope("agent-read-source");
+  const envelope = {...eventEnvelope("agent-read-source"),payload:{text:"<@U_BOT> 私の待ちを一覧で見せて",event_ts:"1756722030.123456"}};
   const source = database.enqueue(envelope, new Date(), proof(envelope.external_event_id)).row;
   const dispatching = database.beginDispatch(source.event_id, path.join(config.resultsDir, `${source.event_id}.json`));
   const contexts = new AgentContextManager(database, config.agentCredentialPath, 60_000);
@@ -174,9 +174,14 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.doesNotMatch(JSON.stringify(waits),/PRIVATE-CANARY|resource_id|source_event_id/);
     const originRef=((waits.items as Array<{origin:{origin_ref:string}}>)[0]!).origin.origin_ref;
     assert.equal((await client.resolveHumanWaitOrigin(source.event_id,originRef)).status,"available");
+    const presentation=await client.presentHumanWaits(source.event_id,10);
+    assert.equal(presentation.status,"ok");
+    assert.match(String(presentation.text),/自分待ちは1件/);
+    assert.doesNotMatch(JSON.stringify(presentation),/PRIVATE-CANARY|resource_id|source_event_id|item_id/);
 
     hidden.add(first.job_id);
     assert.deepEqual((await client.listHumanWaits(source.event_id,20)).items,[]);
+    assert.equal((await client.presentHumanWaits(source.event_id,10)).status,"empty");
     await assert.rejects(()=>client.resolveHumanWaitOrigin(source.event_id,originRef),
       (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===404);
     const listed = await client.listEventJobs(source.event_id);
@@ -214,6 +219,13 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     const deepOwner = await client.listOwnerJobs(source.event_id);
     assert.deepEqual((deepOwner.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
     assert.equal(deepOwner.truncated, false);
+
+    const nonIntentEnvelope={...eventEnvelope("agent-read-non-intent"),payload:{text:"雑談です",event_ts:"1756722031.123456"}};
+    const nonIntent=database.enqueue(nonIntentEnvelope,new Date(Date.now()+200),proof(nonIntentEnvelope.external_event_id)).row;
+    await contexts.issue(database.beginDispatch(nonIntent.event_id,path.join(config.resultsDir,`${nonIntent.event_id}.json`)));
+    await assert.rejects(()=>client.listHumanWaits(nonIntent.event_id,20),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===403&&
+        (error.body as {error?:{code?:string}}).error?.code==="human_wait_intent_not_explicit");
 
     const completionEnvelope = {
       ...eventEnvelope("agent-read-completion"), source: "dona_job" as const, type: "job_completed",

@@ -25,6 +25,7 @@ export interface DispatcherJobClient {
   listThreadJobs(sourceEventId: string, workspaceId: string, channelId: string, threadTs: string): Promise<Record<string, unknown>>;
   listOwnerJobs?(sourceEventId: string): Promise<Record<string, unknown>>;
   listHumanWaits?(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>>;
+  presentHumanWaits?(sourceEventId:string,limit:number,cursor?:string):Promise<Record<string,unknown>>;
   resolveHumanWaitOrigin?(sourceEventId:string,originRef:string):Promise<Record<string,unknown>>;
   steerJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
@@ -265,6 +266,16 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   },async({source_event_id,limit,cursor})=>{
     try {if(!client.listHumanWaits)throw new Error("Human wait query is unavailable");return success(await client.listHumanWaits(source_event_id,limit,cursor));}
     catch(error){return failure(error,logger,"list_human_waits");}
+  });
+
+  server.registerTool("present_human_waits", {
+    title:"Present my human waits",
+    description:"現在eventのtop-level本文が明示的な本人の自分待ち問い合わせであることをserver側で再確認し、投稿可能なbounded日本語表示とopaque continuation/origin actionだけを返します。",
+    inputSchema:{source_event_id:eventId,limit:z.number().int().min(1).max(10).default(10),cursor:humanWaitCursor.optional()},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({source_event_id,limit,cursor})=>{
+    try {if(!client.presentHumanWaits)throw new Error("Human wait presentation is unavailable");return success(await client.presentHumanWaits(source_event_id,limit,cursor));}
+    catch(error){return failure(error,logger,"present_human_waits");}
   });
 
   server.registerTool("resolve_human_wait_origin", {
