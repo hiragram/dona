@@ -315,7 +315,7 @@ describe("DispatcherDatabase", () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
-    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1" };
+    const owner = { instance_id: "instance", tenant_id: "T_TEST", principal_id: "U-1", authorization_kind: "own" as const };
     const fixture = new Database(config.databasePath);
     fixture.prepare("UPDATE events SET source='web',subject_json=? WHERE event_id='evt-source-running'")
       .run(JSON.stringify(owner));

@@ -16,7 +16,11 @@ export class WebJobReadBroker {
     const ingress=this.auth.verifySessionIngress(`web_job_read_${randomBytes(16).toString("hex")}`,input.context,input.method,input.target,Buffer.alloc(0));
     if(ingress.status==="denied")return{status:"denied",reason:ingress.reason==="scope_denied"?"scope_denied":"identity_unavailable"};
     if(ingress.kind!=="session_verified")return{status:"denied",reason:"identity_unavailable"};
-    const identity:WebJobReadIdentity={instance_id:ingress.principal.instance_id,tenant_id:ingress.principal.tenant_id,principal_id:ingress.principal.principal_id};
+    const scopes=new Set(ingress.principal.scopes),owns=scopes.has("job:read:own"),granted=scopes.has("job:read:granted");
+    const authorization_kind=owns&&granted?"own_or_granted":owns?"own":granted?"granted":null;
+    if(!authorization_kind)return{status:"denied",reason:"scope_denied"};
+    const identity:WebJobReadIdentity={instance_id:ingress.principal.instance_id,tenant_id:ingress.principal.tenant_id,
+      principal_id:ingress.principal.principal_id,authorization_kind};
     const url=new URL(input.target,"https://dona.invalid");
     if(input.operation==="list"){
       if(url.pathname!=="/api/jobs"||url.searchParams.size>2||url.searchParams.get("cursor")!==(input.cursor??null)

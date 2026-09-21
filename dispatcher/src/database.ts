@@ -190,6 +190,7 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       instance_id       TEXT NOT NULL,
       tenant_id         TEXT NOT NULL,
       principal_id      TEXT NOT NULL,
+      authorization_kind TEXT NOT NULL CHECK (authorization_kind IN ('own','granted','own_or_granted')),
       resource_id       TEXT,
       snapshot_sequence INTEGER NOT NULL,
       after_created_at  TEXT,
@@ -208,15 +209,29 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
       singleton      INTEGER PRIMARY KEY CHECK (singleton=1),
       initialized_at TEXT NOT NULL
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS web_job_projection_schema (
+      singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+      version   INTEGER NOT NULL CHECK (version>=1)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS web_job_read_grants (
+      grant_id       TEXT PRIMARY KEY,
+      job_id         TEXT NOT NULL,
+      instance_id    TEXT NOT NULL,
+      tenant_id      TEXT NOT NULL,
+      principal_id   TEXT NOT NULL,
+      grant_revision INTEGER NOT NULL CHECK (grant_revision>0),
+      state          TEXT NOT NULL CHECK (state IN ('active','revoked')),
+      expires_at     TEXT NOT NULL,
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      UNIQUE(job_id,instance_id,tenant_id,principal_id)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS web_job_read_grants_principal_idx
+      ON web_job_read_grants(instance_id,tenant_id,principal_id,state,expires_at,job_id);
     CREATE TRIGGER IF NOT EXISTS web_job_projection_insert
       AFTER INSERT ON jobs WHEN new.source='web' BEGIN
         INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
         VALUES(new.job_id,'snapshot',new.updated_at);
-      END;
-    CREATE TRIGGER IF NOT EXISTS web_job_projection_update
-      AFTER UPDATE ON jobs WHEN new.source='web' AND old.updated_at <> new.updated_at BEGIN
-        INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
-        VALUES(new.job_id,'updated',new.updated_at);
       END;
     CREATE TRIGGER IF NOT EXISTS web_job_projection_delete
       AFTER DELETE ON jobs WHEN old.source='web' BEGIN
@@ -224,6 +239,45 @@ function ensureWebJobProjectionSchema(db: Database.Database): void {
         VALUES(old.job_id,'deleted',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       END;
   `);
+  const upgrade = () => {
+    const current = db.prepare("SELECT version FROM web_job_projection_schema WHERE singleton=1")
+      .get() as { version: number } | undefined;
+    if ((current?.version ?? 0) < 2) {
+      const cursorColumns = db.pragma("table_info(web_job_projection_cursors)") as Array<{ name: string }>;
+      if (!cursorColumns.some(column => column.name === "authorization_kind")) db.exec(`
+        DROP TABLE web_job_projection_cursors;
+        CREATE TABLE web_job_projection_cursors (
+          cursor_digest      TEXT PRIMARY KEY CHECK (length(cursor_digest)=64),
+          cursor_kind        TEXT NOT NULL CHECK (cursor_kind IN ('list','events')),
+          instance_id        TEXT NOT NULL,
+          tenant_id          TEXT NOT NULL,
+          principal_id       TEXT NOT NULL,
+          authorization_kind TEXT NOT NULL CHECK (authorization_kind IN ('own','granted','own_or_granted')),
+          resource_id        TEXT,
+          snapshot_sequence  INTEGER NOT NULL,
+          after_created_at   TEXT,
+          after_job_id       TEXT,
+          expires_at         TEXT NOT NULL,
+          created_at         TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX web_job_projection_cursors_expiry_idx ON web_job_projection_cursors(expires_at);
+      `);
+      db.prepare(`INSERT INTO web_job_projection_schema(singleton,version) VALUES(1,2)
+        ON CONFLICT(singleton) DO UPDATE SET version=excluded.version`).run();
+    }
+    db.exec(`
+      DROP TRIGGER IF EXISTS web_job_projection_update;
+      CREATE TRIGGER web_job_projection_update
+        AFTER UPDATE ON jobs WHEN new.source='web' AND (
+          old.status IS NOT new.status OR old.updated_at IS NOT new.updated_at
+          OR old.completed_at IS NOT new.completed_at
+        ) BEGIN
+          INSERT INTO web_job_projection_events(job_id,event_kind,created_at)
+          VALUES(new.job_id,'updated',new.updated_at);
+        END;
+    `);
+  };
+  if (db.inTransaction) upgrade(); else db.transaction(upgrade).immediate();
   const initialize = () => {
     const claimed = db.prepare(`INSERT OR IGNORE INTO web_job_projection_state(singleton,initialized_at)
       VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`).run().changes;
@@ -481,6 +535,7 @@ export interface WebJobReadIdentity {
   instance_id: string;
   tenant_id: string;
   principal_id: string;
+  authorization_kind: "own" | "granted" | "own_or_granted";
 }
 export interface WebJobPage {
   rows: JobRow[];
@@ -502,6 +557,7 @@ interface WebProjectionCursorRow {
   instance_id: string;
   tenant_id: string;
   principal_id: string;
+  authorization_kind: "own" | "granted" | "own_or_granted";
   resource_id: string | null;
   snapshot_sequence: number;
   after_created_at: string | null;
@@ -946,13 +1002,13 @@ export class DispatcherDatabase {
       }
       const rows = this.db.prepare(`
         SELECT jobs.* FROM jobs JOIN events source_event ON source_event.event_id=jobs.source_event_id
-        WHERE ${this.webJobOwnerSql()}
+        WHERE ${this.webJobAccessSql()}
           AND EXISTS (SELECT 1 FROM web_job_projection_events first_event
             WHERE first_event.job_id=jobs.job_id AND first_event.sequence<=?)
           AND (? IS NULL OR jobs.created_at < ? OR (jobs.created_at = ? AND jobs.job_id < ?))
         ORDER BY jobs.created_at DESC,jobs.job_id DESC LIMIT ?
-      `).all(identity.tenant_id, identity.principal_id, identity.instance_id, identity.tenant_id,
-        identity.principal_id, snapshot, afterCreated, afterCreated, afterCreated, afterJob, limit + 1) as JobRow[];
+      `).all(...this.webJobAccessParameters(identity, now), snapshot,
+        afterCreated, afterCreated, afterCreated, afterJob, limit + 1) as JobRow[];
       const visible = rows.slice(0, limit), more = rows.length > limit;
       const next = more && visible.length > 0 ? this.issueWebProjectionCursor("list", identity, null, snapshot,
         visible.at(-1)!.created_at, visible.at(-1)!.job_id, at, 15 * 60_000) : null;
@@ -960,12 +1016,13 @@ export class DispatcherDatabase {
     })();
   }
 
-  getWebJobForRead(jobId: string, identity: WebJobReadIdentity): JobRow | undefined {
+  getWebJobForRead(jobId: string, identity: WebJobReadIdentity, at = new Date()): JobRow | undefined {
+    this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) throw new Error("web_job_read_invalid");
     return this.db.prepare(`SELECT jobs.* FROM jobs JOIN events source_event ON source_event.event_id=jobs.source_event_id
-      WHERE jobs.job_id=? AND ${this.webJobOwnerSql()}`)
-      .get(jobId, identity.tenant_id, identity.principal_id, identity.instance_id, identity.tenant_id, identity.principal_id) as JobRow | undefined;
+      WHERE jobs.job_id=? AND ${this.webJobAccessSql()}`)
+      .get(jobId, ...this.webJobAccessParameters(identity, at.toISOString())) as JobRow | undefined;
   }
 
   webJobEventCursor(identity: WebJobReadIdentity, jobId: string, at = new Date()): string {
@@ -978,7 +1035,7 @@ export class DispatcherDatabase {
     this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
     return this.db.transaction(() => {
-      const row = this.getWebJobForRead(jobId, identity);
+      const row = this.getWebJobForRead(jobId, identity, at);
       if (!row) return undefined;
       const event_cursor = this.issueWebProjectionCursor("events", identity, jobId, this.webProjectionHead(), null, null, at, 60 * 60_000);
       return { row, event_cursor };
@@ -988,7 +1045,7 @@ export class DispatcherDatabase {
   listWebJobChanges(identity: WebJobReadIdentity, jobId: string, cursor: string, limit = 50, at = new Date()): WebJobChangePage {
     this.ensureWebJobProjectionReady();
     this.assertWebReadIdentity(identity);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !this.getWebJobForRead(jobId, identity)) throw new Error("web_job_read_invalid");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !this.getWebJobForRead(jobId, identity, at)) throw new Error("web_job_read_invalid");
     return this.db.transaction(() => {
       const saved = this.webProjectionCursor(cursor, "events", identity, jobId, at.toISOString());
       const retention = this.db.prepare("SELECT pruned_through_sequence FROM web_job_projection_retention WHERE singleton=1")
@@ -1865,17 +1922,27 @@ export class DispatcherDatabase {
     this.webJobProjectionReady = true;
   }
 
-  private webJobOwnerSql(): string {
-    return `jobs.source='web' AND source_event.source='web' AND jobs.workspace_id=? AND jobs.actor_id=?
+  private webJobAccessSql(): string {
+    return `jobs.source='web' AND source_event.source='web' AND jobs.workspace_id=?
       AND json_valid(source_event.subject_json)
       AND json_extract(source_event.subject_json,'$.instance_id')=?
       AND json_extract(source_event.subject_json,'$.tenant_id')=?
-      AND json_extract(source_event.subject_json,'$.principal_id')=?`;
+      AND ((? IN ('own','own_or_granted') AND jobs.actor_id=? AND json_extract(source_event.subject_json,'$.principal_id')=?)
+        OR (? IN ('granted','own_or_granted') AND EXISTS (SELECT 1 FROM web_job_read_grants grant_row
+          WHERE grant_row.job_id=jobs.job_id AND grant_row.instance_id=? AND grant_row.tenant_id=?
+            AND grant_row.principal_id=? AND grant_row.state='active' AND grant_row.expires_at>?)))`;
+  }
+
+  private webJobAccessParameters(identity: WebJobReadIdentity, now: string): unknown[] {
+    return [identity.tenant_id, identity.instance_id, identity.tenant_id,
+      identity.authorization_kind, identity.principal_id, identity.principal_id,
+      identity.authorization_kind, identity.instance_id, identity.tenant_id, identity.principal_id, now];
   }
 
   private assertWebReadIdentity(identity: WebJobReadIdentity): void {
     for (const value of [identity.instance_id, identity.tenant_id, identity.principal_id])
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("web_job_read_invalid");
+    if (!['own','granted','own_or_granted'].includes(identity.authorization_kind)) throw new Error("web_job_read_invalid");
   }
 
   private webProjectionHead(): number {
@@ -1886,9 +1953,13 @@ export class DispatcherDatabase {
   private issueWebProjectionCursor(kind: "list"|"events", identity: WebJobReadIdentity, resourceId: string | null,
     snapshot: number, afterCreated: string | null, afterJob: string | null, at: Date, ttlMs: number): string {
     const token = randomBytes(32).toString("base64url"), digest = createHash("sha256").update(token).digest("hex");
+    this.db.prepare(`DELETE FROM web_job_projection_cursors WHERE cursor_digest IN (
+      SELECT cursor_digest FROM web_job_projection_cursors WHERE expires_at<=?
+      ORDER BY expires_at,cursor_digest LIMIT 128
+    )`).run(at.toISOString());
     this.db.prepare(`INSERT INTO web_job_projection_cursors
-      (cursor_digest,cursor_kind,instance_id,tenant_id,principal_id,resource_id,snapshot_sequence,after_created_at,after_job_id,expires_at,created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(digest, kind, identity.instance_id, identity.tenant_id, identity.principal_id,
+      (cursor_digest,cursor_kind,instance_id,tenant_id,principal_id,authorization_kind,resource_id,snapshot_sequence,after_created_at,after_job_id,expires_at,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(digest, kind, identity.instance_id, identity.tenant_id, identity.principal_id, identity.authorization_kind,
         resourceId, snapshot, afterCreated, afterJob, new Date(at.getTime() + ttlMs).toISOString(), at.toISOString());
     return token;
   }
@@ -1901,7 +1972,8 @@ export class DispatcherDatabase {
     const row = this.db.prepare("SELECT * FROM web_job_projection_cursors WHERE cursor_digest=?")
       .get(digest) as WebProjectionCursorRow | undefined;
     if (!row || row.cursor_kind !== kind || row.instance_id !== identity.instance_id || row.tenant_id !== identity.tenant_id
-      || row.principal_id !== identity.principal_id || row.resource_id !== resourceId || row.expires_at <= now)
+      || row.principal_id !== identity.principal_id || row.authorization_kind !== identity.authorization_kind
+      || row.resource_id !== resourceId || row.expires_at <= now)
       throw new Error("web_job_cursor_invalid");
     return row;
   }
@@ -1984,7 +2056,10 @@ export class DispatcherDatabase {
     to: JobStatus,
     values: Record<string, string | null>,
   ): void {
-    const timestamp = nowUtc();
+    const current = this.getJobRequired(jobId);
+    const wallClock = Date.parse(nowUtc());
+    const previous = Date.parse(current.updated_at);
+    const timestamp = new Date(Math.max(wallClock, previous + 1)).toISOString();
     const assignments = [...Object.keys(values).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
     const params = [...Object.values(values), to, timestamp, jobId, ...from];
     const placeholders = from.map(() => "?").join(", ");
