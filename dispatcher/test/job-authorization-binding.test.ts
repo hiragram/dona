@@ -104,6 +104,42 @@ test("verified exact taskと異なるrepositoryのjobをinsert前に拒否する
   database.close();
 });
 
+test("exact taskをbindしたprincipalが失効したjobをinsert前に拒否する", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const envelope = eventEnvelope("Ev-job-principal-revoked");
+  const source = database.enqueue(envelope, new Date("2026-09-21T00:01:00.000Z"), proof(envelope.external_event_id)).row;
+  database.jobAuthorization.bindEventTask(source.event_id, 0,
+    { provider_verified: true, evidence: evidence(source.event_id) }, verifier, audit,
+    { ...auditContext, transaction_id: "bind_before_principal_revocation" }, new Date("2026-09-21T00:01:30.000Z"));
+  database.close();
+  const raw = new Database(config.databasePath);
+  raw.prepare("UPDATE verified_principal_bindings SET revoked_at=? WHERE event_id=?")
+    .run("2026-09-21T00:01:31.000Z", source.event_id);
+  raw.close();
+  const reopened = new DispatcherDatabase(config.databasePath);
+  assert.throws(() => reopened.createJob({ source_event_id: source.event_id, job_key: "revoked-principal", objective: "確認する",
+    workspace: { kind: "github", repository: "hiragram/dona", base_ref: "main" } },
+  config.jobsWorkspaceRoot, config.jobResultsDir, new Date("2026-09-21T00:02:00.000Z")),
+  (error: unknown) => error instanceof Error && "code" in error && error.code === "job_task_principal_not_current");
+  assert.equal(reopened.listJobs().length, 0);
+  reopened.close();
+});
+
+test("task evidenceの有効期間を15分以内に制限する", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const envelope = eventEnvelope("Ev-task-long-expiry");
+  const source = database.enqueue(envelope, new Date("2026-09-21T00:01:00.000Z"), proof(envelope.external_event_id)).row;
+  const tooLong = { ...evidence(source.event_id), expires_at: "2026-09-21T00:16:00.001Z" };
+  assert.throws(() => database.jobAuthorization.bindEventTask(source.event_id, 0,
+    { provider_verified: true, evidence: tooLong }, verifier, audit,
+    { ...auditContext, transaction_id: "bind_long_expiry" }, new Date("2026-09-21T00:01:30.000Z")),
+  TaskBindingConflictError);
+  assert.equal(database.jobAuthorization.readEventTask(source.event_id), undefined);
+  database.close();
+});
+
 test("共有auditのDB外CASとtask bindingを同じtransactionで確定する", async () => {
   const { root, config } = await tempConfig(); roots.push(root);
   let dispatcher = new DispatcherDatabase(config.databasePath);
@@ -172,13 +208,15 @@ test("evidence重複とprincipal失効を外部anchor reserve前に拒否する"
   const sharedEvidence = evidence(first.event_id, "7");
   bindings.bindEventTask(first.event_id, 0, { provider_verified: true, evidence: sharedEvidence }, verifier, realAudit,
     { ...auditContext, transaction_id: "task_precondition_first" }, new Date("2026-09-21T00:01:30.000Z"));
+  bindings.bindEventTask(first.event_id, 1, { provider_verified: true, evidence: evidence(first.event_id, "9", 4) }, verifier, realAudit,
+    { ...auditContext, transaction_id: "task_precondition_replace" }, new Date("2026-09-21T00:01:30.500Z"));
   const duplicateEvidence = { ...sharedEvidence, source_event_id: second.event_id,
     authorization_principal_event_id: second.event_id };
   assert.throws(() => bindings.bindEventTask(second.event_id, 0,
     { provider_verified: true, evidence: duplicateEvidence }, verifier, realAudit,
     { ...auditContext, transaction_id: "task_precondition_duplicate" }, new Date("2026-09-21T00:01:31.000Z")),
   TaskBindingConflictError);
-  assert.equal(store.reservations, 1);
+  assert.equal(store.reservations, 2);
 
   const revocationPeer = new Database(config.databasePath); revocationPeer.pragma("foreign_keys = ON");
   const revokingAudit = {
@@ -193,8 +231,8 @@ test("evidence重複とprincipal失効を外部anchor reserve前に拒否する"
     { provider_verified: true, evidence: evidence(second.event_id, "8") }, verifier, revokingAudit,
     { ...auditContext, transaction_id: "task_precondition_revoked" }, new Date("2026-09-21T00:01:32.000Z")),
   TaskBindingConflictError);
-  assert.equal(store.reservations, 1);
-  assert.equal(realAudit.verify().sequence, 1);
+  assert.equal(store.reservations, 2);
+  assert.equal(realAudit.verify().sequence, 2);
   assert.equal(bindings.readEventTask(second.event_id), undefined);
   revocationPeer.close(); db.close();
 });

@@ -71,7 +71,8 @@ const jobsRunnableFairIndexSql = `
 
 export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
 export class JobCreationError extends Error {
-  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded" | "job_task_repository_mismatch", message: string,
+  constructor(readonly code: "job_idempotency_conflict" | "job_group_closed" | "job_group_limit_exceeded" |
+    "job_task_repository_mismatch" | "job_task_principal_not_current", message: string,
     readonly limitDetails?: { resource: "jobs_per_event" | "objective_utf8_bytes_per_event"; current: number; attempted: number; maximum: number }) {
     super(message); this.name = "JobCreationError";
   }
@@ -707,9 +708,14 @@ export class DispatcherDatabase {
       }
 
       const exactTask = this.jobAuthorization.readEventTask(sourceEvent.event_id);
-      if (exactTask?.status === "active" && (parsedRequest.workspace.kind !== "github" ||
-        parsedRequest.workspace.repository !== exactTask.repository_full_name)) {
-        throw new JobCreationError("job_task_repository_mismatch", "Job workspace does not match the verified exact-task repository");
+      if (exactTask?.status === "active") {
+        const principal = readVerifiedPrincipalBinding(this.db, sourceEvent.event_id);
+        if (!principal || principal.revoked_at !== null) {
+          throw new JobCreationError("job_task_principal_not_current", "Verified exact-task principal is not current");
+        }
+        if (parsedRequest.workspace.kind !== "github" || parsedRequest.workspace.repository !== exactTask.repository_full_name) {
+          throw new JobCreationError("job_task_repository_mismatch", "Job workspace does not match the verified exact-task repository");
+        }
       }
 
       if (this.schemaWrite === 2 && parsedRequest.job_key !== undefined) throw new Error("multi_job_feature_disabled_for_schema_v2_bridge");

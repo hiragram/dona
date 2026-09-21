@@ -133,6 +133,11 @@ export function migrateJobAuthorizationBindings(db: Database.Database): void {
       CHECK((resource_kind='github_issue')=(task_node_id IS NOT NULL)),
       CHECK(resource_kind!='github_issue' OR (repository_node_id IS NOT NULL AND task_number>0 AND resource_revision>0 AND task_binding_revision>0))
     );
+    CREATE TABLE IF NOT EXISTS task_binding_evidence_uses (
+      authorization_evidence_sha256 TEXT PRIMARY KEY CHECK(length(authorization_evidence_sha256)=64),
+      event_id TEXT NOT NULL,
+      used_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS event_task_resource_idx
       ON event_task_bindings(repository_node_id,task_node_id,resource_revision);
     CREATE UNIQUE INDEX IF NOT EXISTS event_task_evidence_idx
@@ -141,6 +146,10 @@ export function migrateJobAuthorizationBindings(db: Database.Database): void {
       ON job_authorization_bindings(tenant_id,workspace_id,principal_kind,principal_id,job_id);
     CREATE TRIGGER IF NOT EXISTS job_authorization_binding_immutable BEFORE UPDATE ON job_authorization_bindings
       BEGIN SELECT RAISE(ABORT,'job_authorization_binding_immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS task_binding_evidence_use_immutable BEFORE UPDATE ON task_binding_evidence_uses
+      BEGIN SELECT RAISE(ABORT,'task_binding_evidence_use_immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS task_binding_evidence_use_no_delete BEFORE DELETE ON task_binding_evidence_uses
+      BEGIN SELECT RAISE(ABORT,'task_binding_evidence_use_immutable'); END;
     CREATE TRIGGER IF NOT EXISTS job_authorization_source_match BEFORE INSERT ON job_authorization_bindings
       WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE job_id=NEW.job_id AND source_event_id=NEW.source_event_id)
       BEGIN SELECT RAISE(ABORT,'job_authorization_source_mismatch'); END;
@@ -158,6 +167,8 @@ export function migrateJobAuthorizationBindings(db: Database.Database): void {
           AND t.binding_revision=NEW.task_binding_revision)
       BEGIN SELECT RAISE(ABORT,'job_authorization_task_mismatch'); END;
     INSERT OR IGNORE INTO job_authorization_binding_schema(singleton,version) VALUES(1,1);
+    INSERT OR IGNORE INTO task_binding_evidence_uses(authorization_evidence_sha256,event_id,used_at)
+      SELECT authorization_evidence_sha256,event_id,created_at FROM event_task_bindings;
   `);
   const marker = db.prepare("SELECT version FROM job_authorization_binding_schema WHERE singleton=1").get() as {version:number}|undefined;
   if (marker?.version !== 1) throw new Error("Unsupported job authorization binding schema");
@@ -195,8 +206,12 @@ export class JobAuthorizationBindingRepository {
     if (!Number.isSafeInteger(expectedBindingRevision) || expectedBindingRevision < 0) throw new TaskBindingConflictError();
     const evidence = parsedEvidence(verifier.verify(rawEvidence));
     const now = at.toISOString();
+    const verifiedAt = Date.parse(evidence.verified_at);
+    const expiresAt = Date.parse(evidence.expires_at);
     if (evidence.source_event_id !== eventId || evidence.authorization_principal_event_id !== eventId ||
-      Date.parse(evidence.verified_at) > at.getTime() || Date.parse(evidence.expires_at) <= at.getTime()) throw new TaskBindingConflictError();
+      verifiedAt > at.getTime() || expiresAt <= at.getTime() || expiresAt - verifiedAt > 15 * 60 * 1_000) {
+      throw new TaskBindingConflictError();
+    }
     const principal = readVerifiedPrincipalBinding(this.db, eventId);
     if (!principal || principal.revoked_at !== null || principal.tenant_id !== evidence.tenant_id ||
       principal.workspace_id !== evidence.workspace_id || principal.principal_kind !== evidence.principal_kind ||
@@ -231,9 +246,9 @@ export class JobAuthorizationBindingRepository {
         currentPrincipal.tenant_id !== evidence.tenant_id || currentPrincipal.workspace_id !== evidence.workspace_id ||
         currentPrincipal.principal_kind !== evidence.principal_kind || currentPrincipal.principal_id !== evidence.principal_id ||
         currentPrincipal.proof_sha256 !== principal.proof_sha256 || currentPrincipal.event_attempt !== principal.event_attempt) return false;
-      const evidenceOwner = this.db.prepare("SELECT event_id FROM event_task_bindings WHERE authorization_evidence_sha256=?")
+      const evidenceOwner = this.db.prepare("SELECT event_id FROM task_binding_evidence_uses WHERE authorization_evidence_sha256=?")
         .get(evidence.evidence_sha256) as { event_id: string } | undefined;
-      if (evidenceOwner && evidenceOwner.event_id !== eventId) return false;
+      if (evidenceOwner) return false;
       const current = this.readEventTask(eventId);
       return current === undefined
         ? expectedBindingRevision === 0
@@ -245,6 +260,8 @@ export class JobAuthorizationBindingRepository {
       expectedCurrent, () => {
       const current = this.readEventTask(eventId);
       if (!current) {
+        this.db.prepare("INSERT INTO task_binding_evidence_uses VALUES(?,?,?)")
+          .run(evidence.evidence_sha256,eventId,now);
         this.db.prepare(`INSERT INTO event_task_bindings(
           event_id,provider,repository_full_name,repository_node_id,task_node_id,task_number,resource_revision,
           authorization_principal_event_id,authorization_evidence_sha256,binding_revision,status,created_at,updated_at,revoked_at)
@@ -253,6 +270,8 @@ export class JobAuthorizationBindingRepository {
           evidence.task.resource_revision,eventId,evidence.evidence_sha256,now,now);
         return this.readEventTask(eventId)!;
       }
+      this.db.prepare("INSERT INTO task_binding_evidence_uses VALUES(?,?,?)")
+        .run(evidence.evidence_sha256,eventId,now);
       const changed = this.db.prepare(`UPDATE event_task_bindings SET repository_full_name=?,task_number=?,resource_revision=?,authorization_evidence_sha256=?,
         binding_revision=binding_revision+1,updated_at=? WHERE event_id=? AND binding_revision=? AND status='active'`).run(
         evidence.task.repository_full_name,evidence.task.task_number,evidence.task.resource_revision,evidence.evidence_sha256,
@@ -285,6 +304,7 @@ export class JobAuthorizationBindingRepository {
     const routing = readEventJobBinding(this.db, sourceEventId);
     const task = this.readEventTask(sourceEventId);
     const human = principal?.revoked_at === null ? principal : undefined;
+    if (task?.status === "active" && !human) throw new TaskBindingConflictError();
     const ownerKind = human ? "human_verified" : routing?.owner.kind === "schedule" ? "schedule" : "unknown";
     const resourceKind = task?.status === "active" ? "github_issue" : routing?.owner.kind === "schedule" ? "schedule_run" : "unknown";
     const disclosure = stableStringify({ kind: "event_destination", source_event_id: sourceEventId,
