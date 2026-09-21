@@ -90,6 +90,7 @@ export interface LiveSessionObservationInput {
   startedAt: string;
   completedAt: string;
   expectedIdentity?: string;
+  previousStateChangeSeq?: number;
   result?: HerdrCommandResult;
 }
 
@@ -194,6 +195,10 @@ function reconcile(input: LiveSessionObservationInput, query: ReturnType<typeof 
   if (!query.identityMatch) {
     reasons.push("identity_mismatch");
     return { state: "identity_conflict", confidence: "fail_closed", reasonCodes: reasons, safeNextAction: "do_not_retry" };
+  }
+  if (input.previousStateChangeSeq !== undefined && query.sequence !== null && query.sequence < input.previousStateChangeSeq) {
+    reasons.push("same_identity", "state_sequence_regressed");
+    return { state: "unknown", confidence: "fail_closed", reasonCodes: reasons, safeNextAction: "do_not_retry" };
   }
   reasons.push("same_identity", `live_${query.sessionState ?? "unknown"}`);
   const terminalDurable = ["completed", "failed", "cancelled"].includes(input.after.status);

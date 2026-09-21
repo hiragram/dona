@@ -137,4 +137,15 @@ describe("read-only live session reconciliation",()=>{
     const receipts=await Promise.all(Array.from({length:8},()=>supervisor.observeLiveSession(state.job.job_id,state.source.event_id)));
     assert.equal(new Set(receipts.map(row=>row.receipt_id)).size,8);assert.equal(calls.length,8);state.database.close();
   });
+
+  test("同一identityのstate sequence退行はfail closedにする",async()=>{
+    const state=await addressableJob();const calls:string[]=[];let sequence=12;
+    const supervisor=new JobSupervisor(state.database,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:sequence}),calls),state.config,logger,()=>{});
+    assert.equal((await supervisor.observeLiveSession(state.job.job_id,state.source.event_id)).reconciliation.confidence,"bounded_observation");
+    sequence=11;const regressed=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(regressed.reconciliation.state,"unknown");assert.equal(regressed.reconciliation.confidence,"fail_closed");
+    assert.equal(regressed.reconciliation.safe_next_action,"do_not_retry");
+    assert.ok(regressed.reconciliation.reason_codes.includes("state_sequence_regressed"));state.database.close();
+  });
 });

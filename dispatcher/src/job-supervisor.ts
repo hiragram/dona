@@ -132,7 +132,8 @@ export class JobSupervisor {
     const before=this.database.getJob(jobId);
     if(!before)throw new Error(`Job ${jobId} was not found`);
     const startedAt=new Date().toISOString();
-    const expectedIdentity=expectedLiveSessionIdentity(before,this.database.getJobLiveSessionIdentity(jobId));
+    const storedIdentity=this.database.getJobLiveSessionIdentity(jobId);
+    const expectedIdentity=expectedLiveSessionIdentity(before,storedIdentity);
     let result:HerdrCommandResult|undefined;
     if(expectedIdentity){
       try { result=await this.runtime.get(before.agent_name,this.abortController.signal,this.config.jobCommandTimeoutMs); }
@@ -141,8 +142,12 @@ export class JobSupervisor {
     const after=this.database.getJob(jobId);
     if(!after)throw new Error(`Job ${jobId} disappeared during live observation`);
     const completedAt=new Date().toISOString();
+    const previousStateChangeSeq=storedIdentity
+      ? this.database.latestLiveSessionStateChangeSeq(jobId,storedIdentity.recorded_at)
+      : undefined;
     const receipt=buildLiveSessionReceipt({before,after,bootId:this.liveSessionBootId,startedAt,completedAt,
-      ...(sourceEventId?{sourceEventId}:{}),...(expectedIdentity?{expectedIdentity}:{}),...(result?{result}:{})});
+      ...(sourceEventId?{sourceEventId}:{}),...(expectedIdentity?{expectedIdentity}:{}),
+      ...(previousStateChangeSeq===undefined?{}:{previousStateChangeSeq}),...(result?{result}:{})});
     this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt);
     return receipt;
   }

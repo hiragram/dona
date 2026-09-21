@@ -28,7 +28,7 @@ HTTP/MCPはcurrent `source_event_id`と永続owner/threadを照合します。�
 | durable terminal、exact identityで`working` / `blocked` | `durable_live_conflict` | 自動復活させず隔離確認する |
 | identity不一致 | `identity_conflict` | live statusを信用せずraw identityを開示しない |
 | agent不在 | `session_absent` | 未実行・停止済みと断定しない |
-| timeout、transport、malformed、shutdown | `unknown` | 観測不能。control writeを誘発しない |
+| timeout、transport、malformed、shutdown、同一identityのsequence退行 | `unknown` | 観測不能または矛盾。control writeを誘発しない |
 | 旧jobなど保存済みsession identityなし | `not_addressable` | agent列挙・名前類似検索・最新pane選択をしない |
 
 snapshotの`freshness_ms`はquery開始から完了までの時間で、継続的なliveness保証ではありません。durable stateやResultがquery中に変わった場合はreceiptのbefore/afterとreason codeで区別します。新しいqueryは新しいreceiptであり、古いreceiptをcurrent truthへ昇格しません。

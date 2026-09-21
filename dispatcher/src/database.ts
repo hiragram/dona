@@ -973,6 +973,13 @@ export class DispatcherDatabase {
     return row ? projectLiveSessionReceipt(row) : undefined;
   }
 
+  latestLiveSessionStateChangeSeq(jobId: string, identityRecordedAt: string): number | undefined {
+    const row=this.db.prepare(`SELECT state_change_seq FROM live_session_query_receipts
+      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL
+      ORDER BY sequence DESC LIMIT 1`).get(jobId,identityRecordedAt) as {state_change_seq:number}|undefined;
+    return row?.state_change_seq;
+  }
+
   liveSessionRetentionPlan(cutoff: string): { receipt_rows: number } {
     const receipt_rows=(this.db.prepare("SELECT count(*) AS count FROM live_session_query_receipts WHERE created_at<=?")
       .get(cutoff) as {count:number}).count;
