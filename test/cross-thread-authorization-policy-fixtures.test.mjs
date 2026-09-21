@@ -42,21 +42,52 @@ test('principal proofとoperation catalogは重複のない固定集合である
 });
 
 const decide = entry => {
-  const { request, binding, grant, principal } = entry;
-  if (entry.transport !== 'authenticated') return ['deny', 'unverified_ingress'];
+  const { request, binding, grant, principal, transport_context: transport, access_proof: access } = entry;
+  if (!transport.authenticated) return ['deny', 'unverified_ingress'];
   if (!binding || !grant || principal.kind === 'unknown') return ['deny', 'legacy_unknown'];
   if (principal.kind !== 'human') return ['deny', 'principal_kind_denied'];
-  if (binding.event_id !== request.event_id || binding.attempt !== request.attempt) return ['deny', 'event_attempt_mismatch'];
+  if (transport.event_id !== request.event_id || transport.attempt !== request.attempt
+    || binding.event_id !== request.event_id || binding.attempt !== request.attempt) return ['deny', 'event_attempt_mismatch'];
+  if (binding.principal_kind !== principal.kind) return ['deny', 'principal_kind_denied'];
   if (principal.id !== binding.principal_id || principal.id !== grant.principal_id) return ['deny', 'principal_mismatch'];
-  if (entry.access === 'unavailable') return ['deny', 'access_unavailable'];
-  if (entry.access !== 'current') return ['deny', 'membership_revoked'];
-  for (const key of ['tenant_id', 'workspace_id']) if (request[key] !== grant[key]) return ['deny', 'resource_mismatch'];
+  for (const key of ['tenant_id', 'workspace_id']) {
+    if (request[key] !== binding[key] || request[key] !== grant[key]) return ['deny', 'binding_scope_mismatch'];
+  }
+  if (access.status === 'unavailable') return ['deny', 'access_unavailable'];
+  if (access.status !== 'current') return ['deny', 'membership_revoked'];
+  if (access.event_id !== request.event_id || access.principal_id !== principal.id
+    || access.workspace_id !== request.workspace_id || access.destination_id !== request.destination_id
+    || access.consumed || Date.parse(request.now) >= Date.parse(access.expires_at)
+    || Date.parse(access.expires_at) - Date.parse(access.issued_at) > fixture.access_proof.max_age_seconds * 1000) {
+    return ['deny', 'access_unavailable'];
+  }
   for (const key of ['resource_kind', 'resource_id', 'resource_revision']) if (request[key] !== grant[key]) return ['deny', 'resource_mismatch'];
-  if (request.operation !== grant.operation) return ['deny', 'operation_denied'];
+  if (!fixture.grant.operations.includes(request.operation) || !fixture.grant.operations.includes(grant.operation)
+    || request.operation !== grant.operation) return ['deny', 'operation_denied'];
   if (request.policy_revision !== grant.policy_revision) return ['deny', 'policy_revision_mismatch'];
+  if (grant.status !== 'active' || grant.revoked_at) return ['deny', 'grant_revoked'];
+  if (grant.current_revision !== request.resource_revision) return ['deny', 'resource_mismatch'];
+  const grantLifetime = Date.parse(grant.expires_at) - Date.parse(grant.issued_at);
+  if (grantLifetime <= 0 || grantLifetime > fixture.grant.max_age_seconds * 1000) return ['deny', 'invalid_grant_lifetime'];
   if (Date.parse(request.now) >= Date.parse(grant.expires_at)) return ['deny', 'grant_expired'];
+  if (fixture.approval.required_operations.includes(request.operation)) {
+    const receipt = entry.approval_receipt;
+    const validIssuer = receipt && fixture.approval.issuer_kinds.includes(receipt.issuer_kind);
+    const validIdentity = receipt && receipt.tenant_id === request.tenant_id
+      && receipt.principal_id === principal.id && receipt.resource_kind === request.resource_kind
+      && receipt.resource_id === request.resource_id && receipt.resource_revision === request.resource_revision
+      && receipt.operation === request.operation && receipt.policy_revision === request.policy_revision;
+    const lifetime = receipt ? Date.parse(receipt.expires_at) - Date.parse(receipt.issued_at) : NaN;
+    if (!receipt || !validIssuer || !validIdentity || receipt.consumed
+      || lifetime <= 0 || lifetime > fixture.approval.max_age_seconds * 1000
+      || Date.parse(request.now) >= Date.parse(receipt.expires_at)) return ['deny', 'approval_unavailable'];
+  }
   return ['allow', 'authorized'];
 };
+
+const projectDeny = entry => entry.decision === 'allow' ? null : ({
+  code: entry.reason === 'access_unavailable' ? 'access_unavailable' : 'not_available',
+});
 
 test('threat/failure fixtureは具体的な入力からallow/denyを導出する', () => {
   const byId = Object.fromEntries(fixture.cases.map(entry => [entry.id, entry]));
@@ -64,14 +95,23 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
   for (const id of ['stale_event_substitution', 'forged_completion', 'unauthenticated_enqueue',
     'different_actor', 'bot_principal', 'service_principal', 'membership_revoked',
     'provider_unavailable', 'grant_before_expiry', 'grant_at_expiry', 'exact_task_mismatch',
-    'operation_denied', 'policy_revision_mismatch', 'legacy_unknown']) {
+    'operation_denied', 'policy_revision_mismatch', 'legacy_unknown', 'stale_transport_capability',
+    'binding_tenant_mismatch', 'binding_workspace_mismatch', 'binding_kind_mismatch',
+    'grant_too_long', 'grant_revoked', 'unknown_operation', 'access_destination_mismatch',
+    'access_principal_mismatch', 'access_event_mismatch', 'access_expired', 'access_consumed',
+    'steer_with_approval', 'steer_missing_approval', 'cancel_approval_at_expiry',
+    'steer_approval_issuer_mismatch', 'steer_approval_resource_mismatch',
+    'steer_approval_revision_mismatch']) {
     assert.ok(byId[id], id);
   }
   for (const entry of fixture.cases) {
     assert.ok(entry.request?.now, entry.id);
     assert.deepEqual(decide(entry), [entry.decision, entry.reason], entry.id);
+    assert.deepEqual(projectDeny(entry), entry.expected_external, entry.id);
+    if (entry.expected_external) assert.deepEqual(Object.keys(entry.expected_external), ['code'], entry.id);
   }
-  assert.deepEqual(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.id), ['grant_before_expiry']);
+  assert.deepEqual(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.id),
+    ['grant_before_expiry', 'steer_with_approval']);
   assert.equal(byId.grant_at_expiry.reason, 'grant_expired');
   assert.equal(byId.provider_unavailable.reason, 'access_unavailable');
   assert.equal(byId.legacy_unknown.principal.kind, 'unknown');
@@ -84,6 +124,9 @@ test('外部deny projection、approval、全downstream必須artifactを完全照
     max_age_seconds: 300,
     required_operations: ['cancel_exact_job', 'steer_exact_job'],
     issuer_kinds: ['supervisor'],
+  });
+  assert.deepEqual(fixture.access_proof, {
+    expiry_exclusive: true, max_age_seconds: 120, one_time_for_write: true,
   });
   assert.deepEqual(fixture.downstream, {
     162: ['key_rotation', 'replay_fence', 'signed_ingress_proof'],

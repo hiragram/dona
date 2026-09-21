@@ -4,42 +4,2248 @@
   "principal_proof": {
     "expires_after_seconds": 120,
     "one_time": true,
-    "kinds_allowed_owner_wide": ["human"],
-    "required_fields": ["attempt", "event_id", "expires_at", "issued_at", "key_id", "nonce", "principal_id", "principal_kind", "tenant_id", "version", "workspace_id"],
-    "encoding": {"charset": "UTF-8", "key_order": "ascii_recursive", "trailing_lf": false, "whitespace": false, "time": "utc_seconds_rfc3339"},
+    "kinds_allowed_owner_wide": [
+      "human"
+    ],
+    "required_fields": [
+      "attempt",
+      "event_id",
+      "expires_at",
+      "issued_at",
+      "key_id",
+      "nonce",
+      "principal_id",
+      "principal_kind",
+      "tenant_id",
+      "version",
+      "workspace_id"
+    ],
+    "encoding": {
+      "charset": "UTF-8",
+      "key_order": "ascii_recursive",
+      "trailing_lf": false,
+      "whitespace": false,
+      "time": "utc_seconds_rfc3339"
+    },
     "golden": {
       "sample_key": "fixture-only-key-not-a-secret",
       "canonical": "{\"attempt\":1,\"event_id\":\"evt_fixture_owner\",\"expires_at\":\"2026-09-21T00:02:00Z\",\"issued_at\":\"2026-09-21T00:00:00Z\",\"key_id\":\"fixture-key-v1\",\"nonce\":\"nonce-fixture-0001\",\"principal_id\":\"U_OWNER\",\"principal_kind\":\"human\",\"tenant_id\":\"T_FIXTURE\",\"version\":1,\"workspace_id\":\"T_FIXTURE\"}",
       "hmac_sha256_hex": "e14de96e0ad8785c7874b33465f0e0e17bbb58a9c449cd840cd6c8b4a973f223"
     }
   },
-  "grant": {"expiry_exclusive": true, "max_age_seconds": 900, "operations": ["cancel_exact_job", "read_bounded_result", "read_exact_job_status", "read_own_human_waits", "resolve_origin_ref", "steer_exact_job"]},
-  "approval": {"max_age_seconds": 300, "required_operations": ["cancel_exact_job", "steer_exact_job"], "issuer_kinds": ["supervisor"]},
-  "deny_projection": {"codes": ["access_unavailable", "not_available"], "includes_resource_identity": false},
+  "grant": {
+    "expiry_exclusive": true,
+    "max_age_seconds": 900,
+    "operations": [
+      "cancel_exact_job",
+      "read_bounded_result",
+      "read_exact_job_status",
+      "read_own_human_waits",
+      "resolve_origin_ref",
+      "steer_exact_job"
+    ]
+  },
+  "approval": {
+    "max_age_seconds": 300,
+    "required_operations": [
+      "cancel_exact_job",
+      "steer_exact_job"
+    ],
+    "issuer_kinds": [
+      "supervisor"
+    ]
+  },
+  "deny_projection": {
+    "codes": [
+      "access_unavailable",
+      "not_available"
+    ],
+    "includes_resource_identity": false
+  },
   "cases": [
-    {"id":"grant_before_expiry","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:14:59Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"allow","reason":"authorized"},
-    {"id":"stale_event_substitution","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_replaced","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"event_attempt_mismatch"},
-    {"id":"forged_completion","transport":"forged","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"unverified_ingress"},
-    {"id":"unauthenticated_enqueue","transport":"unauthenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"unverified_ingress"},
-    {"id":"different_actor","transport":"authenticated","principal":{"kind":"human","id":"U_OTHER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"principal_mismatch"},
-    {"id":"bot_principal","transport":"authenticated","principal":{"kind":"bot","id":"B_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"bot","principal_id":"B_OWNER"},"grant":{"principal_id":"B_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"principal_kind_denied"},
-    {"id":"service_principal","transport":"authenticated","principal":{"kind":"service","id":"S_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"service","principal_id":"S_OWNER"},"grant":{"principal_id":"S_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"principal_kind_denied"},
-    {"id":"membership_revoked","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"revoked","decision":"deny","reason":"membership_revoked"},
-    {"id":"provider_unavailable","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"unavailable","decision":"deny","reason":"access_unavailable"},
-    {"id":"grant_at_expiry","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:15:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"grant_expired"},
-    {"id":"exact_task_mismatch","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:161","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"resource_mismatch"},
-    {"id":"operation_denied","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_bounded_result","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"operation_denied"},
-    {"id":"policy_revision_mismatch","transport":"authenticated","principal":{"kind":"human","id":"U_OWNER"},"request":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":8,"now":"2026-09-21T00:10:00Z"},"binding":{"event_id":"evt_current","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","principal_kind":"human","principal_id":"U_OWNER"},"grant":{"principal_id":"U_OWNER","tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":3,"operation":"read_own_human_waits","policy_revision":7,"expires_at":"2026-09-21T00:15:00Z"},"access":"current","decision":"deny","reason":"policy_revision_mismatch"},
-    {"id":"legacy_unknown","transport":"authenticated","principal":{"kind":"unknown","id":"legacy"},"request":{"event_id":"evt_legacy","attempt":1,"tenant_id":"T_FIXTURE","workspace_id":"T_FIXTURE","resource_kind":"task","resource_id":"issue:160","resource_revision":1,"operation":"read_own_human_waits","policy_revision":7,"now":"2026-09-21T00:10:00Z"},"binding":null,"grant":null,"access":"current","decision":"deny","reason":"legacy_unknown"}
+    {
+      "id": "grant_before_expiry",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-grant_before_expiry",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": null
+    },
+    {
+      "id": "stale_event_substitution",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_replaced",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "event_attempt_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_replaced",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_replaced",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-stale_event_substitution",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "forged_completion",
+      "transport": "forged",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "unverified_ingress",
+      "transport_context": {
+        "authenticated": false,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-forged_completion",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "unauthenticated_enqueue",
+      "transport": "unauthenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "unverified_ingress",
+      "transport_context": {
+        "authenticated": false,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-unauthenticated_enqueue",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "different_actor",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OTHER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "principal_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OTHER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-different_actor",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "bot_principal",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "bot",
+        "id": "B_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "bot",
+        "principal_id": "B_OWNER"
+      },
+      "grant": {
+        "principal_id": "B_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "principal_kind_denied",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "B_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-bot_principal",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "service_principal",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "service",
+        "id": "S_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "service",
+        "principal_id": "S_OWNER"
+      },
+      "grant": {
+        "principal_id": "S_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "principal_kind_denied",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "S_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-service_principal",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "membership_revoked",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "membership_revoked",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "revoked",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-membership_revoked",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "provider_unavailable",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "unavailable",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-provider_unavailable",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "grant_at_expiry",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:15:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "grant_expired",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:14:00Z",
+        "expires_at": "2026-09-21T00:16:00Z",
+        "nonce": "access-grant_at_expiry",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "exact_task_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:161",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "resource_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-exact_task_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "operation_denied",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_bounded_result",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "operation_denied",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-operation_denied",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "policy_revision_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 8,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "policy_revision_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-policy_revision_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "legacy_unknown",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "unknown",
+        "id": "legacy"
+      },
+      "request": {
+        "event_id": "evt_legacy",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 1,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": null,
+      "grant": null,
+      "decision": "deny",
+      "reason": "legacy_unknown",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_legacy",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_legacy",
+        "principal_id": "legacy",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-legacy_unknown",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "stale_transport_capability",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_old",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_old",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "event_attempt_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_old",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-stale_transport_capability",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "binding_tenant_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_OTHER",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "binding_scope_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-binding_tenant_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "binding_workspace_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_OTHER",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "binding_scope_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-binding_workspace_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "binding_kind_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "bot",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "principal_kind_denied",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-binding_kind_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "grant_too_long",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:01Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "invalid_grant_lifetime",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-grant_too_long",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "grant_revoked",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "revoked",
+        "current_revision": 3,
+        "revoked_at": "2026-09-21T00:05:00Z"
+      },
+      "decision": "deny",
+      "reason": "grant_revoked",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-grant_revoked",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "unknown_operation",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "delete_everything",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "delete_everything",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "operation_denied",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-unknown_operation",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "access_destination_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_OTHER",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-access_destination_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "access_principal_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OTHER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-access_principal_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "access_event_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_other",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-access_event_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "access_expired",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:14:59Z",
+        "nonce": "access-access_expired",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "access_consumed",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-access_consumed",
+        "consumed": true
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      }
+    },
+    {
+      "id": "steer_with_approval",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-steer_with_approval",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false
+      },
+      "expected_external": null
+    },
+    {
+      "id": "steer_missing_approval",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_missing_approval",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "cancel_approval_at_expiry",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:00Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-cancel_approval_at_expiry",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-cancel_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-cancel_exact_job",
+        "consumed": false
+      },
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "steer_approval_issuer_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_issuer_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "agent",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false
+      },
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "steer_approval_resource_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_resource_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:other",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false
+      },
+      "expected_external": {
+        "code": "not_available"
+      }
+    },
+    {
+      "id": "steer_approval_revision_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE"
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_revision_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 2,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false
+      },
+      "expected_external": {
+        "code": "not_available"
+      }
+    }
   ],
   "downstream": {
-    "162": ["key_rotation", "replay_fence", "signed_ingress_proof"],
-    "163": ["attempt_capability", "management_plane_separation"],
-    "164": ["legacy_unknown", "principal_task_binding", "resource_revision_binding"],
-    "165": ["current_access_proof", "provider_fail_closed", "visibility_check"],
-    "166": ["authorize_service", "operation_catalog", "restricted_audit", "safe_projection"],
-    "244": ["human_wait_model"],
-    "245": ["bounded_pagination", "filter_after_auth", "opaque_origin_ref", "read_own_human_waits"],
-    "246": ["ambiguous_post_no_retry", "explicit_owner_intent", "origin_reauthorization", "safe_slack_renderer"]
+    "162": [
+      "key_rotation",
+      "replay_fence",
+      "signed_ingress_proof"
+    ],
+    "163": [
+      "attempt_capability",
+      "management_plane_separation"
+    ],
+    "164": [
+      "legacy_unknown",
+      "principal_task_binding",
+      "resource_revision_binding"
+    ],
+    "165": [
+      "current_access_proof",
+      "provider_fail_closed",
+      "visibility_check"
+    ],
+    "166": [
+      "authorize_service",
+      "operation_catalog",
+      "restricted_audit",
+      "safe_projection"
+    ],
+    "244": [
+      "human_wait_model"
+    ],
+    "245": [
+      "bounded_pagination",
+      "filter_after_auth",
+      "opaque_origin_ref",
+      "read_own_human_waits"
+    ],
+    "246": [
+      "ambiguous_post_no_retry",
+      "explicit_owner_intent",
+      "origin_reauthorization",
+      "safe_slack_renderer"
+    ]
+  },
+  "access_proof": {
+    "expiry_exclusive": true,
+    "max_age_seconds": 120,
+    "one_time_for_write": true
   }
 }
