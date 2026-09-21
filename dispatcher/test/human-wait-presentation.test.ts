@@ -27,6 +27,7 @@ function item(overrides:Partial<HumanWaitProjection>={}):HumanWaitProjection {
 describe("自分待ちSlack表示",()=>{
   test("本人のtop-level明示問い合わせだけを受理する",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 私の待ちを一覧で見せて")),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 今、僕待ちになっているもの")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちの次を表示して","message","im")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im"),{continuation:true}),true);
@@ -44,6 +45,9 @@ describe("自分待ちSlack表示",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event('<@U_BOT> "my waits list" と入力しますか？')),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち受け画面を見せて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち時間を教えて")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ちにはバグがあります。直してください")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ちに関連する仕様を確認したい","message","im")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ちはありますか","message","im")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("田中さんの待ちを一覧で見せて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent({...event("私の待ちを一覧で見せて"),source:"dona_job"}),false);
   });

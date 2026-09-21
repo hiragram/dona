@@ -43,7 +43,7 @@ const binding = {
   created_at: "2026-09-21T00:00:00.000Z",
 } satisfies JobAuthorizationBindingRow;
 
-const destination = { workspace_id: "workspace-a", channel_id: "private-channel", thread_ts: "2.2" };
+const destination = { kind:"slack_thread",workspace_id: "workspace-a", channel_id: "private-channel", thread_ts: "2.2" };
 
 test("共通read policyはauthorityとdisclosureを別判定しtyped portを既定拒否する", () => {
   assert.deepEqual(agentReadGrantOperations, ["read_own_human_waits", "read_exact_job_status", "read_bounded_result", "resolve_origin_ref"]);
@@ -110,7 +110,8 @@ test("service用human-wait providerはcurrent event destinationとowner binding�
     get:(eventId:string)=>eventId===context.event_id?{source:"slack",reply_target_json:JSON.stringify(destination)}:undefined,
     getAgentPrincipalBinding:(eventId:string)=>eventId===context.event_id?{tenant_id:context.tenant_id,
       workspace_id:context.workspace_id,principal_id:context.principal_id,revoked_at:revokedAt}:undefined,
-    humanWaits:{getByOriginRef:(value:string)=>value==="origin_"+"a".repeat(32)?item:undefined,authorizationCurrent:()=>current},
+    humanWaits:{getByOriginRef:(value:string)=>value==="origin_"+"a".repeat(32)?item:undefined,authorizationCurrent:()=>current,
+      disclosureDestination:()=>({kind:"slack_thread",workspace_id:context.workspace_id,channel_id:"private-channel",thread_ts:"1.1"})},
   } as unknown as DispatcherDatabase;
   const policy=createHumanWaitAgentReadAuthorization(database);
   assert.ok(policy.snapshot({context,operation:"read_own_human_waits",surface:"list_human_waits",disclosure_destination:destination}));
@@ -120,6 +121,8 @@ test("service用human-wait providerはcurrent event destinationとowner binding�
     owner_binding_current:true,disclosure_origin:{kind:"human_wait_origin",origin_ref:"origin_"+"a".repeat(32)}};
   assert.equal(policy.authorizeResource({context,operation:"read_own_human_waits",surface:"list_human_waits",resource,
     disclosure_destination:destination}).allowed,true);
+  assert.equal(policy.authorizeResource({context,operation:"read_own_human_waits",surface:"list_human_waits",resource,
+    disclosure_destination:{...destination,channel_id:"public-channel"}}).allowed,false);
   current=false;
   assert.equal(policy.authorizeResource({context,operation:"read_own_human_waits",surface:"list_human_waits",resource,
     disclosure_destination:destination}).allowed,false);

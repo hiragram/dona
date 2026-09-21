@@ -30,9 +30,12 @@ export function hasExplicitOwnHumanWaitIntent(event:EventRow,input:{continuation
   const continuationRequest=/^(?:(?:次|続き)(?:を)?(?:表示|見せて|みせて|お願い|おねがい)?(?:してください|して|ください)?|(?:next|more)(?:\s+(?:page|please))?)[。.!！?？]*$/iu.test(text);
   if(input.continuation)return continuationRequest;
   if(event.event_type==="message"&&subject.channel_type!=="im")return false;
-  const self=/(?:今|現在)?\s*(?:自分|僕|ぼく|私|わたし)(?:が)?(?:対応)?待ち(?=$|[\s、。,.!?！？]|は|を|が|の|に|で|と|一覧|確認|表示)|(?:自分|僕|ぼく|私|わたし)の(?:対応)?待ち(?=$|[\s、。,.!?！？]|は|を|が|の|に|で|と|一覧|確認|表示)|waiting\s+on\s+me\b|my\s+(?:human\s+)?waits?\b/iu.test(text);
-  const request=/(?:一覧|見せ|みせ|教え|おしえ|確認|ある|あります|何|どれ|次|続きを|表示)|(?:list|show|what|any|next|more)/iu.test(text);
-  return self&&request;
+  const japanese=/(?:今|現在)?[\s、,]*(?:(?:自分|僕|ぼく|私|わたし)(?:が)?(?:対応)?待ち|(?:自分|僕|ぼく|私|わたし)の(?:対応)?待ち)(?=$|[\s、。,.!?！？]|は|を|が|の|に|で|と|一覧|確認|表示)/u.exec(text);
+  if(japanese) {
+    const tail=text.slice(japanese.index+japanese[0].length).trim();
+    return /^(?:になっている(?:もの|項目)(?:は)?|(?:を|の|は|が|について)?\s*(?:(?:一覧|リスト)(?:で|を)?\s*(?:表示(?:して)?|見せて|みせて|教えて|おしえて|確認(?:したい|させて))?|(?:次|続き)(?:を)?(?:表示(?:して)?|見せて|みせて|お願い|おねがい)?|(?:何|どれ)(?:が)?(?:ありますか|ある(?:の|か)?|ですか)?|(?:ありますか|ある[?？]|表示して|見せて|みせて|教えて|おしえて|確認させて)))[。.!！?？]*$/u.test(tail);
+  }
+  return /(?:waiting\s+on\s+me|my\s+(?:human\s+)?waits?)\b\s*(?:list|show|what|any|next|more)\b[.!?]*$/iu.test(text);
 }
 
 const category:Record<HumanWaitProjection["category"],string>={

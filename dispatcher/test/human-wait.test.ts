@@ -48,6 +48,9 @@ test("blocked jobをverified ownerの安全なwaitへ正規化しterminal transi
   assert.equal(JSON.stringify(wait).includes("PRIVATE-CANARY"), false);
   assert.match(wait!.item_id, /^wait_[0-9a-f]{32}$/);
   assert.match(wait!.origin_ref, /^origin_[0-9a-f]{32}$/);
+  assert.deepEqual(database.humanWaits.disclosureDestination(wait!),{
+    kind:"slack_thread",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
+  });
   const ownerRevision=database.humanWaits.ownerRevision({tenantId:"T_TEST",workspaceId:"T_TEST",principalId:"U_WAIT"});
   assert.equal(database.humanWaits.authorizationCurrent(wait!),true);
   const revokeDb=new Database(config.databasePath);
@@ -360,6 +363,7 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
     const ownerOpen=harness.database.humanWaits.scanOwnerOpen({tenantId:"T_GATE",workspaceId:"T_GATE",principalId:"U_GATE",limit:10});
     assert.equal(ownerOpen.length,2);
     assert.equal(ownerOpen.every(item=>harness.database.humanWaits.authorizationCurrent(item)),true);
+    assert.equal(ownerOpen.every(item=>harness.database.humanWaits.disclosureDestination(item)!==undefined),true);
     harness.raw.prepare(`INSERT INTO connector_outbox(outbox_id,run_id,kind,idempotency_key,target_json,content,content_hash,
       status,attempt,available_at,created_at,updated_at,content_delete_at,completion_job_status)
       SELECT 'out_work_result_review',run_id,'slack.work_result.post','work-result-review',target_json,content,content_hash,

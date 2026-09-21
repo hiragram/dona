@@ -256,6 +256,16 @@ export function createHumanWaitAgentReadAuthorization(database:DispatcherDatabas
     try {return stableStringify(JSON.parse(event.reply_target_json) as unknown)===stableStringify(input.destination);}
     catch{return false;}
   };
+  const destinationChannel=(value:unknown):{workspace_id:string;channel_id:string}|undefined=>{
+    if(!value||typeof value!=="object"||Array.isArray(value))return undefined;
+    const outer=value as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown;target?:unknown};
+    const raw=outer.kind==="slack"?outer.target:outer;
+    if(!raw||typeof raw!=="object"||Array.isArray(raw))return undefined;
+    const target=raw as {kind?:unknown;workspace_id?:unknown;channel_id?:unknown};
+    if(!["slack_thread","thread","channel","owner_dm"].includes(String(target.kind))||
+      typeof target.workspace_id!=="string"||typeof target.channel_id!=="string")return undefined;
+    return {workspace_id:target.workspace_id,channel_id:target.channel_id};
+  };
   const visibility:AgentReadVisibilityPort={
     authorize:input=>{
       if(!currentDestination({...input,destination:input.disclosure_destination}))return false;
@@ -263,7 +273,10 @@ export function createHumanWaitAgentReadAuthorization(database:DispatcherDatabas
       const origin=input.disclosure_origin as {kind?:unknown;origin_ref?:unknown};
       if(origin.kind!=="human_wait_origin"||typeof origin.origin_ref!=="string")return false;
       const item=database.humanWaits.getByOriginRef(origin.origin_ref);
-      return item!==undefined&&item.resource_id===input.job_id&&database.humanWaits.authorizationCurrent(item);
+      const source=item?destinationChannel(database.humanWaits.disclosureDestination(item)):undefined;
+      const current=destinationChannel(input.disclosure_destination);
+      return item!==undefined&&item.resource_id===input.job_id&&database.humanWaits.authorizationCurrent(item)&&source!==undefined&&current!==undefined&&
+        source.workspace_id===current.workspace_id&&source.channel_id===current.channel_id;
     },
     revision:input=>{
       if(!currentDestination({...input,destination:input.disclosure_destination}))throw new Error("visibility_unavailable");
