@@ -469,8 +469,8 @@ export class JobSupervisor {
 
   private launch(row: JobRow): void {
     let startupReady!: () => void;
-    const startup = row.status === "running" ? Promise.resolve() : new Promise<void>(resolve => { startupReady = resolve; });
-    const operation = (row.status === "running" ? this.monitor(row) : this.startJob(row, startupReady))
+    const startup = new Promise<void>(resolve => { startupReady = resolve; });
+    const operation = (row.status === "running" ? this.monitor(row, startupReady) : this.startJob(row, startupReady))
       .catch((error: unknown) => {
         this.logger.error("Job operation failed unexpectedly", {
           job_id: row.job_id,
@@ -561,8 +561,7 @@ export class JobSupervisor {
     this.database.markJobRunning(row.job_id);
     const running = this.database.getJob(row.job_id)!;
     this.logTransition(dispatching, running);
-    startupReady();
-    await this.monitor(running);
+    await this.monitor(running, startupReady);
     } finally { startupReady(); }
   }
 
@@ -692,11 +691,13 @@ export class JobSupervisor {
     }
   }
 
-  private async monitor(row: JobRow): Promise<void> {
+  private async monitor(row: JobRow, startupReady: () => void = () => {}): Promise<void> {
+    try {
     const initialProgress=this.progress;
     try { await initialProgress?.ingest(this.database.getJob(row.job_id) ?? row); }
     catch (error) { await this.failOpenProgress(initialProgress,row.job_id,"job_progress_initial_ingest_failed",error); }
     if (await this.tryComplete(row, false)) return;
+    startupReady();
     let keepPolling = true;
     const pollAbort = new AbortController();
     const stopPoll = (): void => pollAbort.abort();
@@ -743,6 +744,7 @@ export class JobSupervisor {
     if (["idle", "done"].includes(waited.agentStatus ?? "")) {
       await this.tryComplete(row, true);
     }
+    } finally { startupReady(); }
   }
 
   private async failOpenProgress(progress:JobProgressCoordinator|undefined,jobId:string,errorCode:string,error:unknown):Promise<void> {

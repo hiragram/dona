@@ -120,6 +120,24 @@ test("web cancelはprepare完了まで待ち作成済みagentだけを停止す�
   await supervisor.stop(); database.close();
 });
 
+test("web cancelは初回Result照合を待ち高速完了jobをcancellingへ戻さない", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const database = new DispatcherDatabase(config.databasePath), owner = { instance_id: "instance", tenant_id: "tenant", principal_id: "principal" };
+  const job = database.createWebJob({ ...owner, idempotency_key: "b".repeat(64), objective: "fast result", workspace: { kind: "scratch" } },
+    config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  let releasePrompt!: () => void; const prompting = new Promise<void>(resolve => { releasePrompt = resolve; });
+  const runtime = fakeRuntime({
+    async prepare() { await fs.mkdir(config.jobResultsDir, { recursive: true }); return { herdrWorkspaceId: "w1", herdrPaneId: "p1" }; },
+    async get() { return { ...ok("idle"), agentIdentity: "agent", stateChangeSeq: 1 }; },
+    async prompt() { await fs.writeFile(job.result_path, JSON.stringify({ schema_version: 1, job_id: job.job_id, status: "completed",
+      summary: "done", completed_at: new Date().toISOString() })); await prompting; return ok("done"); },
+  });
+  const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined); supervisor.start();
+  await waitFor(() => database.getJob(job.job_id)?.status === "dispatching"); const cancelled = supervisor.cancelWeb(job.job_id, owner); releasePrompt();
+  await assert.rejects(cancelled, /web_job_terminal:completed/); assert.equal(database.getJob(job.job_id)?.status, "completed");
+  await supervisor.stop(); database.close();
+});
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
