@@ -15,11 +15,11 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 
 async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 503; logoutUnknown?: boolean } = {}) {
+  eventDeniedStatus?: 403 | 404; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseFirstSession?: Promise<void>; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; logoutUnknown?: boolean } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
     result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
-  let current = job(), listReads = 0, detailReads = 0, alphaDetailReads = 0, submitWrites = 0, cancelWrites = 0, eventReads = 0, logoutWrites = 0, logoutStatusReads = 0;
+  let current = job(), sessionReads = 0, listReads = 0, detailReads = 0, alphaDetailReads = 0, submitWrites = 0, cancelWrites = 0, eventReads = 0, logoutWrites = 0, logoutStatusReads = 0;
   page.on("pageerror", error => errors.push(error.message));
   await page.context().route("**/*", async route => {
     const request = route.request(), url = new URL(request.url()), requestHeaders = await request.allHeaders();
@@ -30,7 +30,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
     if (url.origin !== policy.origin) { errors.push("unexpected external request"); await route.abort(); return; }
     if (url.pathname === "/") { await route.fulfill(dashboardPage()); return; }
     if (url.pathname === "/login") { await route.fulfill({ status: 200, contentType: "text/html", body: "<!doctype html><title>login</title>" }); return; }
-    if (url.pathname === "/api/session") { await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
+    if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;await fulfill(route, { principal: { principal_id: "principal-fixture", role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"] }, csrf_token: csrf }); return; }
     if(url.pathname==="/api/session/logout"&&request.method()==="POST"){logoutWrites++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.logoutUnknown){await fulfill(route,{error:"durability_unavailable"},503);return;}await route.fulfill({status:204,body:""});return;}
     if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);await fulfill(route,{revoked:true});return;}
     if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===2)await options.pauseSecondList; if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
@@ -41,7 +41,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
     }
-    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":"identity_unavailable"},options.detailAfterCancelStatus);return;}
+    if (/^\/api\/jobs\/[A-Za-z0-9_-]+$/.test(url.pathname)) { detailReads++;const id=url.pathname.split("/").at(-1)!;if(options.detailAfterCancelStatus&&cancelWrites>0){await fulfill(route,{error:options.detailAfterCancelStatus===403?"scope_denied":options.detailAfterCancelStatus===404?"not_found":"identity_unavailable"},options.detailAfterCancelStatus);return;}
       if(id==="job_alpha"){alphaDetailReads++;if(options.pauseFirstAlphaDetail&&alphaDetailReads===1)await options.pauseFirstAlphaDetail;if(options.firstAlphaDetailStatus&&alphaDetailReads===1){await fulfill(route,{error:"not_found"},options.firstAlphaDetailStatus);return;}}
       await fulfill(route, { job: options.pauseFirstAlphaDetail||options.multipleJobs?job({job_id:id,...(id==="job_alpha"?{error_code:alphaDetailReads===1?"old_projection":"new_projection"}:{})}):current, event_cursor: cursor }); return; }
     if (/^\/api\/jobs\/[A-Za-z0-9_-]+\/events$/.test(url.pathname)) {
@@ -58,7 +58,7 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; cancelUnk
     }
     errors.push("unexpected route: " + url.pathname); await route.abort();
   });
-  return { calls, errors, get listReads() { return listReads; }, get detailReads() { return detailReads; }, get submitWrites() { return submitWrites; }, get cancelWrites() { return cancelWrites; }, get eventReads() { return eventReads; }, get logoutWrites(){return logoutWrites;},get logoutStatusReads(){return logoutStatusReads;} };
+  return { calls, errors, get sessionReads(){return sessionReads;},get listReads() { return listReads; }, get detailReads() { return detailReads; }, get submitWrites() { return submitWrites; }, get cancelWrites() { return cancelWrites; }, get eventReads() { return eventReads; }, get logoutWrites(){return logoutWrites;},get logoutStatusReads(){return logoutStatusReads;} };
 }
 
 test("login後にdurable一覧・詳細・SSEを表示しuntrusted Resultをliteral表示する", async ({ page }) => {
@@ -129,6 +129,10 @@ test("submit専用principalはreceipt後に禁止されたreadを送らない", 
 test("submit専用principalは受付不明後も禁止されたreconcile readを送らない",async({page})=>{
   const f=await fixture(page,{scopes:["job:submit"],submitUnknown:true});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("結果不明を確認する");await page.getByRole("button",{name:"依頼を送信"}).click();
   await expect(page.getByRole("status")).toContainText("受付結果が不明です");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.submitWrites).toBe(1);expect(f.listReads).toBe(0);expect(f.errors).toEqual([]);
+});
+
+test("granted readだけのprincipalは作成直後のjob detailを開かない",async({page})=>{
+  const f=await fixture(page,{scopes:["job:submit","job:read:granted"]});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("grant外の新規job");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("status")).toContainText("durably受理されました");expect(f.submitWrites).toBe(1);expect(f.detailReads).toBe(0);expect(f.errors).toEqual([]);
 });
 
 test("一覧更新で403なら以前のprivate一覧を消去する", async ({ page }) => {
@@ -206,6 +210,10 @@ test("cancel受付不明後のreconcileが403ならprivate表示を消去する"
   await expect(page.getByRole("status")).toContainText("取消の受付結果は不明です");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
+for(const cancelUnknown of [false,true])test(`cancel${cancelUnknown?"受付不明":"成功"}後の404で古いdetailを消去する`,async({page})=>{
+  const f=await fixture(page,{cancelUnknown,detailAfterCancelStatus:404});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
 test("terminal detailではSSEを開始せずerror codeとfocusを表示する", async ({ page }) => {
   const f=await fixture(page);await page.goto(policy.origin+"/");
   await page.evaluate(()=>{history.replaceState(null,"","/");});
@@ -217,6 +225,10 @@ test("terminal detailではSSEを開始せずerror codeとfocusを表示する",
 
 test("logout応答喪失は再POSTせずstatusを一度だけ照合してloginへ戻る",async({page})=>{
   const f=await fixture(page,{logoutUnknown:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:"ログアウト"}).click();await expect(page).toHaveURL(policy.origin+"/login");expect(f.logoutWrites).toBe(1);expect(f.logoutStatusReads).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("古いboot応答はbfcache復帰後の新しいsession表示を消去しない",async({page})=>{
+  let release!:()=>void;const pauseFirstSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseFirstSession});await page.goto(policy.origin+"/");await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();expect(f.sessionReads).toBe(2);expect(f.errors).toEqual([]);
 });
 
 for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 1280, height: 900 }]) {
