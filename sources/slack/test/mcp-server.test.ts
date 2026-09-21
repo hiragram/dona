@@ -63,6 +63,7 @@ class FakeSlackClient implements SlackApiClient {
           isArchived: false,
           isMember: true,
           isShared: false,
+          visibilityKnown: true,
         },
       ],
     };
@@ -75,6 +76,7 @@ class FakeSlackClient implements SlackApiClient {
       isArchived: false,
       isMember: true,
       isShared: false,
+      visibilityKnown: true,
     };
   }
   async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
@@ -84,6 +86,7 @@ class FakeSlackClient implements SlackApiClient {
   async getUser(): Promise<SlackUser> {
     return {
       id: "U1",
+      teamId: "T123",
       displayName: "Test User",
       isBot: false,
       isAppUser: false,

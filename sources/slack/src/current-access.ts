@@ -8,6 +8,7 @@ export type SlackRequiredRole = "member" | "admin" | "owner";
 export interface SlackCurrentAccessEvidence {
   version: 1;
   status: "current";
+  observed_at: string;
   event_id: string;
   workspace_id: string;
   principal_id: string;
@@ -54,6 +55,7 @@ export async function verifyCurrentSlackAccess(
   input: { eventId: string; channelId: string; userId: string; requiredRole?: SlackRequiredRole },
 ): Promise<SlackCurrentAccessEvidence> {
   if (!client.hasChannelMember) unavailable();
+  const observedAt = new Date(Date.now());
   let user: SlackUser, channel: SlackChannel, member: boolean;
   try {
     [user, channel] = await Promise.all([client.getUser(input.userId), client.getChannel(input.channelId)]);
@@ -65,12 +67,14 @@ export async function verifyCurrentSlackAccess(
   const requiredRole=input.requiredRole??"member";
   const roleAllowed=requiredRole==="member"||requiredRole==="admin"&&(user!.isAdmin===true||user!.isOwner===true)
     ||requiredRole==="owner"&&user!.isOwner===true;
-  if (user!.id !== input.userId || user!.teamId && user!.teamId !== workspaceId || user!.isDeleted || user!.isBot || user!.isAppUser
-    || channel!.id !== input.channelId || channel!.isArchived || channel!.isShared || !kind || !member! || !roleAllowed) unavailable();
+  if (user!.id !== input.userId || user!.teamId !== workspaceId || user!.isDeleted || user!.isBot || user!.isAppUser
+    || channel!.id !== input.channelId || channel!.visibilityKnown !== true || channel!.isArchived || channel!.isShared || !kind || !member! || !roleAllowed
+    || kind === "public_channel" && !channel!.isMember) unavailable();
   if (kind === "im" && channel!.userId !== input.userId) unavailable();
   return {
     version: 1,
     status: "current",
+    observed_at: observedAt.toISOString(),
     event_id: input.eventId,
     workspace_id: workspaceId,
     principal_id: input.userId,

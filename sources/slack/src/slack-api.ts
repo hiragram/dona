@@ -56,6 +56,7 @@ export interface SlackChannel {
   isArchived: boolean;
   isMember: boolean;
   isShared: boolean;
+  visibilityKnown?: boolean;
   topic?: string;
   purpose?: string;
   memberCount?: number;
@@ -199,6 +200,9 @@ function channelFromResponse(channel: {
     isArchived: channel.is_archived ?? false,
     isMember: channel.is_member ?? false,
     isShared: channel.is_shared ?? channel.is_ext_shared ?? false,
+    visibilityKnown: typeof channel.is_private === "boolean"
+      && typeof channel.is_archived === "boolean"
+      && (typeof channel.is_shared === "boolean" || typeof channel.is_ext_shared === "boolean"),
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),

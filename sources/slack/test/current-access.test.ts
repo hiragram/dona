@@ -6,7 +6,7 @@ import { verifyCurrentSlackAccess } from "../src/current-access.js";
 import { SlackApiError, type SlackApiClient, type SlackChannel, type SlackUser } from "../src/slack-api.js";
 
 const user: SlackUser = { id:"U_OWNER", teamId:"T_HOME", updatedAt:7, isBot:false, isAppUser:false, isDeleted:false };
-const channel: SlackChannel = { id:"C_PRIVATE", isPrivate:false, isArchived:false, isMember:true, isShared:false };
+const channel: SlackChannel = { id:"C_PRIVATE", isPrivate:false, isArchived:false, isMember:true, isShared:false, visibilityKnown:true };
 
 function provider(overrides: { user?:Partial<SlackUser>; channel?:Partial<SlackChannel>; member?:boolean; error?:boolean } = {}): SlackApiClient {
   return {
@@ -39,8 +39,13 @@ describe("Slack current access verifier", () => {
     await denied(provider({user:{isBot:true}}));
     await denied(provider({user:{isAppUser:true}}));
     await denied(provider({user:{teamId:"T_OTHER"}}));
+    const missingTeam=provider(); missingTeam.getUser=async()=>{
+      const {teamId:_teamId,...withoutTeam}=user; return withoutTeam;
+    };
+    await denied(missingTeam);
     await denied(provider({channel:{isArchived:true}}));
     await denied(provider({channel:{isShared:true}}));
+    await denied(provider({channel:{visibilityKnown:false}}));
     await denied(provider({channel:{id:"X_UNKNOWN"}}),"X_UNKNOWN");
     await denied(provider({error:true}));
   });
@@ -57,6 +62,7 @@ describe("Slack current access verifier", () => {
       {eventId:"evt_private",channelId:"C_PRIVATE",userId:"U_OWNER"});
     assert.equal(privateChannel.destination_kind,"private_channel");
     await denied(provider({channel:{isMember:true},member:false}));
+    await denied(provider({channel:{isMember:false}}));
   });
 
   test("current roleを検証し、originとdisclosure destinationを別証跡へ束縛する",async()=>{
@@ -87,4 +93,15 @@ test("access receiptは観測時刻からexclusive 120秒、opaque nonce、safe 
   assert.deepEqual({issued_at:decoded.issued_at,expires_at:decoded.expires_at,nonce:decoded.nonce,consumed:decoded.consumed},
     {issued_at:"2026-09-21T00:00:00Z",expires_at:"2026-09-21T00:02:00Z",nonce:"nonce-test",consumed:false});
   assert.equal(JSON.stringify(decoded).includes("provider secret"),false);
+});
+
+test("access receiptの有効期間は遅いmembership照会の開始時刻へ束縛する", async () => {
+  const original=Date.now;
+  try {
+    Date.now=()=>new Date("2026-09-21T00:00:00.000Z").getTime();
+    const evidence=await verifyCurrentSlackAccess(provider(),"T_HOME",{eventId:"evt_1",channelId:"C_PRIVATE",userId:"U_OWNER"});
+    const decoded=JSON.parse(Buffer.from(signSlackAccessReceipt(evidence,"k".repeat(32),undefined,"nonce-test").split(".")[0]!,"base64url").toString("utf8"));
+    assert.equal(decoded.issued_at,"2026-09-21T00:00:00Z");
+    assert.equal(decoded.expires_at,"2026-09-21T00:02:00Z");
+  } finally { Date.now=original; }
 });

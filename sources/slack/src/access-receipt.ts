@@ -9,7 +9,7 @@ function utcSeconds(date: Date): string {
 export function signSlackAccessReceipt(
   evidence: SlackCurrentAccessEvidence,
   key: string,
-  now = new Date(),
+  now = new Date(evidence.observed_at),
   nonce: string = randomUUID(),
 ): string {
   if (key.length < 32) throw new Error("Slack access receipt signing key is invalid");
