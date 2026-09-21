@@ -338,7 +338,7 @@ export class DispatcherApi {
               if(!event||!hasExplicitOwnHumanWaitIntent(event,{continuation}))throw new HumanWaitPresentationError();
               const page=service.list({context,destination:this.agentDisclosureDestination(context),limit:Math.min(Number(rawLimit),10),cursorScope:"presentation",
                 ...(continuation?{cursor:url.searchParams.get("cursor")!,allowCrossEventCursor:true}:{})});
-              sendJson(response,200,{schema_version:1,...renderHumanWaits(page)});
+              sendJson(response,200,{schema_version:1,...renderHumanWaits(page,new Date(event.occurred_at))});
             } else sendJson(response,200,service.list({context,destination:this.agentDisclosureDestination(context),limit:Number(rawLimit),
               ...(url.searchParams.has("cursor")?{cursor:url.searchParams.get("cursor")!}:{})}));
           } else {

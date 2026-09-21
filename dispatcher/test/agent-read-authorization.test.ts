@@ -4,11 +4,13 @@ import { test } from "node:test";
 import {
   AgentReadAuthorization,
   agentReadGrantOperations,
+  createHumanWaitAgentReadAuthorization,
   projectAuthorizedJob,
   projectCompletionJob,
   type AgentReadDenyReason,
 } from "../src/agent-read-authorization.js";
 import type { AgentExecutionContext } from "../src/agent-context.js";
+import type { DispatcherDatabase } from "../src/database.js";
 import type { JobAuthorizationBindingRow } from "../src/job-authorization-binding.js";
 import type { JobRow } from "../src/types.js";
 
@@ -99,6 +101,30 @@ test("current visibilityを投影直前ごとに再評価しprivateから別chan
     owner_binding_current: true,
     disclosure_destination: { ...destination, channel_id: "public-channel" } }).allowed, false);
   assert.equal(calls, 3);
+});
+
+test("service用human-wait providerはcurrent event destinationとowner bindingを毎回再確認する",()=>{
+  let revokedAt:string|null=null,current=true;
+  const item={resource_id:job.job_id};
+  const database={
+    get:(eventId:string)=>eventId===context.event_id?{source:"slack",reply_target_json:JSON.stringify(destination)}:undefined,
+    getAgentPrincipalBinding:(eventId:string)=>eventId===context.event_id?{tenant_id:context.tenant_id,
+      workspace_id:context.workspace_id,principal_id:context.principal_id,revoked_at:revokedAt}:undefined,
+    humanWaits:{getByOriginRef:(value:string)=>value==="origin_"+"a".repeat(32)?item:undefined,authorizationCurrent:()=>current},
+  } as unknown as DispatcherDatabase;
+  const policy=createHumanWaitAgentReadAuthorization(database);
+  assert.ok(policy.snapshot({context,operation:"read_own_human_waits",surface:"list_human_waits",disclosure_destination:destination}));
+  const resource={item_id:"wait_"+"a".repeat(32),source_event_id:context.event_id,resource_kind:"job" as const,
+    resource_id:job.job_id,resource_revision:1,owner_kind:"human_verified" as const,owner_principal_kind:"human" as const,
+    owner_principal_id:context.principal_id,tenant_id:context.tenant_id,workspace_id:context.workspace_id,
+    owner_binding_current:true,disclosure_origin:{kind:"human_wait_origin",origin_ref:"origin_"+"a".repeat(32)}};
+  assert.equal(policy.authorizeResource({context,operation:"read_own_human_waits",surface:"list_human_waits",resource,
+    disclosure_destination:destination}).allowed,true);
+  current=false;
+  assert.equal(policy.authorizeResource({context,operation:"read_own_human_waits",surface:"list_human_waits",resource,
+    disclosure_destination:destination}).allowed,false);
+  current=true;revokedAt="2026-09-21T00:10:00.000Z";
+  assert.equal(policy.snapshot({context,operation:"read_own_human_waits",surface:"list_human_waits",disclosure_destination:destination}),undefined);
 });
 
 test("allowlist projectionはraw row、Result、自由文error、runtime identityを含めない", () => {
