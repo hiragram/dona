@@ -191,6 +191,20 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.doesNotMatch(JSON.stringify(restrictedAudit), /PRIVATE-CANARY/);
     assert.ok(restrictedAudit.some(value => (value as {reason?:string}).reason === "visibility_unavailable"));
 
+    for (let index = 0; index < 101; index++) {
+      const extraEnvelope = eventEnvelope(`agent-read-hidden-${index}`);
+      const extra = database.enqueue(extraEnvelope, new Date(Date.now() + index + 1), proof(extraEnvelope.external_event_id)).row;
+      const row = database.createJob({ source_event_id: extra.event_id, job_key: "hidden", objective: "hidden",
+        workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+      hidden.add(row.job_id);
+    }
+    const deepThread = await client.listThreadJobs(source.event_id, "T_TEST", "C_TEST", "1756722030.123456");
+    assert.deepEqual((deepThread.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
+    assert.equal(deepThread.truncated, false);
+    const deepOwner = await client.listOwnerJobs(source.event_id);
+    assert.deepEqual((deepOwner.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
+    assert.equal(deepOwner.truncated, false);
+
     const completionEnvelope = {
       ...eventEnvelope("agent-read-completion"), source: "dona_job" as const, type: "job_completed",
       subject: { source_event_id: source.event_id }, trace: { source_event_id: source.event_id },

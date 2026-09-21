@@ -30,6 +30,7 @@ import {
 } from "./validation.js";
 
 class BodyTooLargeError extends Error {}
+const agentReadCandidateScanMax = 1_000;
 async function confirmScheduleAccess(socketPath:string,internalToken:string,input:Record<string,unknown>,timeoutMs:number):Promise<Record<string,unknown>> {
   const encoded=Buffer.from(JSON.stringify({schema_version:1,...input}));
   return new Promise((resolve,reject)=>{const request=http.request({socketPath,path:"/v1/internal/schedule-access-confirmations",method:"POST",headers:{"content-type":"application/json","content-length":String(encoded.length),"x-dona-update-token":internalToken}},response=>{
@@ -818,12 +819,14 @@ export class DispatcherApi {
       if(sourceEventId){
         const context = this.verifiedAgentContexts.get(request);
         try {
-          const rows = this.database.listOwnerJobs(sourceEventId);
+          const rows = this.database.listOwnerJobs(sourceEventId, context ? agentReadCandidateScanMax + 1 : 100);
+          const scanned = context ? rows.slice(0, agentReadCandidateScanMax) : rows;
           const jobs = context
-            ? rows.filter(row => this.agentJobAllowed(request, "list_owner_jobs", row)).map(projectAuthorizedJob)
-            : rows.map(({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
+            ? scanned.filter(row => this.agentJobAllowed(request, "list_owner_jobs", row)).map(projectAuthorizedJob)
+            : scanned.map(({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
               ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}));
-          sendJson(response,200,{schema_version:1,jobs});
+          sendJson(response,200,{schema_version:1,jobs:jobs.slice(0,100),
+            ...(context ? { truncated: jobs.length > 100 || rows.length > agentReadCandidateScanMax } : {})});
         }
         catch {
           if (context) sendJson(response, 200, { schema_version: 1, jobs: [] });
@@ -845,14 +848,16 @@ export class DispatcherApi {
           throw new ApiRequestError(403, "agent_context_unavailable", "Agent operation is not available");
         }
       }
-      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
+      const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs,
+        agentContext ? agentReadCandidateScanMax + 1 : 101);
+      const scanned = agentContext ? candidates.slice(0, agentReadCandidateScanMax) : candidates;
       const visible = agentContext
-        ? candidates.filter(row => this.agentJobAllowed(request, "list_thread_jobs", row))
-        : candidates;
+        ? scanned.filter(row => this.agentJobAllowed(request, "list_thread_jobs", row))
+        : scanned;
       sendJson(response, 200, {
         schema_version: 1,
         jobs: agentContext ? visible.slice(0, 100).map(projectAuthorizedJob) : visible.slice(0,100),
-        truncated: visible.length > 100,
+        truncated: visible.length > 100 || (agentContext !== undefined && candidates.length > agentReadCandidateScanMax),
       });
       return;
     }
