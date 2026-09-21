@@ -247,25 +247,30 @@ export class JobSupervisor {
     this.running = false;
   }
 
-  steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult> {
+  steer(jobId: string, sourceEventId: string, instruction: string, operationId = sourceEventId): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
       const current = this.database.getJob(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (["queued", "retryable_failed"].includes(current.status)) {
-        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
+        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction, operationId);
         this.wake();
-        return { row, duplicate: current.steer_event_id === sourceEventId && current.steer_state === "accepted" };
+        return { row, duplicate: current.steer_event_id === operationId && current.steer_state === "accepted" };
       }
-      const begun = this.database.beginJobSteer(jobId, sourceEventId);
+      if(current.status==="blocked")await this.active.get(jobId)?.operation;
+      const begun = this.database.beginJobSteer(jobId, sourceEventId, operationId);
       if (begun.duplicate) return begun;
       const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal);
       if (prompted.ok) {
-        this.database.markJobSteerAccepted(jobId, sourceEventId);
+        this.database.markJobSteerAccepted(jobId, operationId);
+        if(begun.row.status==="blocked"){
+          const resumed=this.database.resumeBlockedJob(jobId);
+          if(!this.stopping)this.launch(resumed);
+        }
         return { row: this.database.getJob(jobId)!, duplicate: false };
       }
       if (!prompted.timedOut && prompted.errorCode === "agent_blocked") {
-        this.database.clearJobSteer(jobId, sourceEventId);
-        this.database.markJobBlocked(jobId, "Background agent is waiting for approval or human input");
+        this.database.clearJobSteer(jobId, operationId);
+        if(begun.row.status==="running")this.database.markJobBlocked(jobId, "Background agent is waiting for approval or human input");
         this.wake();
         throw new Error(`Job ${jobId} is blocked and could not accept steer input`);
       }

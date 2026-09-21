@@ -189,11 +189,11 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(conflict.isError,true);assert.equal(calls.length,beforeConflict);
       const instruction=await client.callTool({name:"send_worker_instruction",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
         source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",producer_sequence:1,idempotency_key:"instruction-1",
-        occurred_at:"2026-09-21T00:00:00Z",payload:{operation:"answer",text:"続行"}}});
+        occurred_at:"2026-09-21T00:00:00Z",payload:{operation:"add_condition",text:"続行"}}});
       assert.equal(instruction.isError,undefined);
       assert.deepEqual(calls.at(-1),{method:"sendWorkerInstruction",args:["job_01m1es03xy5cf8d9pm5cwx4srv",{schema_version:1,
         source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",producer_sequence:1,idempotency_key:"instruction-1",
-        occurred_at:"2026-09-21T00:00:00Z",payload:{operation:"answer",text:"続行"}}]});
+        occurred_at:"2026-09-21T00:00:00Z",payload:{operation:"add_condition",text:"続行"}}]});
       const messageId="msg_01m1es03xy5cf8d9pm5cwx4srv";
       const message=await client.callTool({name:"get_worker_message",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
         source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",message_id:messageId}});

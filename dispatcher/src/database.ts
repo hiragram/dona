@@ -1162,6 +1162,11 @@ export class DispatcherDatabase {
     });
   }
 
+  resumeBlockedJob(jobId:string):JobRow {
+    this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
+    return this.getJobRequired(jobId);
+  }
+
   recordInvalidResultAgentStopFailure(jobId:string,message:string):void {
     this.db.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stop_unknown',last_error_message=?,updated_at=? WHERE job_id=? AND status='needs_review'").run(message,nowUtc(),jobId);
   }
@@ -1241,13 +1246,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
+  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string, operationId = sourceEventId): JobRow {
     return this.db.transaction(() => {
       this.assertJobSourceMatchesThread(jobId, sourceEventId);
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
-      if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
+      if (row.steer_event_id === operationId && row.steer_state === "accepted") return row;
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
@@ -1258,37 +1263,37 @@ export class DispatcherDatabase {
       const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
-        .run(objective,sourceEventId,nowUtc(),jobId);
+        .run(objective,operationId,nowUtc(),jobId);
       return this.getJobRequired(jobId);
     }).immediate();
   }
 
-  beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {
+  beginJobSteer(jobId: string, sourceEventId: string, operationId = sourceEventId): { row: JobRow; duplicate: boolean } {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);
-    if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
-    if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
+    if (row.steer_event_id === operationId && row.steer_state === "accepted") return { row, duplicate: true };
+    if (!["running","blocked"].includes(row.status)) throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
-    `).run(sourceEventId, nowUtc(), jobId);
+    `).run(operationId, nowUtc(), jobId);
     return { row: this.getJobRequired(jobId), duplicate: false };
   }
 
-  markJobSteerAccepted(jobId: string, sourceEventId: string): void {
+  markJobSteerAccepted(jobId: string, operationId: string): void {
     const changed = this.db.prepare(`
       UPDATE jobs SET steer_state = 'accepted', updated_at = ?
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
-    `).run(nowUtc(), jobId, sourceEventId).changes;
+    `).run(nowUtc(), jobId, operationId).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
   }
 
-  clearJobSteer(jobId: string, sourceEventId: string): void {
+  clearJobSteer(jobId: string, operationId: string): void {
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = NULL, steer_state = NULL, updated_at = ?
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
-    `).run(nowUtc(), jobId, sourceEventId);
+    `).run(nowUtc(), jobId, operationId);
   }
 
   beginJobCancellation(jobId: string, sourceEventId: string): JobRow {

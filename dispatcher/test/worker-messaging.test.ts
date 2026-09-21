@@ -11,7 +11,7 @@ import { buildJobPrompt } from "../src/job-prompt.js";
 import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
 import { buildEventPrompt, envelopeFromRow } from "../src/prompt.js";
-import { WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
+import { migrateWorkerMessaging, WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
 import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const roots: string[] = [];
@@ -79,8 +79,8 @@ describe("worker messaging ledger",()=>{
     const {database,source,job,config}=await fixture();
     const first=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:10Z"));
     const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
-      idempotency_key:"instruction-1",occurred_at:"2026-09-21T00:00:11Z",correlation_message_id:first.message.message_id,
-      conversation_revision:3,payload:{operation:"answer",text:"continue"}},new Date("2026-09-21T00:00:11Z"));
+      idempotency_key:"instruction-1",occurred_at:"2026-09-21T00:00:11Z",
+      payload:{operation:"add_condition",text:"continue"}},new Date("2026-09-21T00:00:11Z"));
     const workerClaim=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-1",1,10_000,new Date("2026-09-21T00:00:12Z"));
     assert.equal(workerClaim.length,1); assert.equal(workerClaim[0]!.delivery.message_id,instruction.message.message_id);
     assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-1","wrong",workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:13Z")),
@@ -92,7 +92,7 @@ describe("worker messaging ledger",()=>{
     assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,workerClaim[0]!.delivery.delivery_id,"runtime-2",workerClaim[0]!.lease_token,workerClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:14Z")),
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
     database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
-      idempotency_key:"instruction-expiry",occurred_at:"2026-09-21T00:00:15Z",payload:{operation:"answer",text:"境界"}},new Date("2026-09-21T00:00:15Z"));
+      idempotency_key:"instruction-expiry",occurred_at:"2026-09-21T00:00:15Z",payload:{operation:"add_condition",text:"境界"}},new Date("2026-09-21T00:00:15Z"));
     const expiryClaim=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-1",1,1_000,new Date("2026-09-21T00:00:15Z"));
     assert.throws(()=>database.workerMessages.acknowledge(job.job_id,source.event_id,expiryClaim[0]!.delivery.delivery_id,"runtime-1",expiryClaim[0]!.lease_token,expiryClaim[0]!.delivery.fence,new Date("2026-09-21T00:00:16Z")),
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="delivery_fence_mismatch");
@@ -178,6 +178,28 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("answerは未回答questionとの相関と直後revisionを必須にする",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const checkpoint=database.workerMessages.appendReport(job.job_id,report(source.event_id));
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+        idempotency_key:"answer-contract-question",occurred_at:"2026-09-21T00:00:02Z",conversation_revision:7,
+        payload:{kind:"question",question:"回答してください"}});
+      const base={schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"answer-contract",occurred_at:"2026-09-21T00:00:03Z",payload:{operation:"answer" as const,text:"回答"}};
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,base),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{...base,correlation_message_id:checkpoint.message.message_id,conversation_revision:1}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_answer_target_invalid");
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{...base,correlation_message_id:question.message.message_id,conversation_revision:7}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_answer_revision_mismatch");
+      database.workerMessages.appendInstruction(job.job_id,{...base,correlation_message_id:question.message.message_id,conversation_revision:8});
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{...base,producer_sequence:2,idempotency_key:"answer-contract-second",
+        correlation_message_id:question.message.message_id,conversation_revision:8}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_answer_already_exists");
+    } finally {database.close();}
+  });
+
   test("pending questionの次revisionは無関係なmessage最大値ではなく相関元から生成する",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -196,18 +218,23 @@ describe("worker messaging ledger",()=>{
   test("instruction bridgeがdurable typed messageを既存steer経路へ一度だけ配送する",async()=>{
     const {database,source,job}=await fixture();
     bindRuntime(database,job.job_id,"runtime-bridge");
+    const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      producer_sequence:1,idempotency_key:"bridge-question",occurred_at:"2026-09-21T00:00:00Z",conversation_revision:1,
+      payload:{kind:"question",question:"この方針で続けますか"}});
     const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
       producer_sequence:1,idempotency_key:"bridge-answer",occurred_at:"2026-09-21T00:00:01Z",
+      correlation_message_id:question.message.message_id,conversation_revision:2,
       payload:{operation:"answer",text:"この方針で続けてください"}});
-    const calls:Array<{jobId:string;sourceEventId:string;instruction:string}>=[];
-    const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(jobId,sourceEventId,typedInstruction){
-      calls.push({jobId,sourceEventId,instruction:typedInstruction});
+    const calls:Array<{jobId:string;sourceEventId:string;instruction:string;operationId:string|undefined}>=[];
+    const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(jobId,sourceEventId,typedInstruction,operationId){
+      calls.push({jobId,sourceEventId,instruction:typedInstruction,operationId});
     }});
     try {
       assert.equal(await bridge.runOnce(),true);
       assert.equal(await bridge.runOnce(),false);
       assert.equal(calls.length,1);
       assert.deepEqual({jobId:calls[0]!.jobId,sourceEventId:calls[0]!.sourceEventId},{jobId:job.job_id,sourceEventId:source.event_id});
+      assert.equal(calls[0]!.operationId,instruction.message.message_id);
       assert.match(calls[0]!.instruction,/DONA_TYPED_INSTRUCTION/);
       assert.match(calls[0]!.instruction,/この方針で続けてください/);
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","bridge-answer") as
@@ -267,7 +294,7 @@ describe("worker messaging ledger",()=>{
     try {
       for(const sequence of [1,2]) database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:sequence,idempotency_key:`terminal-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
-        payload:{operation:"answer",text:`answer ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
+        payload:{operation:"add_condition",text:`condition ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
       database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-terminal",1,10_000,new Date("2026-09-21T00:00:03Z"));
       database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
       database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
@@ -312,10 +339,25 @@ describe("worker messaging ledger",()=>{
     } finally { try { database.close(); } catch {} }
   });
 
+  test("新しいreportは未処理の旧silence eventを失効させる",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:00Z")),1);
+      database.workerMessages.appendReport(job.job_id,report(source.event_id,2),new Date("2026-09-21T00:15:01Z"));
+      const sqlite=new Database(config.databasePath);
+      const silence=sqlite.prepare("SELECT status,last_error_code FROM events WHERE event_type='worker_message_silence'").get() as
+        {status:string;last_error_code:string|null};
+      sqlite.close();
+      assert.deepEqual(silence,{status:"completed",last_error_code:"worker_message_silence_superseded"});
+    } finally {database.close();}
+  });
+
   test("retentionは存続する相関messageの親を削除しない",async()=>{
     const {database,source,job}=await fixture();
     try {
-      const parent=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-07-01T00:00:00Z"));
+      const parent=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),conversation_revision:0,
+        payload:{kind:"question",question:"継続しますか"}},new Date("2026-07-01T00:00:00Z"));
       database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
         idempotency_key:"instruction-retained",occurred_at:"2026-07-20T00:00:00Z",correlation_message_id:parent.message.message_id,
         conversation_revision:1,payload:{operation:"answer",text:"継続"}},new Date("2026-07-20T00:00:00Z"));
@@ -357,6 +399,27 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-09-21T00:01:10Z")),1);
     } finally {database.close();}
   });
+});
+
+test("legacy job-level runtime identity migrationは複数候補をmessageへ推測帰属しない",async()=>{
+  const {database,source,job,config}=await fixture();
+  database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+  database.close();
+  const sqlite=new Database(config.databasePath);
+  try {
+    sqlite.exec(`DROP TABLE worker_message_runtime_identities;
+      CREATE TABLE worker_message_runtime_identities (
+        job_id TEXT NOT NULL,
+        runtime_identity_sha256 TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL
+      );`);
+    sqlite.prepare("INSERT INTO worker_message_runtime_identities VALUES(?,?,?)")
+      .run(job.job_id,"a".repeat(64),"2026-09-21T00:00:01Z");
+    sqlite.prepare("INSERT INTO worker_message_runtime_identities VALUES(?,?,?)")
+      .run(job.job_id,"b".repeat(64),"2026-09-21T00:00:02Z");
+    migrateWorkerMessaging(sqlite);
+    assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM worker_message_runtime_identities").get() as {count:number}).count,0);
+  } finally {sqlite.close();}
 });
 
 test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{

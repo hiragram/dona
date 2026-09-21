@@ -54,7 +54,13 @@ export const workerReportSchema = z.object({ ...commonMessage, payload: reportPa
       message: "must leave room for the correlated answer revision" });
   }
 });
-export const donaInstructionSchema = z.object({ ...commonMessage, payload: instructionPayload }).strict();
+export const donaInstructionSchema = z.object({ ...commonMessage, payload: instructionPayload }).strict().superRefine((value, context) => {
+  if (value.payload.operation !== "answer") return;
+  if (!value.correlation_message_id) context.addIssue({ code:z.ZodIssueCode.custom,path:["correlation_message_id"],
+    message:"is required for an answer" });
+  if (value.conversation_revision === undefined) context.addIssue({ code:z.ZodIssueCode.custom,path:["conversation_revision"],
+    message:"is required for an answer" });
+});
 
 export type WorkerReportInput = z.infer<typeof workerReportSchema>;
 export type DonaInstructionInput = z.infer<typeof donaInstructionSchema>;
@@ -103,7 +109,7 @@ export interface WorkerMessageDeliveryRow {
 }
 
 export interface WorkerInstructionController {
-  steer(jobId:string,sourceEventId:string,instruction:string):Promise<unknown>;
+  steer(jobId:string,sourceEventId:string,instruction:string,operationId?:string):Promise<unknown>;
 }
 
 export class WorkerMessageError extends Error {
@@ -239,7 +245,8 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     );
     INSERT OR IGNORE INTO worker_message_runtime_identities_v2(message_id,runtime_identity_sha256,first_seen_at)
       SELECT m.message_id,r.runtime_identity_sha256,r.first_seen_at
-      FROM worker_message_runtime_identities r JOIN worker_messages m ON m.job_id=r.job_id AND m.producer='worker';
+      FROM worker_message_runtime_identities r JOIN worker_messages m ON m.job_id=r.job_id AND m.producer='worker'
+      WHERE (SELECT COUNT(*) FROM worker_message_runtime_identities legacy WHERE legacy.job_id=r.job_id)=1;
     DROP TABLE worker_message_runtime_identities;
     ALTER TABLE worker_message_runtime_identities_v2 RENAME TO worker_message_runtime_identities;
   `);
@@ -298,9 +305,20 @@ export class WorkerMessageRepository {
       return { message: keyExisting, receipt_id: receipt.receipt_id, outcome: "reused" };
     }
     if (terminal(job.status)) throw new WorkerMessageError("worker_message_terminal_fence", "new messages are rejected after terminal job state");
+    let correlated:WorkerMessageRow|undefined;
     if (input.correlation_message_id) {
-      const correlated = this.db.prepare("SELECT job_id FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as { job_id: string } | undefined;
+      correlated = this.db.prepare("SELECT * FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as WorkerMessageRow | undefined;
       if (!correlated || correlated.job_id !== jobId) throw new WorkerMessageError("worker_message_correlation_mismatch", "correlated message is not bound to this job");
+    }
+    if (direction === "dona_to_worker" && instructionKind(input as DonaInstructionInput) === "answer") {
+      if (!correlated || correlated.direction !== "worker_to_dona" || !["question","decision_request"].includes(correlated.kind))
+        throw new WorkerMessageError("worker_message_answer_target_invalid", "answer must correlate to a worker question or decision request");
+      const expectedRevision=(correlated.conversation_revision ?? 0)+1;
+      if (input.conversation_revision !== expectedRevision)
+        throw new WorkerMessageError("worker_message_answer_revision_mismatch", `answer revision must be ${expectedRevision}`);
+      const answered=this.db.prepare(`SELECT 1 FROM worker_messages WHERE job_id=? AND direction='dona_to_worker'
+        AND kind='answer' AND correlation_message_id=?`).get(jobId,correlated.message_id);
+      if(answered)throw new WorkerMessageError("worker_message_answer_already_exists","correlated question already has an answer");
     }
     const max = this.db.prepare("SELECT MAX(producer_sequence) AS value FROM worker_messages WHERE job_id=? AND producer=?")
       .get(jobId, producer) as { value: number | null };
@@ -322,6 +340,12 @@ export class WorkerMessageRepository {
 
       let availableAt = acceptedAt;
       if (direction === "worker_to_dona") {
+        const silencePrefix=`worker-message-silence:${jobId}:`;
+        this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+          last_error_code='worker_message_silence_superseded',last_error_message=NULL
+          WHERE source='dona_message' AND event_type='worker_message_silence'
+            AND substr(external_event_id,1,length(?))=? AND status IN ('queued','retryable_failed')`)
+          .run(acceptedAt,acceptedAt,silencePrefix,silencePrefix);
         const cadence = this.db.prepare("SELECT * FROM worker_message_cadence WHERE job_id=?").get(jobId) as { minimum_interval_ms:number;silence_interval_ms:number;last_delivery_at:string|null;pending_message_id:string|null } | undefined;
         const workspaceCadence=job.workspace_id?this.db.prepare("SELECT * FROM worker_message_workspace_cadence WHERE workspace_id=?").get(job.workspace_id) as
           {minimum_interval_ms:number;last_delivery_at:string|null}|undefined:undefined;
@@ -732,7 +756,7 @@ export class WorkerInstructionBridge {
       correlation_message_id:delivery.correlation_message_id,conversation_revision:delivery.conversation_revision,
       operation:delivery.kind,payload:delivery.payload});
     await this.controller.steer(delivery.job_id,delivery.source_event_id,
-      `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`);
+      `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`,delivery.message_id);
     this.repository.acknowledge(delivery.job_id,delivery.source_event_id,delivery.delivery_id,this.leaseOwner,
       lease_token,delivery.fence,new Date());
     return true;

@@ -889,12 +889,46 @@ describe("JobSupervisor", () => {
       async cancel() { return ok("idle"); },
     };
     const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
-    const result = await supervisor.steer(job.job_id, followUp.event_id, "追加条件");
+    const result = await supervisor.steer(job.job_id, followUp.event_id, "追加条件", "msg_operation_1");
     assert.equal(result.duplicate, false);
-    assert.deepEqual(steers, ["追加条件"]);
-    assert.deepEqual(steerTargets, [job.agent_name]);
-    assert.deepEqual(steerTimeouts, [undefined]);
+    const second=await supervisor.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
+    assert.equal(second.duplicate,false);
+    const duplicate=await supervisor.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
+    assert.equal(duplicate.duplicate,true);
+    assert.deepEqual(steers, ["追加条件","別の追加条件"]);
+    assert.deepEqual(steerTargets, [job.agent_name,job.agent_name]);
+    assert.deepEqual(steerTimeouts, [undefined,undefined]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    database.close();
+  });
+
+  test("blocked workerへのtyped answerを受理してrunning監視へ戻す",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-steer-blocked-source")).row;
+    const followUp=database.enqueue(eventEnvelope("Ev-steer-blocked-follow-up")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"回答待ち",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"1","w1:p1");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.markJobBlocked(job.job_id,"回答待ち");
+    let waits=0;
+    const runtime:JobAgentRuntime={
+      async prepare(){throw new Error("not used");},
+      async get(){return ok("blocked");},
+      async prompt(){return ok("working");},
+      async wait(){waits+=1;return {...ok("working"),ok:false,timedOut:true,errorCode:"timeout"};},
+      async cancel(){return ok("idle");},
+    };
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.steer(job.job_id,followUp.event_id,"回答です","msg_blocked_answer");
+    assert.equal(result.duplicate,false);
+    assert.equal(result.row.status,"running");
+    assert.equal(result.row.last_error_code,null);
+    await waitFor(()=>waits===1);
+    await supervisor.stop();
     database.close();
   });
 

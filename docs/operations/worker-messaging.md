@@ -14,6 +14,7 @@ Worker Messaging は、worker と dona-main の途中経過・質問・判断を
 - message全体は UTF-8 で16 KiB以下。本文は4,000文字以下、decision optionは各1,000文字・最大8件。
 - unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing report／claim／ACKは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。worker reportのread-only reconcileだけは、commit済みreportと同じruntime identityのSHA-256をretention期間中保持してterminal cleanup後も照合できるようにする。raw identityは履歴へ保存しない。
 - instructionはtyped operationであり、raw shell、path、URL、environment、credentialをcommand capabilityとして受け付けない。
+- `answer`は未回答のworker `question`／`decision_request`への`correlation_message_id`を必須とし、`conversation_revision`は相関元の直後でなければならない。同じ質問への2件目のanswerは拒否する。
 - `producer_sequence`はjob・producerごとに1から単調増加する。gapは`worker_message_sequence_gap`、未記録の巻き戻しは`worker_message_sequence_rollback`。
 - `idempotency_key`はjob・producerごとに一意。`source_event_id`、`producer_sequence`、key、payload、`correlation_message_id`、`conversation_revision`、`occurred_at`がすべて同一なら`reused`、いずれかが異なるcanonical messageは`worker_message_idempotency_conflict`。
 - jobが`completed`、`failed`、`cancelled`になった後の新規messageは`worker_message_terminal_fence`で拒否する。terminal前にqueuedとなったreport eventも本文read時にterminal fenceで拒否し、完了済みjobについて質問を再通知しない。既にcommit済みのmessageとreceiptはread-only reconcileできる。
@@ -27,7 +28,7 @@ deliveryは`pending`、`leased`、`delivered`、`superseded`を持つ。claimご
 
 worker reportはPublisherがboundedな`dona_message`内部eventへ変換する。event payloadは`message_id`、`job_id`、`source_event_id`、kindだけで、本文は含めない。dona-mainは現在eventとのbindingを伴うread APIで本文を取得する。message commit後のpublish失敗はjob実行・Result保存・terminal notificationを失敗させず、pending deliveryとhealthのdegraded stateとして残す。
 
-通常reportはjobごと・workspaceごとのminimum intervalで抑制し、未配送の古い通常reportを`superseded`にする。`question`、`decision_request`、high riskは即時対象である。最後のreportからsilence intervalを超えた場合はgeneration-boundな`worker_message_silence` eventを一意に生成する。期限はwall-clockの絶対UTC値として保存するため、restartやclockの前後移動で同じgenerationを重複生成しない。
+通常reportはjobごと・workspaceごとのminimum intervalで抑制し、未配送の古い通常reportを`superseded`にする。`question`、`decision_request`、high riskは即時対象である。最後のreportからsilence intervalを超えた場合はgeneration-boundな`worker_message_silence` eventを一意に生成する。期限はwall-clockの絶対UTC値として保存するため、restartやclockの前後移動で同じgenerationを重複生成しない。新しいreportを受理した時点で未処理の旧generation silence eventは失効させる。
 
 ## APIとMCP
 
@@ -38,7 +39,7 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
-- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。process停止後もpending ledgerから再開し、steer側のevent idempotencyによりaccept済みpromptを重複投入しない。
+- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。blocked workerがanswerを受理した場合はrunningへ戻して監視を再開する。
 - `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`を返す。一意なら相関message ID、次のproducer sequence、conversation revisionを返し、複数なら`ambiguous: true`と`pending_count_at_least: 2`だけを返して相関先を推測させない。後続の人間回答はcurrent event bindingで`answer`へ変換し、成功後はAgent Sessionを`processing`へ戻す。通常のfree-form steerへ落とさない。
 
 ## 障害対応
