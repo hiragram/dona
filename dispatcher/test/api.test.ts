@@ -22,6 +22,7 @@ const jobs = {
   async cancel() { throw new Error("not used"); },
 };
 const proofIssued = new Date(Math.floor(Date.now() / 1_000) * 1_000);
+let proofSequence=0;
 function ingressHeaders(body: unknown): Record<string, string> {
   if (!body || typeof body !== "object" || (body as {source?:unknown}).source !== "slack") return {};
   const envelope = body as {external_event_id:string;subject:Record<string,unknown>;trace?:Record<string,unknown>};
@@ -31,7 +32,7 @@ function ingressHeaders(body: unknown): Record<string, string> {
     expires_at: new Date(proofIssued.getTime() + 120_000).toISOString().replace(/\.000Z$/, "Z"),
     issued_at: proofIssued.toISOString().replace(/\.000Z$/, "Z"),
     key_id: principalProofKeyId(testInternalToken),
-    nonce: `test-${createHash("sha256").update(`${envelope.external_event_id}:${String(envelope.trace?.ingress_attempt)}`).digest("hex").slice(0, 24)}`,
+    nonce: `test-${createHash("sha256").update(`${envelope.external_event_id}:${String(envelope.trace?.ingress_attempt)}:${proofSequence++}`).digest("hex").slice(0, 24)}`,
     principal_id: envelope.subject.actor_id,
     principal_kind: "human",
     tenant_id: envelope.subject.workspace_id,
@@ -108,7 +109,7 @@ describe("DispatcherApi", () => {
     assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued+118_500),500);
     assert.throws(()=>scheduleAccessConfirmationTimeout(issuedAt,issued+119_000),/receipt_expired/);
   });
-  test("persists before returning 202 and returns the same event for duplicates", async () => {
+  test("persists before returning 202, rejects proof replay, and accepts a fresh redelivery proof", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -121,11 +122,14 @@ describe("DispatcherApi", () => {
       logger,
     );
     await api.start();
-    const first = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
+    const envelope=eventEnvelope("Ev-1"),replayedProof=ingressHeaders(envelope);
+    const first = await request(config.socketPath, "POST", "/v1/events", envelope, "application/json", replayedProof);
     assert.equal(first.status, 202);
     assert.equal(database.list().length, 1);
     assert.equal(database.getVerifiedPrincipalBinding(String(first.body.event_id))?.principal_id, "U_TEST");
-    const duplicate = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
+    const replay=await request(config.socketPath,"POST","/v1/events",envelope,"application/json",replayedProof);
+    assert.equal(replay.status,409);
+    const duplicate = await request(config.socketPath, "POST", "/v1/events", envelope);
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.event_id, first.body.event_id);
     assert.equal(database.list().length, 1);
