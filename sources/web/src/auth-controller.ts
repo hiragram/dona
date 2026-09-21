@@ -122,7 +122,7 @@ export class WebAuthController {
     return sessionCsrf(binding(snapshot.session.state), key, now, "existing");
   }
   async handle(request: BrowserAuthRequest): Promise<BrowserAuthResponse> {
-    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false, dashboard = false;
+    const now = this.clock(); let candidates: Index[] | null = null, auditAttempted = false, dashboard = false, dashboardBoundaryVerified = false;
     try {
       now();
       if (!(request.body instanceof Uint8Array) || request.body.byteLength > 65536 || request.headers.length > 128
@@ -162,6 +162,7 @@ export class WebAuthController {
         if (!directDashboard && (site !== "same-origin" || (origin !== undefined && origin !== this.policy.origin)))
           throw new AuthFailure(403, "origin_invalid");
         if (request.body.byteLength !== 0) throw new AuthFailure(400, "session_invalid");
+        dashboardBoundaryVerified = dashboard;
       }
       const cookie = parseBrowserCookies(request.headers).session;
       if (!cookie) throw new AuthFailure(401, "cookie_invalid");
@@ -289,7 +290,7 @@ export class WebAuthController {
         } catch { failure = new AuthFailure(503, "identity_unavailable"); }
       }
       if (dashboard && (failure.status === 401 || (failure.status === 400 && ["cookie_invalid", "cookie_ambiguous"].includes(failure.reason)))) return loginRedirect();
-      if (dashboard && failure.status === 503) return dashboardFailurePage();
+      if (dashboard && dashboardBoundaryVerified && failure.status === 503) return dashboardFailurePage();
       return response(failure.status, { error: failure.publicReason });
     }
   }

@@ -329,7 +329,7 @@ test("古い復帰cancel照合失敗を新しいsession表示へ適用しない"
 });
 
 test("復帰cancel照合の404は古いdetailとfragmentを消去する",async({page})=>{
-  let releaseCancel!:()=>void;const pauseCancel=new Promise<void>(resolve=>{releaseCancel=resolve;});const f=await fixture(page,{pauseCancel,detailAfterCancelStatus:404});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"job_alpha"})).toBeVisible();releaseCancel();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page).toHaveURL(policy.origin+"/");expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
+  let releaseCancel!:()=>void;const pauseCancel=new Promise<void>(resolve=>{releaseCancel=resolve;});const f=await fixture(page,{pauseCancel,detailAfterCancelStatus:404,multipleJobs:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:/job_alpha/}).click();await page.getByRole("button",{name:"このジョブを取り消す"}).click();await page.getByRole("button",{name:"取消を送信"}).click();await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect(page.getByRole("heading",{name:"job_alpha"})).toBeVisible();releaseCancel();await expect(page.getByRole("status")).toContainText("以前の内容は消去しました");await expect(page.getByRole("heading",{name:"job_alpha"})).toBeHidden();await expect(page).toHaveURL(policy.origin+"/");await page.getByRole("button",{name:"一覧を更新"}).click();await page.getByRole("button",{name:/job_beta/}).click();await expect(page.getByRole("button",{name:"このジョブを取り消す"})).toBeEnabled();expect(f.cancelWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("別ジョブ表示中の復帰cancel照合は現在のSSEを停止しない",async({page})=>{
@@ -447,6 +447,10 @@ test("再検証と競合したsubmitの確定拒否では送信元principalの�
 
 test("再検証と競合したsubmitの403確定拒否でも入力を復元する",async({page})=>{
   await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit,submitRejected:true,submitRejectedStatus:403});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("権限拒否された依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.clock.fastForward(60001);release();await expect(page.getByRole("status")).toContainText("入力を復元しました");await expect(page.getByLabel("依頼内容")).toHaveValue("権限拒否された依頼");expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("同一世代のsubmitの403確定拒否でも再認証後に入力を復元する",async({page})=>{
+  const f=await fixture(page,{submitRejected:true,submitRejectedStatus:403});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("同一世代で権限拒否された依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.getByRole("status")).toContainText("入力を復元しました");await expect(page.getByLabel("依頼内容")).toHaveValue("同一世代で権限拒否された依頼");await expect(page.getByRole("button",{name:"依頼を送信"})).toBeEnabled();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("新しい編集中draftがある間も確定拒否された旧draftを保持する",async({page})=>{

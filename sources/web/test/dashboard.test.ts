@@ -75,3 +75,15 @@ test("IdP障害中のdashboard navigationはlocal logoutを持つsafe shellを�
   assert.equal(json.status, 503);
   assert.deepEqual(JSON.parse(json.body), { error: "identity_unavailable" });
 });
+
+test("origin拒否のaudit失敗ではdashboard shellを返さない", async () => {
+  const dashboard = controllerFixture();
+  dashboard.connections.write.mutate = async () => { throw Error("private audit details"); };
+  const request = dashboard.request("/");
+  request.headers = [...request.headers, ["origin", "https://cross-site.test"]];
+  const result = await dashboard.controller.handle(request);
+  assert.equal(result.status, 503);
+  assert.equal(result.headers["content-type"], "application/json; charset=utf-8");
+  assert.deepEqual(JSON.parse(result.body), { error: "identity_unavailable" });
+  assert.ok(!result.body.includes("<script>"));
+});
