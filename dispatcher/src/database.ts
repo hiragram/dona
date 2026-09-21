@@ -92,6 +92,9 @@ export class ScheduledJobCreationError extends Error {
     super(message); this.name = "ScheduledJobCreationError";
   }
 }
+export class JobOwnerUnavailableError extends Error {
+  constructor() { super("Unknown job owner"); this.name="JobOwnerUnavailableError"; }
+}
 export interface JobNotificationVerificationRequest { schema_version:1;event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;desired_session_status:"active"|"suspended"|null; }
 export interface JobNotificationEvidence { event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;message_ts:string;body_sha256:string;posted_at:string;reply_broadcast:false;identity_block_verified:boolean;session_status:"active"|"suspended"|null; }
 function notificationText(payload:{result?:{summary?:unknown};error_message?:unknown;job_status?:unknown}):string {
@@ -846,7 +849,7 @@ export class DispatcherDatabase {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const completion=!binding?this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined:undefined;
     const ownerJson=binding?stableStringify(binding.owner):completion?.owner_json;
-    if(!ownerJson) throw new Error("Unknown job owner");
+    if(!ownerJson) throw new JobOwnerUnavailableError();
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN job_owner_bindings b USING(job_id)
       WHERE b.owner_json=? ORDER BY j.created_at DESC LIMIT ?`).all(ownerJson,limit) as JobRow[];
   }

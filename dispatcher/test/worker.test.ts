@@ -141,6 +141,22 @@ describe("DispatcherWorker", () => {
     database.close();
   });
 
+  for(const phase of ["issue","ensure"] as const)test(`${phase}失敗後のcredential cleanup失敗はworkerを停止しない`,async()=>{
+    const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
+    const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-cleanup-${phase}`)).row;
+    const contexts={async issue(){throw new Error("issue failed");},async ensure(){throw new Error("ensure failed");},
+      async revoke(){throw new Error("cleanup failed");}} as unknown as AgentContextManager;
+    const worker=new DispatcherWorker(database,{async get(){return ok("idle");},async prompt(){return ok("working");},async wait(){return ok("done");}},
+      config,logger,undefined,()=>{},contexts);
+    if(phase==="issue")await (worker as unknown as {dispatch(row:typeof event):Promise<void>}).dispatch(event);
+    else {
+      const dispatching=database.beginDispatch(event.event_id,path.join(config.resultsDir,`${event.event_id}.json`));database.markWaiting(event.event_id);
+      await (worker as unknown as {resumeWaiting(row:typeof event):Promise<void>}).resumeWaiting({...dispatching,status:"waiting_agent"});
+    }
+    assert.equal(database.get(event.event_id)?.status,"needs_review");
+    database.close();
+  });
+
   for(const waited of [failed("agent_not_running"),ok("blocked")]) test(`keeps running when ${waited.ok?"blocked":"failed"} wait result arrives after event completion`,async()=>{
     const {root,config}=await tempConfig(); roots.push(root); await fs.mkdir(config.resultsDir,{recursive:true});
     const database=new DispatcherDatabase(config.databasePath),event=database.enqueue(eventEnvelope(`Ev-wait-race-${waited.ok?"blocked":"failed"}`)).row;

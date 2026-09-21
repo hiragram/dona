@@ -270,6 +270,21 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.deepEqual((deepOwner.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
     assert.equal(deepOwner.truncated, false);
 
+    const listOwnerJobs=database.listOwnerJobs.bind(database),listThreadJobs=database.listThreadJobs.bind(database);
+    database.listOwnerJobs=(()=>Array.from({length:1_001},()=>database.getJob(second.job_id)!)) as typeof database.listOwnerJobs;
+    await assert.rejects(()=>client.listOwnerJobs(source.event_id),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===503&&
+        (error.body as {error?:{code?:string}}).error?.code==="owner_query_unavailable");
+    database.listOwnerJobs=(()=>{throw new Error("storage unavailable");}) as typeof database.listOwnerJobs;
+    await assert.rejects(()=>client.listOwnerJobs(source.event_id),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===503);
+    database.listOwnerJobs=listOwnerJobs;
+    database.listThreadJobs=(()=>Array.from({length:1_001},()=>database.getJob(second.job_id)!)) as typeof database.listThreadJobs;
+    await assert.rejects(()=>client.listThreadJobs(source.event_id,"T_TEST","C_TEST","1756722030.123456"),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===503&&
+        (error.body as {error?:{code?:string}}).error?.code==="thread_query_unavailable");
+    database.listThreadJobs=listThreadJobs;
+
     const nonIntentEnvelope={...eventEnvelope("agent-read-non-intent"),payload:{text:"雑談です",event_ts:"1756722031.123456"}};
     const nonIntent=database.enqueue(nonIntentEnvelope,new Date(Date.now()+200),proof(nonIntentEnvelope.external_event_id)).row;
     await contexts.issue(database.beginDispatch(nonIntent.event_id,path.join(config.resultsDir,`${nonIntent.event_id}.json`)));

@@ -52,13 +52,14 @@ class FakeSlackClient implements SlackApiClient {
   postCount = 0;
   statusCount = 0;
   failStatusOnce = false;
+  shared = false;
   async authenticate() { return { teamId: "T123", botId: "B_TEST", botUserId: "U_TEST" }; }
   async listChannels(): Promise<SlackChannelPage> { return { channels: [] }; }
   async getChannel(): Promise<SlackChannel> {
-    return { id: "C123", isPrivate: false, isArchived: false, isMember: true, isShared: false };
+    return { id: "C123", isPrivate: false, isArchived: false, isMember: true, isShared: this.shared, visibilityKnown:true };
   }
   async listUsers(): Promise<SlackUserPage> { return { users: [] }; }
-  async getUser(): Promise<SlackUser> { return { id: "U_TEST", isBot: false, isAppUser: false, isDeleted: false }; }
+  async getUser(): Promise<SlackUser> { return { id: "U_TEST", teamId:"T123", stateKnown:true, isBot: false, isAppUser: false, isDeleted: false }; }
   async hasChannelMember():Promise<boolean> { return true; }
   async getThread(_channelId: string, _threadTs: string, _limit: number, cursor?: string): Promise<SlackThread> {
     if (this.threadPageReader) return this.threadPageReader(cursor);
@@ -130,9 +131,11 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount,1);
   });
   test("schedule accessをadapterのlive membershipへ固定する",async()=>{
-    const {reporter}=await reporterFixture();
+    const {client,reporter}=await reporterFixture();
     assert.deepEqual(await reporter.confirmScheduleAccess({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST"}),
       {schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST",authorized:true,channel_kind:"other",channel_user_id:null});
+    client.shared=true;
+    await assert.rejects(()=>reporter.confirmScheduleAccess({schema_version:1,event_id:"evt_01m1zfewbjx8v0844yrrkqwzc7",workspace_id:"T123",channel_id:"C123",user_id:"U_TEST"}));
   });
   test("strictly binds the notification identity to the request and terminal fence", () => {
     assert.deepEqual(parseUpdateNotificationRequest(request), request);

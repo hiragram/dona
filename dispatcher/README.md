@@ -207,6 +207,16 @@ npm exec -- tsx src/cli.ts job live-session-retention
 npm exec -- tsx src/cli.ts job live-session-retention --apply --force
 ```
 
+### Human-wait read model repair
+
+Migration前から存在するwait正本をbounded batchで補修する。全batchで同じsnapshotを固定し、`next_cursor`が`null`になるまで返されたcursorを次の呼び出しへ渡す。最初にdry-runし、同じsnapshot/cursor/limitで確認後だけ`--apply --force`を付ける。
+
+```bash
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100 --apply --force
+npm exec -- tsx src/cli.ts human-wait repair --snapshot 2026-09-21T00:00:00.000Z --cursor '<next_cursor>' --limit 100
+```
+
 `blocked`または`needs_review`のretryには`--force`が必要です。Herdr画面、結果ファイル、構造化ログを確認し、二重実行の可能性を理解した場合だけ実行してください。
 
 ## 状態と復旧

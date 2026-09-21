@@ -178,7 +178,7 @@ export class DispatcherWorker {
     if(dispatching.status==="completed") return;
     try { await this.agentContexts?.issue(dispatching); }
     catch (error) {
-      await this.agentContexts?.revoke(dispatching.event_id);
+      await this.revokeAgentContext(dispatching.event_id);
       this.database.markNeedsReview(dispatching.event_id, "agent_context_unavailable", error instanceof Error ? error.message : String(error));
       this.logCurrentTransition(dispatching, started);
       return;
@@ -186,14 +186,14 @@ export class DispatcherWorker {
     const prompt = buildEventPrompt(row.event_id, resultPath, envelopeFromRow(row));
     const prompted = await this.herdr.prompt(prompt, this.abortController.signal);
     const afterPrompt=this.database.get(row.event_id);
-    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) { await this.agentContexts?.revoke(row.event_id); return; }
+    if(!afterPrompt||!["dispatching","waiting_agent"].includes(afterPrompt.status)) { await this.revokeAgentContext(row.event_id); return; }
     if (prompted.aborted || this.stopping) {
       this.database.markNeedsReview(
         row.event_id,
         "prompt_interrupted",
         "Dispatcher stopped while prompt acceptance was unknown",
       );
-      await this.agentContexts?.revoke(row.event_id);
+      await this.revokeAgentContext(row.event_id);
       this.logCurrentTransition(dispatching, started);
       return;
     }
@@ -207,7 +207,7 @@ export class DispatcherWorker {
             "prompt_acceptance_unknown",
             "Agent became unavailable after the event advanced during prompt submission",
           );
-          await this.agentContexts?.revoke(row.event_id);
+          await this.revokeAgentContext(row.event_id);
           this.logCurrentTransition(dispatching, started);
           return;
         }
@@ -217,7 +217,7 @@ export class DispatcherWorker {
           commandMessage(prompted),
           this.config.maxAttempts,
         );
-        await this.agentContexts?.revoke(row.event_id);
+        await this.revokeAgentContext(row.event_id);
         this.logTransition(dispatching, updated, started);
         return;
       } else {
@@ -226,14 +226,14 @@ export class DispatcherWorker {
           prompted.errorCode ?? (prompted.timedOut ? "prompt_timeout" : "prompt_unknown"),
           commandMessage(prompted),
         );
-        await this.agentContexts?.revoke(row.event_id);
+        await this.revokeAgentContext(row.event_id);
       }
       this.logCurrentTransition(dispatching, started);
       return;
     }
 
     if(afterPrompt?.status==="dispatching") this.database.markWaiting(row.event_id);
-    else if(afterPrompt?.status!=="waiting_agent") { await this.agentContexts?.revoke(row.event_id); return; }
+    else if(afterPrompt?.status!=="waiting_agent") { await this.revokeAgentContext(row.event_id); return; }
     const waiting = this.database.get(row.event_id)!;
     this.logTransition(dispatching, waiting, started);
     await this.resumeWaiting(waiting);
@@ -242,7 +242,7 @@ export class DispatcherWorker {
   private async resumeWaiting(row: EventRow): Promise<void> {
     if (!row.result_path) {
       this.database.markNeedsReview(row.event_id, "missing_result_path", "waiting_agent event has no result path");
-      await this.agentContexts?.revoke(row.event_id);
+      await this.revokeAgentContext(row.event_id);
       return;
     }
 
@@ -251,7 +251,7 @@ export class DispatcherWorker {
     try {
       await this.agentContexts?.ensure(row);
     } catch (error) {
-      await this.agentContexts?.revoke(row.event_id);
+      await this.revokeAgentContext(row.event_id);
       if (error instanceof AgentPrincipalUnavailableError) {
         if (row.last_error_code !== error.code) {
           this.database.recordWaitingError(row.event_id, error.code, error.message);
@@ -355,7 +355,7 @@ export class DispatcherWorker {
     try {
       await this.agentContexts?.revoke(eventId);
     } catch (error) {
-      this.logger.warn("Agent credential cleanup failed after terminal event settlement", {
+      this.logger.warn("Agent credential cleanup failed", {
         event_id: eventId,
         error_code: "agent_context_cleanup_failed",
         error_message: error instanceof Error ? error.message : String(error),

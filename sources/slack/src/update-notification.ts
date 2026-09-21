@@ -1,6 +1,7 @@
 import type { SlackAgentSessionStatus, SlackApiClient, SlackThreadMessage } from "./slack-api.js";
 import { createHash } from "node:crypto";
 import type { SlackWorkspaceRegistry } from "./workspace-registry.js";
+import { verifyCurrentSlackAccess } from "./current-access.js";
 
 const notificationIdPattern = /^update:upd_[0-9a-hjkmnp-tv-z]{26}:terminal:\d+$/;
 const idPattern = /^[A-Z][A-Z0-9]{1,31}$/;
@@ -277,9 +278,9 @@ export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
 
   async confirmScheduleAccess(input:ScheduleAccessConfirmationRequest):Promise<ScheduleAccessConfirmationResult> {
     let connection; try { connection=this.registry.getByTeamId(input.workspace_id); } catch { throw new Error("unknown_workspace"); }
-    const user=await connection.client.getUser(input.user_id),channel=await connection.client.getChannel(input.channel_id);
-    if(!connection.client.hasChannelMember||user.isDeleted||channel.isArchived||!await connection.client.hasChannelMember(input.channel_id,input.user_id)) throw new Error("schedule_access_not_confirmed");
-    return {...input,workspace_id:connection.teamId,authorized:true,channel_kind:channel.isIm?"im":"other",channel_user_id:channel.isIm?channel.userId??null:null};
+    const evidence=await verifyCurrentSlackAccess(connection.client,connection.teamId,
+      {eventId:input.event_id,channelId:input.channel_id,userId:input.user_id});
+    return {...input,workspace_id:evidence.workspace_id,authorized:true,channel_kind:evidence.channel_kind,channel_user_id:evidence.channel_user_id};
   }
 
   async settleJobSession(input:JobSessionSettlementRequest):Promise<JobSessionSettlementResult> {

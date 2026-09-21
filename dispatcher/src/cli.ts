@@ -34,6 +34,7 @@ function usage(): never {
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher human-wait repair --snapshot REVISION [--cursor CURSOR] [--limit N] [--apply --force]
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -53,13 +54,36 @@ async function main(): Promise<void> {
     await runService(config);
     return;
   }
-  if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
+  if (!["event", "job", "scheduler", "human-wait"].includes(args[0]!)) usage();
   const command = args[1];
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
   try {
+    if(args[0]==="human-wait") {
+      if(command!=="repair")usage();
+      let snapshotRevision:string|undefined,cursor:string|null=null,limit=100,apply=false,force=false;
+      const seen=new Set<string>();
+      for(let index=2;index<args.length;index++){
+        const option=args[index]!;
+        if(seen.has(option))usage();
+        seen.add(option);
+        if(option==="--apply"){apply=true;continue;}
+        if(option==="--force"){force=true;continue;}
+        const value=args[++index];if(!value)usage();
+        if(option==="--snapshot")snapshotRevision=value;
+        else if(option==="--cursor")cursor=value;
+        else if(option==="--limit")limit=Number(value);
+        else usage();
+      }
+      if(!snapshotRevision)usage();
+      const dryRun=!apply;
+      if(!dryRun&&!force)throw new Error("human wait repair apply requires --force; run without --apply for dry-run");
+      if(dryRun&&force)usage();
+      const result=database.humanWaits.repair({dryRun,limit,cursor,snapshotRevision});
+      console.log(JSON.stringify({schema_version:1,...result},null,2));return;
+    }
     if (args[0] === "scheduler") {
       const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
       if (command === "health") { console.log(JSON.stringify(database.scheduler.operationalSnapshot(now), null, 2)); return; }

@@ -9,7 +9,7 @@ import { agentBodyEventOperations, agentOperation, type AgentContextManager, typ
 import { AgentReadAuthorization, projectAuthorizedJob, projectCompletionJob, type AgentReadSurface } from "./agent-read-authorization.js";
 import { HumanWaitQueryError, HumanWaitQueryService } from "./human-wait-query.js";
 import { hasExplicitOwnHumanWaitIntent, HumanWaitPresentationError, renderHumanWaits } from "./human-wait-presentation.js";
-import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
+import { dispatcherSchemaCompatibility, JobCreationError, JobOwnerUnavailableError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
 import type { Logger } from "./logger.js";
 import type { JobControlResult } from "./job-supervisor.js";
 import type { JobRow } from "./types.js";
@@ -920,17 +920,21 @@ export class DispatcherApi {
         const context = this.verifiedAgentContexts.get(request);
         try {
           const rows = this.database.listOwnerJobs(sourceEventId, context ? agentReadCandidateScanMax + 1 : 100);
+          if(context&&rows.length>agentReadCandidateScanMax)throw new ApiRequestError(503,"owner_query_unavailable","Owner job query is unavailable");
           const scanned = context ? rows.slice(0, agentReadCandidateScanMax) : rows;
           const jobs = context
             ? scanned.filter(row => this.agentJobAllowed(request, "list_owner_jobs", row)).map(projectAuthorizedJob)
             : scanned.map(({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code})=>
               ({job_id,source_event_id,job_key,status,created_at,updated_at,completed_at,last_error_code}));
           sendJson(response,200,{schema_version:1,jobs:jobs.slice(0,100),
-            ...(context ? { truncated: jobs.length > 100 || rows.length > agentReadCandidateScanMax } : {})});
+            ...(context ? { truncated: jobs.length > 100 } : {})});
         }
-        catch {
-          if (context) sendJson(response, 200, { schema_version: 1, jobs: [] });
-          else throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");
+        catch(error) {
+          if(error instanceof ApiRequestError)throw error;
+          if(error instanceof JobOwnerUnavailableError){
+            if(context)sendJson(response,200,{schema_version:1,jobs:[],truncated:false});
+            else throw new ApiRequestError(403,"owner_mismatch","Unknown event owner");
+          } else throw new ApiRequestError(503,"owner_query_unavailable","Owner job query is unavailable");
         }
         return;
       }
@@ -950,6 +954,7 @@ export class DispatcherApi {
       }
       const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs,
         agentContext ? agentReadCandidateScanMax + 1 : 101);
+      if(agentContext&&candidates.length>agentReadCandidateScanMax)throw new ApiRequestError(503,"thread_query_unavailable","Thread job query is unavailable");
       const scanned = agentContext ? candidates.slice(0, agentReadCandidateScanMax) : candidates;
       const visible = agentContext
         ? scanned.filter(row => this.agentJobAllowed(request, "list_thread_jobs", row))
@@ -957,7 +962,7 @@ export class DispatcherApi {
       sendJson(response, 200, {
         schema_version: 1,
         jobs: agentContext ? visible.slice(0, 100).map(projectAuthorizedJob) : visible.slice(0,100),
-        truncated: visible.length > 100 || (agentContext !== undefined && candidates.length > agentReadCandidateScanMax),
+        truncated: visible.length > 100,
       });
       return;
     }

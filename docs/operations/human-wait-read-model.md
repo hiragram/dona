@@ -31,6 +31,14 @@ write対象の正本rowは`source_revision <= snapshotRevision`で絞り、UPDAT
 
 schema追加は既存core migration transactionの後にexpand-onlyで行う。core v2→v3 rebuild時はread-model triggerを一時dropし、成功後に再作成する。migration failureはSQLite transactionと既存migration testで旧schemaへrollbackする。既存rowのbackfillはstartupで無制限走査せず、上記bounded repairで行う。
 
+productionでのsupportedな入口は`dona-dispatcher human-wait repair`である。全batchで同じUTC snapshotとlimitを固定し、dry-runの`next_cursor`が`null`になるまで、各cursorについてdry-run後に同じ引数へ`--apply --force`を付けて適用する。応答を失ったbatchはblind retryしない。
+
+```sh
+dona-dispatcher human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100
+dona-dispatcher human-wait repair --snapshot 2026-09-21T00:00:00.000Z --limit 100 --apply --force
+dona-dispatcher human-wait repair --snapshot 2026-09-21T00:00:00.000Z --cursor '<next_cursor>' --limit 100
+```
+
 ## audit、retention、purge
 
 `human_wait_audit`へ保存するのはitem ID、reason class、source revision、transition、actor class、timestampだけである。objective、Result、error本文、secret、destinationは保存しない。
