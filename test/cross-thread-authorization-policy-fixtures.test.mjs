@@ -34,9 +34,8 @@ test('principal proofとoperation catalogは重複のない固定集合である
   assert.deepEqual(operations, [...operations].sort());
   assert.equal(new Set(required).size, required.length);
   assert.equal(new Set(operations).size, operations.length);
-  for (const field of ['event_id', 'attempt', 'tenant_id', 'workspace_id', 'principal_kind', 'principal_id', 'nonce']) {
-    assert.ok(required.includes(field), field);
-  }
+  assert.deepEqual(required, ['attempt', 'event_id', 'expires_at', 'issued_at', 'key_id', 'nonce',
+    'principal_id', 'principal_kind', 'tenant_id', 'version', 'workspace_id']);
   assert.ok(operations.includes('read_own_human_waits'));
   assert.deepEqual(fixture.principal_proof.kinds_allowed_owner_wide, ['human']);
 });
@@ -50,35 +49,58 @@ const decide = entry => {
     || binding.event_id !== request.event_id || binding.attempt !== request.attempt) return ['deny', 'event_attempt_mismatch'];
   if (binding.principal_kind !== principal.kind) return ['deny', 'principal_kind_denied'];
   if (principal.id !== binding.principal_id || principal.id !== grant.principal_id) return ['deny', 'principal_mismatch'];
+  if (principal.tenant_id !== request.tenant_id || principal.workspace_id !== request.workspace_id) return ['deny', 'principal_scope_mismatch'];
   for (const key of ['tenant_id', 'workspace_id']) {
     if (request[key] !== binding[key] || request[key] !== grant[key]) return ['deny', 'binding_scope_mismatch'];
   }
+  if (binding.status !== 'active' || binding.revoked_at) return ['deny', 'binding_revoked'];
+  if (binding.current_revision !== request.binding_revision) return ['deny', 'binding_revoked'];
   if (access.status === 'unavailable') return ['deny', 'access_unavailable'];
   if (access.status !== 'current') return ['deny', 'membership_revoked'];
+  const accessIssued = Date.parse(access.issued_at), accessExpires = Date.parse(access.expires_at), now = Date.parse(request.now);
+  const accessLifetime = accessExpires - accessIssued;
   if (access.event_id !== request.event_id || access.principal_id !== principal.id
     || access.workspace_id !== request.workspace_id || access.destination_id !== request.destination_id
-    || access.consumed || Date.parse(request.now) >= Date.parse(access.expires_at)
-    || Date.parse(access.expires_at) - Date.parse(access.issued_at) > fixture.access_proof.max_age_seconds * 1000) {
+    || access.consumed || ![accessIssued, accessExpires, now].every(Number.isFinite)
+    || accessLifetime <= 0 || accessLifetime > fixture.access_proof.max_age_seconds * 1000
+    || accessIssued > now || now >= accessExpires) {
     return ['deny', 'access_unavailable'];
   }
-  for (const key of ['resource_kind', 'resource_id', 'resource_revision']) if (request[key] !== grant[key]) return ['deny', 'resource_mismatch'];
+  if (grant.scope_kind === 'epic_children_snapshot') {
+    if (grant.resource_kind !== 'epic' || request.parent_resource_id !== grant.resource_id
+      || request.parent_resource_revision !== grant.resource_revision
+      || !grant.child_snapshot.includes(request.resource_id)) return ['deny', 'resource_mismatch'];
+  } else {
+    for (const key of ['resource_kind', 'resource_id', 'resource_revision']) if (request[key] !== grant[key]) return ['deny', 'resource_mismatch'];
+  }
   if (!fixture.grant.operations.includes(request.operation) || !fixture.grant.operations.includes(grant.operation)
     || request.operation !== grant.operation) return ['deny', 'operation_denied'];
-  if (request.policy_revision !== grant.policy_revision) return ['deny', 'policy_revision_mismatch'];
+  if (request.policy_revision !== grant.policy_revision
+    || entry.current_policy_revision !== request.policy_revision) return ['deny', 'policy_revision_mismatch'];
   if (grant.status !== 'active' || grant.revoked_at) return ['deny', 'grant_revoked'];
-  if (grant.current_revision !== request.resource_revision) return ['deny', 'resource_mismatch'];
+  const expectedGrantRevision = grant.scope_kind === 'epic_children_snapshot'
+    ? request.parent_resource_revision : request.resource_revision;
+  if (grant.current_revision !== expectedGrantRevision) return ['deny', 'resource_mismatch'];
   const grantLifetime = Date.parse(grant.expires_at) - Date.parse(grant.issued_at);
   if (grantLifetime <= 0 || grantLifetime > fixture.grant.max_age_seconds * 1000) return ['deny', 'invalid_grant_lifetime'];
   if (Date.parse(request.now) >= Date.parse(grant.expires_at)) return ['deny', 'grant_expired'];
   if (fixture.approval.required_operations.includes(request.operation)) {
     const receipt = entry.approval_receipt;
-    const validIssuer = receipt && fixture.approval.issuer_kinds.includes(receipt.issuer_kind);
+    const requiredFields = ['version', 'receipt_id', 'issuer_kind', 'issuer_id', 'tenant_id', 'principal_id',
+      'resource_kind', 'resource_id', 'resource_revision', 'operation', 'issued_at', 'expires_at',
+      'policy_revision', 'nonce', 'consumed', 'signature_verified'];
+    const complete = receipt && requiredFields.every(key => Object.hasOwn(receipt, key));
+    const validIssuer = complete && receipt.version === 1 && receipt.signature_verified
+      && typeof receipt.receipt_id === 'string' && receipt.receipt_id.length > 0
+      && typeof receipt.issuer_id === 'string' && receipt.issuer_id.length > 0
+      && typeof receipt.nonce === 'string' && receipt.nonce.length > 0
+      && fixture.approval.issuer_kinds.includes(receipt.issuer_kind);
     const validIdentity = receipt && receipt.tenant_id === request.tenant_id
       && receipt.principal_id === principal.id && receipt.resource_kind === request.resource_kind
       && receipt.resource_id === request.resource_id && receipt.resource_revision === request.resource_revision
       && receipt.operation === request.operation && receipt.policy_revision === request.policy_revision;
     const lifetime = receipt ? Date.parse(receipt.expires_at) - Date.parse(receipt.issued_at) : NaN;
-    if (!receipt || !validIssuer || !validIdentity || receipt.consumed
+    if (!complete || !validIssuer || !validIdentity || receipt.consumed
       || lifetime <= 0 || lifetime > fixture.approval.max_age_seconds * 1000
       || Date.parse(request.now) >= Date.parse(receipt.expires_at)) return ['deny', 'approval_unavailable'];
   }
@@ -86,7 +108,7 @@ const decide = entry => {
 };
 
 const projectDeny = entry => entry.decision === 'allow' ? null : ({
-  code: entry.reason === 'access_unavailable' ? 'access_unavailable' : 'not_available',
+  code: ['access_unavailable', 'membership_revoked'].includes(entry.reason) ? 'access_unavailable' : 'not_available',
 });
 
 test('threat/failure fixtureは具体的な入力からallow/denyを導出する', () => {
@@ -101,7 +123,12 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
     'access_principal_mismatch', 'access_event_mismatch', 'access_expired', 'access_consumed',
     'steer_with_approval', 'steer_missing_approval', 'cancel_approval_at_expiry',
     'steer_approval_issuer_mismatch', 'steer_approval_resource_mismatch',
-    'steer_approval_revision_mismatch']) {
+    'steer_approval_revision_mismatch', 'principal_tenant_mismatch', 'principal_workspace_mismatch',
+    'binding_revoked', 'current_policy_revision_mismatch', 'access_negative_lifetime',
+    'access_future_issued_at', 'access_invalid_time', 'steer_approval_missing_field',
+    'steer_approval_unknown_version', 'steer_approval_unverified', 'allow_read_exact_job_status',
+    'allow_read_bounded_result', 'allow_resolve_origin_ref', 'allow_cancel_exact_job',
+    'epic_snapshot_child', 'epic_future_child']) {
     assert.ok(byId[id], id);
   }
   for (const entry of fixture.cases) {
@@ -109,9 +136,13 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
     assert.deepEqual(decide(entry), [entry.decision, entry.reason], entry.id);
     assert.deepEqual(projectDeny(entry), entry.expected_external, entry.id);
     if (entry.expected_external) assert.deepEqual(Object.keys(entry.expected_external), ['code'], entry.id);
+    if (entry.request.operation.startsWith('read_') || entry.request.operation === 'resolve_origin_ref') {
+      assert.deepEqual(entry.state_after, entry.state_before, entry.id);
+      assert.deepEqual(entry.expected_effects, ['restricted_authorization_audit'], entry.id);
+    }
   }
-  assert.deepEqual(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.id),
-    ['grant_before_expiry', 'steer_with_approval']);
+  assert.deepEqual(new Set(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.request.operation)),
+    new Set(fixture.grant.operations));
   assert.equal(byId.grant_at_expiry.reason, 'grant_expired');
   assert.equal(byId.provider_unavailable.reason, 'access_unavailable');
   assert.equal(byId.legacy_unknown.principal.kind, 'unknown');

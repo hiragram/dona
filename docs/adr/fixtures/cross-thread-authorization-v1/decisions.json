@@ -68,7 +68,9 @@
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -81,7 +83,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -89,7 +92,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -103,7 +109,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "allow",
       "reason": "authorized",
@@ -124,14 +132,34 @@
         "consumed": false
       },
       "approval_receipt": null,
-      "expected_external": null
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "stale_event_substitution",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_replaced",
@@ -144,7 +172,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -152,7 +181,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -166,7 +198,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "event_attempt_mismatch",
@@ -189,14 +223,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "forged_completion",
       "transport": "forged",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -209,7 +263,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -217,7 +272,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -231,7 +289,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "unverified_ingress",
@@ -254,14 +314,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "unauthenticated_enqueue",
       "transport": "unauthenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -274,7 +354,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -282,7 +363,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -296,7 +380,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "unverified_ingress",
@@ -319,14 +405,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "different_actor",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OTHER"
+        "id": "U_OTHER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -339,7 +445,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -347,7 +454,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -361,7 +471,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "principal_mismatch",
@@ -384,14 +496,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "bot_principal",
       "transport": "authenticated",
       "principal": {
         "kind": "bot",
-        "id": "B_OWNER"
+        "id": "B_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -404,7 +536,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -412,7 +545,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "bot",
-        "principal_id": "B_OWNER"
+        "principal_id": "B_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "B_OWNER",
@@ -426,7 +562,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "principal_kind_denied",
@@ -449,14 +587,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "service_principal",
       "transport": "authenticated",
       "principal": {
         "kind": "service",
-        "id": "S_OWNER"
+        "id": "S_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -469,7 +627,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -477,7 +636,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "service",
-        "principal_id": "S_OWNER"
+        "principal_id": "S_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "S_OWNER",
@@ -491,7 +653,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "principal_kind_denied",
@@ -514,14 +678,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "membership_revoked",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -534,7 +718,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -542,7 +727,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -556,7 +744,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "membership_revoked",
@@ -578,15 +768,35 @@
       },
       "approval_receipt": null,
       "expected_external": {
-        "code": "not_available"
-      }
+        "code": "access_unavailable"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "provider_unavailable",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -599,7 +809,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -607,7 +818,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -621,7 +835,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -644,14 +860,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "grant_at_expiry",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -664,7 +900,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:15:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -672,7 +909,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -686,7 +926,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "grant_expired",
@@ -709,14 +951,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "exact_task_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -729,7 +991,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -737,7 +1000,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -751,7 +1017,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "resource_mismatch",
@@ -774,14 +1042,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "operation_denied",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -794,7 +1082,8 @@
         "operation": "read_bounded_result",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -802,7 +1091,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -816,7 +1108,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "operation_denied",
@@ -839,14 +1133,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "policy_revision_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -859,7 +1173,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 8,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -867,7 +1182,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -881,7 +1199,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "policy_revision_mismatch",
@@ -904,14 +1224,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "legacy_unknown",
       "transport": "authenticated",
       "principal": {
         "kind": "unknown",
-        "id": "legacy"
+        "id": "legacy",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_legacy",
@@ -924,7 +1264,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": null,
       "grant": null,
@@ -949,14 +1290,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "stale_transport_capability",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_old",
@@ -969,7 +1330,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_old",
@@ -977,7 +1339,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -991,7 +1356,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "event_attempt_mismatch",
@@ -1014,14 +1381,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "binding_tenant_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1034,7 +1421,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1042,7 +1430,10 @@
         "tenant_id": "T_OTHER",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1056,7 +1447,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "binding_scope_mismatch",
@@ -1079,14 +1472,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "binding_workspace_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1099,7 +1512,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1107,7 +1521,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_OTHER",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1121,7 +1538,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "binding_scope_mismatch",
@@ -1144,14 +1563,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "binding_kind_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1164,7 +1603,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1172,7 +1612,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "bot",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1186,7 +1629,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "principal_kind_denied",
@@ -1209,14 +1654,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "grant_too_long",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1229,7 +1694,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1237,7 +1703,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1251,7 +1720,9 @@
         "expires_at": "2026-09-21T00:15:01Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "invalid_grant_lifetime",
@@ -1274,14 +1745,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "grant_revoked",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1294,7 +1785,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1302,7 +1794,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1317,7 +1812,9 @@
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "revoked",
         "current_revision": 3,
-        "revoked_at": "2026-09-21T00:05:00Z"
+        "revoked_at": "2026-09-21T00:05:00Z",
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "grant_revoked",
@@ -1340,14 +1837,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "unknown_operation",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1360,7 +1877,8 @@
         "operation": "delete_everything",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1368,7 +1886,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1382,7 +1903,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "operation_denied",
@@ -1405,14 +1928,22 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "access_destination_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1425,7 +1956,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1433,7 +1965,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1447,7 +1982,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -1470,14 +2007,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "access_principal_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1490,7 +2047,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1498,7 +2056,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1512,7 +2073,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -1535,14 +2098,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "access_event_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1555,7 +2138,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1563,7 +2147,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1577,7 +2164,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -1600,14 +2189,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "access_expired",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1620,7 +2229,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1628,7 +2238,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1642,7 +2255,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -1665,14 +2280,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "access_consumed",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1685,7 +2320,8 @@
         "operation": "read_own_human_waits",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1693,7 +2329,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1707,7 +2346,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "access_unavailable",
@@ -1730,14 +2371,34 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "access_unavailable"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "steer_with_approval",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1750,7 +2411,8 @@
         "operation": "steer_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:10:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1758,7 +2420,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1772,7 +2437,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "allow",
       "reason": "authorized",
@@ -1807,16 +2474,25 @@
         "expires_at": "2026-09-21T00:14:00Z",
         "policy_revision": 7,
         "nonce": "nonce-steer_exact_job",
-        "consumed": false
+        "consumed": false,
+        "signature_verified": true
       },
-      "expected_external": null
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "steer_missing_approval",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1829,7 +2505,8 @@
         "operation": "steer_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1837,7 +2514,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1851,7 +2531,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "approval_unavailable",
@@ -1874,14 +2556,22 @@
       "approval_receipt": null,
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "cancel_approval_at_expiry",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1894,7 +2584,8 @@
         "operation": "cancel_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:00Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1902,7 +2593,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1916,7 +2610,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "approval_unavailable",
@@ -1951,18 +2647,27 @@
         "expires_at": "2026-09-21T00:14:00Z",
         "policy_revision": 7,
         "nonce": "nonce-cancel_exact_job",
-        "consumed": false
+        "consumed": false,
+        "signature_verified": true
       },
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "steer_approval_issuer_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -1975,7 +2680,8 @@
         "operation": "steer_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -1983,7 +2689,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -1997,7 +2706,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "approval_unavailable",
@@ -2032,18 +2743,27 @@
         "expires_at": "2026-09-21T00:14:00Z",
         "policy_revision": 7,
         "nonce": "nonce-steer_exact_job",
-        "consumed": false
+        "consumed": false,
+        "signature_verified": true
       },
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "steer_approval_resource_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -2056,7 +2776,8 @@
         "operation": "steer_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -2064,7 +2785,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -2078,7 +2802,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "approval_unavailable",
@@ -2113,18 +2839,27 @@
         "expires_at": "2026-09-21T00:14:00Z",
         "policy_revision": 7,
         "nonce": "nonce-steer_exact_job",
-        "consumed": false
+        "consumed": false,
+        "signature_verified": true
       },
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     },
     {
       "id": "steer_approval_revision_mismatch",
       "transport": "authenticated",
       "principal": {
         "kind": "human",
-        "id": "U_OWNER"
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
       },
       "request": {
         "event_id": "evt_current",
@@ -2137,7 +2872,8 @@
         "operation": "steer_exact_job",
         "policy_revision": 7,
         "now": "2026-09-21T00:14:59Z",
-        "destination_id": "C_PRIVATE"
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
       },
       "binding": {
         "event_id": "evt_current",
@@ -2145,7 +2881,10 @@
         "tenant_id": "T_FIXTURE",
         "workspace_id": "T_FIXTURE",
         "principal_kind": "human",
-        "principal_id": "U_OWNER"
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
       },
       "grant": {
         "principal_id": "U_OWNER",
@@ -2159,7 +2898,9 @@
         "expires_at": "2026-09-21T00:15:00Z",
         "issued_at": "2026-09-21T00:00:00Z",
         "status": "active",
-        "current_revision": 3
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
       },
       "decision": "deny",
       "reason": "approval_unavailable",
@@ -2194,11 +2935,1527 @@
         "expires_at": "2026-09-21T00:14:00Z",
         "policy_revision": 7,
         "nonce": "nonce-steer_exact_job",
-        "consumed": false
+        "consumed": false,
+        "signature_verified": true
       },
       "expected_external": {
         "code": "not_available"
-      }
+      },
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "principal_tenant_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_OTHER",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "principal_scope_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-principal_tenant_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "principal_workspace_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_OTHER"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "principal_scope_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-principal_workspace_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "binding_revoked",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "revoked",
+        "current_revision": 1,
+        "revoked_at": "2026-09-21T00:05:00Z"
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "binding_revoked",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-binding_revoked",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "current_policy_revision_mismatch",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 6,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 6,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "policy_revision_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-current_policy_revision_mismatch",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "access_negative_lifetime",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:15:30Z",
+        "expires_at": "2026-09-21T00:15:00Z",
+        "nonce": "access-access_negative_lifetime",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "access_future_issued_at",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:15:30Z",
+        "expires_at": "2026-09-21T00:16:00Z",
+        "nonce": "access-access_future_issued_at",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "access_invalid_time",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "access_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "invalid",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-access_invalid_time",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "access_unavailable"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "steer_approval_missing_field",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_missing_field",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "consumed": false,
+        "signature_verified": true
+      },
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "steer_approval_unknown_version",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_unknown_version",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 2,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false,
+        "signature_verified": true
+      },
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "steer_approval_unverified",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "deny",
+      "reason": "approval_unavailable",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-steer_approval_unverified",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-steer_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "steer_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-steer_exact_job",
+        "consumed": false,
+        "signature_verified": false
+      },
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "allow_cancel_exact_job",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-allow_cancel_exact_job",
+        "consumed": false
+      },
+      "approval_receipt": {
+        "version": 1,
+        "receipt_id": "approval-cancel_exact_job",
+        "issuer_kind": "supervisor",
+        "issuer_id": "supervisor-fixture",
+        "tenant_id": "T_FIXTURE",
+        "principal_id": "U_OWNER",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "cancel_exact_job",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:14:00Z",
+        "policy_revision": 7,
+        "nonce": "nonce-cancel_exact_job",
+        "consumed": false,
+        "signature_verified": true
+      },
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": null,
+      "state_after": null,
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "allow_read_bounded_result",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_bounded_result",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_bounded_result",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-allow_read_bounded_result",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "allow_read_exact_job_status",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_exact_job_status",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_exact_job_status",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-allow_read_exact_job_status",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "allow_resolve_origin_ref",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "resolve_origin_ref",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:10:00Z",
+        "destination_id": "C_PRIVATE",
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "resolve_origin_ref",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "exact_resource",
+        "child_snapshot": []
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:09:00Z",
+        "expires_at": "2026-09-21T00:11:00Z",
+        "nonce": "access-allow_resolve_origin_ref",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "epic_snapshot_child",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:161",
+        "resource_revision": 1,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "parent_resource_id": "issue:160",
+        "parent_resource_revision": 3,
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "epic",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "epic_children_snapshot",
+        "child_snapshot": [
+          "issue:161"
+        ]
+      },
+      "decision": "allow",
+      "reason": "authorized",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-epic_snapshot_child",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": null,
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
+    },
+    {
+      "id": "epic_future_child",
+      "transport": "authenticated",
+      "principal": {
+        "kind": "human",
+        "id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE"
+      },
+      "request": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "task",
+        "resource_id": "issue:178",
+        "resource_revision": 1,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "now": "2026-09-21T00:14:59Z",
+        "destination_id": "C_PRIVATE",
+        "parent_resource_id": "issue:160",
+        "parent_resource_revision": 3,
+        "binding_revision": 1
+      },
+      "binding": {
+        "event_id": "evt_current",
+        "attempt": 1,
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "principal_kind": "human",
+        "principal_id": "U_OWNER",
+        "status": "active",
+        "current_revision": 1,
+        "revoked_at": null
+      },
+      "grant": {
+        "principal_id": "U_OWNER",
+        "tenant_id": "T_FIXTURE",
+        "workspace_id": "T_FIXTURE",
+        "resource_kind": "epic",
+        "resource_id": "issue:160",
+        "resource_revision": 3,
+        "operation": "read_own_human_waits",
+        "policy_revision": 7,
+        "expires_at": "2026-09-21T00:15:00Z",
+        "issued_at": "2026-09-21T00:00:00Z",
+        "status": "active",
+        "current_revision": 3,
+        "scope_kind": "epic_children_snapshot",
+        "child_snapshot": [
+          "issue:161"
+        ]
+      },
+      "decision": "deny",
+      "reason": "resource_mismatch",
+      "transport_context": {
+        "authenticated": true,
+        "event_id": "evt_current",
+        "attempt": 1
+      },
+      "access_proof": {
+        "status": "current",
+        "event_id": "evt_current",
+        "principal_id": "U_OWNER",
+        "workspace_id": "T_FIXTURE",
+        "destination_id": "C_PRIVATE",
+        "issued_at": "2026-09-21T00:13:59Z",
+        "expires_at": "2026-09-21T00:15:59Z",
+        "nonce": "access-epic_future_child",
+        "consumed": false
+      },
+      "approval_receipt": null,
+      "expected_external": {
+        "code": "not_available"
+      },
+      "current_policy_revision": 7,
+      "state_before": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "state_after": {
+        "job": "blocked",
+        "group": "attention",
+        "schedule": "needs_review",
+        "session": "suspended",
+        "notification": "needs_review"
+      },
+      "expected_effects": [
+        "restricted_authorization_audit"
+      ]
     }
   ],
   "downstream": {
