@@ -27,6 +27,8 @@ function item(overrides:Partial<HumanWaitProjection>={}):HumanWaitProjection {
 describe("自分待ちSlack表示",()=>{
   test("本人のtop-level明示問い合わせだけを受理する",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 私の待ちを一覧で見せて")),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 私の待ちを一覧で表示してください")),true);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ちを見せてください","message","im")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 今、僕待ちになっているもの")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("自分待ちの次を表示して","message","im")),true);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("次を表示","message","im")),false);
