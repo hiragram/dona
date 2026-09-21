@@ -170,6 +170,16 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS worker_message_delivery_claim_idx
       ON worker_message_deliveries(consumer, state, available_at, created_at);
 
+    CREATE TRIGGER IF NOT EXISTS worker_message_terminal_worker_deliveries
+    AFTER UPDATE OF status ON jobs
+    WHEN NEW.status IN ('completed','failed','cancelled') AND OLD.status <> NEW.status
+    BEGIN
+      UPDATE worker_message_deliveries
+      SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=NEW.updated_at
+      WHERE consumer='worker' AND state IN ('pending','leased')
+        AND message_id IN (SELECT message_id FROM worker_messages WHERE job_id=NEW.job_id);
+    END;
+
     CREATE TABLE IF NOT EXISTS worker_message_receipts (
       receipt_id       TEXT PRIMARY KEY,
       message_id       TEXT NOT NULL REFERENCES worker_messages(message_id) ON DELETE CASCADE,
@@ -337,14 +347,14 @@ export class WorkerMessageRepository {
         WHERE consumer=? AND state='leased' AND lease_expires_at<=?`).run(now, consumer, now);
       const candidates = this.db.prepare(`SELECT d.delivery_id FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
         WHERE m.job_id=? AND d.consumer=? AND d.state='pending' AND d.available_at<=?
-        ORDER BY d.available_at,d.created_at,d.delivery_id LIMIT ?`).all(jobId, consumer, now, limit) as Array<{delivery_id:string}>;
+        ORDER BY m.producer_sequence,d.available_at,d.created_at,d.delivery_id LIMIT ?`).all(jobId, consumer, now, limit) as Array<{delivery_id:string}>;
       return candidates.map(({ delivery_id }) => {
         const token = `lease_${ulid(at.getTime()).toLowerCase()}_${randomBytes(16).toString("hex")}`;
         const expires = new Date(at.getTime() + leaseMs).toISOString();
         const changed = this.db.prepare(`UPDATE worker_message_deliveries SET state='leased',lease_owner=?,lease_token_sha256=?,lease_expires_at=?,fence=fence+1,attempt_count=attempt_count+1,updated_at=?
           WHERE delivery_id=? AND state='pending'`).run(leaseOwner, sha256(token), expires, now, delivery_id).changes;
         if (changed !== 1) throw new WorkerMessageError("delivery_claim_conflict", "delivery was concurrently claimed");
-        const row = this.db.prepare(`SELECT d.*,m.job_id,m.source_event_id,m.kind,m.direction,m.correlation_message_id,m.conversation_revision,m.occurred_at,m.payload_json
+        const row = this.db.prepare(`SELECT d.*,m.job_id,m.source_event_id,m.kind,m.direction,m.producer_sequence,m.correlation_message_id,m.conversation_revision,m.occurred_at,m.payload_json
           FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) WHERE d.delivery_id=?`).get(delivery_id) as WorkerMessageDeliveryRow & WorkerMessageRow;
         const {payload_json,...projected}=row;
         return { delivery: {...projected,payload:JSON.parse(payload_json)}, lease_token: token };
@@ -387,6 +397,13 @@ export class WorkerMessageRepository {
     }).immediate();
   }
 
+  acknowledgeWorker(jobId: string, sourceEventId: string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
+    const row = this.db.prepare("SELECT consumer FROM worker_message_deliveries WHERE delivery_id=?")
+      .get(deliveryId) as {consumer:WorkerMessageDeliveryRow["consumer"]}|undefined;
+    if (row && row.consumer !== "worker") throw new WorkerMessageError("delivery_consumer_mismatch", "worker bridge cannot acknowledge this delivery");
+    return this.acknowledge(jobId,sourceEventId,deliveryId,leaseOwner,leaseToken,fence,at);
+  }
+
   operationalSnapshot(at = new Date()) {
     const pending = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state IN ('pending','leased')").get() as {count:number};
     const overdue = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='pending' AND available_at<=?")
@@ -419,6 +436,7 @@ export class WorkerMessageRepository {
             .run(now,row.job_id,row.message_id);
           continue;
         }
+        if (!row.workspace_id || !row.channel_id || !row.thread_ts) continue;
         const report=JSON.parse(row.payload_json) as {severity?:unknown};
         const urgent=row.kind==="question"||row.kind==="decision_request"||(row.kind==="risk"&&report.severity==="high");
         if(!urgent&&row.workspace_id){
@@ -494,6 +512,10 @@ export class WorkerMessageRepository {
   purge(at = new Date()): number {
     const cutoff = new Date(at.getTime() - workerMessageRetentionDays * 86_400_000).toISOString();
     return this.db.transaction(() => {
+      this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
+        lease_expires_at=NULL,updated_at=? WHERE consumer='worker' AND state IN ('pending','leased') AND message_id IN
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        .run(at.toISOString());
       this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
         (SELECT m.message_id FROM worker_messages m WHERE m.accepted_at<? AND m.job_id IN
           (SELECT job_id FROM jobs WHERE status IN ('completed','failed','cancelled'))

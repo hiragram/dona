@@ -763,11 +763,11 @@ export class DispatcherApi {
     const deliveryClaim = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/claim$/.exec(url.pathname);
     if (request.method === "POST" && deliveryClaim) {
       const input = await this.readJson(request) as Record<string, unknown>;
-      if ((input.consumer !== "worker" && input.consumer !== "dona-main") || typeof input.source_event_id !== "string" ||
+      if (input.consumer !== "worker" || typeof input.source_event_id !== "string" ||
         typeof input.lease_owner !== "string" || !Number.isSafeInteger(input.limit) || !Number.isSafeInteger(input.lease_ms)) {
         throw new ApiRequestError(400, "invalid_request", "delivery claim is invalid");
       }
-      const deliveries = this.database.workerMessages.claim(decodeURIComponent(deliveryClaim[1]!), input.source_event_id, input.consumer,
+      const deliveries = this.database.workerMessages.claim(decodeURIComponent(deliveryClaim[1]!), input.source_event_id, "worker",
         input.lease_owner, input.limit as number, input.lease_ms as number);
       sendJson(response, 200, { schema_version: 1, deliveries });
       return;
@@ -778,7 +778,7 @@ export class DispatcherApi {
       if (typeof input.source_event_id !== "string" || typeof input.lease_owner !== "string" || typeof input.lease_token !== "string" || !Number.isSafeInteger(input.fence)) {
         throw new ApiRequestError(400, "invalid_request", "delivery acknowledgement is invalid");
       }
-      const result = this.database.workerMessages.acknowledge(decodeURIComponent(deliveryAck[1]!), input.source_event_id, deliveryAck[2]!,
+      const result = this.database.workerMessages.acknowledgeWorker(decodeURIComponent(deliveryAck[1]!), input.source_event_id, deliveryAck[2]!,
         input.lease_owner, input.lease_token, input.fence as number);
       sendJson(response, 200, { schema_version: 1, ...result });
       return;

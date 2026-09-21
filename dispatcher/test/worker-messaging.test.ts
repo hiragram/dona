@@ -102,6 +102,47 @@ describe("worker messaging ledger",()=>{
     } finally { restarted.close(); }
   });
 
+  test("同時刻のinstructionをproducer sequence順にclaimする",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const at=new Date("2026-09-21T00:00:10Z");
+      for(const sequence of [1,2]) database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:sequence,idempotency_key:`ordered-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
+        payload:{operation:"add_condition",text:`condition ${sequence}`}},at);
+      const claimed=database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-ordered",2,10_000,new Date("2026-09-21T00:00:11Z"));
+      assert.deepEqual(claimed.map(value=>value.delivery.producer_sequence),[1,2]);
+    } finally { database.close(); }
+  });
+
+  test("宛先のないreportはdeliveryをpendingに保つ",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE jobs SET workspace_id=NULL,channel_id=NULL,thread_ts=NULL WHERE job_id=?").run(job.job_id);
+      sqlite.close();
+      const created=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:10Z"));
+      assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-09-21T00:00:11Z")),0);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as {delivery:{state:string}}).delivery.state,"pending");
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`),undefined);
+    } finally { database.close(); }
+  });
+
+  test("terminal遷移でworker向けpending／leased deliveryをsupersededにする",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      for(const sequence of [1,2]) database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:sequence,idempotency_key:`terminal-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
+        payload:{operation:"answer",text:`answer ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
+      database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-terminal",1,10_000,new Date("2026-09-21T00:00:03Z"));
+      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:00:04Z"},job.result_path);
+      const states=[1,2].map(sequence=>(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main",`terminal-${sequence}`) as {delivery:{state:string}}).delivery.state);
+      assert.deepEqual(states,["superseded","superseded"]);
+      assert.equal(database.workerMessages.operationalSnapshot().degraded,false);
+    } finally { database.close(); }
+  });
+
   test("coalescing、silence deadline、retentionをdurable stateとして保持する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
@@ -241,6 +282,15 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(read.status,200); assert.equal(((read.body.message as {payload:{kind:string}}).payload.kind),"checkpoint");
     const reconcile=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`);
     assert.equal(reconcile.status,200); assert.equal(reconcile.body.reconciliation,"matched");
+    const forbiddenClaim=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/claim`,{
+      source_event_id:source.event_id,consumer:"dona-main",lease_owner:"worker-bridge",limit:1,lease_ms:10_000});
+    assert.equal(forbiddenClaim.status,400);
+    const direct=database.workerMessages.appendReport(job.job_id,report(source.event_id,2,"report-api-2"),new Date());
+    const claimed=database.workerMessages.claim(job.job_id,source.event_id,"dona-main","internal-publisher",1,10_000,new Date(Date.now()+61_000));
+    assert.equal(claimed[0]!.delivery.message_id,direct.message.message_id);
+    const forbiddenAck=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/${claimed[0]!.delivery.delivery_id}/ack`,{
+      source_event_id:source.event_id,lease_owner:"internal-publisher",lease_token:claimed[0]!.lease_token,fence:claimed[0]!.delivery.fence});
+    assert.equal(forbiddenAck.status,409);
     const health=await request(config.socketPath,"GET","/health/ready");
     assert.equal((health.body.worker_messaging as {protocol_version:number}).protocol_version,1);
   } finally { await api.stop(); database.close(); }
