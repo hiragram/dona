@@ -9,6 +9,19 @@ import { UpdateDatabase } from "../src/database.js";
 import { ProcessRunner } from "../src/process.js";
 import { currentSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
+async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await fs.access(filePath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
 describe("DiagnosticLogStore", { concurrency: false }, () => {
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -380,19 +393,28 @@ test("bounds ordered output while an earlier stream keeps redaction carry pendin
 test("timeout cleanup and signal exit both finalize their bound diagnostics", async () => {
   const f = await fixture();
   const pidPath = path.join(f.root, "diagnostic-child.pid");
+  const readyPath = path.join(f.root, "diagnostic-child.ready");
   try {
+    const grandchildScript = `
+      const fs = require("node:fs");
+      process.on("SIGTERM", () => {});
+      fs.writeFileSync(${JSON.stringify(readyPath)}, "ready");
+      setInterval(() => {}, 1000);
+    `;
     const timeoutScript = `
       const { spawn } = require("node:child_process");
       const fs = require("node:fs");
       process.on("SIGTERM", () => {});
-      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(grandchildScript)}], { stdio: "ignore" });
       fs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));
       process.stderr.write("waiting for timeout detail\\n");
       setInterval(() => {}, 1000);
     `;
     const timedOut = await new ProcessRunner().run(process.execPath, ["-e", timeoutScript], {
-      timeoutMs: 50,
+      timeoutMs: 5_000,
       outputLimitBytes: 512,
+      timeoutStartAfter: waitForFile(readyPath),
+      timeoutAfterReadyMs: 50,
       diagnostic: { store: f.store, identity: { request_id: f.claimed.request_id, attempt: f.claimed.attempt, step: "updater:npm-test-timeout" } },
     });
     assert.equal(timedOut.timed_out, true);
