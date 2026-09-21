@@ -684,9 +684,10 @@ export class JobSupervisor {
     if (this.stopping) return;
     if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
+    const runtimeIdentity=this.database.getJobLiveSessionIdentity(row.job_id)?.herdr_agent_session_id;
     const prompted = await this.runtime.prompt(
       dispatching.agent_name,
-      buildJobPrompt(dispatching, this.progress !== undefined),
+      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
     );

@@ -128,6 +128,9 @@ test("caller documentation and advertised MCP tools share ambiguity and partial 
     const text = await fs.readFile(new URL(file, import.meta.url), "utf8");
     for (const pattern of [/初回write前/, /job_key/, /partial success/, /list_thread_jobs/, /複数候補/, /明示.*job_id/, /blind retry/, /read-only reconcile/, /progress/, /source_event_id/]) assert.match(text, pattern, file);
   }
+  const agents=await fs.readFile(new URL("../../AGENTS.md",import.meta.url),"utf8");
+  for(const pattern of [/pending_worker_question/, /send_worker_instruction.*`answer`/, /correlation_message_id/, /next_producer_sequence/, /next_conversation_revision/, /通常の`steer_job`へ変換せず/])
+    assert.match(agents,pattern);
   const f = await fixture();
   try {
     const tools = (await f.client.listTools()).tools;
@@ -173,10 +176,12 @@ for (const operation of ["steer", "cancel"] as const) {
 test("MCP bounds thread projection and signals possible omitted candidates", async () => {
   const f = await fixture();
   try {
-    f.uds.listThreadJobs = async () => ({ jobs: Array.from({ length: 101 }, (_, i) => ({ job_id: `candidate-${i}`, objective: "secret", result_json: "secret", workspace_path: "/private" })) });
+    f.uds.listThreadJobs = async () => ({ jobs: Array.from({ length: 101 }, (_, i) => ({ job_id: `candidate-${i}`, objective: "secret", result_json: "secret", workspace_path: "/private",
+      ...(i===0?{pending_worker_question:{message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3}}:{}) })) });
     const result = await f.call("list_thread_jobs", { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
     assert.equal(result.data.jobs.length, 100);
     assert.equal(result.data.truncated, true);
+    assert.deepEqual(result.data.jobs[0].pending_worker_question,{message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3});
     assert.doesNotMatch(JSON.stringify(result.data), /private|secret/);
   } finally { await f.close(); }
 });

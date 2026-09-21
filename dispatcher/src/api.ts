@@ -521,7 +521,7 @@ export class DispatcherApi {
         sendJson(response, error.status, errorBody(error.code, error.message,error.details));
       } else if (error instanceof WorkerMessageError) {
         const status = error.code === "job_not_found" || error.code === "delivery_not_found" ? 404
-          : error.code === "job_binding_mismatch" ? 403
+          : error.code === "job_binding_mismatch" || error.code === "worker_runtime_mismatch" ? 403
             : error.code.startsWith("invalid_") || error.code === "worker_message_too_large" ? 400 : 409;
         sendJson(response, status, errorBody(error.code, error.message));
       } else if (error instanceof ScheduleApiError) {
@@ -719,7 +719,7 @@ export class DispatcherApi {
       const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
+        jobs: candidates.slice(0,100).map(job=>({...job,pending_worker_question:this.database.workerMessages.pendingQuestion(job.job_id)??null})),
         truncated: candidates.length > 100,
       });
       return;
@@ -727,9 +727,10 @@ export class DispatcherApi {
     const messageCollection = /^\/v1\/jobs\/([^/]+)\/messages\/(reports|instructions)$/.exec(url.pathname);
     if (request.method === "POST" && messageCollection) {
       const jobId = decodeURIComponent(messageCollection[1]!);
-      const input = await this.readJson(request);
+      const input = await this.readJson(request) as Record<string,unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
       const result = messageCollection[2] === "reports"
-        ? this.database.workerMessages.appendReport(jobId, input)
+        ? this.database.workerMessages.appendWorkerReport(jobId,runtimeIdentity,input)
         : this.database.workerMessages.appendInstruction(jobId, input);
       if (messageCollection[2] === "reports") {
         try { this.database.workerMessages.publishPendingReports(); }
@@ -752,7 +753,11 @@ export class DispatcherApi {
       if (producer !== "worker" && producer !== "dona-main") throw new ApiRequestError(400, "invalid_request", "producer is invalid");
       const sourceEventId = url.searchParams.get("source_event_id") ?? "";
       const idempotencyKey = url.searchParams.get("idempotency_key") ?? "";
-      sendJson(response, 200, { schema_version: 1, ...this.database.workerMessages.reconcile(decodeURIComponent(messageReconcile[1]!), sourceEventId, producer, idempotencyKey) });
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
+      const reconciled=producer==="worker"
+        ? this.database.workerMessages.reconcileWorker(decodeURIComponent(messageReconcile[1]!),sourceEventId,runtimeIdentity,idempotencyKey)
+        : this.database.workerMessages.reconcile(decodeURIComponent(messageReconcile[1]!),sourceEventId,producer,idempotencyKey);
+      sendJson(response, 200, { schema_version: 1, ...reconciled });
       return;
     }
     const messageRead = /^\/v1\/jobs\/([^/]+)\/messages\/(msg_[0-9a-hjkmnp-tv-z]{26})$/.exec(url.pathname);
@@ -766,11 +771,12 @@ export class DispatcherApi {
     const deliveryClaim = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/claim$/.exec(url.pathname);
     if (request.method === "POST" && deliveryClaim) {
       const input = await this.readJson(request) as Record<string, unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
       if (input.consumer !== "worker" || typeof input.source_event_id !== "string" ||
         typeof input.lease_owner !== "string" || !Number.isSafeInteger(input.limit) || !Number.isSafeInteger(input.lease_ms)) {
         throw new ApiRequestError(400, "invalid_request", "delivery claim is invalid");
       }
-      const deliveries = this.database.workerMessages.claim(decodeURIComponent(deliveryClaim[1]!), input.source_event_id, "worker",
+      const deliveries = this.database.workerMessages.claimWorker(decodeURIComponent(deliveryClaim[1]!), input.source_event_id,runtimeIdentity,
         input.lease_owner, input.limit as number, input.lease_ms as number);
       sendJson(response, 200, { schema_version: 1, deliveries });
       return;
@@ -778,10 +784,11 @@ export class DispatcherApi {
     const deliveryAck = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/(dlv_[0-9a-hjkmnp-tv-z]{26})\/ack$/.exec(url.pathname);
     if (request.method === "POST" && deliveryAck) {
       const input = await this.readJson(request) as Record<string, unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
       if (typeof input.source_event_id !== "string" || typeof input.lease_owner !== "string" || typeof input.lease_token !== "string" || !Number.isSafeInteger(input.fence)) {
         throw new ApiRequestError(400, "invalid_request", "delivery acknowledgement is invalid");
       }
-      const result = this.database.workerMessages.acknowledgeWorker(decodeURIComponent(deliveryAck[1]!), input.source_event_id, deliveryAck[2]!,
+      const result = this.database.workerMessages.acknowledgeWorker(decodeURIComponent(deliveryAck[1]!), input.source_event_id,runtimeIdentity, deliveryAck[2]!,
         input.lease_owner, input.lease_token, input.fence as number);
       sendJson(response, 200, { schema_version: 1, ...result });
       return;

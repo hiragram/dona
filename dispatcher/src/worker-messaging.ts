@@ -229,6 +229,11 @@ function instructionKind(input: DonaInstructionInput): WorkerMessageKind { retur
 export class WorkerMessageRepository {
   constructor(private readonly db: Database.Database) {}
 
+  appendWorkerReport(jobId: string, runtimeIdentity: string, raw: unknown, at = new Date()) {
+    this.assertWorkerRuntime(jobId, runtimeIdentity);
+    return this.appendReport(jobId, raw, at);
+  }
+
   appendReport(jobId: string, raw: unknown, at = new Date()) {
     return this.append(jobId, "worker_to_dona", parseWorkerReport(raw), at);
   }
@@ -328,8 +333,25 @@ export class WorkerMessageRepository {
         .get(messageId) as {event_id:string|null}|undefined;
       if(!delivery?.event_id||delivery.event_id!==sourceEventId)
         throw new WorkerMessageError("job_binding_mismatch","source event is not the notification event for this message");
+      if(terminal(job.status))
+        throw new WorkerMessageError("worker_message_terminal_fence","worker report is stale after terminal job state");
     }
     return message;
+  }
+
+  pendingQuestion(jobId: string) {
+    const row=this.db.prepare(`SELECT m.message_id,m.kind,
+        COALESCE((SELECT MAX(next.producer_sequence) FROM worker_messages next WHERE next.job_id=m.job_id AND next.producer='dona-main'),0)+1 AS next_producer_sequence,
+        COALESCE((SELECT MAX(next.conversation_revision) FROM worker_messages next WHERE next.job_id=m.job_id),0)+1 AS next_conversation_revision
+      FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
+      WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND d.consumer='dona-main'
+        AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')
+        AND NOT EXISTS (SELECT 1 FROM worker_messages answer WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker'
+          AND answer.kind='answer' AND answer.correlation_message_id=m.message_id)
+      ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 1`).get(jobId) as
+        {message_id:string;kind:"question"|"decision_request";next_producer_sequence:number;next_conversation_revision:number}|undefined;
+    return row ? {message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
+      next_conversation_revision:row.next_conversation_revision} : undefined;
   }
 
   reconcile(jobId: string, sourceEventId: string, producer: "worker" | "dona-main", idempotencyKey: string) {
@@ -379,6 +401,11 @@ export class WorkerMessageRepository {
     }).immediate();
   }
 
+  claimWorker(jobId:string,sourceEventId:string,runtimeIdentity:string,leaseOwner:string,limit:number,leaseMs:number,at=new Date()) {
+    this.assertWorkerRuntime(jobId,runtimeIdentity);
+    return this.claim(jobId,sourceEventId,"worker",leaseOwner,limit,leaseMs,at);
+  }
+
   acknowledge(jobId: string, sourceEventId: string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
     return this.db.transaction(() => {
       const now = at.toISOString();
@@ -414,11 +441,17 @@ export class WorkerMessageRepository {
     }).immediate();
   }
 
-  acknowledgeWorker(jobId: string, sourceEventId: string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
+  acknowledgeWorker(jobId: string, sourceEventId: string, runtimeIdentity:string, deliveryId: string, leaseOwner: string, leaseToken: string, fence: number, at = new Date()) {
+    this.assertWorkerRuntime(jobId,runtimeIdentity);
     const row = this.db.prepare("SELECT consumer FROM worker_message_deliveries WHERE delivery_id=?")
       .get(deliveryId) as {consumer:WorkerMessageDeliveryRow["consumer"]}|undefined;
     if (row && row.consumer !== "worker") throw new WorkerMessageError("delivery_consumer_mismatch", "worker bridge cannot acknowledge this delivery");
     return this.acknowledge(jobId,sourceEventId,deliveryId,leaseOwner,leaseToken,fence,at);
+  }
+
+  reconcileWorker(jobId:string,sourceEventId:string,runtimeIdentity:string,idempotencyKey:string) {
+    this.assertWorkerRuntime(jobId,runtimeIdentity);
+    return this.reconcile(jobId,sourceEventId,"worker",idempotencyKey);
   }
 
   operationalSnapshot(at = new Date()) {
@@ -578,6 +611,15 @@ export class WorkerMessageRepository {
     const caller=sourceEventId===job.source_event_id?owner:readEventJobBinding(this.db,sourceEventId)?.owner;
     if(!owner||!caller||stableStringify(owner)!==stableStringify(caller))
       throw new WorkerMessageError("job_binding_mismatch","source event does not own this job");
+  }
+
+  private assertWorkerRuntime(jobId:string,runtimeIdentity:string):void {
+    if(typeof runtimeIdentity!=="string"||runtimeIdentity.length<1||runtimeIdentity.length>512)
+      throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity is invalid");
+    const identity=this.db.prepare("SELECT herdr_agent_session_id FROM job_live_session_identities WHERE job_id=?")
+      .get(jobId) as {herdr_agent_session_id:string}|undefined;
+    if(!identity||identity.herdr_agent_session_id!==runtimeIdentity)
+      throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
   }
 
   private recordWorkspaceDelivery(workspaceId:string,at:string):void {
