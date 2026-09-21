@@ -174,6 +174,44 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(repeated.reconciliation.state,"unknown");assert.ok(repeated.reconciliation.reason_codes.includes("state_sequence_regressed"));state.database.close();
   });
 
+  test("事前分類が並行してもreceipt追記transaction内でsequence退行をfail closedにする",async()=>{
+    const state=await addressableJob();
+    const identity=state.database.getJobLiveSessionIdentity(state.job.job_id)!;
+    const expectedIdentity=JSON.stringify(["workspace-private","pane-private",state.job.agent_name,"session-private"]);
+    const result=(sequence:number):HerdrCommandResult=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:expectedIdentity,stateChangeSeq:sequence});
+    const receipt=(sequence:number,offset:number)=>buildLiveSessionReceipt({before:state.job,after:state.job,bootId:"boot",
+      startedAt:`2026-09-21T00:00:0${offset}Z`,completedAt:`2026-09-21T00:00:0${offset+1}Z`,
+      expectedIdentity,previousStateChangeSeq:undefined,result:result(sequence)});
+    const newer=state.database.appendLiveSessionReceipt(state.source.event_id,receipt(12,0),"2026-09-21T00:00:00Z",identity);
+    assert.equal(newer.reconciliation.confidence,"bounded_observation");
+    const stale=state.database.appendLiveSessionReceipt(state.source.event_id,receipt(11,2),"2026-09-21T00:00:02Z",identity);
+    assert.equal(stale.reconciliation.state,"unknown");assert.equal(stale.reconciliation.confidence,"fail_closed");
+    assert.equal(stale.reconciliation.safe_next_action,"do_not_retry");
+    assert.ok(stale.reconciliation.reason_codes.includes("state_sequence_regressed"));
+    assert.deepEqual(state.database.getLiveSessionReceipt(state.job.job_id,stale.receipt_id),stale);state.database.close();
+  });
+
+  test("同じruntime identityで再準備してもgenerationとsequence high-waterを保持する",async()=>{
+    const state=await addressableJob();const calls:string[]=[];
+    const firstSupervisor=new JobSupervisor(state.database,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:12}),calls),state.config,logger,()=>{});
+    await firstSupervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    const originalIdentity=state.database.getJobLiveSessionIdentity(state.job.job_id)!;state.database.close();
+    const raw=new Database(state.config.databasePath);
+    raw.prepare("UPDATE jobs SET status='retryable_failed',available_at=? WHERE job_id=?")
+      .run("2026-09-21T00:00:00Z",state.job.job_id);raw.close();
+    const reopened=new DispatcherDatabase(state.config.databasePath);
+    reopened.beginJobPreparation(state.job.job_id,new Date("2026-09-21T00:00:01Z"));
+    reopened.setJobRuntime(state.job.job_id,"workspace-private","pane-private","session-private",new Date("2026-09-21T01:00:00Z"));
+    assert.deepEqual(reopened.getJobLiveSessionIdentity(state.job.job_id),originalIdentity);
+    reopened.beginJobDispatch(state.job.job_id);reopened.markJobNeedsReview(state.job.job_id,"prompt_acceptance_unknown","unknown");
+    const retrySupervisor=new JobSupervisor(reopened,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:11}),calls),state.config,logger,()=>{});
+    const regressed=await retrySupervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.equal(regressed.reconciliation.state,"unknown");assert.ok(regressed.reconciliation.reason_codes.includes("state_sequence_regressed"));reopened.close();
+  });
+
   test("rollback中にruntime列だけ更新されたidentity世代は照合しない",async()=>{
     const state=await addressableJob();state.database.close();
     const raw=new Database(state.config.databasePath);

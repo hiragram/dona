@@ -154,8 +154,7 @@ export class JobSupervisor {
       ...(sourceEventId?{sourceEventId}:{}),...(expectedIdentity?{expectedIdentity}:{}),
       ...(identityGenerationChanged?{identityGenerationChanged:true}:{}),
       ...(previousStateChangeSeq===undefined?{}:{previousStateChangeSeq}),...(result?{result}:{})});
-    this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt,identityGenerationChanged?undefined:storedIdentity);
-    return receipt;
+    return this.database.appendLiveSessionReceipt(sourceEventId,receipt,startedAt,identityGenerationChanged?undefined:storedIdentity);
   }
 
   getLiveSessionReceipt(jobId:string,receiptId:string):LiveSessionReceiptProjection|undefined {

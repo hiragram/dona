@@ -952,11 +952,15 @@ export class DispatcherDatabase {
       const changed=this.db.prepare("UPDATE jobs SET herdr_workspace_id=?,herdr_pane_id=? WHERE job_id=? AND status IN ('preparing','cancelling')")
         .run(herdrWorkspaceId,herdrPaneId,jobId).changes;
       if(changed!==1)throw new Error(`Job ${jobId} is no longer preparing or cancelling`);
-      this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
-      if (agentSessionId !== undefined) this.db.prepare(`INSERT INTO job_live_session_identities(
+      const agentName=(this.db.prepare("SELECT agent_name FROM jobs WHERE job_id=?").get(jobId) as {agent_name:string}).agent_name;
+      const existing=this.getJobLiveSessionIdentity(jobId);
+      const sameIdentity=agentSessionId!==undefined&&existing?.herdr_agent_session_id===agentSessionId
+        &&existing.herdr_workspace_id===herdrWorkspaceId&&existing.herdr_pane_id===herdrPaneId&&existing.agent_name===agentName;
+      if(!sameIdentity)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      if (agentSessionId !== undefined&&!sameIdentity) this.db.prepare(`INSERT INTO job_live_session_identities(
         job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at)
         SELECT job_id,1,?,?,?,?,? FROM jobs WHERE job_id=?`)
-        .run(agentSessionId,herdrWorkspaceId,herdrPaneId,this.getJobRequired(jobId).agent_name,at.toISOString(),jobId);
+        .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),jobId);
     }).immediate();
   }
 
@@ -964,11 +968,20 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT * FROM job_live_session_identities WHERE job_id=?").get(jobId) as LiveSessionIdentityRow | undefined;
   }
 
-  appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string, identity?:LiveSessionIdentityRow): void {
-    this.db.transaction(() => {
-      insertLiveSessionReceipt(this.db,sourceEventId,receipt,startedAt);
+  appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string, identity?:LiveSessionIdentityRow): LiveSessionReceiptProjection {
+    return this.db.transaction(() => {
+      let auditedReceipt=receipt;
       const sequence=receipt.live_session.state_change_seq;
       if(identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
+        const currentSequence=this.latestLiveSessionStateChangeSeq(receipt.job_id,identity);
+        if(currentSequence!==undefined&&sequence<currentSequence){
+          auditedReceipt={...receipt,reconciliation:{state:"unknown",confidence:"fail_closed",
+            reason_codes:[...new Set([...receipt.reconciliation.reason_codes,"same_identity","state_sequence_regressed"])],
+            safe_next_action:"do_not_retry"}};
+        }
+      }
+      insertLiveSessionReceipt(this.db,sourceEventId,auditedReceipt,startedAt);
+      if(identity&&auditedReceipt.live_session.query_status==="observed"&&auditedReceipt.live_session.identity_match===true&&sequence!==null){
         const changed=this.db.prepare(`UPDATE job_live_session_identities SET max_state_change_seq=CASE
           WHEN max_state_change_seq IS NULL OR max_state_change_seq<? THEN ? ELSE max_state_change_seq END
           WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
@@ -976,6 +989,7 @@ export class DispatcherDatabase {
             identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name).changes;
         if(changed!==1)throw new Error("Live session identity generation changed before audit append");
       }
+      return auditedReceipt;
     }).immediate();
   }
 
