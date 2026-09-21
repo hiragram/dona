@@ -287,12 +287,13 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         json_extract(NEW.owner_json,'$.tenant_id'),json_extract(NEW.owner_json,'$.tenant_id'),'schedule','human',json_extract(NEW.owner_json,'$.owner_id'),
         'owner','reconcile_write','notification',COALESCE(NEW.notification_event_id,NEW.job_id),NEW.job_id,
         COALESCE(json_extract(NEW.owner_json,'$.revision'),1),'notification_reconcile','origin_'||lower(hex(randomblob(16))),
-        COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),'open',0,
-        COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NULL,NULL,NEW.content_delete_at
-      WHERE json_extract(NEW.owner_json,'$.kind')='schedule' AND NEW.notification_state='needs_review' AND EXISTS (
+        MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),'open',0,
+        MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),NULL,NULL,NEW.content_delete_at
+      WHERE json_extract(NEW.owner_json,'$.kind')='schedule' AND NEW.notification_state='needs_review' AND
+        (NEW.job_status IN ('blocked','needs_review') OR NEW.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','needs_review','dead_letter'))) AND EXISTS (
         SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
           AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)) AND NOT EXISTS (
         SELECT 1 FROM human_wait_quarantine q WHERE q.dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status)
@@ -301,16 +302,17 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         session_settlement_verified=CASE WHEN human_wait_items.state='open' THEN human_wait_items.session_settlement_verified ELSE 0 END,updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',
-        resolved_at=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
-        updated_at=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
-        source_revision=COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),
-        retain_until=datetime(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),(SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),'+30 days')
+        resolved_at=MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),
+        updated_at=MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),
+        source_revision=MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),
+        retain_until=datetime(MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=NEW.job_id AND o.completion_job_status=NEW.job_status),NEW.materialized_at),COALESCE((SELECT updated_at FROM events WHERE event_id=NEW.notification_event_id),NEW.materialized_at),NEW.materialized_at),'+30 days')
       WHERE dedupe_key='notification:'||NEW.job_id||':'||NEW.job_status AND state='open' AND (
-        NEW.notification_state!='needs_review' OR NOT EXISTS (
+        NEW.notification_state!='needs_review' OR (NEW.job_status NOT IN ('blocked','needs_review') AND NEW.notification_event_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM events e WHERE e.event_id=NEW.notification_event_id AND e.status IN ('completed','needs_review','dead_letter'))) OR NOT EXISTS (
           SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(NEW.owner_json,'$.schedule_id')
             AND s.revision=COALESCE(json_extract(NEW.owner_json,'$.revision'),1)));
     END;
@@ -434,9 +436,9 @@ export class HumanWaitRepository {
         'schedule' AS owner_kind,'human' AS owner_principal_kind,json_extract(owner_json,'$.owner_id') AS owner_principal_id,'owner' AS decision_actor_kind,
         'reconcile_write' AS decision_kind,'notification' AS resource_kind,COALESCE(notification_event_id,job_id) AS resource_id,job_id AS parent_resource_id,
         COALESCE(json_extract(owner_json,'$.revision'),1) AS resource_revision,'notification_reconcile' AS reason_code,
-        COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=job_completion_results.job_id AND o.completion_job_status=job_completion_results.job_status),
-          (SELECT updated_at FROM events WHERE event_id=notification_event_id),materialized_at) AS source_revision
+        MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=job_completion_results.job_id AND o.completion_job_status=job_completion_results.job_status),materialized_at),
+          COALESCE((SELECT updated_at FROM events WHERE event_id=notification_event_id),materialized_at),materialized_at) AS source_revision
         FROM job_completion_results WHERE job_id=? AND job_status=?`).get(row.resource_id,row.aux_id) as ExpectedProjection|undefined;
       return this.db.prepare(`SELECT s.tenant_id AS tenant_id,s.tenant_id AS workspace_id,'schedule' AS owner_kind,'human' AS owner_principal_kind,s.owner_id AS owner_principal_id,
         'owner' AS decision_actor_kind,'reconcile_write' AS decision_kind,'notification' AS resource_kind,o.outbox_id AS resource_id,o.run_id AS parent_resource_id,
@@ -454,6 +456,7 @@ export class HumanWaitRepository {
       if(row.kind==="completion")return this.db.prepare(`SELECT 1 FROM job_completion_results c JOIN schedules s
         ON s.schedule_id=json_extract(c.owner_json,'$.schedule_id') WHERE c.job_id=? AND c.job_status=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review'
+        AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.event_id=c.notification_event_id AND e.status IN ('completed','needs_review','dead_letter')))
         AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)`).get(row.resource_id,row.aux_id)!==undefined;
       return this.db.prepare(`SELECT 1 FROM connector_outbox o JOIN schedule_runs r USING(run_id) JOIN schedules s USING(schedule_id)
         WHERE o.outbox_id=? AND o.status='needs_review' AND o.kind!='slack.work_result.post' AND r.revision=s.revision`).get(row.resource_id)!==undefined;
@@ -484,8 +487,9 @@ export class HumanWaitRepository {
         CASE WHEN julianday(COALESCE(r.terminal_at,r.created_at))>=julianday(s.updated_at) THEN COALESCE(r.terminal_at,r.created_at) ELSE s.updated_at END,
         CASE WHEN r.status='needs_review' AND r.revision=s.revision THEN 1 ELSE 0 END,'run:'||r.run_id FROM schedule_runs r JOIN schedules s USING(schedule_id)
       UNION ALL SELECT 'completion:'||c.job_id||':'||c.job_status,'completion',c.job_id,COALESCE(c.notification_event_id,c.job_id),c.job_status,
-        COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
-          WHERE r.job_id=c.job_id AND o.completion_job_status=c.job_status),e.updated_at,c.materialized_at),CASE WHEN json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review' AND EXISTS (
+        MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+          WHERE r.job_id=c.job_id AND o.completion_job_status=c.job_status),c.materialized_at),COALESCE(e.updated_at,c.materialized_at),c.materialized_at),CASE WHEN json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review'
+          AND (c.job_status IN ('blocked','needs_review') OR c.notification_event_id IS NULL OR e.status IN ('completed','needs_review','dead_letter')) AND EXISTS (
           SELECT 1 FROM schedules s WHERE s.schedule_id=json_extract(c.owner_json,'$.schedule_id')
             AND s.revision=COALESCE(json_extract(c.owner_json,'$.revision'),1)) THEN 1 ELSE 0 END,
         'notification:'||c.job_id||':'||c.job_status FROM job_completion_results c LEFT JOIN events e ON e.event_id=c.notification_event_id
@@ -539,7 +543,9 @@ export class HumanWaitRepository {
             else if(row.kind==="run")changed=this.db.prepare(`UPDATE schedule_runs SET status=status WHERE run_id=? AND
               MAX(julianday(COALESCE(terminal_at,created_at)),julianday((SELECT updated_at FROM schedules WHERE schedule_id=schedule_runs.schedule_id)))<=julianday(?)`).run(row.resource_id,input.snapshotRevision).changes;
             else if(row.kind==="completion")changed=this.db.prepare(`UPDATE job_completion_results SET notification_state=notification_state,notification_event_id=notification_event_id WHERE job_id=? AND job_status=? AND
-              julianday(COALESCE((SELECT updated_at FROM events WHERE event_id=job_completion_results.notification_event_id),materialized_at))<=julianday(?)`).run(row.resource_id,row.aux_id,input.snapshotRevision).changes;
+              julianday(MAX(COALESCE((SELECT MAX(o.updated_at) FROM connector_outbox o JOIN schedule_runs r USING(run_id)
+                WHERE r.job_id=job_completion_results.job_id AND o.completion_job_status=job_completion_results.job_status),materialized_at),
+                COALESCE((SELECT updated_at FROM events WHERE event_id=job_completion_results.notification_event_id),materialized_at),materialized_at))<=julianday(?)`).run(row.resource_id,row.aux_id,input.snapshotRevision).changes;
             else changed=this.db.prepare("UPDATE connector_outbox SET updated_at=updated_at WHERE outbox_id=? AND julianday(updated_at)<=julianday(?)").run(row.resource_id,input.snapshotRevision).changes;
           } else if(item&&shouldOpen&&expected) {
             const settlement= item.state==="open"&&!derivedProjectionMismatch(item,expected)?item.session_settlement_verified:0;

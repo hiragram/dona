@@ -451,14 +451,16 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET job_status='needs_review',notification_state='needs_review' WHERE job_id=?").run(job.job_id);
+  const settlementAcceptedAt=new Date(Date.parse(dispatcher.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${job.job_id}:needs_review`)!.opened_at)+1_000);
   dispatcher.saveCompleted(completionEventId,{schema_version:1,event_id:completionEventId,status:"completed",actions:[
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true},
     {tool:"dona_slack.check_user_channel_access",workspace:"test",workspace_id:"T_TEST",channel_id:"C_TEST",user_id:"U_TEST",authorized:true},
     {tool:"dona_dispatcher.authorize_job_notification",event_id:completionEventId,authorized:true,access_receipt_verified:true},
     {tool:"dona_slack.post_message",event_id:completionEventId,workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",message_ts:"2.000001",body_sha256:bodySha,reply_broadcast:false,mrkdwn:false,parse:"none"},
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
-  ],completed_at:due},notificationPath,new Date(due),deliveryEvidence(completionEventId,bodySha,"2.000001","1.000001",due,"suspended"));
+  ],completed_at:due},notificationPath,settlementAcceptedAt,deliveryEvidence(completionEventId,bodySha,"2.000001","1.000001",due,"suspended"));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  assert.equal((raw.prepare("SELECT session_settlement_verified FROM human_wait_items WHERE dedupe_key=?").get(`notification:${job.job_id}:needs_review`) as {session_settlement_verified:number}).session_settlement_verified,1);
   raw.prepare("UPDATE job_completion_results SET job_status='completed' WHERE job_id=?").run(job.job_id);
   raw.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(completionEventId);
   raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(job.job_id);

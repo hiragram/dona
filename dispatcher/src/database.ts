@@ -1823,6 +1823,14 @@ export class DispatcherDatabase {
     return {schema_version:1,event_id:eventId,workspace_id:String(target.workspace_id??""),channel_id:String(target.channel_id??""),thread_ts:String(target.thread_ts??""),desired_session_status:["blocked","needs_review"].includes(completion.job_status)?"suspended":"active"};
   }
 
+  recordVerifiedNotificationSessionSettlement(eventId:string,evidence:{event_id:string;workspace_id:string;channel_id:string;thread_ts:string|null;session_status:"active"|"suspended"|null},settledAt=new Date()):boolean {
+    const request=this.notificationSessionSettlementRequest(eventId);
+    if(!request||request.desired_session_status!=="suspended"||evidence.event_id!==eventId||evidence.workspace_id!==request.workspace_id||
+      evidence.channel_id!==request.channel_id||evidence.thread_ts!==request.thread_ts||evidence.session_status!=="suspended") return false;
+    return this.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:request.event_id,workspace_id:request.workspace_id,
+      channel_id:request.channel_id,thread_ts:request.thread_ts,desired_session_status:"suspended",session_status:"suspended"},settledAt.toISOString());
+  }
+
   claimNotificationReconciliation(eventId:string,resume=false):string {
     const current=this.getRequired(eventId);
     if(current.last_error_code==="operator_notification_reconcile_claimed") {
@@ -1918,6 +1926,8 @@ export class DispatcherDatabase {
       });
       const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.runId) {
+        if(delivery.delivered&&evidence&&this.notificationSessionSettlementRequest(eventId)?.desired_session_status==="suspended"&&
+          !this.recordVerifiedNotificationSessionSettlement(eventId,evidence,acceptedAt)) throw new Error("job_notification_session_settlement_not_recorded");
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
     }).immediate();
@@ -1949,6 +1959,8 @@ export class DispatcherDatabase {
       }
       const delivery=this.notificationDelivered(eventId,result,acceptedAt,evidence);
       if(delivery.delivered) {
+        if(evidence&&this.notificationSessionSettlementRequest(eventId)?.desired_session_status==="suspended"&&
+          !this.recordVerifiedNotificationSessionSettlement(eventId,evidence,acceptedAt)) throw new Error("job_notification_session_settlement_not_recorded");
         this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,completed_at:result.completed_at,last_error_code:"agent_failed_after_delivery",last_error_message:result.summary??"Agent failed after confirmed delivery"});
         this.setNotificationState(eventId,"accepted",new Date(result.completed_at));return;
       }

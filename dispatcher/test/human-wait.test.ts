@@ -417,6 +417,9 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     const settlement={provider_verified:true as const,event_id:completion.notification_event_id,
       workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,
       desired_session_status:"suspended" as const,session_status:"suspended" as const};
+    harness.raw.prepare(`INSERT INTO connector_outbox(outbox_id,run_id,kind,idempotency_key,target_json,content,content_hash,status,
+      available_at,created_at,updated_at,completion_job_status) VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)`).run(
+      "outbox_human_wait_old",runId,"slack.work_result.post",`${runId}:human-wait-old`,"{}","safe","a".repeat(64),due,due,due,"completed");
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(result.job_id);
     const initialNotification=harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)!;
     const initialSettlementAt=new Date(Date.parse(initialNotification.opened_at)+1_000).toISOString();
@@ -444,6 +447,28 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     assert.equal(reopened.session_settlement_verified,0);
     assert.equal(reopened.source_revision,"2026-09-05T00:02:03Z");
     assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:02:01.000Z"),false);
+  } finally { harness.close(); }
+});
+
+test("通常の通知認可はwait化せずverified settlementをproduction helperで記録する", () => {
+  const harness=new SchedulerIntegrationHarness("2026-09-05T00:00:00Z");
+  try {
+    const due="2026-09-05T00:01:00Z",runId=harness.materialize("human-wait-auth-transient",harness.input("work.read_only",true,due),due);
+    const run=harness.raw.prepare("SELECT event_id FROM schedule_runs WHERE run_id=?").get(runId) as {event_id:string};
+    const result=new FakeJobRuntime().run(harness,run.event_id,"inspect");
+    const completion=harness.raw.prepare("SELECT notification_event_id,destination_json FROM job_completion_results WHERE job_id=?")
+      .get(result.job_id) as {notification_event_id:string;destination_json:string};
+    harness.raw.prepare("UPDATE events SET status='waiting_agent',completed_at=NULL,updated_at='2026-09-21T12:00:00Z' WHERE event_id=?").run(completion.notification_event_id);
+    harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review',notification_authorization_phase='preflight' WHERE job_id=?").run(result.job_id);
+    assert.equal(harness.database.humanWaits.listInternal().some(item=>item.dedupe_key===`notification:${result.job_id}:completed`),false);
+
+    harness.raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='agent_wait_observation_unknown',updated_at='2026-09-21T12:00:01Z' WHERE job_id=?").run(result.job_id);
+    harness.raw.prepare("UPDATE job_completion_results SET job_status='needs_review',notification_state='needs_review',notification_authorization_phase='write' WHERE job_id=?").run(result.job_id);
+    const destination=JSON.parse(completion.destination_json) as {target:{workspace_id:string;channel_id:string;thread_ts:string}};
+    assert.equal(harness.database.recordVerifiedNotificationSessionSettlement(completion.notification_event_id,{event_id:completion.notification_event_id,
+      workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,session_status:"suspended"},
+    new Date("2026-09-21T12:00:02Z")),true);
+    assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:needs_review`)?.session_settlement_verified,1);
   } finally { harness.close(); }
 });
 
