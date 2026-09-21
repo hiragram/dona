@@ -27,9 +27,11 @@ principal proofの署名対象は`version, key_id, event_id, attempt, tenant_id,
 
 grantのtyped intentは次のoperation catalogから選ぶ。`read_own_human_waits`、`read_exact_job_status`、`read_bounded_result`、`steer_exact_job`、`cancel_exact_job`、`resolve_origin_ref`は別権限であり、前者から後者を推論しない。
 
-grantは`issued_at`とexclusiveな`expires_at`を持ち、その差は正かつ900秒以下でなければならない。catalog外operation、current resource revision不一致、`revoked`または`revoked_at`を持つgrantは、期限前でも次の判定から即時denyする。current policy revisionはrequest/grantとは独立した信頼済み入力として比較し、自己整合した旧revisionも拒否する。Epic grantは発行時のparent revisionと明示child ID集合をsnapshotし、その集合内だけを許可する。後から追加されたchildを現在のEpicから動的展開しない。
+grantは有限なUTC秒精度の`issued_at`とexclusiveな`expires_at`を持ち、`issued_at <= now < expires_at`、その差は正かつ900秒以下でなければならない。catalog外operation、未知のscope kind、current resource revision不一致、`revoked`または`revoked_at`を持つgrantは、期限前でも次の判定から即時denyする。v1 scopeは`exact_resource`と`epic_children_snapshot`だけである。current policy/resource revisionはrequest/grantとは独立した信頼済み入力として比較し、自己整合した旧revisionも拒否する。Epic grantは発行時のparent revisionと明示child ID集合をsnapshotし、その集合内だけを許可する。後から追加されたchildを現在のEpicから動的展開しない。
 
-v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exact_job`と`cancel_exact_job`はIssue #15のsupervisor approval domainへ接続し、次のtyped receiptを必須とする。receiptは`version, receipt_id, issuer_kind, issuer_id, tenant_id, principal_id, resource_kind, resource_id, resource_revision, operation, issued_at, expires_at, policy_revision, nonce`を上記と同じcanonical encodingで署名する。検証済み署名結果も判定入力とし、全fieldの存在、contract version、空でないissuer/receipt/nonceを確認する。issuerは`supervisor`だけ、expiryは発行から5分以内かつexclusive、operationとresource revisionは完全一致、一度だけ消費する。missing、未知version/issuer、未検証署名、期限切れ、revision/operation不一致、#15の実装が未提供の場合は`approval_unavailable`でdenyし、read grantから補完しない。将来、対象operationまたはissuerを変える場合は新contract versionと#15側の合意が必要である。
+delegated grantはparentのchild集合・operation集合の部分集合で、expiryがparent以前の場合だけ発行できる。child追加、operation追加、expiry延長のいずれか一つでも拡張ならdenyし、新しい上位grantで代用しない。
+
+v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exact_job`と`cancel_exact_job`はIssue #15のsupervisor approval domainへ接続し、次のtyped receiptを必須とする。receiptは`version, receipt_id, issuer_kind, issuer_id, tenant_id, principal_id, resource_kind, resource_id, resource_revision, operation, issued_at, expires_at, policy_revision, nonce`を上記と同じcanonical encodingで署名する。検証済み署名結果も判定入力とし、全fieldの存在、contract version、空でないissuer/receipt/nonceを確認する。issuerは`supervisor`だけ、日時は有限で`issued_at <= now < expires_at`、寿命は正かつ5分以内、operationとresource revisionは完全一致、一度だけ消費する。missing、未知version/issuer、未検証署名、未来発行、不正日時、期限切れ、revision/operation不一致、#15の実装が未提供の場合は`approval_unavailable`でdenyし、read grantから補完しない。将来、対象operationまたはissuerを変える場合は新contract versionと#15側の合意が必要である。
 
 ## 認可decision table
 
@@ -40,9 +42,11 @@ v1ではread系と`resolve_origin_ref`は追加approval不要だが、`steer_exa
 
 どの段階でも不明ならdenyし、外部向けerrorは`not_available`または`access_unavailable`へ縮退する。restricted auditだけに`unverified_ingress`、`principal_mismatch`、`grant_expired`、`policy_revision_mismatch`、`membership_revoked`、`legacy_unknown`等を残す。存在・件数・cursor・timing・詳細errorで不可視resourceを推測できる差を作らない。
 
-current access proofは`status, event_id, principal_id, workspace_id, destination_id, issued_at, expires_at, nonce, consumed`を持ち、requestと全identityを一致させる。日時は有限なUTC秒精度とし、`issued_at <= now < expires_at`、寿命は正かつ120秒以下、expiryはexclusive、write用proofは一度だけ消費する。destination/principal/event不一致、未来発行、負または不正な寿命、期限切れ、消費済み、provider unavailable/revokedは外部へ`access_unavailable`だけを返す。それ以外の内部denyはresource ID、件数、cursor等を付けず`not_available`へ縮退する。
+current access proofは`status, event_id, principal_id, workspace_id, destination_id, issued_at, expires_at, nonce, consumed`を持ち、requestと全identityを一致させる。nonceは空でない文字列、署名検証済みでなければならない。日時は有限なUTC秒精度とし、`issued_at <= now < expires_at`、寿命は正かつ120秒以下、expiryはexclusive、write用proofは一度だけ消費する。destination/principal/event不一致、未来発行、負または不正な寿命、期限切れ、消費済み、provider unavailable/revokedは外部へ`access_unavailable`だけを返す。それ以外の内部denyはresource ID、件数、cursor等を付けず`not_available`へ縮退する。
 
-全operation catalogはallow fixtureを少なくとも1件持つ。read系と`resolve_origin_ref`のfixtureはjob/group/schedule/session/notificationのbefore/after snapshotが完全一致し、許容する副作用をrestricted authorization auditだけに固定する。
+全operation catalogはallow fixtureを少なくとも1件持つ。read系と`resolve_origin_ref`のfixtureはjob/group/schedule/session/notificationのbefore/after snapshotが完全一致し、許容する副作用をrestricted authorization auditだけに固定する。denyされたsteer/cancelも同じくstate不変である。成功したwrite gateはaccess proof nonceとapproval nonceをoperation開始と同じatomic boundaryで消費し、同じ入力の二回目をdenyする。
+
+principal proof verifierは署名に加え、空でないnonce、有限な時刻、`issued_at <= now < expires_at`、正かつ120秒以下の寿命、未消費であることを確認する。expiry境界、未来発行、消費済みnonce、未検証署名はbindingを作らずdenyする。principal/binding/grant等の必須identity自体が欠落しても例外差を外部へ出さずsafe denyへ縮退する。
 
 fixtureの主な期待値は次のとおりである。
 
@@ -64,7 +68,7 @@ rollbackは新規issue/authorization routeをsafe-offにし、新binding/grant�
 | #163 | event/attempt専用agent context、別socket/credentialの管理API、route deny test |
 | #164 | principal・exact task・resource revisionの永続binding、legacy unknown migration |
 | #165 | current membership/visibility proof、120秒expiry、provider failureのfail-closed |
-| #166 | 共通authorize、operation catalog、restricted audit、安全なprojection fixture |
+| #166 | 共通authorize、operation catalog、delegation subset判定、restricted audit、安全なprojection fixture |
 | #244 | owner bindingを使うhuman-wait read model。自由文やdestinationを複写しない |
 | #245 | `read_own_human_waits`、認可後filter、bounded pagination、opaque origin ref |
 | #246 | 明示intent、safe renderer、origin再認可、曖昧Slack writeの非再試行 |

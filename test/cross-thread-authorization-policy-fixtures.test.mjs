@@ -36,14 +36,15 @@ test('principal proofとoperation catalogは重複のない固定集合である
   assert.equal(new Set(operations).size, operations.length);
   assert.deepEqual(required, ['attempt', 'event_id', 'expires_at', 'issued_at', 'key_id', 'nonce',
     'principal_id', 'principal_kind', 'tenant_id', 'version', 'workspace_id']);
-  assert.ok(operations.includes('read_own_human_waits'));
+  assert.deepEqual(operations, ['cancel_exact_job', 'read_bounded_result', 'read_exact_job_status',
+    'read_own_human_waits', 'resolve_origin_ref', 'steer_exact_job']);
   assert.deepEqual(fixture.principal_proof.kinds_allowed_owner_wide, ['human']);
 });
 
 const decide = entry => {
   const { request, binding, grant, principal, transport_context: transport, access_proof: access } = entry;
   if (!transport.authenticated) return ['deny', 'unverified_ingress'];
-  if (!binding || !grant || principal.kind === 'unknown') return ['deny', 'legacy_unknown'];
+  if (!principal || !binding || !grant || principal.kind === 'unknown') return ['deny', 'legacy_unknown'];
   if (principal.kind !== 'human') return ['deny', 'principal_kind_denied'];
   if (transport.event_id !== request.event_id || transport.attempt !== request.attempt
     || binding.event_id !== request.event_id || binding.attempt !== request.attempt) return ['deny', 'event_attempt_mismatch'];
@@ -61,11 +62,13 @@ const decide = entry => {
   const accessLifetime = accessExpires - accessIssued;
   if (access.event_id !== request.event_id || access.principal_id !== principal.id
     || access.workspace_id !== request.workspace_id || access.destination_id !== request.destination_id
-    || access.consumed || ![accessIssued, accessExpires, now].every(Number.isFinite)
+    || access.consumed || !access.signature_verified || typeof access.nonce !== 'string' || access.nonce.length === 0
+    || ![accessIssued, accessExpires, now].every(Number.isFinite)
     || accessLifetime <= 0 || accessLifetime > fixture.access_proof.max_age_seconds * 1000
     || accessIssued > now || now >= accessExpires) {
     return ['deny', 'access_unavailable'];
   }
+  if (!['exact_resource', 'epic_children_snapshot'].includes(grant.scope_kind)) return ['deny', 'resource_mismatch'];
   if (grant.scope_kind === 'epic_children_snapshot') {
     if (grant.resource_kind !== 'epic' || request.parent_resource_id !== grant.resource_id
       || request.parent_resource_revision !== grant.resource_revision
@@ -80,10 +83,12 @@ const decide = entry => {
   if (grant.status !== 'active' || grant.revoked_at) return ['deny', 'grant_revoked'];
   const expectedGrantRevision = grant.scope_kind === 'epic_children_snapshot'
     ? request.parent_resource_revision : request.resource_revision;
-  if (grant.current_revision !== expectedGrantRevision) return ['deny', 'resource_mismatch'];
-  const grantLifetime = Date.parse(grant.expires_at) - Date.parse(grant.issued_at);
-  if (grantLifetime <= 0 || grantLifetime > fixture.grant.max_age_seconds * 1000) return ['deny', 'invalid_grant_lifetime'];
-  if (Date.parse(request.now) >= Date.parse(grant.expires_at)) return ['deny', 'grant_expired'];
+  if (entry.current_resource_revision !== expectedGrantRevision) return ['deny', 'resource_mismatch'];
+  const grantIssued = Date.parse(grant.issued_at), grantExpires = Date.parse(grant.expires_at);
+  const grantLifetime = grantExpires - grantIssued;
+  if (![grantIssued, grantExpires, now].every(Number.isFinite) || grantIssued > now
+    || grantLifetime <= 0 || grantLifetime > fixture.grant.max_age_seconds * 1000) return ['deny', 'invalid_grant_lifetime'];
+  if (now >= grantExpires) return ['deny', 'grant_expired'];
   if (fixture.approval.required_operations.includes(request.operation)) {
     const receipt = entry.approval_receipt;
     const requiredFields = ['version', 'receipt_id', 'issuer_kind', 'issuer_id', 'tenant_id', 'principal_id',
@@ -99,10 +104,13 @@ const decide = entry => {
       && receipt.principal_id === principal.id && receipt.resource_kind === request.resource_kind
       && receipt.resource_id === request.resource_id && receipt.resource_revision === request.resource_revision
       && receipt.operation === request.operation && receipt.policy_revision === request.policy_revision;
-    const lifetime = receipt ? Date.parse(receipt.expires_at) - Date.parse(receipt.issued_at) : NaN;
+    const receiptIssued = receipt ? Date.parse(receipt.issued_at) : NaN;
+    const receiptExpires = receipt ? Date.parse(receipt.expires_at) : NaN;
+    const lifetime = receiptExpires - receiptIssued;
     if (!complete || !validIssuer || !validIdentity || receipt.consumed
+      || ![receiptIssued, receiptExpires, now].every(Number.isFinite) || receiptIssued > now
       || lifetime <= 0 || lifetime > fixture.approval.max_age_seconds * 1000
-      || Date.parse(request.now) >= Date.parse(receipt.expires_at)) return ['deny', 'approval_unavailable'];
+      || now >= receiptExpires) return ['deny', 'approval_unavailable'];
   }
   return ['allow', 'authorized'];
 };
@@ -128,7 +136,11 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
     'access_future_issued_at', 'access_invalid_time', 'steer_approval_missing_field',
     'steer_approval_unknown_version', 'steer_approval_unverified', 'allow_read_exact_job_status',
     'allow_read_bounded_result', 'allow_resolve_origin_ref', 'allow_cancel_exact_job',
-    'epic_snapshot_child', 'epic_future_child']) {
+    'epic_snapshot_child', 'epic_future_child', 'grant_invalid_time', 'grant_future_issued_at',
+    'approval_invalid_time', 'approval_future_issued_at', 'approval_negative_lifetime',
+    'access_nonce_missing', 'access_nonce_empty', 'access_signature_unverified', 'unknown_grant_scope',
+    'principal_missing', 'exact_current_revision_mismatch', 'epic_current_revision_mismatch',
+    'steer_replayed_nonce', 'cancel_replayed_nonce']) {
     assert.ok(byId[id], id);
   }
   for (const entry of fixture.cases) {
@@ -140,12 +152,51 @@ test('threat/failure fixtureは具体的な入力からallow/denyを導出する
       assert.deepEqual(entry.state_after, entry.state_before, entry.id);
       assert.deepEqual(entry.expected_effects, ['restricted_authorization_audit'], entry.id);
     }
+    if (entry.decision === 'deny' && ['steer_exact_job', 'cancel_exact_job'].includes(entry.request.operation)) {
+      assert.deepEqual(entry.state_after, entry.state_before, entry.id);
+      assert.deepEqual(entry.expected_effects, ['restricted_authorization_audit'], entry.id);
+    }
+    if (entry.decision === 'allow' && ['steer_exact_job', 'cancel_exact_job'].includes(entry.request.operation)) {
+      assert.equal(entry.state_before.access_nonce_consumed, false, entry.id);
+      assert.equal(entry.state_before.approval_nonce_consumed, false, entry.id);
+      assert.equal(entry.state_after.access_nonce_consumed, true, entry.id);
+      assert.equal(entry.state_after.approval_nonce_consumed, true, entry.id);
+      assert.deepEqual(entry.expected_effects,
+        ['authorized_operation', 'consume_access_nonce', 'consume_approval_nonce', 'restricted_authorization_audit'], entry.id);
+    }
   }
   assert.deepEqual(new Set(fixture.cases.filter(entry => entry.decision === 'allow').map(entry => entry.request.operation)),
     new Set(fixture.grant.operations));
   assert.equal(byId.grant_at_expiry.reason, 'grant_expired');
   assert.equal(byId.provider_unavailable.reason, 'access_unavailable');
   assert.equal(byId.legacy_unknown.principal.kind, 'unknown');
+});
+
+test('principal proofは期限・未来発行・replay・署名をfail-closedにする', () => {
+  const decideProof = entry => {
+    const now = Date.parse(entry.now), issued = Date.parse(entry.issued_at), expires = Date.parse(entry.expires_at);
+    if (!entry.signature_verified) return ['deny', 'unverified_ingress'];
+    if (entry.consumed) return ['deny', 'proof_replayed'];
+    if (![now, issued, expires].every(Number.isFinite) || issued > now || expires - issued <= 0
+      || expires - issued > fixture.principal_proof.expires_after_seconds * 1000) return ['deny', 'invalid_proof_time'];
+    if (now >= expires) return ['deny', 'proof_expired'];
+    return ['allow', 'verified'];
+  };
+  for (const entry of fixture.principal_proof.cases) {
+    assert.equal(typeof entry.nonce, 'string', entry.id);
+    assert.ok(entry.nonce.length > 0, entry.id);
+    assert.deepEqual(decideProof(entry), [entry.decision, entry.reason], entry.id);
+  }
+});
+
+test('delegated grantはchild・operation・expiryを縮小する場合だけ許可する', () => {
+  const isSubset = (child, parent) => child.every(value => parent.includes(value));
+  for (const entry of fixture.delegation_cases) {
+    const allowed = isSubset(entry.child.children, entry.parent.children)
+      && isSubset(entry.child.operations, entry.parent.operations)
+      && Date.parse(entry.child.expires_at) <= Date.parse(entry.parent.expires_at);
+    assert.equal(allowed ? 'allow' : 'deny', entry.decision, entry.id);
+  }
 });
 
 test('外部deny projection、approval、全downstream必須artifactを完全照合する', () => {
@@ -164,7 +215,7 @@ test('外部deny projection、approval、全downstream必須artifactを完全照
     163: ['attempt_capability', 'management_plane_separation'],
     164: ['legacy_unknown', 'principal_task_binding', 'resource_revision_binding'],
     165: ['current_access_proof', 'provider_fail_closed', 'visibility_check'],
-    166: ['authorize_service', 'operation_catalog', 'restricted_audit', 'safe_projection'],
+    166: ['authorize_service', 'delegation_subset', 'operation_catalog', 'restricted_audit', 'safe_projection'],
     244: ['human_wait_model'],
     245: ['bounded_pagination', 'filter_after_auth', 'opaque_origin_ref', 'read_own_human_waits'],
     246: ['ambiguous_post_no_retry', 'explicit_owner_intent', 'origin_reauthorization', 'safe_slack_renderer'],
