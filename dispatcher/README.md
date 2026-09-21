@@ -90,7 +90,7 @@ schedule操作は、呼出し元が指定したworkspace・actor・返信先を�
 - `delegate_job`: 長い調査・開発をscratchまたはGitHub worktreeへ委任。同じsource eventでは安定した`job_key`ごとにcreate/reuseを判定
 - `list_event_jobs`: create応答喪失時に`source_event_id`と任意の`job_key`から、writeを再送せずjobを照合。元の`objective`とworkspaceも渡すとcanonical payloadの`matched` / `conflict`を判定
 - `list_thread_jobs`: Slack threadに紐づくジョブを列挙
-- `get_job_status`: 現在の`source_event_id`と明示`job_id`でthreadを照合。 状態と結果を取得
+- `get_job_status`: 現在の`source_event_id`と明示`job_id`を照合し、agent向けには認可済みstatus/receipt projectionだけを取得。Result本文と自由文errorは返さない
 - `steer_job`: 同じthreadの後続イベントを稼働中Codex turnへsteer
 - `cancel_job`: ジョブを中止
 - `plan_self_update`: fixed mainのexact SHA update planを作る（read-only）
@@ -114,7 +114,7 @@ terminal updateは`source: dona_update`としてDispatcherへ戻ります。外�
 
 ジョブが`completed`、`failed`、`blocked`、`cancelled`、`needs_review`になると、Dispatcherは同じSQLiteへ`source: dona_job`の内部イベントを冪等に追加します。`dona-main`がそのイベントを通常の直列キューで受け、必要なSlack応答とAgent Sessionの状態変更を行います。ジョブworkerはSlackへ直接書き込みません。セルフアップデート通知は前述の専用workerだけが、固定文面・固定宛先でSlack Adapterへ依頼します。
 
-明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`で全jobのdurable summaryを列挙し、snapshot内の各IDへread-onlyな`get_job_status`を使って先行jobのResultも集約するため、owner 1件の`payload.result`だけを全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
+明示的な`job_key`を持つ複数jobでは、元のsource eventが`dispatching` / `waiting_agent`から離れるtransaction内でgroupをsealし、それまではjob通知をメインキューへ流しません。各通知にはResult全文とは別の最大32件のboundedなgroup snapshotと`progress` / `attention` / `all_terminal` transitionを付けます。`progress`はAgent Sessionを変更せず、最初の`attention`だけが`suspended`、attention対象がなく全jobが`completed`または`cancelled`になった最初の`all_terminal`だけが`active`を所有します。`all_terminal`を処理する`dona-main`は`list_event_jobs`の認証済みcompletion projectionで全jobのstatusを列挙します。`get_job_status`はResult本文を返さず、限定Result開示は別operationの責務です。owner 1件の`payload.result`を全体結果として誤用しません。transition claim、event enqueue、jobの`completion_event_id`更新は1 transactionなので、再起動後は未通知jobだけを再照合できます。v2移行由来の単一jobと`job_key`省略callerはgroup fieldのない従来通知を維持します。
 
 ### background jobのAgent Status進捗
 

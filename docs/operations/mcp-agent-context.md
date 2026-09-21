@@ -17,6 +17,8 @@ credentialはowner-only fileへ置き、値をprompt、model output、通常log�
 | `schedule_work` | durable `dona_schedule` run | `record_schedule_job_access`、`delegate_scheduled_work` |
 | `update_completion` | stable updater notification | `get_self_update_status` |
 
+この表はtransport上のoperation上限であり、job readの開示許可ではない。human commandのjob readは[agent read認可・開示境界](agent-read-authorization.md)で各jobをfilter-after-authし、grant/current visibility portが未接続ならdenyする。`job_completion`のreadは関連source eventとnotification ownerへ束縛した専用projectionだけを返し、`result_json`や自由文errorを返さない。
+
 正本は`dispatcher/src/agent-context.ts`の`agentPurposeOperations`である。`.codex/config.toml`のtool allowlistはこの集合の和と一致させる。background job workerは親agentのcapabilityを継承せず、`dona_dispatcher` MCPを常に無効化する。
 
 `list_thread_jobs`と`get_self_update_status`を含む全toolは現在の`source_event_id`を明示する。write routeのJSON bodyにある`source_event_id`は、schema validationや業務処理より前にserver-side contextのevent IDと完全一致させる。唯一、`job_completion`の`list_event_jobs`はgroup完了集約のため、durableな完了通知の`subject.source_event_id`または`trace.source_event_id`と一致する元eventを一覧対象にできる。queryでpath上の対象eventを上書きできず、他purposeや無関係なeventへの横断はdenyする。tool説明やmodelの遵守は認可根拠にせず、source-event swap、別attempt、期限切れ、purpose違反、context欠落、agent socketからの管理routeを一律denyする。

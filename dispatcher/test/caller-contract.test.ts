@@ -182,8 +182,28 @@ test("MCP bounds thread projection and signals possible omitted candidates", asy
   } finally { await f.close(); }
 });
 
+test("MCP event/owner listはclientのraw fieldと不可視metadataを再投影する", async () => {
+  const f = await fixture();
+  try {
+    const unsafe = { jobs: [{ job_id: "job_safe", status: "running", objective: "PRIVATE-CANARY", result_json: "PRIVATE-CANARY", last_error_message: "PRIVATE-CANARY" }],
+      source_event_id: f.source, reconciliation: "matched", total: 99, cursor: "PRIVATE-CANARY", truncated: true };
+    f.uds.listEventJobs = async () => unsafe;
+    f.uds.listOwnerJobs = async () => unsafe;
+    const event = await f.call("list_event_jobs", { source_event_id: f.source });
+    const owner = await f.call("list_owner_jobs", { source_event_id: f.source });
+    for (const result of [event.data, owner.data]) {
+      assert.equal(result.jobs[0].job_id, "job_safe");
+      assert.equal(result.truncated, true);
+      assert.equal(result.total, undefined);
+      assert.equal(result.cursor, undefined);
+      assert.doesNotMatch(JSON.stringify(result), /PRIVATE-CANARY/);
+    }
+    assert.equal(event.data.reconciliation, "matched");
+  } finally { await f.close(); }
+});
+
 for (const status of ["blocked", "needs_review"] as const) {
-  test(`MCP status retains bounded ${status} reason without a Result`, async () => {
+  test(`MCP status omits ${status} free text and Result`, async () => {
     const f = await fixture();
     try {
       const created = await f.call("delegate_job", { source_event_id: f.source, job_key: "error.audit", objective: "private objective", workspace_kind: "scratch" });
@@ -193,11 +213,10 @@ for (const status of ["blocked", "needs_review"] as const) {
       if (status === "blocked") f.database.markJobBlocked(id, reason, ["queued"]);
       else f.database.markJobNeedsReview(id, "steer_acceptance_unknown", reason);
       const result = (await f.call("get_job_status", { source_event_id: f.source, job_id: id })).data.job;
-      assert.equal(result.result_json, null);
+      assert.equal(result.result_json, undefined);
       assert.equal(result.status, status);
-      assert.match(result.last_error_message, /Human approval is required; acceptance unknown/);
-      assert.ok(result.last_error_message.length <= 2_000);
-      assert.doesNotMatch(result.last_error_message, /private|hidden-value|https:|job_/);
+      assert.equal(result.last_error_message, undefined);
+      assert.doesNotMatch(JSON.stringify(result), /private|hidden-value|https:/);
       assert.equal((await f.call("list_thread_jobs", { source_event_id: f.source, workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" })).data.jobs[0].last_error_message, undefined);
     } finally { await f.close(); }
   });
