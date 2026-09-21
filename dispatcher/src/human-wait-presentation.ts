@@ -16,7 +16,9 @@ function unquotedText(value:string):string {
   return value.split(/\r?\n/).filter(line=>{
     if(line.trim().startsWith("```")){fenced=!fenced;return false;}
     return !fenced&&!line.trimStart().startsWith(">");
-  }).join("\n").replace(/`[^`\r\n]*`/g," ").replace(/<@[A-Z0-9]+>/g," ").trim();
+  }).join("\n")
+    .replace(/`[^`\r\n]*`|「[^」\r\n]*」|『[^』\r\n]*』|“[^”\r\n]*”|‘[^’\r\n]*’|"[^"\r\n]*"|'[^'\r\n]*'/g," ")
+    .replace(/<@[A-Z0-9]+>/g," ").trim();
 }
 
 export function hasExplicitOwnHumanWaitIntent(event:EventRow,input:{continuation?:boolean}={}):boolean {

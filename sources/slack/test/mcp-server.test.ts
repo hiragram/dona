@@ -8,6 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { KeychainStore } from "../src/keychain.js";
 import type { SlackLogger } from "../src/logger.js";
 import { createSlackMcpServer } from "../src/mcp/server.js";
+import { SlackApiError } from "../src/slack-api.js";
 import type {
   SlackApiClient,
   SlackAgentSessionStatus,
@@ -372,7 +373,7 @@ describe("Dona Slack MCP server", () => {
         throw new Error("connection lost");
       }
     }
-    const run=async(fake:AmbiguousClient)=>{
+    const run=async(fake:FakeSlackClient)=>{
       const registry=await SlackWorkspaceRegistry.load(["company"],new MemoryKeychain(),logger,()=>fake);
       const server=createSlackMcpServer(registry,logger,input=>JSON.stringify(input));
       const client=new Client({name:"test-client",version:"1.0.0"});
@@ -407,6 +408,21 @@ describe("Dona Slack MCP server", () => {
       assert.equal(result.isError,true);
       assert.match(JSON.stringify(result.structuredContent),/slack_post_acceptance_unknown/);
       assert.equal(unknown.posts.length,0);
+    } finally {await pair.client.close();await pair.server.close();}
+
+    class RejectedClient extends FakeSlackClient {
+      override async postMessage():Promise<SlackPostResult> {
+        throw new SlackApiError("restricted_action","Slack rejected the presentation");
+      }
+    }
+    const rejected=new RejectedClient();
+    pair=await run(rejected);
+    try {
+      const result=await pair.client.callTool({name:"post_message_once",arguments:input});
+      assert.equal(result.isError,true);
+      assert.match(JSON.stringify(result.structuredContent),/restricted_action/);
+      assert.doesNotMatch(JSON.stringify(result.structuredContent),/slack_post_acceptance_unknown/);
+      assert.equal(rejected.posts.length,0);
     } finally {await pair.client.close();await pair.server.close();}
 
     class DuplicatePagesClient extends AmbiguousClient {

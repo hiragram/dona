@@ -606,7 +606,9 @@ export function createSlackMcpServer(
             throw new SlackApiError("slack_post_acceptance_unknown","Slack presentation acceptance is unknown; do not retry the write");
           return {workspace,channel_id:posted.channelId,message_ts:posted.messageTs,thread_ts,duplicate:false,reconciled:true,
             body_sha256:createHash("sha256").update(text).digest("hex"),event_id,idempotency_key,mrkdwn:false,parse:"none"};
-        } catch {
+        } catch(error) {
+          if(error instanceof SlackApiError&&!["slack_transport_error","slack_http_error","slack_api_error","invalid_slack_response"].includes(error.errorCode))
+            throw error;
           let reconciled;
           try {reconciled=await find();} catch(error) {
             if(error instanceof SlackApiError&&error.errorCode==="slack_post_identity_conflict")throw error;
