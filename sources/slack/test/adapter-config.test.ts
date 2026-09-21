@@ -14,6 +14,8 @@ describe("loadAdapterConfig", () => {
       config.dispatcherSocketPath,
       path.join(os.homedir(), "Library", "Application Support", "Dona", "run", "dispatcher.sock"),
     );
+    assert.equal(config.slackIngressTokenPath,
+      path.join(os.homedir(), "Library", "Application Support", "Dona", "update-control", "slack-ingress.token"));
     assert.equal(
       config.healthSocketPath,
       path.join(os.homedir(), "Library", "Application Support", "Dona", "run", "slack-adapter.sock"),

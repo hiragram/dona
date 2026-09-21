@@ -13,6 +13,8 @@ import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
 import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
 import { ScheduleError } from "./scheduler/errors.js";
+import { PrincipalBindingConflictError } from "./principal-binding.js";
+import { PrincipalProofError, verifySlackPrincipalProof } from "./principal-proof.js";
 import {
   jobKeyPattern,
   parseCancelJobRequest,
@@ -454,10 +456,29 @@ export class DispatcherApi {
       }
       const input = await this.readJson(request);
       const envelope = parseEventEnvelope(input);
+      if (envelope.source !== "slack") {
+        throw new ApiRequestError(403, "unverified_ingress", "External event source is not accepted");
+      }
+      let verifiedPrincipal;
+      const acceptedAt = new Date();
+      try {
+        const key = await readPrivateToken(this.config.slackIngressTokenPath);
+        if (!key) throw new PrincipalProofError("principal_proof_missing");
+        verifiedPrincipal = verifySlackPrincipalProof(envelope, request.headers["x-dona-slack-principal-proof"],
+          request.headers["x-dona-slack-principal-signature"], key, acceptedAt);
+      } catch (error) {
+        if (error instanceof PrincipalProofError) {
+          throw new ApiRequestError(403, "unverified_ingress", "Slack ingress authentication failed");
+        }
+        throw error;
+      }
       let result;
       try {
-        result = this.database.enqueue(envelope);
+        result = this.database.enqueue(envelope, acceptedAt, verifiedPrincipal);
       } catch (error) {
+        if (error instanceof PrincipalBindingConflictError) {
+          throw new ApiRequestError(409, error.code, "Slack ingress evidence conflicts with the persisted event");
+        }
         throw new PersistenceUnavailableError(
           error instanceof Error ? error.message : "Event could not be persisted",
         );

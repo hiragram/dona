@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import { randomBytes } from "node:crypto";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -626,7 +627,35 @@ export class RealRuntime implements RuntimePort {
     return resolved;
   }
 
-  startDispatcher(): Promise<CommandResult> {
+  private async ensureSlackIngressToken(): Promise<void> {
+    const tokenPath = path.join(this.policy.control_root, "slack-ingress.token");
+    await fs.mkdir(this.policy.control_root, { recursive: true, mode: 0o700 });
+    try {
+      await fs.lstat(tokenPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const temporary=path.join(this.policy.control_root,`.slack-ingress.token.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+      const handle=await fs.open(temporary,"wx",0o600);
+      try { await handle.writeFile(`${randomBytes(32).toString("hex")}\n`); await handle.sync(); }
+      finally { await handle.close(); }
+      try {
+        await fs.link(temporary,tokenPath);
+        const directory=await fs.open(this.policy.control_root,"r");
+        try { await directory.sync(); } finally { await directory.close(); }
+      } catch(linkError) {
+        if((linkError as NodeJS.ErrnoException).code!=="EEXIST") throw linkError;
+      } finally { await fs.unlink(temporary).catch(()=>undefined); }
+    }
+    const stats = await fs.lstat(tokenPath), uid = process.getuid?.();
+    if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      throw new Error("slack_ingress_token_identity_invalid");
+    }
+    const token = (await fs.readFile(tokenPath, "utf8")).trim();
+    if (!/^[0-9a-f]{64}$/.test(token)) throw new Error("slack_ingress_token_invalid");
+  }
+
+  async startDispatcher(): Promise<CommandResult> {
+    await this.ensureSlackIngressToken();
     return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
   }
 

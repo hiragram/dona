@@ -17,6 +17,7 @@ DONA_DIR="$HOME/Library/Application Support/Dona"
 LOG_DIR="$DONA_DIR/logs"
 CONTROL_DIR="$DONA_DIR/update-control"
 DISPATCHER_TOKEN_PATH="$CONTROL_DIR/dispatcher.token"
+SLACK_INGRESS_TOKEN_PATH="$CONTROL_DIR/slack-ingress.token"
 DISPATCHER_PLIST="$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
 SLACK_PLIST="$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist"
 DOMAIN="gui/$UID"
@@ -32,6 +33,11 @@ if [[ ! -f "$DISPATCHER_TOKEN_PATH" ]]; then
   /usr/bin/openssl rand -hex 32 > "$DISPATCHER_TOKEN_PATH.tmp"
   chmod 600 "$DISPATCHER_TOKEN_PATH.tmp"
   /bin/mv "$DISPATCHER_TOKEN_PATH.tmp" "$DISPATCHER_TOKEN_PATH"
+fi
+if [[ ! -f "$SLACK_INGRESS_TOKEN_PATH" ]]; then
+  /usr/bin/openssl rand -hex 32 > "$SLACK_INGRESS_TOKEN_PATH.tmp"
+  chmod 600 "$SLACK_INGRESS_TOKEN_PATH.tmp"
+  /bin/mv "$SLACK_INGRESS_TOKEN_PATH.tmp" "$SLACK_INGRESS_TOKEN_PATH"
 fi
 
 npm --prefix "$DISPATCHER_DIR" ci
@@ -52,6 +58,7 @@ CODEX_XML=$(escape_xml "$CODEX_PATH")
 GH_XML=$(escape_xml "$GH_PATH")
 GIT_XML=$(escape_xml "$GIT_PATH")
 DISPATCHER_TOKEN_XML=$(escape_xml "$DISPATCHER_TOKEN_PATH")
+SLACK_INGRESS_TOKEN_XML=$(escape_xml "$SLACK_INGRESS_TOKEN_PATH")
 
 cat > "$DISPATCHER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -73,6 +80,7 @@ cat > "$DISPATCHER_PLIST" <<PLIST
     <key>DONA_GH_PATH</key><string>$GH_XML</string>
     <key>DONA_GIT_PATH</key><string>$GIT_XML</string>
     <key>DONA_UPDATE_INTERNAL_TOKEN_PATH</key><string>$DISPATCHER_TOKEN_XML</string>
+    <key>DONA_SLACK_INGRESS_TOKEN_PATH</key><string>$SLACK_INGRESS_TOKEN_XML</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -99,6 +107,7 @@ cat > "$SLACK_PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>DONA_UPDATE_INTERNAL_TOKEN_PATH</key><string>$DISPATCHER_TOKEN_XML</string>
+    <key>DONA_SLACK_INGRESS_TOKEN_PATH</key><string>$SLACK_INGRESS_TOKEN_XML</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

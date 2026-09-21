@@ -17,8 +17,12 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
+import { ensurePrivateToken } from "./private-token.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
+  // The target release performs this before becoming ready, so updates driven by
+  // an older stable updater also provision the adapter/Dispatcher credential.
+  await ensurePrivateToken(config.slackIngressTokenPath);
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
   const database = new DispatcherDatabase(config.databasePath, {

@@ -9,6 +9,7 @@ export interface SlackAdapterConfig {
   dispatcherSocketPath: string;
   healthSocketPath: string;
   updateInternalTokenPath: string;
+  slackIngressTokenPath: string;
   dispatcherConnectTimeoutMs: number;
   dispatcherTimeoutMs: number;
   shutdownGraceMs: number;
@@ -75,6 +76,9 @@ export function loadAdapterConfig(env: NodeJS.ProcessEnv = process.env): SlackAd
     ),
     updateInternalTokenPath: expandHome(
       env.DONA_UPDATE_INTERNAL_TOKEN_PATH ?? path.join(base, "update-control", "dispatcher.token"),
+    ),
+    slackIngressTokenPath: expandHome(
+      env.DONA_SLACK_INGRESS_TOKEN_PATH ?? path.join(base, "update-control", "slack-ingress.token"),
     ),
     dispatcherConnectTimeoutMs: positiveInteger(
       env.DONA_CONNECT_TIMEOUT_MS,

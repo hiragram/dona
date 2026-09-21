@@ -12,6 +12,7 @@ const config: SlackAdapterConfig = {
   dispatcherSocketPath: "/tmp/dispatcher.sock",
   healthSocketPath: "/tmp/slack-health.sock",
   updateInternalTokenPath: "/tmp/dispatcher.token",
+  slackIngressTokenPath: "/tmp/slack-ingress.token",
   dispatcherConnectTimeoutMs: 500,
   dispatcherTimeoutMs: 2_000,
   shutdownGraceMs: 200,
@@ -80,7 +81,7 @@ describe("SlackSocketAdapter", () => {
       postEvent: () => new Promise<DispatcherResponse>((resolve) => void (finishDispatch = resolve)),
       healthReady: async () => true,
     };
-    const adapter = new SlackSocketAdapter([{ workspace: "company", client }], dispatcher, config, logger);
+    const adapter = new SlackSocketAdapter([{ workspace: "company", teamId: "T01234567", client }], dispatcher, config, logger);
     await adapter.start();
     let acked = false;
     client.emit("slack_event", socketEnvelope("env-1", async () => void (acked = true)));
@@ -107,7 +108,7 @@ describe("SlackSocketAdapter", () => {
       },
       healthReady: async () => true,
     };
-    const adapter = new SlackSocketAdapter([{ workspace: "company", client }], dispatcher, config, logger);
+    const adapter = new SlackSocketAdapter([{ workspace: "company", teamId: "T01234567", client }], dispatcher, config, logger);
     await adapter.start();
     let ackCount = 0;
     for (const envelopeId of ["env-1", "env-2", "env-3", "env-4"]) {
@@ -128,7 +129,7 @@ describe("SlackSocketAdapter", () => {
       },
       healthReady: async () => true,
     };
-    const adapter = new SlackSocketAdapter([{ workspace: "company", client }], dispatcher, config, logger);
+    const adapter = new SlackSocketAdapter([{ workspace: "company", teamId: "T01234567", client }], dispatcher, config, logger);
     await adapter.start();
     let ackCount = 0;
     client.emit(
@@ -146,11 +147,41 @@ describe("SlackSocketAdapter", () => {
     await adapter.stop();
   });
 
+  test("authenticated Socket workspaceと異なるteam_idを署名・ACKしない", async () => {
+    const client = new FakeSocketClient();
+    let calls = 0;
+    const adapter = new SlackSocketAdapter(
+      [{ workspace: "company", teamId: "T01234567", client }],
+      {
+        async postEvent() {
+          calls += 1;
+          return { statusCode: 202, body: "{}" };
+        },
+        healthReady: async () => true,
+      },
+      config,
+      logger,
+    );
+    await adapter.start();
+    let acked = false;
+    client.emit(
+      "slack_event",
+      socketEnvelope("env-wrong-team", async () => void (acked = true), {
+        ...eventBody("Ev-wrong-team"),
+        team_id: "T_OTHER",
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 0);
+    assert.equal(acked, false);
+    await adapter.stop();
+  });
+
   test("ACKs deliberately ignored events without calling Dispatcher", async () => {
     const client = new FakeSocketClient();
     let calls = 0;
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       {
         async postEvent() {
           calls += 1;
@@ -172,6 +203,11 @@ describe("SlackSocketAdapter", () => {
     );
     await waitFor(() => acked);
     assert.equal(calls, 0);
+    acked=false;
+    client.emit("slack_event",socketEnvelope("env-no-actor",async()=>void(acked=true),{
+      ...eventBody(),event:{type:"message",channel:"C123",channel_type:"channel",ts:"1756722030.123456",text:"unknown"},
+    }));
+    await waitFor(()=>acked);assert.equal(calls,0);
     await adapter.stop();
   });
 
@@ -179,7 +215,7 @@ describe("SlackSocketAdapter", () => {
     const client = new FakeSocketClient();
     let calls = 0;
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       {
         async postEvent() {
           calls += 1;
@@ -215,7 +251,7 @@ describe("SlackSocketAdapter", () => {
   test("reconnects after an unexpected disconnect", async () => {
     const client = new FakeSocketClient();
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       { postEvent: async () => ({ statusCode: 202, body: "{}" }), healthReady: async () => true },
       config,
       logger,
@@ -242,7 +278,7 @@ describe("SlackSocketAdapter", () => {
     }
     const client = new AuthFailureClient();
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       { postEvent: async () => ({ statusCode: 202, body: "{}" }), healthReady: async () => true },
       config,
       logger,
@@ -258,7 +294,7 @@ describe("SlackSocketAdapter", () => {
     const client = new FakeSocketClient();
     let finishDispatch: ((response: DispatcherResponse) => void) | undefined;
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       {
         postEvent: () => new Promise<DispatcherResponse>((resolve) => void (finishDispatch = resolve)),
         healthReady: async () => true,
@@ -283,7 +319,7 @@ describe("SlackSocketAdapter", () => {
   test("quiesceは進行中のreminder配送もdrain対象にする", async () => {
     const client = new FakeSocketClient();
     const adapter = new SlackSocketAdapter(
-      [{ workspace: "company", client }],
+      [{ workspace: "company", teamId: "T01234567", client }],
       { postEvent: async () => ({ statusCode: 202, body: "{}" }), healthReady: async () => true },
       { ...config, shutdownGraceMs: 10 },
       logger,

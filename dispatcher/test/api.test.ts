@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -8,9 +8,10 @@ import { afterEach, describe, test } from "node:test";
 import { DispatcherApi, scheduleAccessConfirmationTimeout } from "../src/api.js";
 import { DispatcherDatabase } from "../src/database.js";
 import type { Logger } from "../src/logger.js";
+import { principalProofKeyId } from "../src/principal-proof.js";
 import { UpdaterClientError } from "../src/updater-client.js";
 import { canonicalJobPayloadSha256, parseCreateJobRequest, stableStringify } from "../src/validation.js";
-import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
+import { eventEnvelope, tempConfig, testInternalToken, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -20,6 +21,29 @@ const jobs = {
   async steer() { throw new Error("not used"); },
   async cancel() { throw new Error("not used"); },
 };
+const proofIssued = new Date(Math.floor(Date.now() / 1_000) * 1_000);
+let proofSequence=0;
+function ingressHeaders(body: unknown): Record<string, string> {
+  if (!body || typeof body !== "object" || (body as {source?:unknown}).source !== "slack") return {};
+  const envelope = body as {external_event_id:string;subject:Record<string,unknown>;trace?:Record<string,unknown>};
+  const proof = stableStringify({
+    attempt: envelope.trace?.ingress_attempt,
+    event_id: envelope.external_event_id,
+    expires_at: new Date(proofIssued.getTime() + 120_000).toISOString().replace(/\.000Z$/, "Z"),
+    issued_at: proofIssued.toISOString().replace(/\.000Z$/, "Z"),
+    key_id: principalProofKeyId(testInternalToken),
+    nonce: `test-${createHash("sha256").update(`${envelope.external_event_id}:${String(envelope.trace?.ingress_attempt)}:${proofSequence++}`).digest("hex").slice(0, 24)}`,
+    principal_id: envelope.subject.actor_id,
+    principal_kind: "human",
+    tenant_id: envelope.subject.workspace_id,
+    version: 1,
+    workspace_id: envelope.subject.workspace_id,
+  });
+  return {
+    "x-dona-slack-principal-proof": Buffer.from(proof).toString("base64url"),
+    "x-dona-slack-principal-signature": createHmac("sha256", testInternalToken).update(proof).digest("base64url"),
+  };
+}
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
@@ -39,7 +63,7 @@ function request(
         socketPath,
         method,
         path: route,
-        headers: { ...extraHeaders, ...(encoded ? { "content-type": contentType, "content-length": String(encoded.length) } : {}) },
+        headers: { ...ingressHeaders(body), ...extraHeaders, ...(encoded ? { "content-type": contentType, "content-length": String(encoded.length) } : {}) },
       },
       (response) => {
         const chunks: Buffer[] = [];
@@ -65,7 +89,7 @@ function requestAndDropResponseBody(socketPath: string, route: string, body: unk
         socketPath,
         method: "POST",
         path: route,
-        headers: { "content-type": "application/json", "content-length": String(encoded.length) },
+        headers: { ...ingressHeaders(body), "content-type": "application/json", "content-length": String(encoded.length) },
       },
       (response) => {
         response.once("error", () => {});
@@ -85,7 +109,7 @@ describe("DispatcherApi", () => {
     assert.equal(scheduleAccessConfirmationTimeout(issuedAt,issued+118_500),500);
     assert.throws(()=>scheduleAccessConfirmationTimeout(issuedAt,issued+119_000),/receipt_expired/);
   });
-  test("persists before returning 202 and returns the same event for duplicates", async () => {
+  test("persists before returning 202, rejects proof replay, and accepts a fresh redelivery proof", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -98,10 +122,14 @@ describe("DispatcherApi", () => {
       logger,
     );
     await api.start();
-    const first = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
+    const envelope=eventEnvelope("Ev-1"),replayedProof=ingressHeaders(envelope);
+    const first = await request(config.socketPath, "POST", "/v1/events", envelope, "application/json", replayedProof);
     assert.equal(first.status, 202);
     assert.equal(database.list().length, 1);
-    const duplicate = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
+    assert.equal(database.getVerifiedPrincipalBinding(String(first.body.event_id))?.principal_id, "U_TEST");
+    const replay=await request(config.socketPath,"POST","/v1/events",envelope,"application/json",replayedProof);
+    assert.equal(replay.status,409);
+    const duplicate = await request(config.socketPath, "POST", "/v1/events", envelope);
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.event_id, first.body.event_id);
     assert.equal(database.list().length, 1);
@@ -147,6 +175,48 @@ describe("DispatcherApi", () => {
     assert.equal((await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"))).status, 413);
     await api.stop();
     database.close();
+  });
+
+  test("rejects unauthenticated Slack、forged internal source、conflicting duplicate payload", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
+    await api.start();
+    const unauthenticated = eventEnvelope("Ev-unauthenticated");
+    const unauthenticatedStatus = (await request(config.socketPath, "POST", "/v1/events", unauthenticated, "application/json", {
+      "x-dona-slack-principal-proof": "",
+      "x-dona-slack-principal-signature": "",
+    })).status;
+    const unauthenticatedRow = database.getByExternalId("slack", "Ev-unauthenticated");
+
+    const forged = { ...eventEnvelope("Ev-forged-completion"), source: "dona_job" };
+    const forgedStatus = (await request(config.socketPath, "POST", "/v1/events", forged)).status;
+    const forgedRow = database.getByExternalId("dona_job", "Ev-forged-completion");
+
+    const duplicate = eventEnvelope("Ev-proof-conflict");
+    const firstStatus = (await request(config.socketPath, "POST", "/v1/events", duplicate)).status;
+    const retry = structuredClone(duplicate); retry.trace = { ingress_attempt:2 };
+    const retryStatus = (await request(config.socketPath,"POST","/v1/events",retry)).status;
+    const changed = structuredClone(retry); changed.payload.text = "tampered";
+    const conflict = await request(config.socketPath, "POST", "/v1/events", changed);
+    await api.stop(); database.close();
+    assert.equal(unauthenticatedStatus,403); assert.equal(unauthenticatedRow,undefined);
+    assert.equal(forgedStatus,403); assert.equal(forgedRow,undefined);
+    assert.equal(firstStatus,202); assert.equal(retryStatus,200);
+    assert.equal(conflict.status, 409);
+    assert.equal((conflict.body.error as {code:string}).code, "principal_binding_conflict");
+  });
+
+  test("fallback受信時刻だけが変わるSlack再配送を同一eventとして受理する",async()=>{
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath),api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger);
+    await api.start();
+    const first=eventEnvelope("Ev-received-at-retry");first.occurred_at="2026-09-21T00:00:00.000Z";
+    first.trace={ingress_attempt:1,occurred_at_source:"received_at"};
+    const second=structuredClone(first);second.occurred_at="2026-09-21T00:00:05.000Z";second.trace={ingress_attempt:2,occurred_at_source:"received_at"};
+    const firstStatus=(await request(config.socketPath,"POST","/v1/events",first)).status;
+    const retryStatus=(await request(config.socketPath,"POST","/v1/events",second)).status;
+    await api.stop();database.close();assert.equal(firstStatus,202);assert.equal(retryStatus,200);
   });
 
   test("creates and reads a durable background job over UDS", async () => {
