@@ -121,12 +121,26 @@ export class AuditRepository {
    * It must not commit, issue external writes, or return deferred work. The returned
    * value is released only after durable finalize and a complete verified reread. */
   append<T>(transactionId: string, keyVersion: number, event: AuditEvent, mutation: () => T): { record: AuditRecord; result: T } {
+    const appended = this.appendConditional(transactionId, keyVersion, event, () => true, mutation);
+    if (!appended.applied) throw new AuditIntegrityError();
+    return appended;
+  }
+
+  /** Evaluate a DB-only CAS precondition under the same IMMEDIATE writer lock used
+   * for append, but before reserving the external anchor. A false precondition has
+   * no audit or application side effects. */
+  appendConditional<T>(transactionId: string, keyVersion: number, event: AuditEvent,
+    precondition: () => boolean, mutation: () => T):
+    { applied: false } | { applied: true; record: AuditRecord; result: T } {
     return guard(() => {
       if (this.db.inTransaction) throw new AuditIntegrityError();
       let reservation: AuditAnchor | undefined;
       const committed = this.db.transaction(() => {
         const current = this.verifyInside();
         if (this.db.prepare("SELECT 1 FROM security_audit_records WHERE transaction_id=?").get(transactionId)) throw new AuditIntegrityError();
+        const allowed = precondition();
+        if (typeof allowed !== "boolean") throw new AuditIntegrityError();
+        if (!allowed) return { applied: false as const };
         const record = signAuditRecord({ codec_version: 1, chain_id: current.chain_id,
           sequence: current.sequence + 1, transaction_id: transactionId, previous_mac: current.mac,
           key_version: keyVersion, event }, this.keys);
@@ -151,8 +165,9 @@ export class AuditRepository {
         const expected = { ...proposed, pending_transaction_id: null };
         verifyAuditChain(this.checkpoint(), this.records(), expected, this.keys);
         requireEqual(reservation, this.store.read());
-        return { record, result };
+        return { applied: true as const, record, result };
       }).immediate();
+      if (!committed.applied) return committed;
       if (!reservation) throw new AuditIntegrityError();
       const expected = { ...reservation, pending_transaction_id: null };
       // The first transaction is already durable. Reacquire the writer lock

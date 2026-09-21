@@ -186,7 +186,7 @@ export class JobAuthorizationBindingRepository {
   constructor(private readonly db: Database.Database) {}
 
   bindEventTask(eventId: string, expectedBindingRevision: number, rawEvidence: unknown,
-    verifier: TaskBindingEvidenceVerifier, audit: Pick<AuditRepository, "append">,
+    verifier: TaskBindingEvidenceVerifier, audit: Pick<AuditRepository, "appendConditional">,
     auditContext: TaskBindingAuditContext, at = new Date()): EventTaskBindingRow {
     if (!Number.isSafeInteger(expectedBindingRevision) || expectedBindingRevision < 0) throw new TaskBindingConflictError();
     const evidence = parsedEvidence(verifier.verify(rawEvidence));
@@ -220,24 +220,36 @@ export class JobAuthorizationBindingRepository {
       attempt_id: evidence.evidence_sha256, policy_revision: 1,
       binding_revision: existing ? existing.binding_revision + 1 : 1, authz_revision: principal.event_attempt,
     };
-    return audit.append(auditValues.transaction_id, auditValues.key_version, auditEvent, () => this.db.transaction(() => {
+    const expectedCurrent = (): boolean => {
+      const current = this.readEventTask(eventId);
+      return current === undefined
+        ? expectedBindingRevision === 0
+        : current.binding_revision === expectedBindingRevision && current.status === "active" &&
+          current.repository_node_id === evidence.task.repository_node_id && current.task_node_id === evidence.task.task_node_id &&
+          evidence.task.resource_revision >= current.resource_revision;
+    };
+    const appended = audit.appendConditional(auditValues.transaction_id, auditValues.key_version, auditEvent,
+      expectedCurrent, () => {
       const current = this.readEventTask(eventId);
       if (!current) {
-        if (expectedBindingRevision !== 0) throw new TaskBindingConflictError();
         this.db.prepare(`INSERT INTO event_task_bindings VALUES(?,?,?,?,?,?,?,?,1,'active',?,?,NULL)`).run(
           eventId,evidence.task.provider,evidence.task.repository_node_id,evidence.task.task_node_id,evidence.task.task_number,
           evidence.task.resource_revision,eventId,evidence.evidence_sha256,now,now);
         return this.readEventTask(eventId)!;
       }
-      if (current.binding_revision !== expectedBindingRevision || current.status !== "active" ||
-        current.repository_node_id !== evidence.task.repository_node_id || current.task_node_id !== evidence.task.task_node_id ||
-        evidence.task.resource_revision < current.resource_revision) throw new TaskBindingConflictError();
       const changed = this.db.prepare(`UPDATE event_task_bindings SET task_number=?,resource_revision=?,authorization_evidence_sha256=?,
         binding_revision=binding_revision+1,updated_at=? WHERE event_id=? AND binding_revision=? AND status='active'`).run(
         evidence.task.task_number,evidence.task.resource_revision,evidence.evidence_sha256,now,eventId,expectedBindingRevision).changes;
       if (changed !== 1) throw new TaskBindingConflictError();
       return this.readEventTask(eventId)!;
-    })()).result;
+    });
+    if (appended.applied) return appended.result;
+    const raced = this.readEventTask(eventId);
+    if (raced?.authorization_evidence_sha256 === evidence.evidence_sha256 && raced.provider === evidence.task.provider &&
+      raced.repository_node_id === evidence.task.repository_node_id && raced.task_node_id === evidence.task.task_node_id &&
+      raced.task_number === evidence.task.task_number && raced.resource_revision === evidence.task.resource_revision &&
+      raced.status === "active") return raced;
+    throw new TaskBindingConflictError();
   }
 
   readEventTask(eventId: string): EventTaskBindingRow | undefined {

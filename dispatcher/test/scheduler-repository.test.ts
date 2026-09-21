@@ -929,6 +929,14 @@ test("旧scheduled eventのbindingとwork payloadをmigrationで復元する", (
   raw.prepare("DELETE FROM event_job_bindings WHERE event_id=?").run(run.event_id);
   raw.prepare("UPDATE events SET payload_json='{}' WHERE event_id=?").run(run.event_id);
   raw.prepare("DELETE FROM job_routing_schema").run();
+  raw.prepare("UPDATE job_authorization_binding_schema SET version=2 WHERE singleton=1").run();
+  assert.throws(() => new DispatcherDatabase(filename), /Unsupported job authorization binding schema/);
+  assert.equal(fs.readFileSync(legacyResult,"utf8"),"old result");
+  assert.equal(fs.existsSync(`${legacyResult}.routing-migration-backup`),false);
+  assert.equal((raw.prepare("SELECT count(*) AS count FROM job_routing_schema").get() as {count:number}).count,0);
+  assert.deepEqual(raw.prepare("SELECT status,result_path FROM events WHERE event_id=?").get(run.event_id),
+    {status:"completed",result_path:legacyResult});
+  raw.prepare("UPDATE job_authorization_binding_schema SET version=1 WHERE singleton=1").run();
   const reopened=new DispatcherDatabase(filename); reopened.close();
   assert.equal(fs.existsSync(legacyResult),false);
   assert.equal(fs.readFileSync(`${legacyResult}.routing-migration-backup`,"utf8"),"old result");

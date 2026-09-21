@@ -423,8 +423,10 @@ export class DispatcherDatabase {
           if(fs.existsSync(backup)) throw new Error("routing_migration_result_backup_exists");
           fs.renameSync(row.result_path,backup); movedResults.push({from:row.result_path,to:backup});
         }
-        migrateJobRouting(this.db);
-        migrateJobAuthorizationBindings(this.db);
+        this.db.transaction(() => {
+          migrateJobRouting(this.db);
+          migrateJobAuthorizationBindings(this.db);
+        }).immediate();
       } catch(error) {
         for(const moved of movedResults.reverse()) if(fs.existsSync(moved.to)&&!fs.existsSync(moved.from)) fs.renameSync(moved.to,moved.from);
         throw error;

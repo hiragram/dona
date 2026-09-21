@@ -33,11 +33,13 @@ const verifier: TaskBindingEvidenceVerifier = {
 };
 const auditEvents: AuditEvent[] = [];
 const audit = {
-  append<T>(_transactionId: string, _keyVersion: number, event: AuditEvent, mutation: () => T) {
+  appendConditional<T>(_transactionId: string, _keyVersion: number, event: AuditEvent,
+    precondition: () => boolean, mutation: () => T) {
+    if (!precondition()) return { applied: false as const };
     auditEvents.push(event);
-    return { record: {} as never, result: mutation() };
+    return { applied: true as const, record: {} as never, result: mutation() };
   },
-} as Pick<AuditRepository, "append">;
+} as Pick<AuditRepository, "appendConditional">;
 const auditContext = { instance_id: "dispatcher_test", transaction_id: "bind_transaction_1", key_version: 1 };
 
 const auditKey: AuditKey = { version: 1, purpose: "audit", state: "active",
@@ -96,10 +98,11 @@ test("共有auditのDB外CASとtask bindingを同じtransactionで確定する",
   const checkpoint = signAuditCheckpoint({ codec_version: 1, chain_id: "task_binding_chain",
     transaction_id: "task_binding_genesis", signed_at: "2026-09-21T00:00:00.000Z", key_version: 1 }, auditKeys);
   class Store implements AuditAnchorStore {
+    reservations = 0;
     value: AuditAnchor = { chain_id: "task_binding_chain", sequence: 0, mac: "0".repeat(64),
       checkpoint_mac: checkpoint.mac, pending_transaction_id: null };
     read() { return structuredClone(this.value); }
-    reserve(expected: AuditAnchor, proposed: AuditAnchor) { assert.deepEqual(this.value, expected); this.value = structuredClone(proposed); return this.read(); }
+    reserve(expected: AuditAnchor, proposed: AuditAnchor) { this.reservations++; assert.deepEqual(this.value, expected); this.value = structuredClone(proposed); return this.read(); }
     finalize(reservation: AuditAnchor) { assert.deepEqual(this.value, reservation); this.value = { ...this.value, pending_transaction_id: null }; return this.read(); }
   }
   const auditStore = new Store(); const realAudit = new AuditRepository(db, auditStore, auditKeys);
@@ -108,7 +111,21 @@ test("共有auditのDB外CASとtask bindingを同じtransactionで確定する",
   const bound = bindings.bindEventTask(source.event_id, 0, { provider_verified: true, evidence: evidence(source.event_id) },
     verifier, realAudit, { ...auditContext, transaction_id: "bind_with_shared_audit" }, new Date("2026-09-21T00:01:30.000Z"));
   assert.equal(bound.binding_revision, 1); assert.equal(realAudit.verify().sequence, 1);
+  const peerDb = new Database(config.databasePath); peerDb.pragma("foreign_keys = ON"); peerDb.pragma("busy_timeout = 2000");
+  const peerBindings = new JobAuthorizationBindingRepository(peerDb);
+  const peerAudit = new AuditRepository(peerDb, auditStore, auditKeys);
+  const updated = bindings.bindEventTask(source.event_id, 1,
+    { provider_verified: true, evidence: evidence(source.event_id, "2", 4) }, verifier, realAudit,
+    { ...auditContext, transaction_id: "bind_with_shared_audit_2" }, new Date("2026-09-21T00:01:31.000Z"));
+  assert.equal(updated.binding_revision, 2); assert.equal(auditStore.reservations, 2);
+  assert.throws(() => peerBindings.bindEventTask(source.event_id, 1,
+    { provider_verified: true, evidence: evidence(source.event_id, "3", 5) }, verifier, peerAudit,
+    { ...auditContext, transaction_id: "stale_bind_must_not_reserve" }, new Date("2026-09-21T00:01:32.000Z")),
+  TaskBindingConflictError);
+  assert.equal(auditStore.reservations, 2);
+  assert.equal(peerAudit.verify().sequence, 2);
   assert.deepEqual(db.pragma("foreign_key_check"), []);
+  peerDb.close();
   db.close();
   dispatcher = new DispatcherDatabase(config.databasePath);
   assert.equal(dispatcher.jobAuthorization.readEventTask(source.event_id)?.task_number, 164);
