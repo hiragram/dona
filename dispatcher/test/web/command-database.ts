@@ -66,6 +66,13 @@ test("preparingとdispatchingのweb jobもownerがcancellingへ遷移できる",
   }
 });
 
+test("cancelling中のweb cancel再送はterminalにせずacceptance unknownへ保つ", async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const db = new DispatcherDatabase(config.databasePath), created = db.createWebJob(input("6".repeat(64)), config.jobsWorkspaceRoot, config.jobResultsDir);
+  db.beginWebJobCancellation(created.row.job_id, owner);
+  assert.throws(() => db.beginWebJobCancellation(created.row.job_id, owner), /web_cancel_acceptance_unknown/); db.close();
+});
+
 test("blockedとneeds_reviewのweb jobもworker解放確認まではowner quotaへ算入する", async t => {
   for (const [index, status] of ["blocked", "needs_review"].entries()) {
     const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));

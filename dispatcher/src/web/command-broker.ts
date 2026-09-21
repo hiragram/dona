@@ -21,7 +21,9 @@ export class WebCommandBroker {
     private readonly jobs: Pick<JobSupervisor, "cancelWeb" | "wake">, private readonly paths: WebCommandPaths) {}
   async execute(input: WebCommandInput): Promise<WebCommandResult> {
     try {
-      const body = Buffer.from(input.browser_body, "base64url"), parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+      const body = Buffer.from(input.browser_body, "base64url"); let parsed: unknown;
+      try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)); }
+      catch { return { status: "denied", reason: "invalid_request" }; }
       const ingress = this.auth.verifySessionIngress(`web_command_${randomBytes(16).toString("hex")}`, input.context,
         input.method, input.target, body, { csrf_verified: true });
       if (ingress.status === "denied") return { status: "denied", reason: ingress.reason === "scope_denied" ? "scope_denied" : "identity_unavailable" };
@@ -78,7 +80,7 @@ export class WebCommandBroker {
       });
     } catch (error) {
       if (error instanceof JobCreationError) return { status: "denied", reason: error.code === "job_group_limit_exceeded" ? "quota_exceeded" : "idempotency_conflict" };
-      if (error instanceof z.ZodError || error instanceof SyntaxError || error instanceof TypeError)
+      if (error instanceof z.ZodError)
         return { status: "denied", reason: "invalid_request" };
       return { status: "denied", reason: "internal_error" };
     }

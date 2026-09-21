@@ -105,7 +105,7 @@ test("public TLSからWeb Adapter・認証UDS・Dispatcher queue・DB receiptま
   const jobs = new DispatcherDatabase(config.databasePath); t.after(() => jobs.close());
   let cancelFailure = false;
   const controls = { wake() {}, async cancelWeb(jobId: string, identity: {instance_id:string;tenant_id:string;principal_id:string}) {
-    if (cancelFailure) throw Error("fixture internal failure");
+    if (cancelFailure) throw new TypeError("fixture internal failure");
     const before = jobs.assertWebJobOwner(jobId, identity), row = jobs.beginWebJobCancellation(jobId, identity);
     jobs.markJobCancelled(jobId, "fixture"); return { row: jobs.getJob(jobId)!, duplicate: before.status === "cancelled" || row.status === "cancelled" };
   } };
