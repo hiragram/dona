@@ -38,7 +38,7 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
-- `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`として相関message ID、次のproducer sequence、conversation revisionを返す。後続の人間回答はcurrent event bindingで`answer`へ変換し、通常のfree-form steerへ落とさない。
+- `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`を返す。一意なら相関message ID、次のproducer sequence、conversation revisionを返し、複数なら`ambiguous: true`と`pending_count_at_least: 2`だけを返して相関先を推測させない。後続の人間回答はcurrent event bindingで`answer`へ変換し、成功後はAgent Sessionを`processing`へ戻す。通常のfree-form steerへ落とさない。
 
 ## 障害対応
 

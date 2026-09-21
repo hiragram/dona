@@ -129,7 +129,7 @@ test("caller documentation and advertised MCP tools share ambiguity and partial 
     for (const pattern of [/初回write前/, /job_key/, /partial success/, /list_thread_jobs/, /複数候補/, /明示.*job_id/, /blind retry/, /read-only reconcile/, /progress/, /source_event_id/]) assert.match(text, pattern, file);
   }
   const agents=await fs.readFile(new URL("../../AGENTS.md",import.meta.url),"utf8");
-  for(const pattern of [/pending_worker_question/, /send_worker_instruction.*`answer`/, /correlation_message_id/, /next_producer_sequence/, /next_conversation_revision/, /通常の`steer_job`へ変換せず/])
+  for(const pattern of [/pending_worker_question/, /ambiguous: true/, /send_worker_instruction.*`answer`/, /correlation_message_id/, /next_producer_sequence/, /next_conversation_revision/, /通常の`steer_job`へ変換せず/, /Agent Sessionを`processing`へ戻し/])
     assert.match(agents,pattern);
   const f = await fixture();
   try {
@@ -177,11 +177,11 @@ test("MCP bounds thread projection and signals possible omitted candidates", asy
   const f = await fixture();
   try {
     f.uds.listThreadJobs = async () => ({ jobs: Array.from({ length: 101 }, (_, i) => ({ job_id: `candidate-${i}`, objective: "secret", result_json: "secret", workspace_path: "/private",
-      ...(i===0?{pending_worker_question:{message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3}}:{}) })) });
+      ...(i===0?{pending_worker_question:{ambiguous:false,message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3}}:{}) })) });
     const result = await f.call("list_thread_jobs", { workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" });
     assert.equal(result.data.jobs.length, 100);
     assert.equal(result.data.truncated, true);
-    assert.deepEqual(result.data.jobs[0].pending_worker_question,{message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3});
+    assert.deepEqual(result.data.jobs[0].pending_worker_question,{ambiguous:false,message_id:"msg_00000000000000000000000000",kind:"question",next_producer_sequence:2,next_conversation_revision:3});
     assert.doesNotMatch(JSON.stringify(result.data), /private|secret/);
   } finally { await f.close(); }
 });
@@ -216,7 +216,7 @@ test("schedule全九ツールを設定許可からMCPとUDSを経て永続revisi
     const dispatcherConfig = config.split("[mcp_servers.dona_dispatcher]")[1]!;
     const enabled = JSON.parse(dispatcherConfig.match(/enabled_tools = (\[[^\n]+\])/)![1]!) as string[];
     const advertised = (await f.client.listTools()).tools.map(tool => tool.name);
-    for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access"]) {
+    for (const name of [...names,"delegate_scheduled_work","list_event_jobs","list_owner_jobs","authorize_job_notification","record_schedule_job_access","send_worker_instruction","get_worker_message","reconcile_worker_message"]) {
       assert.ok(enabled.includes(name), name); assert.ok(advertised.includes(name), name);
     }
     assert.match(dispatcherConfig,/tool_timeout_sec = 150/);

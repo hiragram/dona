@@ -261,6 +261,7 @@ export function migrateDispatcherDatabase(
       migrateWorkerMessaging(db);
       db.exec(`
         CREATE TEMP TABLE preserved_worker_messages_v3 AS SELECT * FROM worker_messages;
+        CREATE TEMP TABLE preserved_worker_message_runtime_identities_v3 AS SELECT * FROM worker_message_runtime_identities;
         CREATE TEMP TABLE preserved_worker_message_deliveries_v3 AS SELECT * FROM worker_message_deliveries;
         CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
         CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
@@ -268,6 +269,7 @@ export function migrateDispatcherDatabase(
         DROP TABLE worker_message_receipts;
         DROP TABLE worker_message_deliveries;
         DROP TABLE worker_message_cadence;
+        DROP TABLE worker_message_runtime_identities;
         DROP TABLE worker_messages;
         DROP TABLE worker_message_workspace_cadence;
       `);
@@ -343,6 +345,10 @@ export function migrateDispatcherDatabase(
           direction, kind, producer, producer_sequence, idempotency_key, payload_json, payload_sha256,
           correlation_message_id, conversation_revision, occurred_at, accepted_at
         FROM preserved_worker_messages_v3;
+        INSERT INTO worker_message_runtime_identities (
+          job_id, runtime_identity_sha256, first_seen_at
+        ) SELECT job_id, runtime_identity_sha256, first_seen_at
+        FROM preserved_worker_message_runtime_identities_v3;
         INSERT INTO worker_message_deliveries (
           delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,
           lease_expires_at, fence, attempt_count, delivered_at, delivered_lease_owner,
@@ -368,6 +374,7 @@ export function migrateDispatcherDatabase(
         ) SELECT workspace_id, minimum_interval_ms, last_delivery_at, updated_at
         FROM preserved_worker_message_workspace_cadence_v3;
         DROP TABLE preserved_worker_messages_v3;
+        DROP TABLE preserved_worker_message_runtime_identities_v3;
         DROP TABLE preserved_worker_message_deliveries_v3;
         DROP TABLE preserved_worker_message_receipts_v3;
         DROP TABLE preserved_worker_message_cadence_v3;

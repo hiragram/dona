@@ -352,7 +352,7 @@ export class WorkerMessageRepository {
   }
 
   pendingQuestion(jobId: string) {
-    const row=this.db.prepare(`SELECT m.message_id,m.kind,
+    const rows=this.db.prepare(`SELECT m.message_id,m.kind,
         COALESCE((SELECT MAX(next.producer_sequence) FROM worker_messages next WHERE next.job_id=m.job_id AND next.producer='dona-main'),0)+1 AS next_producer_sequence,
         COALESCE((SELECT MAX(next.conversation_revision) FROM worker_messages next WHERE next.job_id=m.job_id),0)+1 AS next_conversation_revision
       FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
@@ -360,9 +360,11 @@ export class WorkerMessageRepository {
         AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')
         AND NOT EXISTS (SELECT 1 FROM worker_messages answer WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker'
           AND answer.kind='answer' AND answer.correlation_message_id=m.message_id)
-      ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 1`).get(jobId) as
-        {message_id:string;kind:"question"|"decision_request";next_producer_sequence:number;next_conversation_revision:number}|undefined;
-    return row ? {message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
+      ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 2`).all(jobId) as Array<
+        {message_id:string;kind:"question"|"decision_request";next_producer_sequence:number;next_conversation_revision:number}>;
+    if(rows.length>1)return {ambiguous:true,pending_count_at_least:2};
+    const row=rows[0];
+    return row ? {ambiguous:false,message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
       next_conversation_revision:row.next_conversation_revision} : undefined;
   }
 

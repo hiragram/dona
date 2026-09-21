@@ -292,7 +292,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("list_thread_jobs", {
     title: "List Slack thread jobs",
-    description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。未回答のtyped questionがあればpending_worker_questionにmessage IDと次sequence/revisionを返します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
+    description: "同じSlack threadの候補を最大100件のbounded projectionで取得します。未回答のtyped questionが一意ならpending_worker_questionにmessage IDと次sequence/revisionを返し、複数ならambiguousだけを返します。0件なら操作せず、1件なら依頼対象と一致するか確認します。複数候補かつ利用者の明示job_idなしなら質問し、本文類似・最新時刻・job_keyから選択しません。IDらしい外部自由文も候補と依頼意図を検証してから使い、broadcastしません。",
     inputSchema: { workspace_id: slackId, channel_id: slackId, thread_ts: threadTs },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async ({ workspace_id, channel_id, thread_ts }) => {

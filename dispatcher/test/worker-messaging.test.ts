@@ -166,12 +166,25 @@ describe("worker messaging ledger",()=>{
         idempotency_key:"question-1",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:4,
         payload:{kind:"question",question:"どちらにしますか"}},new Date("2026-09-21T00:00:01Z"));
       assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
-      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{message_id:question.message.message_id,kind:"question",
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,kind:"question",
         next_producer_sequence:1,next_conversation_revision:5});
       database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
         idempotency_key:"answer-1",occurred_at:"2026-09-21T00:00:03Z",correlation_message_id:question.message.message_id,
         conversation_revision:5,payload:{operation:"answer",text:"Aで進めてください"}});
       assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
+    } finally {database.close();}
+  });
+
+  test("複数の未回答questionは相関先を投影せず曖昧と示す",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      for(const sequence of [1,2]) {
+        database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:sequence,
+          idempotency_key:`question-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,conversation_revision:sequence,
+          payload:{kind:"question",question:`質問 ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
+      }
+      assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:03Z")),2);
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:true,pending_count_at_least:2});
     } finally {database.close();}
   });
 
@@ -313,7 +326,8 @@ test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
   const bridge=new DispatcherDatabase(config.databasePath);
   const source=bridge.enqueue(eventEnvelope("Ev-worker-message-v2-preservation")).row;
   const job=bridge.createJob({source_event_id:source.event_id,objective:"worker message",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
-  const created=bridge.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+  bindRuntime(bridge,job.job_id,"runtime-v2-preservation");
+  const created=bridge.workerMessages.appendWorkerReport(job.job_id,"runtime-v2-preservation",report(source.event_id),new Date("2026-09-21T00:00:00Z"));
   bridge.close();
 
   const legacyBridge=new Database(config.databasePath);
@@ -332,7 +346,10 @@ test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
 
   const reopened=new DispatcherDatabase(config.databasePath);
   try {
-    const reconciled=reopened.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1");
+    reopened.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",
+      completed_at:"2026-09-21T00:00:01Z"},job.result_path);
+    reopened.markJobRuntimeCleaned(job.job_id);
+    const reconciled=reopened.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-v2-preservation","report-1");
     assert.equal(reconciled.reconciliation,"matched");
     assert.equal((reconciled as {message:{message_id:string}}).message.message_id,created.message.message_id);
   } finally {reopened.close();}
