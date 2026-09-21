@@ -13,9 +13,9 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, headers, body: JSON.stringify(body) });
 }
 
-async function fixture(page: Page, options: { submitUnknown?: boolean; submitIdentityUnavailable?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
+async function fixture(page: Page, options: { submitUnknown?: boolean; submitIdentityUnavailable?: boolean; submitRejected?: boolean; cancelUnknown?: boolean; pauseSubmit?: Promise<void>; unsafeResult?: boolean;
   scopes?: string[]; firstEventAbort?: boolean; cancelReason?: "terminal" | "owner_mismatch"; listFailsAfterSubmit?: boolean;
-  eventDeniedStatus?: 403 | 404; pauseFirstEvent?: Promise<void>; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseListNumber?: number; secondListUnavailable?: boolean; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; sessionUnavailableAfterFirst?: boolean; sessionPrincipals?: string[]; sessionExpiresAt?: string; pauseCancel?: Promise<void>; pauseLogout?: Promise<void>; pauseFirstDetailAfterCancel?: Promise<void>; firstDetailAfterCancelStatus?: 503; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; listUnavailableAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean; logoutUnknownOnce?: boolean; logoutDeniedOnce?: boolean; logoutStatusRevoked?: boolean } = {}) {
+  eventDeniedStatus?: 403 | 404; pauseFirstEvent?: Promise<void>; pauseFirstAlphaDetail?: Promise<void>; firstAlphaDetailStatus?: 404; pauseSecondList?: Promise<void>; pauseListNumber?: number; secondListUnavailable?: boolean; pauseFirstSession?: Promise<void>; pauseSecondSession?: Promise<void>; sessionUnavailableAfterFirst?: boolean; sessionPrincipals?: string[]; sessionExpiresAt?: string; pauseCancel?: Promise<void>; pauseLogout?: Promise<void>; pauseFirstDetailAfterCancel?: Promise<void>; firstDetailAfterCancelStatus?: 503; multipleJobs?: boolean; listDeniedAfterFirst?: boolean; listUnavailableAfterFirst?: boolean; detailAfterCancelStatus?: 403 | 404 | 503; detailAfterEventStatus?: 503; logoutUnknown?: boolean; logoutUnknownOnce?: boolean; logoutDeniedOnce?: boolean; logoutStatusDeniedOnce?: boolean; logoutStatusRevoked?: boolean } = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown; csrf?: string; lastEventId?: string }> = [], errors: string[] = [];
   const unsafeTerminal = job({ status: "completed", completed_at: at, progress: null, control: { can_cancel: false },
     result: { status: "completed", summary: "<img src=x onerror=alert(1)>\u202eend\u061cmore", completed_at: at, artifacts: [{ name: "report.txt", kind: "report" }] } });
@@ -33,12 +33,13 @@ async function fixture(page: Page, options: { submitUnknown?: boolean; submitIde
     if (url.pathname === "/api/session") { sessionReads++;if(options.pauseFirstSession&&sessionReads===1)await options.pauseFirstSession;if(options.pauseSecondSession&&sessionReads===2)await options.pauseSecondSession;if(options.sessionUnavailableAfterFirst&&sessionReads>1){await fulfill(route,{error:"identity_unavailable"},503);return;}const principals=options.sessionPrincipals;const principalId=principals?.[Math.min(sessionReads-1,principals.length-1)]??"principal-fixture";await fulfill(route, { principal: { principal_id: principalId, role_ids: ["requester"], scopes: options.scopes ?? ["job:submit", "job:read:own", "job:cancel:own"], expires_at:options.sessionExpiresAt??"2099-01-01T00:00:00.000Z" }, csrf_token: csrf }); return; }
     if(url.pathname==="/api/session/csrf"&&request.method()==="POST"){csrfReads++;await fulfill(route,{csrf_token:csrf});return;}
     if(url.pathname==="/api/session/logout"&&request.method()==="POST"){logoutWrites++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.pauseLogout)await options.pauseLogout;if(options.logoutDeniedOnce&&logoutWrites===1){await fulfill(route,{error:"csrf_invalid"},403);return;}if(options.logoutUnknown||(options.logoutUnknownOnce&&logoutWrites===1)){await fulfill(route,{error:"durability_unavailable"},503);return;}await route.fulfill({status:204,body:""});return;}
-    if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);await fulfill(route,{revoked:options.logoutStatusRevoked??true});return;}
+    if(url.pathname==="/api/session/logout-status"&&request.method()==="POST"){logoutStatusReads++;expect(requestHeaders["x-dona-csrf"]).toBe(csrf);if(options.logoutStatusDeniedOnce&&logoutStatusReads===1){await fulfill(route,{error:"csrf_invalid"},403);return;}await fulfill(route,{revoked:options.logoutStatusRevoked??true});return;}
     if (url.pathname === "/api/jobs" && request.method() === "GET") { listReads++;const snapshot=current;if(options.pauseSecondList&&listReads===(options.pauseListNumber??2))await options.pauseSecondList;if(options.secondListUnavailable&&listReads===2){await fulfill(route,{error:"identity_unavailable"},503);return;} if(options.listDeniedAfterFirst&&listReads>1){await fulfill(route,{error:"scope_denied"},403);return;}if(options.listUnavailableAfterFirst&&listReads>1){await fulfill(route,{error:"identity_unavailable"},503);return;}if(options.listFailsAfterSubmit&&submitWrites>0){await fulfill(route,{error:"identity_unavailable"},503);return;}
       await fulfill(route, { items: options.pauseFirstAlphaDetail||options.multipleJobs ? [job(),job({job_id:"job_beta"})] : [snapshot], next_cursor: null }); return; }
     if (url.pathname === "/api/jobs" && request.method() === "POST") {
       submitWrites++; expect(requestHeaders["x-dona-csrf"]).toBe(csrf); expect(body).toMatchObject({ workspace: { kind: "scratch" } });
       expect((body as { request_id: string }).request_id).toMatch(/^[A-Za-z0-9_-]{43}$/); if (options.pauseSubmit) await options.pauseSubmit;
+      if(options.submitRejected){await fulfill(route,{error:"invalid_repository"},400);return;}
       if (options.submitUnknown) { await fulfill(route, { error: "acceptance_unknown" }, 503); return; }
       if(options.submitIdentityUnavailable){await fulfill(route,{error:"identity_unavailable"},503);return;}
       current = job({ job_id: "job_created", status: "queued", progress: null }); await fulfill(route, { status: "succeeded", outcome: "created", receipt_id: "receipt", job: { job_id: "job_created", status: "queued" } }, 201); return;
@@ -337,6 +338,10 @@ test("logoutの確定的CSRF拒否ではロックを解除してcurrent session�
   const f=await fixture(page,{logoutDeniedOnce:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:"ログアウト"}).click();await expect(page.getByRole("status")).toContainText("ログアウトを送信しませんでした");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.logoutStatusReads).toBe(0);await page.getByRole("button",{name:"ログアウト"}).click();await expect(page).toHaveURL(policy.origin+"/login");expect(f.logoutWrites).toBe(2);expect(f.errors).toEqual([]);
 });
 
+test("logout-statusの確定的CSRF拒否でも受付不明を保ってcurrent sessionを再検証する",async({page})=>{
+  const f=await fixture(page,{logoutUnknownOnce:true,logoutStatusDeniedOnce:true});await page.goto(policy.origin+"/");await page.getByRole("button",{name:"ログアウト"}).click();await expect(page.getByRole("status")).toContainText("ログアウト結果は不明です");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.logoutStatusReads).toBe(1);await page.getByRole("button",{name:"ログアウト"}).click();await expect(page).toHaveURL(policy.origin+"/login");expect(f.logoutWrites).toBe(2);expect(f.errors).toEqual([]);
+});
+
 test("session再検証失敗後もlocal CSRFを取得してlogoutできる",async({page})=>{
   const f=await fixture(page,{sessionUnavailableAfterFirst:true});await page.goto(policy.origin+"/");await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await page.evaluate(()=>dispatchEvent(new FocusEvent("focus")));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeHidden();await page.getByRole("button",{name:"ログアウト"}).click();await expect(page).toHaveURL(policy.origin+"/login");expect(f.csrfReads).toBe(1);expect(f.logoutWrites).toBe(1);expect(f.errors).toEqual([]);
 });
@@ -347,6 +352,10 @@ test("logout開始時に進行中bootを無効化しprivate viewを再表示し�
 
 test("古いboot応答はbfcache復帰後の新しいsession表示を消去しない",async({page})=>{
   let release!:()=>void;const pauseFirstSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseFirstSession});await page.goto(policy.origin+"/");await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();release();await page.waitForTimeout(100);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByRole("button",{name:/job_alpha/})).toBeVisible();expect(f.sessionReads).toBe(2);expect(f.errors).toEqual([]);
+});
+
+test("pagehideで無効化した復帰bootはBFCache pageshow後に一度再実行する",async({page})=>{
+  let release!:()=>void;const pauseSecondSession=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSecondSession});await page.goto(policy.origin+"/");const before=f.sessionReads;await page.evaluate(()=>dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true})));await expect.poll(()=>f.sessionReads).toBe(before+1);await page.evaluate(()=>{dispatchEvent(new PageTransitionEvent("pagehide",{persisted:true}));dispatchEvent(new PageTransitionEvent("pageshow",{persisted:true}));});release();await expect.poll(()=>f.sessionReads).toBe(before+2);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();expect(f.errors).toEqual([]);
 });
 
 test("bfcache復帰のsession再確認中は以前のprincipalを表示しない",async({page})=>{
@@ -382,6 +391,10 @@ test("定期session再検証で同じprincipalの編集中draftを復元する",
 
 test("送信中のformは定期session再検証後にdraftとして復元しない",async({page})=>{
   await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("送信済みの依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.clock.fastForward(60001);await expect(page.getByRole("heading",{name:"新しい依頼"})).toBeVisible();await expect(page.getByLabel("依頼内容")).toHaveValue("");release();await expect(page.getByRole("status")).toContainText("受付結果が不明です");await expect(page.getByLabel("依頼内容")).toHaveValue("");expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
+});
+
+test("再検証と競合したsubmitの確定拒否では送信元principalの入力だけを復元する",async({page})=>{
+  await page.clock.install({time:new Date("2026-09-21T00:00:00.000Z")});let release!:()=>void;const pauseSubmit=new Promise<void>(resolve=>{release=resolve;});const f=await fixture(page,{pauseSubmit,submitRejected:true});await page.goto(policy.origin+"/");await page.getByLabel("依頼内容").fill("拒否された依頼");await page.getByRole("button",{name:"依頼を送信"}).click();await expect.poll(()=>f.submitWrites).toBe(1);await page.clock.fastForward(60001);await expect(page.getByLabel("依頼内容")).toHaveValue("");release();await expect(page.getByRole("status")).toContainText("入力を復元しました");await expect(page.getByLabel("依頼内容")).toHaveValue("拒否された依頼");await expect(page.getByRole("button",{name:"依頼を送信"})).toBeEnabled();expect(f.submitWrites).toBe(1);expect(f.errors).toEqual([]);
 });
 
 test("定期session再検証でprincipalが変わった場合はdraftを復元しない",async({page})=>{
