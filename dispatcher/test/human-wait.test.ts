@@ -149,13 +149,13 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
     desired_session_status:"suspended",session_status:"suspended"},new Date(transitionAt.getTime()+1_750).toISOString()),true);
   assert.equal(database.humanWaits.get(group!.item_id)?.session_settlement_verified,1);
   const settlementRaw=new Database(config.databasePath);
-  settlementRaw.prepare("UPDATE jobs SET status='failed',updated_at=? WHERE job_id=?")
+  settlementRaw.prepare("UPDATE jobs SET status='needs_review',last_error_code='unknown',updated_at=? WHERE job_id=?")
     .run(new Date(transitionAt.getTime()+1_900).toISOString(),second.job_id);
   settlementRaw.close();
   assert.equal(database.humanWaits.get(group!.item_id)?.session_settlement_verified,1);
   const terminalEvent=database.enqueue(eventEnvelope("Ev-group-terminal")).row;
   database.claimJobGroupTransition(source.event_id,"all_terminal",terminalEvent.event_id,new Date(transitionAt.getTime()+2_000));
-  assert.equal(database.humanWaits.listInternal().length,0);
+  assert.deepEqual(database.humanWaits.listInternal().map(item=>item.dedupe_key),[`job:${second.job_id}`]);
   const resolvedGroup=database.humanWaits.get(group!.item_id)!;
   const retentionDb=new Database(config.databasePath);
   const retention=retentionDb.prepare("SELECT julianday(retain_until)-julianday(resolved_at) AS days FROM human_wait_items WHERE item_id=?")
@@ -293,8 +293,11 @@ test("repairはmalformed itemを一度だけquarantineしてopen projectionか�
   raw.prepare("UPDATE human_wait_items SET origin_ref='origin_bad/value' WHERE dedupe_key=?").run(`job:${job.job_id}`);
   raw.close();
   const snapshot=new Date(Date.now()+60_000).toISOString();
+  const dry=database.humanWaits.repair({dryRun:true,limit:500,snapshotRevision:snapshot});
+  assert.deepEqual({repaired:dry.repaired,quarantined:dry.quarantined},{repaired:0,quarantined:1});
   const first=database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:snapshot});
   assert.equal(first.quarantined,1);
+  assert.equal(first.repaired,0);
   assert.equal(database.humanWaits.listInternal().length,0);
   const second=database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:snapshot});
   assert.equal(second.quarantined,0);
@@ -415,11 +418,17 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
       workspace_id:destination.target.workspace_id,channel_id:destination.target.channel_id,thread_ts:destination.target.thread_ts,
       desired_session_status:"suspended" as const,session_status:"suspended" as const};
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(result.job_id);
-    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:01:01.000Z"),true);
-    assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)?.session_settlement_verified,1);
+    const initialNotification=harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)!;
+    const initialSettlementAt=new Date(Date.parse(initialNotification.opened_at)+1_000).toISOString();
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,initialSettlementAt),true);
+    assert.equal(harness.database.humanWaits.get(initialNotification.item_id)?.session_settlement_verified,1);
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE job_id=?").run(result.job_id);
+    const reopenedAt=new Date(Date.parse(initialNotification.opened_at)+2_000).toISOString();
+    harness.raw.prepare("UPDATE events SET updated_at=? WHERE event_id=?").run(reopenedAt,completion.notification_event_id);
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE job_id=?").run(result.job_id);
     assert.equal(harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`notification:${result.job_id}:completed`)?.session_settlement_verified,0);
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,initialSettlementAt),false);
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,new Date(Date.parse(reopenedAt)+1_000).toISOString()),true);
     harness.raw.prepare("UPDATE job_completion_results SET notification_state='accepted' WHERE job_id=?").run(result.job_id);
     harness.raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='steer_acceptance_unknown',updated_at='2026-09-05T00:02:00Z' WHERE job_id=?").run(result.job_id);
     harness.raw.prepare("UPDATE schedule_runs SET status='started',reason=NULL,terminal_at=NULL WHERE run_id=?").run(runId);
@@ -434,6 +443,7 @@ test("schedule workのjob waitをrun waitへ集約する", () => {
     const reopened=harness.database.humanWaits.listInternal().find(item=>item.dedupe_key===`run:${runId}`)!;
     assert.equal(reopened.session_settlement_verified,0);
     assert.equal(reopened.source_revision,"2026-09-05T00:02:03Z");
+    assert.equal(harness.database.humanWaits.recordVerifiedSessionSettlement(settlement,"2026-09-05T00:02:01.000Z"),false);
   } finally { harness.close(); }
 });
 
