@@ -40,7 +40,10 @@ describe("自分待ちSlack表示",()=>{
     assert.equal(hasExplicitOwnHumanWaitIntent(event("```\n自分待ちを一覧で見せて\n```\n確認します")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> `私の待ちを一覧で見せて`って入力すればいいですか？")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> 「私の待ちを一覧で見せて」と言えばいいですか？")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("<@U_BOT> ＂私の待ちを一覧で見せて＂と入力すればいいですか？")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event('<@U_BOT> "my waits list" と入力しますか？')),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち受け画面を見せて")),false);
+    assert.equal(hasExplicitOwnHumanWaitIntent(event("私の待ち時間を教えて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent(event("田中さんの待ちを一覧で見せて")),false);
     assert.equal(hasExplicitOwnHumanWaitIntent({...event("私の待ちを一覧で見せて"),source:"dona_job"}),false);
   });

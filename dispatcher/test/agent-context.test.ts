@@ -220,6 +220,13 @@ test("agent read境界は認可後だけallowlist投影し不可視と不存在�
     assert.deepEqual((deepOwner.jobs as Array<{job_id:string}>).map(row => row.job_id), [second.job_id]);
     assert.equal(deepOwner.truncated, false);
 
+    const nonIntentEnvelope={...eventEnvelope("agent-read-non-intent"),payload:{text:"雑談です",event_ts:"1756722031.123456"}};
+    const nonIntent=database.enqueue(nonIntentEnvelope,new Date(Date.now()+200),proof(nonIntentEnvelope.external_event_id)).row;
+    await contexts.issue(database.beginDispatch(nonIntent.event_id,path.join(config.resultsDir,`${nonIntent.event_id}.json`)));
+    await assert.rejects(()=>client.listHumanWaits(nonIntent.event_id,20),
+      (error:unknown)=>error instanceof DispatcherClientError&&error.statusCode===403&&
+        (error.body as {error?:{code?:string}}).error?.code==="human_wait_intent_not_explicit");
+
     const completionEnvelope = {
       ...eventEnvelope("agent-read-completion"), source: "dona_job" as const, type: "job_completed",
       subject: { source_event_id: source.event_id }, trace: { source_event_id: source.event_id },
