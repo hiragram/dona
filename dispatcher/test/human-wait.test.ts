@@ -51,13 +51,15 @@ test("blocked jobをverified ownerの安全なwaitへ正規化しterminal transi
   database.beginJobCancellation(job.job_id, source.event_id);
   database.markJobCancelled(job.job_id, "resolved", new Date("2026-09-21T00:01:00.000Z"));
   assert.equal(database.humanWaits.listInternal().length, 0);
-  assert.equal(database.humanWaits.listInternal("resolved")[0]?.dedupe_key, `job:${job.job_id}`);
+  const resolved=database.humanWaits.listInternal("resolved")[0]!;
+  assert.equal(resolved.dedupe_key, `job:${job.job_id}`);
   assert.equal(database.humanWaits.purge(new Date(Date.now()+40*86_400_000).toISOString(),1),1);
   assert.equal(database.humanWaits.get(wait!.item_id),undefined);
   const auditDb=new Database(config.databasePath);
-  const audit=auditDb.prepare("SELECT reason_class,transition,actor_class FROM human_wait_audit ORDER BY sequence").all();
+  const audit=auditDb.prepare("SELECT reason_class,source_revision,transition,actor_class FROM human_wait_audit ORDER BY sequence").all();
   assert.equal(JSON.stringify(audit).includes("PRIVATE-CANARY"),false);
   assert.equal((audit.at(-1) as {transition:string}).transition,"purged");
+  assert.equal((audit.at(-1) as {source_revision:string}).source_revision,resolved.source_revision);
   auditDb.close();
   database.close();
 });
@@ -125,6 +127,13 @@ test("group attentionはbounded snapshotのroot waitへ束ね個別waitを閉じ
   assert.equal(group?.owner_principal_id, "U_WAIT");
   assert.equal(group?.reason_code,"human_input");
   assert.equal(JSON.stringify(group).includes(second.objective), false);
+  const raw=new Database(config.databasePath);
+  raw.prepare("UPDATE jobs SET status='failed',updated_at=? WHERE job_id=?").run(new Date(transitionAt.getTime()+1_500).toISOString(),job.job_id);
+  raw.close();
+  assert.equal(database.humanWaits.recordVerifiedSessionSettlement({provider_verified:true,event_id:notification.row.event_id,
+    workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
+    desired_session_status:"suspended",session_status:"suspended"},new Date(transitionAt.getTime()+1_750).toISOString()),true);
+  assert.equal(database.humanWaits.get(group!.item_id)?.session_settlement_verified,1);
   const terminalEvent=database.enqueue(eventEnvelope("Ev-group-terminal")).row;
   database.claimJobGroupTransition(source.event_id,"all_terminal",terminalEvent.event_id,new Date(transitionAt.getTime()+2_000));
   assert.equal(database.humanWaits.listInternal().length,0);
@@ -151,12 +160,16 @@ test("session waitはdurable causeとverified suspended settlementの両方が�
   database.close();
 });
 
-test("repairはbounded cursorとsnapshot fenceを持ちdry-runでは変更しない", async () => {
-  const { database, job } = await jobFixture("wait.repair");
+test("repairはbounded cursorとsnapshot fenceを持ちdry-runでは予定件数だけを返す", async () => {
+  const { database, config, source, job } = await jobFixture("wait.repair");
   database.markJobNeedsReview(job.job_id, "unknown", "redacted");
+  const raw=new Database(config.databasePath);
+  raw.prepare("DELETE FROM human_wait_items WHERE dedupe_key=?").run(`job:${job.job_id}`);
+  raw.close();
   const snapshot = new Date(Date.now()+60_000).toISOString();
-  const dry = database.humanWaits.repair({ dryRun:true,limit:1,snapshotRevision:snapshot });
-  assert.deepEqual({dry:dry.dry_run,scanned:dry.scanned,repaired:dry.repaired},{dry:true,scanned:1,repaired:0});
+  const dry = database.humanWaits.repair({ dryRun:true,limit:1,cursor:`group:${source.event_id}`,snapshotRevision:snapshot });
+  assert.deepEqual({dry:dry.dry_run,scanned:dry.scanned,repaired:dry.repaired},{dry:true,scanned:1,repaired:1});
+  assert.equal(database.humanWaits.listInternal().length,0);
   assert.match(dry.digest,/^[0-9a-f]{64}$/);
   assert.throws(() => database.humanWaits.repair({dryRun:false,limit:501,snapshotRevision:snapshot}),/limit/);
   database.close();
@@ -215,6 +228,12 @@ test("schedule runとnotification needs_reviewを永続ownerへbindして解消�
     const open=harness.database.humanWaits.listInternal();
     assert.deepEqual(open.map(item=>item.resource_kind).sort(),["notification","schedule_run"]);
     assert.equal(open.every(item=>item.owner_kind==="schedule"&&item.owner_principal_id==="U_GATE"),true);
+    harness.raw.prepare(`INSERT INTO connector_outbox(outbox_id,run_id,kind,idempotency_key,target_json,content,content_hash,
+      status,attempt,available_at,created_at,updated_at,content_delete_at,completion_job_status)
+      SELECT 'out_work_result_review',run_id,'slack.work_result.post','work-result-review',target_json,content,content_hash,
+        'needs_review',0,available_at,created_at,updated_at,content_delete_at,'failed'
+      FROM connector_outbox WHERE outbox_id=?`).run(outbox.outbox_id);
+    assert.equal(harness.database.humanWaits.listInternal().some(item=>item.dedupe_key==='outbox:out_work_result_review'),false);
     harness.raw.prepare("DELETE FROM human_wait_items").run();
     const repaired=harness.database.humanWaits.repair({dryRun:false,limit:500,snapshotRevision:"2026-09-05T00:03:00.000Z"});
     assert.equal(repaired.repaired>=2,true);

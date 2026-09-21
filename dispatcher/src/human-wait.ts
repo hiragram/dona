@@ -269,7 +269,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,
         COALESCE(NEW.content_delete_at,datetime(NEW.updated_at,'+30 days'))
       FROM schedule_runs r JOIN schedules s USING(schedule_id)
-      WHERE r.run_id=NEW.run_id AND NEW.status='needs_review'
+      WHERE r.run_id=NEW.run_id AND NEW.status='needs_review' AND NEW.kind!='slack.work_result.post'
       ON CONFLICT(dedupe_key) DO NOTHING;
     END;
     CREATE TRIGGER IF NOT EXISTS human_wait_outbox_update AFTER UPDATE OF status,updated_at ON connector_outbox BEGIN
@@ -281,7 +281,7 @@ export function migrateHumanWaitReadModel(db: Database.Database): void {
         'origin_'||lower(hex(randomblob(16))),NEW.updated_at,'open',0,NEW.updated_at,NEW.updated_at,NULL,NULL,
         COALESCE(NEW.content_delete_at,datetime(NEW.updated_at,'+30 days'))
       FROM schedule_runs r JOIN schedules s USING(schedule_id)
-      WHERE r.run_id=NEW.run_id AND NEW.status='needs_review'
+      WHERE r.run_id=NEW.run_id AND NEW.status='needs_review' AND NEW.kind!='slack.work_result.post'
       ON CONFLICT(dedupe_key) DO UPDATE SET source_revision=excluded.source_revision,state='open',updated_at=excluded.updated_at,
         resolved_at=NULL,stale_at=NULL;
       UPDATE human_wait_items SET state='resolved',resolved_at=NEW.updated_at,updated_at=NEW.updated_at,source_revision=NEW.updated_at
@@ -320,7 +320,7 @@ export class HumanWaitRepository {
       const cause = job ? this.db.prepare(`SELECT * FROM human_wait_items WHERE state='open' AND
         dedupe_key IN (?,?) ORDER BY CASE resource_kind WHEN 'job_group' THEN 0 ELSE 1 END LIMIT 1`)
         .get(`job:${completion.job_id}`,`group:${job.source_event_id}`) as HumanWaitItemRow | undefined : undefined;
-      if (!job || !["blocked","needs_review"].includes(job.status) || !cause) return false;
+      if (!job || !cause || (cause.resource_kind!=="job_group" && !["blocked","needs_review"].includes(job.status))) return false;
       if(cause.session_settlement_verified===1)return true;
       const changed=this.db.prepare(`UPDATE human_wait_items SET session_settlement_verified=1,updated_at=?,source_revision=?
         WHERE item_id=? AND state='open'`).run(settledAt,settledAt,cause.item_id).changes;
@@ -347,11 +347,22 @@ export class HumanWaitRepository {
         COALESCE(e.updated_at,c.materialized_at),CASE WHEN json_extract(c.owner_json,'$.kind')='schedule' AND c.notification_state='needs_review' THEN 1 ELSE 0 END,
         'notification:'||c.job_id||':'||c.job_status FROM job_completion_results c LEFT JOIN events e ON e.event_id=c.notification_event_id
       UNION ALL SELECT 'outbox:'||o.outbox_id,'outbox',o.outbox_id,NULL,o.updated_at,
-        CASE WHEN o.status='needs_review' THEN 1 ELSE 0 END,'outbox:'||o.outbox_id FROM connector_outbox o
+        CASE WHEN o.status='needs_review' AND o.kind!='slack.work_result.post' THEN 1 ELSE 0 END,'outbox:'||o.outbox_id FROM connector_outbox o
     ) WHERE source_key>? AND source_revision<=? ORDER BY source_key LIMIT ?`)
       .all(input.cursor??"",input.snapshotRevision,input.limit+1) as Candidate[];
     const page=rows.slice(0,input.limit), next=rows.length>input.limit?page.at(-1)!.source_key:null;
     let repaired=0,quarantined=0;
+    if(input.dryRun) {
+      for(const row of page) {
+        const item=this.db.prepare("SELECT state,source_revision FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string}|undefined;
+        if(item&&item.source_revision>input.snapshotRevision) continue;
+        const shouldOpen=row.desired_open===1;
+        if((shouldOpen&&!item)||(item&&shouldOpen&&item.state!=="open")||(item&&!shouldOpen&&item.state==="open")) repaired++;
+        const malformed=this.db.prepare(`SELECT 1 FROM human_wait_items WHERE dedupe_key=? AND
+          (origin_ref LIKE '%/%' OR reason_code NOT IN ('human_input','ambiguous_write','invalid_result','notification_reconcile','operator_review_unknown'))`).get(row.dedupe_key);
+        if(malformed) quarantined++;
+      }
+    }
     if(!input.dryRun) this.db.transaction(()=>{
       for(const row of page) {
         const item=this.db.prepare("SELECT state,source_revision FROM human_wait_items WHERE dedupe_key=?").get(row.dedupe_key) as {state:string;source_revision:string}|undefined;
@@ -381,11 +392,11 @@ export class HumanWaitRepository {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error("human_wait_purge_limit_invalid");
     if (!Number.isFinite(Date.parse(before)) || new Date(Date.parse(before)).toISOString() !== before) throw new Error("human_wait_purge_time_invalid");
     return this.db.transaction(() => {
-      const ids=this.db.prepare(`SELECT item_id FROM human_wait_items WHERE state!='open' AND retain_until<=?
-        ORDER BY retain_until,item_id LIMIT ?`).all(before,limit) as Array<{item_id:string}>;
+      const ids=this.db.prepare(`SELECT item_id,source_revision FROM human_wait_items WHERE state!='open' AND retain_until<=?
+        ORDER BY retain_until,item_id LIMIT ?`).all(before,limit) as Array<{item_id:string;source_revision:string}>;
       const audit=this.db.prepare("INSERT INTO human_wait_audit(item_id,reason_class,source_revision,transition,actor_class,created_at) VALUES(?,'retention',?,'purged','operator',?)");
       const remove=this.db.prepare("DELETE FROM human_wait_items WHERE item_id=? AND state!='open' AND retain_until<=?");
-      for(const {item_id} of ids){audit.run(item_id,before,before);remove.run(item_id,before);}
+      for(const {item_id,source_revision} of ids){audit.run(item_id,source_revision,before);remove.run(item_id,before);}
       return ids.length;
     }).immediate();
   }
