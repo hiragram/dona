@@ -473,7 +473,12 @@ export class WorkerMessageRepository {
     const candidate=this.db.prepare(`SELECT m.job_id,m.source_event_id FROM worker_message_deliveries d
       JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
       WHERE d.consumer='worker' AND d.state='pending' AND d.available_at<=?
-        AND j.status NOT IN ('completed','failed','cancelled')
+        AND j.status IN ('queued','retryable_failed','running','blocked')
+        AND NOT EXISTS (
+          SELECT 1 FROM worker_messages prior JOIN worker_message_deliveries prior_delivery USING(message_id)
+          WHERE prior.job_id=m.job_id AND prior.producer=m.producer AND prior.producer_sequence<m.producer_sequence
+            AND prior_delivery.consumer=d.consumer AND prior_delivery.state IN ('pending','leased')
+        )
       ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT 1`)
       .get(now) as {job_id:string;source_event_id:string}|undefined;
     return candidate ? this.claim(candidate.job_id,candidate.source_event_id,"worker",leaseOwner,1,leaseMs,at)[0] : undefined;
@@ -699,12 +704,10 @@ export class WorkerMessageRepository {
   private assertWorkerReconciliationRuntime(jobId:string,runtimeIdentity:string,idempotencyKey:string):void {
     if(typeof runtimeIdentity!=="string"||runtimeIdentity.length<1||runtimeIdentity.length>512)
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity is invalid");
-    const current=this.db.prepare("SELECT 1 FROM job_live_session_identities WHERE job_id=? AND herdr_agent_session_id=?")
-      .get(jobId,runtimeIdentity);
     const historical=this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_runtime_identities r USING(message_id)
       WHERE m.job_id=? AND m.producer='worker' AND m.idempotency_key=? AND r.runtime_identity_sha256=?`)
       .get(jobId,idempotencyKey,sha256(runtimeIdentity));
-    if(!current&&!historical)
+    if(!historical)
       throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
   }
 

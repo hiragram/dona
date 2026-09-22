@@ -907,13 +907,17 @@ describe("JobSupervisor", () => {
     const database=new DispatcherDatabase(config.databasePath);
     const source=database.enqueue(eventEnvelope("Ev-steer-blocked-source")).row;
     const followUp=database.enqueue(eventEnvelope("Ev-steer-blocked-follow-up")).row;
-    const job=database.createJob({source_event_id:source.event_id,objective:"回答待ち",workspace:{kind:"scratch"}},
+    const job=database.createJob({source_event_id:source.event_id,job_key:"blocked-answer",objective:"回答待ち",workspace:{kind:"scratch"}},
       config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.sealJobGroup(source.event_id);
     database.beginJobPreparation(job.job_id);
     database.setJobRuntime(job.job_id,"1","w1:p1");
     database.beginJobDispatch(job.job_id);
     database.markJobRunning(job.job_id);
     database.markJobBlocked(job.job_id,"回答待ち");
+    const attention=database.enqueueJobNotification(job.job_id).row;
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.event_id);
+    assert.equal(database.getJob(job.job_id)?.completion_event_id,attention.event_id);
     let waits=0;
     const runtime:JobAgentRuntime={
       async prepare(){throw new Error("not used");},
@@ -927,6 +931,10 @@ describe("JobSupervisor", () => {
     assert.equal(result.duplicate,false);
     assert.equal(result.row.status,"running");
     assert.equal(result.row.last_error_code,null);
+    assert.equal(database.get(attention.event_id)?.status,"completed");
+    assert.equal(database.get(attention.event_id)?.last_error_code,"job_attention_superseded");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
     await waitFor(()=>waits===1);
     await supervisor.stop();
     database.close();

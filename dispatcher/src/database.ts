@@ -1163,8 +1163,28 @@ export class DispatcherDatabase {
   }
 
   resumeBlockedJob(jobId:string):JobRow {
-    this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
-    return this.getJobRequired(jobId);
+    return this.db.transaction(()=>{
+      const job=this.getJobRequired(jobId),timestamp=nowUtc();
+      if(job.status!=="blocked")throw new Error(`Job ${jobId} is not blocked`);
+      if(job.completion_event_id){
+        const event=this.get(job.completion_event_id);
+        if(event&&["queued","retryable_failed"].includes(event.status)){
+          const changed=this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+            last_error_code='job_attention_superseded',last_error_message=NULL
+            WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+            .run(timestamp,timestamp,event.event_id).changes;
+          if(changed!==1)throw new Error(`Job ${jobId} attention event changed during resume`);
+          this.db.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=? AND attention_event_id=?")
+            .run(timestamp,job.source_event_id,event.event_id);
+          this.db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
+            .run(timestamp,job.source_event_id,event.event_id);
+          this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'")
+            .run(event.event_id);
+        }
+      }
+      this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
+      return this.getJobRequired(jobId);
+    }).immediate();
   }
 
   recordInvalidResultAgentStopFailure(jobId:string,message:string):void {

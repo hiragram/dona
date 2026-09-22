@@ -659,6 +659,14 @@ export class DispatcherApi {
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 
+  private async authorizedDonaInternalRequest(request:IncomingMessage):Promise<boolean> {
+    const supplied=request.headers["x-dona-internal-token"];
+    if(typeof supplied!=="string")return false;
+    const expected=await readPrivateToken(this.config.updateInternalTokenPath);
+    if(!expected||supplied.length!==expected.length)return false;
+    return timingSafeEqual(Buffer.from(supplied),Buffer.from(expected));
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -727,6 +735,8 @@ export class DispatcherApi {
     const messageCollection = /^\/v1\/jobs\/([^/]+)\/messages\/(reports|instructions)$/.exec(url.pathname);
     if (request.method === "POST" && messageCollection) {
       const jobId = decodeURIComponent(messageCollection[1]!);
+      if(messageCollection[2]==="instructions"&&!await this.authorizedDonaInternalRequest(request))
+        throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");
       const input = await this.readJson(request) as Record<string,unknown>;
       const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
       const result = messageCollection[2] === "reports"

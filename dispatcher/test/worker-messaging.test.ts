@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import Database from "better-sqlite3";
 
 import { DispatcherApi } from "../src/api.js";
+import { DispatcherApiClient } from "../src/client.js";
 import { DispatcherDatabase, migrateDispatcherDatabase } from "../src/database.js";
 import { buildJobPrompt } from "../src/job-prompt.js";
 import { readEventJobBinding } from "../src/job-routing.js";
@@ -244,6 +246,32 @@ describe("worker messaging ledger",()=>{
     } finally {await bridge.stop();database.close();}
   });
 
+  test("bridge候補はleased先行instructionと配送不能jobを飛ばす",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      for(const sequence of [1,2])database.workerMessages.appendInstruction(job.job_id,{schema_version:1,
+        source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:`ordered-${sequence}`,
+        occurred_at:`2026-09-21T00:00:0${sequence}Z`,payload:{operation:"add_condition",text:`条件 ${sequence}`}},
+        new Date(`2026-09-21T00:00:0${sequence}Z`));
+      database.workerMessages.claim(job.job_id,source.event_id,"worker","crashed-bridge",1,10_000,new Date("2026-09-21T00:00:03Z"));
+      const sibling=database.createJob({source_event_id:source.event_id,job_key:"claimable-sibling",objective:"sibling",workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      const siblingInstruction=database.workerMessages.appendInstruction(sibling.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"sibling-instruction",occurred_at:"2026-09-21T00:00:04Z",
+        payload:{operation:"add_condition",text:"別jobの条件"}},new Date("2026-09-21T00:00:04Z"));
+      assert.equal(database.workerMessages.claimNextWorkerInstruction("live-bridge",10_000,new Date("2026-09-21T00:00:05Z"))?.delivery.message_id,
+        siblingInstruction.message.message_id);
+      const unavailable=database.createJob({source_event_id:source.event_id,job_key:"unavailable",objective:"unavailable",workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      bindRuntime(database,unavailable.job_id,"runtime-unavailable");
+      database.markJobNeedsReview(unavailable.job_id,"test","test");
+      database.workerMessages.appendInstruction(unavailable.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"unavailable-instruction",occurred_at:"2026-09-21T00:00:06Z",
+        payload:{operation:"add_condition",text:"配送不能"}},new Date("2026-09-21T00:00:06Z"));
+      assert.equal(database.workerMessages.claimNextWorkerInstruction("live-bridge",10_000,new Date("2026-09-21T00:00:07Z")),undefined);
+    } finally {database.close();}
+  });
+
   test("複数の未回答questionは相関先を投影せず曖昧と示す",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -474,6 +502,8 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
   bindRuntime(database,job.job_id,"runtime-primary");
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger); await api.start();
   try {
+    await fs.mkdir(path.dirname(config.updateInternalTokenPath),{recursive:true,mode:0o700});
+    await fs.writeFile(config.updateInternalTokenPath,"i".repeat(64),{mode:0o600});
     const created=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(created.status,202);
     const messageId=((created.body.message as Record<string,unknown>).message_id as string);
@@ -495,6 +525,14 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(read.status,200); assert.equal(((read.body.message as {payload:{kind:string}}).payload.kind),"checkpoint");
     const reconcile=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,undefined,{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(reconcile.status,200); assert.equal(reconcile.body.reconciliation,"matched");
+    const instruction={schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"api-instruction",
+      occurred_at:"2026-09-21T00:00:02Z",payload:{operation:"add_condition",text:"認証済み条件"}};
+    assert.equal((await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/instructions`,instruction)).status,403);
+    assert.equal((await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/instructions`,instruction,
+      {"x-dona-worker-runtime":"runtime-primary"})).status,403);
+    const instructionResult=await new DispatcherApiClient(config.socketPath,1_000,config.updateInternalTokenPath)
+      .sendWorkerInstruction(job.job_id,instruction);
+    assert.equal(instructionResult.outcome,"created");
     const forbiddenClaim=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/claim`,{
       source_event_id:source.event_id,consumer:"dona-main",lease_owner:"worker-bridge",limit:1,lease_ms:10_000},{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(forbiddenClaim.status,400);
@@ -583,6 +621,8 @@ test("過去runtimeは自分が生成したmessageだけをreconcileできる",a
   sqlite.prepare("UPDATE job_live_session_identities SET herdr_agent_session_id=? WHERE job_id=?").run("runtime-second",job.job_id);
   sqlite.close();
   database.workerMessages.appendWorkerReport(job.job_id,"runtime-second",report(source.event_id,2,"second-report"));
+  assert.throws(()=>database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-second","first-report"),
+    (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
   database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",
     completed_at:"2026-09-21T00:00:04Z"},job.result_path);
   database.markJobRuntimeCleaned(job.job_id);
