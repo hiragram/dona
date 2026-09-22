@@ -90,11 +90,31 @@ function buildSha(env: NodeJS.ProcessEnv): string {
   return parsed.sha;
 }
 
+function canonicalPathForContainment(value:string):string {
+  let existing=path.resolve(value);
+  const missing:string[]=[];
+  while(!fs.existsSync(existing)){
+    const parent=path.dirname(existing);
+    if(parent===existing)break;
+    missing.unshift(path.basename(existing));
+    existing=parent;
+  }
+  return path.join(fs.realpathSync.native(existing),...missing);
+}
+
+function sameOrAncestor(parent:string,child:string):boolean {
+  const relative=path.relative(parent,child);
+  return relative===""||(!path.isAbsolute(relative)&&relative!==".."&&!relative.startsWith(`..${path.sep}`));
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DispatcherConfig {
   const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
   const socketPath=expandHome(env.DONA_SOCKET_PATH ?? path.join(base, "run", "dispatcher.sock"));
   const workerSocketPath=expandHome(env.DONA_WORKER_SOCKET_PATH ?? path.join(base,"worker-run","dispatcher.sock"));
-  if(path.dirname(socketPath)===path.dirname(workerSocketPath))throw new Error("DONA_WORKER_SOCKET_PATH must use a directory separate from DONA_SOCKET_PATH");
+  const mainSocketDirectory=canonicalPathForContainment(path.dirname(socketPath));
+  const workerSocketDirectory=canonicalPathForContainment(path.dirname(workerSocketPath));
+  if(sameOrAncestor(mainSocketDirectory,workerSocketDirectory)||sameOrAncestor(workerSocketDirectory,mainSocketDirectory))
+    throw new Error("DONA_WORKER_SOCKET_PATH must use a canonical non-overlapping directory separate from DONA_SOCKET_PATH");
   const jobPromptReconcileMs = positiveInteger(
     env.DONA_JOB_PROMPT_RECONCILE_MS,
     30_000,

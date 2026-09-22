@@ -288,6 +288,7 @@ export class WorkerMessageRepository {
     if (!job) throw new WorkerMessageError("job_not_found", "job does not exist");
     this.assertAuthorized(job, input.source_event_id);
     const producer = direction === "worker_to_dona" ? "worker" : "dona-main";
+    const kind = direction === "worker_to_dona" ? reportKind(input as WorkerReportInput) : instructionKind(input as DonaInstructionInput);
     const payloadJson = stableStringify(input.payload);
     const payloadSha = sha256(payloadJson);
     const acceptedAt = at.toISOString();
@@ -307,6 +308,9 @@ export class WorkerMessageRepository {
     if (terminal(job.status)) throw new WorkerMessageError("worker_message_terminal_fence", "new messages are rejected after terminal job state");
     if(direction==="dona_to_worker"&&!["queued","retryable_failed","running","blocked"].includes(job.status))
       throw new WorkerMessageError("worker_message_instruction_unavailable",`job in status ${job.status} cannot accept instructions`);
+    if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)
+      &&!["queued","retryable_failed","running","blocked"].includes(job.status))
+      throw new WorkerMessageError("worker_message_report_unavailable",`job in status ${job.status} cannot accept a question report`);
     let correlated:WorkerMessageRow|undefined;
     if (input.correlation_message_id) {
       correlated = this.db.prepare("SELECT * FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as WorkerMessageRow | undefined;
@@ -333,7 +337,6 @@ export class WorkerMessageRepository {
       const messageId = `msg_${ulid(at.getTime()).toLowerCase()}`;
       const receiptId = `rcpt_${ulid(at.getTime()).toLowerCase()}`;
       const deliveryId = `dlv_${ulid(at.getTime()).toLowerCase()}`;
-      const kind = direction === "worker_to_dona" ? reportKind(input as WorkerReportInput) : instructionKind(input as DonaInstructionInput);
       this.db.prepare(`INSERT INTO worker_messages(message_id,schema_version,job_id,source_event_id,workspace_id,channel_id,thread_ts,direction,kind,producer,producer_sequence,idempotency_key,payload_json,payload_sha256,correlation_message_id,conversation_revision,occurred_at,accepted_at)
         VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(messageId, jobId, input.source_event_id, job.workspace_id, job.channel_id, job.thread_ts,
         direction, kind, producer, input.producer_sequence, input.idempotency_key, payloadJson, payloadSha,
@@ -380,6 +383,12 @@ export class WorkerMessageRepository {
       const consumer = direction === "worker_to_dona" ? "dona-main" : "worker";
       this.db.prepare(`INSERT INTO worker_message_deliveries(delivery_id,message_id,consumer,state,available_at,lease_owner,lease_token_sha256,lease_expires_at,fence,attempt_count,delivered_at,created_at,updated_at)
         VALUES(?,?,?,'pending',?,NULL,NULL,NULL,0,0,NULL,?,?)`).run(deliveryId, messageId, consumer, availableAt, acceptedAt, acceptedAt);
+      if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)&&job.status==="running"){
+        const changed=this.db.prepare(`UPDATE jobs SET status='blocked',last_error_code='worker_message_question_pending',
+          last_error_message='Background worker is waiting for an answer',updated_at=? WHERE job_id=? AND status='running'`)
+          .run(acceptedAt,jobId).changes;
+        if(changed!==1)throw new WorkerMessageError("worker_message_job_state_changed","job state changed while accepting the question report");
+      }
       return { message: this.getMessageRequired(messageId), receipt_id: receiptId, outcome: "created" as const };
     }).immediate();
   }

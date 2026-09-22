@@ -210,12 +210,32 @@ describe("worker messaging ledger",()=>{
         payload:{kind:"question",question:"回答できますか"}},new Date("2026-09-21T00:00:01Z"));
       assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
       database.markJobNeedsReview(job.job_id,"test","確認待ち");
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:2,idempotency_key:"needs-review-late-question",occurred_at:"2026-09-21T00:00:02Z",conversation_revision:2,
+        payload:{kind:"question",question:"遅延した質問です"}},new Date("2026-09-21T00:00:02Z")),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_report_unavailable");
       assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:1,idempotency_key:"needs-review-answer",occurred_at:"2026-09-21T00:00:02Z",
         correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"回答"}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
       assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
         kind:"question",next_producer_sequence:1,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
+  test("running jobのquestion受理をblocked遷移と同じtransactionで確定する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-question");
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"running-question",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:3,
+        payload:{kind:"question",question:"回答を待ちます"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.getJob(job.job_id)?.status,"blocked");
+      assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
+      assert.equal(database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"running-answer",occurred_at:"2026-09-21T00:00:02Z",
+        correlation_message_id:question.message.message_id,conversation_revision:4,
+        payload:{operation:"answer",text:"続行してください"}},new Date("2026-09-21T00:00:02Z")).outcome,"created");
     } finally {database.close();}
   });
 
