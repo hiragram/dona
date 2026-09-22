@@ -724,7 +724,7 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(instructionResult.outcome,"created");
     const forbiddenClaim=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/claim`,{
       source_event_id:source.event_id,consumer:"dona-main",lease_owner:"worker-bridge",limit:1,lease_ms:10_000},{"x-dona-worker-runtime":"runtime-primary"});
-    assert.equal(forbiddenClaim.status,400);
+    assert.equal(forbiddenClaim.status,404);
     const direct=database.workerMessages.appendReport(job.job_id,report(source.event_id,2,"report-api-2"),new Date());
     const claimed=database.workerMessages.claim(job.job_id,source.event_id,"dona-main","internal-publisher",1,10_000,new Date(Date.now()+61_000));
     assert.equal(claimed[0]!.delivery.message_id,direct.message.message_id);

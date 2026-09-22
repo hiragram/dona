@@ -179,6 +179,11 @@ export class DispatcherApi {
     const socketDirectory=path.dirname(socketPath);
     const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
     if(!workerOnly||createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
+    if(workerOnly){
+      const directoryStat=await fs.stat(socketDirectory);
+      if((directoryStat.mode&0o022)!==0||(typeof process.getuid==="function"&&directoryStat.uid!==process.getuid()))
+        throw new Error("Worker socket directory must be owned by the Dispatcher user and not group/world writable");
+    }
     try {
       await fs.lstat(socketPath);
       if(await socketIsAlive(socketPath))throw new Error(`Another dispatcher is already listening on ${socketPath}`);
@@ -194,7 +199,8 @@ export class DispatcherApi {
         resolve();
       });
     });
-    await fs.chmod(socketPath,0o600);
+    try { await fs.chmod(socketPath,0o600); }
+    catch(error) { await new Promise<void>(resolve=>server.close(()=>resolve())); try{await fs.unlink(socketPath);}catch{} throw error; }
     return server;
   }
 
@@ -247,9 +253,7 @@ export class DispatcherApi {
       if(workerOnly){
         const report=request.method==="POST"&&/^\/v1\/jobs\/[^/]+\/messages\/reports$/.test(url.pathname);
         const reconcile=request.method==="GET"&&/^\/v1\/jobs\/[^/]+\/messages\/reconcile$/.test(url.pathname)&&url.searchParams.get("producer")==="worker";
-        const delivery=request.method==="POST"&&(/^\/v1\/jobs\/[^/]+\/messages\/deliveries\/claim$/.test(url.pathname)
-          ||/^\/v1\/jobs\/[^/]+\/messages\/deliveries\/dlv_[0-9a-hjkmnp-tv-z]{26}\/ack$/.test(url.pathname));
-        if(!report&&!reconcile&&!delivery)throw new ApiRequestError(404,"not_found","Route not found");
+        if(!report&&!reconcile)throw new ApiRequestError(404,"not_found","Route not found");
       }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });

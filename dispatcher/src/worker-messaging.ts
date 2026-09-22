@@ -281,7 +281,10 @@ export class WorkerMessageRepository {
   }
 
   appendInstruction(jobId: string, raw: unknown, at = new Date()) {
-    return this.append(jobId, "dona_to_worker", parseDonaInstruction(raw), at);
+    const input=parseDonaInstruction(raw);
+    const event=this.db.prepare("SELECT source FROM events WHERE event_id=?").get(input.source_event_id) as {source:string}|undefined;
+    if(event?.source!=="slack")throw new WorkerMessageError("worker_message_instruction_source_invalid","worker instructions require a Slack source event");
+    return this.append(jobId, "dona_to_worker", input, at);
   }
 
   private append(jobId: string, direction: WorkerMessageDirection, input: WorkerMessageInput, at: Date): { message: WorkerMessageRow; receipt_id: string; outcome: "created" | "reused" } {
