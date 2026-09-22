@@ -39,8 +39,9 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - `GET /v1/jobs/{job_id}/messages/reconcile`: receiptとdelivery stateをread-only照合する。
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
+- 通常のGitHub／scratch workerにはpromptの`worker_messaging`でDispatcherのUnix socket、report／reconcile endpoint、認証header参照、closed payload variants、サイズ上限を渡し、Codex sandboxにはそのsocket directoryだけを追加する。schedule workerのread-only sandboxにはこのtransportを公開しない。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
-- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。bridgeはsteer可能な`queued`、`retryable_failed`、`running`、`blocked`だけを対象にし、同じjobの先行instructionがpendingまたはleasedなら後続を追い越さない。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。blocked workerがanswerを受理した場合はrunningへ戻して監視を再開し、queuedまたは処理中のattention eventとそのjob/group pointerをsupersedeして古い質問通知を出さない。
+- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。bridgeはsteer可能な`queued`、`retryable_failed`、`running`、`blocked`だけを対象にし、同じjobの先行instructionがpendingまたはleasedなら後続を追い越さない。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。blocked workerではsteer receiptのcommit、running復帰、既存attentionのsupersedeを1 transactionで行い、receiptは復帰要否と完了時刻を保持するため旧operationのretryが後の別blocked状態を解除しない。受理後、claim前にjobが`needs_review`へ遷移したinstructionはsupersedeし、未配送answerなら相関questionを再公開する。
 - `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`を返す。一意なら相関message ID、次のproducer sequence、conversation revisionを返し、複数なら`ambiguous: true`と`pending_count_at_least: 2`だけを返して相関先を推測させない。後続の人間回答はcurrent event bindingで`answer`へ変換し、成功後はAgent Sessionを`processing`へ戻す。通常のfree-form steerへ落とさない。
 
 ## 障害対応

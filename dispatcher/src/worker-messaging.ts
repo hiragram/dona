@@ -318,8 +318,9 @@ export class WorkerMessageRepository {
       const expectedRevision=(correlated.conversation_revision ?? 0)+1;
       if (input.conversation_revision !== expectedRevision)
         throw new WorkerMessageError("worker_message_answer_revision_mismatch", `answer revision must be ${expectedRevision}`);
-      const answered=this.db.prepare(`SELECT 1 FROM worker_messages WHERE job_id=? AND direction='dona_to_worker'
-        AND kind='answer' AND correlation_message_id=?`).get(jobId,correlated.message_id);
+      const answered=this.db.prepare(`SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries delivery ON delivery.message_id=answer.message_id
+        WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
+          AND answer.correlation_message_id=? AND delivery.consumer='worker' AND delivery.state!='superseded'`).get(jobId,correlated.message_id);
       if(answered)throw new WorkerMessageError("worker_message_answer_already_exists","correlated question already has an answer");
     }
     const max = this.db.prepare("SELECT MAX(producer_sequence) AS value FROM worker_messages WHERE job_id=? AND producer=?")
@@ -406,14 +407,21 @@ export class WorkerMessageRepository {
       FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
       WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND d.consumer='dona-main'
         AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')
-        AND NOT EXISTS (SELECT 1 FROM worker_messages answer WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker'
-          AND answer.kind='answer' AND answer.correlation_message_id=m.message_id)
+        AND NOT EXISTS (SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries answer_delivery ON answer_delivery.message_id=answer.message_id
+          WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker' AND answer.kind='answer'
+            AND answer.correlation_message_id=m.message_id AND answer_delivery.consumer='worker' AND answer_delivery.state!='superseded')
       ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 2`).all(jobId) as Array<
         {message_id:string;kind:"question"|"decision_request";next_producer_sequence:number;next_conversation_revision:number}>;
     if(rows.length>1)return {ambiguous:true,pending_count_at_least:2};
     const row=rows[0];
     return row ? {ambiguous:false,message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
       next_conversation_revision:row.next_conversation_revision} : undefined;
+  }
+
+  supersedeUndeliveredInstructions(jobId:string,at=new Date().toISOString()):number {
+    return this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
+      lease_expires_at=NULL,updated_at=? WHERE consumer='worker' AND state IN ('pending','leased')
+      AND message_id IN (SELECT message_id FROM worker_messages WHERE job_id=? AND direction='dona_to_worker')`).run(at,jobId).changes;
   }
 
   reconcile(jobId: string, sourceEventId: string, producer: "worker" | "dona-main", idempotencyKey: string) {

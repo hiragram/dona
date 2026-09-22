@@ -219,6 +219,25 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("受理済みanswerをneeds_review遷移で失効してquestionを再公開する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"transition-question",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"transition-answer",occurred_at:"2026-09-21T00:00:03Z",
+        correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"回答"}});
+      assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
+      database.markJobNeedsReview(job.job_id,"test","確認待ち");
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","transition-answer") as
+        {delivery:{state:string}}).delivery.state,"superseded");
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
+        kind:"question",next_producer_sequence:2,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
   test("pending questionの次revisionは無関係なmessage最大値ではなく相関元から生成する",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -599,9 +618,12 @@ test("worker-facing APIは同じownerのsibling runtimeを拒否する",async()=
     const accepted=await request(config.socketPath,"POST",`/v1/jobs/${sibling.job_id}/messages/reports`,
       report(source.event_id),{"x-dona-worker-runtime":"runtime-sibling"});
     assert.equal(accepted.status,202);
-    const prompt=buildJobPrompt(sibling,true,"runtime-sibling");
-    const jobJson=JSON.parse(prompt.split("job_json:\n")[1]!.split("\n[DONA_JOB_END]")[0]!) as {runtime_identity:string};
+    const prompt=buildJobPrompt(sibling,true,"runtime-sibling",config.socketPath);
+    const jobJson=JSON.parse(prompt.split("job_json:\n")[1]!.split("\n[DONA_JOB_END]")[0]!) as
+      {runtime_identity:string;worker_messaging:{transport:{socket_path:string};report:{path:string}}};
     assert.equal(jobJson.runtime_identity,"runtime-sibling");
+    assert.equal(jobJson.worker_messaging.transport.socket_path,config.socketPath);
+    assert.equal(jobJson.worker_messaging.report.path,`/v1/jobs/${sibling.job_id}/messages/reports`);
     assert.match(prompt,/他jobへ転用せず/);
   } finally {await api.stop();database.close();}
 });

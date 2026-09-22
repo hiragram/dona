@@ -177,9 +177,15 @@ function ensureJobSteerReceiptSchema(db:Database.Database):void {db.exec(`
     job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
     operation_id TEXT NOT NULL,
     accepted_at TEXT NOT NULL,
+    resume_required INTEGER NOT NULL DEFAULT 0 CHECK (resume_required IN (0,1)),
+    resumed_at TEXT,
     PRIMARY KEY (job_id,operation_id)
   );
-`);}
+`);
+  const columns=new Set((db.pragma("table_info(job_steer_receipts)") as Array<{name:string}>).map(row=>row.name));
+  if(!columns.has("resume_required"))db.exec("ALTER TABLE job_steer_receipts ADD COLUMN resume_required INTEGER NOT NULL DEFAULT 0 CHECK (resume_required IN (0,1))");
+  if(!columns.has("resumed_at"))db.exec("ALTER TABLE job_steer_receipts ADD COLUMN resumed_at TEXT");
+}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -345,7 +351,8 @@ export function migrateDispatcherDatabase(
       ${jobsRunnableFairIndexSql};
     `);
     ensureJobSteerReceiptSchema(db);
-    if(hasSteerReceipts)db.exec(`INSERT INTO job_steer_receipts SELECT * FROM preserved_job_steer_receipts_v3;
+    if(hasSteerReceipts)db.exec(`INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at)
+      SELECT job_id,operation_id,accepted_at FROM preserved_job_steer_receipts_v3;
       DROP TABLE preserved_job_steer_receipts_v3;`);
     if (hasWorkerMessages) {
       migrateWorkerMessaging(db);
@@ -1161,13 +1168,16 @@ export class DispatcherDatabase {
   }
 
   markJobNeedsReview(jobId: string, code: string, message: string): void {
-    const row = this.getJobRequired(jobId);
-    if (["completed", "failed", "cancelled"].includes(row.status)) return;
-    this.updateJob(jobId, [row.status], "needs_review", {
-      last_error_code: code,
-      last_error_message: message,
-      steer_state: null,
-    });
+    this.db.transaction(()=>{
+      const row = this.getJobRequired(jobId);
+      if (["completed", "failed", "cancelled"].includes(row.status)) return;
+      this.workerMessages.supersedeUndeliveredInstructions(jobId,nowUtc());
+      this.updateJob(jobId, [row.status], "needs_review", {
+        last_error_code: code,
+        last_error_message: message,
+        steer_state: null,
+      });
+    }).immediate();
   }
 
   markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
@@ -1177,9 +1187,8 @@ export class DispatcherDatabase {
     });
   }
 
-  resumeBlockedJob(jobId:string):JobRow {
-    return this.db.transaction(()=>{
-      const job=this.getJobRequired(jobId),timestamp=nowUtc();
+  private resumeBlockedJobInTransaction(jobId:string,timestamp:string):JobRow {
+      const job=this.getJobRequired(jobId);
       if(job.status!=="blocked")throw new Error(`Job ${jobId} is not blocked`);
       if(job.completion_event_id){
         const event=this.get(job.completion_event_id);
@@ -1201,7 +1210,10 @@ export class DispatcherDatabase {
       }
       this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
       return this.getJobRequired(jobId);
-    }).immediate();
+  }
+
+  resumeBlockedJob(jobId:string):JobRow {
+    return this.db.transaction(()=>this.resumeBlockedJobInTransaction(jobId,nowUtc())).immediate();
   }
 
   recordInvalidResultAgentStopFailure(jobId:string,message:string):void {
@@ -1302,7 +1314,7 @@ export class DispatcherDatabase {
       const timestamp=nowUtc();
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
         .run(objective,operationId,timestamp,jobId);
-      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at) VALUES(?,?,?)")
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,0,NULL)")
         .run(jobId,operationId,timestamp);
       return this.getJobRequired(jobId);
     }).immediate();
@@ -1313,7 +1325,20 @@ export class DispatcherDatabase {
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);
-    if (this.hasAcceptedJobSteerReceipt(jobId,operationId)) return { row, duplicate: true };
+    const receipt=this.db.prepare("SELECT resume_required,resumed_at FROM job_steer_receipts WHERE job_id=? AND operation_id=?")
+      .get(jobId,operationId) as {resume_required:number;resumed_at:string|null}|undefined;
+    if(receipt){
+      if(receipt.resume_required===1&&receipt.resumed_at===null&&row.status==="blocked"){
+        return this.db.transaction(()=>{
+          const timestamp=nowUtc(),resumed=this.resumeBlockedJobInTransaction(jobId,timestamp);
+          const changed=this.db.prepare("UPDATE job_steer_receipts SET resumed_at=? WHERE job_id=? AND operation_id=? AND resumed_at IS NULL")
+            .run(timestamp,jobId,operationId).changes;
+          if(changed!==1)throw new Error(`Job ${jobId} steer receipt changed unexpectedly`);
+          return {row:resumed,duplicate:true};
+        }).immediate();
+      }
+      return { row, duplicate: true };
+    }
     if (!["running","blocked"].includes(row.status)) throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
@@ -1321,16 +1346,18 @@ export class DispatcherDatabase {
     return { row: this.getJobRequired(jobId), duplicate: false };
   }
 
-  markJobSteerAccepted(jobId: string, operationId: string): void {
-    this.db.transaction(()=>{
+  markJobSteerAccepted(jobId: string, operationId: string): JobRow {
+    return this.db.transaction(()=>{
       const timestamp=nowUtc();
+      const job=this.getJobRequired(jobId),resumeRequired=job.status==="blocked";
       const changed = this.db.prepare(`
         UPDATE jobs SET steer_state = 'accepted', updated_at = ?
         WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
       `).run(timestamp, jobId, operationId).changes;
       if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
-      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at) VALUES(?,?,?)")
-        .run(jobId,operationId,timestamp);
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,?,?)")
+        .run(jobId,operationId,timestamp,resumeRequired?1:0,resumeRequired?timestamp:null);
+      return resumeRequired?this.resumeBlockedJobInTransaction(jobId,timestamp):this.getJobRequired(jobId);
     }).immediate();
   }
 

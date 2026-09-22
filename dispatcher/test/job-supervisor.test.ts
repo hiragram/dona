@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
+import Database from "better-sqlite3";
+
 import { DispatcherDatabase } from "../src/database.js";
 import type { DispatcherConfig } from "../src/config.js";
 import type { HerdrCommandResult } from "../src/herdr.js";
@@ -946,6 +948,24 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
     await waitFor(()=>waits===1);
     await supervisor.stop();
+    database.markJobBlocked(job.job_id,"別の回答待ち");
+    const restarted=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const duplicate=await restarted.steer(job.job_id,followUp.event_id,"回答です","msg_blocked_answer");
+    assert.equal(duplicate.duplicate,true);
+    assert.equal(duplicate.row.status,"blocked");
+    await restarted.stop();
+    const sqlite=new Database(config.databasePath),timestamp=new Date().toISOString();
+    sqlite.prepare("UPDATE jobs SET steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?")
+      .run("msg_partial_receipt",timestamp,job.job_id);
+    sqlite.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,1,NULL)")
+      .run(job.job_id,"msg_partial_receipt",timestamp);
+    sqlite.close();
+    const recovering=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const recovered=await recovering.steer(job.job_id,followUp.event_id,"回答です","msg_partial_receipt");
+    assert.equal(recovered.duplicate,true);
+    assert.equal(recovered.row.status,"running");
+    await waitFor(()=>waits===2);
+    await recovering.stop();
     database.close();
   });
 

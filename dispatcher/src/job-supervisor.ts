@@ -258,15 +258,17 @@ export class JobSupervisor {
       }
       if(current.status==="blocked")await this.active.get(jobId)?.operation;
       const begun = this.database.beginJobSteer(jobId, sourceEventId, operationId);
-      if (begun.duplicate) return begun;
+      if (begun.duplicate) {
+        if(current.status==="blocked"&&begun.row.status==="running"&&!this.stopping)this.launch(begun.row);
+        return begun;
+      }
       const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal);
       if (prompted.ok) {
-        this.database.markJobSteerAccepted(jobId, operationId);
+        const accepted=this.database.markJobSteerAccepted(jobId, operationId);
         if(begun.row.status==="blocked"){
-          const resumed=this.database.resumeBlockedJob(jobId);
-          if(!this.stopping)this.launch(resumed);
+          if(!this.stopping)this.launch(accepted);
         }
-        return { row: this.database.getJob(jobId)!, duplicate: false };
+        return { row: accepted, duplicate: false };
       }
       if (!prompted.timedOut && prompted.errorCode === "agent_blocked") {
         this.database.clearJobSteer(jobId, operationId);
@@ -692,7 +694,7 @@ export class JobSupervisor {
     const runtimeIdentity=this.database.getJobLiveSessionIdentity(row.job_id)?.herdr_agent_session_id;
     const prompted = await this.runtime.prompt(
       dispatching.agent_name,
-      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity),
+      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity,this.config.socketPath),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
     );

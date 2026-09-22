@@ -46,6 +46,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
     ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
     : ["--add-dir", resultDirectory];
+  if(row.source!=="dona_schedule")args.push("--add-dir",path.dirname(config.socketPath));
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
