@@ -12,6 +12,7 @@ export const workerMessageProtocolVersion = 1 as const;
 export const workerMessagePayloadUtf8ByteMax = 16_384;
 export const workerMessageRetentionDays = 30;
 export const workerMessageLeaseMaxMs = 300_000;
+export const workerReportMaxPerJob = 256;
 
 const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
 const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
@@ -311,6 +312,24 @@ export class WorkerMessageRepository {
     if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)
       &&!["queued","retryable_failed","running","blocked"].includes(job.status))
       throw new WorkerMessageError("worker_message_report_unavailable",`job in status ${job.status} cannot accept a question report`);
+    if(direction==="worker_to_dona") {
+      const reportCount=this.db.prepare("SELECT COUNT(*) AS count FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
+        .get(jobId) as {count:number};
+      if(reportCount.count>=workerReportMaxPerJob)
+        throw new WorkerMessageError("worker_message_report_limit_exceeded",`worker report limit of ${workerReportMaxPerJob} has been reached`);
+      if(["question","decision_request"].includes(kind)) {
+        const pending=this.db.prepare(`SELECT 1 FROM worker_messages question
+          JOIN worker_message_deliveries question_delivery ON question_delivery.message_id=question.message_id
+          WHERE question.job_id=? AND question.direction='worker_to_dona' AND question.kind IN ('question','decision_request')
+            AND question_delivery.consumer='dona-main' AND question_delivery.state!='superseded'
+            AND NOT EXISTS (SELECT 1 FROM worker_messages answer
+              JOIN worker_message_deliveries answer_delivery ON answer_delivery.message_id=answer.message_id
+              WHERE answer.job_id=question.job_id AND answer.direction='dona_to_worker' AND answer.kind='answer'
+                AND answer.correlation_message_id=question.message_id AND answer_delivery.consumer='worker'
+                AND answer_delivery.state!='superseded') LIMIT 1`).get(jobId);
+        if(pending)throw new WorkerMessageError("worker_message_question_pending","job already has an unanswered question");
+      }
+    }
     let correlated:WorkerMessageRow|undefined;
     if (input.correlation_message_id) {
       correlated = this.db.prepare("SELECT * FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as WorkerMessageRow | undefined;
@@ -411,7 +430,7 @@ export class WorkerMessageRepository {
   }
 
   pendingQuestion(jobId: string) {
-    const rows=this.db.prepare(`SELECT m.message_id,m.kind,
+    const rows=this.db.prepare(`SELECT m.message_id,m.kind,m.payload_json,
         COALESCE((SELECT MAX(next.producer_sequence) FROM worker_messages next WHERE next.job_id=m.job_id AND next.producer='dona-main'),0)+1 AS next_producer_sequence,
         COALESCE(m.conversation_revision,0)+1 AS next_conversation_revision
       FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
@@ -420,9 +439,11 @@ export class WorkerMessageRepository {
         AND NOT EXISTS (SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries answer_delivery ON answer_delivery.message_id=answer.message_id
           WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker' AND answer.kind='answer'
             AND answer.correlation_message_id=m.message_id AND answer_delivery.consumer='worker' AND answer_delivery.state!='superseded')
-      ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 2`).all(jobId) as Array<
-        {message_id:string;kind:"question"|"decision_request";next_producer_sequence:number;next_conversation_revision:number}>;
-    if(rows.length>1)return {ambiguous:true,pending_count_at_least:2};
+      ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 4`).all(jobId) as Array<
+        {message_id:string;kind:"question"|"decision_request";payload_json:string;next_producer_sequence:number;next_conversation_revision:number}>;
+    if(rows.length>1)return {ambiguous:true,pending_count_at_least:rows.length,candidates:rows.map(({payload_json,...row})=>({
+      ...row,question:(JSON.parse(payload_json) as {question:string}).question,
+    }))};
     const row=rows[0];
     return row ? {ambiguous:false,message_id:row.message_id,kind:row.kind,next_producer_sequence:row.next_producer_sequence,
       next_conversation_revision:row.next_conversation_revision} : undefined;
@@ -676,9 +697,10 @@ export class WorkerMessageRepository {
     const projected=payload as {job_id?:unknown;generation?:unknown};
     if(projected.job_id!==jobId||!Number.isSafeInteger(projected.generation))return undefined;
     const cadence=this.db.prepare("SELECT generation FROM worker_message_cadence WHERE job_id=?").get(jobId) as {generation:number}|undefined;
+    const job=this.db.prepare("SELECT status FROM jobs WHERE job_id=?").get(jobId) as Pick<JobRow,"status">|undefined;
     const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
     return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
-      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration}};
+      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)}};
   }
 
   purge(at = new Date()): number {

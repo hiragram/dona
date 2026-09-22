@@ -13,7 +13,7 @@ import { buildJobPrompt } from "../src/job-prompt.js";
 import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
 import { buildEventPrompt, envelopeFromRow } from "../src/prompt.js";
-import { migrateWorkerMessaging, WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
+import { migrateWorkerMessaging, workerReportMaxPerJob, WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
 import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
@@ -382,16 +382,54 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
-  test("複数の未回答questionは相関先を投影せず曖昧と示す",async()=>{
+  test("未回答questionがある間は次のquestionを受理しない",async()=>{
     const {database,source,job}=await fixture();
     try {
-      for(const sequence of [1,2]) {
-        database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:sequence,
-          idempotency_key:`question-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,conversation_revision:sequence,
-          payload:{kind:"question",question:`質問 ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
-      }
-      assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:03Z")),2);
-      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:true,pending_count_at_least:2});
+      const first=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"question-1",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
+        payload:{kind:"question",question:"質問 1"}},new Date("2026-09-21T00:00:01Z"));
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+        idempotency_key:"question-2",occurred_at:"2026-09-21T00:00:02Z",conversation_revision:2,
+        payload:{kind:"decision_request",question:"質問 2",options:["続行"]}},new Date("2026-09-21T00:00:02Z")),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_question_pending");
+      assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:03Z")),1);
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:first.message.message_id,kind:"question",
+        next_producer_sequence:1,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
+  test("既存DBの複数未回答questionはboundedな選択候補を投影する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
+        idempotency_key:"legacy-question-1",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
+        payload:{kind:"question",question:"最初の質問"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE worker_message_deliveries SET state='superseded' WHERE message_id=?").run(first.message.message_id);
+      const second=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+        idempotency_key:"legacy-question-2",occurred_at:"2026-09-21T00:00:03Z",conversation_revision:2,
+        payload:{kind:"decision_request",question:"次の質問",options:["続行"]}},new Date("2026-09-21T00:00:03Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:04Z"));
+      sqlite.prepare("UPDATE worker_message_deliveries SET state='delivered' WHERE message_id=?").run(first.message.message_id);
+      sqlite.close();
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:true,pending_count_at_least:2,candidates:[
+        {message_id:second.message.message_id,kind:"decision_request",next_producer_sequence:1,next_conversation_revision:3,question:"次の質問"},
+        {message_id:first.message.message_id,kind:"question",next_producer_sequence:1,next_conversation_revision:2,question:"最初の質問"},
+      ]});
+    } finally {database.close();}
+  });
+
+  test("worker reportはjob単位の永続件数上限を超えて増加しない",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      for(let sequence=1;sequence<=workerReportMaxPerJob;sequence++) database.workerMessages.appendReport(job.job_id,
+        {...report(source.event_id,sequence,`limit-${sequence}`),occurred_at:"2026-09-21T00:00:00Z"});
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,
+        {...report(source.event_id,workerReportMaxPerJob+1,"limit-overflow"),occurred_at:"2026-09-21T00:00:00Z"}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_report_limit_exceeded");
+      assert.equal(database.workerMessages.appendReport(job.job_id,
+        {...report(source.event_id,workerReportMaxPerJob,"limit-256"),occurred_at:"2026-09-21T00:00:00Z"}).outcome,"reused");
     } finally {database.close();}
   });
 
@@ -400,7 +438,7 @@ describe("worker messaging ledger",()=>{
     try {
       for(let sequence=1;sequence<=101;sequence++) database.workerMessages.appendReport(job.job_id,{schema_version:1,
         source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:`bounded-${sequence}`,
-        occurred_at:"2026-09-21T00:00:00Z",payload:{kind:"question",question:`question ${sequence}`}},
+        occurred_at:"2026-09-21T00:00:00Z",payload:{kind:"risk",severity:"high",summary:`risk ${sequence}`}},
         new Date(Date.parse("2026-09-21T00:00:00Z")+sequence));
       const sqlite=new Database(config.databasePath);
       sqlite.prepare(`UPDATE worker_messages SET workspace_id=NULL,channel_id=NULL,thread_ts=NULL
@@ -418,7 +456,7 @@ describe("worker messaging ledger",()=>{
       const at=new Date("2026-09-21T00:00:10Z");
       const messages=[1,2].map(sequence=>database.workerMessages.appendReport(job.job_id,{schema_version:1,
         source_event_id:source.event_id,producer_sequence:sequence,idempotency_key:`publish-order-${sequence}`,
-        occurred_at:`2026-09-21T00:00:0${sequence}Z`,payload:{kind:"question",question:`question ${sequence}`}},at).message.message_id);
+        occurred_at:`2026-09-21T00:00:0${sequence}Z`,payload:{kind:"risk",severity:"high",summary:`risk ${sequence}`}},at).message.message_id);
       assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:11Z")),2);
       const sqlite=new Database(config.databasePath);
       const externalIds=(sqlite.prepare("SELECT external_event_id FROM events WHERE source='dona_message' ORDER BY rowid").all() as Array<{external_event_id:string}>).map(row=>row.external_event_id);
@@ -497,6 +535,24 @@ describe("worker messaging ledger",()=>{
       assert.deepEqual(silence,{status:"completed",last_error_code:"worker_message_silence_superseded"});
       assert.deepEqual(database.workerMessages.silenceEventState(job.job_id,silenceEvent.event_id),{worker_message_silence:{
         event_id:silenceEvent.event_id,event_generation:1,current_generation:2,current:false}});
+    } finally {database.close();}
+  });
+
+  test("terminal jobの処理中silence eventはcurrentではない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+      database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:00Z"));
+      const sqlite=new Database(config.databasePath);
+      const silenceEvent=sqlite.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string};
+      sqlite.close();
+      database.beginDispatch(silenceEvent.event_id,path.join(config.resultsDir,"terminal-silence.json"));
+      database.markWaiting(silenceEvent.event_id);
+      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:16:00Z"},job.result_path);
+      assert.deepEqual(database.workerMessages.silenceEventState(job.job_id,silenceEvent.event_id),{worker_message_silence:{
+        event_id:silenceEvent.event_id,event_generation:1,current_generation:1,current:false}});
     } finally {database.close();}
   });
 
