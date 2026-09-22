@@ -14,7 +14,7 @@ import { readEventJobBinding } from "../src/job-routing.js";
 import type { Logger } from "../src/logger.js";
 import { buildEventPrompt, envelopeFromRow } from "../src/prompt.js";
 import { migrateWorkerMessaging, WorkerInstructionBridge, WorkerMessageError, WorkerMessagePublisher } from "../src/worker-messaging.js";
-import { eventEnvelope, tempConfig } from "./helpers.js";
+import { eventEnvelope, tempConfig, waitFor } from "./helpers.js";
 
 const roots: string[] = [];
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -224,7 +224,7 @@ describe("worker messaging ledger",()=>{
   });
 
   test("running jobのquestion受理をblocked遷移と同じtransactionで確定する",async()=>{
-    const {database,source,job}=await fixture();
+    const {database,source,job,config}=await fixture();
     try {
       bindRuntime(database,job.job_id,"runtime-question");
       const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
@@ -232,10 +232,21 @@ describe("worker messaging ledger",()=>{
         payload:{kind:"question",question:"回答を待ちます"}},new Date("2026-09-21T00:00:01Z"));
       assert.equal(database.getJob(job.job_id)?.status,"blocked");
       assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:01Z")),1);
       assert.equal(database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:1,idempotency_key:"running-answer",occurred_at:"2026-09-21T00:00:02Z",
         correlation_message_id:question.message.message_id,conversation_revision:4,
         payload:{operation:"answer",text:"続行してください"}},new Date("2026-09-21T00:00:02Z")).outcome,"created");
+      assert.equal(database.beginJobSteer(job.job_id,source.event_id,"running-answer").duplicate,false);
+      database.markJobSteerAccepted(job.job_id,"running-answer");
+      assert.equal(database.getJob(job.job_id)?.status,"running");
+      const sqlite=new Database(config.databasePath);
+      const cadence=sqlite.prepare("SELECT generation,silence_due_at,updated_at FROM worker_message_cadence WHERE job_id=?").get(job.job_id) as
+        {generation:number;silence_due_at:string|null;updated_at:string};
+      sqlite.close();
+      assert.equal(cadence.generation,2);
+      assert.ok(cadence.silence_due_at);
+      assert.ok(Date.parse(cadence.silence_due_at)>Date.parse(cadence.updated_at));
     } finally {database.close();}
   });
 
@@ -324,6 +335,25 @@ describe("worker messaging ledger",()=>{
       assert.equal(instruction.message.message_id,(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","bridge-answer") as
         {message:{message_id:string}}).message.message_id);
     } finally {await bridge.stop();database.close();}
+  });
+
+  test("instruction bridgeはshutdown開始後に次のdeliveryをclaimしない",async()=>{
+    const {database,source,job}=await fixture();
+    for(const sequence of [1,2])database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      producer_sequence:sequence,idempotency_key:`shutdown-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
+      payload:{operation:"add_condition",text:`条件 ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
+    let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});let calls=0;
+    const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(){calls+=1;await gate;}},5);
+    try {
+      bridge.start();
+      await waitFor(()=>calls===1);
+      bridge.beginShutdown();
+      release();
+      await bridge.stop();
+      assert.equal(calls,1);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","shutdown-1") as {delivery:{state:string}}).delivery.state,"delivered");
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","shutdown-2") as {delivery:{state:string}}).delivery.state,"pending");
+    } finally {release();await bridge.stop();database.close();}
   });
 
   test("bridge候補はleased先行instructionと配送不能jobを飛ばす",async()=>{
@@ -457,12 +487,16 @@ describe("worker messaging ledger",()=>{
       sqliteBefore.close();
       database.beginDispatch(silenceEvent.event_id,path.join(config.resultsDir,"silence.json"));
       database.markWaiting(silenceEvent.event_id);
+      assert.deepEqual(database.workerMessages.silenceEventState(job.job_id,silenceEvent.event_id),{worker_message_silence:{
+        event_id:silenceEvent.event_id,event_generation:1,current_generation:1,current:true}});
       database.workerMessages.appendReport(job.job_id,report(source.event_id,2),new Date("2026-09-21T00:15:01Z"));
       const sqlite=new Database(config.databasePath);
       const silence=sqlite.prepare("SELECT status,last_error_code FROM events WHERE event_type='worker_message_silence'").get() as
         {status:string;last_error_code:string|null};
       sqlite.close();
       assert.deepEqual(silence,{status:"completed",last_error_code:"worker_message_silence_superseded"});
+      assert.deepEqual(database.workerMessages.silenceEventState(job.job_id,silenceEvent.event_id),{worker_message_silence:{
+        event_id:silenceEvent.event_id,event_generation:1,current_generation:2,current:false}});
     } finally {database.close();}
   });
 

@@ -143,6 +143,8 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
     ...(response.live_session&&typeof response.live_session==="object"&&!Array.isArray(response.live_session)?{live_session:response.live_session}:{}),
     ...(response.reconciliation&&typeof response.reconciliation==="object"&&!Array.isArray(response.reconciliation)?{reconciliation:response.reconciliation}:{}),
     ...(response.receipt&&typeof response.receipt==="object"&&!Array.isArray(response.receipt)?{receipt:response.receipt}:{}),
+    ...(response.worker_message_silence&&typeof response.worker_message_silence==="object"&&!Array.isArray(response.worker_message_silence)
+      ?{worker_message_silence:response.worker_message_silence}:{}),
   };
 }
 
@@ -315,7 +317,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。worker_message_silence eventではSlack write直前の呼出しにgeneration-boundなcurrent判定も返します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },

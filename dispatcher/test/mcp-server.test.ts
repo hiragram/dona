@@ -26,6 +26,7 @@ describe("Dona Dispatcher MCP server", () => {
       async getJob(jobId, sourceEventId, options) {
         calls.push({ method: "getJob", args: options===undefined?[jobId, sourceEventId]:[jobId,sourceEventId,options] });
         return { schema_version: 1, job: { job_id: jobId, status: "running", notification_state:"needs_review", notification_authorization_phase:"preflight" },
+          worker_message_silence:{event_id:sourceEventId,event_generation:3,current_generation:3,current:true},
           ...(options?.includeLiveSession?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:"lsr_0123456789abcdef0123456789abcdef"}}:{}),
           ...(options?.liveSessionReceiptId?{live_session:{query_status:"observed",identity_match:true},reconciliation:{state:"consistent_running"},receipt:{receipt_id:options.liveSessionReceiptId}}:{}) };
       },
@@ -176,6 +177,8 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(status.isError, undefined);
       assert.equal((status.structuredContent as {job:Record<string,unknown>}).job.notification_authorization_phase,"preflight");
       assert.equal((status.structuredContent as { job: { status: string } }).job.status, "running");
+      assert.deepEqual((status.structuredContent as {worker_message_silence:unknown}).worker_message_silence,
+        {event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",event_generation:3,current_generation:3,current:true});
       assert.deepEqual(calls[2], {
         method: "getJob",
         args: ["job_01m1es03xy5cf8d9pm5cwx4srv", "evt_01M1ES03XY5CF8D9PM5CWX4SRV"],

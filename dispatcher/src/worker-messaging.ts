@@ -666,6 +666,21 @@ export class WorkerMessageRepository {
     }).immediate();
   }
 
+  silenceEventState(jobId:string,eventId:string):{worker_message_silence:{event_id:string,event_generation:number,current_generation:number,current:boolean}}|undefined {
+    const event=this.db.prepare("SELECT status,payload_json FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_silence'")
+      .get(eventId) as {status:string;payload_json:string}|undefined;
+    if(!event)return undefined;
+    let payload:unknown;
+    try {payload=JSON.parse(event.payload_json);} catch {return undefined;}
+    if(!payload||typeof payload!=="object"||Array.isArray(payload))return undefined;
+    const projected=payload as {job_id?:unknown;generation?:unknown};
+    if(projected.job_id!==jobId||!Number.isSafeInteger(projected.generation))return undefined;
+    const cadence=this.db.prepare("SELECT generation FROM worker_message_cadence WHERE job_id=?").get(jobId) as {generation:number}|undefined;
+    const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
+    return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
+      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration}};
+  }
+
   purge(at = new Date()): number {
     const cutoff = new Date(at.getTime() - workerMessageRetentionDays * 86_400_000).toISOString();
     return this.db.transaction(() => {
@@ -757,18 +772,24 @@ export class WorkerMessagePublisher {
 export class WorkerInstructionBridge {
   private timer:NodeJS.Timeout|undefined;
   private operation:Promise<void>|undefined;
+  private stopping=false;
   private readonly leaseOwner="dispatcher-worker-instruction-bridge";
   constructor(private readonly repository:WorkerMessageRepository,private readonly controller:WorkerInstructionController,
     private readonly pollMs=1_000,private readonly onError:(error:unknown)=>void=()=>{}) {}
   start():void {
     if(this.timer)return;
+    this.stopping=false;
     this.run();
     this.timer=setInterval(()=>this.run(),this.pollMs);
     this.timer.unref();
   }
-  async stop():Promise<void> {
+  beginShutdown():void {
+    this.stopping=true;
     if(this.timer)clearInterval(this.timer);
     this.timer=undefined;
+  }
+  async stop():Promise<void> {
+    this.beginShutdown();
     await this.operation;
   }
   async runOnce(at=new Date()):Promise<boolean> {
@@ -786,7 +807,7 @@ export class WorkerInstructionBridge {
   }
   private run():void {
     if(this.operation)return;
-    const operation=(async()=>{while(await this.runOnce());})().catch(error=>this.onError(error));
+    const operation=(async()=>{while(!this.stopping&&await this.runOnce());})().catch(error=>this.onError(error));
     this.operation=operation;
     void operation.finally(()=>{if(this.operation===operation)this.operation=undefined;});
   }

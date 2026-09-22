@@ -125,6 +125,8 @@ describe("DispatcherApi", () => {
       config,
       logger,
     );
+    await fs.mkdir(path.dirname(config.workerSocketPath),{recursive:true,mode:0o750});
+    await fs.chmod(path.dirname(config.workerSocketPath),0o750);
     await api.start();
     const first = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
     assert.equal(first.status, 202);
@@ -136,6 +138,7 @@ describe("DispatcherApi", () => {
     assert.equal(wakeCount, 2);
     assert.equal((await fs.stat(config.socketPath)).mode & 0o777, 0o600);
     assert.equal((await fs.stat(config.workerSocketPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(path.dirname(config.workerSocketPath))).mode & 0o777,0o750);
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
     assert.equal((await request(config.workerSocketPath,"GET","/health/ready")).status,404);
     await api.stop();

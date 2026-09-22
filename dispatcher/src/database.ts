@@ -1213,6 +1213,13 @@ export class DispatcherDatabase {
             .run(event.event_id);
         }
       }
+      const cadence=this.db.prepare("SELECT generation,silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
+        .get(jobId) as {generation:number;silence_interval_ms:number}|undefined;
+      if(cadence){
+        const silenceDueAt=new Date(Date.parse(timestamp)+cadence.silence_interval_ms).toISOString();
+        this.db.prepare(`UPDATE worker_message_cadence SET generation=generation+1,silence_due_at=?,updated_at=? WHERE job_id=?`)
+          .run(silenceDueAt,timestamp,jobId);
+      }
       this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
       return this.getJobRequired(jobId);
   }

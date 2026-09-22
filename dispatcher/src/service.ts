@@ -89,11 +89,12 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       async quiesce() {
         await scheduler.stop();
         workerMessagePublisher.stop();
-        await workerInstructionBridge.stop();
+        workerInstructionBridge.beginShutdown();
         await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
+        await workerInstructionBridge.stop();
       },
     },
     updateNotificationWorker,
@@ -137,8 +138,9 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
-    await workerInstructionBridge.stop();
+    workerInstructionBridge.beginShutdown();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
+    await workerInstructionBridge.stop();
     if (scheduler.isRunning()) await scheduler.stop();
     workerMessagePublisher.stop();
     if (reminderPublisher.isRunning()) await reminderPublisher.stop();
@@ -161,10 +163,11 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         await api.stop();
         await scheduler.stop();
         workerMessagePublisher.stop();
-        await workerInstructionBridge.stop();
+        workerInstructionBridge.beginShutdown();
         await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
+        await workerInstructionBridge.stop();
         await worker.stop();
         database.close();
         updateNotificationDatabase.close();

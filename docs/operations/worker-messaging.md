@@ -30,7 +30,7 @@ deliveryは`pending`、`leased`、`delivered`、`superseded`を持つ。claimご
 
 worker reportはPublisherがboundedな`dona_message`内部eventへ変換する。event payloadは`message_id`、`job_id`、`source_event_id`、kindだけで、本文は含めない。dona-mainは現在eventとのbindingを伴うread APIで本文を取得する。message commit後のpublish失敗はjob実行・Result保存・terminal notificationを失敗させず、pending deliveryとhealthのdegraded stateとして残す。
 
-通常reportはjobごと・workspaceごとのminimum intervalで抑制し、未配送の古い通常reportを`superseded`にする。`question`、`decision_request`、high riskは即時対象である。最後のreportからsilence intervalを超えた場合はgeneration-boundな`worker_message_silence` eventを一意に生成する。期限はwall-clockの絶対UTC値として保存するため、restartやclockの前後移動で同じgenerationを重複生成しない。新しいreportを受理した時点で、queue待ちだけでなくdispatch中・人間待ちを含む未完了の旧generation silence eventも失効させる。
+通常reportはjobごと・workspaceごとのminimum intervalで抑制し、未配送の古い通常reportを`superseded`にする。`question`、`decision_request`、high riskは即時対象である。最後のreportからsilence intervalを超えた場合はgeneration-boundな`worker_message_silence` eventを一意に生成する。期限はwall-clockの絶対UTC値として保存するため、restartやclockの前後移動で同じgenerationを重複生成しない。新しいreportを受理した時点で、queue待ちだけでなくdispatch中・人間待ちを含む未完了の旧generation silence eventも失効させる。dona-mainはSlack write直前の`get_job_status`でevent generationがcurrentであることを再検証し、falseまたは照会不能なら投稿しない。question解除時はgenerationを進めて新しいsilence deadlineを設定し、再開後の無通信を別世代として監視する。
 
 ## APIとMCP
 

@@ -176,8 +176,9 @@ export class DispatcherApi {
   }
 
   private async startServer(socketPath:string,workerOnly:boolean):Promise<http.Server> {
-    await fs.mkdir(path.dirname(socketPath),{recursive:true,mode:0o700});
-    await fs.chmod(path.dirname(socketPath),0o700);
+    const socketDirectory=path.dirname(socketPath);
+    const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
+    if(createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
     try {
       await fs.lstat(socketPath);
       if(await socketIsAlive(socketPath))throw new Error(`Another dispatcher is already listening on ${socketPath}`);
@@ -857,7 +858,8 @@ export class DispatcherApi {
           sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)},
+        ...(this.database.workerMessages.silenceEventState(jobId,sourceEventId) ?? {}) });
       return;
     }
     if (request.method === "POST" && action === "steer") {
