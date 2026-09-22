@@ -80,7 +80,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
       "--add-dir",
       path.dirname(job.result_path),
       "--add-dir",
-      path.dirname(config.socketPath),
+      path.dirname(config.workerSocketPath),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
@@ -101,7 +101,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir",path.dirname(config.socketPath), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
+    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir",path.dirname(config.workerSocketPath), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "-c", expectedOverride]);
     assert.equal(args[7]!.match(/trust_level/g)?.length, 1);
     assert.equal(args[7]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[7]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
@@ -161,7 +161,7 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
       "--add-dir",
       path.dirname(job.result_path),
       "--add-dir",
-      path.dirname(config.socketPath),
+      path.dirname(config.workerSocketPath),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c",
@@ -219,7 +219,7 @@ process.exit(1);
       "--timeout", String(config.jobAgentStartTimeoutMs),
       "--",
       "--add-dir", path.dirname(job.result_path),
-      "--add-dir", path.dirname(config.socketPath),
+      "--add-dir", path.dirname(config.workerSocketPath),
       "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);

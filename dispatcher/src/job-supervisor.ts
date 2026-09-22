@@ -252,9 +252,10 @@ export class JobSupervisor {
       const current = this.database.getJob(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (["queued", "retryable_failed"].includes(current.status)) {
+        const duplicate=this.database.hasAcceptedJobSteerReceipt(jobId,operationId);
         const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction, operationId);
         this.wake();
-        return { row, duplicate: current.steer_event_id === operationId && current.steer_state === "accepted" };
+        return { row, duplicate };
       }
       if(current.status==="blocked")await this.active.get(jobId)?.operation;
       const begun = this.database.beginJobSteer(jobId, sourceEventId, operationId);
@@ -694,7 +695,7 @@ export class JobSupervisor {
     const runtimeIdentity=this.database.getJobLiveSessionIdentity(row.job_id)?.herdr_agent_session_id;
     const prompted = await this.runtime.prompt(
       dispatching.agent_name,
-      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity,this.config.socketPath),
+      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity,this.config.workerSocketPath),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
     );

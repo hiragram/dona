@@ -347,7 +347,8 @@ export class WorkerMessageRepository {
         this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
           last_error_code='worker_message_silence_superseded',last_error_message=NULL
           WHERE source='dona_message' AND event_type='worker_message_silence'
-            AND substr(external_event_id,1,length(?))=? AND status IN ('queued','retryable_failed')`)
+            AND substr(external_event_id,1,length(?))=?
+            AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`)
           .run(acceptedAt,acceptedAt,silencePrefix,silencePrefix);
         const cadence = this.db.prepare("SELECT * FROM worker_message_cadence WHERE job_id=?").get(jobId) as { minimum_interval_ms:number;silence_interval_ms:number;last_delivery_at:string|null;pending_message_id:string|null } | undefined;
         const workspaceCadence=job.workspace_id?this.db.prepare("SELECT * FROM worker_message_workspace_cadence WHERE workspace_id=?").get(job.workspace_id) as

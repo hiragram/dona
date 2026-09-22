@@ -1009,14 +1009,18 @@ export class DispatcherDatabase {
   }
 
   recoverStaleJobs(at = new Date()): { retryable: number; needsReview: number } {
-    const timestamp = at.toISOString();
-    const retryable = this.db.prepare(`
+    return this.db.transaction(()=>{
+      const timestamp = at.toISOString();
+      const staleNeedsReview=this.db.prepare(`SELECT job_id FROM jobs
+        WHERE status IN ('dispatching','cancelling') OR steer_state='dispatching'`).all() as Array<{job_id:string}>;
+      const retryable = this.db.prepare(`
       UPDATE jobs SET status = 'retryable_failed', available_at = ?,
         last_error_code = 'stale_preparing',
         last_error_message = 'Dispatcher restarted before the job prompt was attempted', updated_at = ?
       WHERE status = 'preparing'
     `).run(timestamp, timestamp).changes;
-    const needsReview = this.db.prepare(`
+      for(const row of staleNeedsReview)this.workerMessages.supersedeUndeliveredInstructions(row.job_id,timestamp);
+      const needsReview = this.db.prepare(`
       UPDATE jobs SET status = 'needs_review',
         last_error_code = CASE WHEN status='cancelling' THEN 'ambiguous_cancel_acceptance'
           WHEN status='dispatching' THEN 'ambiguous_prompt_acceptance' ELSE 'ambiguous_steer_acceptance' END,
@@ -1024,7 +1028,8 @@ export class DispatcherDatabase {
         steer_state = NULL, updated_at = ?
       WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
     `).run(timestamp).changes;
-    return { retryable, needsReview };
+      return { retryable, needsReview };
+    }).immediate();
   }
 
   beginJobPreparation(jobId: string, at = new Date()): JobRow {
@@ -1361,7 +1366,7 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  private hasAcceptedJobSteerReceipt(jobId:string,operationId:string):boolean {
+  hasAcceptedJobSteerReceipt(jobId:string,operationId:string):boolean {
     return this.db.prepare("SELECT 1 FROM job_steer_receipts WHERE job_id=? AND operation_id=?").get(jobId,operationId)!==undefined;
   }
 

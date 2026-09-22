@@ -136,6 +136,7 @@ export interface ApiJobProgressResolver {
 
 export class DispatcherApi {
   private server: http.Server | undefined;
+  private workerServer:http.Server|undefined;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
@@ -161,32 +162,39 @@ export class DispatcherApi {
   disableJobProgress(): void { this.jobProgress = undefined; }
 
   async start(): Promise<void> {
-    await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(this.config.socketPath), 0o700);
     await fs.mkdir(this.config.resultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.resultsDir, 0o700);
+    this.server=await this.startServer(this.config.socketPath,false);
     try {
-      await fs.lstat(this.config.socketPath);
-      if (await socketIsAlive(this.config.socketPath)) {
-        throw new Error(`Another dispatcher is already listening on ${this.config.socketPath}`);
-      }
-      await fs.unlink(this.config.socketPath);
-      this.logger.warn("Removed stale dispatcher socket", { socket_path: this.config.socketPath });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.workerServer=await this.startServer(this.config.workerSocketPath,true);
+    } catch(error) {
+      await this.closeServer(this.server,this.config.socketPath);
+      this.server=undefined;
+      throw error;
     }
+    this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
+  }
 
-    this.server = http.createServer((request, response) => void this.handle(request, response));
+  private async startServer(socketPath:string,workerOnly:boolean):Promise<http.Server> {
+    await fs.mkdir(path.dirname(socketPath),{recursive:true,mode:0o700});
+    await fs.chmod(path.dirname(socketPath),0o700);
+    try {
+      await fs.lstat(socketPath);
+      if(await socketIsAlive(socketPath))throw new Error(`Another dispatcher is already listening on ${socketPath}`);
+      await fs.unlink(socketPath);
+      this.logger.warn("Removed stale dispatcher socket",{socket_path:socketPath});
+    } catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error; }
+    const server=http.createServer((request,response)=>void this.handle(request,response,workerOnly));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error);
-      this.server!.once("error", onError);
-      this.server!.listen(this.config.socketPath, () => {
-        this.server!.off("error", onError);
+      server.once("error", onError);
+      server.listen(socketPath, () => {
+        server.off("error", onError);
         resolve();
       });
     });
-    await fs.chmod(this.config.socketPath, 0o600);
-    this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
+    await fs.chmod(socketPath,0o600);
+    return server;
   }
 
   beginShutdown(): void {
@@ -215,25 +223,30 @@ export class DispatcherApi {
 
   async stop(): Promise<void> {
     this.beginShutdown();
-    const ownsSocket = this.server?.listening === true;
-    if (this.server?.listening) {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.close((error) => (error ? reject(error) : resolve()));
-      });
-    }
+    await Promise.all([this.closeServer(this.server,this.config.socketPath),this.closeServer(this.workerServer,this.config.workerSocketPath)]);
     this.server = undefined;
-    if (!ownsSocket) return;
-    try {
-      await fs.unlink(this.config.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    this.workerServer=undefined;
     this.logger.info("Dispatcher API stopped");
   }
 
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async closeServer(server:http.Server|undefined,socketPath:string):Promise<void> {
+    const ownsSocket=server?.listening===true;
+    if(server?.listening)await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    if(!ownsSocket)return;
+    try { await fs.unlink(socketPath); }
+    catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error; }
+  }
+
+  private async handle(request: IncomingMessage, response: ServerResponse,workerOnly=false): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if(workerOnly){
+        const report=request.method==="POST"&&/^\/v1\/jobs\/[^/]+\/messages\/reports$/.test(url.pathname);
+        const reconcile=request.method==="GET"&&/^\/v1\/jobs\/[^/]+\/messages\/reconcile$/.test(url.pathname)&&url.searchParams.get("producer")==="worker";
+        const delivery=request.method==="POST"&&(/^\/v1\/jobs\/[^/]+\/messages\/deliveries\/claim$/.test(url.pathname)
+          ||/^\/v1\/jobs\/[^/]+\/messages\/deliveries\/dlv_[0-9a-hjkmnp-tv-z]{26}\/ack$/.test(url.pathname));
+        if(!report&&!reconcile&&!delivery)throw new ApiRequestError(404,"not_found","Route not found");
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;

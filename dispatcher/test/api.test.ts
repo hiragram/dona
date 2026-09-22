@@ -135,8 +135,12 @@ describe("DispatcherApi", () => {
     assert.equal(database.list().length, 1);
     assert.equal(wakeCount, 2);
     assert.equal((await fs.stat(config.socketPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(config.workerSocketPath)).mode & 0o777, 0o600);
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
+    assert.equal((await request(config.workerSocketPath,"GET","/health/ready")).status,404);
     await api.stop();
+    await assert.rejects(fs.stat(config.socketPath),{code:"ENOENT"});
+    await assert.rejects(fs.stat(config.workerSocketPath),{code:"ENOENT"});
     database.close();
   });
 

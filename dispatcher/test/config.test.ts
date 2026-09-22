@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -346,6 +347,7 @@ describe("job resource config", () => {
     assert.equal(defaults.jobPromptTimeoutMs, 30_000);
     assert.equal(defaults.jobPromptReconcileMs, 30_000);
     assert.equal(defaults.jobPromptReconcilePollMs, 5_000);
+    assert.notEqual(path.dirname(defaults.socketPath),path.dirname(defaults.workerSocketPath));
 
     const configured = loadConfig({
       DONA_JOBS_PER_EVENT_MAX: "32",
@@ -357,6 +359,11 @@ describe("job resource config", () => {
     assert.equal(configured.jobObjectiveTotalMaxBytes, 1);
     assert.equal(configured.jobConcurrency, 1);
     assert.equal(configured.jobConcurrencyPerEvent, 2);
+  });
+
+  test("worker socketをmain Dispatcher socketと同じdirectoryへ配置しない",()=>{
+    assert.throws(()=>loadConfig({DONA_SOCKET_PATH:"/tmp/dona-main/dispatcher.sock",DONA_WORKER_SOCKET_PATH:"/tmp/dona-main/worker.sock"}),
+      /directory separate/);
   });
 
   test("prompt専用timeoutとbounded reconcile設定を検証する", () => {

@@ -238,6 +238,30 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("restart時の曖昧なsteerはleased answerを失効してquestionを再公開する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"restart-question",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
+        payload:{kind:"question",question:"再起動後も回答待ちですか"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"restart-answer",occurred_at:"2026-09-21T00:00:03Z",
+        correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"続行してください"}},
+      new Date("2026-09-21T00:00:03Z"));
+      bindRuntime(database,job.job_id,"runtime-restart");
+      assert.equal(database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-restart",1,10_000,
+        new Date("2026-09-21T00:00:04Z"))[0]?.delivery.state,"leased");
+      assert.equal(database.beginJobSteer(job.job_id,source.event_id,"restart-answer").duplicate,false);
+      assert.deepEqual(database.recoverStaleJobs(new Date("2026-09-21T00:00:05Z")),{retryable:0,needsReview:1});
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","restart-answer") as
+        {delivery:{state:string}}).delivery.state,"superseded");
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
+        kind:"question",next_producer_sequence:2,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
   test("pending questionの次revisionは無関係なmessage最大値ではなく相関元から生成する",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -408,6 +432,11 @@ describe("worker messaging ledger",()=>{
     try {
       database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
       assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:00Z")),1);
+      const sqliteBefore=new Database(config.databasePath);
+      const silenceEvent=sqliteBefore.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string};
+      sqliteBefore.close();
+      database.beginDispatch(silenceEvent.event_id,path.join(config.resultsDir,"silence.json"));
+      database.markWaiting(silenceEvent.event_id);
       database.workerMessages.appendReport(job.job_id,report(source.event_id,2),new Date("2026-09-21T00:15:01Z"));
       const sqlite=new Database(config.databasePath);
       const silence=sqlite.prepare("SELECT status,last_error_code FROM events WHERE event_type='worker_message_silence'").get() as
@@ -540,7 +569,8 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
   try {
     await fs.mkdir(path.dirname(config.updateInternalTokenPath),{recursive:true,mode:0o700});
     await fs.writeFile(config.updateInternalTokenPath,"i".repeat(64),{mode:0o600});
-    const created=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-primary"});
+    assert.equal((await request(config.workerSocketPath,"POST","/v1/events",eventEnvelope("Ev-worker-socket-forbidden"))).status,404);
+    const created=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(created.status,202);
     const messageId=((created.body.message as Record<string,unknown>).message_id as string);
     const internal=database.getByExternalId("dona_message",`worker-message:${messageId}`);
@@ -559,7 +589,7 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(sourceRead.status,403);
     const read=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/${messageId}?source_event_id=${internal.event_id}`);
     assert.equal(read.status,200); assert.equal(((read.body.message as {payload:{kind:string}}).payload.kind),"checkpoint");
-    const reconcile=await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,undefined,{"x-dona-worker-runtime":"runtime-primary"});
+    const reconcile=await request(config.workerSocketPath,"GET",`/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,undefined,{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(reconcile.status,200); assert.equal(reconcile.body.reconciliation,"matched");
     const instruction={schema_version:1,source_event_id:source.event_id,producer_sequence:1,idempotency_key:"api-instruction",
       occurred_at:"2026-09-21T00:00:02Z",payload:{operation:"add_condition",text:"認証済み条件"}};
@@ -569,7 +599,7 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     const instructionResult=await new DispatcherApiClient(config.socketPath,1_000,config.updateInternalTokenPath)
       .sendWorkerInstruction(job.job_id,instruction);
     assert.equal(instructionResult.outcome,"created");
-    const forbiddenClaim=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/claim`,{
+    const forbiddenClaim=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/deliveries/claim`,{
       source_event_id:source.event_id,consumer:"dona-main",lease_owner:"worker-bridge",limit:1,lease_ms:10_000},{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(forbiddenClaim.status,400);
     const direct=database.workerMessages.appendReport(job.job_id,report(source.event_id,2,"report-api-2"),new Date());
@@ -612,17 +642,17 @@ test("worker-facing APIは同じownerのsibling runtimeを拒否する",async()=
   bindRuntime(database,sibling.job_id,"runtime-sibling");
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger); await api.start();
   try {
-    const crossed=await request(config.socketPath,"POST",`/v1/jobs/${sibling.job_id}/messages/reports`,
+    const crossed=await request(config.workerSocketPath,"POST",`/v1/jobs/${sibling.job_id}/messages/reports`,
       report(source.event_id),{"x-dona-worker-runtime":"runtime-primary"});
     assert.equal(crossed.status,403);
-    const accepted=await request(config.socketPath,"POST",`/v1/jobs/${sibling.job_id}/messages/reports`,
+    const accepted=await request(config.workerSocketPath,"POST",`/v1/jobs/${sibling.job_id}/messages/reports`,
       report(source.event_id),{"x-dona-worker-runtime":"runtime-sibling"});
     assert.equal(accepted.status,202);
-    const prompt=buildJobPrompt(sibling,true,"runtime-sibling",config.socketPath);
+    const prompt=buildJobPrompt(sibling,true,"runtime-sibling",config.workerSocketPath);
     const jobJson=JSON.parse(prompt.split("job_json:\n")[1]!.split("\n[DONA_JOB_END]")[0]!) as
       {runtime_identity:string;worker_messaging:{transport:{socket_path:string};report:{path:string}}};
     assert.equal(jobJson.runtime_identity,"runtime-sibling");
-    assert.equal(jobJson.worker_messaging.transport.socket_path,config.socketPath);
+    assert.equal(jobJson.worker_messaging.transport.socket_path,config.workerSocketPath);
     assert.equal(jobJson.worker_messaging.report.path,`/v1/jobs/${sibling.job_id}/messages/reports`);
     assert.match(prompt,/他jobへ転用せず/);
   } finally {await api.stop();database.close();}
@@ -633,19 +663,19 @@ test("worker reportはterminal cleanup後も元runtimeでread-only reconcileで�
   bindRuntime(database,job.job_id,"runtime-terminal-reconcile");
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger); await api.start();
   try {
-    const created=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,
+    const created=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,
       report(source.event_id),{"x-dona-worker-runtime":"runtime-terminal-reconcile"});
     assert.equal(created.status,202);
     database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",
       completed_at:"2026-09-21T00:00:04Z"},job.result_path);
     database.markJobRuntimeCleaned(job.job_id);
     assert.equal(database.getJobLiveSessionIdentity(job.job_id),undefined);
-    const reconciled=await request(config.socketPath,"GET",
+    const reconciled=await request(config.workerSocketPath,"GET",
       `/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,
       undefined,{"x-dona-worker-runtime":"runtime-terminal-reconcile"});
     assert.equal(reconciled.status,200);
     assert.equal(reconciled.body.reconciliation,"matched");
-    const rejected=await request(config.socketPath,"GET",
+    const rejected=await request(config.workerSocketPath,"GET",
       `/v1/jobs/${job.job_id}/messages/reconcile?source_event_id=${source.event_id}&producer=worker&idempotency_key=report-1`,
       undefined,{"x-dona-worker-runtime":"runtime-foreign"});
     assert.equal(rejected.status,403);
@@ -713,7 +743,7 @@ test("report delivery障害をaccepted messageと独立したdegraded stateに�
     BEGIN SELECT RAISE(ABORT,'publisher unavailable'); END;`);
   const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,config,logger); await api.start();
   try {
-    const created=await request(config.socketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-degraded"});
+    const created=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-degraded"});
     assert.equal(created.status,202); assert.equal(database.workerMessages.operationalSnapshot().pending_deliveries,1);
     assert.equal(database.workerMessages.operationalSnapshot().degraded,true);
     sqlite.exec("DROP TRIGGER fail_worker_message_event");

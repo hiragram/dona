@@ -876,6 +876,10 @@ describe("JobSupervisor", () => {
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
+    const queued=database.createJob(
+      {source_event_id:followUp.event_id,job_key:"queued-steer-receipt",objective:"待機中",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir,
+    ).row;
     database.beginJobPreparation(job.job_id);
     database.setJobRuntime(job.job_id, "1", "w1:p1");
     database.beginJobDispatch(job.job_id);
@@ -903,6 +907,14 @@ describe("JobSupervisor", () => {
     assert.equal(replayFirst.duplicate,true);
     const duplicate=await restarted.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
     assert.equal(duplicate.duplicate,true);
+    const queuedFirst=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件A","msg_queued_operation_1");
+    assert.equal(queuedFirst.duplicate,false);
+    const queuedSecond=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件B","msg_queued_operation_2");
+    assert.equal(queuedSecond.duplicate,false);
+    const queuedReplay=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件A","msg_queued_operation_1");
+    assert.equal(queuedReplay.duplicate,true);
+    assert.equal(reopened.getJob(queued.job_id)?.objective.match(/待機中の追加条件A/g)?.length,1);
+    assert.equal(reopened.getJob(queued.job_id)?.objective.match(/待機中の追加条件B/g)?.length,1);
     assert.deepEqual(steers, ["追加条件","別の追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name,job.agent_name]);
     assert.deepEqual(steerTimeouts, [undefined,undefined]);
