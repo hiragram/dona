@@ -214,7 +214,10 @@ export class DispatcherApi {
     ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
       operations.stale_claims === 0 && operations.retention_overdue === 0;
     let workerMessaging: Record<string, unknown>;
-    try { workerMessaging = this.database.workerMessages.operationalSnapshot(); }
+    try {
+      workerMessaging = this.database.workerMessages.operationalSnapshot();
+      if(workerMessaging.degraded===true)ready=false;
+    }
     catch {
       ready = false;
       workerMessaging = { protocol_version: 1, degraded: true, error_code: "worker_message_storage_unavailable" };

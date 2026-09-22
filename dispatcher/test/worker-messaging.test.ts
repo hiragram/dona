@@ -202,7 +202,7 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
-  test("needs_review jobはanswerを受理せず未回答questionを維持する",async()=>{
+  test("needs_review jobはanswerを受理せず回答可能questionを投影しない",async()=>{
     const {database,source,job}=await fixture();
     try {
       const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
@@ -218,8 +218,7 @@ describe("worker messaging ledger",()=>{
         producer_sequence:1,idempotency_key:"needs-review-answer",occurred_at:"2026-09-21T00:00:02Z",
         correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"回答"}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
-      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
-        kind:"question",next_producer_sequence:1,next_conversation_revision:2});
+      assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
     } finally {database.close();}
   });
 
@@ -250,7 +249,7 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
-  test("受理済みanswerをneeds_review遷移で失効してquestionを再公開する",async()=>{
+  test("受理済みanswerをneeds_review遷移で失効し回答不能questionを非表示にする",async()=>{
     const {database,source,job}=await fixture();
     try {
       const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
@@ -264,12 +263,11 @@ describe("worker messaging ledger",()=>{
       database.markJobNeedsReview(job.job_id,"test","確認待ち");
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","transition-answer") as
         {delivery:{state:string}}).delivery.state,"superseded");
-      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
-        kind:"question",next_producer_sequence:2,next_conversation_revision:2});
+      assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
     } finally {database.close();}
   });
 
-  test("restart時の曖昧なsteerはleased answerを失効してquestionを再公開する",async()=>{
+  test("restart時の曖昧なsteerはleased answerを失効し回答不能questionを非表示にする",async()=>{
     const {database,source,job}=await fixture();
     try {
       const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
@@ -288,8 +286,7 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.getJob(job.job_id)?.status,"needs_review");
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","restart-answer") as
         {delivery:{state:string}}).delivery.state,"superseded");
-      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
-        kind:"question",next_producer_sequence:2,next_conversation_revision:2});
+      assert.equal(database.workerMessages.pendingQuestion(job.job_id),undefined);
     } finally {database.close();}
   });
 
@@ -720,6 +717,11 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(forbiddenAck.status,409);
     const health=await request(config.socketPath,"GET","/health/ready");
     assert.equal((health.body.worker_messaging as {protocol_version:number}).protocol_version,1);
+    const snapshot=database.workerMessages.operationalSnapshot.bind(database.workerMessages);
+    database.workerMessages.operationalSnapshot=()=>({...snapshot(),degraded:true});
+    const degraded=await request(config.socketPath,"GET","/health/version");
+    assert.equal(degraded.status,503);
+    assert.equal(degraded.body.status,"not_ready");
     database.workerMessages.operationalSnapshot=()=>{throw new Error("worker message storage unavailable");};
     const unavailable=await request(config.socketPath,"GET","/health/ready");
     assert.equal(unavailable.status,503);
@@ -811,6 +813,17 @@ test("過去runtimeは自分が生成したmessageだけをreconcileできる",a
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
     assert.equal(database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-second","second-report").reconciliation,"matched");
     assert.throws(()=>database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-second","first-report"),
+      (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
+  } finally {database.close();}
+});
+
+test("current runtimeは未記録reportをnot_foundとしてreconcileできる",async()=>{
+  const {database,source,job}=await fixture();
+  try {
+    bindRuntime(database,job.job_id,"runtime-current");
+    assert.deepEqual(database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-current","missing-report"),
+      {reconciliation:"not_found"});
+    assert.throws(()=>database.workerMessages.reconcileWorker(job.job_id,source.event_id,"runtime-foreign","missing-report"),
       (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_runtime_mismatch");
   } finally {database.close();}
 });

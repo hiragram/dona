@@ -435,7 +435,7 @@ export class WorkerMessageRepository {
         COALESCE(m.conversation_revision,0)+1 AS next_conversation_revision
       FROM worker_messages m JOIN worker_message_deliveries d ON d.message_id=m.message_id JOIN jobs j ON j.job_id=m.job_id
       WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind IN ('question','decision_request') AND d.consumer='dona-main'
-        AND d.state='delivered' AND j.status NOT IN ('completed','failed','cancelled')
+        AND d.state='delivered' AND j.status IN ('queued','retryable_failed','running','blocked')
         AND NOT EXISTS (SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries answer_delivery ON answer_delivery.message_id=answer.message_id
           WHERE answer.job_id=m.job_id AND answer.direction='dona_to_worker' AND answer.kind='answer'
             AND answer.correlation_message_id=m.message_id AND answer_delivery.consumer='worker' AND answer_delivery.state!='superseded')
@@ -764,8 +764,11 @@ export class WorkerMessageRepository {
     const historical=this.db.prepare(`SELECT 1 FROM worker_messages m JOIN worker_message_runtime_identities r USING(message_id)
       WHERE m.job_id=? AND m.producer='worker' AND m.idempotency_key=? AND r.runtime_identity_sha256=?`)
       .get(jobId,idempotencyKey,sha256(runtimeIdentity));
-    if(!historical)
-      throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
+    if(historical)return;
+    const existing=this.db.prepare("SELECT 1 FROM worker_messages WHERE job_id=? AND producer='worker' AND idempotency_key=?")
+      .get(jobId,idempotencyKey);
+    if(existing)throw new WorkerMessageError("worker_runtime_mismatch","worker runtime identity does not own this job");
+    this.assertWorkerRuntime(jobId,runtimeIdentity);
   }
 
   private recordWorkspaceDelivery(workspaceId:string,at:string):void {
