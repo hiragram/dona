@@ -14,6 +14,7 @@ Worker Messaging は、worker と dona-main の途中経過・質問・判断を
 - message全体は UTF-8 で16 KiB以下。本文は4,000文字以下、decision optionは各1,000文字・最大8件。
 - unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing report／claim／ACKは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。worker reportのread-only reconcileだけは、commit済みreportと同じruntime identityのSHA-256をretention期間中保持してterminal cleanup後も照合できるようにする。current runtimeであってもmessage固有の履歴hash一致を必須とし、raw identityは履歴へ保存しない。
 - instructionはtyped operationであり、raw shell、path、URL、environment、credentialをcommand capabilityとして受け付けない。
+- instructionはworkerへsteer可能なjob状態だけで新規受理し、`needs_review`等の配送不能状態では未回答questionを維持して拒否する。受理済みsteer operationはjobの最新slotとは別のdurable receiptで照合し、別のsteerで上書きされても再投入しない。
 - `answer`は未回答のworker `question`／`decision_request`への`correlation_message_id`を必須とし、`conversation_revision`は相関元の直後でなければならない。同じ質問への2件目のanswerは拒否する。
 - `producer_sequence`はjob・producerごとに1から単調増加する。gapは`worker_message_sequence_gap`、未記録の巻き戻しは`worker_message_sequence_rollback`。
 - `idempotency_key`はjob・producerごとに一意。`source_event_id`、`producer_sequence`、key、payload、`correlation_message_id`、`conversation_revision`、`occurred_at`がすべて同一なら`reused`、いずれかが異なるcanonical messageは`worker_message_idempotency_conflict`。
@@ -39,7 +40,7 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
 - worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
-- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。bridgeはsteer可能な`queued`、`retryable_failed`、`running`、`blocked`だけを対象にし、同じjobの先行instructionがpendingまたはleasedなら後続を追い越さない。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。blocked workerがanswerを受理した場合はrunningへ戻して監視を再開し、未送信のattention eventとそのjob/group pointerをsupersedeして古い質問通知を出さない。
+- worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。bridgeはsteer可能な`queued`、`retryable_failed`、`running`、`blocked`だけを対象にし、同じjobの先行instructionがpendingまたはleasedなら後続を追い越さない。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。blocked workerがanswerを受理した場合はrunningへ戻して監視を再開し、queuedまたは処理中のattention eventとそのjob/group pointerをsupersedeして古い質問通知を出さない。
 - `list_thread_jobs`は未回答のquestion／decision requestがある場合だけ、boundedな`pending_worker_question`を返す。一意なら相関message ID、次のproducer sequence、conversation revisionを返し、複数なら`ambiguous: true`と`pending_count_at_least: 2`だけを返して相関先を推測させない。後続の人間回答はcurrent event bindingで`answer`へ変換し、成功後はAgent Sessionを`processing`へ戻す。通常のfree-form steerへ落とさない。
 
 ## 障害対応

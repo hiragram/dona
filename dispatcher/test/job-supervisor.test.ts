@@ -893,13 +893,20 @@ describe("JobSupervisor", () => {
     assert.equal(result.duplicate, false);
     const second=await supervisor.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
     assert.equal(second.duplicate,false);
-    const duplicate=await supervisor.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
+    await supervisor.stop();
+    database.close();
+    const reopened=new DispatcherDatabase(config.databasePath);
+    const restarted=new JobSupervisor(reopened,runtime,config,logger,()=>undefined);
+    const replayFirst=await restarted.steer(job.job_id,followUp.event_id,"追加条件","msg_operation_1");
+    assert.equal(replayFirst.duplicate,true);
+    const duplicate=await restarted.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
     assert.equal(duplicate.duplicate,true);
     assert.deepEqual(steers, ["追加条件","別の追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name,job.agent_name]);
     assert.deepEqual(steerTimeouts, [undefined,undefined]);
-    assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
-    database.close();
+    assert.equal(reopened.getJob(job.job_id)?.steer_state, "accepted");
+    await restarted.stop();
+    reopened.close();
   });
 
   test("blocked workerへのtyped answerを受理してrunning監視へ戻す",async()=>{
@@ -916,6 +923,8 @@ describe("JobSupervisor", () => {
     database.markJobRunning(job.job_id);
     database.markJobBlocked(job.job_id,"回答待ち");
     const attention=database.enqueueJobNotification(job.job_id).row;
+    database.beginDispatch(attention.event_id,path.join(config.resultsDir,"attention.json"));
+    database.markWaiting(attention.event_id);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.event_id);
     assert.equal(database.getJob(job.job_id)?.completion_event_id,attention.event_id);
     let waits=0;

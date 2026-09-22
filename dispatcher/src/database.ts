@@ -172,6 +172,14 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
     WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
 `);}
+function ensureJobSteerReceiptSchema(db:Database.Database):void {db.exec(`
+  CREATE TABLE IF NOT EXISTS job_steer_receipts (
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    operation_id TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    PRIMARY KEY (job_id,operation_id)
+  );
+`);}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -256,6 +264,9 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasSteerReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_steer_receipts'").get() !== undefined;
+    if (hasSteerReceipts) db.exec(`CREATE TEMP TABLE preserved_job_steer_receipts_v3 AS SELECT * FROM job_steer_receipts;
+      DROP TABLE job_steer_receipts;`);
     const hasWorkerMessages = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get() !== undefined;
     if (hasWorkerMessages) {
       migrateWorkerMessaging(db);
@@ -333,6 +344,9 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
       ${jobsRunnableFairIndexSql};
     `);
+    ensureJobSteerReceiptSchema(db);
+    if(hasSteerReceipts)db.exec(`INSERT INTO job_steer_receipts SELECT * FROM preserved_job_steer_receipts_v3;
+      DROP TABLE preserved_job_steer_receipts_v3;`);
     if (hasWorkerMessages) {
       migrateWorkerMessaging(db);
       db.exec(`
@@ -438,6 +452,7 @@ export function migrateDispatcherDatabase(
     ensureJobsWorkspaceJobIndex(db);
     ensureJobsStatusJobIndex(db);
   }
+  ensureJobSteerReceiptSchema(db);
 }
 
 export class DispatcherDatabase {
@@ -1168,12 +1183,14 @@ export class DispatcherDatabase {
       if(job.status!=="blocked")throw new Error(`Job ${jobId} is not blocked`);
       if(job.completion_event_id){
         const event=this.get(job.completion_event_id);
-        if(event&&["queued","retryable_failed"].includes(event.status)){
+        if(event&&!(["completed","dead_letter"] as EventStatus[]).includes(event.status)){
           const changed=this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
             last_error_code='job_attention_superseded',last_error_message=NULL
-            WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+            WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`)
             .run(timestamp,timestamp,event.event_id).changes;
           if(changed!==1)throw new Error(`Job ${jobId} attention event changed during resume`);
+        }
+        if(event){
           this.db.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=? AND attention_event_id=?")
             .run(timestamp,job.source_event_id,event.event_id);
           this.db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
@@ -1272,7 +1289,7 @@ export class DispatcherDatabase {
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
-      if (row.steer_event_id === operationId && row.steer_state === "accepted") return row;
+      if (this.hasAcceptedJobSteerReceipt(jobId,operationId)) return row;
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
@@ -1282,8 +1299,11 @@ export class DispatcherDatabase {
       const attempted = current + Buffer.byteLength(addition,"utf8");
       const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
+      const timestamp=nowUtc();
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
-        .run(objective,operationId,nowUtc(),jobId);
+        .run(objective,operationId,timestamp,jobId);
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at) VALUES(?,?,?)")
+        .run(jobId,operationId,timestamp);
       return this.getJobRequired(jobId);
     }).immediate();
   }
@@ -1293,7 +1313,7 @@ export class DispatcherDatabase {
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);
-    if (row.steer_event_id === operationId && row.steer_state === "accepted") return { row, duplicate: true };
+    if (this.hasAcceptedJobSteerReceipt(jobId,operationId)) return { row, duplicate: true };
     if (!["running","blocked"].includes(row.status)) throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
@@ -1302,11 +1322,20 @@ export class DispatcherDatabase {
   }
 
   markJobSteerAccepted(jobId: string, operationId: string): void {
-    const changed = this.db.prepare(`
-      UPDATE jobs SET steer_state = 'accepted', updated_at = ?
-      WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
-    `).run(nowUtc(), jobId, operationId).changes;
-    if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+    this.db.transaction(()=>{
+      const timestamp=nowUtc();
+      const changed = this.db.prepare(`
+        UPDATE jobs SET steer_state = 'accepted', updated_at = ?
+        WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
+      `).run(timestamp, jobId, operationId).changes;
+      if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at) VALUES(?,?,?)")
+        .run(jobId,operationId,timestamp);
+    }).immediate();
+  }
+
+  private hasAcceptedJobSteerReceipt(jobId:string,operationId:string):boolean {
+    return this.db.prepare("SELECT 1 FROM job_steer_receipts WHERE job_id=? AND operation_id=?").get(jobId,operationId)!==undefined;
   }
 
   clearJobSteer(jobId: string, operationId: string): void {

@@ -305,6 +305,8 @@ export class WorkerMessageRepository {
       return { message: keyExisting, receipt_id: receipt.receipt_id, outcome: "reused" };
     }
     if (terminal(job.status)) throw new WorkerMessageError("worker_message_terminal_fence", "new messages are rejected after terminal job state");
+    if(direction==="dona_to_worker"&&!["queued","retryable_failed","running","blocked"].includes(job.status))
+      throw new WorkerMessageError("worker_message_instruction_unavailable",`job in status ${job.status} cannot accept instructions`);
     let correlated:WorkerMessageRow|undefined;
     if (input.correlation_message_id) {
       correlated = this.db.prepare("SELECT * FROM worker_messages WHERE message_id=?").get(input.correlation_message_id) as WorkerMessageRow | undefined;

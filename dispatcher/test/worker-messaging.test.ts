@@ -202,6 +202,23 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("needs_review jobはanswerを受理せず未回答questionを維持する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const question=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"needs-review-question",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
+        payload:{kind:"question",question:"回答できますか"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      database.markJobNeedsReview(job.job_id,"test","確認待ち");
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"needs-review-answer",occurred_at:"2026-09-21T00:00:02Z",
+        correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"回答"}}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
+      assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:question.message.message_id,
+        kind:"question",next_producer_sequence:1,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
   test("pending questionの次revisionは無関係なmessage最大値ではなく相関元から生成する",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -264,10 +281,10 @@ describe("worker messaging ledger",()=>{
       const unavailable=database.createJob({source_event_id:source.event_id,job_key:"unavailable",objective:"unavailable",workspace:{kind:"scratch"}},
         config.jobsWorkspaceRoot,config.jobResultsDir).row;
       bindRuntime(database,unavailable.job_id,"runtime-unavailable");
-      database.markJobNeedsReview(unavailable.job_id,"test","test");
       database.workerMessages.appendInstruction(unavailable.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:1,idempotency_key:"unavailable-instruction",occurred_at:"2026-09-21T00:00:06Z",
         payload:{operation:"add_condition",text:"配送不能"}},new Date("2026-09-21T00:00:06Z"));
+      database.markJobNeedsReview(unavailable.job_id,"test","test");
       assert.equal(database.workerMessages.claimNextWorkerInstruction("live-bridge",10_000,new Date("2026-09-21T00:00:07Z")),undefined);
     } finally {database.close();}
   });
