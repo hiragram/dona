@@ -138,6 +138,7 @@ describe("DispatcherApi", () => {
     assert.equal(wakeCount, 2);
     assert.equal((await fs.stat(config.socketPath)).mode & 0o777, 0o600);
     assert.equal((await fs.stat(config.workerSocketPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(path.dirname(config.socketPath))).mode & 0o777,0o700);
     assert.equal((await fs.stat(path.dirname(config.workerSocketPath))).mode & 0o777,0o750);
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
     assert.equal((await request(config.workerSocketPath,"GET","/health/ready")).status,404);

@@ -1361,7 +1361,10 @@ export class DispatcherDatabase {
   markJobSteerAccepted(jobId: string, operationId: string): JobRow {
     return this.db.transaction(()=>{
       const timestamp=nowUtc();
-      const job=this.getJobRequired(jobId),resumeRequired=job.status==="blocked";
+      const job=this.getJobRequired(jobId);
+      const typedAnswer=this.db.prepare("SELECT 1 FROM worker_messages WHERE message_id=? AND job_id=? AND direction='dona_to_worker' AND kind='answer'")
+        .get(operationId,jobId);
+      const resumeRequired=job.status==="blocked"&&(job.last_error_code!=="worker_message_question_pending"||!!typedAnswer);
       const changed = this.db.prepare(`
         UPDATE jobs SET steer_state = 'accepted', updated_at = ?
         WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'

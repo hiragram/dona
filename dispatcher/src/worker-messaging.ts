@@ -381,7 +381,7 @@ export class WorkerMessageRepository {
         if (!urgent && cadence?.last_delivery_at) availableAt = new Date(Math.max(at.getTime(), Date.parse(cadence.last_delivery_at) + minimum)).toISOString();
         if (!urgent && workspaceCadence?.last_delivery_at) availableAt = new Date(Math.max(Date.parse(availableAt),
           Date.parse(workspaceCadence.last_delivery_at)+workspaceCadence.minimum_interval_ms)).toISOString();
-        if (!urgent && cadence?.pending_message_id) {
+        if (cadence?.pending_message_id) {
           const pending = this.db.prepare("SELECT kind,payload_json FROM worker_messages WHERE message_id=?")
             .get(cadence.pending_message_id) as {kind:WorkerMessageKind;payload_json:string}|undefined;
           const pendingPayload = pending ? JSON.parse(pending.payload_json) as {severity?:unknown} : undefined;
@@ -395,7 +395,7 @@ export class WorkerMessageRepository {
         const silenceInterval = cadence?.silence_interval_ms ?? 900_000;
         this.db.prepare(`INSERT INTO worker_message_cadence(job_id,last_report_at,silence_due_at,pending_message_id,generation,updated_at)
           VALUES(?,?,?,?,1,?) ON CONFLICT(job_id) DO UPDATE SET last_report_at=excluded.last_report_at,silence_due_at=excluded.silence_due_at,
-          pending_message_id=COALESCE(excluded.pending_message_id,worker_message_cadence.pending_message_id),
+          pending_message_id=excluded.pending_message_id,
           generation=worker_message_cadence.generation+1,updated_at=excluded.updated_at`)
           .run(jobId, acceptedAt, new Date(at.getTime() + silenceInterval).toISOString(), urgent ? null : messageId, acceptedAt);
       }

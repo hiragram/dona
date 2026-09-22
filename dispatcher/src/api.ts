@@ -178,7 +178,7 @@ export class DispatcherApi {
   private async startServer(socketPath:string,workerOnly:boolean):Promise<http.Server> {
     const socketDirectory=path.dirname(socketPath);
     const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
-    if(createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
+    if(!workerOnly||createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
     try {
       await fs.lstat(socketPath);
       if(await socketIsAlive(socketPath))throw new Error(`Another dispatcher is already listening on ${socketPath}`);

@@ -232,12 +232,16 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.getJob(job.job_id)?.status,"blocked");
       assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
       assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:01Z")),1);
-      assert.equal(database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      assert.equal(database.beginJobSteer(job.job_id,source.event_id,"normal-condition").duplicate,false);
+      database.markJobSteerAccepted(job.job_id,"normal-condition");
+      assert.equal(database.getJob(job.job_id)?.status,"blocked");
+      const answer=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:1,idempotency_key:"running-answer",occurred_at:"2026-09-21T00:00:02Z",
         correlation_message_id:question.message.message_id,conversation_revision:4,
-        payload:{operation:"answer",text:"続行してください"}},new Date("2026-09-21T00:00:02Z")).outcome,"created");
-      assert.equal(database.beginJobSteer(job.job_id,source.event_id,"running-answer").duplicate,false);
-      database.markJobSteerAccepted(job.job_id,"running-answer");
+        payload:{operation:"answer",text:"続行してください"}},new Date("2026-09-21T00:00:02Z"));
+      assert.equal(answer.outcome,"created");
+      assert.equal(database.beginJobSteer(job.job_id,source.event_id,answer.message.message_id).duplicate,false);
+      database.markJobSteerAccepted(job.job_id,answer.message.message_id);
       assert.equal(database.getJob(job.job_id)?.status,"running");
       const sqlite=new Database(config.databasePath);
       const cadence=sqlite.prepare("SELECT generation,silence_due_at,updated_at FROM worker_message_cadence WHERE job_id=?").get(job.job_id) as
@@ -579,6 +583,18 @@ describe("worker messaging ledger",()=>{
       const latest=database.workerMessages.appendReport(job.job_id,report(source.event_id,3),new Date("2026-09-21T00:00:03Z"));
       const states=[first,urgent,latest].map(value=>(database.workerMessages.reconcile(job.job_id,source.event_id,"worker",value.message.idempotency_key) as {delivery:{state:string}}).delivery.state);
       assert.deepEqual(states,["superseded","pending","pending"]);
+    } finally {database.close();}
+  });
+
+  test("新しい緊急reportは古いpending checkpointをsupersedeする",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,report(source.event_id,1),new Date("2026-09-21T00:00:01Z"));
+      const urgent=database.workerMessages.appendReport(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:2,
+        idempotency_key:"urgent-question",occurred_at:"2026-09-21T00:00:02Z",conversation_revision:1,
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:02Z"));
+      const states=[first,urgent].map(value=>(database.workerMessages.reconcile(job.job_id,source.event_id,"worker",value.message.idempotency_key) as {delivery:{state:string}}).delivery.state);
+      assert.deepEqual(states,["superseded","pending"]);
     } finally {database.close();}
   });
 
