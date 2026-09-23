@@ -76,14 +76,14 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | crash after update fence | durable stateが`dispatching` | 結果なしでrestart | `acceptance_unknown`へ移し、再update禁止 |
 | stale before dispatch | `pending` | current desired revisionと不一致 | `aborted`、update禁止 |
 | prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` / retention `needs_review` fence | 同じmessage | 先行attemptが一意に解決するまで後続dispatch禁止 |
-| update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
+| update reconciled | `acceptance_unknown` | 同じ座標・app author・revision・attempt ID・MAC付きmarkerが一意に一致 | `succeeded` |
 | update absent | `acceptance_unknown` | bounded全pageでrevision 0件 | `acceptance_unknown`のまま、後続update禁止 |
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
 | update duplicate | `acceptance_unknown` | exact revision複数件 | 人間review、message fence維持、後続update禁止 |
 | update result unproven | `acceptance_unknown` | 相関済み不受理receiptなし | `failed`へ進めずfence維持 |
 | update retention boundary | `acceptance_unknown` | 90日経過、exact revision未確定 | 最小tombstoneへ移して`needs_review`、再送禁止fence維持 |
 
-presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
+presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。各revisionの更新後messageにはrequest、message座標、app author、desired revision、update attempt ID、key versionのMAC付き`block_id` markerを含め、read-backではその一意な一致だけを成功証拠にします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Pending notice delivery fixture
 
@@ -172,7 +172,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - claim時に60秒固定のexecution_expires_atとcontinuous readingをdurable保存し、`executing`直前に期限・全preconditionを再検証。時間証明不能も外部callなしで`needs_review`
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
-- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknownまたはretention tombstone fence中は後続dispatch禁止。外部call前のabortedだけはcredential回復の認証済み確認後に新desired revisionを一意に作り、terminal requestを維持して新attemptで表示更新。dispatch前にmessage targetのshared状態と必要なvisibility、実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
+- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknownまたはretention tombstone fence中は後続dispatch禁止。外部call前のabortedだけはcredential回復の認証済み確認後に新desired revisionを一意に作り、terminal requestを維持して新attemptで表示更新。正規rotationでは同一team/app/botの認証済み後継credential revisionを新attemptにだけ固定し、requestの実行credentialは変更しない。dispatch前にmessage targetのshared状態と必要なvisibility、実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
 - 同じrequest/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
 - decisionのない`delivery_failed`・restore invalidation後に遅着noticeを無効表示へ更新する場合も、request/message/desired revisionの同じattemptへ収束
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
