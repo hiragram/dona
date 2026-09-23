@@ -7,12 +7,13 @@ const binding = { instance_id: "instance", workspace_id: "T123", alias: "primary
 const target = { channel_id: "C123", thread_ts: "1234567890.123456" };
 function fixture() {
   let deleted = false, suspended = false, shared = false, available = true, loop = false, member = true;
-  let deletionKnown = true, sharingKnown = true;
+  let deletionKnown = true, sharingKnown = true, strangerKnown = true, suspendedKnown = true;
   const client = {
     async getUser() {
       if (!available) throw Error("unavailable private context");
       return { id: "U123", teamId: "T123", isDeleted: deleted, deletionKnown,
-        isSuspended: suspended, isBot: false, isAppUser: false };
+        ...(suspendedKnown ? { isSuspended: suspended } : {}),
+        ...(strangerKnown ? { isStranger: false } : {}), isBot: false, isAppUser: false };
     },
     async getChannel() { return { id: "C123", isArchived: false, isShared: shared,
       sharingKnown, isMember: true, isPrivate: true }; },
@@ -27,7 +28,7 @@ function fixture() {
     getByTeamId(team: string) { if (team !== "T123") throw Error(); return connection; } } as unknown as Pick<SlackWorkspaceRegistry, "get" | "getByTeamId">;
   const probe = new SlackApprovalAccessProbe(registry, () => new Date("2026-09-19T00:00:00.000Z"));
   return { probe, set: (fault: "deleted" | "suspended" | "shared" | "unavailable" | "loop" | "nonmember"
-    | "missing_user_status" | "missing_channel_status") => {
+    | "missing_user_status" | "missing_channel_status" | "missing_stranger_status" | "missing_suspended_status") => {
     if (fault === "deleted") deleted = true;
     if (fault === "suspended") suspended = true;
     if (fault === "shared") shared = true;
@@ -36,6 +37,8 @@ function fixture() {
     if (fault === "nonmember") member = false;
     if (fault === "missing_user_status") deletionKnown = false;
     if (fault === "missing_channel_status") sharingKnown = false;
+    if (fault === "missing_stranger_status") strangerKnown = false;
+    if (fault === "missing_suspended_status") suspendedKnown = false;
   } };
 }
 
@@ -54,7 +57,7 @@ test("別workspace、alias違い、退職・停止・shared・API欠落・member
     await assert.rejects(fixture().probe.observe({ ...binding, ...change }, target, "transaction", "decision"), SlackApprovalAccessError);
   }
   for (const fault of ["deleted", "suspended", "shared", "unavailable", "loop", "nonmember",
-    "missing_user_status", "missing_channel_status"] as const) {
+    "missing_user_status", "missing_channel_status", "missing_stranger_status", "missing_suspended_status"] as const) {
     const f = fixture(); f.set(fault);
     await assert.rejects(f.probe.observe(binding, target, "transaction", "decision"), SlackApprovalAccessError);
   }

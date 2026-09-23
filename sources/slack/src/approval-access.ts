@@ -64,7 +64,7 @@ export class SlackApprovalAccessProbe {
         connection.client.getChannel(target.channel_id),
       ]);
       if (user.id !== binding.supervisor_user_id || user.teamId !== binding.team_id || user.deletionKnown !== true || user.isDeleted || user.isBot
-        || user.isAppUser || user.isStranger === true || user.isSuspended === true
+        || user.isAppUser || user.isStranger !== false || user.isSuspended !== false
         || channel.id !== target.channel_id || channel.sharingKnown !== true
         || channel.isArchived || channel.isShared || !channel.isMember) throw Error();
       const members = connection.client.getChannelMembers;
