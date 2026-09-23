@@ -78,7 +78,7 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
 | update duplicate | `acceptance_unknown` | exact revision複数件 | `needs_review`、自動後続update禁止 |
 
-presentation update attemptは初回delivery attemptと別recordにし、`decision ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。同じdecisionのoutbox再配送や並行workerは、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
+presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Pending notice delivery fixture
 
@@ -154,7 +154,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
 - 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止
-- 同じdecision/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
+- 同じrequest/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
+- decisionのない`delivery_failed`・restore invalidation後に遅着noticeを無効表示へ更新する場合も、request/message/desired revisionの同じattemptへ収束
+- 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
 - pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
