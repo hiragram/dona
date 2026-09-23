@@ -164,6 +164,38 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("回答不能状態では通知eventから質問本文を読めない",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      database.markJobNeedsReview(job.job_id,"test","review required");
+      assert.throws(()=>database.workerMessages.getMessage(job.job_id,question.message.message_id,event.event_id),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_report_unavailable");
+    } finally {database.close();}
+  });
+
+  test("質問通知のdispatch中断はjobをneeds_reviewとして顕在化する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-uncertain-question");
+      database.sealJobGroup(source.event_id);
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      database.beginDispatch(event.event_id,path.join(config.resultsDir,"uncertain-question.json"));
+      assert.equal(database.recoverStaleDispatching(new Date("2026-09-21T00:00:03Z")),1);
+      assert.equal(database.get(event.event_id)?.status,"needs_review");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),true);
+    } finally {database.close();}
+  });
+
   test("question通知の安全なdispatch前失敗は上限後も再配送可能に保つ",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -172,12 +204,20 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
       const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
       assert.ok(event);
-      assert.equal(database.recordPreDispatchFailure(event.event_id,"herdr_unavailable","offline",1,new Date("2026-09-21T00:00:03Z")).status,"retryable_failed");
-      assert.equal(database.recordPreDispatchFailure(event.event_id,"herdr_unavailable","offline",1,new Date("2026-09-21T00:01:03Z")).status,"retryable_failed");
-      assert.equal(database.workerMessages.getMessage(job.job_id,question.message.message_id,event.event_id)?.message_id,question.message.message_id);
-      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:01:04Z")),0);
-      database.beginDispatch(event.event_id,"/tmp/worker-message-result");
-      assert.equal(database.recordSafePromptFailure(event.event_id,"prompt_unavailable","offline",1,new Date("2026-09-21T00:01:05Z")).status,"retryable_failed");
+      assert.equal(database.recordPreDispatchFailure(event.event_id,"herdr_unavailable","offline",1,new Date("2026-09-21T00:00:03Z")).status,"dead_letter");
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as
+        {delivery:{state:string}}).delivery.state,"pending");
+      assert.throws(()=>database.workerMessages.getMessage(job.job_id,question.message.message_id,event.event_id),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="job_binding_mismatch");
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:07Z")),0);
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:08Z")),1);
+      const second=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}:2`);
+      assert.ok(second);
+      assert.equal(database.workerMessages.getMessage(job.job_id,question.message.message_id,second.event_id)?.message_id,question.message.message_id);
+      database.beginDispatch(second.event_id,"/tmp/worker-message-result");
+      assert.equal(database.recordSafePromptFailure(second.event_id,"prompt_unavailable","offline",1,new Date("2026-09-21T00:00:10Z")).status,"dead_letter");
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:15Z")),1);
+      assert.ok(database.getByExternalId("dona_message",`worker-message:${question.message.message_id}:3`));
     } finally {database.close();}
   });
 
@@ -317,6 +357,25 @@ describe("worker messaging ledger",()=>{
         payload:{operation:"add_condition",text:"続行"}}),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
       assert.equal(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","over-cap").reconciliation,"not_found");
+    } finally {database.close();}
+  });
+
+  test("queued instructionのpending容量を次の受理にも予約する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:8,jobObjectiveTotalMaxBytes:600});
+    try {
+      const source=database.enqueue(eventEnvelope("Ev-worker-instruction-reserve")).row;
+      const first=database.createJob({source_event_id:source.event_id,job_key:"first",objective:"a",workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      const second=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"b",workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      const instruction=(sequence:number)=>({schema_version:1 as const,source_event_id:source.event_id,
+        producer_sequence:sequence,idempotency_key:`reserve-${sequence}`,occurred_at:"2026-09-21T00:00:01Z",
+        payload:{operation:"add_condition" as const,text:"x".repeat(200)}});
+      assert.equal(database.workerMessages.appendInstruction(first.job_id,instruction(1)).outcome,"created");
+      assert.throws(()=>database.workerMessages.appendInstruction(second.job_id,instruction(1)),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
+      assert.equal(database.workerMessages.reconcile(second.job_id,source.event_id,"dona-main","reserve-1").reconciliation,"not_found");
     } finally {database.close();}
   });
 

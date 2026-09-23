@@ -742,7 +742,8 @@ export class DispatcherDatabase {
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
         const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
-        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0)
+          +this.workerMessages.reservedQueuedInstructionBytes(sourceEvent.event_id);
         if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
@@ -1842,6 +1843,11 @@ export class DispatcherDatabase {
       const scheduled=(this.db.prepare("SELECT event_id FROM events WHERE status='dispatching' AND source='dona_schedule'").all() as Array<{event_id:string}>);
       const notifications=(this.db.prepare(`SELECT e.event_id,c.owner_json FROM events e JOIN job_completion_results c
         ON c.notification_event_id=e.event_id WHERE e.status='dispatching' AND e.source='dona_job'`).all() as Array<{event_id:string;owner_json:string}>);
+      const uncertainQuestions=this.db.prepare(`SELECT DISTINCT m.job_id FROM events e
+        JOIN worker_message_deliveries d ON d.event_id=e.event_id
+        JOIN worker_messages m ON m.message_id=d.message_id JOIN jobs j ON j.job_id=m.job_id
+        WHERE e.status='dispatching' AND e.source='dona_message' AND e.event_type='worker_message_report'
+          AND m.kind IN ('question','decision_request') AND j.status='blocked'`).all() as Array<{job_id:string}>;
       const changed=this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
@@ -1855,6 +1861,8 @@ export class DispatcherDatabase {
       for(const row of notifications) {
         this.setNotificationState(row.event_id,"needs_review",at);
       }
+      for(const row of uncertainQuestions) this.markJobNeedsReview(row.job_id,"worker_message_notification_ambiguous",
+        "Question notification prompt acceptance is unknown after Dispatcher restart");
       return changed;
     }).immediate();
   }
@@ -1915,11 +1923,8 @@ export class DispatcherDatabase {
         throw new Error(`Event ${eventId} is no longer dispatchable`);
       }
       const attemptCount = row.attempt_count + 1;
-      // A worker report has already been accepted durably. A pre-dispatch failure
-      // proves the agent never saw it, so keep retrying instead of losing a
-      // question behind a terminal event while its delivery is marked delivered.
       const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
-      const status: EventStatus = attemptCount >= maxAttempts && !durableWorkerReport ? "dead_letter" : "retryable_failed";
+      const status: EventStatus = attemptCount >= maxAttempts ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(attemptCount, at);
       this.db
         .prepare(`
@@ -1929,6 +1934,7 @@ export class DispatcherDatabase {
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(durableWorkerReport)this.workerMessages.rearmUndispatchedReport(eventId,retryAt(attemptCount,at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -1942,7 +1948,7 @@ export class DispatcherDatabase {
       const row = this.get(eventId);
       if (!row || row.status !== "dispatching") throw new Error(`Event ${eventId} is not dispatching`);
       const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
-      const status: EventStatus = row.attempt_count >= maxAttempts && !durableWorkerReport ? "dead_letter" : "retryable_failed";
+      const status: EventStatus = row.attempt_count >= maxAttempts ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(row.attempt_count, at);
       this.db
         .prepare(`
@@ -1951,6 +1957,7 @@ export class DispatcherDatabase {
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(durableWorkerReport)this.workerMessages.rearmUndispatchedReport(eventId,retryAt(row.attempt_count,at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);

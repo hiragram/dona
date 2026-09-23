@@ -272,6 +272,37 @@ function typedInstructionText(messageId:string,kind:WorkerMessageKind,payload:un
 export class WorkerMessageRepository {
   constructor(private readonly db: Database.Database,private readonly jobObjectiveTotalMaxBytes=400_000) {}
 
+  private queuedInstructionReservations(sourceEventId:string):Array<{job_id:string;addition:string}> {
+    const rows=this.db.prepare(`SELECT m.message_id,m.job_id,m.kind,m.payload_json,m.correlation_message_id,m.conversation_revision
+      FROM worker_messages m JOIN worker_message_deliveries d USING(message_id) JOIN jobs j USING(job_id)
+      WHERE j.source_event_id=? AND j.status IN ('queued','retryable_failed') AND m.direction='dona_to_worker'
+        AND d.consumer='worker' AND d.state IN ('pending','leased')
+        AND NOT EXISTS (SELECT 1 FROM job_steer_receipts r WHERE r.job_id=m.job_id AND r.operation_id=m.message_id)`)
+      .all(sourceEventId) as Array<{message_id:string;job_id:string;kind:WorkerMessageKind;payload_json:string;
+        correlation_message_id:string|null;conversation_revision:number|null}>;
+    return rows.map(row=>({job_id:row.job_id,addition:`\n\n[DONA_FOLLOW_UP]\n${typedInstructionText(row.message_id,row.kind,
+      JSON.parse(row.payload_json),row.correlation_message_id,row.conversation_revision)}\n[/DONA_FOLLOW_UP]`}));
+  }
+
+  reservedQueuedInstructionBytes(sourceEventId:string):number {
+    return this.queuedInstructionReservations(sourceEventId)
+      .reduce((sum,row)=>sum+Buffer.byteLength(row.addition,"utf8"),0);
+  }
+
+  rearmUndispatchedReport(eventId:string,availableAt:string,at=new Date()):boolean {
+    const row=this.db.prepare(`SELECT d.delivery_id,j.status FROM worker_message_deliveries d
+      JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
+      WHERE d.event_id=? AND d.consumer='dona-main' AND d.state='delivered'`)
+      .get(eventId) as {delivery_id:string;status:JobRow["status"]}|undefined;
+    if(!row||terminal(row.status))return false;
+    this.db.prepare("DELETE FROM worker_message_receipts WHERE delivery_id=? AND consumer='dona-main' AND receipt_kind='delivered'")
+      .run(row.delivery_id);
+    this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',event_id=NULL,delivered_at=NULL,
+      available_at=?,updated_at=? WHERE delivery_id=? AND event_id=? AND state='delivered'`)
+      .run(availableAt,at.toISOString(),row.delivery_id,eventId);
+    return true;
+  }
+
   appendWorkerReport(jobId: string, runtimeIdentity: string, raw: unknown, at = new Date()) {
     this.assertWorkerRuntime(jobId, runtimeIdentity);
     return this.db.transaction(() => {
@@ -368,10 +399,13 @@ export class WorkerMessageRepository {
       if(direction==="dona_to_worker"&&["queued","retryable_failed"].includes(job.status)){
         const typed=typedInstructionText(messageId,kind,input.payload,input.correlation_message_id??null,input.conversation_revision??null);
         const addition=`\n\n[DONA_FOLLOW_UP]\n${typed}\n[/DONA_FOLLOW_UP]`;
-        if([...job.objective,...addition].length>jobObjectiveCharacterMax)
+        const reservations=this.queuedInstructionReservations(job.source_event_id);
+        const own=reservations.filter(row=>row.job_id===jobId).map(row=>row.addition).join("");
+        if([...job.objective,...own,...addition].length>jobObjectiveCharacterMax)
           throw new WorkerMessageError("worker_message_instruction_unavailable","effective job objective character limit exceeded");
         const siblings=this.db.prepare("SELECT objective FROM jobs WHERE source_event_id=?").all(job.source_event_id) as Array<{objective:string}>;
-        const current=siblings.reduce((sum,sibling)=>sum+Buffer.byteLength(sibling.objective,"utf8"),0);
+        const current=siblings.reduce((sum,sibling)=>sum+Buffer.byteLength(sibling.objective,"utf8"),0)
+          +reservations.reduce((sum,row)=>sum+Buffer.byteLength(row.addition,"utf8"),0);
         if(current+Buffer.byteLength(addition,"utf8")>this.jobObjectiveTotalMaxBytes)
           throw new WorkerMessageError("worker_message_instruction_unavailable","effective job group objective byte limit exceeded");
       }
@@ -469,6 +503,9 @@ export class WorkerMessageRepository {
         throw new WorkerMessageError("job_binding_mismatch","source event is not the notification event for this message");
       if(terminal(job.status))
         throw new WorkerMessageError("worker_message_terminal_fence","worker report is stale after terminal job state");
+      if(["question","decision_request"].includes(message.kind)
+        &&!["queued","retryable_failed","running","blocked"].includes(job.status))
+        throw new WorkerMessageError("worker_message_report_unavailable","question can no longer receive an answer");
     }
     return message;
   }
@@ -678,14 +715,16 @@ export class WorkerMessageRepository {
           WHERE delivery_id=? AND state='pending'`).run(sha256(`${row.delivery_id}:${now}`),leaseExpires,now,row.delivery_id).changes;
         if(claimed!==1)continue;
         const eventId=`evt_${ulid(at.getTime())}`;
+        const claimedDelivery=this.db.prepare("SELECT fence FROM worker_message_deliveries WHERE delivery_id=?").get(row.delivery_id) as {fence:number};
+        const externalId=`worker-message:${row.message_id}${claimedDelivery.fence===1?"":`:${claimedDelivery.fence}`}`;
         const subject=stableStringify({job_id:row.job_id,message_id:row.message_id});
         const payload=stableStringify({schema_version:1,message_id:row.message_id,job_id:row.job_id,source_event_id:row.source_event_id,kind:row.kind});
         const replyTarget=row.workspace_id&&row.channel_id&&row.thread_ts?stableStringify({kind:"slack_thread",workspace_id:row.workspace_id,channel_id:row.channel_id,thread_ts:row.thread_ts}):null;
         this.db.prepare(`INSERT OR IGNORE INTO events(event_id,schema_version,source,external_event_id,event_type,occurred_at,subject_json,payload_json,reply_target_json,trace_json,status,available_at,created_at,updated_at)
-          VALUES(?,1,'dona_message',?,'worker_message_report',?,?,?,?,?,'queued',?,?,?)`).run(eventId,`worker-message:${row.message_id}`,row.occurred_at,subject,payload,replyTarget,
+          VALUES(?,1,'dona_message',?,'worker_message_report',?,?,?,?,?,'queued',?,?,?)`).run(eventId,externalId,row.occurred_at,subject,payload,replyTarget,
           stableStringify({message_id:row.message_id,job_id:row.job_id}),now,now,now);
         const event=this.db.prepare("SELECT event_id,event_type,payload_json FROM events WHERE source='dona_message' AND external_event_id=?")
-          .get(`worker-message:${row.message_id}`) as {event_id:string;event_type:string;payload_json:string};
+          .get(externalId) as {event_id:string;event_type:string;payload_json:string};
         if(event.event_type!=="worker_message_report"||event.payload_json!==payload)
           throw new WorkerMessageError("worker_message_event_conflict","internal event identity has a different projection");
         const binding=readEventJobBinding(this.db,row.source_event_id);

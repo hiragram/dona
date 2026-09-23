@@ -180,9 +180,17 @@ export class DispatcherApi {
     const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
     if(!workerOnly||createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
     if(workerOnly){
-      const directoryStat=await fs.stat(socketDirectory);
-      if((directoryStat.mode&0o022)!==0||(typeof process.getuid==="function"&&directoryStat.uid!==process.getuid()))
-        throw new Error("Worker socket directory must be owned by the Dispatcher user and not group/world writable");
+      const canonicalDirectory=await fs.realpath(socketDirectory);
+      for(let ancestor=canonicalDirectory;;ancestor=path.dirname(ancestor)){
+        const directoryStat=await fs.lstat(ancestor);
+        const currentUid=typeof process.getuid==="function"?process.getuid():undefined;
+        const ownerTrusted=currentUid===undefined||directoryStat.uid===currentUid||directoryStat.uid===0;
+        const writableByOthers=(directoryStat.mode&0o022)!==0;
+        const sticky=(directoryStat.mode&0o1000)!==0;
+        if(!directoryStat.isDirectory()||!ownerTrusted||(writableByOthers&&(!sticky||ancestor===canonicalDirectory)))
+          throw new Error("Worker socket ancestor is replaceable or not owned by a trusted user");
+        if(ancestor===path.dirname(ancestor))break;
+      }
     }
     try {
       await fs.lstat(socketPath);

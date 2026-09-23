@@ -148,6 +148,21 @@ describe("DispatcherApi", () => {
     database.close();
   });
 
+  test("worker socketの置換可能なancestorを起動時に拒否する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const replaceable=path.join(root,"replaceable");
+    await fs.mkdir(replaceable,{mode:0o777});
+    await fs.chmod(replaceable,0o777);
+    const workerSocketPath=path.join(replaceable,"private","worker.sock");
+    const database=new DispatcherDatabase(config.databasePath);
+    const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,{...config,workerSocketPath},logger);
+    try {
+      await assert.rejects(api.start(),/Worker socket ancestor is replaceable/);
+      await assert.rejects(fs.stat(config.socketPath),{code:"ENOENT"});
+      await assert.rejects(fs.stat(workerSocketPath),{code:"ENOENT"});
+    } finally {await api.stop();database.close();}
+  });
+
   test("readyはprocess liveとscheduler loopを分離しredacted metricsを公開する", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
