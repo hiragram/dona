@@ -178,6 +178,10 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - restore current binding/policyはgenerationに加えて予約済みcanonical digestとcommit transaction IDも完全一致必須
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
+- 全terminal transitionで既に`sent`のpending noticeにも一意なredacted terminal updateを作り、再配送では同じattemptへ収束
+- decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
+- break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
+- terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、最小opaque tombstoneだけ400日保持して古い再配送を拒否
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
