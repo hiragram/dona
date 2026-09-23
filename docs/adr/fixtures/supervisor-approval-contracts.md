@@ -110,7 +110,7 @@ presentation update attemptは初回delivery attemptと別recordにし、`reques
   },
   "policy": {
     "reply_broadcast": false,
-    "text_encoding": "plain_text",
+    "text_encoding": "rich_text_literal_and_allowed_user_elements",
     "mrkdwn": false,
     "parse": "none",
     "unfurl_links": false,
@@ -152,10 +152,11 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 期待する否定fixture:
 
 - `operation_kind`を任意のtool名へ変更するとunknown operationで拒否
-- `workspace_id`、channel、thread、broadcast flag、mention policy、text encoding、mrkdwn/parse/unfurl設定、content HMAC、root revisionのどれか一つでも変更するとhash不一致
+- `workspace_id`、channel、thread、broadcast flag、mention policy、text encoding、rich_text要素列とfallbackのmrkdwn/parse/unfurl設定、content HMAC、root revisionのどれか一つでも変更するとhash不一致
 - 別instance、別binding revision、別requestのdecisionを転用するとconsume拒否
 - DM/private thread由来contextをpresentationへ追加するとdata-classification test失敗
 - `<!channel>`、`<!here>`、`<!everyone>`、user group、allowlist外または4名以上のuser mentionはgatewayとexecutorの両方で拒否
+- 本文はliteral text要素とallowlist済みuser要素だけへ分割し、裸URL/markupをlinkへ変換せず、許可userだけ通知。fallbackはmentionを二重発火させない
 - Slack Connectを含むshared channel、または承認後にshared化されたchannelはrequest/decision/consumeで拒否
 - supervisorがprivate targetから外れた場合はdecision/consumeを`needs_review`へ遷移
 - claim直後のcrashでもattempt専用暗号化payloadから同じ本文を復元し、別attemptは作らない
@@ -163,7 +164,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - claim時に60秒固定のexecution_expires_atとcontinuous readingをdurable保存し、`executing`直前に期限・全preconditionを再検証。時間証明不能も外部callなしで`needs_review`
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
-- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknownまたはretention tombstone fence中は後続dispatch禁止。dispatch前に実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
+- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknownまたはretention tombstone fence中は後続dispatch禁止。dispatch前にmessage targetのshared状態と必要なvisibility、実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
 - 同じrequest/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
 - decisionのない`delivery_failed`・restore invalidation後に遅着noticeを無効表示へ更新する場合も、request/message/desired revisionの同じattemptへ収束
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
@@ -173,7 +174,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 同じcreation keyを並行作成するworkerはDBでallocation_pending placeholderを一つだけclaimし、敗者は別payloadを割り当てない
 - placeholder commit直後のcrashはlease失効後にCAS fenceを進め、同じpayload IDの不在を証明してから割当てを再開。不明ならneeds_reviewで止め、旧fenceの遅着writeを拒否
 - payloadとcontent HMACは別々のkey versionを保持し、envelope鍵は最後のpayloadとbackup、content MAC鍵は最後のretained request snapshotとbackupが消えるまで旧鍵をdecrypt/verify-onlyで保持
-- pending noticeも専用attemptと開始fenceを持ち、送信前にrequesterのcurrent target権限とshared状態を再検証し、timeout後0件では再投稿しない
+- pending noticeも専用attemptと開始fenceを持ち、送信前にcurrent binding/policy revision・status・期限・scope、requesterのcurrent target権限とshared状態を再検証し、timeout後0件では再投稿しない
 - restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - high-water markの欠落、読取不能、integrity不明も二者再承認までfail closed
 - policy緩和はexact digestと次generationに対する独立actor二人のauthorizationが必須
