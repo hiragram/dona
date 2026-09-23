@@ -173,6 +173,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - policy緩和はexact digestと次generationに対する独立actor二人のauthorizationが必須
 - 時刻high-water markはbackup外へ保存し、restore/restart時の欠落や巻戻しで全未完了requestをfail closed
 - approval cardのdispatching直前にvisibility/shared状態を再検証し、不一致なら送信せずpayload削除
+- requestに認証済みSlack executorのteam/app/bot identityとcredential revisionを固定し、card送信・decision・consume・実行直前のactual credentialが別app/botや別revisionなら外部callなしでneeds_review
 - 本文不要となる全terminal/invalid request transitionでpayloadを同一transaction削除
 - credential storeへ時刻mark reservationをDBより先にdurable commitし、失敗/不明ではDB writeを開始しない
 - 時刻mark reservationは直前markを条件とするCASで直列化し、stale/競合/小さい遅着writeを拒否
@@ -181,8 +182,8 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - approval deliveryのdispatching transactionでTTL、binding/policy、requester、visibility、shared状態を再検証
 - pending noticeのdispatching transactionでもcurrent request state/revisionとTTLを再検証
 - 同一boot IDのcontinuous clockだけをprocess再起動後の経過証明に使い、boot変更/証明不能なら未完了requestを失効
-- boot変更/経過証明不能ではclaimed attemptを外部callなしでneeds_review、executingをunknown経由のneeds_reviewとしてpayload削除
-- boot変更/経過証明不能時に既存のacceptance_unknown attemptもpayload即時削除・needs_reviewへ固定
+- boot変更/経過証明不能ではclaimed attemptを外部callなしでneeds_review、executingをacceptance_unknownへ移し、保持期限を証明できなければpayloadだけ削除してmarker照合と再送禁止fenceを維持
+- boot変更/経過証明不能時に既存のacceptance_unknown attemptもpayload即時削除し、stateとfenceを維持してread-only照合を継続
 - restore current binding/policyはgenerationに加えて予約済みcanonical digestとcommit transaction IDも完全一致必須
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
 - approve/consume/executionなど各security state transitionは次audit anchorを先にCAS reserveし、状態変更とaudit rowを同じSQLite transactionでcommitしてからanchor finalize
@@ -191,7 +192,8 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - `approved` decisionと全terminal transitionで既に`sent`のpending noticeを現在の決定状態へ更新し、承認済みなのに「承認待ち」を残さず、再配送では同じrevisionのattemptへ収束
 - `approved` decisionが先着した未送信pending noticeは同じtransactionで`aborted`とし、遅いworkerが待機表示を新規投稿しない
-- `approved` decisionでapproval cardの操作を除いた決定済みrevisionを一意に作り、曖昧なupdate中はmessage fenceを維持
+- `approved` decisionと全terminal transitionで既に`sent`のapproval cardに操作なしの現在状態revisionを一意に作り、曖昧なupdate中はmessage fenceを維持
+- `sent` cardの`rejected` / `cancelled` / `expired` / `needs_review` / `consume_expired`遷移で既存cardを無効表示へ更新し、遅着cardも同じrevisionへ収束
 - decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
 - approved後・consume前のexecution_cancelled/consume_expired/needs_reviewは、approval eventとは別のpost-decision terminal outboxを同じtransactionで一意に作りpersisted ownerへ配送
 - terminal eventがapproval eventより先に届いても、Dispatcherはrequest event revisionの高水位を元job stateと同じtransactionで保存し、後着approvalをstale拒否
