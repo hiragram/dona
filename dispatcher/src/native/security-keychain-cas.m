@@ -65,8 +65,8 @@ static NSMutableDictionary *query(NSDictionary *identity) {
 
 static NSDictionary *readHead(NSDictionary *identity) {
     NSMutableDictionary *request = query(identity);
-    // Request two, not all: a duplicate must never be mistaken for one head.
-    request[(__bridge id)kSecMatchLimit] = @2;
+    // Inspect every match: a duplicate must never be mistaken for one head.
+    request[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
     request[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
     request[(__bridge id)kSecReturnAttributes] = @YES;
     request[(__bridge id)kSecReturnData] = @YES;

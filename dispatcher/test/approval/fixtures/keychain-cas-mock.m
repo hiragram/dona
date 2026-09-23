@@ -26,7 +26,7 @@ OSStatus DonaFixtureCopyMatching(CFDictionaryRef input, CFTypeRef *result) {
     NSDictionary *query = (__bridge NSDictionary *)input;
     reads++;
     assertBase(query);
-    assert([query[(__bridge id)kSecMatchLimit] isEqual:@2]);
+    assert([query[(__bridge id)kSecMatchLimit] isEqual:(__bridge id)kSecMatchLimitAll]);
     assert([query[(__bridge id)kSecAttrSynchronizable] isEqual:(__bridge id)kSecAttrSynchronizableAny]);
     assert([query[(__bridge id)kSecReturnData] isEqual:@YES]);
     assert([query[(__bridge id)kSecReturnAttributes] isEqual:@YES]);
