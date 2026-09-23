@@ -12,10 +12,10 @@
     "dona-dispatcher-mcp": "dist/mcp/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build-security-native.mjs && tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts serve",
     "start": "node dist/cli.js serve",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "node scripts/build-security-native.mjs && node test/run-tests.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

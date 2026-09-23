@@ -1,0 +1,139 @@
+import type Database from "better-sqlite3";
+import { AuditRepository, assertCurrentAuditReadState, type AuditAnchorStore } from "../audit/repository.js";
+import type { AuditKeyLookup, VerifiedAuditState } from "../audit/codec.js";
+import { ApprovalMetadataNodes } from "./metadata-store.js";
+import { ApprovalIndexBlobs } from "./index-store.js";
+import { ApprovalMetadataPlan } from "./metadata-plan.js";
+import { ApprovalRecordSql } from "./record-sql.js";
+import { approvalRecordKey, encodeApprovalRecord, type ApprovalRecord, type ApprovalRecordKind, type ApprovalRecordScope } from "./record-codec.js";
+import { assertSynchronousResult } from "../audit/synchronous.js";
+import { z } from "zod";
+import { readApprovalRecordGraph } from "./record-relations.js";
+import { approvalIndexKey, type ApprovalIndexIdentity, type ApprovalIndexList } from "./index-codec.js";
+import { approvalRecordAliases, approvalRecordPrimary, approvalRecordActive } from "./record-indexes.js";
+import { readApprovalListHead, verifyApprovalListMembership } from "./index-list.js";
+const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
+export class ApprovalRecordRepositoryError extends Error {
+  constructor() { super("approval_record_repository_unverified"); this.name = "ApprovalRecordRepositoryError"; }
+}
+type Of<K extends ApprovalRecordKind> = Extract<ApprovalRecord, { kind: K }>;
+type Selector = Extract<ApprovalIndexIdentity, { kind: "alias" }>["selector"];
+export interface ApprovalRecordListHead { readonly count: number; readonly records: readonly ApprovalRecord[]; readonly truncated: boolean }
+const aliasKinds: Record<Selector["name"], ApprovalRecordKind> = {
+  request_creation: "request", decision_id: "decision", consume_id: "consume", consume_decision: "consume", consume_attempt: "consume",
+  execution_request: "execution", execution_consume: "execution", notification_request_kind: "notification", notification_message: "notification",
+  event_decision: "event", presentation_revision: "presentation", presentation_active_message: "presentation",
+};
+/** 永続recordの現在rootと親参照を検証する内部読取component。
+ * actor/binding/visibilityの現在の認可や操作可能性判定は提供しない。 */
+export class ApprovalRecordRepository {
+  private readonly audit: AuditRepository;
+  private readonly sql: ApprovalRecordSql;
+  private readonly nodes: ApprovalMetadataNodes;
+  private readonly indexes: ApprovalIndexBlobs;
+  private readonly scope: ApprovalRecordScope;
+  constructor(private readonly db: Database.Database, anchors: AuditAnchorStore, keys: AuditKeyLookup, scope: ApprovalRecordScope) {
+    try {
+      assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
+      this.audit = new AuditRepository(db, anchors, keys); this.sql = new ApprovalRecordSql(db, this.scope);
+      this.nodes = new ApprovalMetadataNodes(db); this.indexes = new ApprovalIndexBlobs(db, this.scope);
+    } catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  read<K extends ApprovalRecordKind>(kind: K, primary: string): Of<K> | null;
+  read(kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
+    try { return this.audit.readVerifiedState(state => this.readInState(state, kind, primary)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  /** Framework callbackのexact stateと同じconnectionだけで使う内部読取。
+   * actor認可やstate所持による任意root指定を提供しない。 */
+  readInState<K extends ApprovalRecordKind>(state: VerifiedAuditState, kind: K, primary: string): Of<K> | null;
+  readInState(state: VerifiedAuditState, kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
+    try {
+      // kind/primaryはcodecで検証し、任意rootを引数として受け取らない。
+      approvalRecordKey(this.scope, kind, primary);
+      return this.withPlan(state, plan => this.record(plan, kind, primary));
+    } catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  /** 固定aliasを現在rootから解決する。aliasが指すrowだけでなく、その
+   * selector、all/active membership、全固定aliasを同じ読取で照合する。 */
+  readAlias(selector: Selector): ApprovalRecord | null {
+    try { return this.audit.readVerifiedState(state => this.readAliasInState(state, selector)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  readAliasInState(state: VerifiedAuditState, selector: Selector): ApprovalRecord | null {
+    try {
+      const selectedKey = approvalIndexKey(this.scope, { kind: "alias", selector });
+      return this.withPlan(state, plan => {
+        if (selector.name === "presentation_active_message") return this.presentationHolder(plan, selector.message_ref);
+        const index = plan.readIndex({ kind: "alias", selector });
+        if (index === null) return null;
+        if (index.kind !== "alias") throw Error();
+        if (index.target === null) throw Error();
+        const record = this.record(plan, aliasKinds[index.selector.name], index.target);
+        if (record === null) throw Error();
+        if (!approvalRecordAliases(record).some(value => approvalIndexKey(this.scope, { kind: "alias", selector: value }) === selectedKey)) throw Error();
+        this.verifyIndexes(plan, record); return record;
+      });
+    } catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  /** 内部一覧の先頭のみ、最大4件/3MiB。truncatedを全件取得やexpiry sweep
+   * 完了に変換しない。cursor、並べ替え、caller root、認可は受け付けない。 */
+  readListHead(list: ApprovalIndexList, limit: number): ApprovalRecordListHead {
+    try { return this.audit.readVerifiedState(state => this.readListHeadInState(state, list, limit)); }
+    catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  readListHeadInState(state: VerifiedAuditState, list: ApprovalIndexList, limit: number): ApprovalRecordListHead {
+    try {
+      approvalIndexKey(this.scope, { kind: "manifest", list }); z.number().int().min(1).max(4).parse(limit);
+      return this.withPlan(state, plan => {
+        const head = readApprovalListHead(plan, list, limit), records: ApprovalRecord[] = []; let bytes = 0;
+        for (const primary of head.ids) {
+          const record = this.record(plan, list.record_kind, primary);
+          if (record === null || (list.membership === "active" && !approvalRecordActive(record))) throw Error();
+          this.verifyIndexes(plan, record); bytes += Buffer.byteLength(encodeApprovalRecord(record, this.scope).canonical);
+          if (bytes > 3 * 1024 * 1024) throw Error(); records.push(record);
+        }
+        return Object.freeze({ count: head.count, records: Object.freeze(records), truncated: head.truncated });
+      });
+    } catch { throw new ApprovalRecordRepositoryError(); }
+  }
+  private record(plan: ApprovalMetadataPlan, kind: ApprovalRecordKind, primary: string): ApprovalRecord | null {
+    return readApprovalRecordGraph(this.scope, plan, (type, key) => this.sql.read(type, key), kind, primary);
+  }
+  private presentationHolder(plan: ApprovalMetadataPlan, messageRef: string): Of<"presentation"> | null {
+    const index = plan.readIndex({ kind: "alias", selector: { name: "presentation_active_message", message_ref: messageRef } });
+    if (index !== null && index.kind !== "alias") throw Error();
+    if (index === null || index.target === null) { this.sql.assertNoPresentationHolder(messageRef); return null; }
+    const holder = this.record(plan, "presentation", index.target);
+    if (holder?.kind !== "presentation" || holder.row.message_ref !== messageRef
+      || !["dispatching", "acceptance_unknown"].includes(holder.row.state)) throw Error();
+    // holder自身のmessage aliasは直前に解決済み。再帰せず他の全indexを検証する。
+    this.verifyIndexes(plan, holder, false); return holder;
+  }
+  private verifyIndexes(plan: ApprovalMetadataPlan, record: ApprovalRecord, checkHolder = true): void {
+    const primary = approvalRecordPrimary(record);
+    verifyApprovalListMembership(plan, { record_kind: record.kind, membership: "all" }, primary, true);
+    if (!["decision", "consume"].includes(record.kind))
+      verifyApprovalListMembership(plan, { record_kind: record.kind, membership: "active" }, primary, approvalRecordActive(record));
+    for (const selector of approvalRecordAliases(record)) {
+      const index = plan.readIndex({ kind: "alias", selector });
+      if (index?.kind !== "alias" || index.target !== primary) throw Error();
+    }
+    if (record.kind === "presentation" && checkHolder) {
+      const holder = this.presentationHolder(plan, record.row.message_ref);
+      const holds = ["dispatching", "acceptance_unknown"].includes(record.row.state);
+      if ((holder?.row.update_id === primary) !== holds) throw Error();
+    }
+  }
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null): ApprovalRecord | null;
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecordListHead): ApprovalRecordListHead;
+  private withPlan(state: VerifiedAuditState, read: (plan: ApprovalMetadataPlan) => ApprovalRecord | null | ApprovalRecordListHead): ApprovalRecord | null | ApprovalRecordListHead {
+    assertCurrentAuditReadState(this.db, state);
+    const bindings = state.resource_bindings.filter(value => value.resource_id === "approval_records"
+      && value.scope.instance_id === this.scope.instance_id && value.scope.tenant_id === this.scope.workspace_id);
+    if (bindings.length !== 1) throw Error();
+    const result = this.nodes.read(nodes => this.indexes.read(indexes => read(new ApprovalMetadataPlan(this.scope, bindings[0]!.resource_digest, nodes, indexes))));
+    assertCurrentAuditReadState(this.db, state); return result;
+  }
+}

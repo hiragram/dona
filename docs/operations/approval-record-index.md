@@ -1,0 +1,31 @@
+# 承認indexのcanonical blobと同一DB保存層
+
+#16の段階実装。承認recordのpoint digestだけではSQL一覧からの行欠落やsecondary keyの不在を証明できないため、共有metadata treeへ結ぶindex表現と保存層を追加する。公開repository、一覧planner、broker、runtime activationはまだ接続していない。
+
+## 表現と検証境界
+
+`index-codec.ts`のversion 1はinstance/workspace scopeを持つ、最大2,048 byteのcanonical JSONである。unknown field、非canonical JSON、重複key、過大値、accessor、Proxy、scope不一致は固定`approval_index_unverified`で拒否する。SHA-256のdomainはrecord/nodeと分離し、point keyには変更しないidentity、blob digestには全内容を含める。
+
+- manifest: record kindと`all`/`active`、件数、先頭・末尾。空・単一・複数件の局所整合性を検証する。decision/consumeにはactive listを定義しない。
+- link: list、recordの主キー、membership、前後ID。自己参照や同じ前後IDを拒否する。activeからの除外は両隣をnullにした`member: false`の明示tombstone。allからの除外はこのversionで許可しない。
+- alias: 固定secondary selectorと対象主キー。request creation、decision ID、consumeのID/decision/attempt、executionのrequest/consume、notificationのrequestとkind/message、eventのdecision、presentationのnotificationとrevision/active message枠を定義する。対象をnullにできるのはactive message枠だけで、生涯uniqueなaliasを解放しない。
+
+codecは隣接link、manifest件数、recordとの整合性、activeの業務状態、current rootや権限を証明しない。これらは同じ監査transaction内のrepositoryが検証する。`approvalIndexKey`の所持も本人性や操作権限にはならない。record更新時、membershipを変更しないならlinkへrow digestを重複保存する必要はない。
+
+## 明示schema v3とblob保存
+
+`installApprovalIndexSchema`はv2からv3への明示migrationで、immutableな`approval_index_blobs(digest,wire)`だけを追加する。v1には先に既存v2 migrationが必要。v3で旧installerを呼んでもdowngradeしない。既存business row/nodeを保持し、既存rowからindex/rootを自動生成しない。旧binaryは未知v3を拒否するため、実際の更新・rollback計画ではこの互換性を別途評価する。
+
+schemaの完全DDL、version、trigger、TEMP shadow、外部キー、WAL durabilityを検証し、共有writer lock内でfile identityを移行前・commit直前・直後に確認する。既存v3の確認でも末尾のfile検証を省略しない。constructorによる自動migration、実環境への移行呼出し、root初期化はない。
+
+`ApprovalIndexBlobs`は共有AuditRepository/ApprovalTransactionと同じconnectionで、既存transactionの中だけで使う。1回のstageは1〜32個、digestは重複不可。canonical表現とscopeを確認してINSERTし、既存digestは同一wireであることを確認して全件read-backする。UPDATE、DELETE、REPLACEはtriggerで拒否する。schema検証とbounded SQL読取の後にdecodeし、過大値や破損を空値に変換しない。
+
+readerは同期callbackの間だけ有効で、終了後の再利用を拒否する。生storage障害は固定`approval_index_store_unverified`にする。通常の`MetadataConflictError`だけは固定messageで上位の監査denialへ渡せるが、file identityを失っていれば競合より保存層障害を優先する。SQLite transactionが存在すること自体は認可ではない。
+
+## 残る接続と検証
+
+利用側は監査済みcurrent resource rootからpoint digestを取得し、blobをそのdigestでdecodeしたうえで、要求したidentityから導いたkeyと比較する。rootが参照するblobの欠落を空一覧として扱ってはいけない。複数link/manifest/alias/rowの更新は、boundedな計画の全node/blobとbusiness rowを同じ監査mutationで確定する必要がある。
+
+一覧の全隣接関係・件数検証、rootに結ぶpagination、secondary aliasとrowの照合、active一覧の更新、expiry sweepの進捗保証は次段階である。単純な先頭page走査だけで全expired rowを回収できるとは主張しない。retention/GCとopaque IDの保持期限も別の監査済み手順が必要で、この保存層だけでは#16全体の完了にならない。
+
+testは実SQLite/native guardと共有監査transactionを使用する。clock、鍵、外部CAS anchorはfixture providerであり、実Keychain/IdP/production evidenceではない。commit/rollback、reserve/finalize応答喪失、移行中DB置換、unknown schema/TEMP、bounded input、immutable保護、blob欠落・破損を検証する。
