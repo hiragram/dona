@@ -179,10 +179,14 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - `approved` decisionと全terminal transitionで既に`sent`のpending noticeを現在の決定状態へ更新し、承認済みなのに「承認待ち」を残さず、再配送では同じrevisionのattemptへ収束
+- `approved` decisionが先着した未送信pending noticeは同じtransactionで`aborted`とし、遅いworkerが待機表示を新規投稿しない
 - decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
 - break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
 - terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、key version付き最小opaque tombstoneだけ400日保持して古い再配送を拒否
 - tombstone MAC鍵はrotation後も最終tombstoneの保持とbackup expiryまでverification-onlyで保護し、削除後に破棄
+- terminal requestのdelivery/updateが90日後もunknownなら詳細を削除し、opaque keyed message fenceだけを人間解決まで維持して再送と後続writeを禁止
+- delivery/update/execution markerのkey versionと旧verification鍵を未解決attempt・backupの終了まで保持し、鍵不明時はfenceを維持
+- break-glassのoperation/target scope digestを一時bindingへ固定し、request作成・送信・decision・consume・実行直前のすべてで範囲外actionを拒否
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
 - interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
