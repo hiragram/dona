@@ -2110,12 +2110,18 @@ export class DispatcherDatabase {
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
             typeof (action as Record<string,unknown>).message_ts==="string"&&
             (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
-          if(!posted){
+          const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
+            (action as Record<string,unknown>).channel_id===target?.channel_id&&
+            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
+            (action as Record<string,unknown>).status==="suspended"&&(action as Record<string,unknown>).success!==false);
+          if(!posted||!suspended){
+            const reason=!posted?"worker_message_question_not_posted":"worker_message_session_not_suspended";
+            const description=!posted?"Question notification completed without a confirmed post":
+              "Question notification completed without a confirmed suspended session";
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
-              completed_at:result.completed_at,last_error_code:"worker_message_question_not_posted",
-              last_error_message:"Question notification completed without a confirmed post"});
-            this.markJobNeedsReview(payload.job_id,"worker_message_question_not_posted",
-              "Question notification completed without a confirmed post");
+              completed_at:result.completed_at,last_error_code:reason,last_error_message:description});
+            this.markJobNeedsReview(payload.job_id,reason,description);
             return;
           }
         }

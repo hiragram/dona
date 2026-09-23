@@ -265,6 +265,34 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("質問通知eventの完了には投稿とsuspended遷移の両方を要求する",async()=>{
+    for(const suspended of [false,true]){
+      const {database,source,job,config}=await fixture();
+      try {
+        bindRuntime(database,job.job_id,`runtime-session-${suspended}`);
+        const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+          payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+        database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+        const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+        assert.ok(event);
+        const target=JSON.parse(event.reply_target_json!) as {channel_id:string;thread_ts:string};
+        const resultPath=path.join(config.resultsDir,`session-${suspended}.json`);
+        database.beginDispatch(event.event_id,resultPath);
+        database.markWaiting(event.event_id);
+        database.sealJobGroup(source.event_id);
+        const actions:Array<Record<string,unknown>>=[{tool:"dona_slack.post_message",channel_id:target.channel_id,
+          thread_ts:target.thread_ts,message_ts:"1756722031.123456",success:true}];
+        if(suspended)actions.push({tool:"dona_slack.set_agent_session_status",channel_id:target.channel_id,
+          thread_ts:target.thread_ts,status:"suspended",success:true});
+        database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+          summary:"処理しました",actions,memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
+          resultPath,new Date("2026-09-21T00:00:04Z"));
+        assert.equal(database.get(event.event_id)?.status,suspended?"completed":"needs_review");
+        assert.equal(database.getJob(job.job_id)?.status,suspended?"blocked":"needs_review");
+      } finally {database.close();}
+    }
+  });
+
   test("needs_reviewへ遷移した未配送reportは通知eventを作らず失効する",async()=>{
     const {database,source,job}=await fixture();
     try {
