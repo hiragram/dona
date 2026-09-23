@@ -41,6 +41,7 @@
 | restore claimed/executing | payload欠落またはHMAC不一致 | `needs_review` | 再開・再送禁止 |
 | reconciled accepted | exact idempotency key/resultを発見 | 同じattemptを`succeeded`へ更新 | 新attemptを作らない |
 | reconciled rejected | exact rejection receiptを発見 | 同じattemptを`failed`へ更新 | 新attemptを作らない |
+| execution pagination incomplete | marker探索の全pageを完走できない | `acceptance_unknown`とfenceを維持 | 再送禁止 |
 
 ## Delivery attempt transition table
 
@@ -53,7 +54,8 @@
 | request invalidated before fence | `pending` | requestがterminal | 同じtransactionで`aborted`、送信禁止 |
 | unknown reconciled sent | `acceptance_unknown` | saved presentation identityがexactly 1件 | 同じattemptを`sent`へ更新 |
 | unknown marker absent | `acceptance_unknown` | bounded全pageで0件 | `acceptance_unknown`のまま、再送禁止 |
-| unknown marker ambiguous | `acceptance_unknown` | 複数件、pagination不完全 | `needs_review`、再送禁止 |
+| unknown marker duplicate | `acceptance_unknown` | 全pageでexact markerが複数件 | `needs_review`、再送禁止 |
+| unknown pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`とdelivery fenceを維持、再送・後続write禁止 |
 
 requestの`sent`は対応delivery attemptの`sent`と同じtransactionでだけ設定します。decisionは`synchronized sent`からだけ受理し、`delivery_failed`はterminal、`delivery_unknown`はreconcile待ちとしてapprove/reject actionを拒否します。requester cancelは`requested` / `delivery_pending` / `delivery_unknown` / `sent`からtransactionalに競合でき、cancel後に遅延deliveryが確定してもrequestを再び`sent`へ戻しません。
 
@@ -159,6 +161,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
+- 同じcreation keyを並行作成するworkerはDBでrequest placeholderを一つだけclaimし、敗者は暗号化payloadを割り当てない。保存失敗・不明の孤児候補はread-backで確定してから削除
 - pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
 - restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - high-water markの欠落、読取不能、integrity不明も二者再承認までfail closed
@@ -180,6 +183,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - `approved` decisionと全terminal transitionで既に`sent`のpending noticeを現在の決定状態へ更新し、承認済みなのに「承認待ち」を残さず、再配送では同じrevisionのattemptへ収束
 - `approved` decisionが先着した未送信pending noticeは同じtransactionで`aborted`とし、遅いworkerが待機表示を新規投稿しない
+- `approved` decisionでapproval cardの操作を除いた決定済みrevisionを一意に作り、曖昧なupdate中はmessage fenceを維持
 - decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
 - break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
 - terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、key version付き最小opaque tombstoneだけ400日保持して古い再配送を拒否
