@@ -163,6 +163,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
+- content HMAC鍵rotation後の同一source retryはcreation keyで既存requestを先に取得し、その保存済みkey versionのverification-only鍵で同じcanonical actionを照合して既存requestへ収束
 - 同じcreation keyを並行作成するworkerはDBでallocation_pending placeholderを一つだけclaimし、敗者は別payloadを割り当てない
 - placeholder commit直後のcrashはlease失効後にCAS fenceを進め、同じpayload IDの不在を証明してから割当てを再開。不明ならneeds_reviewで止め、旧fenceの遅着writeを拒否
 - payloadとcontent HMACは別々のkey versionを保持し、最後の参照payloadとbackupが消えるまで旧鍵をdecrypt/verify-onlyで保持
@@ -185,6 +186,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - restore current binding/policyはgenerationに加えて予約済みcanonical digestとcommit transaction IDも完全一致必須
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
 - approve/consume/executionなど各security state transitionは次audit anchorを先にCAS reserveし、状態変更とaudit rowを同じSQLite transactionでcommitしてからanchor finalize
+- 状態不変のreplay・非supervisor・cross-workspace・不正cancel拒否もanchor予約、audit-only transaction、finalizeを完了してから応答
 - consumed後のexecution attemptが同期結果または後日reconcileで初めてterminalになったtransactionで、attempt IDごとに一意なredacted result outboxを作りpersisted ownerへ配送
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - `approved` decisionと全terminal transitionで既に`sent`のpending noticeを現在の決定状態へ更新し、承認済みなのに「承認待ち」を残さず、再配送では同じrevisionのattemptへ収束
@@ -192,6 +194,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - `approved` decisionでapproval cardの操作を除いた決定済みrevisionを一意に作り、曖昧なupdate中はmessage fenceを維持
 - decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
 - approved後・consume前のexecution_cancelled/consume_expired/needs_reviewは、approval eventとは別のpost-decision terminal outboxを同じtransactionで一意に作りpersisted ownerへ配送
+- terminal eventがapproval eventより先に届いても、Dispatcherはrequest event revisionの高水位を元job stateと同じtransactionで保存し、後着approvalをstale拒否
 - break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
 - terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、key version付き最小opaque tombstoneだけ400日保持して古い再配送を拒否
 - tombstone MAC鍵はrotation後も最終tombstoneの保持とbackup expiryまでverification-onlyで保護し、削除後に破棄
