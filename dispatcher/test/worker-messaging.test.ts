@@ -574,6 +574,27 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("needs_review後は既存silenceを無効化し新規silenceも発行しない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:00Z")),1);
+      const sqlite=new Database(config.databasePath);
+      const event=sqlite.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string};
+      sqlite.close();
+      database.beginDispatch(event.event_id,path.join(config.resultsDir,"needs-review-silence.json"));
+      database.markWaiting(event.event_id);
+      database.markJobNeedsReview(job.job_id,"test","review required");
+      assert.equal(database.workerMessages.silenceEventState(job.job_id,event.event_id)?.worker_message_silence.current,false);
+      const second=database.createJob({source_event_id:source.event_id,job_key:"silence-review",objective:"review",workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      database.workerMessages.appendReport(second.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+      database.markJobNeedsReview(second.job_id,"test","review required");
+      assert.equal(database.workerMessages.publishDueSilenceEvents(2,new Date("2026-09-21T00:15:00Z")),0);
+      assert.equal(database.workerMessages.operationalSnapshot(new Date("2026-09-21T00:15:00Z")).due_silence_deadlines,0);
+    } finally {database.close();}
+  });
+
   test("retentionは存続する相関messageの親を削除しない",async()=>{
     const {database,source,job}=await fixture();
     try {

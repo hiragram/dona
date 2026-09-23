@@ -582,7 +582,7 @@ export class WorkerMessageRepository {
       .get(at.toISOString()) as {count:number};
     const expired = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='leased' AND lease_expires_at<=?").get(at.toISOString()) as {count:number};
     const dueSilence = this.db.prepare(`SELECT COUNT(*) AS count FROM worker_message_cadence c JOIN jobs j USING(job_id)
-      WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled')`).get(at.toISOString()) as {count:number};
+      WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')`).get(at.toISOString()) as {count:number};
     return { protocol_version: workerMessageProtocolVersion, pending_deliveries: pending.count, overdue_deliveries: overdue.count,
       expired_leases: expired.count, due_silence_deadlines: dueSilence.count, degraded: expired.count > 0 || overdue.count > 0 };
   }
@@ -666,7 +666,7 @@ export class WorkerMessageRepository {
     return this.db.transaction(() => {
       const now=at.toISOString();
       const rows=this.db.prepare(`SELECT c.job_id,c.generation,c.silence_interval_ms,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts
-        FROM worker_message_cadence c JOIN jobs j USING(job_id) WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled')
+        FROM worker_message_cadence c JOIN jobs j USING(job_id) WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
         const externalId=`worker-message-silence:${row.job_id}:${row.generation}`;
@@ -703,7 +703,7 @@ export class WorkerMessageRepository {
     const job=this.db.prepare("SELECT status FROM jobs WHERE job_id=?").get(jobId) as Pick<JobRow,"status">|undefined;
     const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
     return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
-      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)}};
+      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"}};
   }
 
   purge(at = new Date()): number {

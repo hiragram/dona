@@ -12,7 +12,7 @@ Worker Messaging は、worker と dona-main の途中経過・質問・判断を
 - worker report kind は `checkpoint`、`question`、`risk`、`decision_request` のclosed enum。
 - dona-main instruction operation は `answer`、`add_condition`、`change_priority` のclosed enum。
 - message全体は UTF-8 で16 KiB以下。本文は4,000文字以下、decision optionは各1,000文字・最大8件。
-- unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing report／claim／ACKは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。worker reportのread-only reconcileだけは、commit済みreportと同じruntime identityのSHA-256をretention期間中保持してterminal cleanup後も照合できるようにする。current runtimeであってもmessage固有の履歴hash一致を必須とし、raw identityは履歴へ保存しない。
+- unknown fieldは拒否する。job ID、message ID、thread IDの所持だけでは認可せず、永続化済み`job_id`と`source_event_id`のbindingを照合する。worker-facing reportは、さらにDispatcherがprompt時に発行するjob固有`runtime_identity`をcurrent `job_live_session_identities`へ照合し、同一ownerのsibling worker間も分離する。worker reportのread-only reconcileだけは、commit済みreportと同じruntime identityのSHA-256をretention期間中保持してterminal cleanup後も照合できるようにする。current runtimeであってもmessage固有の履歴hash一致を必須とし、raw identityは履歴へ保存しない。
 - instructionはtyped operationであり、raw shell、path、URL、environment、credentialをcommand capabilityとして受け付けない。
 - instructionはworkerへsteer可能なjob状態だけで新規受理し、`needs_review`等の配送不能状態では未回答questionを維持して拒否する。受理済みsteer operationはjobの最新slotとは別のdurable receiptで照合し、別のsteerで上書きされても再投入しない。
 - `question`／`decision_request`は後続answerを配送可能なjob状態だけで受理する。running jobではmessage commitと同じtransactionでblockedへ遷移して回答待ちを維持し、遅延reportが`needs_review`等へ回答不能な質問を追加することを拒否する。
@@ -38,9 +38,9 @@ worker reportはPublisherがboundedな`dona_message`内部eventへ変換する�
 - `POST /v1/jobs/{job_id}/messages/instructions`: dona-main instructionをcommitする。worker runtime credentialでは認可せず、Dona内部processだけが読めるprivate internal credentialを必須とする。
 - `GET /v1/jobs/{job_id}/messages/{message_id}`: binding確認後にbounded本文を読む。
 - `GET /v1/jobs/{job_id}/messages/reconcile`: receiptとdelivery stateをread-only照合する。
-- delivery claim／ACK routeはworker bridge用。lease情報をlog、health、Resultへ出さない。
-- worker-facing report／claim／ACK／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
-- 通常のGitHub／scratch workerにはpromptの`worker_messaging`でworker専用Unix socket、report／reconcile endpoint、認証header参照、closed payload variants、サイズ上限を渡す。socketはread可能な既存pathとして参照させ、共有する親directoryを`--add-dir`でwritableにはしない。worker専用socketはmain Dispatcher socketとはcanonical pathで相互に包含しない別directoryに置き、report、worker reconcile、delivery claim／ACK以外のrouteを公開しない。schedule workerのread-only sandboxにはこのtransportを公開しない。
+- delivery claim／ACKはDispatcher process内のbridge専用で、worker専用socketには公開しない。lease情報をlog、health、Resultへ出さない。
+- worker-facing report／reconcileはpromptの`runtime_identity`を`x-dona-worker-runtime` headerで渡す。body、query、log、Resultへ複製しない。
+- 通常のGitHub／scratch workerにはpromptの`worker_messaging`でworker専用Unix socket、report／reconcile endpoint、認証header参照、closed payload variants、サイズ上限を渡す。socketはread可能な既存pathとして参照させ、共有する親directoryを`--add-dir`でwritableにはしない。worker専用socketはmain Dispatcher socketとはcanonical pathで相互に包含しない別directoryに置き、reportとworker reconcileだけを公開する。schedule workerのread-only sandboxにはこのtransportを公開しない。
 - worker reportは1 jobあたり256件を上限とし、未回答の`question`／`decision_request`がある間は次の質問を受理しない。idempotentな同一reportのreconcileは上限到達後も再利用できる。
 - MCPは`send_worker_instruction`、`get_worker_message`、Donaからworkerへのwrite専用`reconcile_worker_message`を公開する。worker reportの照合はjob固有runtime identityを伴うworker HTTP経路だけに限定する。
 - worker向けdeliveryはproduction bridgeがleaseし、typed envelopeを既存のjob steer経路へ渡してからACKする。bridgeはsteer可能な`queued`、`retryable_failed`、`running`、`blocked`だけを対象にし、同じjobの先行instructionがpendingまたはleasedなら後続を追い越さない。process停止後もpending ledgerから再開し、message IDをsteer operation identityとして使うため、同じsource eventの複数instructionを区別しつつaccept済みpromptを重複投入しない。queued jobでも最新slotだけでなくdurable receiptを照合する。blocked workerではsteer receiptのcommit、running復帰、既存attentionのsupersedeを1 transactionで行い、receiptは復帰要否と完了時刻を保持するため旧operationのretryが後の別blocked状態を解除しない。受理後、claim前またはrestart時の曖昧なsteerによりjobが`needs_review`へ遷移したinstructionはpending／leasedを問わずsupersedeし、未配送answerなら相関questionを再公開する。

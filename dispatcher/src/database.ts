@@ -351,9 +351,13 @@ export function migrateDispatcherDatabase(
       ${jobsRunnableFairIndexSql};
     `);
     ensureJobSteerReceiptSchema(db);
-    if(hasSteerReceipts)db.exec(`INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at)
-      SELECT job_id,operation_id,accepted_at FROM preserved_job_steer_receipts_v3;
-      DROP TABLE preserved_job_steer_receipts_v3;`);
+    if(hasSteerReceipts){
+      const receiptColumns=new Set((db.pragma("table_info(preserved_job_steer_receipts_v3)") as Array<{name:string}>).map(row=>row.name));
+      db.exec(`INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at)
+        SELECT job_id,operation_id,accepted_at,${receiptColumns.has("resume_required")?"resume_required":"0"},${receiptColumns.has("resumed_at")?"resumed_at":"NULL"}
+        FROM preserved_job_steer_receipts_v3;
+        DROP TABLE preserved_job_steer_receipts_v3;`);
+    }
     if (hasWorkerMessages) {
       migrateWorkerMessaging(db);
       db.exec(`
