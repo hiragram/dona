@@ -81,6 +81,7 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
 | update duplicate | `acceptance_unknown` | exact revision複数件 | 人間review、message fence維持、後続update禁止 |
 | update result unproven | `acceptance_unknown` | 相関済み不受理receiptなし | `failed`へ進めずfence維持 |
+| update retention boundary | `acceptance_unknown` | 90日経過、exact revision未確定 | 最小tombstoneへ移して`needs_review`、再送禁止fence維持 |
 
 presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
@@ -166,15 +167,17 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - content HMAC鍵rotation後の同一source retryはcreation keyで既存requestを先に取得し、その保存済みkey versionのverification-only鍵で同じcanonical actionを照合して既存requestへ収束
 - 同じcreation keyを並行作成するworkerはDBでallocation_pending placeholderを一つだけclaimし、敗者は別payloadを割り当てない
 - placeholder commit直後のcrashはlease失効後にCAS fenceを進め、同じpayload IDの不在を証明してから割当てを再開。不明ならneeds_reviewで止め、旧fenceの遅着writeを拒否
-- payloadとcontent HMACは別々のkey versionを保持し、最後の参照payloadとbackupが消えるまで旧鍵をdecrypt/verify-onlyで保持
+- payloadとcontent HMACは別々のkey versionを保持し、envelope鍵は最後のpayloadとbackup、content MAC鍵は最後のretained request snapshotとbackupが消えるまで旧鍵をdecrypt/verify-onlyで保持
 - pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
 - restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - high-water markの欠落、読取不能、integrity不明も二者再承認までfail closed
 - policy緩和はexact digestと次generationに対する独立actor二人のauthorizationが必須
 - 時刻high-water markはbackup外へ保存し、restore/restart時の欠落や巻戻しで全未完了requestをfail closed
 - approval cardのdispatching直前にvisibility/shared状態を再検証し、不一致なら送信せずpayload削除
-- requestに認証済みSlack executorのteam/app/bot identityとcredential revisionを固定し、card送信・decision・consume・実行直前のactual credentialが別app/botや別revisionなら外部callなしでneeds_review
-- 本文不要となる全terminal/invalid request transitionでpayloadを同一transaction削除
+- requestに認証済みSlack executorのteam/app/bot identityとcredential revisionを固定し、card・pending notice送信、decision・consume・実行直前のactual credentialが別app/botや別revisionなら外部callなしでneeds_review
+- 本文不要となる全terminal/invalid request transitionでpayload IDのdeletion intentをSQLite transactionに保存し、外部storeの削除と不在read-backをreconcilerが完了するまで利用を拒否
+- consume claimはattempt専用payloadへ複製・read-back後にDB参照を移し、旧request payloadのdeletion intentをdurable保存。crash後も孤児payloadを照合して削除
+- 永続表示projectionはredacted template/revision/暗号化payload referenceに限定し、exact draftとmention対象は送信直前だけ復号
 - credential storeへ時刻mark reservationをDBより先にdurable commitし、失敗/不明ではDB writeを開始しない
 - 時刻mark reservationは直前markを条件とするCASで直列化し、stale/競合/小さい遅着writeを拒否
 - binding/policy次generationも二者承認済みdigestとともにDB前のCASでreserveし、未使用reservationはreconcileまでfail closed
