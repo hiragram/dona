@@ -75,7 +75,7 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update timeout | `dispatching` | acceptanceを証明不能 | `acceptance_unknown`、再update禁止 |
 | crash after update fence | durable stateが`dispatching` | 結果なしでrestart | `acceptance_unknown`へ移し、再update禁止 |
 | stale before dispatch | `pending` | current desired revisionと不一致 | `aborted`、update禁止 |
-| prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` | 同じmessage | 先行attemptの一意なterminalまで後続dispatch禁止 |
+| prior update unresolved | new `pending`、prior `dispatching` / `acceptance_unknown` / retention `needs_review` fence | 同じmessage | 先行attemptが一意に解決するまで後続dispatch禁止 |
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
 | update absent | `acceptance_unknown` | bounded全pageでrevision 0件 | `acceptance_unknown`のまま、後続update禁止 |
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
@@ -110,6 +110,10 @@ presentation update attemptは初回delivery attemptと別recordにし、`reques
   },
   "policy": {
     "reply_broadcast": false,
+    "text_encoding": "plain_text",
+    "mrkdwn": false,
+    "unfurl_links": false,
+    "unfurl_media": false,
     "special_mentions": "deny_all",
     "allowed_user_mentions": ["user_example"],
     "max_user_mentions": 3,
@@ -147,7 +151,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 期待する否定fixture:
 
 - `operation_kind`を任意のtool名へ変更するとunknown operationで拒否
-- `workspace_id`、channel、thread、broadcast flag、mention policy、content HMAC、root revisionのどれか一つでも変更するとhash不一致
+- `workspace_id`、channel、thread、broadcast flag、mention policy、text encoding、mrkdwn/unfurl設定、content HMAC、root revisionのどれか一つでも変更するとhash不一致
 - 別instance、別binding revision、別requestのdecisionを転用するとconsume拒否
 - DM/private thread由来contextをpresentationへ追加するとdata-classification test失敗
 - `<!channel>`、`<!here>`、`<!everyone>`、user group、allowlist外または4名以上のuser mentionはgatewayとexecutorの両方で拒否
@@ -158,7 +162,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - claim時に60秒固定のexecution_expires_atとcontinuous readingをdurable保存し、`executing`直前に期限・全preconditionを再検証。時間証明不能も外部callなしで`needs_review`
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
-- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止。dispatch前に実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
+- 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknownまたはretention tombstone fence中は後続dispatch禁止。dispatch前に実際のupdate credentialを保存済みteam/app/bot identityとrevisionへ照合。drift時にterminal requestは維持し、update attemptだけabortして運用reviewへ記録
 - 同じrequest/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
 - decisionのない`delivery_failed`・restore invalidation後に遅着noticeを無効表示へ更新する場合も、request/message/desired revisionの同じattemptへ収束
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
@@ -208,7 +212,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - break-glassのoperation/target scope digestを一時bindingへ固定し、request作成・送信・decision・consume・実行直前のすべてで範囲外actionを拒否
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
-- interactive commandはallowlistしたrequest handle、revision、envelope ID、connection/actor/container/action proofだけをdurable inboxへ保存してからACKし、duplicateは一件へ収束
+- interactive commandはallowlistしたrequest handle、revision、envelope ID、connection IDと受信時workspace registry revision、actor/container/action proofだけをdurable inboxへ保存してからACKし、decision時にcurrent registryと照合。duplicateは一件へ収束
 - interactive raw `message`、`blocks`、`response_url`、private draft、token、private URLはinbox commit前に破棄してbackupへ入れない
 
 ## Threat review scenarios
