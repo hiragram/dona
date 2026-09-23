@@ -38,7 +38,8 @@
 | timeout after send | acceptanceを証明不能 | `acceptance_unknown` | read-only reconcileのみ |
 | crash after external-call fence | durable stateが`executing` | 送信結果なしでrestart | 同じattemptを`acceptance_unknown`へ移す | read-only reconcileのみ、再送禁止 |
 | claimed precondition drift | `claimed`、execution直前に期限/binding/thread/visibility不一致 | `needs_review`、外部callなし | 自動retry不可 |
-| restore claimed/executing | payload欠落またはHMAC不一致 | `needs_review` | 再開・再送禁止 |
+| restore claimed | payload欠落またはHMAC不一致、外部call前 | `needs_review` | 再開・再送禁止 |
+| restore executing | payload欠落またはHMAC不一致、外部call開始後 | `acceptance_unknown`、payload削除 | markerのread-only reconcileだけ継続、再送禁止 |
 | reconciled accepted | exact idempotency key/resultを発見 | 同じattemptを`succeeded`へ更新 | 新attemptを作らない |
 | reconciled rejected | exact rejection receiptを発見 | 同じattemptを`failed`へ更新 | 新attemptを作らない |
 | execution pagination incomplete | marker探索の全pageを完走できない | `acceptance_unknown`とfenceを維持 | 再送禁止 |
@@ -190,6 +191,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - `approved` decisionが先着した未送信pending noticeは同じtransactionで`aborted`とし、遅いworkerが待機表示を新規投稿しない
 - `approved` decisionでapproval cardの操作を除いた決定済みrevisionを一意に作り、曖昧なupdate中はmessage fenceを維持
 - decisionのない`delivery_failed`・restore invalidationでもrequest transitionと同じtransactionで一意なterminal `dona_approval` outboxを作り、元turn/jobへ結果を配送
+- approved後・consume前のexecution_cancelled/consume_expired/needs_reviewは、approval eventとは別のpost-decision terminal outboxを同じtransactionで一意に作りpersisted ownerへ配送
 - break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
 - terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、key version付き最小opaque tombstoneだけ400日保持して古い再配送を拒否
 - tombstone MAC鍵はrotation後も最終tombstoneの保持とbackup expiryまでverification-onlyで保護し、削除後に破棄
