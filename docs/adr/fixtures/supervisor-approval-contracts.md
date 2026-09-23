@@ -123,6 +123,12 @@ presentation update attemptは初回delivery attemptと別recordにし、`reques
   },
   "encrypted_content_ref": "payload-store:content_example",
   "content_hmac_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "rendering": {
+    "encrypted_elements_ref": "payload-store:rendered_elements_example",
+    "elements_hmac_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "fallback_hmac_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "ordered_user_mentions": ["user_example"]
+  },
   "preconditions": {
     "thread_exists": true,
     "channel_is_shared": false,
@@ -146,6 +152,8 @@ presentation update attemptは初回delivery attemptと別recordにし、`reques
 CanonicalizationはUTF-8、field名の辞書順、整数/boolean/string/nullの型維持、未知field拒否、codec version必須とします。semantic action hashはcanonical byte列のSHA-256です。requesterとsource ownershipは認証済みEvent Envelope actorまたはDispatcherの永続job ownerから導出してimmutableに結合し、外部本文やLLM出力から受け取りません。creation keyはinstance、workspace、source event/job、stable operation slotからserver-sideで導出し、同じkey/action hashは既存requestへ収束、hash不一致はconflictにします。instance、workspace、request source/owner、operation、target、policy、precondition、content HMACはsemantic action hashへ含めます。`encrypted_content_ref`、暗号nonce、ciphertextだけを対象外とし、creation key lookupをpayload allocationより先に行います。本文そのものはsnapshot、audit、button valueへ含めず、request中は最大20分の暗号化payload store、claim後はattempt専用の暗号化payloadからexecutor直前に取得してserver-side HMACを再検証します。content HMACとthread message HMACはUIへ表示しません。draft生成に使ったrootと全replyを、`message_ts`順の完全な集合、各`edited_ts`（未編集は明示的なnull）、content HMACとして保存します。consume時と`executing` fence直前に全pageを再取得し、追加・削除・並べ替え・編集のどれか一つでもあれば`needs_review`へ遷移します。認証済みapp author、request ID、共通の`notification_attempt_id`、notification kind、server-side MACが一致するDonaのpending/approval markerだけは会話context集合から除外し、本文やauthorだけでは除外しません。
 
 request作成・decision・consumeの各時点で、supervisorのtarget visibilityと`channel_is_shared: false`を再取得します。approval cardにはexact target ID/表示名、復号したexact draft、解決済みmention対象を、mention/link/unfurlを発火しないescaped `plain_text`として表示し、表示内容のHMACがsnapshotと一致する場合だけactionを有効にします。claim時は暗号化payloadをattempt専用recordへ移し、durable terminal結果またはclaimから24時間の早い方まで保持します。unknownのまま期限に達したらpayloadだけを削除し、stateと再送禁止fenceを維持します。
+
+暗号化payloadの復号例は`[{"type":"text","text":"example "},{"type":"user","user_id":"user_example"}]`で、これはfixture用の非機密値です。productionの要素列とfallbackは短期暗号化payloadにだけ置き、永続snapshotの`rendering`には参照、keyed MAC、順序付きuser IDだけを保存します。gatewayはSlack text/block上限を越える入力を拒否し、read-backした要素列とfallbackが保存済みMACに一致しない場合はmarkerが一件でも`needs_review`と再送禁止fenceにします。
 
 送信時はexecution attempt IDとserver-side MACから一意な`block_id` markerを作り、Slack messageの本文を変えずblockへ保存します。送信前とtimeout後のread-backはchannel/threadの全pageを完走し、同marker 0件、exactly 1件、複数件を区別します。timeout後の0件は不在確定ではなくunknownのままです。pagination cursor欠落・反復、別Bot author、marker MAC不一致はreconcile成功にしません。
 
@@ -180,7 +188,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - policy緩和はexact digestと次generationに対する独立actor二人のauthorizationが必須
 - 時刻high-water markはbackup外へ保存し、restore/restart時の欠落や巻戻しで全未完了requestをfail closed
 - approval cardのdispatching直前にvisibility/shared状態を再検証し、不一致なら送信せずpayload削除
-- requestに認証済みSlack executorのteam/app/bot identityとcredential revisionを固定し、card・pending notice送信、presentation update、decision・consume・実行直前のactual credentialが別app/botや別revisionなら外部callなしでneeds_review
+- requestに認証済みSlack executorのteam/app/bot identityとcredential revisionを固定し、card・pending notice送信、presentation update、decision・consume・実行直前のactual credentialが別app/botや別revisionなら外部callを拒否。nonterminal requestはneeds_review、terminal表示更新ではrequestを維持しupdate attemptだけabortして運用reviewへ記録
 - 本文不要となる全terminal/invalid request transitionでpayload IDのdeletion intentをSQLite transactionに保存し、外部storeの削除と不在read-backをreconcilerが完了するまで利用を拒否
 - consume claimはattempt専用payloadへ複製・read-back後にDB参照を移し、旧request payloadのdeletion intentをdurable保存。crash後も孤児payloadを照合して削除
 - 永続表示projectionはredacted template/revision/暗号化payload referenceに限定し、exact draftとmention対象は送信直前だけ復号
@@ -207,6 +215,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - approved後・consume前のexecution_cancelled/consume_expired/needs_reviewは、approval eventとは別のpost-decision terminal outboxを同じtransactionで一意に作りpersisted ownerへ配送
 - terminal eventがapproval eventより先に届いても、Dispatcherはrequest event revisionの高水位を元job stateと同じtransactionで保存し、後着approvalをstale拒否
 - break-glass bindingの絶対`expires_at`は信頼済み時刻で最大30分とし、request作成・送信・decision・consume・実行直前で直接失効判定
+- 400日後もacceptance_unknownのexecution attemptは最小opaque execution fence tombstoneへ移してneeds_reviewとし、target/precondition詳細を削除。人間解決まで再送禁止を維持
 - terminal後90日でrequest snapshot、precondition、creation key、notification/inbox/outbox詳細を削除し、key version付き最小opaque tombstoneだけ400日保持して古い再配送を拒否
 - tombstone MAC鍵はrotation後も最終tombstoneの保持とbackup expiryまでverification-onlyで保護し、削除後に破棄
 - terminal requestのdelivery/updateが90日後もunknownなら詳細を削除し、opaque keyed message fenceだけを人間解決まで維持して再送と後続writeを禁止
