@@ -552,7 +552,7 @@ export class DispatcherDatabase {
         return true;
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
-    this.workerMessages = new WorkerMessageRepository(this.db);
+    this.workerMessages = new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);
   }
 
   close(): void {

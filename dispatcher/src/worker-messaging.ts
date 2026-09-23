@@ -6,13 +6,14 @@ import { z } from "zod";
 
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
 import type { JobRow } from "./types.js";
-import { stableStringify } from "./validation.js";
+import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
 
 export const workerMessageProtocolVersion = 1 as const;
 export const workerMessagePayloadUtf8ByteMax = 16_384;
 export const workerMessageRetentionDays = 30;
 export const workerMessageLeaseMaxMs = 300_000;
 export const workerReportMaxPerJob = 256;
+const workerMessageOverdueGraceMs = 60_000;
 
 const utcRfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
 const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
@@ -262,9 +263,14 @@ function sha256(value: string): string { return createHash("sha256").update(valu
 function terminal(status: JobRow["status"]): boolean { return status === "completed" || status === "failed" || status === "cancelled"; }
 function reportKind(input: WorkerReportInput): WorkerMessageKind { return input.payload.kind; }
 function instructionKind(input: DonaInstructionInput): WorkerMessageKind { return input.payload.operation; }
+function typedInstructionText(messageId:string,kind:WorkerMessageKind,payload:unknown,correlationMessageId:string|null,conversationRevision:number|null):string {
+  const instruction=stableStringify({schema_version:workerMessageProtocolVersion,message_id:messageId,
+    correlation_message_id:correlationMessageId,conversation_revision:conversationRevision,operation:kind,payload});
+  return `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`;
+}
 
 export class WorkerMessageRepository {
-  constructor(private readonly db: Database.Database) {}
+  constructor(private readonly db: Database.Database,private readonly jobObjectiveTotalMaxBytes=400_000) {}
 
   appendWorkerReport(jobId: string, runtimeIdentity: string, raw: unknown, at = new Date()) {
     this.assertWorkerRuntime(jobId, runtimeIdentity);
@@ -359,6 +365,41 @@ export class WorkerMessageRepository {
       const messageId = `msg_${ulid(at.getTime()).toLowerCase()}`;
       const receiptId = `rcpt_${ulid(at.getTime()).toLowerCase()}`;
       const deliveryId = `dlv_${ulid(at.getTime()).toLowerCase()}`;
+      if(direction==="dona_to_worker"&&["queued","retryable_failed"].includes(job.status)){
+        const typed=typedInstructionText(messageId,kind,input.payload,input.correlation_message_id??null,input.conversation_revision??null);
+        const addition=`\n\n[DONA_FOLLOW_UP]\n${typed}\n[/DONA_FOLLOW_UP]`;
+        if([...job.objective,...addition].length>jobObjectiveCharacterMax)
+          throw new WorkerMessageError("worker_message_instruction_unavailable","effective job objective character limit exceeded");
+        const siblings=this.db.prepare("SELECT objective FROM jobs WHERE source_event_id=?").all(job.source_event_id) as Array<{objective:string}>;
+        const current=siblings.reduce((sum,sibling)=>sum+Buffer.byteLength(sibling.objective,"utf8"),0);
+        if(current+Buffer.byteLength(addition,"utf8")>this.jobObjectiveTotalMaxBytes)
+          throw new WorkerMessageError("worker_message_instruction_unavailable","effective job group objective byte limit exceeded");
+      }
+      if(direction==="worker_to_dona"&&["question","decision_request"].includes(kind)&&job.status==="blocked"){
+        if(job.completion_event_id){
+          const attention=this.db.prepare("SELECT status FROM events WHERE event_id=?").get(job.completion_event_id) as {status:string}|undefined;
+          if(!attention)throw new WorkerMessageError("worker_message_attention_conflict","blocked attention event is missing");
+          if(["dispatching","waiting_agent","blocked","needs_review"].includes(attention.status))
+            throw new WorkerMessageError("worker_message_attention_conflict","blocked attention delivery is uncertain");
+          if(["queued","retryable_failed"].includes(attention.status)){
+            const siblingAttention=this.db.prepare(`SELECT 1 FROM jobs WHERE source_event_id=? AND job_id!=?
+              AND status IN ('blocked','failed','needs_review') LIMIT 1`).get(job.source_event_id,jobId);
+            if(siblingAttention)throw new WorkerMessageError("worker_message_attention_conflict","group attention includes another job");
+            this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+              last_error_code='worker_message_question_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+              .run(acceptedAt,acceptedAt,job.completion_event_id);
+            this.db.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=? AND attention_event_id=?")
+              .run(acceptedAt,job.source_event_id,job.completion_event_id);
+            this.db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE job_id=? AND completion_event_id=?")
+              .run(acceptedAt,jobId,job.completion_event_id);
+            this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'")
+              .run(job.completion_event_id);
+          }
+        }
+        this.db.prepare(`UPDATE jobs SET last_error_code='worker_message_question_pending',
+          last_error_message='Background worker is waiting for an answer',updated_at=? WHERE job_id=? AND status='blocked'`)
+          .run(acceptedAt,jobId);
+      }
       this.db.prepare(`INSERT INTO worker_messages(message_id,schema_version,job_id,source_event_id,workspace_id,channel_id,thread_ts,direction,kind,producer,producer_sequence,idempotency_key,payload_json,payload_sha256,correlation_message_id,conversation_revision,occurred_at,accepted_at)
         VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(messageId, jobId, input.source_event_id, job.workspace_id, job.channel_id, job.thread_ts,
         direction, kind, producer, input.producer_sequence, input.idempotency_key, payloadJson, payloadSha,
@@ -579,7 +620,7 @@ export class WorkerMessageRepository {
   operationalSnapshot(at = new Date()) {
     const pending = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state IN ('pending','leased')").get() as {count:number};
     const overdue = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='pending' AND available_at<=?")
-      .get(at.toISOString()) as {count:number};
+      .get(new Date(at.getTime()-workerMessageOverdueGraceMs).toISOString()) as {count:number};
     const expired = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='leased' AND lease_expires_at<=?").get(at.toISOString()) as {count:number};
     const dueSilence = this.db.prepare(`SELECT COUNT(*) AS count FROM worker_message_cadence c JOIN jobs j USING(job_id)
       WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')`).get(at.toISOString()) as {count:number};
@@ -824,11 +865,8 @@ export class WorkerInstructionBridge {
     const claimed=this.repository.claimNextWorkerInstruction(this.leaseOwner,workerMessageLeaseMaxMs,at);
     if(!claimed)return false;
     const {delivery,lease_token}=claimed;
-    const instruction=stableStringify({schema_version:workerMessageProtocolVersion,message_id:delivery.message_id,
-      correlation_message_id:delivery.correlation_message_id,conversation_revision:delivery.conversation_revision,
-      operation:delivery.kind,payload:delivery.payload});
     await this.controller.steer(delivery.job_id,delivery.source_event_id,
-      `[DONA_TYPED_INSTRUCTION]\n${instruction}\n[/DONA_TYPED_INSTRUCTION]`,delivery.message_id);
+      typedInstructionText(delivery.message_id,delivery.kind,delivery.payload,delivery.correlation_message_id,delivery.conversation_revision),delivery.message_id);
     this.repository.acknowledge(delivery.job_id,delivery.source_event_id,delivery.delivery_id,this.leaseOwner,
       lease_token,delivery.fence,new Date());
     return true;

@@ -271,6 +271,55 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("既存blocked jobの質問は未配送attentionを失効させる",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-blocked-question");
+      database.markJobBlocked(job.job_id,"agent blocked");
+      database.sealJobGroup(source.event_id);
+      const attention=database.enqueueJobNotification(job.job_id);
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(question.outcome,"created");
+      assert.equal(database.get(attention.row.event_id)?.status,"completed");
+      assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+      assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
+      assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),false);
+    } finally {database.close();}
+  });
+
+  test("配送中のblocked attentionがある質問は曖昧な重複通知を作らない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-attention-race");
+      database.markJobBlocked(job.job_id,"agent blocked");
+      database.sealJobGroup(source.event_id);
+      const attention=database.enqueueJobNotification(job.job_id);
+      database.beginDispatch(attention.row.event_id,path.join(config.resultsDir,"attention-race.json"));
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z")),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_attention_conflict");
+      assert.equal(database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1").reconciliation,"not_found");
+      assert.equal(database.getJob(job.job_id)?.last_error_code,"agent_blocked");
+    } finally {database.close();}
+  });
+
+  test("queued instructionはobjective上限超過を受理前に拒否する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath,{jobsPerEventMax:8,jobObjectiveTotalMaxBytes:100});
+    try {
+      const source=database.enqueue(eventEnvelope("Ev-worker-instruction-cap")).row;
+      const job=database.createJob({source_event_id:source.event_id,objective:"a".repeat(80),workspace:{kind:"scratch"}},
+        config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      assert.throws(()=>database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"over-cap",occurred_at:"2026-09-21T00:00:01Z",
+        payload:{operation:"add_condition",text:"続行"}}),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_instruction_unavailable");
+      assert.equal(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","over-cap").reconciliation,"not_found");
+    } finally {database.close();}
+  });
+
   test("受理済みanswerをneeds_review遷移で失効し回答不能questionを非表示にする",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -944,7 +993,9 @@ test("report delivery障害をaccepted messageと独立したdegraded stateに�
   try {
     const created=await request(config.workerSocketPath,"POST",`/v1/jobs/${job.job_id}/messages/reports`,report(source.event_id),{"x-dona-worker-runtime":"runtime-degraded"});
     assert.equal(created.status,202); assert.equal(database.workerMessages.operationalSnapshot().pending_deliveries,1);
-    assert.equal(database.workerMessages.operationalSnapshot().degraded,true);
+    const available=(sqlite.prepare("SELECT available_at FROM worker_message_deliveries WHERE consumer='dona-main'").get() as {available_at:string}).available_at;
+    assert.equal(database.workerMessages.operationalSnapshot(new Date(Date.parse(available)+59_999)).degraded,false);
+    assert.equal(database.workerMessages.operationalSnapshot(new Date(Date.parse(available)+60_000)).degraded,true);
     sqlite.exec("DROP TRIGGER fail_worker_message_event");
     assert.equal(database.workerMessages.publishPendingReports(),1);
   } finally { sqlite.close(); await api.stop(); database.close(); }
