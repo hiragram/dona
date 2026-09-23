@@ -2145,6 +2145,12 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], needsReview?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":posted?"incomplete_delivery_after_post":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
+      if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
+        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
+        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind)))
+          this.markJobNeedsReview(payload.job_id,"worker_message_notification_failed",
+            "Question notification failed before the worker could receive an answer");
+      }
       this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,needsReview?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();

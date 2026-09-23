@@ -221,6 +221,28 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("質問通知eventの確定失敗はblocked jobをneeds_reviewにして通知可能にする",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-failed-question");
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      const resultPath=path.join(config.resultsDir,"failed-question.json");
+      database.beginDispatch(event.event_id,resultPath);
+      database.markWaiting(event.event_id);
+      database.sealJobGroup(source.event_id);
+      database.saveFailedResult(event.event_id,{schema_version:1,event_id:event.event_id,status:"failed",
+        summary:"通知に失敗しました",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
+        resultPath,new Date("2026-09-21T00:00:04Z"));
+      assert.equal(database.get(event.event_id)?.status,"dead_letter");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),true);
+    } finally {database.close();}
+  });
+
   test("needs_reviewへ遷移した未配送reportは通知eventを作らず失効する",async()=>{
     const {database,source,job}=await fixture();
     try {
