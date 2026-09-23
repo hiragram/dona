@@ -290,16 +290,27 @@ export class WorkerMessageRepository {
   }
 
   rearmUndispatchedReport(eventId:string,availableAt:string,at=new Date()):boolean {
-    const row=this.db.prepare(`SELECT d.delivery_id,j.status FROM worker_message_deliveries d
+    const row=this.db.prepare(`SELECT d.delivery_id,j.status,m.job_id,m.kind,m.payload_json,m.producer_sequence FROM worker_message_deliveries d
       JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
       WHERE d.event_id=? AND d.consumer='dona-main' AND d.state='delivered'`)
-      .get(eventId) as {delivery_id:string;status:JobRow["status"]}|undefined;
+      .get(eventId) as {delivery_id:string;status:JobRow["status"];job_id:string;kind:WorkerMessageKind;payload_json:string;producer_sequence:number}|undefined;
     if(!row||terminal(row.status))return false;
     this.db.prepare("DELETE FROM worker_message_receipts WHERE delivery_id=? AND consumer='dona-main' AND receipt_kind='delivered'")
       .run(row.delivery_id);
+    const urgent=row.kind==="question"||row.kind==="decision_request"
+      ||(row.kind==="risk"&&(JSON.parse(row.payload_json) as {severity?:string}).severity==="high");
+    const newer=!urgent&&this.db.prepare(`SELECT 1 FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'
+      AND producer_sequence>? LIMIT 1`).get(row.job_id,row.producer_sequence);
+    if(newer){
+      this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',event_id=NULL,delivered_at=NULL,updated_at=?
+        WHERE delivery_id=? AND event_id=? AND state='delivered'`).run(at.toISOString(),row.delivery_id,eventId);
+      return true;
+    }
     this.db.prepare(`UPDATE worker_message_deliveries SET state='pending',event_id=NULL,delivered_at=NULL,
       available_at=?,updated_at=? WHERE delivery_id=? AND event_id=? AND state='delivered'`)
       .run(availableAt,at.toISOString(),row.delivery_id,eventId);
+    if(!urgent)this.db.prepare("UPDATE worker_message_cadence SET pending_message_id=(SELECT message_id FROM worker_message_deliveries WHERE delivery_id=?),updated_at=? WHERE job_id=?")
+      .run(row.delivery_id,at.toISOString(),row.job_id);
     return true;
   }
 
@@ -459,17 +470,11 @@ export class WorkerMessageRepository {
         if (!urgent && cadence?.last_delivery_at) availableAt = new Date(Math.max(at.getTime(), Date.parse(cadence.last_delivery_at) + minimum)).toISOString();
         if (!urgent && workspaceCadence?.last_delivery_at) availableAt = new Date(Math.max(Date.parse(availableAt),
           Date.parse(workspaceCadence.last_delivery_at)+workspaceCadence.minimum_interval_ms)).toISOString();
-        if (cadence?.pending_message_id) {
-          const pending = this.db.prepare("SELECT kind,payload_json FROM worker_messages WHERE message_id=?")
-            .get(cadence.pending_message_id) as {kind:WorkerMessageKind;payload_json:string}|undefined;
-          const pendingPayload = pending ? JSON.parse(pending.payload_json) as {severity?:unknown} : undefined;
-          const pendingUrgent = pending?.kind === "question" || pending?.kind === "decision_request"
-            || (pending?.kind === "risk" && pendingPayload?.severity === "high");
-          if (!pendingUrgent) {
-            this.db.prepare("UPDATE worker_message_deliveries SET state='superseded',updated_at=? WHERE message_id=? AND consumer='dona-main' AND state='pending'")
-              .run(acceptedAt, cadence.pending_message_id);
-          }
-        }
+        this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',updated_at=?
+          WHERE consumer='dona-main' AND state='pending' AND message_id IN
+          (SELECT message_id FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'
+            AND (kind='checkpoint' OR (kind='risk' AND json_extract(payload_json,'$.severity')!='high')))`)
+          .run(acceptedAt,jobId);
         const silenceInterval = cadence?.silence_interval_ms ?? 900_000;
         this.db.prepare(`INSERT INTO worker_message_cadence(job_id,last_report_at,silence_due_at,pending_message_id,generation,updated_at)
           VALUES(?,?,?,?,1,?) ON CONFLICT(job_id) DO UPDATE SET last_report_at=excluded.last_report_at,silence_due_at=excluded.silence_due_at,
@@ -673,15 +678,15 @@ export class WorkerMessageRepository {
         WHERE consumer='dona-main' AND state='leased' AND lease_expires_at<=?`).run(now, now);
       this.db.prepare(`UPDATE worker_message_deliveries SET state='superseded',lease_owner=NULL,lease_token_sha256=NULL,
         lease_expires_at=NULL,updated_at=? WHERE consumer='dona-main' AND state IN ('pending','leased') AND message_id IN
-        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled','needs_review'))`)
         .run(now);
       this.db.prepare(`UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE pending_message_id IN
-        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled'))`)
+        (SELECT m.message_id FROM worker_messages m JOIN jobs j USING(job_id) WHERE j.status IN ('completed','failed','cancelled','needs_review'))`)
         .run(now);
       const rows = this.db.prepare(`SELECT d.delivery_id,d.message_id,m.job_id,m.source_event_id,m.workspace_id,m.channel_id,m.thread_ts,m.kind,m.payload_json,m.occurred_at,j.status
         FROM worker_message_deliveries d JOIN worker_messages m USING(message_id) JOIN jobs j USING(job_id)
         WHERE d.consumer='dona-main' AND d.state='pending' AND d.available_at<=?
-          AND j.status NOT IN ('completed','failed','cancelled')
+          AND j.status NOT IN ('completed','failed','cancelled','needs_review')
           AND m.workspace_id IS NOT NULL AND m.channel_id IS NOT NULL AND m.thread_ts IS NOT NULL
         ORDER BY d.available_at,d.created_at,m.job_id,m.producer_sequence,d.delivery_id LIMIT ?`).all(now, limit) as Array<{
           delivery_id:string;message_id:string;job_id:string;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null;
@@ -689,7 +694,7 @@ export class WorkerMessageRepository {
         }>;
       let published = 0;
       for (const row of rows) {
-        if (terminal(row.status)) {
+        if (terminal(row.status)||row.status==='needs_review') {
           this.db.prepare("UPDATE worker_message_deliveries SET state='superseded',updated_at=? WHERE delivery_id=? AND state='pending'").run(now,row.delivery_id);
           this.db.prepare("UPDATE worker_message_cadence SET pending_message_id=NULL,updated_at=? WHERE job_id=? AND pending_message_id=?")
             .run(now,row.job_id,row.message_id);

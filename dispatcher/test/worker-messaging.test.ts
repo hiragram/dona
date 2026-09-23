@@ -221,6 +221,35 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("needs_reviewへ遷移した未配送reportは通知eventを作らず失効する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const checkpoint=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+      database.markJobNeedsReview(job.job_id,"test","review required");
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),0);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as
+        {delivery:{state:string}}).delivery.state,"superseded");
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${checkpoint.message.message_id}`),undefined);
+    } finally {database.close();}
+  });
+
+  test("再armした通常reportは新しいreportに追い越されたら失効する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      const event=database.getByExternalId("dona_message",`worker-message:${first.message.message_id}`);
+      assert.ok(event);
+      database.recordPreDispatchFailure(event.event_id,"offline","offline",1,new Date("2026-09-21T00:00:03Z"));
+      const second=database.workerMessages.appendReport(job.job_id,report(source.event_id,2),new Date("2026-09-21T00:00:04Z"));
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1") as
+        {delivery:{state:string}}).delivery.state,"superseded");
+      assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:01:02Z")),1);
+      assert.ok(database.getByExternalId("dona_message",`worker-message:${second.message.message_id}`));
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${first.message.message_id}:2`),undefined);
+    } finally {database.close();}
+  });
+
   test("未回答questionを次のtyped answer identityと共に投影する",async()=>{
     const {database,source,job}=await fixture();
     try {
