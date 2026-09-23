@@ -2109,6 +2109,7 @@ export class DispatcherDatabase {
             (action as Record<string,unknown>).channel_id===target?.channel_id&&
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
             typeof (action as Record<string,unknown>).message_ts==="string"&&
+            (action as Record<string,unknown>).reply_broadcast===false&&
             (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
           const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
@@ -2317,6 +2318,15 @@ export class DispatcherDatabase {
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
+      if(row.source==="dona_message"&&row.event_type==="worker_message_report"){
+        const payload=JSON.parse(row.payload_json) as {job_id?:unknown;kind?:unknown};
+        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
+          const job=this.getJob(payload.job_id);
+          if(job?.status==="blocked"&&job.last_error_code==="worker_message_question_pending")
+            this.markJobNeedsReview(payload.job_id,"worker_message_notification_discarded",
+              "Question notification was discarded by an operator");
+        }
+      }
       this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       this.sealJobGroupIfPresent(eventId, at.toISOString());
       this.setNotificationState(eventId,"failed",at);
