@@ -14,6 +14,8 @@ import { ApprovalPayloadRepository } from "./payload-repository.js";
 import { openApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { verifyApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
 import { recordDecision, terminateApproved, type RequestState } from "./domain.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -58,14 +60,16 @@ export class ApprovalDecisionBroker {
   private readonly records: ApprovalRecordRepository;
   private readonly lifecycle: ApprovalRequestLifecycle;
   private readonly payloads: ApprovalPayloadRepository;
-  constructor(db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
+  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
     private readonly authorize: ApprovalDecisionAuthority,
     private readonly contentKey: (version: number) => ApprovalPayloadKey,
     private readonly wrappingKey: (version: number) => ApprovalPayloadKey,
-    private readonly notificationKey: (version: number) => ApprovalNotificationKey) {
+    private readonly notificationKey: (version: number) => ApprovalNotificationKey,
+    private readonly bindingGuard?: SupervisorBindingGuard) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       for (const callback of [authorize, contentKey, wrappingKey, notificationKey]) assertSynchronousCallback(callback);
+      if (approvalSupervisorBindingRequired(db) && bindingGuard === undefined) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
@@ -75,6 +79,7 @@ export class ApprovalDecisionBroker {
   }
   decide(transactionId: string, input: ApprovalDecisionCommand): ApprovalDecisionResult {
     try {
+      if (approvalSupervisorBindingRequired(this.db) && this.bindingGuard === undefined) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(commandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalDecisionResult>(transactionId, (mark, state) => {
         const request = this.records.readInState(state, "request", command.request_handle);
@@ -112,7 +117,9 @@ export class ApprovalDecisionBroker {
           return denied("revision_mismatch", event);
         }
         const mutable = undecided.has(request.row.state) || request.row.state === "approved";
-        const drift = grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
+        const currentBinding = this.bindingGuard?.current(state, mark, "decision", { binding_id: request.row.binding_id,
+          revision: request.row.binding_revision, actor_id: command.action === "cancel" ? null : grant.actor_id }, snapshot.target) ?? true;
+        const drift = !currentBinding || grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
           || grant.policy_revision !== request.row.policy_revision || grant.semantic_hash !== request.row.semantic_hash
           || grant.requester_authorization_revision !== snapshot.preconditions.requester_authorization_revision;
         if (mutable && drift) return this.lifecycle.change(mark, state, request, "needs_review", null,

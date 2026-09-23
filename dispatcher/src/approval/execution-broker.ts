@@ -14,6 +14,8 @@ import { ApprovalPayloadRepository } from "./payload-repository.js";
 import { ApprovalPayloadMutation } from "./payload-mutation.js";
 import { openApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { ApprovalExecutionMarkerStore } from "./execution-marker-store.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 import { signApprovalExecutionMarker, verifyApprovalExecutionMarker, type ApprovalExecutionMarkerKey } from "./execution-marker.js";
 import { executionCommandSchema, executionStartGrantSchema, executionRecoveryGrantSchema, executionReceiptGrantSchema,
   type ExecutionCommand, type ExecutionStartAuthority, type ExecutionRecoveryAuthority, type ExecutionReceiptAuthority } from "./execution-authority.js";
@@ -38,15 +40,17 @@ export class ApprovalExecutionBroker {
   private readonly payloads: ApprovalPayloadRepository;
   private readonly payloadMutation: ApprovalPayloadMutation;
   private readonly markers: ApprovalExecutionMarkerStore;
-  constructor(db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
+  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
     private readonly authorizeStart: ExecutionStartAuthority, private readonly authorizeRecovery: ExecutionRecoveryAuthority,
     private readonly authorizeReceipt: ExecutionReceiptAuthority,
     private readonly contentKey: (version: number) => ApprovalPayloadKey,
     private readonly wrappingKey: (version: number) => ApprovalPayloadKey,
-    private readonly markerKey: (version: number | null) => ApprovalExecutionMarkerKey) {
+    private readonly markerKey: (version: number | null) => ApprovalExecutionMarkerKey,
+    private readonly bindingGuard?: SupervisorBindingGuard) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(z.strictObject({ instance_id: id, workspace_id: id }).parse(scope));
       for (const callback of [authorizeStart, authorizeRecovery, authorizeReceipt, contentKey, wrappingKey, markerKey]) assertSynchronousCallback(callback);
+      if (approvalSupervisorBindingRequired(db) && bindingGuard === undefined) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope); this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
       this.mutations = new ApprovalRecordMutation(db, this.scope); this.lifecycle = new ApprovalRequestLifecycle(db, providers, this.scope);
@@ -56,6 +60,7 @@ export class ApprovalExecutionBroker {
   }
   start(transactionId: string, input: ExecutionCommand): ApprovalExecutionResult {
     try {
+      if (approvalSupervisorBindingRequired(this.db) && this.bindingGuard === undefined) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(executionCommandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalExecutionResult>(transactionId, (mark, state) => {
         const base = this.base(), found = this.load(state, command);
@@ -70,7 +75,11 @@ export class ApprovalExecutionBroker {
         this.clock(request, attempt, mark, state);
         if (approvalExpired(attempt.row.execution_expires_at, mark)) return this.change(mark, state, attempt, "needs_review", "expired", null, event);
         const snapshot = this.lifecycle.snapshot(request);
-        const drift = grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
+        const decision = this.records.readInState(state, "decision", request.row.request_id);
+        const currentBinding = decision?.row.kind === "approve" &&
+          (this.bindingGuard?.current(state, mark, "execution", { binding_id: request.row.binding_id,
+            revision: request.row.binding_revision, actor_id: decision.row.actor_id }, snapshot.target) ?? true);
+        const drift = !currentBinding || grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
           || grant.policy_revision !== request.row.policy_revision || grant.semantic_hash !== request.row.semantic_hash
           || grant.requester_authorization_revision !== snapshot.preconditions.requester_authorization_revision;
         if (drift) return this.change(mark, state, attempt, "needs_review", grant.stale_reason ?? "revision_mismatch", null, event);

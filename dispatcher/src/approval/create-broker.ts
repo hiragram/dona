@@ -16,6 +16,8 @@ import { approvalExpiry, consumeTtlMs, type ClockMark } from "./clock.js";
 import { createApprovalContentBinding, matchesApprovalContentBinding, sealApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { encodeApprovalPayloadEnvelope } from "./payload-metadata.js";
 import { signApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const intentSchema = z.strictObject({ source_ref: id, operation_slot: id,
   target: z.strictObject({ channel_id: id, thread_ts: z.string().regex(/^[0-9]{10}\.[0-9]{6}$/) }), text: z.string().min(1).max(3000) });
@@ -70,11 +72,13 @@ export class ApprovalCreateBroker {
  private readonly recordMutation:ApprovalRecordMutation;
  private readonly payloadMutation:ApprovalPayloadMutation;
  private readonly keys:ApprovalCreateKeyLookup;
- constructor(db:Database.Database,providers:ApprovalTransactionProviders,scope:ApprovalRecordScope,
-   private readonly authorize:ApprovalCreateAuthority,keys:ApprovalCreateKeyLookup){
+ constructor(private readonly db:Database.Database,providers:ApprovalTransactionProviders,scope:ApprovalRecordScope,
+   private readonly authorize:ApprovalCreateAuthority,keys:ApprovalCreateKeyLookup,
+   private readonly bindingGuard?:SupervisorBindingGuard){
   try{
    assertSynchronousResult(scope);this.scope=Object.freeze(z.strictObject({instance_id:id,workspace_id:id}).parse(scope));
    assertSynchronousCallback(authorize);
+   if(approvalSupervisorBindingRequired(db)&&bindingGuard===undefined)throw Error();
    // Read descriptors rather than invoking accessor-backed configuration.
    if(keys===null||typeof keys!=="object"||types.isProxy(keys)||Object.getPrototypeOf(keys)!==Object.prototype)throw Error();
    const descriptors=Object.getOwnPropertyDescriptors(keys);
@@ -90,6 +94,7 @@ export class ApprovalCreateBroker {
  }
  create(transactionId:string,input:ApprovalCreateIntent):ApprovalCreateResult {
   try{
+   if(approvalSupervisorBindingRequired(this.db)&&this.bindingGuard===undefined)throw Error();
    assertSynchronousResult(input);const intent=freeze(intentSchema.parse(input));
    return this.transaction.runPrepared<()=>ApprovalCreateResult>(transactionId,(mark,state)=>{
     const raw=this.authorize(intent,mark,state);assertSynchronousResult(raw);const parsed=grantSchema.parse(raw);
@@ -102,6 +107,9 @@ export class ApprovalCreateBroker {
     const creationKey=approvalCreationKey(context);
     if(source.instance_id!==this.scope.instance_id||source.workspace_id!==this.scope.workspace_id
       ||source.request_source.operation_slot!==intent.operation_slot||source.target.channel_id!==intent.target.channel_id||source.target.thread_ts!==intent.target.thread_ts)throw Error();
+    if(this.bindingGuard&&!this.bindingGuard.current(state,mark,"create",{binding_id:grant.binding_id,
+      revision:source.preconditions.workspace_binding_revision,actor_id:null},source.target))
+      return denied({status:"denied",reason:"binding_revoked"},{...baseEvent,reason:"binding_revoked"});
     const notified=mentions(intent.text,source.policy.allowed_user_mentions);
     if(JSON.stringify(grant.display.mentioned_users.map(user=>user.id).sort())!==JSON.stringify(notified))throw Error();
     // The full snapshot codec validates all policy/precondition/source fields below.

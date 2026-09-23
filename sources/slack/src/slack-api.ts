@@ -55,6 +55,7 @@ export interface SlackChannel {
   isArchived: boolean;
   isMember: boolean;
   isShared: boolean;
+  sharingKnown?: boolean;
   topic?: string;
   purpose?: string;
   memberCount?: number;
@@ -67,6 +68,7 @@ export interface SlackChannelPage {
 
 export interface SlackUser {
   id: string;
+  teamId?: string;
   username?: string;
   displayName?: string;
   realName?: string;
@@ -75,6 +77,9 @@ export interface SlackUser {
   isBot: boolean;
   isAppUser: boolean;
   isDeleted: boolean;
+  deletionKnown?: boolean;
+  isStranger?: boolean;
+  isSuspended?: boolean;
 }
 
 export interface SlackUserPage {
@@ -125,6 +130,7 @@ export interface SlackApiClient {
   getChannel(channelId: string): Promise<SlackChannel>;
   listUsers(limit: number, cursor?: string): Promise<SlackUserPage>;
   getUser(userId: string): Promise<SlackUser>;
+  getChannelMembers?(channelId: string, limit: number, cursor?: string): Promise<{ members: string[]; nextCursor?: string }>;
   getThread(channelId: string, threadTs: string, limit: number, cursor?: string): Promise<SlackThread>;
   getReactions(channelId: string, messageTs: string): Promise<SlackReactionSnapshot>;
   getFile(fileId: string): Promise<SlackFileInfo>;
@@ -170,6 +176,7 @@ function channelFromResponse(channel: {
   is_member?: boolean;
   is_shared?: boolean;
   is_ext_shared?: boolean;
+  is_pending_ext_shared?: boolean;
   topic?: { value?: string };
   purpose?: { value?: string };
   num_members?: number;
@@ -180,7 +187,9 @@ function channelFromResponse(channel: {
     isPrivate: channel.is_private ?? false,
     isArchived: channel.is_archived ?? false,
     isMember: channel.is_member ?? false,
-    isShared: channel.is_shared ?? channel.is_ext_shared ?? false,
+    isShared: channel.is_shared === true || channel.is_ext_shared === true || channel.is_pending_ext_shared === true,
+    ...(channel.is_shared !== undefined || channel.is_ext_shared !== undefined || channel.is_pending_ext_shared !== undefined
+      ? { sharingKnown: true } : {}),
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),
     ...(channel.num_members !== undefined ? { memberCount: channel.num_members } : {}),
@@ -189,16 +198,21 @@ function channelFromResponse(channel: {
 
 function userFromResponse(user: {
   id?: string;
+  team_id?: string;
+  team?: string;
   name?: string;
   real_name?: string;
   tz?: string;
   is_bot?: boolean;
   is_app_user?: boolean;
   deleted?: boolean;
+  is_stranger?: boolean;
+  suspended?: boolean;
   profile?: { display_name?: string; real_name?: string; title?: string };
 }): SlackUser {
   return {
     id: nonEmpty(user.id, "user.id"),
+    ...(user.team_id ?? user.team ? { teamId: user.team_id ?? user.team! } : {}),
     ...(user.name ? { username: user.name } : {}),
     ...(user.profile?.display_name ? { displayName: user.profile.display_name } : {}),
     ...(user.profile?.real_name ?? user.real_name
@@ -209,6 +223,9 @@ function userFromResponse(user: {
     isBot: user.is_bot ?? false,
     isAppUser: user.is_app_user ?? false,
     isDeleted: user.deleted ?? false,
+    ...(user.deleted !== undefined ? { deletionKnown: true } : {}),
+    ...(user.is_stranger !== undefined ? { isStranger: user.is_stranger } : {}),
+    ...(user.suspended !== undefined ? { isSuspended: user.suspended } : {}),
   };
 }
 
@@ -367,6 +384,17 @@ export class SlackWebApiClient implements SlackApiClient {
       throw new SlackApiError("invalid_slack_response", "Slack response did not include channel");
     }
     return channelFromResponse(response.channel);
+  }
+
+  async getChannelMembers(channelId: string, limit: number, cursor?: string): Promise<{ members: string[]; nextCursor?: string }> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new SlackApiError("invalid_input", "Invalid member page limit");
+    const response = await callSlack(() => this.client.conversations.members({
+      channel: channelId, limit, ...(optionalCursor(cursor) ? { cursor: optionalCursor(cursor)! } : {}),
+    }));
+    if (!Array.isArray(response.members) || response.members.some(member => typeof member !== "string" || member.length === 0))
+      throw new SlackApiError("invalid_slack_response", "Slack response did not include complete members");
+    const nextCursor = optionalCursor(response.response_metadata?.next_cursor);
+    return { members: response.members, ...(nextCursor ? { nextCursor } : {}) };
   }
 
   async listUsers(limit: number, cursor?: string): Promise<SlackUserPage> {

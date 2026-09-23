@@ -305,6 +305,23 @@ CREATE TRIGGER approval_execution_marker_no_delete BEFORE DELETE ON approval_exe
 `;
 const schemaV5Sql = schemaV4Sql.replace("CHECK(version=4)", "CHECK(version=5)")
   .replace("INSERT INTO approval_schema VALUES (4)", "INSERT INTO approval_schema VALUES (5)") + executionMarkerSql;
+const supervisorBindingSql = `
+CREATE TABLE approval_supervisor_bindings (
+  instance_id TEXT NOT NULL, workspace_id TEXT NOT NULL, binding_json TEXT NOT NULL
+    CHECK(json_valid(binding_json) AND length(CAST(binding_json AS BLOB)) BETWEEN 1 AND 8192),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  PRIMARY KEY(instance_id,workspace_id)
+) STRICT;
+CREATE TRIGGER approval_supervisor_binding_no_delete BEFORE DELETE ON approval_supervisor_bindings
+  BEGIN SELECT RAISE(ABORT,'approval_binding_retention'); END;
+CREATE TRIGGER approval_supervisor_binding_identity BEFORE UPDATE OF instance_id,workspace_id ON approval_supervisor_bindings
+  BEGIN SELECT RAISE(ABORT,'approval_binding_identity'); END;
+CREATE TRIGGER approval_supervisor_binding_revision BEFORE UPDATE ON approval_supervisor_bindings
+  WHEN NEW.revision IS NOT OLD.revision+1
+  BEGIN SELECT RAISE(ABORT,'approval_binding_revision'); END;
+`;
+const schemaV6Sql = schemaV5Sql.replace("CHECK(version=5)", "CHECK(version=6)")
+  .replace("INSERT INTO approval_schema VALUES (5)", "INSERT INTO approval_schema VALUES (6)") + supervisorBindingSql;
 
 function shape(db: Database.Database): string {
   return JSON.stringify(db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE substr(lower(name),1,9)='approval_' OR substr(lower(tbl_name),1,9)='approval_' ORDER BY type,name").all());
@@ -316,7 +333,7 @@ function verifiedVersion(db: Database.Database): number {
   try {
     if (expectedShapes === undefined) {
       const computed = new Map<number, string>();
-      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql], [5, schemaV5Sql]] as const) {
+      for (const [version, sql] of [[1, schemaSql], [2, schemaV2Sql], [3, schemaV3Sql], [4, schemaV4Sql], [5, schemaV5Sql], [6, schemaV6Sql]] as const) {
         const expected = new Database(":memory:");
         try { expected.exec(sql); computed.set(version, shape(expected)); }
         finally { expected.close(); }
@@ -488,5 +505,33 @@ export function installApprovalExecutionMarkerSchema(db: Database.Database): voi
   } catch { throw new ApprovalSchemaError(); }
 }
 export function verifyApprovalExecutionMarkerSchema(db: Database.Database): void {
-  if (verifiedVersion(db) !== 5) throw new ApprovalSchemaError();
+  if (verifiedVersion(db) < 5) throw new ApprovalSchemaError();
+}
+/** 明示的なv5->v6移行。binding、保護generation、operator権限は作成しない。 */
+export function installApprovalSupervisorBindingSchema(db: Database.Database): void {
+  try {
+    loadSecurityExtension(db);
+    if (db.inTransaction) throw new ApprovalSchemaError();
+    withSecurityTransactionLock(db, () => {
+      db.transaction(() => {
+        assertSecurityDurability(db); verifyOpenDatabaseFile(db); verifyIntegrityInside(db);
+        const version = verifiedVersion(db);
+        if (version < 5) throw new ApprovalSchemaError();
+        if (version === 5) {
+          db.exec("DROP TABLE main.approval_schema");
+          db.exec("CREATE TABLE approval_schema (version INTEGER PRIMARY KEY CHECK(version=6)) STRICT; INSERT INTO approval_schema VALUES (6)");
+          db.exec(supervisorBindingSql);
+          verifyIntegrityInside(db);
+        }
+        verifyOpenDatabaseFile(db);
+      }).immediate();
+      verifyOpenDatabaseFile(db);
+    });
+  } catch { throw new ApprovalSchemaError(); }
+}
+export function verifyApprovalSupervisorBindingSchema(db: Database.Database): void {
+  if (verifiedVersion(db) !== 6) throw new ApprovalSchemaError();
+}
+export function approvalSupervisorBindingRequired(db: Database.Database): boolean {
+  return verifiedVersion(db) === 6;
 }
