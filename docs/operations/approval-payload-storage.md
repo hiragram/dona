@@ -1,0 +1,32 @@
+# 承認payloadの保存schemaとbackup境界
+
+Issue #16の段階的な実装。`installApprovalPayloadSchema`は承認schema v3からv4への明示的な移行だけを行う。Dispatcherの`user_version`とは独立し、通常起動では呼ばない。既存record、clock、audit rootを作り直さず、鍵やproviderをprovisionしない。
+
+## 保存と削除
+
+`approval_payload_metadata`はrequestまたはattemptの所有者、request参照、暗号化binding、envelope digest、保持期限、削除状態を持つ。`approval_payload_secrets`にはenvelopeだけを保存する。本文、token、private download URLをmetadataへ格納するAPIではない。
+
+所有者とbindingの対応するfieldはimmutableで、requestはrequest ID、attemptはexact request/consume/attemptの外部キーへ結合する。payload refと所有者slotは一度だけ使用できる。metadataを`deleted`へ更新すると、同じSQLite transactionのtriggerがsecretを削除する。rollbackは両方を戻す。active secretの直接削除、暗号文のUPDATE/REPLACE、削除済みmetadataの復活を拒否する。metadata tombstoneのretention削除はまだ提供しない。
+
+DDLはJSONの最低限の形・byte上限・対応fieldと関係制約を検査する。暗号文の真正性や全binding fieldの意味は[暗号化codec](approval-payload-protection.md)で検証する必要がある。このschemaだけではactive metadataにsecretが必ず存在すること、ownerのcurrent scopeやsemantic hash、期限・terminal stateとpayloadの同時遷移、監査rootとの一致を証明しない。これらを共有ApprovalTransactionへ結合するrepositoryとbrokerは後続工程であり、runtimeの承認・外部送信は有効化しない。
+
+## 全体backupの拒否
+
+既存のDispatcher schema v2→v3 rolloutはDB全体をコピーする。そのため、payload storeのinstallerは導入と同じtransactionでDB headerの[`application_id`](https://sqlite.org/pragma.html#pragma_application_id)へ固定の導入履歴`DONP`を記録する。履歴はtableのrename・dropでも残り、applicationに解除操作はない。未知の既存application IDを上書きせず移行を拒否する。承認v4とWebのschema admissionでは履歴を検証し、監査mutationからの変更も拒否する。旧Web schemaの明示installerは完全なschema検査と履歴付与を同じtransactionで行う。
+
+全体backupはapplication IDが非zeroならコピー前に`schema_full_backup_payload_store_forbidden`で拒否する。導入履歴のない旧DBも保守的に扱い、承認/Webのschema markerまたはpayload tableが存在すれば拒否する。空table・大小文字違いでも例外はない。コピーしてから削除する方法は使わない。
+
+除外検査・件数/digest取得・Online Backupを同一connectionの読取transactionに置き、同じsnapshotへ固定する。backup中に別connectionが追加したtableはそのsnapshotへ混入しない。読取transactionの終了後、migration transaction内で再度検査し、その間にpayload storeが追加された場合もmigrationしない。既存backupの再利用、receipt再読、receipt喪失後の復旧でもsourceとbackupを検査する。拒否時は自動再試行せず、既存backupやreceiptを成功結果へ上書きしない。
+
+この制限はquiesced/drainedの運用前提に追加するもの。[SQLite Online Backup API](https://sqlite.org/backup.html)は全体snapshotのコピーであり、tableの除外機能ではない。[source connection上のwrite transactionはbackupをLOCKEDにする](https://sqlite.org/c3ref/backup_finish.html)ため、読取transactionを使う。
+
+payloadを含まない固定allowlistのmetadata export/restoreはまだ未実装。payload storeを持つDBへの既存rolloutを許可する代替backupは、この変更では提供しない。任意の外部backupソフトやファイルコピーを遮断するものでもない。SQL DELETEはWAL・空きpage・OS上の物理消去を保証しない。DB headerは暗号学的な外部anchorではないため、任意の外部writerによるheader改変や古い未標識DBへのrollbackまで検出するものではない。security decisionの真正性は共有監査・外部anchorによるadmissionで引き続き検証する。
+
+## fixture検証
+
+- v3→v4の明示移行、既存recordの保持、再open、旧installerからの検査、欠落triggerや未知schemaの拒否。
+- metadata/secret削除のrollbackと復活拒否、孤立secret、binding差替え、サイズ上限、attemptのrequest/consume不一致。
+- 空のpayload tableのコピー前拒否、backup中の別connectionからの追加、既存backupとreceiptの全復旧経路。
+- rename後と`secure_delete=OFF`でdropした後、source pageにfixture payloadが残るDBでもコピー前拒否。履歴の再open、監査mutationでの解除拒否、未知application IDと移行rollback。
+
+fixtureのSQL制約とsnapshot検証であり、実credential、production backup、復旧operator手順の検証ではない。

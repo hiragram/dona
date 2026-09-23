@@ -1,0 +1,25 @@
+# 過去の承認clock markと共有監査
+
+`ApprovalClockHistory`は、SQLの`approval_clock_reservations`に保存した過去markの全フィールドを、現在の共有監査rootへ照合する。recordの`clock_transaction_id`だけが認証されていても、参照先のboot IDやcontinuous clockが認証されるわけではない。この履歴を、brokerが過去の経過時刻を判定する前提として使う。
+
+## 保存と照合
+
+固定collection `approval_clock_marks_v1`のmetadata treeを使い、instance/workspaceとtransaction IDをkeyへ結合する。markは既存のversioned parserでcanonical化し、scopeと用途別domainを含むSHA-256 digestをleafへ保存する。rootの正本は共通audit v3の`approval_clock_marks` resource commitmentであり、別の監査sequenceや外部CASは作らない。
+
+`prepare`は、実行中の監査read callbackのstateと現在markから一件の追加計画を作る。SQL markそのものは既存の`ApprovalTransaction`が挿入する。計画のmutationは一度だけ、同じconnection・同じ保護clock transactionの中で実行できる。挿入済みSQL markと計画のmarkが全フィールド一致した後だけ、metadata nodeを保存・再読する。別mark、既存transaction、履歴の上書き、二重実行は拒否する。
+
+`readInState`は同じ監査callback内で、current root、scope、bounded SQL mark、canonical表現、digestを照合する。欠落したnodeやSQL row、不正wire、異なるboot/continuous/UTCへのSQL-only改変を空値へ変換しない。SQL rowもleafも存在しないtransactionだけが`null`になる。SQLにだけ存在するlegacy markは、履歴の認証済み証拠として返さない。
+
+## 同じtransactionへの接続
+
+新しいbrokerの保存経路では`ApprovalHistoryTransaction.runPrepared`を使う。内部では既存の`ApprovalTransaction`だけがclock予約・writer lock・SQL transaction・監査reserve/finalizeを所有する。wrapperは現在markの履歴計画を必ず追加し、record/payloadなどのcommitmentとscopeを照合して順序を整える。callerによるhistory root指定、別scope、重複root、不正planは監査reserve前に拒否する。eventには実際の非null resource IDを要求し、historyのために書き換えない。
+
+history nodeと業務mutationは同じcommitへ保存する。nodeやSQLの途中失敗では両方がrollbackするが、外部anchor予約を取り消して再利用しない。finalizeの応答喪失はcommit済みの可能性があるため、同じwriteを再試行せず、durableな監査状態から確認する。
+
+## 継続する境界
+
+rootの初期化は別途operator admissionが必要で、欠落rootへの自動fallbackやlegacy markの自動取り込みは提供しない。試験だけが既知の空storageへ明示的なfixture rootを作る。既存の`ApprovalTransaction`を直接使った過去の処理に、この履歴保証を遡及適用しない。
+
+履歴を読めてもactor認可や現在のTTLを判定したことにはならない。brokerは同じtransactionで認証済みrecordとの参照・作成時刻を照合し、現在のprotected markに対するboot一致、continuous clockの非巻戻り、保存済みexpiryを検証する必要がある。boot変更時の復旧admission、brokerのdecision/consume、履歴retention、production providerは継続作業である。metadataの全履歴削除を実装するまでは、history treeとmarkを削除しない。
+
+fixtureではrecord・payload・historyの三rootをcreate/consumeで同時commitし、再open、SQL-only改変、未追跡mark、失効state、node障害とanchor応答喪失を確認する。実credential・実IdP/WebAuthn・production activationの証拠ではない。

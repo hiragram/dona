@@ -1,0 +1,39 @@
+# 承認のone-shot consumeと実行attempt
+
+`ApprovalConsumeBroker`は、approved requestを一度だけ使用し、consume ledgerと`claimed` execution attemptを同じ共有監査transactionへ保存する。claimは外部実行の成功や送信開始を意味しない。このcomponentは外部callを行わない。
+
+## consumerの認証と現在条件
+
+callerが渡すのはrequest handle、authority ref、期待する現在request revisionだけである。`ApprovalConsumeAuthority`はtrusted runtimeの内部consumer専用portとして、認証済みconnectionと保存済みdecision eventへの結合、consumerの操作権限、current binding/policy、requester authorization、supervisor visibility、shared状態、exact snapshot、closed operation allowlistを毎回確認する。
+
+request/event/decision IDの所持だけでgrantを返してはいけない。grantが指すscope/request/approve decisionとevent outboxを共有repositoryで照合する。実providerや公開APIのdefaultは追加せず、実認証・オンライン再照合を接続するまでruntimeで有効にしない。
+
+新規claimはrequestの`approved`と現在revisionを条件にする。取消・失効・consumeを同じwriter coordinationと監査transactionで競合させ、先着した状態を上書きしない。binding/policy/snapshot/visibilityの変化は未consume requestを`needs_review`へ固定し、本文を同時に削除する。consume済みattemptをその経路で取り消したり、新しいattemptへ置換したりしない。
+
+approve decisionに結合したcardとpresentation revisionも確認し、通知markerを現在の保持鍵で再検証する。失効・未知version・用途不一致ならclaimしない。作成・approval・既存claimのclockを共有監査履歴へ照合し、boot/continuous/UTCの順序が証明できない場合は停止する。
+
+## 期限と一度限りの保存
+
+consumeはapproval後5分の保存済み期限と同じ時刻から拒否する。request作成時の15分期限を再適用して、期限直前の正規approvalを無効にすることはしない。期限に達した未consume requestは`consume_expired`とpayload削除へ同時に進める。
+
+新規claimではrequestを`consumed`へ進め、別tableのconsume ledgerとexecution attemptを一件ずつ保存する。opaque consume/attempt IDと保存状態だけを返し、本文、snapshot、MAC、鍵、targetを返さない。
+
+外部callを開始できる期限はclaimから最大30秒とし、保存済みconsume期限も越えない固定値である。callerから期限の延長を受け付けない。attempt payloadの最大保持はclaimから24時間。この保持期間は外部送信を許す期間ではない。
+
+duplicateは現在のconsumer認可と保存済みdecision/eventの一致を確認したうえで、同じledger・attempt・保存状態へ収束する。期限後も別attemptを作らず、payloadの再暗号化や実行期限の延長をしない。`reused`を再送の許可として扱ってはいけない。
+
+## payloadの移動と表示
+
+request payloadは共有監査root、owner/request/scope、snapshot/hash、content MAC、payload refを照合し、保持鍵で復号・認証する。本文が欠落または検証不能ならrequestを`needs_review`へ進め、新attemptは作らない。
+
+新規claimでは新しいattempt owner/refと別DEKで本文をsealし、request payloadの削除とattempt payloadの作成を一つのpayload mutationへまとめる。content MACとimmutable snapshotは維持するため、旧content検証鍵と新しいactive wrapping鍵でrotationをまたいで移動できる。record、payload、clock履歴のrootは同じ監査commitへ結合する。
+
+decisionとconsumeが使うclock照合・pending通知のabort・送信済み表示の更新outbox・不要payload削除は`ApprovalRequestLifecycle`へまとめる。このhelperは認可や外部送信を提供せず、認可済みbrokerの同じprepareと保護clock mutation内だけで使う。presentation outboxの作成を実表示の更新成功とみなさず、先行updateの結果不明を後続workerが飛び越えてはならない。
+
+## 検証と残る接続
+
+fixtureでclaimとcancelの先着、duplicate、5分境界、30秒上限、rotation、scope/decision/event不一致、権限・policy drift、本文欠落、鍵失効、SQL/audit障害、再openを検証する。
+
+競合テストでは二つの実Node processを同じSQLiteへ接続する。一方が実writer lockを保持する間にもう一方がconsumeを一回呼び、loserがclock/audit予約前に失敗すること、winnerだけがledger・attempt・payload移動をcommitすることを確認する。loserは自動再実行しない。共有JSON head providerはこのテスト専用であり、production credential storeやrollback耐性の証拠にはしない。
+
+`claimed`から`executing`へのTOCTOU再検証、実executor、receipt settlement、acceptance-unknown reconcile、期限後のattempt payload削除、boot/restore recovery、実consumer/binding/operator providerは継続作業である。#16全体、実Slack/IdP/WebAuthn、production activationの完了を示さない。

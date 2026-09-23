@@ -1,0 +1,37 @@
+# 承認decision・cancel・期限切れのdurable core
+
+`ApprovalDecisionBroker`は、作成済みrequestへapprove/reject/cancelを記録し、内部expiry worker向けに一件の期限判定を行う。request、decision、event outbox、presentation update outbox、payload削除、clock履歴を既存の共有監査transactionへまとめる。外部API、配送worker、consume、executorはまだ接続しない。
+
+## 認証済みadapterとの境界
+
+`ApprovalDecisionAuthority`はtrusted runtime専用の同期read-only portである。commandの`authority_ref`を認証済みtransport connectionとdurable inboxへ結び、actorのrequest操作権限、current binding/policy、requester authorization、supervisor visibility、shared状態、exact snapshotを都度確認する。actor IDやproofらしい文字列の所持を認可にしない。実adapterとdefault providerは本componentに含まれない。
+
+portには同じtransactionの`VerifiedAuditState`を渡し、共有repositoryをそのcallback内だけで読める。callback内のSQL writeは拒否される。外部APIの結果を無期限のallow cacheへ置き換えることも認めない。実transport接続では、オンライン照合とこの同期transactionを結ぶ一回限りの証明を別途実装する必要がある。
+
+callerはopaque request handle、authority ref、action、期待revision、approve/rejectのpresentation revisionだけを渡す。approve/rejectの期待revisionはcard作成時に結合した`request_revision`、cancelは現在のrequest revisionである。配送でrequestが`sent`になりrevisionが進んでも、同じcardのapprove/rejectを現在revisionとの二重比較で拒否しない。現在のstate・binding・policy・snapshotは同じtransactionで別途照合する。actor、binding、policy、MAC、状態の自己申告は受けない。grantのscope/request/actorを照合し、approve/rejectでは保存済みcardの`sent`、exact message ref、presentation revision、元request revisionも照合する。markerは保存済み作成clockと現在の保持鍵で再検証し、失効・用途違い・未知versionならdecisionを確定しない。proof不一致があるときは、同時にpolicyが変化していてもrequestを変更しない。
+
+認証済みactorに対してcurrent binding/policy/snapshot/visibilityの不一致を確認した場合は、未決定またはapproved requestを`needs_review`へ固定する。不一致を無視して保存済みapprovalを再利用しない。
+
+## decision slotと期限
+
+approve/rejectはrequestとapproval cardがともに`sent`のときだけ確定する。requestごとのsingle decision slotへ一件だけ記録し、同じactor・action・presentationのduplicateは既存decisionへ収束する。異なるdecisionは拒否し、新しいeventやexpiryを作らない。
+
+requesterはdecision前にcancelできる。approveが先着した後でも、未consumeかつcurrent revisionが一致すれば`execution_cancelled`へ進める。この場合、最初のapprove decisionをcancelへ書き換えない。consume後の取消や実行の強制中断は行わない。
+
+request TTLは15分、approve後のconsume TTLは5分で、期限と同じ時刻からexpiredと扱う。request作成とapproveのclock markを共有監査root付き履歴で認証し、現在の保護clockとboot・continuous・UTCの順序を照合する。duplicateでconsume期限を延長しない。期限到来した未決定requestは`expire` decisionと`expired` stateへ、approved requestはdecisionを保持して`consume_expired`へ進める。
+
+`expire()`はtrusted内部worker専用の一件処理である。全件sweepの走査完了やprocess schedulingを提供しない。boot変更・clock巻戻しは既存transaction境界で停止する。新bootのoperator recovery admissionと、全未完了recordを処理する復旧workerは継続作業であり、このmethodで自動回復したとは扱わない。
+
+## 本文と表示の後処理
+
+approve時は保存済みpayloadのscope/request/snapshot/MAC/refを照合し、保持鍵でenvelopeと本文bindingを検証する。検証に失敗したpayloadを承認済み本文として使わず、`needs_review`へ進めて削除する。復号した本文をdecision結果、audit、event、presentation outboxへ保存しない。
+
+新しいdecisionには一件の`dona_approval.decision.v1` event outboxを同時作成する。decisionの確定または無効化では、まだ`pending`の通知を`aborted`へ進める。すでに送信済みのcard/noticeには、requestの新revisionに対応するpresentation updateを一件ずつ記録する。外部表示を更新済みとする証拠ではなく、redactedな表示へ収束させる後続workerの入力である。先行updateの`dispatching`/`acceptance_unknown`を飛び越えて送信してはいけない。
+
+reject/cancel/expired/needs_review/execution_cancelled/consume_expiredではrequest payloadを同じtransactionで削除する。approveはconsumeのためにpayloadを保持する。`dispatching`/`acceptance_unknown`の遅着通知はここで送信済みに変更せず、配送reconcile側でterminal requestを復活させずに扱う。
+
+## 検証範囲
+
+fixtureでsingle decision、duplicate、approve/cancelの先着順、15分・5分の境界、proofとpolicy driftの優先順位、鍵失効、payload欠落、clock改変、SQL/audit障害、再openを検証する。SQLと監査anchorの部分commit/応答喪失を区別し、受理不明のwriteを自動再実行しない。
+
+実source/binding/transport認証、二者operator admission、並行consume、配送・presentation・event worker、expiry sweep、実IdP/WebAuthnとproduction activationは未接続である。#16全体やEpicの完了を示すものではない。

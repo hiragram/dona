@@ -1,0 +1,25 @@
+# 承認recordとindexの一括保存
+
+`ApprovalRecordMutation.prepare(mark, state, changes)`を共有`ApprovalTransaction.runPrepared`の同期prepareへ接続する。現在のscopeに一致する`approval_records` root、SQL旧record、親参照、既存aliasとall/active membershipを照合してから、最終recordと固定indexを一つのmetadata planにまとめる。rootやmanifestの欠落を空DBへ自動補完しない。
+
+この内部componentは、brokerの認可付き操作を完成させるものではない。event、actor、現在binding/policy、TTL、visibility、完全な状態遷移とpayload lifecycleをbrokerが別途検証し、必要なrecord/outbox変更を渡す。生の外部requestやLLM出力を`changes`へ直接渡さない。認証済みprovider、runtime、retention/GC、payload削除は後続作業であり、Issue #16は部分対応のままとする。
+
+## 準備と保存
+
+最大16件・canonical previous/next合計8MiB、既存metadata planの32 point・64変更・256 walkの上限を維持する。全旧recordを先に認証し、新recordは同一batchのoverlayから親を参照して検証する。consume/attemptの循環FKやdecision/eventの入力順に依存せず、SQLは固定の親優先順へ並べる。新recordの保護時計参照とcreated/decided/claimed時刻は、このprepareのmarkと一致させる。既存SQL trigger相当のmutable制約もreserve前に検証する。
+
+返却する`resource_commitments`はscopeと`approval_records`を固定する。eventのresource IDにrootの保存先を委ねず、Web等の別resource rootを保持する。返却mutationは同じnative clock transactionで一度だけSQLとmetadataを書き、例外を共有監査transactionへ伝播させる。準備済みclosureを別transactionへ再利用しない。stage失敗やanchor応答喪失を成功や自動retryへ変換しない。
+
+## 固定index
+
+全recordのall listへ実SQL primaryを登録し、履歴と一度使ったaliasを解放しない。requestは未decisionとapproved、executionはclaimed/executing/acceptance_unknown、notification/presentationはpending/dispatching/acceptance_unknown、eventはpendingをactiveとして扱う。decision/consumeにactive listは作らない。
+
+creation key、decision ID、consume ID/decision/attempt、execution request/consume、notification request/kind/message、event decision、presentation revisionを固定aliasへ結合する。既存recordのalias欠落・不一致は保存整合性の障害として扱い、新primaryによる一意aliasの衝突はSQL UNIQUEへの書込み前に拒否する。
+
+presentationのmessage fenceはdispatching/acceptance_unknownだけが保持する。終了するholderを先に解放してから次のholderを取得し、SQLのunique indexも同じ順序で更新する。acceptance unknownのholderが残る場合は後続writeを拒否する。解放可能なaliasは`presentation_active_message`だけで、null tombstoneを残す。
+
+membership検証は指定memberと隣接参照の局所検証であり、全履歴の走査やexpiry sweepの進捗保証ではない。初期manifestの作成は明示bootstrapの責務とし、fixtureの空DB初期化を本番の採用手順にしない。
+
+## 検証
+
+fixtureのSQLite/native guardと共有監査を使い、requestと2種notification、配送、decision/event、one-shot consume/attempt、cancelと2つの無効表示outbox、message fence引継ぎ、unknown中の後続write拒否、alias重複、reserve前の拒否、SQL後のmetadata障害、anchor応答喪失、別clock transactionでのclosure再利用拒否を検証する。実Slackへの送信、認可済みoperator/adapter、実provider、payload削除や本番運用の証拠ではない。
