@@ -1,5 +1,7 @@
 import http from "node:http";
 
+import { readPrivateToken } from "./private-token.js";
+
 export class DispatcherClientError extends Error {
   constructor(readonly statusCode: number | undefined, message: string, readonly body?: unknown) {
     super(message);
@@ -8,7 +10,8 @@ export class DispatcherClientError extends Error {
 }
 
 export class DispatcherApiClient {
-  constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
+  constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000,
+    private readonly internalTokenPath?:string) {}
 
   createJob(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/jobs", input);
@@ -66,6 +69,19 @@ export class DispatcherApiClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`, input);
   }
+  async sendWorkerInstruction(jobId:string,input:unknown):Promise<Record<string,unknown>> {
+    const token=this.internalTokenPath?await readPrivateToken(this.internalTokenPath):undefined;
+    if(!token)throw new DispatcherClientError(undefined,"Dona internal credential is unavailable");
+    return this.request("POST",`/v1/jobs/${encodeURIComponent(jobId)}/messages/instructions`,input,{"x-dona-internal-token":token});
+  }
+  getWorkerMessage(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({source_event_id:sourceEventId});
+    return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}?${query}`);
+  }
+  reconcileWorkerMessage(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>> {
+    const query=new URLSearchParams({source_event_id:sourceEventId,producer:"dona-main",idempotency_key:idempotencyKey});
+    return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/reconcile?${query}`);
+  }
   previewSchedule(input: unknown) { return this.request("POST", "/v1/schedules/preview", input); }
   createSchedule(input: unknown) { return this.request("POST", "/v1/schedules", input); }
   getSchedule(scheduleId: string, sourceEventId: string) { return this.request("GET", `/v1/schedules/${encodeURIComponent(scheduleId)}?source_event_id=${encodeURIComponent(sourceEventId)}`); }
@@ -90,7 +106,7 @@ export class DispatcherApiClient {
     return this.request("POST", "/v1/self-update/cancel", input);
   }
 
-  private request(method: string, route: string, body?: unknown): Promise<Record<string, unknown>> {
+  private request(method: string, route: string, body?: unknown,extraHeaders:Record<string,string>={}): Promise<Record<string, unknown>> {
     const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     return new Promise((resolve, reject) => {
       const request = http.request({
@@ -100,7 +116,8 @@ export class DispatcherApiClient {
         headers: encoded ? {
           "content-type": "application/json",
           "content-length": encoded.length,
-        } : undefined,
+          ...extraHeaders,
+        } : extraHeaders,
       }, (response) => {
         const chunks: Buffer[] = [];
         let size = 0;

@@ -247,25 +247,33 @@ export class JobSupervisor {
     this.running = false;
   }
 
-  steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult> {
+  steer(jobId: string, sourceEventId: string, instruction: string, operationId = sourceEventId): Promise<JobControlResult> {
     return this.serialized(jobId, async () => {
       const current = this.database.getJob(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (["queued", "retryable_failed"].includes(current.status)) {
-        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
+        const duplicate=this.database.hasAcceptedJobSteerReceipt(jobId,operationId);
+        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction, operationId);
         this.wake();
-        return { row, duplicate: current.steer_event_id === sourceEventId && current.steer_state === "accepted" };
+        return { row, duplicate };
       }
-      const begun = this.database.beginJobSteer(jobId, sourceEventId);
-      if (begun.duplicate) return begun;
+      if(current.status==="blocked")await this.active.get(jobId)?.operation;
+      const begun = this.database.beginJobSteer(jobId, sourceEventId, operationId);
+      if (begun.duplicate) {
+        if(current.status==="blocked"&&begun.row.status==="running"&&!this.stopping)this.launch(begun.row);
+        return begun;
+      }
       const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal);
       if (prompted.ok) {
-        this.database.markJobSteerAccepted(jobId, sourceEventId);
-        return { row: this.database.getJob(jobId)!, duplicate: false };
+        const accepted=this.database.markJobSteerAccepted(jobId, operationId);
+        if(begun.row.status==="blocked"){
+          if(!this.stopping)this.launch(accepted);
+        }
+        return { row: accepted, duplicate: false };
       }
       if (!prompted.timedOut && prompted.errorCode === "agent_blocked") {
-        this.database.clearJobSteer(jobId, sourceEventId);
-        this.database.markJobBlocked(jobId, "Background agent is waiting for approval or human input");
+        this.database.clearJobSteer(jobId, operationId);
+        if(begun.row.status==="running")this.database.markJobBlocked(jobId, "Background agent is waiting for approval or human input");
         this.wake();
         throw new Error(`Job ${jobId} is blocked and could not accept steer input`);
       }
@@ -684,9 +692,10 @@ export class JobSupervisor {
     if (this.stopping) return;
     if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     const dispatching = this.database.beginJobDispatch(row.job_id);
+    const runtimeIdentity=this.database.getJobLiveSessionIdentity(row.job_id)?.herdr_agent_session_id;
     const prompted = await this.runtime.prompt(
       dispatching.agent_name,
-      buildJobPrompt(dispatching, this.progress !== undefined),
+      buildJobPrompt(dispatching, this.progress !== undefined,runtimeIdentity,this.config.workerSocketPath),
       this.abortController.signal,
       this.config.jobPromptTimeoutMs,
     );

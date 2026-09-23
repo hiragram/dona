@@ -14,6 +14,7 @@ import { readPrivateToken } from "./private-token.js";
 import { UpdaterClientError } from "./updater-client.js";
 import { ScheduleApiError, ScheduleApiService } from "./scheduler/api.js";
 import { ScheduleError } from "./scheduler/errors.js";
+import { WorkerMessageError } from "./worker-messaging.js";
 import {
   jobKeyPattern,
   parseCancelJobRequest,
@@ -135,6 +136,7 @@ export interface ApiJobProgressResolver {
 
 export class DispatcherApi {
   private server: http.Server | undefined;
+  private workerServer:http.Server|undefined;
   private shuttingDown = false;
   private quiesceOperationId: string | undefined;
   private quiescePromise: Promise<void> | undefined;
@@ -160,39 +162,71 @@ export class DispatcherApi {
   disableJobProgress(): void { this.jobProgress = undefined; }
 
   async start(): Promise<void> {
-    await fs.mkdir(path.dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(this.config.socketPath), 0o700);
     await fs.mkdir(this.config.resultsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.config.resultsDir, 0o700);
+    this.server=await this.startServer(this.config.socketPath,false);
     try {
-      await fs.lstat(this.config.socketPath);
-      if (await socketIsAlive(this.config.socketPath)) {
-        throw new Error(`Another dispatcher is already listening on ${this.config.socketPath}`);
-      }
-      await fs.unlink(this.config.socketPath);
-      this.logger.warn("Removed stale dispatcher socket", { socket_path: this.config.socketPath });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.workerServer=await this.startServer(this.config.workerSocketPath,true);
+    } catch(error) {
+      await this.closeServer(this.server,this.config.socketPath);
+      this.server=undefined;
+      throw error;
     }
+    this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
+  }
 
-    this.server = http.createServer((request, response) => void this.handle(request, response));
+  private async startServer(socketPath:string,workerOnly:boolean):Promise<http.Server> {
+    const socketDirectory=path.dirname(socketPath);
+    const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
+    if(!workerOnly||createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
+    if(workerOnly){
+      const currentUid=typeof process.getuid==="function"?process.getuid():undefined;
+      for(let ancestor=path.resolve(socketDirectory);;ancestor=path.dirname(ancestor)){
+        const ancestorStat=await fs.lstat(ancestor);
+        const ownerTrusted=currentUid===undefined||ancestorStat.uid===currentUid||ancestorStat.uid===0;
+        const acceptableType=ancestorStat.isDirectory()||ancestorStat.isSymbolicLink();
+        const replaceable=ancestorStat.isDirectory()&&(ancestorStat.mode&0o022)!==0
+          &&((ancestorStat.mode&0o1000)===0||ancestor===path.resolve(socketDirectory));
+        if(!ownerTrusted||!acceptableType||replaceable)
+          throw new Error("Worker socket ancestor is replaceable or not owned by a trusted user");
+        if(ancestor===path.dirname(ancestor))break;
+      }
+      const canonicalDirectory=await fs.realpath(socketDirectory);
+      for(let ancestor=canonicalDirectory;;ancestor=path.dirname(ancestor)){
+        const directoryStat=await fs.lstat(ancestor);
+        const ownerTrusted=currentUid===undefined||directoryStat.uid===currentUid||directoryStat.uid===0;
+        const writableByOthers=(directoryStat.mode&0o022)!==0;
+        const sticky=(directoryStat.mode&0o1000)!==0;
+        if(!directoryStat.isDirectory()||!ownerTrusted||(writableByOthers&&(!sticky||ancestor===canonicalDirectory)))
+          throw new Error("Worker socket ancestor is replaceable or not owned by a trusted user");
+        if(ancestor===path.dirname(ancestor))break;
+      }
+    }
+    try {
+      await fs.lstat(socketPath);
+      if(await socketIsAlive(socketPath))throw new Error(`Another dispatcher is already listening on ${socketPath}`);
+      await fs.unlink(socketPath);
+      this.logger.warn("Removed stale dispatcher socket",{socket_path:socketPath});
+    } catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error; }
+    const server=http.createServer((request,response)=>void this.handle(request,response,workerOnly));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error);
-      this.server!.once("error", onError);
-      this.server!.listen(this.config.socketPath, () => {
-        this.server!.off("error", onError);
+      server.once("error", onError);
+      server.listen(socketPath, () => {
+        server.off("error", onError);
         resolve();
       });
     });
-    await fs.chmod(this.config.socketPath, 0o600);
-    this.logger.info("Dispatcher API started", { socket_path: this.config.socketPath });
+    try { await fs.chmod(socketPath,0o600); }
+    catch(error) { await new Promise<void>(resolve=>server.close(()=>resolve())); try{await fs.unlink(socketPath);}catch{} throw error; }
+    return server;
   }
 
   beginShutdown(): void {
     this.shuttingDown = true;
   }
 
-  private readiness(): { ready: boolean; scheduler: Record<string, unknown> } {
+  private readiness(): { ready: boolean; scheduler: Record<string, unknown>; worker_messaging: Record<string, unknown> } {
     let ready = !this.shuttingDown && this.worker.isRunning() && this.jobs.isRunning() &&
       (this.updateNotifications?.isRunning() ?? true) && (this.updateNotifications?.isHealthy?.() ?? true);
     let operations: ReturnType<DispatcherDatabase["scheduler"]["operationalSnapshot"]> | undefined;
@@ -203,37 +237,49 @@ export class DispatcherApi {
     const scheduler = this.schedulerState?.operationalState();
     ready = ready && operations !== undefined && (scheduler?.running ?? true) && operations.authorization_expired === 0 &&
       operations.stale_claims === 0 && operations.retention_overdue === 0;
-    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations } };
+    let workerMessaging: Record<string, unknown>;
+    try {
+      workerMessaging = this.database.workerMessages.operationalSnapshot();
+      if(workerMessaging.degraded===true)ready=false;
+    }
+    catch {
+      ready = false;
+      workerMessaging = { protocol_version: 1, degraded: true, error_code: "worker_message_storage_unavailable" };
+    }
+    return { ready, scheduler: operations === undefined ? { ...scheduler, error_code: "scheduler_storage_unavailable" } : { ...scheduler, ...operations }, worker_messaging: workerMessaging };
   }
 
   async stop(): Promise<void> {
     this.beginShutdown();
-    const ownsSocket = this.server?.listening === true;
-    if (this.server?.listening) {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.close((error) => (error ? reject(error) : resolve()));
-      });
-    }
+    await Promise.all([this.closeServer(this.server,this.config.socketPath),this.closeServer(this.workerServer,this.config.workerSocketPath)]);
     this.server = undefined;
-    if (!ownsSocket) return;
-    try {
-      await fs.unlink(this.config.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    this.workerServer=undefined;
     this.logger.info("Dispatcher API stopped");
   }
 
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async closeServer(server:http.Server|undefined,socketPath:string):Promise<void> {
+    const ownsSocket=server?.listening===true;
+    if(server?.listening)await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    if(!ownsSocket)return;
+    try { await fs.unlink(socketPath); }
+    catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error; }
+  }
+
+  private async handle(request: IncomingMessage, response: ServerResponse,workerOnly=false): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      if(workerOnly){
+        const report=request.method==="POST"&&/^\/v1\/jobs\/[^/]+\/messages\/reports$/.test(url.pathname);
+        const reconcile=request.method==="GET"&&/^\/v1\/jobs\/[^/]+\/messages\/reconcile$/.test(url.pathname)&&url.searchParams.get("producer")==="worker";
+        if(!report&&!reconcile)throw new ApiRequestError(404,"not_found","Route not found");
+      }
       if (request.method === "GET" && url.pathname === "/health/live") {
         sendJson(response, 200, { schema_version: 1, status: "live" });
         return;
       }
       if (request.method === "GET" && url.pathname === "/health/ready") {
         const health = this.readiness();
-        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler });
+        sendJson(response, health.ready ? 200 : 503, { schema_version: 1, status: health.ready ? "ready" : "not_ready", scheduler: health.scheduler, worker_messaging: health.worker_messaging });
         return;
       }
       if (request.method === "GET" && url.pathname === "/metrics/scheduler") {
@@ -256,6 +302,7 @@ export class DispatcherApi {
           app_schema_write: appSchema.write,
           config: 1,
           scheduler: health.scheduler,
+          worker_messaging: health.worker_messaging,
           ...(this.updateNotifications ? { update_notification_protocol: 1 } : {}),
         });
         return;
@@ -511,6 +558,11 @@ export class DispatcherApi {
         sendJson(response, 503, errorBody("persistence_unavailable", "Event could not be persisted"));
       } else if (error instanceof ApiRequestError) {
         sendJson(response, error.status, errorBody(error.code, error.message,error.details));
+      } else if (error instanceof WorkerMessageError) {
+        const status = error.code === "job_not_found" || error.code === "delivery_not_found" ? 404
+          : error.code === "job_binding_mismatch" || error.code === "worker_runtime_mismatch" ? 403
+            : error.code.startsWith("invalid_") || error.code === "worker_message_too_large" ? 400 : 409;
+        sendJson(response, status, errorBody(error.code, error.message));
       } else if (error instanceof ScheduleApiError) {
         sendJson(response, error.status, errorBody(error.code, error.message));
       } else if (error instanceof Error && error.name === "ZodError") {
@@ -646,6 +698,14 @@ export class DispatcherApi {
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 
+  private async authorizedDonaInternalRequest(request:IncomingMessage):Promise<boolean> {
+    const supplied=request.headers["x-dona-internal-token"];
+    if(typeof supplied!=="string")return false;
+    const expected=await readPrivateToken(this.config.updateInternalTokenPath);
+    if(!expected||supplied.length!==expected.length)return false;
+    return timingSafeEqual(Buffer.from(supplied),Buffer.from(expected));
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -706,9 +766,80 @@ export class DispatcherApi {
       const candidates = this.database.listThreadJobs(workspaceId, channelId, threadTs, 101);
       sendJson(response, 200, {
         schema_version: 1,
-        jobs: candidates.slice(0,100),
+        jobs: candidates.slice(0,100).map(job=>({...job,pending_worker_question:this.database.workerMessages.pendingQuestion(job.job_id)??null})),
         truncated: candidates.length > 100,
       });
+      return;
+    }
+    const messageCollection = /^\/v1\/jobs\/([^/]+)\/messages\/(reports|instructions)$/.exec(url.pathname);
+    if (request.method === "POST" && messageCollection) {
+      const jobId = decodeURIComponent(messageCollection[1]!);
+      if(messageCollection[2]==="instructions"&&!await this.authorizedDonaInternalRequest(request))
+        throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");
+      const input = await this.readJson(request) as Record<string,unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
+      const result = messageCollection[2] === "reports"
+        ? this.database.workerMessages.appendWorkerReport(jobId,runtimeIdentity,input)
+        : this.database.workerMessages.appendInstruction(jobId, input);
+      if (messageCollection[2] === "reports") {
+        try { this.database.workerMessages.publishPendingReports(); }
+        catch { this.logger.warn("Worker message delivery deferred after durable acceptance", {
+          error_code:"worker_message_delivery_deferred",
+        }); }
+        this.worker.wake();
+      }
+      sendJson(response, result.outcome === "created" ? 202 : 200, {
+        schema_version: 1,
+        outcome: result.outcome,
+        message: this.database.workerMessages.project(result.message),
+        receipt: { receipt_id: result.receipt_id, kind: "accepted" },
+      });
+      return;
+    }
+    const messageReconcile = /^\/v1\/jobs\/([^/]+)\/messages\/reconcile$/.exec(url.pathname);
+    if (request.method === "GET" && messageReconcile) {
+      const producer = url.searchParams.get("producer");
+      if (producer !== "worker" && producer !== "dona-main") throw new ApiRequestError(400, "invalid_request", "producer is invalid");
+      const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+      const idempotencyKey = url.searchParams.get("idempotency_key") ?? "";
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
+      const reconciled=producer==="worker"
+        ? this.database.workerMessages.reconcileWorker(decodeURIComponent(messageReconcile[1]!),sourceEventId,runtimeIdentity,idempotencyKey)
+        : this.database.workerMessages.reconcile(decodeURIComponent(messageReconcile[1]!),sourceEventId,producer,idempotencyKey);
+      sendJson(response, 200, { schema_version: 1, ...reconciled });
+      return;
+    }
+    const messageRead = /^\/v1\/jobs\/([^/]+)\/messages\/(msg_[0-9a-hjkmnp-tv-z]{26})$/.exec(url.pathname);
+    if (request.method === "GET" && messageRead) {
+      const sourceEventId = url.searchParams.get("source_event_id") ?? "";
+      const row = this.database.workerMessages.getMessage(decodeURIComponent(messageRead[1]!), messageRead[2]!, sourceEventId);
+      if (!row) throw new WorkerMessageError("job_not_found", "message was not found for this job binding");
+      sendJson(response, 200, { schema_version: 1, message: { ...this.database.workerMessages.project(row), payload: JSON.parse(row.payload_json) } });
+      return;
+    }
+    const deliveryClaim = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/claim$/.exec(url.pathname);
+    if (request.method === "POST" && deliveryClaim) {
+      const input = await this.readJson(request) as Record<string, unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
+      if (input.consumer !== "worker" || typeof input.source_event_id !== "string" ||
+        typeof input.lease_owner !== "string" || !Number.isSafeInteger(input.limit) || !Number.isSafeInteger(input.lease_ms)) {
+        throw new ApiRequestError(400, "invalid_request", "delivery claim is invalid");
+      }
+      const deliveries = this.database.workerMessages.claimWorker(decodeURIComponent(deliveryClaim[1]!), input.source_event_id,runtimeIdentity,
+        input.lease_owner, input.limit as number, input.lease_ms as number);
+      sendJson(response, 200, { schema_version: 1, deliveries });
+      return;
+    }
+    const deliveryAck = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/(dlv_[0-9a-hjkmnp-tv-z]{26})\/ack$/.exec(url.pathname);
+    if (request.method === "POST" && deliveryAck) {
+      const input = await this.readJson(request) as Record<string, unknown>;
+      const runtimeIdentity=typeof request.headers["x-dona-worker-runtime"]==="string"?request.headers["x-dona-worker-runtime"]:"";
+      if (typeof input.source_event_id !== "string" || typeof input.lease_owner !== "string" || typeof input.lease_token !== "string" || !Number.isSafeInteger(input.fence)) {
+        throw new ApiRequestError(400, "invalid_request", "delivery acknowledgement is invalid");
+      }
+      const result = this.database.workerMessages.acknowledgeWorker(decodeURIComponent(deliveryAck[1]!), input.source_event_id,runtimeIdentity, deliveryAck[2]!,
+        input.lease_owner, input.lease_token, input.fence as number);
+      sendJson(response, 200, { schema_version: 1, ...result });
       return;
     }
     const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel)|\/live-session-receipts\/([^/]+))?$/.exec(url.pathname);
@@ -752,7 +883,8 @@ export class DispatcherApi {
           sendJson(response,200,projectLiveJobResponse({...refreshed,...this.database.jobNotificationState(jobId)},receipt));
         }
         catch{throw new ApiRequestError(503,"live_session_audit_unavailable","Live session observation could not be durably audited");}
-      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)} });
+      }else sendJson(response, 200, { schema_version: 1, job: {...job,...this.database.jobNotificationState(jobId)},
+        ...(this.database.workerMessages.silenceEventState(jobId,sourceEventId) ?? {}) });
       return;
     }
     if (request.method === "POST" && action === "steer") {

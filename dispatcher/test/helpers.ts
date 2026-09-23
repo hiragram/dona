@@ -11,6 +11,7 @@ export async function tempConfig(): Promise<{ root: string; config: DispatcherCo
     root,
     config: {
       socketPath: path.join(root, "run", "dispatcher.sock"),
+      workerSocketPath:path.join(root,"worker-run","dispatcher.sock"),
       databasePath: path.join(root, "dona.sqlite3"),
       resultsDir: path.join(root, "results"),
       herdrSession: "dona",

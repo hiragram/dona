@@ -17,6 +17,7 @@ import {
   UpdateNotificationWorker,
 } from "./update-notification.js";
 import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
+import { WorkerInstructionBridge, WorkerMessagePublisher } from "./worker-messaging.js";
 
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
@@ -46,6 +47,8 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     ? new JobProgressCoordinator(database, jobProgressStore, config, createLogger("dispatcher_job_progress"))
     : undefined;
   const worker = new DispatcherWorker(database, herdr, config, workerLogger,new SlackAdapterJobNotificationVerifier(config), () => jobSupervisor.wake());
+  const workerMessagePublisher = new WorkerMessagePublisher(database.workerMessages,()=>worker.wake(),Math.min(config.queuePollMs,30_000),
+    () => apiLogger.warn("Worker message publication deferred", { error_code: "worker_message_publication_deferred" }));
   const scheduler = new SchedulerService(
     database.scheduler,
     new SystemClock(),
@@ -63,6 +66,10 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     () => worker.wake(),
     jobProgress,
   );
+  const workerInstructionBridge = new WorkerInstructionBridge(database.workerMessages,jobSupervisor,
+    Math.min(config.queuePollMs,1_000),error=>apiLogger.warn("Worker instruction delivery deferred",{
+      error_code:"worker_instruction_delivery_deferred",error_message:error instanceof Error?error.message:String(error),
+    }),()=>jobSupervisor.wake());
   if (!jobProgressStore) await jobSupervisor.disableProgress();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,
@@ -81,10 +88,13 @@ export async function runService(config: DispatcherConfig): Promise<void> {
     {
       async quiesce() {
         await scheduler.stop();
+        workerMessagePublisher.stop();
+        workerInstructionBridge.beginShutdown();
         await reminderPublisher.stop();
         worker.quiesceAfterCurrent();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
+        await workerInstructionBridge.stop();
       },
     },
     updateNotificationWorker,
@@ -120,14 +130,19 @@ export async function runService(config: DispatcherConfig): Promise<void> {
       }
     }
     worker.start();
+    workerMessagePublisher.start();
     scheduler.start();
     reminderPublisher.start();
     jobSupervisor.start();
+    workerInstructionBridge.start();
     updateNotificationWorker.start();
   } catch (error) {
     if (updateNotificationWorker.isRunning()) await updateNotificationWorker.stop();
+    workerInstructionBridge.beginShutdown();
     if (jobSupervisor.isRunning()) await jobSupervisor.stop();
+    await workerInstructionBridge.stop();
     if (scheduler.isRunning()) await scheduler.stop();
+    workerMessagePublisher.stop();
     if (reminderPublisher.isRunning()) await reminderPublisher.stop();
     if (worker.isRunning()) await worker.stop();
     await api.stop();
@@ -147,9 +162,12 @@ export async function runService(config: DispatcherConfig): Promise<void> {
         api.beginShutdown();
         await api.stop();
         await scheduler.stop();
+        workerMessagePublisher.stop();
+        workerInstructionBridge.beginShutdown();
         await reminderPublisher.stop();
         await updateNotificationWorker.stop();
         await jobSupervisor.stop();
+        await workerInstructionBridge.stop();
         await worker.stop();
         database.close();
         updateNotificationDatabase.close();

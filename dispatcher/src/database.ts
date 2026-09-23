@@ -41,6 +41,7 @@ import {
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
   jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
+import { migrateWorkerMessaging, WorkerMessageRepository } from "./worker-messaging.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -171,6 +172,20 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
     WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
 `);}
+function ensureJobSteerReceiptSchema(db:Database.Database):void {db.exec(`
+  CREATE TABLE IF NOT EXISTS job_steer_receipts (
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    operation_id TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    resume_required INTEGER NOT NULL DEFAULT 0 CHECK (resume_required IN (0,1)),
+    resumed_at TEXT,
+    PRIMARY KEY (job_id,operation_id)
+  );
+`);
+  const columns=new Set((db.pragma("table_info(job_steer_receipts)") as Array<{name:string}>).map(row=>row.name));
+  if(!columns.has("resume_required"))db.exec("ALTER TABLE job_steer_receipts ADD COLUMN resume_required INTEGER NOT NULL DEFAULT 0 CHECK (resume_required IN (0,1))");
+  if(!columns.has("resumed_at"))db.exec("ALTER TABLE job_steer_receipts ADD COLUMN resumed_at TEXT");
+}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -255,6 +270,27 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasSteerReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_steer_receipts'").get() !== undefined;
+    if (hasSteerReceipts) db.exec(`CREATE TEMP TABLE preserved_job_steer_receipts_v3 AS SELECT * FROM job_steer_receipts;
+      DROP TABLE job_steer_receipts;`);
+    const hasWorkerMessages = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_messages'").get() !== undefined;
+    if (hasWorkerMessages) {
+      migrateWorkerMessaging(db);
+      db.exec(`
+        CREATE TEMP TABLE preserved_worker_messages_v3 AS SELECT * FROM worker_messages;
+        CREATE TEMP TABLE preserved_worker_message_runtime_identities_v3 AS SELECT * FROM worker_message_runtime_identities;
+        CREATE TEMP TABLE preserved_worker_message_deliveries_v3 AS SELECT * FROM worker_message_deliveries;
+        CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
+        CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
+        CREATE TEMP TABLE preserved_worker_message_workspace_cadence_v3 AS SELECT * FROM worker_message_workspace_cadence;
+        DROP TABLE worker_message_receipts;
+        DROP TABLE worker_message_deliveries;
+        DROP TABLE worker_message_cadence;
+        DROP TABLE worker_message_runtime_identities;
+        DROP TABLE worker_messages;
+        DROP TABLE worker_message_workspace_cadence;
+      `);
+    }
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -314,6 +350,62 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
       ${jobsRunnableFairIndexSql};
     `);
+    ensureJobSteerReceiptSchema(db);
+    if(hasSteerReceipts){
+      const receiptColumns=new Set((db.pragma("table_info(preserved_job_steer_receipts_v3)") as Array<{name:string}>).map(row=>row.name));
+      db.exec(`INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at)
+        SELECT job_id,operation_id,accepted_at,${receiptColumns.has("resume_required")?"resume_required":"0"},${receiptColumns.has("resumed_at")?"resumed_at":"NULL"}
+        FROM preserved_job_steer_receipts_v3;
+        DROP TABLE preserved_job_steer_receipts_v3;`);
+    }
+    if (hasWorkerMessages) {
+      migrateWorkerMessaging(db);
+      db.exec(`
+        INSERT INTO worker_messages (
+          message_id, schema_version, job_id, source_event_id, workspace_id, channel_id, thread_ts,
+          direction, kind, producer, producer_sequence, idempotency_key, payload_json, payload_sha256,
+          correlation_message_id, conversation_revision, occurred_at, accepted_at
+        ) SELECT
+          message_id, schema_version, job_id, source_event_id, workspace_id, channel_id, thread_ts,
+          direction, kind, producer, producer_sequence, idempotency_key, payload_json, payload_sha256,
+          correlation_message_id, conversation_revision, occurred_at, accepted_at
+        FROM preserved_worker_messages_v3;
+        INSERT INTO worker_message_runtime_identities (
+          message_id, runtime_identity_sha256, first_seen_at
+        ) SELECT message_id, runtime_identity_sha256, first_seen_at
+        FROM preserved_worker_message_runtime_identities_v3;
+        INSERT INTO worker_message_deliveries (
+          delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,
+          lease_expires_at, fence, attempt_count, delivered_at, delivered_lease_owner,
+          delivered_lease_token_sha256, delivered_fence, event_id, created_at, updated_at
+        ) SELECT
+          delivery_id, message_id, consumer, state, available_at, lease_owner, lease_token_sha256,
+          lease_expires_at, fence, attempt_count, delivered_at, delivered_lease_owner,
+          delivered_lease_token_sha256, delivered_fence, event_id, created_at, updated_at
+        FROM preserved_worker_message_deliveries_v3;
+        INSERT INTO worker_message_receipts (
+          receipt_id, message_id, delivery_id, receipt_kind, consumer, created_at
+        ) SELECT receipt_id, message_id, delivery_id, receipt_kind, consumer, created_at
+        FROM preserved_worker_message_receipts_v3;
+        INSERT INTO worker_message_cadence (
+          job_id, minimum_interval_ms, silence_interval_ms, last_report_at, last_delivery_at,
+          silence_due_at, pending_message_id, generation, updated_at
+        ) SELECT
+          job_id, minimum_interval_ms, silence_interval_ms, last_report_at, last_delivery_at,
+          silence_due_at, pending_message_id, generation, updated_at
+        FROM preserved_worker_message_cadence_v3;
+        INSERT INTO worker_message_workspace_cadence (
+          workspace_id, minimum_interval_ms, last_delivery_at, updated_at
+        ) SELECT workspace_id, minimum_interval_ms, last_delivery_at, updated_at
+        FROM preserved_worker_message_workspace_cadence_v3;
+        DROP TABLE preserved_worker_messages_v3;
+        DROP TABLE preserved_worker_message_runtime_identities_v3;
+        DROP TABLE preserved_worker_message_deliveries_v3;
+        DROP TABLE preserved_worker_message_receipts_v3;
+        DROP TABLE preserved_worker_message_cadence_v3;
+        DROP TABLE preserved_worker_message_workspace_cadence_v3;
+      `);
+    }
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
@@ -371,11 +463,13 @@ export function migrateDispatcherDatabase(
     ensureJobsWorkspaceJobIndex(db);
     ensureJobsStatusJobIndex(db);
   }
+  ensureJobSteerReceiptSchema(db);
 }
 
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
+  readonly workerMessages: WorkerMessageRepository;
   private readonly schemaWrite: 2 | 3;
   private readonly migrationHook: DispatcherMigrationHook;
   private readonly jobAdmissionLimits: JobAdmissionLimits;
@@ -401,6 +495,7 @@ export class DispatcherDatabase {
         migrateDispatcherDatabase(this.db, this.migrationHook, true, this.schemaWrite);
         migrateScheduler(this.db, this.migrationHook, true);
         migrateLiveSession(this.db);
+        migrateWorkerMessaging(this.db);
       }).immediate();
       const routingTable=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_routing_schema'").get()!==undefined;
       const routingMarker=routingTable&&this.db.prepare("SELECT 1 FROM job_routing_schema WHERE singleton=1").get()!==undefined;
@@ -457,6 +552,7 @@ export class DispatcherDatabase {
         return true;
       } catch(error) { return (error as NodeJS.ErrnoException).code==="ENOENT"; }
     });
+    this.workerMessages = new WorkerMessageRepository(this.db,this.jobAdmissionLimits.jobObjectiveTotalMaxBytes);
   }
 
   close(): void {
@@ -646,7 +742,8 @@ export class DispatcherDatabase {
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
         const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
-        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0);
+        const effectiveBytes=admitted.reduce((sum,row)=>sum+Buffer.byteLength(row.objective,"utf8"),0)
+          +this.workerMessages.reservedQueuedInstructionBytes(sourceEvent.event_id);
         if(effectiveBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current:effectiveBytes,attempted:effectiveBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
         if(!group) this.db.prepare("INSERT INTO job_groups(source_event_id,sealed_at,notification_mode,attention_event_id,all_terminal_event_id,created_at,updated_at) VALUES(?,NULL,?,NULL,NULL,?,?)").run(sourceEvent.event_id,jobKey===legacyJobKey?"legacy":"grouped",at.toISOString(),at.toISOString());
       }
@@ -773,6 +870,9 @@ export class DispatcherDatabase {
         FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status IN ('preparing','dispatching','running')
       ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
         WHERE jobs.status IN ('queued','retryable_failed','running')
+          AND (jobs.status='running' OR NOT EXISTS (SELECT 1 FROM worker_message_deliveries d
+            JOIN worker_messages m USING(message_id) WHERE m.job_id=jobs.job_id AND d.consumer='worker'
+              AND d.state IN ('pending','leased')))
         ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,ranked.insertion_order LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
   }
@@ -902,7 +1002,8 @@ export class DispatcherDatabase {
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
-      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review') AND (
+      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending') AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
@@ -917,14 +1018,18 @@ export class DispatcherDatabase {
   }
 
   recoverStaleJobs(at = new Date()): { retryable: number; needsReview: number } {
-    const timestamp = at.toISOString();
-    const retryable = this.db.prepare(`
+    return this.db.transaction(()=>{
+      const timestamp = at.toISOString();
+      const staleNeedsReview=this.db.prepare(`SELECT job_id FROM jobs
+        WHERE status IN ('dispatching','cancelling') OR steer_state='dispatching'`).all() as Array<{job_id:string}>;
+      const retryable = this.db.prepare(`
       UPDATE jobs SET status = 'retryable_failed', available_at = ?,
         last_error_code = 'stale_preparing',
         last_error_message = 'Dispatcher restarted before the job prompt was attempted', updated_at = ?
       WHERE status = 'preparing'
     `).run(timestamp, timestamp).changes;
-    const needsReview = this.db.prepare(`
+      for(const row of staleNeedsReview)this.workerMessages.supersedeUndeliveredInstructions(row.job_id,timestamp);
+      const needsReview = this.db.prepare(`
       UPDATE jobs SET status = 'needs_review',
         last_error_code = CASE WHEN status='cancelling' THEN 'ambiguous_cancel_acceptance'
           WHEN status='dispatching' THEN 'ambiguous_prompt_acceptance' ELSE 'ambiguous_steer_acceptance' END,
@@ -932,7 +1037,8 @@ export class DispatcherDatabase {
         steer_state = NULL, updated_at = ?
       WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
     `).run(timestamp).changes;
-    return { retryable, needsReview };
+      return { retryable, needsReview };
+    }).immediate();
   }
 
   beginJobPreparation(jobId: string, at = new Date()): JobRow {
@@ -941,6 +1047,8 @@ export class DispatcherDatabase {
       UPDATE jobs SET status = 'preparing', attempt_count = attempt_count + 1,
         last_error_code = NULL, last_error_message = NULL, updated_at = ?
       WHERE job_id = ? AND status IN ('queued', 'retryable_failed') AND available_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+          WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
     `).run(timestamp, jobId, timestamp).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} is no longer ready to prepare`);
     return this.getJobRequired(jobId);
@@ -1076,13 +1184,25 @@ export class DispatcherDatabase {
   }
 
   markJobNeedsReview(jobId: string, code: string, message: string): void {
-    const row = this.getJobRequired(jobId);
-    if (["completed", "failed", "cancelled"].includes(row.status)) return;
-    this.updateJob(jobId, [row.status], "needs_review", {
-      last_error_code: code,
-      last_error_message: message,
-      steer_state: null,
-    });
+    this.db.transaction(()=>{
+      const row = this.getJobRequired(jobId);
+      if (["completed", "failed", "cancelled"].includes(row.status)) return;
+      this.workerMessages.supersedeUndeliveredInstructions(jobId,nowUtc());
+      this.updateJob(jobId, [row.status], "needs_review", {
+        last_error_code: code,
+        last_error_message: message,
+        steer_state: null,
+      });
+    }).immediate();
+  }
+
+  private revealBlockedQuestionOwner(event:EventRow,code:string,message:string):void {
+    if(event.source!=="dona_message"||event.event_type!=="worker_message_report")return;
+    const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
+    if(typeof payload.job_id!=="string"||!["question","decision_request"].includes(String(payload.kind)))return;
+    const job=this.getJob(payload.job_id);
+    if(job?.status==="blocked"&&job.last_error_code==="worker_message_question_pending")
+      this.markJobNeedsReview(payload.job_id,code,message);
   }
 
   markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
@@ -1090,6 +1210,42 @@ export class DispatcherDatabase {
       last_error_code: "agent_blocked",
       last_error_message: message,
     });
+  }
+
+  private resumeBlockedJobInTransaction(jobId:string,timestamp:string):JobRow {
+      const job=this.getJobRequired(jobId);
+      if(job.status!=="blocked")throw new Error(`Job ${jobId} is not blocked`);
+      if(job.completion_event_id){
+        const event=this.get(job.completion_event_id);
+        if(event&&!(["completed","dead_letter"] as EventStatus[]).includes(event.status)){
+          const changed=this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+            last_error_code='job_attention_superseded',last_error_message=NULL
+            WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent','blocked','needs_review')`)
+            .run(timestamp,timestamp,event.event_id).changes;
+          if(changed!==1)throw new Error(`Job ${jobId} attention event changed during resume`);
+        }
+        if(event){
+          this.db.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=? AND attention_event_id=?")
+            .run(timestamp,job.source_event_id,event.event_id);
+          this.db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
+            .run(timestamp,job.source_event_id,event.event_id);
+          this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'")
+            .run(event.event_id);
+        }
+      }
+      const cadence=this.db.prepare("SELECT generation,silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
+        .get(jobId) as {generation:number;silence_interval_ms:number}|undefined;
+      if(cadence){
+        const silenceDueAt=new Date(Date.parse(timestamp)+cadence.silence_interval_ms).toISOString();
+        this.db.prepare(`UPDATE worker_message_cadence SET generation=generation+1,silence_due_at=?,updated_at=? WHERE job_id=?`)
+          .run(silenceDueAt,timestamp,jobId);
+      }
+      this.updateJob(jobId,["blocked"],"running",{last_error_code:null,last_error_message:null});
+      return this.getJobRequired(jobId);
+  }
+
+  resumeBlockedJob(jobId:string):JobRow {
+    return this.db.transaction(()=>this.resumeBlockedJobInTransaction(jobId,nowUtc())).immediate();
   }
 
   recordInvalidResultAgentStopFailure(jobId:string,message:string):void {
@@ -1171,13 +1327,13 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
+  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string, operationId = sourceEventId): JobRow {
     return this.db.transaction(() => {
       this.assertJobSourceMatchesThread(jobId, sourceEventId);
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
-      if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
+      if (this.hasAcceptedJobSteerReceipt(jobId,operationId)) return row;
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
@@ -1187,38 +1343,68 @@ export class DispatcherDatabase {
       const attempted = current + Buffer.byteLength(addition,"utf8");
       const maximum = this.jobAdmissionLimits.jobObjectiveTotalMaxBytes;
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
+      const timestamp=nowUtc();
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
-        .run(objective,sourceEventId,nowUtc(),jobId);
+        .run(objective,operationId,timestamp,jobId);
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,0,NULL)")
+        .run(jobId,operationId,timestamp);
       return this.getJobRequired(jobId);
     }).immediate();
   }
 
-  beginJobSteer(jobId: string, sourceEventId: string): { row: JobRow; duplicate: boolean } {
+  beginJobSteer(jobId: string, sourceEventId: string, operationId = sourceEventId): { row: JobRow; duplicate: boolean } {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);
-    if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
-    if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
+    const receipt=this.db.prepare("SELECT resume_required,resumed_at FROM job_steer_receipts WHERE job_id=? AND operation_id=?")
+      .get(jobId,operationId) as {resume_required:number;resumed_at:string|null}|undefined;
+    if(receipt){
+      if(receipt.resume_required===1&&receipt.resumed_at===null&&row.status==="blocked"){
+        return this.db.transaction(()=>{
+          const timestamp=nowUtc(),resumed=this.resumeBlockedJobInTransaction(jobId,timestamp);
+          const changed=this.db.prepare("UPDATE job_steer_receipts SET resumed_at=? WHERE job_id=? AND operation_id=? AND resumed_at IS NULL")
+            .run(timestamp,jobId,operationId).changes;
+          if(changed!==1)throw new Error(`Job ${jobId} steer receipt changed unexpectedly`);
+          return {row:resumed,duplicate:true};
+        }).immediate();
+      }
+      return { row, duplicate: true };
+    }
+    if (!["running","blocked"].includes(row.status)) throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
-    `).run(sourceEventId, nowUtc(), jobId);
+    `).run(operationId, nowUtc(), jobId);
     return { row: this.getJobRequired(jobId), duplicate: false };
   }
 
-  markJobSteerAccepted(jobId: string, sourceEventId: string): void {
-    const changed = this.db.prepare(`
-      UPDATE jobs SET steer_state = 'accepted', updated_at = ?
-      WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
-    `).run(nowUtc(), jobId, sourceEventId).changes;
-    if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+  markJobSteerAccepted(jobId: string, operationId: string): JobRow {
+    return this.db.transaction(()=>{
+      const timestamp=nowUtc();
+      const job=this.getJobRequired(jobId);
+      const typedAnswer=this.db.prepare("SELECT 1 FROM worker_messages WHERE message_id=? AND job_id=? AND direction='dona_to_worker' AND kind='answer'")
+        .get(operationId,jobId);
+      const resumeRequired=job.status==="blocked"&&(job.last_error_code!=="worker_message_question_pending"||!!typedAnswer);
+      const changed = this.db.prepare(`
+        UPDATE jobs SET steer_state = 'accepted', updated_at = ?
+        WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
+      `).run(timestamp, jobId, operationId).changes;
+      if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+      this.db.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,?,?)")
+        .run(jobId,operationId,timestamp,resumeRequired?1:0,resumeRequired?timestamp:null);
+      return resumeRequired?this.resumeBlockedJobInTransaction(jobId,timestamp):this.getJobRequired(jobId);
+    }).immediate();
   }
 
-  clearJobSteer(jobId: string, sourceEventId: string): void {
+  hasAcceptedJobSteerReceipt(jobId:string,operationId:string):boolean {
+    return this.db.prepare("SELECT 1 FROM job_steer_receipts WHERE job_id=? AND operation_id=?").get(jobId,operationId)!==undefined;
+  }
+
+  clearJobSteer(jobId: string, operationId: string): void {
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = NULL, steer_state = NULL, updated_at = ?
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
-    `).run(nowUtc(), jobId, sourceEventId);
+    `).run(nowUtc(), jobId, operationId);
   }
 
   beginJobCancellation(jobId: string, sourceEventId: string): JobRow {
@@ -1671,6 +1857,11 @@ export class DispatcherDatabase {
       const scheduled=(this.db.prepare("SELECT event_id FROM events WHERE status='dispatching' AND source='dona_schedule'").all() as Array<{event_id:string}>);
       const notifications=(this.db.prepare(`SELECT e.event_id,c.owner_json FROM events e JOIN job_completion_results c
         ON c.notification_event_id=e.event_id WHERE e.status='dispatching' AND e.source='dona_job'`).all() as Array<{event_id:string;owner_json:string}>);
+      const uncertainQuestions=this.db.prepare(`SELECT DISTINCT m.job_id FROM events e
+        JOIN worker_message_deliveries d ON d.event_id=e.event_id
+        JOIN worker_messages m ON m.message_id=d.message_id JOIN jobs j ON j.job_id=m.job_id
+        WHERE e.status='dispatching' AND e.source='dona_message' AND e.event_type='worker_message_report'
+          AND m.kind IN ('question','decision_request') AND j.status='blocked'`).all() as Array<{job_id:string}>;
       const changed=this.db.prepare(`
         UPDATE events SET
           status = 'needs_review',
@@ -1684,6 +1875,8 @@ export class DispatcherDatabase {
       for(const row of notifications) {
         this.setNotificationState(row.event_id,"needs_review",at);
       }
+      for(const row of uncertainQuestions) this.markJobNeedsReview(row.job_id,"worker_message_notification_ambiguous",
+        "Question notification prompt acceptance is unknown after Dispatcher restart");
       return changed;
     }).immediate();
   }
@@ -1731,7 +1924,10 @@ export class DispatcherDatabase {
 
   markNeedsReview(eventId: string, code: string, message: string): void {
     this.db.transaction(()=>{
+      const event=this.getRequired(eventId);
       this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {last_error_code: code,last_error_message: message});
+      this.revealBlockedQuestionOwner(event,"worker_message_notification_ambiguous",
+        "Question notification needs review before the worker can receive an answer");
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
       this.setNotificationState(eventId,"needs_review",new Date());
     }).immediate();
@@ -1744,6 +1940,7 @@ export class DispatcherDatabase {
         throw new Error(`Event ${eventId} is no longer dispatchable`);
       }
       const attemptCount = row.attempt_count + 1;
+      const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
       const status: EventStatus = attemptCount >= maxAttempts ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(attemptCount, at);
       this.db
@@ -1754,6 +1951,7 @@ export class DispatcherDatabase {
         `)
         .run(status, attemptCount, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(durableWorkerReport)this.workerMessages.rearmUndispatchedReport(eventId,retryAt(attemptCount,at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -1766,6 +1964,7 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const row = this.get(eventId);
       if (!row || row.status !== "dispatching") throw new Error(`Event ${eventId} is not dispatching`);
+      const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
       const status: EventStatus = row.attempt_count >= maxAttempts ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(row.attempt_count, at);
       this.db
@@ -1775,6 +1974,7 @@ export class DispatcherDatabase {
         `)
         .run(status, availableAt, code, message, at.toISOString(), eventId);
       if(status==="dead_letter") {
+        if(durableWorkerReport)this.workerMessages.rearmUndispatchedReport(eventId,retryAt(row.attempt_count,at),at);
         this.sealJobGroupIfPresent(eventId, at.toISOString());
         this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.setNotificationState(eventId,"failed",at);
@@ -1912,6 +2112,35 @@ export class DispatcherDatabase {
           return;
         }
       }
+      if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
+        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
+        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
+          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
+            (action as Record<string,unknown>).channel_id===target?.channel_id&&
+            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
+            typeof (action as Record<string,unknown>).message_ts==="string"&&
+            (action as Record<string,unknown>).reply_broadcast===false&&
+            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
+          const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
+            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
+            (action as Record<string,unknown>).channel_id===target?.channel_id&&
+            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
+            (action as Record<string,unknown>).status==="suspended"&&(action as Record<string,unknown>).success!==false);
+          if(!posted||!suspended){
+            const reason=!posted?"worker_message_question_not_posted":"worker_message_session_not_suspended";
+            const description=!posted?"Question notification completed without a confirmed post":
+              "Question notification completed without a confirmed suspended session";
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:reason,last_error_message:description});
+            this.revealBlockedQuestionOwner(event,reason,description);
+            return;
+          }
+        }
+      }
       this.transition(eventId, ["waiting_agent"], "completed", {
         result_json: stableStringify(result), result_path: resultPath, completed_at: result.completed_at,
         last_error_code: null, last_error_message: null,
@@ -1962,6 +2191,8 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], needsReview?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":posted?"incomplete_delivery_after_post":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
+      this.revealBlockedQuestionOwner(event,"worker_message_notification_failed",
+        "Question notification failed before the worker could receive an answer");
       this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,needsReview?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
@@ -2020,6 +2251,11 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const row = this.getRequired(eventId);
       if(row.source==="dona_schedule") throw new Error("scheduled_event_completion_requires_reconciliation");
+      if(row.status!=="completed"&&row.source==="dona_message"&&row.event_type==="worker_message_report"){
+        const payload=JSON.parse(row.payload_json) as {kind?:unknown};
+        if(["question","decision_request"].includes(String(payload.kind)))
+          throw new Error("worker_message_question_completion_requires_delivery_receipt");
+      }
       const scheduledNotification=this.db.prepare(`SELECT 1 FROM job_completion_results WHERE notification_event_id=?
         AND json_extract(owner_json,'$.kind')='schedule' AND notification_state!='accepted'`).get(eventId);
       if(scheduledNotification) throw new Error("scheduled_notification_receipt_required");
@@ -2097,6 +2333,8 @@ export class DispatcherDatabase {
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
+      this.revealBlockedQuestionOwner(row,"worker_message_notification_discarded",
+        "Question notification was discarded by an operator");
       this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       this.sealJobGroupIfPresent(eventId, at.toISOString());
       this.setNotificationState(eventId,"failed",at);
@@ -2176,6 +2414,8 @@ export class DispatcherDatabase {
       const row = this.db.prepare(`
         SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
         WHERE status = 'queued' AND available_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+            WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
         ORDER BY source_event_id DESC
         LIMIT 1
       `).get(timestamp) as Pick<JobRow, "source_event_id"> | undefined;
@@ -2202,6 +2442,8 @@ export class DispatcherDatabase {
     const statement = this.db.prepare(`
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
       WHERE status = 'queued' AND available_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+          WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
         AND source_event_id > ?
         AND source_event_id <= ?
         ${excludedSources}

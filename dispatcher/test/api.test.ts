@@ -125,6 +125,8 @@ describe("DispatcherApi", () => {
       config,
       logger,
     );
+    await fs.mkdir(path.dirname(config.workerSocketPath),{recursive:true,mode:0o750});
+    await fs.chmod(path.dirname(config.workerSocketPath),0o750);
     await api.start();
     const first = await request(config.socketPath, "POST", "/v1/events", eventEnvelope("Ev-1"));
     assert.equal(first.status, 202);
@@ -135,9 +137,47 @@ describe("DispatcherApi", () => {
     assert.equal(database.list().length, 1);
     assert.equal(wakeCount, 2);
     assert.equal((await fs.stat(config.socketPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(config.workerSocketPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(path.dirname(config.socketPath))).mode & 0o777,0o700);
+    assert.equal((await fs.stat(path.dirname(config.workerSocketPath))).mode & 0o777,0o750);
     assert.equal((await request(config.socketPath, "GET", "/health/ready")).status, 200);
+    assert.equal((await request(config.workerSocketPath,"GET","/health/ready")).status,404);
     await api.stop();
+    await assert.rejects(fs.stat(config.socketPath),{code:"ENOENT"});
+    await assert.rejects(fs.stat(config.workerSocketPath),{code:"ENOENT"});
     database.close();
+  });
+
+  test("worker socketの置換可能なancestorを起動時に拒否する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const replaceable=path.join(root,"replaceable");
+    await fs.mkdir(replaceable,{mode:0o777});
+    await fs.chmod(replaceable,0o777);
+    const workerSocketPath=path.join(replaceable,"private","worker.sock");
+    const database=new DispatcherDatabase(config.databasePath);
+    const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,{...config,workerSocketPath},logger);
+    try {
+      await assert.rejects(api.start(),/Worker socket ancestor is replaceable/);
+      await assert.rejects(fs.stat(config.socketPath),{code:"ENOENT"});
+      await assert.rejects(fs.stat(workerSocketPath),{code:"ENOENT"});
+    } finally {await api.stop();database.close();}
+  });
+
+  test("worker socketの字句pathに置換可能なsymlink祖先があれば拒否する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const replaceable=path.join(root,"replaceable-alias");
+    const safe=path.join(root,"safe-worker");
+    await fs.mkdir(replaceable,{mode:0o777});
+    await fs.chmod(replaceable,0o777);
+    await fs.mkdir(safe,{mode:0o700});
+    await fs.symlink(safe,path.join(replaceable,"alias"));
+    const workerSocketPath=path.join(replaceable,"alias","worker.sock");
+    const database=new DispatcherDatabase(config.databasePath);
+    const api=new DispatcherApi(database,{isRunning:()=>true,wake(){}},jobs,{...config,workerSocketPath},logger);
+    try {
+      await assert.rejects(api.start(),/Worker socket ancestor is replaceable/);
+      await assert.rejects(fs.stat(workerSocketPath),{code:"ENOENT"});
+    } finally {await api.stop();database.close();}
   });
 
   test("readyはprocess liveとscheduler loopを分離しredacted metricsを公開する", async () => {

@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
 
+import Database from "better-sqlite3";
+
 import { DispatcherDatabase } from "../src/database.js";
 import type { DispatcherConfig } from "../src/config.js";
 import type { HerdrCommandResult } from "../src/herdr.js";
@@ -874,6 +876,10 @@ describe("JobSupervisor", () => {
       config.jobsWorkspaceRoot,
       config.jobResultsDir,
     ).row;
+    const queued=database.createJob(
+      {source_event_id:followUp.event_id,job_key:"queued-steer-receipt",objective:"待機中",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir,
+    ).row;
     database.beginJobPreparation(job.job_id);
     database.setJobRuntime(job.job_id, "1", "w1:p1");
     database.beginJobDispatch(job.job_id);
@@ -889,12 +895,89 @@ describe("JobSupervisor", () => {
       async cancel() { return ok("idle"); },
     };
     const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
-    const result = await supervisor.steer(job.job_id, followUp.event_id, "追加条件");
+    const result = await supervisor.steer(job.job_id, followUp.event_id, "追加条件", "msg_operation_1");
     assert.equal(result.duplicate, false);
-    assert.deepEqual(steers, ["追加条件"]);
-    assert.deepEqual(steerTargets, [job.agent_name]);
-    assert.deepEqual(steerTimeouts, [undefined]);
-    assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    const second=await supervisor.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
+    assert.equal(second.duplicate,false);
+    await supervisor.stop();
+    database.close();
+    const reopened=new DispatcherDatabase(config.databasePath);
+    const restarted=new JobSupervisor(reopened,runtime,config,logger,()=>undefined);
+    const replayFirst=await restarted.steer(job.job_id,followUp.event_id,"追加条件","msg_operation_1");
+    assert.equal(replayFirst.duplicate,true);
+    const duplicate=await restarted.steer(job.job_id,followUp.event_id,"別の追加条件","msg_operation_2");
+    assert.equal(duplicate.duplicate,true);
+    const queuedFirst=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件A","msg_queued_operation_1");
+    assert.equal(queuedFirst.duplicate,false);
+    const queuedSecond=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件B","msg_queued_operation_2");
+    assert.equal(queuedSecond.duplicate,false);
+    const queuedReplay=await restarted.steer(queued.job_id,followUp.event_id,"待機中の追加条件A","msg_queued_operation_1");
+    assert.equal(queuedReplay.duplicate,true);
+    assert.equal(reopened.getJob(queued.job_id)?.objective.match(/待機中の追加条件A/g)?.length,1);
+    assert.equal(reopened.getJob(queued.job_id)?.objective.match(/待機中の追加条件B/g)?.length,1);
+    assert.deepEqual(steers, ["追加条件","別の追加条件"]);
+    assert.deepEqual(steerTargets, [job.agent_name,job.agent_name]);
+    assert.deepEqual(steerTimeouts, [undefined,undefined]);
+    assert.equal(reopened.getJob(job.job_id)?.steer_state, "accepted");
+    await restarted.stop();
+    reopened.close();
+  });
+
+  test("blocked workerへのtyped answerを受理してrunning監視へ戻す",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-steer-blocked-source")).row;
+    const followUp=database.enqueue(eventEnvelope("Ev-steer-blocked-follow-up")).row;
+    const job=database.createJob({source_event_id:source.event_id,job_key:"blocked-answer",objective:"回答待ち",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.sealJobGroup(source.event_id);
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"1","w1:p1");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.markJobBlocked(job.job_id,"回答待ち");
+    const attention=database.enqueueJobNotification(job.job_id).row;
+    database.beginDispatch(attention.event_id,path.join(config.resultsDir,"attention.json"));
+    database.markWaiting(attention.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.event_id);
+    assert.equal(database.getJob(job.job_id)?.completion_event_id,attention.event_id);
+    let waits=0;
+    const runtime:JobAgentRuntime={
+      async prepare(){throw new Error("not used");},
+      async get(){return ok("blocked");},
+      async prompt(){return ok("working");},
+      async wait(){waits+=1;return {...ok("working"),ok:false,timedOut:true,errorCode:"timeout"};},
+      async cancel(){return ok("idle");},
+    };
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const result=await supervisor.steer(job.job_id,followUp.event_id,"回答です","msg_blocked_answer");
+    assert.equal(result.duplicate,false);
+    assert.equal(result.row.status,"running");
+    assert.equal(result.row.last_error_code,null);
+    assert.equal(database.get(attention.event_id)?.status,"completed");
+    assert.equal(database.get(attention.event_id)?.last_error_code,"job_attention_superseded");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
+    await waitFor(()=>waits===1);
+    await supervisor.stop();
+    database.markJobBlocked(job.job_id,"別の回答待ち");
+    const restarted=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const duplicate=await restarted.steer(job.job_id,followUp.event_id,"回答です","msg_blocked_answer");
+    assert.equal(duplicate.duplicate,true);
+    assert.equal(duplicate.row.status,"blocked");
+    await restarted.stop();
+    const sqlite=new Database(config.databasePath),timestamp=new Date().toISOString();
+    sqlite.prepare("UPDATE jobs SET steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?")
+      .run("msg_partial_receipt",timestamp,job.job_id);
+    sqlite.prepare("INSERT INTO job_steer_receipts(job_id,operation_id,accepted_at,resume_required,resumed_at) VALUES(?,?,?,1,NULL)")
+      .run(job.job_id,"msg_partial_receipt",timestamp);
+    sqlite.close();
+    const recovering=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    const recovered=await recovering.steer(job.job_id,followUp.event_id,"回答です","msg_partial_receipt");
+    assert.equal(recovered.duplicate,true);
+    assert.equal(recovered.row.status,"running");
+    await waitFor(()=>waits===2);
+    await recovering.stop();
     database.close();
   });
 
