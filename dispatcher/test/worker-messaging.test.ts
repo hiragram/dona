@@ -454,16 +454,21 @@ describe("worker messaging ledger",()=>{
 
   test("queued jobは受理済みinstructionの配送完了まで開始しない",async()=>{
     const {database,source,job}=await fixture();
+    let schedulerWakes=0;
     const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
       producer_sequence:1,idempotency_key:"queued-start-gate",occurred_at:"2026-09-21T00:00:01Z",
       payload:{operation:"add_condition",text:"起動前に適用する条件"}});
     const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(jobId,sourceEventId,typed,operationId){
       database.appendQueuedJobInstruction(jobId,sourceEventId,typed,operationId);
-    }});
+    }},1_000,()=>{},()=>{
+      schedulerWakes+=1;
+      assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),true);
+    });
     try {
       assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),false);
       assert.throws(()=>database.beginJobPreparation(job.job_id),/no longer ready/);
       assert.equal(await bridge.runOnce(),true);
+      assert.equal(schedulerWakes,1);
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","queued-start-gate") as
         {delivery:{state:string}}).delivery.state,"delivered");
       assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),true);

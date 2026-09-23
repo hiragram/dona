@@ -69,7 +69,7 @@ export async function runService(config: DispatcherConfig): Promise<void> {
   const workerInstructionBridge = new WorkerInstructionBridge(database.workerMessages,jobSupervisor,
     Math.min(config.queuePollMs,1_000),error=>apiLogger.warn("Worker instruction delivery deferred",{
       error_code:"worker_instruction_delivery_deferred",error_message:error instanceof Error?error.message:String(error),
-    }));
+    }),()=>jobSupervisor.wake());
   if (!jobProgressStore) await jobSupervisor.disableProgress();
   const updateNotificationWorker = new UpdateNotificationWorker(
     database,

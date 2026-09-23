@@ -891,7 +891,8 @@ export class WorkerInstructionBridge {
   private stopping=false;
   private readonly leaseOwner="dispatcher-worker-instruction-bridge";
   constructor(private readonly repository:WorkerMessageRepository,private readonly controller:WorkerInstructionController,
-    private readonly pollMs=1_000,private readonly onError:(error:unknown)=>void=()=>{}) {}
+    private readonly pollMs=1_000,private readonly onError:(error:unknown)=>void=()=>{},
+    private readonly onDelivered:()=>void=()=>{}) {}
   start():void {
     if(this.timer)return;
     this.stopping=false;
@@ -916,6 +917,7 @@ export class WorkerInstructionBridge {
       typedInstructionText(delivery.message_id,delivery.kind,delivery.payload,delivery.correlation_message_id,delivery.conversation_revision),delivery.message_id);
     this.repository.acknowledge(delivery.job_id,delivery.source_event_id,delivery.delivery_id,this.leaseOwner,
       lease_token,delivery.fence,new Date());
+    this.onDelivered();
     return true;
   }
   private run():void {
