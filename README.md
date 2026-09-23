@@ -61,6 +61,7 @@ updater自身はroutine updateの対象外です。stable updater/policy/schema�
 ## Integration manifest
 
 - [Supervisor approval integration](./docs/supervisor-approval-integration.md): Issue #26の子Issueを集約するbranch、native dependency graph、merge gate、未検証境界
+- [Supervisor approval ADR](./docs/adr/0001-supervisor-approval.md): trust boundary、lifecycle、UX、運用方針、release gate
 
 ## 全体検証
 
