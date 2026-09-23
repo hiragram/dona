@@ -17,7 +17,7 @@ import { SupervisorBindingOperator, SupervisorBindingRepository, SupervisorBindi
   type BindingGeneration, type BindingGenerationStore, type SupervisorBindingProposal,
   type SupervisorAccessReceipt } from "../../src/approval/supervisor-binding.js";
 
-const blank: SupervisorBindingProposal = { team_id: "T123", supervisor_user_id: "U123",
+const blank: SupervisorBindingProposal = { team_id: scope.workspace_id, supervisor_user_id: "U123",
   reason: null, reason_digest: null, operation_scope_digest: null, target_scope_digest: null, expires_at: null };
 function bindingFixture(t: { after(fn: () => void): void }) {
   const f = fixture(t);
@@ -44,7 +44,9 @@ function bindingFixture(t: { after(fn: () => void): void }) {
   const operator = new SupervisorBindingOperator(f.db, f.providers, scope, generations, proofs);
   const repository = new SupervisorBindingRepository(f.db, f.providers.auditAnchors, f.providers.auditKeys, scope, generations);
   return { ...f, operator, repository, setMode: (value: typeof mode) => { mode = value; },
-    generation: () => generation };
+    generation: () => generation, tamperGeneration: (transactionId: string) => {
+      if (generation === null) throw Error(); generation = { ...generation, transaction_id: transactionId };
+    } };
 }
 
 test("bootstrapは監査、DB、保護generationを同じrevisionへ固定し、一回だけ受理する", t => {
@@ -57,6 +59,7 @@ test("bootstrapは監査、DB、保護generationを同じrevisionへ固定し、
   assert.throws(() => f.operator.change("duplicate", "bootstrap", blank), SupervisorBindingError);
   assert.equal(f.repository.read()?.revision, 1);
   assert.equal(f.db.prepare("SELECT count(*) FROM approval_supervisor_bindings").pluck().get(), 1);
+  assert.equal(binding.transaction_id, "bootstrap");
 });
 
 test("rotationとrevokeは単調revisionを保持し旧scopeのDB rowを再利用しない", t => {
@@ -104,6 +107,14 @@ test("restoreされた旧DB、別instance、保護generation不整合を読取�
   assert.throws(() => other.read(), SupervisorBindingError);
   assert.throws(() => f.db.prepare("UPDATE approval_supervisor_bindings SET binding_json='{}' WHERE instance_id=? AND workspace_id=?")
     .run(scope.instance_id, scope.workspace_id));
+  f.tamperGeneration("different_transaction");
+  assert.throws(() => f.repository.read(), SupervisorBindingError);
+});
+
+test("bootstrapは別workspaceのteamをreserve前に拒否する", t => {
+  const f = bindingFixture(t);
+  assert.throws(() => f.operator.change("wrong_team", "bootstrap", { ...blank, team_id: "other" }), SupervisorBindingError);
+  assert.equal(f.generation(), null);
 });
 
 test("break-glassは理由・scope・30分以内の期限を要求する", t => {
@@ -219,6 +230,14 @@ test("v6移行前に構築したbrokerもguardなしではrequestを作れない
   assert.equal(f.db.prepare("SELECT count(*) FROM approval_requests").pluck().get(), 0);
 });
 
+test("別workspaceのbinding guardをbrokerへ接続できない", t => {
+  const f = bindingFixture(t);
+  const other = new SupervisorBindingRepository(f.db, f.providers.auditAnchors, f.providers.auditKeys,
+    { instance_id: scope.instance_id, workspace_id: "other" }, { read: () => null, reserve: () => { throw Error(); } });
+  const guard = new SupervisorBindingGuard(other, "primary", () => { throw Error(); });
+  assert.throws(() => new ApprovalCreateBroker(f.db, f.providers, scope, () => grant(), f.lookup, guard), ApprovalCreateError);
+});
+
 test("request作成はcurrent bindingとcurrent accessを通しrotation後の旧revisionを拒否する", t => {
   const f = bindingFixture(t);
   const binding = f.operator.change("bootstrap", "bootstrap", blank);
@@ -233,13 +252,19 @@ test("request作成はcurrent bindingとcurrent accessを通しrotation後の旧
   }));
   const original = grant(); original.binding_id = supervisorBindingId(binding);
   original.snapshot.preconditions.workspace_binding_revision = binding.revision;
-  const broker = new ApprovalCreateBroker(f.db, f.providers, scope, () => original, f.lookup, guard);
+  let currentGrant = original;
+  const broker = new ApprovalCreateBroker(f.db, f.providers, scope, () => currentGrant, f.lookup, guard);
   accessAvailable = false;
   assert.deepEqual(broker.create("unavailable", intent), { status: "denied", reason: "binding_revoked" });
   accessAvailable = true;
   assert.equal(broker.create("current", intent).status, "created");
-  f.operator.change("rotate", "rotate", { ...blank, supervisor_user_id: "U456" });
+  const rotated = f.operator.change("rotate", "rotate", { ...blank, supervisor_user_id: "U456" });
+  const renewed = grant(); renewed.binding_id = supervisorBindingId(rotated);
+  renewed.snapshot.preconditions.workspace_binding_revision = rotated.revision;
+  currentGrant = renewed;
   assert.deepEqual(broker.create("stale", intent), { status: "denied", reason: "binding_revoked" });
+  const requestId = f.db.prepare("SELECT request_id FROM approval_requests").pluck().get() as string;
+  assert.equal(f.records.read("request", requestId)?.row.state, "needs_review");
 });
 
 test("Keychain CAS adapterは初回genesisと次generationをbyte一致で進める", () => {

@@ -69,7 +69,7 @@ export class ApprovalDecisionBroker {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       for (const callback of [authorize, contentKey, wrappingKey, notificationKey]) assertSynchronousCallback(callback);
-      if (approvalSupervisorBindingRequired(db) && bindingGuard === undefined) throw Error();
+      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope))) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
@@ -79,7 +79,7 @@ export class ApprovalDecisionBroker {
   }
   decide(transactionId: string, input: ApprovalDecisionCommand): ApprovalDecisionResult {
     try {
-      if (approvalSupervisorBindingRequired(this.db) && this.bindingGuard === undefined) throw Error();
+      if (approvalSupervisorBindingRequired(this.db) && (this.bindingGuard === undefined || !this.bindingGuard.matchesScope(this.scope))) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(commandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalDecisionResult>(transactionId, (mark, state) => {
         const request = this.records.readInState(state, "request", command.request_handle);

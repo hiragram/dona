@@ -50,6 +50,7 @@ export interface SlackAgentSessionStatusResult {
 
 export interface SlackChannel {
   id: string;
+  isIm?: boolean;
   name?: string;
   isPrivate: boolean;
   isArchived: boolean;
@@ -168,8 +169,9 @@ function epochSecondsToIso(value: number | undefined): string | undefined {
   return new Date(value * 1_000).toISOString();
 }
 
-function channelFromResponse(channel: {
+export function channelFromResponse(channel: {
   id?: string;
+  is_im?: boolean;
   name?: string;
   is_private?: boolean;
   is_archived?: boolean;
@@ -183,12 +185,13 @@ function channelFromResponse(channel: {
 }): SlackChannel {
   return {
     id: nonEmpty(channel.id, "channel.id"),
+    ...(channel.is_im !== undefined ? { isIm: channel.is_im } : {}),
     ...(channel.name ? { name: channel.name } : {}),
     isPrivate: channel.is_private ?? false,
     isArchived: channel.is_archived ?? false,
     isMember: channel.is_member ?? false,
     isShared: channel.is_shared === true || channel.is_ext_shared === true || channel.is_pending_ext_shared === true,
-    ...(channel.is_shared !== undefined || channel.is_ext_shared !== undefined || channel.is_pending_ext_shared !== undefined
+    ...(channel.is_shared !== undefined && channel.is_ext_shared !== undefined && channel.is_pending_ext_shared !== undefined
       ? { sharingKnown: true } : {}),
     ...(channel.topic?.value ? { topic: channel.topic.value } : {}),
     ...(channel.purpose?.value ? { purpose: channel.purpose.value } : {}),

@@ -65,8 +65,8 @@ export class SlackApprovalAccessProbe {
       ]);
       if (user.id !== binding.supervisor_user_id || user.teamId !== binding.team_id || user.deletionKnown !== true || user.isDeleted || user.isBot
         || user.isAppUser || user.isStranger !== false || user.isSuspended !== false
-        || channel.id !== target.channel_id || channel.sharingKnown !== true
-        || channel.isArchived || channel.isShared || !channel.isMember) throw Error();
+        || channel.id !== target.channel_id || channel.isArchived || channel.isShared
+        || (channel.isIm !== true && (channel.sharingKnown !== true || !channel.isMember))) throw Error();
       const members = connection.client.getChannelMembers;
       if (typeof members !== "function") throw Error();
       let cursor: string | undefined;

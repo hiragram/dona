@@ -23,6 +23,7 @@ const proofSchema = z.strictObject({
 });
 const bindingSchema = z.strictObject({
   codec_version: z.literal(1), scope: scopeSchema, team_id: id, supervisor_user_id: id,
+  transaction_id: id,
   revision: positive, status: z.enum(["active", "revoked", "break_glass"]),
   operation_scope_digest: digest.nullable(), target_scope_digest: digest.nullable(),
   expires_at: utc.nullable(), reason: z.string().min(8).max(512).nullable(), reason_digest: digest.nullable(),
@@ -163,9 +164,13 @@ export class SupervisorBindingRepository {
       if (raw.binding_json !== canonical(parsed) || !same(parsed.scope, this.scope) || parsed.revision !== raw.revision
         || root !== recordDigest(parsed) || protectedValue === null) throw Error();
       const generation = parseGeneration(protectedValue);
-      if (generation.revision !== parsed.revision || generation.digest !== root) throw Error();
+      if (generation.revision !== parsed.revision || generation.digest !== root
+        || generation.transaction_id !== parsed.transaction_id) throw Error();
       return Object.freeze(parsed);
     } catch { throw new SupervisorBindingError(); }
+  }
+  matchesScope(input: SupervisorBindingScope): boolean {
+    try { return same(scopeSchema.parse(input), this.scope); } catch { return false; }
   }
 }
 
@@ -233,6 +238,7 @@ export class SupervisorBindingGuard {
     private readonly access: SupervisorCurrentAccess) {
     id.parse(alias); assertSynchronousCallback(access);
   }
+  matchesScope(scope: SupervisorBindingScope): boolean { return this.repository.matchesScope(scope); }
   current(state: VerifiedAuditState, mark: Readonly<ClockMark>, phase: SupervisorAccessPhase,
     expected: { binding_id: string | null; revision: number | null; actor_id: string | null },
     target: { channel_id: string; thread_ts: string }): boolean {
@@ -285,6 +291,7 @@ export class SupervisorBindingOperator {
     try {
       id.parse(transactionId); assertSynchronousResult(proposalInput);
       const proposal = Object.freeze(proposalSchema.parse(proposalInput));
+      if (proposal.team_id !== this.scope.workspace_id) throw Error();
       if (proposal.reason !== null && proposal.reason_digest !== supervisorReasonDigest(proposal.reason)) throw Error();
       if (action === "break_glass" ? proposal.expires_at === null || proposal.reason === null || proposal.reason_digest === null
           || proposal.operation_scope_digest === null || proposal.target_scope_digest === null
@@ -311,6 +318,7 @@ export class SupervisorBindingOperator {
           || [first, second].some(proof => proof.action !== action || proof.transaction_id !== transactionId
             || proof.proposal_digest !== scopeDigest)) throw Error();
         const binding: SupervisorBinding = bindingSchema.parse({ codec_version: 1, scope: this.scope,
+          transaction_id: transactionId,
           team_id: proposal.team_id, supervisor_user_id: proposal.supervisor_user_id, revision,
           status: action === "revoke" ? "revoked" : action === "break_glass" ? "break_glass" : "active",
           operation_scope_digest: action === "break_glass" ? proposal.operation_scope_digest : null,

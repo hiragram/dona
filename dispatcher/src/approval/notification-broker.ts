@@ -50,7 +50,7 @@ export class ApprovalNotificationBroker {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(z.strictObject({ instance_id: id, workspace_id: id }).parse(scope));
       for (const callback of [authorizeClaim, authorizeRecovery, authorizeReceipt, contentKey, wrappingKey, markerKey]) assertSynchronousCallback(callback);
-      if (approvalSupervisorBindingRequired(db) && bindingGuard === undefined) throw Error();
+      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope))) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope); this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
       this.mutations = new ApprovalRecordMutation(db, this.scope); this.lifecycle = new ApprovalRequestLifecycle(db, providers, this.scope);
@@ -60,7 +60,7 @@ export class ApprovalNotificationBroker {
   }
   claim(transactionId: string, input: NotificationCommand): ApprovalNotificationResult {
     try {
-      if (approvalSupervisorBindingRequired(this.db) && this.bindingGuard === undefined) throw Error();
+      if (approvalSupervisorBindingRequired(this.db) && (this.bindingGuard === undefined || !this.bindingGuard.matchesScope(this.scope))) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(notificationCommandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalNotificationResult>(transactionId, (mark, state) => {
         const base = this.base(), found = this.load(state, command); if (found === null) return this.denied(base, "unauthorized");
