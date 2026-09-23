@@ -78,7 +78,7 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
 | update duplicate | `acceptance_unknown` | exact revision複数件 | `needs_review`、自動後続update禁止 |
 
-presentation update attemptは初回delivery attemptと別recordにし、decision ID、presentation revision、channel/message座標へbindingします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
+presentation update attemptは初回delivery attemptと別recordにし、`decision ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。同じdecisionのoutbox再配送や並行workerは、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Pending notice delivery fixture
 
@@ -154,6 +154,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
 - 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止
+- 同じdecision/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
 - pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
