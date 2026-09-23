@@ -180,10 +180,20 @@ export class DispatcherApi {
     const createdDirectory=await fs.mkdir(socketDirectory,{recursive:true,mode:0o700});
     if(!workerOnly||createdDirectory!==undefined)await fs.chmod(socketDirectory,0o700);
     if(workerOnly){
+      const currentUid=typeof process.getuid==="function"?process.getuid():undefined;
+      for(let ancestor=path.resolve(socketDirectory);;ancestor=path.dirname(ancestor)){
+        const ancestorStat=await fs.lstat(ancestor);
+        const ownerTrusted=currentUid===undefined||ancestorStat.uid===currentUid||ancestorStat.uid===0;
+        const acceptableType=ancestorStat.isDirectory()||ancestorStat.isSymbolicLink();
+        const replaceable=ancestorStat.isDirectory()&&(ancestorStat.mode&0o022)!==0
+          &&((ancestorStat.mode&0o1000)===0||ancestor===path.resolve(socketDirectory));
+        if(!ownerTrusted||!acceptableType||replaceable)
+          throw new Error("Worker socket ancestor is replaceable or not owned by a trusted user");
+        if(ancestor===path.dirname(ancestor))break;
+      }
       const canonicalDirectory=await fs.realpath(socketDirectory);
       for(let ancestor=canonicalDirectory;;ancestor=path.dirname(ancestor)){
         const directoryStat=await fs.lstat(ancestor);
-        const currentUid=typeof process.getuid==="function"?process.getuid():undefined;
         const ownerTrusted=currentUid===undefined||directoryStat.uid===currentUid||directoryStat.uid===0;
         const writableByOthers=(directoryStat.mode&0o022)!==0;
         const sticky=(directoryStat.mode&0o1000)!==0;

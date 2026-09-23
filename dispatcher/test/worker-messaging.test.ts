@@ -243,6 +243,28 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("質問通知eventの完了には元threadへの投稿receiptを要求する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-unposted-question");
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      const resultPath=path.join(config.resultsDir,"unposted-question.json");
+      database.beginDispatch(event.event_id,resultPath);
+      database.markWaiting(event.event_id);
+      database.sealJobGroup(source.event_id);
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"処理しました",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
+        resultPath,new Date("2026-09-21T00:00:04Z"));
+      assert.equal(database.get(event.event_id)?.status,"needs_review");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),true);
+    } finally {database.close();}
+  });
+
   test("needs_reviewへ遷移した未配送reportは通知eventを作らず失効する",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -430,6 +452,28 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("queued jobは受理済みinstructionの配送完了まで開始しない",async()=>{
+    const {database,source,job}=await fixture();
+    const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      producer_sequence:1,idempotency_key:"queued-start-gate",occurred_at:"2026-09-21T00:00:01Z",
+      payload:{operation:"add_condition",text:"起動前に適用する条件"}});
+    const bridge=new WorkerInstructionBridge(database.workerMessages,{async steer(jobId,sourceEventId,typed,operationId){
+      database.appendQueuedJobInstruction(jobId,sourceEventId,typed,operationId);
+    }});
+    try {
+      assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),false);
+      assert.throws(()=>database.beginJobPreparation(job.job_id),/no longer ready/);
+      assert.equal(await bridge.runOnce(),true);
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","queued-start-gate") as
+        {delivery:{state:string}}).delivery.state,"delivered");
+      assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),true);
+      const preparing=database.beginJobPreparation(job.job_id);
+      assert.equal(preparing.status,"preparing");
+      assert.match(preparing.objective,/起動前に適用する条件/);
+      assert.equal(instruction.outcome,"created");
+    } finally {await bridge.stop();database.close();}
+  });
+
   test("受理済みanswerをneeds_review遷移で失効し回答不能questionを非表示にする",async()=>{
     const {database,source,job}=await fixture();
     try {
@@ -455,11 +499,11 @@ describe("worker messaging ledger",()=>{
         producer_sequence:1,idempotency_key:"restart-question",occurred_at:"2026-09-21T00:00:01Z",conversation_revision:1,
         payload:{kind:"question",question:"再起動後も回答待ちですか"}},new Date("2026-09-21T00:00:01Z"));
       assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      bindRuntime(database,job.job_id,"runtime-restart");
       database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:1,idempotency_key:"restart-answer",occurred_at:"2026-09-21T00:00:03Z",
         correlation_message_id:question.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"続行してください"}},
       new Date("2026-09-21T00:00:03Z"));
-      bindRuntime(database,job.job_id,"runtime-restart");
       assert.equal(database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-restart",1,10_000,
         new Date("2026-09-21T00:00:04Z"))[0]?.delivery.state,"leased");
       assert.equal(database.beginJobSteer(job.job_id,source.event_id,"restart-answer").duplicate,false);
@@ -667,12 +711,11 @@ describe("worker messaging ledger",()=>{
   test("terminal遷移でworker向けpending／leased deliveryをsupersededにする",async()=>{
     const {database,source,job}=await fixture();
     try {
+      bindRuntime(database,job.job_id,"runtime-terminal");
       for(const sequence of [1,2]) database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
         producer_sequence:sequence,idempotency_key:`terminal-${sequence}`,occurred_at:`2026-09-21T00:00:0${sequence}Z`,
         payload:{operation:"add_condition",text:`condition ${sequence}`}},new Date(`2026-09-21T00:00:0${sequence}Z`));
       database.workerMessages.claim(job.job_id,source.event_id,"worker","runtime-terminal",1,10_000,new Date("2026-09-21T00:00:03Z"));
-      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
-      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
       database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:00:04Z"},job.result_path);
       const states=[1,2].map(sequence=>(database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main",`terminal-${sequence}`) as {delivery:{state:string}}).delivery.state);
       assert.deepEqual(states,["superseded","superseded"]);
@@ -801,11 +844,10 @@ describe("worker messaging ledger",()=>{
     try {
       const parent=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),conversation_revision:0,
         payload:{kind:"question",question:"継続しますか"}},new Date("2026-07-01T00:00:00Z"));
+      bindRuntime(database,job.job_id,"runtime-retention");
       database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,producer_sequence:1,
         idempotency_key:"instruction-retained",occurred_at:"2026-07-20T00:00:00Z",correlation_message_id:parent.message.message_id,
         conversation_revision:1,payload:{operation:"answer",text:"継続"}},new Date("2026-07-20T00:00:00Z"));
-      database.beginJobPreparation(job.job_id); database.setJobRuntime(job.job_id,"workspace","pane");
-      database.beginJobDispatch(job.job_id); database.markJobRunning(job.job_id);
       database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-07-20T00:01:00Z"},job.result_path);
       assert.equal(database.workerMessages.publishPendingReports(100,new Date("2026-07-20T00:01:00Z")),0);
       assert.equal(database.workerMessages.purge(new Date("2026-08-02T00:00:00Z")),0);

@@ -870,6 +870,9 @@ export class DispatcherDatabase {
         FROM jobs WHERE (status IN ('queued','retryable_failed') AND available_at<=?) OR status IN ('preparing','dispatching','running')
       ) SELECT jobs.* FROM ranked JOIN jobs USING(job_id)
         WHERE jobs.status IN ('queued','retryable_failed','running')
+          AND (jobs.status='running' OR NOT EXISTS (SELECT 1 FROM worker_message_deliveries d
+            JOIN worker_messages m USING(message_id) WHERE m.job_id=jobs.job_id AND d.consumer='worker'
+              AND d.state IN ('pending','leased')))
         ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,fairness_rank,created_at,ranked.insertion_order LIMIT ?
     `).all(at.toISOString(), limit) as JobRow[];
   }
@@ -1044,6 +1047,8 @@ export class DispatcherDatabase {
       UPDATE jobs SET status = 'preparing', attempt_count = attempt_count + 1,
         last_error_code = NULL, last_error_message = NULL, updated_at = ?
       WHERE job_id = ? AND status IN ('queued', 'retryable_failed') AND available_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+          WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
     `).run(timestamp, jobId, timestamp).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} is no longer ready to prepare`);
     return this.getJobRequired(jobId);
@@ -2093,6 +2098,26 @@ export class DispatcherDatabase {
           this.scheduler.settleUndelegatedWorkEvent(eventId,rejected&&!needsReview?"failed":"needs_review",
             new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"),rejectionCode);
           return;
+        }
+      }
+      if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
+        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
+        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
+          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {channel_id?:unknown;thread_ts?:unknown}:undefined;
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).channel_id===target?.channel_id&&
+            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
+            typeof (action as Record<string,unknown>).message_ts==="string"&&
+            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
+          if(!posted){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_question_not_posted",
+              last_error_message:"Question notification completed without a confirmed post"});
+            this.markJobNeedsReview(payload.job_id,"worker_message_question_not_posted",
+              "Question notification completed without a confirmed post");
+            return;
+          }
         }
       }
       this.transition(eventId, ["waiting_agent"], "completed", {
