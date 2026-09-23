@@ -1910,7 +1910,11 @@ export class DispatcherDatabase {
         throw new Error(`Event ${eventId} is no longer dispatchable`);
       }
       const attemptCount = row.attempt_count + 1;
-      const status: EventStatus = attemptCount >= maxAttempts ? "dead_letter" : "retryable_failed";
+      // A worker report has already been accepted durably. A pre-dispatch failure
+      // proves the agent never saw it, so keep retrying instead of losing a
+      // question behind a terminal event while its delivery is marked delivered.
+      const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
+      const status: EventStatus = attemptCount >= maxAttempts && !durableWorkerReport ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(attemptCount, at);
       this.db
         .prepare(`
@@ -1932,7 +1936,8 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const row = this.get(eventId);
       if (!row || row.status !== "dispatching") throw new Error(`Event ${eventId} is not dispatching`);
-      const status: EventStatus = row.attempt_count >= maxAttempts ? "dead_letter" : "retryable_failed";
+      const durableWorkerReport = row.source === "dona_message" && row.event_type === "worker_message_report";
+      const status: EventStatus = row.attempt_count >= maxAttempts && !durableWorkerReport ? "dead_letter" : "retryable_failed";
       const availableAt = status === "dead_letter" ? at.toISOString() : retryAt(row.attempt_count, at);
       this.db
         .prepare(`

@@ -164,6 +164,23 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("question通知の安全なdispatch前失敗は上限後も再配送可能に保つ",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      assert.equal(database.recordPreDispatchFailure(event.event_id,"herdr_unavailable","offline",1,new Date("2026-09-21T00:00:03Z")).status,"retryable_failed");
+      assert.equal(database.recordPreDispatchFailure(event.event_id,"herdr_unavailable","offline",1,new Date("2026-09-21T00:01:03Z")).status,"retryable_failed");
+      assert.equal(database.workerMessages.getMessage(job.job_id,question.message.message_id,event.event_id)?.message_id,question.message.message_id);
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:01:04Z")),0);
+      database.beginDispatch(event.event_id,"/tmp/worker-message-result");
+      assert.equal(database.recordSafePromptFailure(event.event_id,"prompt_unavailable","offline",1,new Date("2026-09-21T00:01:05Z")).status,"retryable_failed");
+    } finally {database.close();}
+  });
+
   test("未回答questionを次のtyped answer identityと共に投影する",async()=>{
     const {database,source,job}=await fixture();
     try {
