@@ -183,6 +183,8 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - boot変更/経過証明不能時に既存のacceptance_unknown attemptもpayload即時削除・needs_reviewへ固定
 - restore current binding/policyはgenerationに加えて予約済みcanonical digestとcommit transaction IDも完全一致必須
 - audit sequence/previous MACのhash chainをDB外のCAS末尾anchorまで検証し、欠落・切断・未finalizeをfail closed
+- approve/consume/executionなど各security state transitionは次audit anchorを先にCAS reserveし、状態変更とaudit rowを同じSQLite transactionでcommitしてからanchor finalize
+- consumed後のexecution attemptが同期結果または後日reconcileで初めてterminalになったtransactionで、attempt IDごとに一意なredacted result outboxを作りpersisted ownerへ配送
 - terminal requestへ遅着したpending noticeはstateを戻さず、直列化したupdate attemptでterminal表示へ変更
 - `approved` decisionと全terminal transitionで既に`sent`のpending noticeを現在の決定状態へ更新し、承認済みなのに「承認待ち」を残さず、再配送では同じrevisionのattemptへ収束
 - `approved` decisionが先着した未送信pending noticeは同じtransactionで`aborted`とし、遅いworkerが待機表示を新規投稿しない
