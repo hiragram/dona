@@ -131,6 +131,12 @@ Dispatcher DBをbackupからrestoreするtransactionでは、全nonterminal/appr
 
 理由: 同じdurability primitiveの別実装によるraceと復旧差異を防ぎます。安全側defaultは共有contractが利用可能になるまで接続しないことです。scheduler Issueのparent、本文、close状態は変更しません。
 
+### 既存成果との照合と採用境界
+
+current `main`のscheduler schema v3、typed outbox、job owner/result routing、Agent Sessionはapproval専用のrequest/decision/consume/executionを提供しません。#16の共有approval primitiveは`feature/web-adapter-dashboard`上にあり、requestとdelivery、decision、one-shot consume、execution attempt、notification attemptを別record・状態として保持します。`acceptance_unknown`を再送許可に変えず、unknown versionとpayload/proof不整合を安全側へ送る点は本ADRと整合します。
+
+ただし#16のIssue closeやfeature branch上の実装は、`main`またはこのADRのintegration branchへの採用を意味しません。後続の#25では、同じprimitiveを複製せずcurrent mainのschema v3、typed outbox、owner binding、authorization receipt、Agent Sessionとの接続とmigration順序を検証します。それまでsupervisor approvalの実行機能は`safe_off`です。
+
 ## State machine
 
 decision stateとexecution stateは別のrecordとして扱います。

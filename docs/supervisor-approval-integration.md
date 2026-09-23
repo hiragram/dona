@@ -31,14 +31,14 @@ release_state: safe_off
 | [#24](https://github.com/hiragram/dona/issues/24) | health、metrics、CLI、reconcile、expiry、retention |
 | [#25](https://github.com/hiragram/dona/issues/25) | deterministic integration/chaos/security testとrunbook |
 
-このmanifest作成時点で#15〜#25はすべて未完了です。状態の判定にはGitHub Issueとnative relationの最新値を使い、この記述だけで完了扱いしません。
+#16はfeature branch上で共有primitiveを実装してclose済みですが、current `main`とこのintegration branchには未採用です。#15のADRを先に採用し、#25で共有primitiveとcurrent mainの整合を検証します。その他の状態もGitHub Issueとnative relationの最新値で判定し、この記述だけで完了扱いしません。
 
 ## Native dependency graph
 
 矢印は`blocker -> blocked`を表します。以下はIssue #26で定義済みの直接依存だけであり、phaseの都合によるedgeや推移edgeは追加しません。
 
 ```text
-#15 -> #16, #17
+#15 -> #17
 #16 -> #18, #19, #24
 #17 -> #18, #19
 #18 -> #20, #22
@@ -50,7 +50,7 @@ release_state: safe_off
 #24 -> #25
 ```
 
-native relationがこのgraphと一致することを、Epic側の`sub_issues`、各子Issueの`parent`、`blocked_by`、`blocking`の両方向から照合します。
+native relationはEpic側の`sub_issues`、各子Issueの`parent`、`blocked_by`、`blocking`の両方向から再取得します。#15からclosedの#16へのedgeは持たず、#17への直接edgeを維持します。
 
 ## 子PRの受け入れ条件
 
