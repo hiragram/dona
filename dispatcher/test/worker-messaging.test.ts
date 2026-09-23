@@ -322,8 +322,12 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
-  test("質問通知eventの完了にはthread限定投稿とsuspended遷移を要求する",async()=>{
-    for(const {suspended,broadcast} of [{suspended:false,broadcast:false},{suspended:true,broadcast:true},{suspended:true,broadcast:false}]){
+  test("質問通知eventの完了にはworkspaceとthread限定投稿とsuspended遷移を要求する",async()=>{
+    for(const {suspended,broadcast,wrongWorkspace} of [
+      {suspended:false,broadcast:false,wrongWorkspace:false},
+      {suspended:true,broadcast:true,wrongWorkspace:false},
+      {suspended:true,broadcast:false,wrongWorkspace:true},
+      {suspended:true,broadcast:false,wrongWorkspace:false}]){
       const {database,source,job,config}=await fixture();
       try {
         bindRuntime(database,job.job_id,`runtime-session-${suspended}`);
@@ -332,20 +336,21 @@ describe("worker messaging ledger",()=>{
         database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
         const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
         assert.ok(event);
-        const target=JSON.parse(event.reply_target_json!) as {channel_id:string;thread_ts:string};
-        const resultPath=path.join(config.resultsDir,`session-${suspended}-${broadcast}.json`);
+        const target=JSON.parse(event.reply_target_json!) as {workspace_id:string;channel_id:string;thread_ts:string};
+        const resultPath=path.join(config.resultsDir,`session-${suspended}-${broadcast}-${wrongWorkspace}.json`);
         database.beginDispatch(event.event_id,resultPath);
         database.markWaiting(event.event_id);
         database.sealJobGroup(source.event_id);
-        const actions:Array<Record<string,unknown>>=[{tool:"dona_slack.post_message",channel_id:target.channel_id,
+        const workspaceId=wrongWorkspace?"T_OTHER":target.workspace_id;
+        const actions:Array<Record<string,unknown>>=[{tool:"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,message_ts:"1756722031.123456",reply_broadcast:broadcast,success:true}];
-        if(suspended)actions.push({tool:"dona_slack.set_agent_session_status",channel_id:target.channel_id,
+        if(suspended)actions.push({tool:"dona_slack.set_agent_session_status",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,status:"suspended",success:true});
         database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
           summary:"処理しました",actions,memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
           resultPath,new Date("2026-09-21T00:00:04Z"));
-        assert.equal(database.get(event.event_id)?.status,suspended&&!broadcast?"completed":"needs_review");
-        assert.equal(database.getJob(job.job_id)?.status,suspended&&!broadcast?"blocked":"needs_review");
+        assert.equal(database.get(event.event_id)?.status,suspended&&!broadcast&&!wrongWorkspace?"completed":"needs_review");
+        assert.equal(database.getJob(job.job_id)?.status,suspended&&!broadcast&&!wrongWorkspace?"blocked":"needs_review");
       } finally {database.close();}
     }
   });
@@ -487,6 +492,32 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("完了または破棄済みattentionの参照も質問受理時に解除する",async()=>{
+    for(const terminal of ["completed","dead_letter"] as const){
+      const {database,source,job}=await fixture();
+      try {
+        bindRuntime(database,job.job_id,`runtime-prior-attention-${terminal}`);
+        database.markJobBlocked(job.job_id,"agent blocked");
+        database.sealJobGroup(source.event_id);
+        const attention=database.enqueueJobNotification(job.job_id);
+        if(terminal==="completed")database.manualComplete(attention.row.event_id);
+        else database.manualDeadLetter(attention.row.event_id);
+        const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+          payload:{kind:"question",question:"回答してください"}},new Date("2026-09-21T00:00:01Z"));
+        assert.equal(question.outcome,"created");
+        assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
+        assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+        database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+        const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+        assert.ok(event);
+        database.beginDispatch(event.event_id,"/tmp/worker-message-prior-attention");
+        database.markNeedsReview(event.event_id,"prompt_unknown","unknown");
+        assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+        assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),true);
+      } finally {database.close();}
+    }
+  });
+
   test("配送中のblocked attentionがある質問は曖昧な重複通知を作らない",async()=>{
     const {database,source,job,config}=await fixture();
     try {
@@ -551,12 +582,16 @@ describe("worker messaging ledger",()=>{
     });
     try {
       assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),false);
+      assert.equal(database.beginRunnableCycle(),undefined);
+      assert.equal(database.nextRunnableJob(),undefined);
       assert.throws(()=>database.beginJobPreparation(job.job_id),/no longer ready/);
       assert.equal(await bridge.runOnce(),true);
       assert.equal(schedulerWakes,1);
       assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"dona-main","queued-start-gate") as
         {delivery:{state:string}}).delivery.state,"delivered");
       assert.equal(database.listRunnableJobs().some(row=>row.job_id===job.job_id),true);
+      assert.equal(database.beginRunnableCycle(),source.event_id);
+      assert.equal(database.nextRunnableJob()?.job_id,job.job_id);
       const preparing=database.beginJobPreparation(job.job_id);
       assert.equal(preparing.status,"preparing");
       assert.match(preparing.objective,/起動前に適用する条件/);

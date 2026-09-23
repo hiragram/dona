@@ -2115,9 +2115,10 @@ export class DispatcherDatabase {
       if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
         const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
         if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
-          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {channel_id?:unknown;thread_ts?:unknown}:undefined;
+          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
           const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
             (action as Record<string,unknown>).channel_id===target?.channel_id&&
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
             typeof (action as Record<string,unknown>).message_ts==="string"&&
@@ -2125,6 +2126,7 @@ export class DispatcherDatabase {
             (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
           const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
+            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
             (action as Record<string,unknown>).channel_id===target?.channel_id&&
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
             (action as Record<string,unknown>).status==="suspended"&&(action as Record<string,unknown>).success!==false);
@@ -2412,6 +2414,8 @@ export class DispatcherDatabase {
       const row = this.db.prepare(`
         SELECT source_event_id FROM jobs INDEXED BY jobs_runnable_fair_idx
         WHERE status = 'queued' AND available_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+            WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
         ORDER BY source_event_id DESC
         LIMIT 1
       `).get(timestamp) as Pick<JobRow, "source_event_id"> | undefined;
@@ -2438,6 +2442,8 @@ export class DispatcherDatabase {
     const statement = this.db.prepare(`
       SELECT * FROM jobs INDEXED BY jobs_runnable_fair_idx
       WHERE status = 'queued' AND available_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM worker_message_deliveries d JOIN worker_messages m USING(message_id)
+          WHERE m.job_id=jobs.job_id AND d.consumer='worker' AND d.state IN ('pending','leased'))
         AND source_event_id > ?
         AND source_event_id <= ?
         ${excludedSources}

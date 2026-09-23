@@ -440,6 +440,12 @@ export class WorkerMessageRepository {
             this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'")
               .run(job.completion_event_id);
           }
+          if(["completed","dead_letter"].includes(attention.status)){
+            this.db.prepare("UPDATE job_groups SET attention_event_id=NULL,updated_at=? WHERE source_event_id=? AND attention_event_id=?")
+              .run(acceptedAt,job.source_event_id,job.completion_event_id);
+            this.db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE job_id=? AND completion_event_id=?")
+              .run(acceptedAt,jobId,job.completion_event_id);
+          }
         }
         this.db.prepare(`UPDATE jobs SET last_error_code='worker_message_question_pending',
           last_error_message='Background worker is waiting for an answer',updated_at=? WHERE job_id=? AND status='blocked'`)
