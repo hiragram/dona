@@ -318,7 +318,7 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.getJob(job.job_id)?.status,"blocked");
       assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
       assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),false);
-      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:01Z")),1);
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:01Z")),0);
       assert.equal(database.beginJobSteer(job.job_id,source.event_id,"normal-condition").duplicate,false);
       database.markJobSteerAccepted(job.job_id,"normal-condition");
       assert.equal(database.getJob(job.job_id)?.status,"blocked");
@@ -751,6 +751,26 @@ describe("worker messaging ledger",()=>{
       database.markJobNeedsReview(second.job_id,"test","review required");
       assert.equal(database.workerMessages.publishDueSilenceEvents(2,new Date("2026-09-21T00:15:00Z")),0);
       assert.equal(database.workerMessages.operationalSnapshot(new Date("2026-09-21T00:15:00Z")).due_silence_deadlines,0);
+    } finally {database.close();}
+  });
+
+  test("質問待ちblocked jobはsilenceを発行せず既存eventもcurrentにしない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-silence-question");
+      database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:00Z"));
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:00Z")),1);
+      const sqlite=new Database(config.databasePath);
+      const event=sqlite.prepare("SELECT event_id FROM events WHERE event_type='worker_message_silence'").get() as {event_id:string};
+      sqlite.close();
+      database.beginDispatch(event.event_id,path.join(config.resultsDir,"question-silence.json"));
+      database.markWaiting(event.event_id);
+      database.workerMessages.appendReport(job.job_id,{...report(source.event_id,2),payload:{kind:"question",question:"確認してください"}},
+        new Date("2026-09-21T00:15:01Z"));
+      assert.equal(database.getJob(job.job_id)?.status,"blocked");
+      assert.equal(database.workerMessages.silenceEventState(job.job_id,event.event_id)?.worker_message_silence.current,false);
+      assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:30:01Z")),0);
+      assert.equal(database.workerMessages.operationalSnapshot(new Date("2026-09-21T00:30:01Z")).due_silence_deadlines,0);
     } finally {database.close();}
   });
 

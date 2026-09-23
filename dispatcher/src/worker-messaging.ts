@@ -665,7 +665,8 @@ export class WorkerMessageRepository {
       .get(new Date(at.getTime()-workerMessageOverdueGraceMs).toISOString()) as {count:number};
     const expired = this.db.prepare("SELECT COUNT(*) AS count FROM worker_message_deliveries WHERE state='leased' AND lease_expires_at<=?").get(at.toISOString()) as {count:number};
     const dueSilence = this.db.prepare(`SELECT COUNT(*) AS count FROM worker_message_cadence c JOIN jobs j USING(job_id)
-      WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')`).get(at.toISOString()) as {count:number};
+      WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
+        AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending')`).get(at.toISOString()) as {count:number};
     return { protocol_version: workerMessageProtocolVersion, pending_deliveries: pending.count, overdue_deliveries: overdue.count,
       expired_leases: expired.count, due_silence_deadlines: dueSilence.count, degraded: expired.count > 0 || overdue.count > 0 };
   }
@@ -752,6 +753,7 @@ export class WorkerMessageRepository {
       const now=at.toISOString();
       const rows=this.db.prepare(`SELECT c.job_id,c.generation,c.silence_interval_ms,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts
         FROM worker_message_cadence c JOIN jobs j USING(job_id) WHERE c.silence_due_at<=? AND j.status NOT IN ('completed','failed','cancelled','needs_review')
+          AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending')
         ORDER BY c.silence_due_at,c.job_id LIMIT ?`).all(now,limit) as Array<{job_id:string;generation:number;silence_interval_ms:number;source_event_id:string;workspace_id:string|null;channel_id:string|null;thread_ts:string|null}>;
       for(const row of rows){
         const externalId=`worker-message-silence:${row.job_id}:${row.generation}`;
@@ -785,10 +787,11 @@ export class WorkerMessageRepository {
     const projected=payload as {job_id?:unknown;generation?:unknown};
     if(projected.job_id!==jobId||!Number.isSafeInteger(projected.generation))return undefined;
     const cadence=this.db.prepare("SELECT generation FROM worker_message_cadence WHERE job_id=?").get(jobId) as {generation:number}|undefined;
-    const job=this.db.prepare("SELECT status FROM jobs WHERE job_id=?").get(jobId) as Pick<JobRow,"status">|undefined;
+    const job=this.db.prepare("SELECT status,last_error_code FROM jobs WHERE job_id=?").get(jobId) as Pick<JobRow,"status"|"last_error_code">|undefined;
     const currentGeneration=cadence?.generation ?? 0,eventGeneration=projected.generation as number;
     return {worker_message_silence:{event_id:eventId,event_generation:eventGeneration,current_generation:currentGeneration,
-      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"}};
+      current:event.status==="waiting_agent"&&eventGeneration===currentGeneration&&!!job&&!terminal(job.status)&&job.status!=="needs_review"
+        &&!(job.status==="blocked"&&job.last_error_code==="worker_message_question_pending")}};
   }
 
   purge(at = new Date()): number {
