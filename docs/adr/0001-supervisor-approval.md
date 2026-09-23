@@ -57,7 +57,7 @@ LLM、Slack本文、button value、元event、Codex host approvalは境界外の
 
 ### 1. MVP typed operation
 
-採用: 最初のoperationは`slack.post_thread_reply.v1`とします。保存対象はworkspace、channel、thread、reply policy、mention policy、送信時のplain_text encoding・`mrkdwn: false`・`unfurl_links: false`・`unfurl_media: false`、server-side content MAC、reconcile marker policyで、executorへは暗号化短期payload storeから復号した本文を渡します。`<!channel>`、`<!here>`、`<!everyone>`、user group mentionは拒否し、明示user mentionはsnapshotのallowlistにある最大3名だけを許可します。Slack Connectを含むshared channelはMVP対象外で、request作成、decision、consumeの各時点で`isShared: false`を再検証します。任意のMCP tool名、任意JSON、DM新規送信、broadcast、reaction、GitHub/Notion/Figma/Drive write、production/self-updateは対象外です。
+採用: 最初のoperationは`slack.post_thread_reply.v1`とします。保存対象はworkspace、channel、thread、reply policy、mention policy、送信時のplain_text encoding・`mrkdwn: false`・`parse: "none"`・`unfurl_links: false`・`unfurl_media: false`、server-side content MAC、reconcile marker policyで、executorへは暗号化短期payload storeから復号した本文を渡します。`<!channel>`、`<!here>`、`<!everyone>`、user group mentionは拒否し、明示user mentionはsnapshotのallowlistにある最大3名だけを許可します。Slack Connectを含むshared channelはMVP対象外で、request作成、decision、consumeの各時点で`isShared: false`を再検証します。任意のMCP tool名、任意JSON、DM新規送信、broadcast、reaction、GitHub/Notion/Figma/Drive write、production/self-updateは対象外です。
 
 理由: Donaの主要経路でありながら、thread固定、broadcast禁止、workspace binding、message read-backにより作用範囲とacceptanceを狭く検証できます。安全側defaultは未知operation拒否です。operation追加はtyped schema、projection、precondition、idempotency/reconcile、bypass inventory、security fixtureを独立reviewできる場合だけです。
 

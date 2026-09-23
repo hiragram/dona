@@ -112,6 +112,7 @@ presentation update attemptは初回delivery attemptと別recordにし、`reques
     "reply_broadcast": false,
     "text_encoding": "plain_text",
     "mrkdwn": false,
+    "parse": "none",
     "unfurl_links": false,
     "unfurl_media": false,
     "special_mentions": "deny_all",
@@ -151,7 +152,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 期待する否定fixture:
 
 - `operation_kind`を任意のtool名へ変更するとunknown operationで拒否
-- `workspace_id`、channel、thread、broadcast flag、mention policy、text encoding、mrkdwn/unfurl設定、content HMAC、root revisionのどれか一つでも変更するとhash不一致
+- `workspace_id`、channel、thread、broadcast flag、mention policy、text encoding、mrkdwn/parse/unfurl設定、content HMAC、root revisionのどれか一つでも変更するとhash不一致
 - 別instance、別binding revision、別requestのdecisionを転用するとconsume拒否
 - DM/private thread由来contextをpresentationへ追加するとdata-classification test失敗
 - `<!channel>`、`<!here>`、`<!everyone>`、user group、allowlist外または4名以上のuser mentionはgatewayとexecutorの両方で拒否
