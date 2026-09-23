@@ -329,7 +329,7 @@ export class WorkerMessageRepository {
               JOIN worker_message_deliveries answer_delivery ON answer_delivery.message_id=answer.message_id
               WHERE answer.job_id=question.job_id AND answer.direction='dona_to_worker' AND answer.kind='answer'
                 AND answer.correlation_message_id=question.message_id AND answer_delivery.consumer='worker'
-                AND answer_delivery.state!='superseded') LIMIT 1`).get(jobId);
+                AND answer_delivery.state='delivered') LIMIT 1`).get(jobId);
         if(pending)throw new WorkerMessageError("worker_message_question_pending","job already has an unanswered question");
       }
     }

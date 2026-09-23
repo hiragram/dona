@@ -998,7 +998,8 @@ export class DispatcherDatabase {
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
-      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review') AND (
+      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT (j.status='blocked' AND j.last_error_code='worker_message_question_pending') AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'

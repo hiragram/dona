@@ -248,6 +248,7 @@ describe("worker messaging ledger",()=>{
         payload:{kind:"question",question:"回答を待ちます"}},new Date("2026-09-21T00:00:01Z"));
       assert.equal(database.getJob(job.job_id)?.status,"blocked");
       assert.equal(database.getJob(job.job_id)?.last_error_code,"worker_message_question_pending");
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id===job.job_id),false);
       assert.equal(database.workerMessages.publishDueSilenceEvents(1,new Date("2026-09-21T00:15:01Z")),1);
       assert.equal(database.beginJobSteer(job.job_id,source.event_id,"normal-condition").duplicate,false);
       database.markJobSteerAccepted(job.job_id,"normal-condition");
@@ -413,6 +414,27 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.workerMessages.publishPendingReports(2,new Date("2026-09-21T00:00:03Z")),1);
       assert.deepEqual(database.workerMessages.pendingQuestion(job.job_id),{ambiguous:false,message_id:first.message.message_id,kind:"question",
         next_producer_sequence:1,next_conversation_revision:2});
+    } finally {database.close();}
+  });
+
+  test("answerがworkerへ配送されるまで次のquestionを受理しない",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),conversation_revision:1,
+        payload:{kind:"question",question:"最初の質問"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"answer-pending",occurred_at:"2026-09-21T00:00:02Z",
+        correlation_message_id:first.message.message_id,conversation_revision:2,payload:{operation:"answer",text:"回答"}},
+        new Date("2026-09-21T00:00:02Z"));
+      const next={...report(source.event_id,2),conversation_revision:2,payload:{kind:"question" as const,question:"次の質問"}};
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,next,new Date("2026-09-21T00:00:03Z")),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_question_pending");
+      const claim=database.workerMessages.claim(job.job_id,source.event_id,"worker","test-worker",1,10_000,new Date("2026-09-21T00:00:04Z"))[0]!;
+      assert.throws(()=>database.workerMessages.appendReport(job.job_id,next,new Date("2026-09-21T00:00:05Z")),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="worker_message_question_pending");
+      database.workerMessages.acknowledge(job.job_id,source.event_id,claim.delivery.delivery_id,"test-worker",claim.lease_token,
+        claim.delivery.fence,new Date("2026-09-21T00:00:06Z"));
+      assert.equal(database.workerMessages.appendReport(job.job_id,next,new Date("2026-09-21T00:00:07Z")).outcome,"created");
     } finally {database.close();}
   });
 
