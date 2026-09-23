@@ -161,7 +161,9 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
 - Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
-- 同じcreation keyを並行作成するworkerはDBでrequest placeholderを一つだけclaimし、敗者は暗号化payloadを割り当てない。保存失敗・不明の孤児候補はread-backで確定してから削除
+- 同じcreation keyを並行作成するworkerはDBでallocation_pending placeholderを一つだけclaimし、敗者は別payloadを割り当てない
+- placeholder commit直後のcrashはlease失効後にCAS fenceを進め、同じpayload IDの不在を証明してから割当てを再開。不明ならneeds_reviewで止め、旧fenceの遅着writeを拒否
+- payloadとcontent HMACは別々のkey versionを保持し、最後の参照payloadとbackupが消えるまで旧鍵をdecrypt/verify-onlyで保持
 - pending noticeも専用attemptと開始fenceを持ち、timeout後0件では再投稿しない
 - restoreしたbinding/policy generationが保護されたhigh-water mark未満なら二者再承認までfail closed
 - high-water markの欠落、読取不能、integrity不明も二者再承認までfail closed
