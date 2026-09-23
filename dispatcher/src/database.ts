@@ -1196,6 +1196,15 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  private revealBlockedQuestionOwner(event:EventRow,code:string,message:string):void {
+    if(event.source!=="dona_message"||event.event_type!=="worker_message_report")return;
+    const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
+    if(typeof payload.job_id!=="string"||!["question","decision_request"].includes(String(payload.kind)))return;
+    const job=this.getJob(payload.job_id);
+    if(job?.status==="blocked"&&job.last_error_code==="worker_message_question_pending")
+      this.markJobNeedsReview(payload.job_id,code,message);
+  }
+
   markJobBlocked(jobId: string, message: string, from: JobStatus[] = ["running"]): void {
     this.updateJob(jobId, from, "blocked", {
       last_error_code: "agent_blocked",
@@ -1915,7 +1924,10 @@ export class DispatcherDatabase {
 
   markNeedsReview(eventId: string, code: string, message: string): void {
     this.db.transaction(()=>{
+      const event=this.getRequired(eventId);
       this.transition(eventId, ["dispatching", "waiting_agent"], "needs_review", {last_error_code: code,last_error_message: message});
+      this.revealBlockedQuestionOwner(event,"worker_message_notification_ambiguous",
+        "Question notification needs review before the worker can receive an answer");
       this.scheduler.settleUndelegatedWorkEvent(eventId,"needs_review",new Date().toISOString().replace(/\.\d{3}Z$/,"Z"));
       this.setNotificationState(eventId,"needs_review",new Date());
     }).immediate();
@@ -2122,7 +2134,7 @@ export class DispatcherDatabase {
               "Question notification completed without a confirmed suspended session";
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:reason,last_error_message:description});
-            this.markJobNeedsReview(payload.job_id,reason,description);
+            this.revealBlockedQuestionOwner(event,reason,description);
             return;
           }
         }
@@ -2177,12 +2189,8 @@ export class DispatcherDatabase {
       this.transition(eventId, ["waiting_agent"], needsReview?"needs_review":"dead_letter", {result_json: stableStringify(result),result_path: resultPath,
         completed_at: result.completed_at,last_error_code: ambiguous?"ambiguous_external_write":posted?"incomplete_delivery_after_post":"agent_reported_failure",
         last_error_message: result.summary ?? "Agent reported failure"});
-      if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
-        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
-        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind)))
-          this.markJobNeedsReview(payload.job_id,"worker_message_notification_failed",
-            "Question notification failed before the worker could receive an answer");
-      }
+      this.revealBlockedQuestionOwner(event,"worker_message_notification_failed",
+        "Question notification failed before the worker could receive an answer");
       this.scheduler.settleUndelegatedWorkEvent(eventId,needsReview||event.source==="dona_schedule"?"needs_review":"failed",new Date(Math.floor(Date.parse(result.completed_at)/1000)*1000).toISOString().replace(".000Z","Z"));
       this.setNotificationState(eventId,needsReview?"needs_review":"failed",new Date(result.completed_at));
     }).immediate();
@@ -2241,6 +2249,11 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const row = this.getRequired(eventId);
       if(row.source==="dona_schedule") throw new Error("scheduled_event_completion_requires_reconciliation");
+      if(row.status!=="completed"&&row.source==="dona_message"&&row.event_type==="worker_message_report"){
+        const payload=JSON.parse(row.payload_json) as {kind?:unknown};
+        if(["question","decision_request"].includes(String(payload.kind)))
+          throw new Error("worker_message_question_completion_requires_delivery_receipt");
+      }
       const scheduledNotification=this.db.prepare(`SELECT 1 FROM job_completion_results WHERE notification_event_id=?
         AND json_extract(owner_json,'$.kind')='schedule' AND notification_state!='accepted'`).get(eventId);
       if(scheduledNotification) throw new Error("scheduled_notification_receipt_required");
@@ -2318,15 +2331,8 @@ export class DispatcherDatabase {
           last_error_message = 'Moved to dead letter by operator', updated_at = ? WHERE event_id = ?
       `)
       .run(at.toISOString(), eventId);
-      if(row.source==="dona_message"&&row.event_type==="worker_message_report"){
-        const payload=JSON.parse(row.payload_json) as {job_id?:unknown;kind?:unknown};
-        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
-          const job=this.getJob(payload.job_id);
-          if(job?.status==="blocked"&&job.last_error_code==="worker_message_question_pending")
-            this.markJobNeedsReview(payload.job_id,"worker_message_notification_discarded",
-              "Question notification was discarded by an operator");
-        }
-      }
+      this.revealBlockedQuestionOwner(row,"worker_message_notification_discarded",
+        "Question notification was discarded by an operator");
       this.scheduler.settleUndelegatedWorkEvent(eventId,"failed",new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
       this.sealJobGroupIfPresent(eventId, at.toISOString());
       this.setNotificationState(eventId,"failed",at);

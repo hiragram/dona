@@ -260,6 +260,46 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("質問通知のmanual completeを拒否し通常needs_reviewで質問待ちjobを顕在化する",async()=>{
+    const {database,source,job}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-manual-question");
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      assert.throws(()=>database.manualComplete(event.event_id),/worker_message_question_completion_requires_delivery_receipt/);
+      assert.equal(database.get(event.event_id)?.status,"queued");
+      database.beginDispatch(event.event_id,"/tmp/worker-message-manual-question");
+      database.markNeedsReview(event.event_id,"prompt_unknown","unknown");
+      assert.equal(database.get(event.event_id)?.status,"needs_review");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+    } finally {database.close();}
+  });
+
+  test("cancelling中の質問通知失敗はjobの取消状態を維持する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-cancelling-question");
+      const question=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"question",question:"確認してください"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${question.message.message_id}`);
+      assert.ok(event);
+      const resultPath=path.join(config.resultsDir,"cancelling-question.json");
+      database.beginDispatch(event.event_id,resultPath);
+      database.markWaiting(event.event_id);
+      database.beginJobCancellation(job.job_id,source.event_id);
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"投稿できませんでした",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
+        resultPath,new Date("2026-09-21T00:00:04Z"));
+      assert.equal(database.getJob(job.job_id)?.status,"cancelling");
+      database.markJobCancelled(job.job_id,"cancelled");
+      assert.equal(database.getJob(job.job_id)?.status,"cancelled");
+    } finally {database.close();}
+  });
+
   test("質問通知eventの完了には元threadへの投稿receiptを要求する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
