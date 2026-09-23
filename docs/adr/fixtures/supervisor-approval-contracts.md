@@ -83,7 +83,7 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update result unproven | `acceptance_unknown` | 相関済み不受理receiptなし | `failed`へ進めずfence維持 |
 | update retention boundary | `acceptance_unknown` | 90日経過、exact revision未確定 | 最小tombstoneへ移して`needs_review`、再送禁止fence維持 |
 
-presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。各revisionの更新後messageにはrequest、message座標、app author、desired revision、update attempt ID、key versionのMAC付き`block_id` markerを含め、read-backではその一意な一致だけを成功証拠にします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
+presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。各revisionの更新後messageには元のrequest ID・`notification_attempt_id`・notification kind・MAC付きnotification markerを別blockに維持し、request、message座標、app author、desired revision、update attempt ID、key versionのMAC付き`block_id` markerも含め、read-backではその一意な一致だけを成功証拠にします。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
 ## Pending notice delivery fixture
 
@@ -176,7 +176,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - 同じrequest/message/desired revisionのoutbox再配送と並行workerは、成功済みも含む同一update attemptへ収束し、`chat.update`は一回だけ実行
 - decisionのない`delivery_failed`・restore invalidation後に遅着noticeを無効表示へ更新する場合も、request/message/desired revisionの同じattemptへ収束
 - 初回bootstrapは保護storeのgeneration不在をCAS条件に二者承認済みdigest/transaction IDをDBより先にreserveし、DB値からmarkを推定しない
-- Dona自身の認証済みpending/approval markerだけをthread revision比較から除外
+- Dona自身の認証済みpending/approval markerだけをthread revision比較から除外。chat.update後も元notification markerを別blockに保持し、presentation markerだけでは除外しない
 - 同じsource/operation slotの作成retryは同じrequestへ収束し、action hash不一致はconflict
 - content HMAC鍵rotation後の同一source retryはcreation keyで既存requestを先に取得し、その保存済みkey versionのverification-only鍵で同じcanonical actionを照合して既存requestへ収束
 - 同じcreation keyを並行作成するworkerはDBでallocation_pending placeholderを一つだけclaimし、敗者は別payloadを割り当てない
