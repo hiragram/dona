@@ -207,7 +207,7 @@ test("retentionはjob anchorと有効なlist cursorを保持しtimestamp逆転�
 test("retentionは削除済みweb jobのanchorとtombstoneをwatermarkへ畳み込む",t=>{const f=fixture(t),job=f.seed();
   f.jobs.listWebJobs(owner,1,undefined,new Date("2026-09-21T00:01:00.000Z"));f.raw.prepare("DELETE FROM jobs WHERE job_id=?").run(job);
   const before=f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number};assert.equal(before.count,2);
-  const pruned=f.jobs.pruneWebJobProjection(new Date("2026-09-22T00:00:00.000Z"),new Date("2026-09-22T00:00:01.000Z"));assert.equal(pruned.events,2);
+  const now=Date.now();const pruned=f.jobs.pruneWebJobProjection(new Date(now+1000),new Date(now+2000));assert.equal(pruned.events,2);
   const after=f.raw.prepare("SELECT COUNT(*) AS count FROM web_job_projection_events WHERE job_id=?").get(job) as {count:number};assert.equal(after.count,0);
 });
 

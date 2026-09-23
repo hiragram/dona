@@ -45,7 +45,7 @@ test("local operator grantは監査済みcurrent observerだけを許可しregis
       mutation:()=>{f.db.prepare("UPDATE web_auth_state SET state_json=? WHERE instance_id=? AND tenant_id=?").run(next.canonical,scope.instance_id,scope.tenant_id);return null;}};});
   const issue={schema_version:1,operation_id:"grant_runtime_issue",operation:"grant",job_id:job.job_id,expected_owner_principal_id:"principal",
     principal_id:"observer",principal_identity_binding_revision:3,principal_authz_revision:5,expected_grant_revision:0,
-    expires_at:"2026-09-22T00:00:00.000Z"};
+    expires_at:new Date(Date.now()+24*60*60*1000).toISOString()};
   await assert.rejects(operatorGrant(f.socket,Buffer.alloc(32,0x65),issue));
   const issued=await operatorGrant(f.socket,operatorKey,issue);assert.equal(issued.status,200);assert.equal(issued.body.outcome,"created");
   assert.equal((await operatorGrant(f.socket,operatorKey,issue)).body.outcome,"reused");
