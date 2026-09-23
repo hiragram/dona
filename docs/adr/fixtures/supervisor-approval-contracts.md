@@ -78,7 +78,8 @@ binding rotation、policy risk increase、restore不整合は`requested` / `deli
 | update reconciled | `acceptance_unknown` | exact revisionが1件 | `succeeded` |
 | update absent | `acceptance_unknown` | bounded全pageでrevision 0件 | `acceptance_unknown`のまま、後続update禁止 |
 | update pagination incomplete | `acceptance_unknown` | cursor欠落/反復、全page未完走 | `acceptance_unknown`のまま、後続update禁止 |
-| update duplicate | `acceptance_unknown` | exact revision複数件 | `needs_review`、自動後続update禁止 |
+| update duplicate | `acceptance_unknown` | exact revision複数件 | 人間review、message fence維持、後続update禁止 |
+| update result unproven | `acceptance_unknown` | 相関済み不受理receiptなし | `failed`へ進めずfence維持 |
 
 presentation update attemptは初回delivery attemptと別recordにし、`request ID + workspace/channel/message ID + desired presentation revision`をunique creation keyとしてbindingします。revisionはrequestとmessage内で単調増加し、decisionのないterminal invalidationでも生成できます。decision IDは存在すれば監査metadataへ保持します。同じdecisionのoutbox再配送や並行worker、decisionのない無効化処理の再配送は、既存attemptが`succeeded`でも同じrecordを返し、同じrevisionの`chat.update`を再送しません。次のrevisionだけ別attemptを作れます。`chat.update`直前に`dispatching`をdurable commitし、復旧した`dispatching`は無条件に`acceptance_unknown`へ移してread-only reconcileだけを行います。
 
@@ -152,7 +153,7 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - supervisorがprivate targetから外れた場合はdecision/consumeを`needs_review`へ遷移
 - claim直後のcrashでもattempt専用暗号化payloadから同じ本文を復元し、別attemptは作らない
 - external-call開始fence後のcrashでは復旧時に同じattemptをunknownへ移し、marker 0件でも再送しない
-- claim復旧後もexecution期限と全preconditionを`executing`直前に再検証し、drift時は外部callなしで`needs_review`
+- claim時に60秒固定のexecution_expires_atとcontinuous readingをdurable保存し、`executing`直前に期限・全preconditionを再検証。時間証明不能も外部callなしで`needs_review`
 - approval decisionとstable `dona_approval` outbox rowを同じtransactionで一度だけ作り、restart後はoutboxからresume
 - requester/source ownerを認証済み起点から導出し、別actorを指定したsnapshotを作成拒否
 - 同じmessageのpresentation updateを直列化し、stale pendingをabort、先行unknown中は後続dispatch禁止
@@ -195,7 +196,8 @@ request作成・decision・consumeの各時点で、supervisorのtarget visibili
 - break-glassのoperation/target scope digestを一時bindingへ固定し、request作成・送信・decision・consume・実行直前のすべてで範囲外actionを拒否
 - retained auditはrecordの`key_version`でverification-only keyを選び、保持期間中の欠落/不明keyを検証成功にしない
 - execution attemptが`needs_review`へ収束した時点でattempt専用暗号化payloadを即時削除し、全状態を通じた最大保持を24時間に制限
-- interactive commandはenvelope ID、connection provenance、actor proofとともにdurable inboxへ保存してからACKし、duplicateは一件へ収束
+- interactive commandはallowlistしたrequest handle、revision、envelope ID、connection/actor/container/action proofだけをdurable inboxへ保存してからACKし、duplicateは一件へ収束
+- interactive raw `message`、`blocks`、`response_url`、private draft、token、private URLはinbox commit前に破棄してbackupへ入れない
 
 ## Threat review scenarios
 
