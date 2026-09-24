@@ -69,9 +69,15 @@ function hasPrivateJwkText(value: string): boolean {
         const scope = scopes.at(-1)!;
         if (field[2] === "kty") scope.keyType = true;
         else scope.privateParameter = true;
-        index += field[0].length - 1;
-        continue;
       }
+    }
+    if (char === "'") {
+      index++;
+      for (; index < value.length; index++) {
+        if (value[index] === "\\") { index++; continue; }
+        if (value[index] === "'") break;
+      }
+      continue;
     }
     if (char !== '"') continue;
     const start = index;
@@ -136,7 +142,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|\d+(?:\.\d+){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -253,48 +259,20 @@ function forbiddenKey(key: string): boolean {
 }
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
-interface MatchNode { next: Map<string, number>; fail: number; terminal: boolean }
 class ForbiddenValueMatcher {
   private readonly exact = new Set<string>();
-  private readonly nodes: MatchNode[] = [{ next: new Map(), fail: 0, terminal: false }];
+  private readonly substrings: string[] = [];
   constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
     const normalizedShortValues = new Set([...substringShortValues].map(value => value.normalize("NFC")));
     for (const value of new Set(values.map(item => item.normalize("NFC")))) {
       if (value.length < 8 && !normalizedShortValues.has(value)) { this.exact.add(value); continue; }
-      let state = 0;
-      for (const char of value) {
-        let next = this.nodes[state]!.next.get(char);
-        if (next === undefined) {
-          next = this.nodes.length;
-          this.nodes[state]!.next.set(char, next);
-          this.nodes.push({ next: new Map(), fail: 0, terminal: false });
-        }
-        state = next;
-      }
-      this.nodes[state]!.terminal = true;
-    }
-    const queue = [...this.nodes[0]!.next.values()];
-    for (let index = 0; index < queue.length; index++) {
-      const state = queue[index]!;
-      for (const [char, child] of this.nodes[state]!.next) {
-        let fallback = this.nodes[state]!.fail;
-        while (fallback && !this.nodes[fallback]!.next.has(char)) fallback = this.nodes[fallback]!.fail;
-        this.nodes[child]!.fail = this.nodes[fallback]!.next.get(char) ?? 0;
-        this.nodes[child]!.terminal ||= this.nodes[this.nodes[child]!.fail]!.terminal;
-        queue.push(child);
-      }
+      this.substrings.push(value);
     }
   }
   contains(value: string): boolean {
     value = value.normalize("NFC");
     if (this.exact.has(value)) return true;
-    let state = 0;
-    for (const char of value) {
-      while (state && !this.nodes[state]!.next.has(char)) state = this.nodes[state]!.fail;
-      state = this.nodes[state]!.next.get(char) ?? 0;
-      if (this.nodes[state]!.terminal) return true;
-    }
-    return false;
+    return this.substrings.some(privateValue => value.includes(privateValue));
   }
 }
 
@@ -337,11 +315,16 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
       if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
-    if (decodeDepth < 2 && /\\u[0-9A-Fa-f]{4}/.test(value)) {
-      const decodedJson = value.replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+    const jsonEscape = /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g;
+    if (decodeDepth < 2 && jsonEscape.test(value)) {
+      jsonEscape.lastIndex = 0;
+      const decodedJson = value.replace(jsonEscape, escaped => {
+        if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
+        return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
+      });
       assertSafeJson(decodedJson, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
-    if (decodeDepth >= 2 && /\\u[0-9A-Fa-f]{4}/.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (decodeDepth >= 2 && /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (decodeDepth < 2 && value.includes("%")) {
       const decoded = value.replace(/(?:%[0-9A-Fa-f]{2})+/g, encoded => {
         try { return decodeURIComponent(encoded); }

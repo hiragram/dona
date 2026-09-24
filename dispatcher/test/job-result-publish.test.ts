@@ -82,6 +82,7 @@ describe("job result publish contract", () => {
       '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
       "{ kty: 'RSA', n: 'public', d: 'PRIVATE_VALUE' }",
       "{ kty: 'RSA', meta: {}, d: 'PRIVATE_VALUE' }",
+      "{ note: '}', kty: 'RSA', d: 'PRIVATE_VALUE' }",
       '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}',
       '{"kty":"R\\u0053A","n":"public","d":"PRIVATE_VALUE"}',
       '{"kty":"RSA","n":"public","d":"PRIVATE_VALUE"']) {
@@ -101,7 +102,7 @@ describe("job result publish contract", () => {
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
-      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "artifact.internal./private/result",
+      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
       "GET /run/secrets/db-password returned 200", "GET /proc/self/environ returned 200", "POST /dev/null", "GET /sys/kernel", "保存先は/home/worker/private.txt", "結果を/workspace/dona/privateへ保存", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -276,6 +277,10 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));
+    const multiline = new JobResultPublishCapabilities(() => "session-multiline");
+    const multilineGrant = multiline.issue(row({ objective: "internal\nplan" }), "session-multiline");
+    assert.throws(() => multiline.validate(multilineGrant.capability, "session-multiline", { ...base, summary: 'payload={"detail":"internal\\nplan"}' },
+      () => row({ status: "running", objective: "internal\nplan" })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "private%252520objective%252520text" }, () => current), code("content_requires_redaction"));
     const japanese = new JobResultPublishCapabilities(() => "session-ja");
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
@@ -321,6 +326,18 @@ describe("job result publish contract", () => {
       () => row({ status: "running", job_id: "job_0", objective: "private objective number 0" }));
     assert.equal(candidate.envelope.status, "completed");
     assert.ok(performance.now() - started < 2_000, "grant数に比例して本文を再走査しない");
+  });
+
+  test("長いprivate objectiveが多数あってもpublishの検査を完了する", () => {
+    const grants = new JobResultPublishCapabilities(id => id);
+    let own = "";
+    for (let index = 0; index < 100; index++) {
+      const id = `job_large_${index}`;
+      const issued = grants.issue(row({ job_id: id, objective: `private-${index}-` + "x".repeat(50_000) }), id);
+      if (index === 0) own = issued.capability;
+    }
+    const current = row({ status: "running", job_id: "job_large_0", objective: "private-0-" + "x".repeat(50_000) });
+    assert.equal(grants.validate(own, "job_large_0", base, () => current).envelope.status, "completed");
   });
 
   test("terminal cleanup後は同じgrantでread-only照合できる", () => {
@@ -511,6 +528,12 @@ describe("job result publish contract", () => {
       const response = new Promise<string>(resolve => client!.once("data", chunk => resolve(String(chunk))));
       client.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}`);
       assert.match(await response, /^HTTP\/1\.1 202 /);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      client.write("POST /v1/job-result-publish HTTP/1.1\r\n");
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(client.destroyed, true, "keep-alive上の次のpartial headerも期限で閉じる");
       stalled = net.createConnection(socket);
       stalled.on("error", () => {});
       await new Promise<void>(resolve => stalled!.once("connect", resolve));

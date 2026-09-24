@@ -108,6 +108,12 @@ export class JobResultPublishServer {
       socket.pause();
       socket.unshift(chunk);
       this.server.emit("connection", socket);
+      socket.on("data", () => {
+        if (this.activeRequests.has(socket) || this.headerDeadlines.has(socket)) return;
+        const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
+        nextDeadline.unref();
+        this.headerDeadlines.set(socket, nextDeadline);
+      });
       socket.resume();
     });
     socket.once("close", () => {
