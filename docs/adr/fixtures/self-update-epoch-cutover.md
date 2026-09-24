@@ -11,7 +11,8 @@
 | W5 | lease expiredのみ、旧workerが後からResult公開 | 同一owner/session/fenceでrevokeなしならreceipt化。revokedは隔離 |
 | W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
 | W6a | 旧epoch scheduled workerのcancel | schedule/run/revisionと取消mutation ID、旧owner fence、exact sessionを検証 |
-| W7 | Aのlive workerまたは通知が残るBからCへの更新 | CがA/Bのcompletion/progressとnotification protocolを扱えなければactivation拒否 |
+| W7 | Aのlive worker、通知、outbox、sandboxが残るBからCへの更新 | CがA/Bのcompletion/progress、notification、provider、cleanup protocolを扱えなければactivation拒否 |
+| W8 | queued/retryable_failed jobがcutover後にdispatch | claim時に新epoch/release/protocolへ原子的にrebind |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
