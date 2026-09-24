@@ -1019,21 +1019,23 @@ export class DispatcherDatabase {
       for (const eventId of new Set([job.completion_event_id, group?.attention_event_id, group?.all_terminal_event_id])) {
         if (!eventId) continue;
         const event = this.getRequired(eventId);
-        if (["queued", "retryable_failed"].includes(event.status)) {
+        const pending = ["queued", "retryable_failed"].includes(event.status);
+        if (pending) {
           this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
             last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=?`)
             .run(at.toISOString(),at.toISOString(),eventId);
         } else if (event.status !== "completed") throw new Error("prior_notification_requires_reconciliation");
         this.db.prepare(`UPDATE job_groups SET
-          attention_event_id=CASE WHEN attention_event_id=? THEN NULL ELSE attention_event_id END,
+          attention_event_id=CASE WHEN attention_event_id=? AND ? THEN NULL ELSE attention_event_id END,
           all_terminal_event_id=CASE WHEN all_terminal_event_id=? THEN NULL ELSE all_terminal_event_id END
-          WHERE source_event_id=?`).run(eventId,eventId,job.source_event_id);
+          WHERE source_event_id=?`).run(eventId,pending?1:0,eventId,job.source_event_id);
       }
       const changed = this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,
         completion_event_id=NULL,last_error_code='invalid_result_operator_resolved',last_error_message=?
         WHERE job_id=? AND status='needs_review' AND updated_at=? AND result_json IS NULL`)
         .run(at.toISOString(), at.toISOString(), `Operator reviewed worker termination and side effects; receipt ${receiptId}`, jobId, expectedUpdatedAt).changes;
       if (changed !== 1) throw new Error("job_changed_since_review");
+      this.enqueueJobNotification(jobId, at);
       this.enqueueJobNotification(jobId, at);
       return this.getJobRequired(jobId);
     }).immediate();

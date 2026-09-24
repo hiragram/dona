@@ -28,11 +28,11 @@ function runtimeWith(result:(agentName:string)=>HerdrCommandResult,calls:string[
   };
 }
 
-async function addressableJob(status:"dispatching"|"needs_review"="needs_review"){
+async function addressableJob(status:"dispatching"|"needs_review"="needs_review",jobKey?:string){
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath);
   const source=database.enqueue(eventEnvelope(`Ev-live-${root.slice(-6)}`)).row;
-  const created=database.createJob({source_event_id:source.event_id,objective:"private objective",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  const created=database.createJob({source_event_id:source.event_id,objective:"private objective",workspace:{kind:"scratch"},...(jobKey?{job_key:jobKey}:{})},config.jobsWorkspaceRoot,config.jobResultsDir).row;
   database.beginJobPreparation(created.job_id);
   database.setJobRuntime(created.job_id,"workspace-private","pane-private","session-private");
   database.beginJobDispatch(created.job_id);
@@ -42,7 +42,7 @@ async function addressableJob(status:"dispatching"|"needs_review"="needs_review"
 
 describe("read-only live session reconciliation",()=>{
   test("invalid Resultのoperator解決は最新receiptと状態の一致を要求する",async()=>{
-    const state=await addressableJob();
+    const state=await addressableJob("needs_review","invalid-result-first");
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
     state.database.sealJobGroup(state.source.event_id);
     const prior=state.database.enqueueJobNotification(state.job.job_id).row;
@@ -60,6 +60,7 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(state.database.get(prior.event_id)?.last_error_code,"job_result_superseded");
     assert.notEqual(resolved.completion_event_id,prior.event_id);
     assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
+    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
     state.database.close();
   });
@@ -75,7 +76,7 @@ describe("read-only live session reconciliation",()=>{
     state.database.close();
   });
   test("配達済みの旧通知を保持し確定状態の通知を追加する",async()=>{
-    const state=await addressableJob();
+    const state=await addressableJob("needs_review","invalid-result-delivered");
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
     state.database.sealJobGroup(state.source.event_id);
     const prior=state.database.enqueueJobNotification(state.job.job_id).row;
@@ -87,6 +88,7 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(state.database.get(prior.event_id)?.status,"completed");
     assert.notEqual(resolved.completion_event_id,prior.event_id);
     assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
+    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
     state.database.close();
   });
   test("exact identityのworkingを永続receiptへ記録しcontrol commandを呼ばない",async()=>{
