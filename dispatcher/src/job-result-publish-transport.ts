@@ -200,7 +200,8 @@ export class JobResultPublishServer {
     } catch (error) {
       if (error instanceof JobResultPublishError) {
         const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : error.code === "renewal_not_due" ? 425 : 403;
-        reject(request, response, status, error.code);
+        if (error.code === "renewal_not_due") reply(response, status, error.code);
+        else reject(request, response, status, error.code);
       } else {
         reject(request, response, 503, "publish_unavailable");
       }

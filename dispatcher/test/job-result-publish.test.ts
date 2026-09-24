@@ -95,6 +95,7 @@ describe("job result publish contract", () => {
       "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
       "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ",
+      "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
@@ -228,7 +229,7 @@ describe("job result publish contract", () => {
     const short = new JobResultPublishCapabilities(() => "s1");
     const shortGrant = short.issue(row(), "s1");
     assert.throws(() => short.validate(shortGrant.capability, "s1", { ...base, summary: "s1" }, () => row({ status: "running" })), code("content_requires_redaction"));
-    assert.equal(short.validate(shortGrant.capability, "s1", { ...base, summary: "task s1 is complete" }, () => row({ status: "running" })).envelope.status, "completed");
+    assert.throws(() => short.validate(shortGrant.capability, "s1", { ...base, summary: "task s1 is complete" }, () => row({ status: "running" })), code("content_requires_redaction"));
     const composite = JSON.stringify(["workspace", "pane", "agent", "😀".repeat(512)]);
     const compositeGrants = new JobResultPublishCapabilities(() => composite);
     const compositeGrant = compositeGrants.issue(row(), composite);
@@ -266,6 +267,15 @@ describe("job result publish contract", () => {
     const current = row({ status: "running", objective: "test" });
     assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "tests passed" }, () => current).envelope.status, "completed");
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "test" }, () => current), code("content_requires_redaction"));
+  });
+
+  test("固定schema keyは他jobのprivate valueに左右されない", () => {
+    const grants = new JobResultPublishCapabilities(id => id);
+    grants.issue(row({ job_id: "job_two", objective: "summary" }), "job_two");
+    const own = grants.issue(row({ job_id: "job_one" }), "job_one");
+    const current = row({ status: "running" });
+    assert.equal(grants.validate(own.capability, "job_one", base, () => current).envelope.status, "completed");
+    assert.throws(() => grants.validate(own.capability, "job_one", { ...base, artifacts: [{ summary: "public" }] }, () => current), code("content_requires_redaction"));
   });
 
   test("多数grantの非公開値を大きい本文で一度だけ走査する", () => {
@@ -345,9 +355,11 @@ describe("job result publish contract", () => {
       assert.equal((await post(Buffer.from([0xff]), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify(base), grant.capability, "old-session")).status, 403);
       assert.equal((await post(" ".repeat(jobResultEnvelopeMaxBytes + 1), grant.capability)).status, 413);
-      assert.equal((await post("", grant.capability, "session-1", "/v1/job-result-publish/renew")).status, 425);
-      now += 15 * 60_000;
       const beforeReuse = connections;
+      const earlyRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
+      assert.equal(earlyRenewal.status, 425);
+      assert.notEqual(earlyRenewal.connection, "close");
+      now += 15 * 60_000;
       const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
       assert.equal(renewal.status, 200);
       const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);

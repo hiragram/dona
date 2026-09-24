@@ -209,9 +209,9 @@ interface MatchNode { next: Map<string, number>; fail: number; terminal: boolean
 class ForbiddenValueMatcher {
   private readonly exact = new Set<string>();
   private readonly nodes: MatchNode[] = [{ next: new Map(), fail: 0, terminal: false }];
-  constructor(values: readonly string[]) {
+  constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
     for (const value of new Set(values)) {
-      if (value.length < 8) { this.exact.add(value); continue; }
+      if (value.length < 8 && !substringShortValues.has(value)) { this.exact.add(value); continue; }
       let state = 0;
       for (const char of value) {
         let next = this.nodes[state]!.next.get(char);
@@ -248,7 +248,7 @@ class ForbiddenValueMatcher {
   }
 }
 
-function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>): void {
+function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     for (const match of value.matchAll(networkUrlCandidate)) {
@@ -269,10 +269,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     }
     if (forbiddenDigests && forbiddenFingerprints) {
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
-      if (value.includes("%")) {
-        const decoded = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-        if (decoded !== value && containsForbiddenCapability(decoded, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
-      }
+    }
+    if (decodeDepth < 2 && value.includes("%")) {
+      const decoded = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+      if (decoded !== value) assertSafeJson(decoded, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
     if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
@@ -280,13 +280,13 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (sensitive.test(value) || localPath.test(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
-    for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
+    for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
   } else if (value !== null && typeof value === "object") {
     if (hasPrivateJwkFields(value as Record<string, unknown>)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
       if (forbiddenKey(key) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
-      assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
+      assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+      assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
   } else if (typeof value === "number" && !Number.isSafeInteger(value)) {
     throw new JobResultPublishError("invalid_request");
@@ -352,13 +352,18 @@ export interface AuthorizedJobResultPublish extends ValidatedJobResultPublish {
   assertCurrentGrant: () => void;
 }
 
-export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[], forbiddenFingerprints?: ReadonlySet<number>): ValidatedJobResultPublish {
+export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[], forbiddenFingerprints?: ReadonlySet<number>, shortRuntimeValues?: ReadonlySet<string>): ValidatedJobResultPublish {
   assertJsonDepth(input);
   const parsed = requestSchema.safeParse(input);
   if (!parsed.success || !Number.isFinite(Date.parse(completedAt)) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(completedAt)) {
     throw new JobResultPublishError("invalid_request");
   }
-  assertSafeJson(parsed.data, 0, forbiddenDigests, forbiddenValues ? new ForbiddenValueMatcher(forbiddenValues) : undefined, forbiddenFingerprints);
+  const matcher = forbiddenValues ? new ForbiddenValueMatcher(forbiddenValues, shortRuntimeValues) : undefined;
+  // Fixed schema keys are Dispatcher-owned; inspect only worker-provided fields.
+  assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
@@ -386,6 +391,7 @@ interface Grant {
   agentName: string | null;
   herdrWorkspaceId: string | null;
   privateValues: readonly string[];
+  runtimeValues: readonly string[];
   expiresAt: number;
   renewableAt: number;
   revoked: boolean;
@@ -397,6 +403,13 @@ function grantPrivateValues(job: JobRow, session: string): string[] {
   try { sessionParts = JSON.parse(session); } catch { /* A legacy opaque session is still valid. */ }
   return [session, job.herdr_pane_id, job.herdr_workspace_id, job.agent_name,
     job.objective, job.workspace_path, job.result_path,
+    ...(Array.isArray(sessionParts) && sessionParts.length === 4 ? sessionParts : [])]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+function grantRuntimeValues(job: JobRow, session: string): string[] {
+  let sessionParts: unknown;
+  try { sessionParts = JSON.parse(session); } catch { /* Legacy opaque session. */ }
+  return [session, job.herdr_pane_id, job.herdr_workspace_id, job.agent_name,
     ...(Array.isArray(sessionParts) && sessionParts.length === 4 ? sessionParts : [])]
     .filter((value): value is string => typeof value === "string" && value.length > 0);
 }
@@ -440,6 +453,7 @@ export class JobResultPublishCapabilities {
     this.grants.set(key, { jobId: job.job_id, generation: predecessor.generation, session, attemptCount: job.attempt_count,
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
+      runtimeValues: grantRuntimeValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
@@ -455,6 +469,7 @@ export class JobResultPublishCapabilities {
       jobId: job.job_id, generation, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
       agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
+      runtimeValues: grantRuntimeValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
@@ -504,10 +519,14 @@ export class JobResultPublishCapabilities {
     const grantIdentities = [...this.grants.values()]
       .filter(candidate => candidate.expiresAt > this.now())
       .flatMap(candidate => candidate.privateValues);
+    const shortRuntimeValues = new Set([...this.grants.values()]
+      .filter(candidate => candidate.expiresAt > this.now())
+      .flatMap(candidate => candidate.runtimeValues)
+      .filter(value => value.length < 8));
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
-    return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
+    return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints, shortRuntimeValues),
       fence: { jobId: job.job_id, publishableStatuses: ["dispatching", "running"], grantGeneration: grant.generation,
         attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session },
       assertCurrentGrant: () => {
