@@ -13,6 +13,7 @@
 | W6a | 旧epoch scheduled workerのcancel | schedule/run/revisionと取消mutation ID、旧owner fence、exact sessionを検証 |
 | W7 | Aのlive worker、通知、outbox、sandboxが残るBからCへの更新 | CがA/Bのcompletion/progress、notification、provider、cleanup protocolを扱えなければactivation拒否 |
 | W8 | queued/retryable_failed jobがcutover後にdispatch | claim時に新epoch/release/protocolへ原子的にrebind |
+| W9 | 未dispatchの旧Event Envelopeが残る | drainまたはsource prompt protocolのtarget reader互換性を検証 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
@@ -42,3 +43,4 @@
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
 | C2 | dispatch前cancelでResultなし、通知先none | 両dispositionを`not_required`へ確定後、参照がなければGC可 |
 | C3 | completion receipt commit直後にrestart | terminal状態・event/group transitionも同時に存在し、重複生成なし |
+| C4 | scheduled completion commit直後にrestart | schedule run terminal状態と時刻も同時に存在 |
