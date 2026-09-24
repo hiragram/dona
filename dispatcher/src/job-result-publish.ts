@@ -43,6 +43,11 @@ function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
     Object.keys(value).some(key => privateJwkParameter.has(key));
 }
 function hasPrivateJwkText(value: string): boolean {
+  for (const match of value.matchAll(/\{[^{}]{0,8192}\}/g)) {
+    const scope = match[0];
+    if (/(?:^|[\s,{])['"]?kty['"]?\s*:\s*['"](?:RSA|EC|OKP|oct)['"]/.test(scope) &&
+      /(?:^|[\s,{])['"]?(?:d|p|q|dp|dq|qi|oth|k)['"]?\s*:/.test(scope)) return true;
+  }
   const scopes: { keyType: boolean; privateParameter: boolean }[] = [];
   for (let index = 0; index < value.length; index++) {
     const char = value[index];
@@ -88,7 +93,9 @@ function hasLocalPath(value: string): boolean {
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
     const prefix = value.slice(0, match.index);
-    if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd())) continue;
+    if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd()) &&
+      !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private)(?:\/|\b)/i.test(route) &&
+      !/\/(?:\.ssh|\.aws|\.env|id_(?:rsa|ed25519))(?:\/|\b)/i.test(route)) continue;
     return true;
   }
   return false;
@@ -106,6 +113,7 @@ function hasPrivateSlashAuthority(value: string): boolean {
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa))\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -266,10 +274,18 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       let url: URL;
       try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
       if (url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
+      for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
+        for (const [, parameterValue] of parameters) {
+          if (forbiddenValues?.contains(parameterValue)) throw new JobResultPublishError("content_requires_redaction");
+        }
+      }
       if ((url.search.includes("+") || url.hash.includes("+")) && match[0].includes("+")) {
         const decodedForm = value.replace(match[0], match[0].replace(/\+/g, " "));
         assertSafeJson(decodedForm, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
       }
+    }
+    for (const match of value.matchAll(privateHostPathCandidate)) {
+      if (hasPrivateHttpHost(`http://${match[1]}`)) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       const rawKey = match[0].replace(/\s*[:=]$/, "");
@@ -286,12 +302,15 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenDigests && forbiddenFingerprints) {
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
     }
-    if (value.includes("\u001b")) {
-      const stripped = value.replace(ansiEscape, "");
+    if (/[\p{Cc}\p{Cf}]/u.test(value)) {
+      const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
       if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
     if (decodeDepth < 2 && value.includes("%")) {
-      const decoded = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+      const decoded = value.replace(/(?:%[0-9A-Fa-f]{2})+/g, encoded => {
+        try { return decodeURIComponent(encoded); }
+        catch { return encoded; }
+      });
       if (decoded !== value) assertSafeJson(decoded, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
     if (forbiddenValues?.contains(value)) {
