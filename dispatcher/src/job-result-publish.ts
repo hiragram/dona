@@ -132,7 +132,7 @@ function hasSignedQueryKey(candidate: string): boolean {
     if (equal < 0) continue;
     try {
       const key = decodeURIComponent(parameter.slice(0, equal).replaceAll("+", " ")).toLowerCase();
-      if (signedQueryKeys.has(key)) return true;
+      if (signedQueryKeys.has(key) || forbiddenKey(key)) return true;
     } catch { return true; }
   }
   return false;
@@ -309,7 +309,7 @@ export interface ValidatedJobResultPublish {
 
 export interface AuthorizedJobResultPublish extends ValidatedJobResultPublish {
   /** The durable commit must compare this fence in its Result transaction. */
-  fence: { jobId: string; attemptCount: number; paneId: string | null; session: string };
+  fence: { jobId: string; status: JobRow["status"]; attemptCount: number; paneId: string | null; session: string };
 }
 
 export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[], forbiddenFingerprints?: ReadonlySet<number>): ValidatedJobResultPublish {
@@ -360,7 +360,7 @@ function grantPrivateValues(job: JobRow, session: string): string[] {
     .filter((value): value is string => typeof value === "string" && value.length > 0);
 }
 
-/** Process-local grants fail closed on restart. Only the worker prompt gets the raw token. */
+/** Process-local grants fail closed on restart. Only the private worker transport receives the raw token. */
 export class JobResultPublishCapabilities {
   private readonly grants = new Map<string, Grant>();
   private readonly renewalKey = randomBytes(32);
@@ -455,6 +455,6 @@ export class JobResultPublishCapabilities {
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
-      fence: { jobId: job.job_id, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
+      fence: { jobId: job.job_id, status: job.status, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
   }
 }
