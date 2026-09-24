@@ -5,12 +5,13 @@ import path from "node:path";
 import { TextDecoder } from "node:util";
 
 import type { JobRow } from "./types.js";
-import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, type ValidatedJobResultPublish } from "./job-result-publish.js";
+import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, type AuthorizedJobResultPublish } from "./job-result-publish.js";
 
 export interface JobResultPublishSink {
-  commit(candidate: ValidatedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
+  /** Must compare candidate.fence in the same durable transaction as Result creation. */
+  commit(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
   /** Must compare the durable digest and may never mutate a terminal Result. */
-  reconcile(candidate: ValidatedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;
+  reconcile(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;
 }
 
 function reply(response: ServerResponse, status: number, code: string): void {
@@ -113,7 +114,7 @@ export class JobResultPublishServer {
       reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
     } catch (error) {
       if (error instanceof JobResultPublishError) {
-        const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : 403;
+        const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : error.code === "renewal_not_due" ? 425 : 403;
         reply(response, status, error.code);
       } else {
         reply(response, 503, "publish_unavailable");

@@ -11,7 +11,7 @@ export const jobResultPublishTtlMs = 30 * 60_000;
 export type JobResultPublishErrorCode =
   | "invalid_request" | "payload_too_large" | "content_requires_redaction"
   | "capability_invalid" | "capability_expired" | "capability_revoked"
-  | "worker_session_stale" | "job_not_publishable";
+  | "worker_session_stale" | "job_not_publishable" | "renewal_not_due";
 
 export class JobResultPublishError extends Error {
   constructor(readonly code: JobResultPublishErrorCode) {
@@ -22,22 +22,23 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)\s*[:=]|file:\/\/\S+|https?:\/\/(?:[^\s/@]+:[^\s/@]+@|(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|https?:\/\/[^\s]+[?&](?:token|signature|api[_-]?key|access[_-]?key|auth)=|(?:^|[\s"'(])(?:\/(?!\/)[^\s"'<>]+|~\/|[A-Za-z]:\\))/i;
-const secretKey = /^(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)$/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)\s*[:=]|file:\/\/\S+|https?:\/\/(?:[^\s/@]+:[^\s/@]+@|(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|https?:\/\/[^\s]+[?&](?:token|signature|api[_-]?key|access[_-]?key|auth)=|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
+const secretKey = /^(?:token|capability|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential)$/i;
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
-function assertSafeJson(value: unknown, depth = 0): void {
+function assertSafeJson(value: unknown, depth = 0, forbiddenCapability?: string): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
+    if (forbiddenCapability && value.includes(forbiddenCapability)) throw new JobResultPublishError("content_requires_redaction");
     if (sensitive.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
-    for (const item of value) assertSafeJson(item, depth + 1);
+    for (const item of value) assertSafeJson(item, depth + 1, forbiddenCapability);
   } else if (value !== null && typeof value === "object") {
     for (const [key, item] of Object.entries(value)) {
       if (secretKey.test(key)) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeJson(key);
-      assertSafeJson(item, depth + 1);
+      assertSafeJson(key, depth + 1, forbiddenCapability);
+      assertSafeJson(item, depth + 1, forbiddenCapability);
     }
   } else if (typeof value !== "boolean" && typeof value !== "number" && value !== null) {
     throw new JobResultPublishError("invalid_request");
@@ -81,13 +82,18 @@ export interface ValidatedJobResultPublish {
   reconcileOnly: boolean;
 }
 
-export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string): ValidatedJobResultPublish {
+export interface AuthorizedJobResultPublish extends ValidatedJobResultPublish {
+  /** The durable commit must compare this fence in its Result transaction. */
+  fence: { jobId: string; attemptCount: number; paneId: string | null; session: string };
+}
+
+export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string, forbiddenCapability?: string): ValidatedJobResultPublish {
   assertJsonDepth(input);
   const parsed = requestSchema.safeParse(input);
   if (!parsed.success || !Number.isFinite(Date.parse(completedAt)) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(completedAt)) {
     throw new JobResultPublishError("invalid_request");
   }
-  assertSafeJson(parsed.data);
+  assertSafeJson(parsed.data, 0, forbiddenCapability);
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
@@ -112,6 +118,7 @@ interface Grant {
   attemptCount: number;
   paneId: string | null;
   expiresAt: number;
+  renewableAt: number;
   revoked: boolean;
 }
 
@@ -134,15 +141,18 @@ export class JobResultPublishCapabilities {
   renew(capability: string, session: string, getJob: (jobId: string) => JobRow | undefined): { capability: string; expiresAt: string } {
     const job = this.authorize(capability, session, getJob);
     if (job.status !== "running") throw new JobResultPublishError("job_not_publishable");
+    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
     // The previous token remains valid until its own expiry. A lost response can
     // safely repeat the same renewal and recover the same successor token.
     const next = createHmac("sha256", this.renewalKey).update(`renew:v1\n${capability}`).digest("base64url");
     const key = createHash("sha256").update(next).digest("hex");
     const existing = this.grants.get(key);
     if (existing) return { capability: next, expiresAt: new Date(existing.expiresAt).toISOString() };
+    const predecessor = this.grants.get(createHash("sha256").update(capability).digest("hex"));
+    if (!predecessor || this.now() < predecessor.renewableAt) throw new JobResultPublishError("renewal_not_due");
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(key, { jobId: job.job_id, session, attemptCount: job.attempt_count,
-      paneId: job.herdr_pane_id, expiresAt, revoked: false });
+      paneId: job.herdr_pane_id, expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -153,7 +163,7 @@ export class JobResultPublishCapabilities {
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(createHash("sha256").update(capability).digest("hex"), {
       jobId: job.job_id, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
-      expiresAt, revoked: false,
+      expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false,
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
   }
@@ -185,8 +195,9 @@ export class JobResultPublishCapabilities {
     return job;
   }
 
-  validate(capability: string, session: string, input: unknown, getJob: (jobId: string) => JobRow | undefined): ValidatedJobResultPublish {
+  validate(capability: string, session: string, input: unknown, getJob: (jobId: string) => JobRow | undefined): AuthorizedJobResultPublish {
     const job = this.authorize(capability, session, getJob);
-    return validateJobResultPublish(input, job, new Date(this.now()).toISOString());
+    return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), capability),
+      fence: { jobId: job.job_id, attemptCount: job.attempt_count, paneId: job.herdr_pane_id, session } };
   }
 }

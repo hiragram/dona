@@ -50,7 +50,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -92,8 +92,11 @@ describe("job result publish contract", () => {
     current = row({ status: "running", attempt_count: 2 });
     assert.throws(() => grants.validate(grant.capability, "session-1", base, getJob), code("worker_session_stale"));
     current = row({ status: "running" });
+    assert.throws(() => grants.renew(grant.capability, "session-1", getJob), code("renewal_not_due"));
+    now += 15 * 60_000;
     const renewed = grants.renew(grant.capability, "session-1", getJob);
     assert.notEqual(renewed.capability, grant.capability);
+    assert.throws(() => grants.renew(renewed.capability, "session-1", getJob), code("renewal_not_due"));
     assert.equal(grants.renew(grant.capability, "session-1", getJob).capability, renewed.capability);
     assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
     assert.throws(() => new JobResultPublishCapabilities(() => persistedSession, () => now).validate(grant.capability, "session-1", base, getJob), code("capability_invalid"));
@@ -107,13 +110,14 @@ describe("job result publish contract", () => {
   test("専用UDSだけで認可し、本文・capabilityを応答せずcommit材料へ渡す", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-contract-"));
     const socket = path.join(directory, "p.sock");
-    const grants = new JobResultPublishCapabilities(() => "session-1");
+    let now = Date.now();
+    const grants = new JobResultPublishCapabilities(() => "session-1", () => now);
     const grant = grants.issue(row(), "session-1");
     let current = row({ status: "running" });
     const accepted: string[] = [];
     const reconciled: string[] = [];
     const server = new JobResultPublishServer(socket, grants, id => id === current.job_id ? current : undefined,
-      { commit: async candidate => { accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
+      { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" }); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST",
@@ -135,10 +139,16 @@ describe("job result publish contract", () => {
       const secret = await post(JSON.stringify({ ...base, summary: "secret=CANARY_VALUE" }), grant.capability);
       assert.equal(secret.status, 400);
       assert.equal(secret.body.includes("CANARY_VALUE"), false);
+      const leaked = await post(JSON.stringify({ ...base, summary: `capability ${grant.capability}` }), grant.capability);
+      assert.equal(leaked.status, 400);
+      assert.equal(leaked.body.includes(grant.capability), false);
+      assert.equal((await post(JSON.stringify({ ...base, artifacts: [{ capability: "CANARY_VALUE" }] }), grant.capability)).status, 400);
       assert.equal((await post("{", grant.capability)).status, 400);
       assert.equal((await post(Buffer.from([0xff]), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify(base), grant.capability, "old-session")).status, 403);
       assert.equal((await post(" ".repeat(jobResultEnvelopeMaxBytes + 1), grant.capability)).status, 413);
+      assert.equal((await post("", grant.capability, "session-1", "/v1/job-result-publish/renew")).status, 425);
+      now += 15 * 60_000;
       const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
       assert.equal(renewal.status, 200);
       const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
