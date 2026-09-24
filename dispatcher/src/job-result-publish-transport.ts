@@ -78,6 +78,7 @@ export class JobResultPublishServer {
   private readonly headerDeadlines = new Map<net.Socket, NodeJS.Timeout>();
   private readonly publishingSockets = new Set<net.Socket>();
   private readonly activeRequests = new Set<net.Socket>();
+  private readonly activeMessages = new Map<net.Socket, IncomingMessage>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
@@ -109,7 +110,9 @@ export class JobResultPublishServer {
       socket.unshift(chunk);
       this.server.emit("connection", socket);
       socket.on("data", () => {
-        if (this.activeRequests.has(socket) || this.headerDeadlines.has(socket)) return;
+        if (this.headerDeadlines.has(socket)) return;
+        const active = this.activeMessages.get(socket);
+        if (active && !active.complete) return;
         const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
         nextDeadline.unref();
         this.headerDeadlines.set(socket, nextDeadline);
@@ -135,7 +138,11 @@ export class JobResultPublishServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (this.activeRequests.has(request.socket)) { request.socket.destroy(); return; }
     this.activeRequests.add(request.socket);
-    const clearActive = () => this.activeRequests.delete(request.socket);
+    this.activeMessages.set(request.socket, request);
+    const clearActive = () => {
+      this.activeRequests.delete(request.socket);
+      if (this.activeMessages.get(request.socket) === request) this.activeMessages.delete(request.socket);
+    };
     response.once("finish", clearActive);
     response.once("close", clearActive);
     const headerDeadline = this.headerDeadlines.get(request.socket);

@@ -142,7 +142,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -388,7 +388,7 @@ const jsonValue: z.ZodType<unknown> = z.json();
 const requestSchema = z.object({
   schema_version: z.literal(1),
   status: z.enum(["completed", "failed"]),
-  summary: z.string().min(1).refine(value => value.trim().length > 0),
+  summary: z.string().min(1).refine(value => value.replace(/[\p{Cc}\p{Cf}]/gu, "").trim().length > 0),
   output: z.object({ format: z.enum(["markdown", "text"]), text: z.string() }).strict().optional(),
   artifacts: z.array(z.record(z.string(), jsonValue)).optional(),
   actions: z.array(jsonValue).optional(),
@@ -452,6 +452,8 @@ interface Grant {
   privateValues: readonly string[];
   runtimeValues: readonly string[];
   expiresAt: number;
+  monotonicDeadline: number;
+  expired: boolean;
   renewableAt: number;
   revoked: boolean;
   fingerprint: number;
@@ -518,7 +520,8 @@ export class JobResultPublishCapabilities {
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       runtimeValues: grantRuntimeValues(job, session),
-      expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
+      expiresAt, monotonicDeadline: performance.now() + jobResultPublishTtlMs, expired: false,
+      renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -534,7 +537,8 @@ export class JobResultPublishCapabilities {
       agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       runtimeValues: grantRuntimeValues(job, session),
-      expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
+      expiresAt, monotonicDeadline: performance.now() + jobResultPublishTtlMs, expired: false,
+      renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
   }
@@ -555,7 +559,10 @@ export class JobResultPublishCapabilities {
     }
     if (!grant) throw new JobResultPublishError("capability_invalid");
     if (grant.revoked) throw new JobResultPublishError("capability_revoked");
-    if (this.now() >= grant.expiresAt) throw new JobResultPublishError("capability_expired");
+    if (grant.expired || this.now() >= grant.expiresAt || performance.now() >= grant.monotonicDeadline) {
+      grant.expired = true;
+      throw new JobResultPublishError("capability_expired");
+    }
     const job = getJob(grant.jobId);
     if (!job || job.job_id !== grant.jobId) throw new JobResultPublishError("capability_invalid");
     const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";

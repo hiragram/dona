@@ -151,6 +151,10 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ count: 9_007_199_254_740_992 }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ count: 1.5 }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: " \n\t " }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
+    assert.throws(() => validateJobResultPublish({ ...base, summary: "\u200b\u0001" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
+    for (const privateUrl of ["files.slack.com/files-pri/T1/F1/download", "hooks.slack.com/services/T/B/SECRET"]) {
+      assert.throws(() => validateJobResultPublish({ ...base, summary: privateUrl }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
   });
 
   test("単一job、失効、revocation、stale worker、restart時fail closed", () => {
@@ -200,6 +204,7 @@ describe("job result publish contract", () => {
     now = Date.parse(renewed.expiresAt);
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"));
     now -= 1;
+    assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"), "時計が巻き戻っても失効は不可逆");
     grants.revokeJob("job_one");
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_revoked"));
   });
@@ -512,9 +517,15 @@ describe("job result publish contract", () => {
     const socket = path.join(directory, "p.sock");
     const grants = new JobResultPublishCapabilities(() => "session-1");
     const grant = grants.issue(row(), "session-1");
+    let blockCommit = false;
+    let releaseCommit: (() => void) | undefined;
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
-      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
+      { commit: async () => {
+        if (blockCommit) await new Promise<void>(resolve => { releaseCommit = resolve; });
+        return { outcome: "created" };
+      }, reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
     let client: net.Socket | undefined;
+    let overlapping: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
     try {
@@ -534,6 +545,18 @@ describe("job result publish contract", () => {
       assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(client.destroyed, true, "keep-alive上の次のpartial headerも期限で閉じる");
+      blockCommit = true;
+      overlapping = net.createConnection(socket);
+      overlapping.on("error", () => {});
+      await new Promise<void>(resolve => overlapping!.once("connect", resolve));
+      overlapping.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}`);
+      for (let i = 0; i < 20 && !releaseCommit; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.ok(releaseCommit, "commit待機に入る");
+      overlapping.write("POST /v1/job-result-publish HTTP/1.1\r\n");
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(overlapping.destroyed, true, "commit中に届いた次headerも期限で閉じる");
+      releaseCommit?.();
+      blockCommit = false;
       stalled = net.createConnection(socket);
       stalled.on("error", () => {});
       await new Promise<void>(resolve => stalled!.once("connect", resolve));
@@ -550,6 +573,8 @@ describe("job result publish contract", () => {
       await new Promise<void>(resolve => beforeData.once("close", resolve));
     } finally {
       client?.destroy();
+      releaseCommit?.();
+      overlapping?.destroy();
       stalled?.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
