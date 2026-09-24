@@ -578,14 +578,20 @@ export class WorkerMessageRepository {
         WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
         ORDER BY m.producer_sequence DESC,d.decided_at DESC,d.notification_event_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
         {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null}|undefined;
-      const lastEta=this.db.prepare(`SELECT json_extract(m.payload_json,'$.eta_at') AS eta_at FROM worker_messages m
+      const etaQuery=`SELECT json_extract(m.payload_json,'$.eta_at') AS eta_at FROM worker_messages m
         JOIN worker_message_decisions d ON d.message_id=m.message_id
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
         JOIN worker_message_deliveries delivery ON delivery.message_id=m.message_id
           AND delivery.consumer='dona-main' AND delivery.event_id=d.notification_event_id
         WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.producer_sequence<?
-          AND json_type(m.payload_json,'$.eta_at')='text'
+          AND json_type(m.payload_json,'$.eta_at')='text'`;
+      const postedEta=this.db.prepare(`${etaQuery} AND EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')
         ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const firstEvaluatedEta=postedEta?undefined:this.db.prepare(`${etaQuery}
+        ORDER BY m.producer_sequence ASC,d.decided_at ASC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const lastEta=postedEta??firstEvaluatedEta;
       const lastRisk=this.db.prepare(`SELECT json_extract(m.payload_json,'$.severity') AS severity FROM worker_messages m
         JOIN worker_message_decisions d ON d.message_id=m.message_id AND d.action='report_to_user'
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
@@ -600,7 +606,7 @@ export class WorkerMessageRepository {
         AND delivery.state!='superseded' LIMIT 1`).get(jobId,messageId)!==undefined;
       const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
         .get(jobId) as {at:string|null};
-      const lastUserDecision=this.db.prepare(`SELECT MAX(d.decided_at) AS at FROM worker_message_decisions d
+      const lastUserDecision=this.db.prepare(`SELECT MAX(e.completed_at) AS at FROM worker_message_decisions d
         JOIN worker_messages m USING(message_id)
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
         WHERE d.job_id=? AND m.producer_sequence<?

@@ -2162,6 +2162,14 @@ export class DispatcherDatabase {
             ((action as Record<string,unknown>).status==="suspended"&&typeof (action as Record<string,unknown>).tool==="string"&&
               String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status"))));
         const currentState=()=>this.workerMessages.decisionCurrent(String(payload.job_id),String(payload.message_id),eventId);
+        if(decision.action==="ask_user"&&!posts.length&&statusActions.length){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_unexpected_session_change",
+            last_error_message:"Unposted worker question changed the agent session"});
+          this.revealBlockedQuestionOwner(event,"worker_message_unexpected_session_change",
+            "Unposted question changed the agent session");
+          return;
+        }
         if(posts.length&&!currentState().current){
           this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
             completed_at:result.completed_at,last_error_code:"worker_message_post_after_decision_invalidated",
