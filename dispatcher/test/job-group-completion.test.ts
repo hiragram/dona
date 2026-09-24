@@ -144,6 +144,36 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("明示取消後に残るfailedへ配送済みattention ownerを引き継ぐ", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-cancel-handoff");
+    const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.markJobBlocked(job.job_id,"入力待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"failed",
+      summary:"別の失敗",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
+    database.enqueueJobNotification(sibling.job_id);
+    const followUp=database.enqueue(eventEnvelope("Ev-attention-cancel-handoff-followup")).row;
+    database.beginJobCancellation(job.job_id,followUp.event_id);
+    database.markJobCancelled(job.job_id,"明示取消");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.listJobsNeedingNotification()[0]?.job_id,sibling.job_id);
+    assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"attention");
+    database.close();
+  });
+
   test("別jobのlate Resultでは配送済みattention ownerを維持する", async () => {
     const {database,source,job,config}=await oneJobGroup("Ev-attention-other-result");
     const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
@@ -244,6 +274,40 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("原因jobの解消後に配送receiptを保存して残るfailedへ引き継ぐ", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-receipt-handoff");
+    const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"配送結果不明",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",ambiguous:true}]},`${config.resultsDir}/attention.json`);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"failed",
+      summary:"別の失敗",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
+    database.enqueueJobNotification(sibling.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",
+      summary:"late Result",completed_at:"2026-09-05T00:02:00.000Z"},job.result_path);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    const hash="a".repeat(64),expectedUpdatedAt=database.get(attention.row.event_id)!.updated_at;
+    const {request,claimToken}=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
+    database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+        identity_block_verified:true,session_status:"suspended"});
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.listJobsNeedingNotification()[0]?.job_id,sibling.job_id);
+    assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"attention");
+    database.close();
+  });
+
   test("Session更新timeoutではpost成功記録だけでactiveへ進めない", async () => {
     const {database,source,job,config} = await oneJobGroup("Ev-attention-session-timeout");
     database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
@@ -281,6 +345,28 @@ describe("通常groupのResult統合", () => {
       actions.find(action=>action.tool===tool)![failedField]=failedField==="ok"?false:"slack_error";
       database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
         status:"completed",summary:"配送失敗",completed_at:"2026-09-05T00:01:00.000Z",actions},
+        `${config.resultsDir}/attention.json`);
+      assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
+        database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
+      assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+      database.close();
+    }
+  });
+
+  test("最後のSession statusがsuspendedでなければ配送済みとしない", async () => {
+    for(const lastStatus of ["active","closed"] as const) {
+      const {database,source,job,config}=await oneJobGroup(`Ev-attention-last-session-${lastStatus}`);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+        summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+      sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+      const attention=database.enqueueJobNotification(job.job_id);
+      database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+      database.markWaiting(attention.row.event_id);
+      database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+        status:"completed",summary:"Session復帰",completed_at:"2026-09-05T00:01:00.000Z",
+        actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+          {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"},
+          {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:lastStatus}]},
         `${config.resultsDir}/attention.json`);
       assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
         database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
