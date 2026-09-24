@@ -43,6 +43,30 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
+  test("質問は無害なgroup driftで維持しattention時だけ投稿を抑止する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-question-group-drift");
+      const created=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        conversation_revision:1,payload:{kind:"question",question:"確認が必要です"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id).action,"ask_user");
+      const sibling=database.createJob({source_event_id:source.event_id,job_key:"sibling",objective:"sibling",
+        workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+      assert.equal(database.workerMessages.decisionCurrent(job.job_id,created.message.message_id,event.event_id).current,true);
+      database.markJobNeedsReview(sibling.job_id,"review","review");
+      assert.deepEqual(database.workerMessages.decisionCurrent(job.job_id,created.message.message_id,event.event_id),
+        {current:false,reason:"group_attention"});
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"group attentionへ集約",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
+      assert.equal(database.get(event.event_id)?.status,"completed");
+      assert.equal(database.getJob(job.job_id)?.status,"blocked");
+    } finally {database.close();}
+  });
   test("投稿前に無効になったprogress decisionを投稿なしで完了する",async()=>{
     for(const drift of ["group","terminal"] as const){
       const {database,source,job,config}=await fixture();
@@ -669,12 +693,14 @@ describe("worker messaging ledger",()=>{
   });
 
   test("質問通知eventの完了にはworkspaceとthread限定投稿とsuspended遷移を要求する",async()=>{
-    for(const {suspended,broadcast,wrongWorkspace,wrongBody} of [
-      {suspended:false,broadcast:false,wrongWorkspace:false,wrongBody:false},
-      {suspended:true,broadcast:true,wrongWorkspace:false,wrongBody:false},
-      {suspended:true,broadcast:false,wrongWorkspace:true,wrongBody:false},
-      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:true},
-      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false}]){
+    for(const {suspended,broadcast,wrongWorkspace,wrongBody,ambiguousSession,extraPost} of [
+      {suspended:false,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false},
+      {suspended:true,broadcast:true,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false},
+      {suspended:true,broadcast:false,wrongWorkspace:true,wrongBody:false,ambiguousSession:false,extraPost:false},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:true,ambiguousSession:false,extraPost:false},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:true,extraPost:false},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:true},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false}]){
       const {database,source,job,config}=await fixture();
       try {
         bindRuntime(database,job.job_id,`runtime-session-${suspended}`);
@@ -694,13 +720,16 @@ describe("worker messaging ledger",()=>{
         const actions:Array<Record<string,unknown>>=[{tool:"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,message_ts:"1756722031.123456",body_sha256:wrongBody?"0".repeat(64):decision.post_body_sha256,
           reply_broadcast:broadcast,success:true}];
+        if(extraPost)actions.push({tool:"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
+          thread_ts:target.thread_ts,message_ts:"1756722032.123456",body_sha256:"0".repeat(64),reply_broadcast:false,success:true});
         if(suspended)actions.push({tool:"dona_slack.set_agent_session_status",workspace_id:workspaceId,channel_id:target.channel_id,
-          thread_ts:target.thread_ts,status:"suspended",success:true});
+          thread_ts:target.thread_ts,status:"suspended",success:true,...(ambiguousSession?{ambiguous:true}:{})});
         database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
           summary:"処理しました",actions,memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
           resultPath,new Date("2026-09-21T00:00:04Z"));
-        assert.equal(database.get(event.event_id)?.status,suspended&&!broadcast&&!wrongWorkspace&&!wrongBody?"completed":"needs_review");
-        assert.equal(database.getJob(job.job_id)?.status,suspended&&!broadcast&&!wrongWorkspace&&!wrongBody?"blocked":"needs_review");
+        const valid=suspended&&!broadcast&&!wrongWorkspace&&!wrongBody&&!ambiguousSession&&!extraPost;
+        assert.equal(database.get(event.event_id)?.status,valid?"completed":"needs_review");
+        assert.equal(database.getJob(job.job_id)?.status,valid?"blocked":"needs_review");
       } finally {database.close();}
     }
   });

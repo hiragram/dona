@@ -2138,10 +2138,10 @@ export class DispatcherDatabase {
           this.revealBlockedQuestionOwner(event,"worker_message_decision_missing","Worker report decision is unavailable");
           return;
         }
+        const posts=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")) as Array<Record<string,unknown>>;
         if(decision.action==="ack_internal"||decision.action==="aggregate_wait"){
-          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message"));
-          if(posted){
+          if(posts.length){
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:"worker_message_unexpected_post",
               last_error_message:"Worker report was posted despite an internal-only decision"});
@@ -2172,7 +2172,7 @@ export class DispatcherDatabase {
           }
           if(decision.action==="ask_user"&&!hasPostOrSuspension){
             const state=currentState();
-            if(!state.current&&state.reason==="job_inactive"){
+            if(!state.current&&["job_inactive","group_changed","group_attention"].includes(state.reason)){
               this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
                 completed_at:result.completed_at,last_error_code:null,last_error_message:null});
               return;
@@ -2186,21 +2186,20 @@ export class DispatcherDatabase {
             return;
           }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
-          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
-            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
-            (action as Record<string,unknown>).channel_id===target?.channel_id&&
-            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            typeof (action as Record<string,unknown>).message_ts==="string"&&
-            (action as Record<string,unknown>).body_sha256===expectedBodySha256&&
-            (action as Record<string,unknown>).reply_broadcast===false&&
-            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
+          const posted=posts.length===1&&posts[0]!.workspace_id===target?.workspace_id&&
+            posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
+            typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
+            posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
+            posts[0]!.ok!==false&&!("error" in posts[0]!);
           const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
             (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
             (action as Record<string,unknown>).channel_id===target?.channel_id&&
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            (action as Record<string,unknown>).status==="suspended"&&(action as Record<string,unknown>).success!==false);
+            (action as Record<string,unknown>).status==="suspended"&&
+            (action as Record<string,unknown>).ambiguous!==true&&
+            (action as Record<string,unknown>).success!==false&&
+            (action as Record<string,unknown>).ok!==false&&!("error" in (action as Record<string,unknown>)));
           if(!posted||!suspended){
             const reason=!posted?"worker_message_question_not_posted":"worker_message_session_not_suspended";
             const description=!posted?"Question notification completed without a confirmed post":
@@ -2221,15 +2220,11 @@ export class DispatcherDatabase {
             }
           }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
-          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
-            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
-            (action as Record<string,unknown>).channel_id===target?.channel_id&&
-            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            typeof (action as Record<string,unknown>).message_ts==="string"&&
-            (action as Record<string,unknown>).body_sha256===expectedBodySha256&&
-            (action as Record<string,unknown>).reply_broadcast===false&&
-            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
+          const posted=posts.length===1&&posts[0]!.workspace_id===target?.workspace_id&&
+            posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
+            typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
+            posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
+            posts[0]!.ok!==false&&!("error" in posts[0]!);
           if(!posted||!decision.safe_projection_json){
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:"worker_message_progress_not_posted",

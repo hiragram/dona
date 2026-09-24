@@ -648,7 +648,8 @@ export class WorkerMessageRepository {
       .all(job.source_event_id) as WorkerDecisionSibling[];
     const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
       .get(job.source_event_id) as {count:number}).count;
-    if(sha256(stableStringify({total,jobs:group}))!==decision.group_sha256)return {current:false,reason:"group_changed"};
+    if(decision.action!=="ask_user"&&sha256(stableStringify({total,jobs:group}))!==decision.group_sha256)
+      return {current:false,reason:"group_changed"};
     if(group.some(row=>(row.status==="blocked"&&!(decision.action==="ask_user"&&row.job_id===jobId))
       ||row.status==="failed"||row.status==="needs_review"))
       return {current:false,reason:"group_attention"};
