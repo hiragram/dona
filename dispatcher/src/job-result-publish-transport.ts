@@ -78,7 +78,6 @@ export class JobResultPublishServer {
     this.server = http.createServer((request, response) => void this.handle(request, response));
     // A worker may renew and then publish over its sole pre-connected FD.
     // The per-socket active fence below rejects overlapping/pipelined requests.
-    this.server.maxRequestsPerSocket = 128;
     this.server.keepAliveTimeout = jobResultPublishTtlMs + 60_000;
   }
 
