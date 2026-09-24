@@ -824,7 +824,8 @@ if (args[2] === "agent" && args[3] === "get") {
 }
 process.exit(2);
 `, { mode: 0o700 });
-    await assert.rejects(runtime.prepare(job), /Git worktree HEAD mismatch/);
+    await assert.rejects(runtime.prepare(job), (error:unknown)=>
+      error instanceof Error && "code" in error && error.code==="existing_agent_permission_unverified");
     fixture.database.close();
   });
 

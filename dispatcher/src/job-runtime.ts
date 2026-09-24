@@ -348,7 +348,10 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
-      if (workspace.kind === "github") await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
+      if (workspace.kind === "github") {
+        try { await this.verifyExistingGitHubWorktree(row, workspace.repository, signal); }
+        catch { throw new UnverifiedExistingAgentError(); }
+      }
       throw new UnverifiedExistingAgentError();
     }
 
