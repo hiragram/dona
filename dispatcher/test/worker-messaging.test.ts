@@ -693,14 +693,18 @@ describe("worker messaging ledger",()=>{
   });
 
   test("質問通知eventの完了にはworkspaceとthread限定投稿とsuspended遷移を要求する",async()=>{
-    for(const {suspended,broadcast,wrongWorkspace,wrongBody,ambiguousSession,extraPost} of [
+    const cases:Array<{suspended:boolean;broadcast:boolean;wrongWorkspace:boolean;wrongBody:boolean;
+      ambiguousSession:boolean;extraPost:boolean;lateActive?:boolean;dummyPost?:boolean}>=[
       {suspended:false,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false},
       {suspended:true,broadcast:true,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false},
       {suspended:true,broadcast:false,wrongWorkspace:true,wrongBody:false,ambiguousSession:false,extraPost:false},
       {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:true,ambiguousSession:false,extraPost:false},
       {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:true,extraPost:false},
       {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:true},
-      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false}]){
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false,lateActive:true},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false,dummyPost:true},
+      {suspended:true,broadcast:false,wrongWorkspace:false,wrongBody:false,ambiguousSession:false,extraPost:false}];
+    for(const {suspended,broadcast,wrongWorkspace,wrongBody,ambiguousSession,extraPost,lateActive,dummyPost} of cases){
       const {database,source,job,config}=await fixture();
       try {
         bindRuntime(database,job.job_id,`runtime-session-${suspended}`);
@@ -717,17 +721,19 @@ describe("worker messaging ledger",()=>{
         const decision=database.workerMessages.decideReport(job.job_id,question.message.message_id,event.event_id);
         assert.equal(decision.action,"ask_user");
         const workspaceId=wrongWorkspace?"T_OTHER":target.workspace_id;
-        const actions:Array<Record<string,unknown>>=[{tool:"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
+        const actions:Array<Record<string,unknown>>=[{tool:dummyPost?"dummy.post_message":"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,message_ts:"1756722031.123456",body_sha256:wrongBody?"0".repeat(64):decision.post_body_sha256,
           reply_broadcast:broadcast,success:true}];
         if(extraPost)actions.push({tool:"dona_slack.post_message",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,message_ts:"1756722032.123456",body_sha256:"0".repeat(64),reply_broadcast:false,success:true});
         if(suspended)actions.push({tool:"dona_slack.set_agent_session_status",workspace_id:workspaceId,channel_id:target.channel_id,
           thread_ts:target.thread_ts,status:"suspended",success:true,...(ambiguousSession?{ambiguous:true}:{})});
+        if(lateActive)actions.push({tool:"dona_slack.set_agent_session_status",workspace_id:workspaceId,channel_id:target.channel_id,
+          thread_ts:target.thread_ts,status:"active",success:true});
         database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
           summary:"処理しました",actions,memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},
           resultPath,new Date("2026-09-21T00:00:04Z"));
-        const valid=suspended&&!broadcast&&!wrongWorkspace&&!wrongBody&&!ambiguousSession&&!extraPost;
+        const valid=suspended&&!broadcast&&!wrongWorkspace&&!wrongBody&&!ambiguousSession&&!extraPost&&!lateActive&&!dummyPost;
         assert.equal(database.get(event.event_id)?.status,valid?"completed":"needs_review");
         assert.equal(database.getJob(job.job_id)?.status,valid?"blocked":"needs_review");
       } finally {database.close();}

@@ -2186,20 +2186,21 @@ export class DispatcherDatabase {
             return;
           }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
-          const posted=posts.length===1&&posts[0]!.workspace_id===target?.workspace_id&&
+          const posted=posts.length===1&&posts[0]!.tool==="dona_slack.post_message"&&
+            posts[0]!.workspace_id===target?.workspace_id&&
             posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
             typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
             posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
             posts[0]!.ok!==false&&!("error" in posts[0]!);
-          const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
-            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
-            (action as Record<string,unknown>).channel_id===target?.channel_id&&
-            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            (action as Record<string,unknown>).status==="suspended"&&
-            (action as Record<string,unknown>).ambiguous!==true&&
-            (action as Record<string,unknown>).success!==false&&
-            (action as Record<string,unknown>).ok!==false&&!("error" in (action as Record<string,unknown>)));
+          const statusActions=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&
+            String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")) as Array<Record<string,unknown>>;
+          const finalStatus=statusActions.at(-1);
+          const suspended=finalStatus?.tool==="dona_slack.set_agent_session_status"&&
+            finalStatus.workspace_id===target?.workspace_id&&finalStatus.channel_id===target?.channel_id&&
+            finalStatus.thread_ts===target?.thread_ts&&finalStatus.status==="suspended"&&
+            finalStatus.ambiguous!==true&&finalStatus.success!==false&&finalStatus.ok!==false&&
+            !("error" in finalStatus);
           if(!posted||!suspended){
             const reason=!posted?"worker_message_question_not_posted":"worker_message_session_not_suspended";
             const description=!posted?"Question notification completed without a confirmed post":
@@ -2220,7 +2221,8 @@ export class DispatcherDatabase {
             }
           }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
-          const posted=posts.length===1&&posts[0]!.workspace_id===target?.workspace_id&&
+          const posted=posts.length===1&&posts[0]!.tool==="dona_slack.post_message"&&
+            posts[0]!.workspace_id===target?.workspace_id&&
             posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
             typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
             posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
