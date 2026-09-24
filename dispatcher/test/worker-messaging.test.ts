@@ -1239,10 +1239,13 @@ test("worker-facing APIは同じownerのsibling runtimeを拒否する",async()=
     assert.equal(accepted.status,202);
     const prompt=buildJobPrompt(sibling,true,"runtime-sibling",config.workerSocketPath);
     const jobJson=JSON.parse(prompt.split("job_json:\n")[1]!.split("\n[DONA_JOB_END]")[0]!) as
-      {runtime_identity:string;worker_messaging:{transport:{socket_path:string};report:{path:string}}};
+      {runtime_identity:string;worker_messaging:{transport:{socket_path:string};report:{path:string;
+        payload_variants:{checkpoint:{eta_at:string};risk:{eta_at:string}}}}};
     assert.equal(jobJson.runtime_identity,"runtime-sibling");
     assert.equal(jobJson.worker_messaging.transport.socket_path,config.workerSocketPath);
     assert.equal(jobJson.worker_messaging.report.path,`/v1/jobs/${sibling.job_id}/messages/reports`);
+    assert.equal(jobJson.worker_messaging.report.payload_variants.checkpoint.eta_at,"optional UTC RFC 3339");
+    assert.equal(jobJson.worker_messaging.report.payload_variants.risk.eta_at,"optional UTC RFC 3339");
     assert.match(prompt,/他jobへ転用せず/);
   } finally {await api.stop();database.close();}
 });

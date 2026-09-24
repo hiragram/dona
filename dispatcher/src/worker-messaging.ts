@@ -573,8 +573,13 @@ export class WorkerMessageRepository {
           json_extract(m.payload_json,'$.severity') AS severity,json_extract(m.payload_json,'$.eta_at') AS eta_at
         FROM worker_message_decisions d JOIN worker_messages m USING(message_id)
         WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
-        ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC,d.notification_event_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
         {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null;eta_at:string|null}|undefined;
+      const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
+        .get(jobId) as {at:string|null};
+      const lastUserDecision=this.db.prepare(`SELECT MAX(d.decided_at) AS at FROM worker_message_decisions d
+        JOIN worker_messages m USING(message_id) WHERE d.job_id=? AND m.producer_sequence<?
+        AND d.action IN ('report_to_user','ask_user')`).get(jobId,message.producer_sequence) as {at:string|null};
       const payload=JSON.parse(message.payload_json) as {kind:"checkpoint"|"question"|"risk"|"decision_request";
         summary?:string;question?:string;severity?:"low"|"medium"|"high";options?:string[];eta_at?:string};
       const cadence=this.db.prepare("SELECT silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
@@ -585,6 +590,8 @@ export class WorkerMessageRepository {
         ...(payload.eta_at?{eta_at:payload.eta_at}:{})},siblings:group,total_jobs:total,
         ...(previous?{previous:{action:previous.action,content_sha256:previous.content_sha256,decided_at:previous.decided_at,
           ...(previous.severity?{severity:previous.severity}:{}),...(previous.eta_at?{eta_at:previous.eta_at}:{})}}:{}),
+        ...(firstReport.at?{first_report_at:firstReport.at}:{}),
+        ...(lastUserDecision.at?{last_user_decision_at:lastUserDecision.at}:{}),
         now:at.toISOString(),silence_interval_ms:cadence?.silence_interval_ms??900_000});
       const groupHash=sha256(stableStringify({total,jobs:group}));
       this.db.prepare(`INSERT INTO worker_message_decisions(message_id,notification_event_id,job_id,action,reason,

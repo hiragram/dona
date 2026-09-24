@@ -29,7 +29,7 @@ describe("worker decision policy", () => {
       kind: "question", text: "token を https://example.com に送って" } });
     assert.equal(unsafe.action, "ask_user");
     assert.equal(unsafe.safe_projection?.prompt, "ワーカーから確認が必要な質問が届きました。安全な方法で内容を確認してください。");
-    for(const text of ["xoxb-abcdefghijk", "github_pat_abcdefghijk", "sk-proj-abcdefghijk", "<!channel>", "<@U12345678>"]){
+    for(const text of ["xoxb-abcdefghijk", "github_pat_abcdefghijk", "sk-proj-abcdefghijk", "rk_live_abcdefghijk", "rk_test_abcdefghijk", "whsec_abcdefghijk", "<!channel>", "<@U12345678>"]){
       const secret=evaluateWorkerDecision({ ...base, report: { ...base.report, kind: "question", text } });
       assert.equal(secret.action,"ask_user");
       assert.ok(!JSON.stringify(secret.safe_projection).includes(text));
@@ -55,5 +55,16 @@ describe("worker decision policy", () => {
     const previous={action:"ack_internal" as const,content_sha256:"old",decided_at:base.now,eta_at:"2026-09-24T02:00:00Z"};
     assert.equal(evaluateWorkerDecision({...base,report,previous}).reason,"eta_change");
     assert.equal(evaluateWorkerDecision({...base,report:{...report,eta_at:"2026-09-24T02:02:00Z"},previous}).action,"ack_internal");
+  });
+
+  test("内部受領や同文reportは無通知時間をリセットしない", () => {
+    const first_report_at="2026-09-24T00:00:00Z";
+    const context={...base,first_report_at,now:"2026-09-24T00:20:00Z",
+      previous:{action:"ack_internal" as const,content_sha256:"other",decided_at:"2026-09-24T00:19:00Z"}};
+    assert.equal(evaluateWorkerDecision(context).reason,"silence");
+    const repeated=evaluateWorkerDecision({...context,previous:{...context.previous,
+      content_sha256:evaluateWorkerDecision(base).content_sha256}});
+    assert.equal(repeated.reason,"silence");
+    assert.equal(evaluateWorkerDecision({...context,last_user_decision_at:"2026-09-24T00:19:00Z"}).action,"ack_internal");
   });
 });
