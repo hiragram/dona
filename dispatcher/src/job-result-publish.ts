@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
   return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
@@ -81,7 +81,7 @@ function hasPrivateJwkText(value: string): boolean {
   }
   return scopes.some(scope => scope.keyType && scope.privateParameter);
 }
-const localPath = /(?:(?<![A-Za-z0-9/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
+const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
 const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/?#\s"'<>`]+)(?:[/?#][^\s"'<>`]*)?/g;
 function hasPrivateSlashAuthority(value: string): boolean {
@@ -99,9 +99,14 @@ const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
     const first = match[1]!;
-    for (let start = 0; start <= first.length - 8; start++) {
-      if (start > 0 && first[start - 1] !== "_" && first[start - 1] !== "-") continue;
-      if (first.length - start > 4_096) continue;
+    const starts = [0];
+    // A compact JSON header normally starts with {" (base64url: eyJ).
+    // Limit secondary candidates so a hostile 1 MiB body stays bounded.
+    for (let start = first.lastIndexOf("eyJ"); start > 0 && starts.length < 17; start = first.lastIndexOf("eyJ", start - 1)) {
+      if ((first[start - 1] === "_" || first[start - 1] === "-") && first.length - start <= 1_024) starts.push(start);
+    }
+    for (const start of starts) {
+      if (first.length - start > 1_024) continue;
       try {
         const header = JSON.parse(Buffer.from(first.slice(start), "base64url").toString("utf8"));
         if (header && typeof header === "object" && typeof header.alg === "string") return true;
@@ -192,6 +197,7 @@ function isPublicCountField(key: string, value: unknown): boolean {
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie|session)(?:_|$)/.test(normalized) ||
+    /^(?:sig|signature|x_amz_signature|x_goog_signature)$/.test(normalized) ||
     /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|accountkey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|account|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
