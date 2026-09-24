@@ -45,7 +45,8 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const args = row.source==="dona_schedule"
     ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
-    : ["--add-dir", resultDirectory];
+    : ["--add-dir", resultDirectory,"--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
+        "-c","mcp_servers.dona_slack.enabled=false","-c","mcp_servers.dona_dispatcher.enabled=false"];
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
@@ -342,18 +343,8 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
-      if(row.source==="dona_schedule") throw new Error("Existing scheduled agent permission identity cannot be verified");
-      if (workspace.kind === "github") {
-        await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
-      }
-      const parsed = parseJson(existingAgent.stdout);
-      const workspaceId = findValue(parsed, ["workspace_id"]);
-      const paneId = findValue(parsed, ["pane_id"]);
-      if (workspaceId !== undefined && paneId !== undefined) {
-        const herdrWorkspaceId=String(workspaceId),herdrPaneId=String(paneId);
-        const herdrAgentSessionId=agentSessionIdFromIdentity(existingAgent.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
-        return { herdrWorkspaceId, herdrPaneId, ...(herdrAgentSessionId?{herdrAgentSessionId}:{}) };
-      }
+      if (workspace.kind === "github") await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
+      throw new Error("Existing agent permission identity cannot be verified");
     }
 
     let disabledMcpServers:string[]=[];

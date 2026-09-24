@@ -923,6 +923,30 @@ describe("JobSupervisor", () => {
     reopened.close();
   });
 
+  test("typed instructionは現在のHerdr sessionが一致する場合だけ配送する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-typed-session-fence")).row;
+    const job=database.createJob({source_event_id:source.event_id,job_key:"typed-fence",objective:"調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"workspace","pane","original-session");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    const instruction=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+      producer_sequence:1,idempotency_key:"session-fence",occurred_at:new Date().toISOString(),
+      payload:{operation:"add_condition",text:"安全な追加条件"}});
+    let prompts=0;
+    const runtime:JobAgentRuntime={async prepare(){throw new Error("unused");},async get(){return {...ok("working"),
+      agentIdentity:JSON.stringify(["workspace","pane",job.agent_name,"replacement-session"])};},
+      async prompt(){prompts++;return ok("working");},async wait(){return ok("working");},async cancel(){return ok("idle");}};
+    const supervisor=new JobSupervisor(database,runtime,config,logger,()=>undefined);
+    try{
+      await assert.rejects(supervisor.steer(job.job_id,source.event_id,"追加条件",instruction.message.message_id),/requires review/);
+      assert.equal(prompts,0);
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+    }finally{await supervisor.stop();database.close();}
+  });
+
   test("blocked workerへのtyped answerを受理してrunning監視へ戻す",async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);

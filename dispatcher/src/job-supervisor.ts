@@ -258,6 +258,17 @@ export class JobSupervisor {
         return { row, duplicate };
       }
       if(current.status==="blocked")await this.active.get(jobId)?.operation;
+      const typedInstruction=this.database.workerMessages.getMessage(jobId,operationId,sourceEventId);
+      if(typedInstruction?.direction==="dona_to_worker"&&!this.database.hasAcceptedJobSteerReceipt(jobId,operationId)){
+        const latest=this.database.getJob(jobId);
+        const expected=latest&&expectedLiveSessionIdentity(latest,this.database.getJobLiveSessionIdentity(jobId));
+        const observed=expected?await this.runtime.get(latest.agent_name,this.abortController.signal):undefined;
+        if(!expected||!observed?.ok||observed.agentIdentity!==expected||!["working","blocked","idle"].includes(observed.agentStatus??"")){
+          this.database.markJobNeedsReview(jobId,"worker_instruction_session_unverified","Instruction target session could not be verified");
+          this.wake();
+          throw new Error(`Job ${jobId} instruction target session requires review`);
+        }
+      }
       const begun = this.database.beginJobSteer(jobId, sourceEventId, operationId);
       if (begun.duplicate) {
         if(current.status==="blocked"&&begun.row.status==="running"&&!this.stopping)this.launch(begun.row);
