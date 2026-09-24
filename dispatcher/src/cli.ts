@@ -39,6 +39,7 @@ function usage(): never {
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job attention-recovery <source_event_id>
   dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed [--resume <claim_token>]
+  dona-dispatcher job release-rejected-attention-claim <source_event_id> <attention_event_id> <expected_event_updated_at> <claim_token> --definitive-rejection-reviewed --no-session-write-reviewed
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -145,6 +146,12 @@ async function main(): Promise<void> {
         const sourceEventId=eventIdAt(args,2);
         console.log(JSON.stringify({group:database.getJobGroup(sourceEventId),
           legacy_claim:database.getLegacyAttentionClaim(sourceEventId)},null,2));return;
+      }
+      if(command==="release-rejected-attention-claim") {
+        if(args.length!==8 || args[6]!=="--definitive-rejection-reviewed" || args[7]!=="--no-session-write-reviewed")usage();
+        const sourceEventId=eventIdAt(args,2),attentionEventId=eventIdAt(args,3);
+        database.releaseRejectedAttentionDeliveryClaim(sourceEventId,attentionEventId,eventIdAt(args,4),eventIdAt(args,5));
+        console.log(JSON.stringify({source_event_id:sourceEventId,attention_event_id:attentionEventId,claim_released:true}));return;
       }
       if(command==="reconcile-attention-delivery") {
         if((args.length!==8 && args.length!==10) || args[7]!=="--notification-reviewed" ||

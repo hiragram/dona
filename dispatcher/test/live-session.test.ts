@@ -82,6 +82,36 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
     state.database.close();
   });
+  test("別jobのattentionではinvalid Resultを解消済みと記録しない",async()=>{
+    const state=await addressableJob("needs_review","attention-owner");
+    const sibling=state.database.createJob({source_event_id:state.source.event_id,job_key:"invalid-sibling",
+      objective:"別調査",workspace:{kind:"scratch"}},state.config.jobsWorkspaceRoot,state.config.jobResultsDir).row;
+    state.database.beginJobPreparation(sibling.job_id);
+    state.database.setJobRuntime(sibling.job_id,"workspace-second","pane-second","session-second");
+    state.database.beginJobDispatch(sibling.job_id);
+    state.database.markJobNeedsReview(sibling.job_id,"invalid_result","malformed Result");
+    state.database.sealJobGroup(state.source.event_id);
+    const attention=state.database.enqueueJobNotification(state.job.job_id).row;
+    state.database.enqueueJobNotification(sibling.job_id);
+    state.database.beginDispatch(attention.event_id,`${state.config.resultsDir}/attention.json`);
+    state.database.markWaiting(attention.event_id);
+    state.database.saveCompleted(attention.event_id,{schema_version:1,event_id:attention.event_id,status:"completed",
+      summary:"attention delivered",completed_at:"2026-09-05T00:00:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${state.config.resultsDir}/attention.json`);
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(sibling.job_id,state.source.event_id);
+    const current=state.database.getJob(sibling.job_id)!;
+    const resolved=state.database.resolveInvalidJobResult(sibling.job_id,receipt.receipt_id,current.updated_at);
+    assert.equal(resolved.status,"failed");
+    const raw=new Database(state.config.databasePath);
+    assert.equal(raw.prepare("SELECT 1 FROM job_attention_resolutions WHERE job_id=?").get(sibling.job_id),undefined);
+    raw.close();
+    assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
+    assert.equal(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id,null);
+    state.database.close();
+  });
   test("別のneeds_review原因で得たreceiptは後のinvalid Resultに使えない",async()=>{
     const state=await addressableJob();
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});

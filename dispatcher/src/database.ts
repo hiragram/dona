@@ -204,6 +204,14 @@ function ensureJobAttentionResolutionSchema(db: Database.Database): void { db.ex
     body_sha256 TEXT NOT NULL,
     claimed_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS job_attention_delivery_claim_releases (
+    claim_token TEXT PRIMARY KEY,
+    attention_event_id TEXT NOT NULL REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    expected_event_updated_at TEXT NOT NULL,
+    release_reason TEXT NOT NULL CHECK (release_reason='definitive_rejection_no_session_write'),
+    released_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS job_attention_legacy_claims (
     source_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
     all_terminal_event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -1136,7 +1144,8 @@ export class DispatcherDatabase {
         .run(at.toISOString(), at.toISOString(), `Operator reviewed worker termination and side effects; receipt ${receiptId}`, jobId, expectedUpdatedAt).changes;
       if (changed !== 1) throw new Error("job_changed_since_review");
       if (group?.notification_mode === "grouped" && group.attention_event_id) {
-        this.recordAttentionResolution(jobId, group.attention_event_id, "failed", "operator_reconcile", null, at);
+        const payload=JSON.parse(this.getRequired(group.attention_event_id).payload_json) as {job_id?:string};
+        if(payload.job_id===jobId) this.recordAttentionResolution(jobId, group.attention_event_id, "failed", "operator_reconcile", null, at);
       }
       this.enqueueJobNotification(jobId, at);
       return this.getJobRequired(jobId);
@@ -1273,6 +1282,29 @@ export class DispatcherDatabase {
         claim.body_sha256!==bodySha256 || this.getRequired(attentionEventId).updated_at!==expectedUpdatedAt)
       throw new Error("attention_delivery_claim_mismatch");
     return {request,claimToken};
+  }
+
+  releaseRejectedAttentionDeliveryClaim(
+    sourceEventId:string,attentionEventId:string,expectedUpdatedAt:string,claimToken:string,at=new Date(),
+  ):void {
+    this.db.transaction(()=>{
+      const group=this.getJobGroupRequired(sourceEventId);
+      const event=this.getRequired(attentionEventId);
+      const claim=this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?")
+        .get(attentionEventId) as {source_event_id:string;claim_token:string;expected_event_updated_at:string}|undefined;
+      if(group.attention_event_id!==attentionEventId || group.all_terminal_event_id ||
+          event.updated_at!==expectedUpdatedAt || !claim || claim.source_event_id!==sourceEventId ||
+          claim.claim_token!==claimToken || claim.expected_event_updated_at!==expectedUpdatedAt ||
+          this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(attentionEventId)) {
+        throw new Error("attention_delivery_claim_release_mismatch");
+      }
+      this.db.prepare(`INSERT INTO job_attention_delivery_claim_releases
+        (claim_token,attention_event_id,source_event_id,expected_event_updated_at,release_reason,released_at)
+        VALUES(?,?,?,?,?,?)`).run(claimToken,attentionEventId,sourceEventId,expectedUpdatedAt,
+        "definitive_rejection_no_session_write",at.toISOString());
+      this.db.prepare("DELETE FROM job_attention_delivery_claims WHERE attention_event_id=? AND claim_token=?")
+        .run(attentionEventId,claimToken);
+    }).immediate();
   }
 
   recordVerifiedAttentionDelivery(
@@ -1488,7 +1520,8 @@ export class DispatcherDatabase {
           last_error_message: result.status === "failed" ? result.summary : null,
         });
         if (recoverAmbiguous && attentionEventId && binding?.owner.kind === "slack_thread") {
-          this.recordAttentionResolution(jobId, attentionEventId, status, "validated_result", null, at);
+          const payload=JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string};
+          if(payload.job_id===jobId) this.recordAttentionResolution(jobId, attentionEventId, status, "validated_result", null, at);
         }
         if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,at,notificationHook);
       }).immediate();
@@ -1629,6 +1662,10 @@ export class DispatcherDatabase {
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const timestamp = at.toISOString();
       let group = this.getJobGroupRequired(job.source_event_id);
+      if(group.notification_mode==="grouped" && group.attention_event_id && jobAttentionStatuses.has(job.status)) {
+        this.handoffResolvedAttention(group.attention_event_id,at);
+        group=this.getJobGroupRequired(job.source_event_id);
+      }
       if (group.notification_mode === "grouped" && group.all_terminal_event_id) {
         const existing = this.getRequired(group.all_terminal_event_id);
         if (!job.completion_event_id) {
@@ -2776,7 +2813,8 @@ export class DispatcherDatabase {
     const attention = this.getRequired(attentionEventId);
     if (job.status !== status || attention.source !== "dona_job") throw new Error("attention_resolution_binding_mismatch");
     const payload = JSON.parse(attention.payload_json) as { job_id?: string; group?: { transition?: string; source_event_id?: string } };
-    if (payload.group?.transition !== "attention" || payload.group.source_event_id !== job.source_event_id) {
+    if (payload.group?.transition !== "attention" || payload.group.source_event_id !== job.source_event_id ||
+        payload.job_id !== jobId) {
       throw new Error("attention_resolution_binding_mismatch");
     }
     const existing = this.db.prepare("SELECT * FROM job_attention_resolutions WHERE job_id=?")

@@ -183,6 +183,36 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("原因job解消後に失敗したrunning siblingへattentionを引き継ぐ", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-later-failure");
+    const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"failed",
+      summary:"後発の失敗",completed_at:"2026-09-05T00:02:00.000Z"},sibling.result_path);
+    const replacement=database.enqueueJobNotification(sibling.job_id);
+    assert.equal((envelopeFromRow(replacement.row).payload.group as Record<string,unknown>).transition,"attention");
+    assert.notEqual(replacement.row.event_id,attention.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,replacement.row.event_id);
+    database.close();
+  });
+
   test("別jobのlate Resultでは配送済みattention ownerを維持する", async () => {
     const {database,source,job,config}=await oneJobGroup("Ev-attention-other-result");
     const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
@@ -277,8 +307,20 @@ describe("通常groupのResult統合", () => {
     assert.throws(()=>database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
       expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
         identity_block_verified:false,session_status:"suspended"}),/evidence_mismatch/);
+    assert.throws(()=>database.releaseRejectedAttentionDeliveryClaim(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"wrong-token"),/claim_release_mismatch/);
+    database.releaseRejectedAttentionDeliveryClaim(source.event_id,attention.row.event_id,expectedUpdatedAt,claimToken);
+    assert.throws(()=>database.resumeAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash,claimToken),/claim_mismatch/);
+    const audit=new Database(config.databasePath);
+    assert.equal((audit.prepare("SELECT release_reason FROM job_attention_delivery_claim_releases WHERE claim_token=?")
+      .get(claimToken) as {release_reason:string}).release_reason,"definitive_rejection_no_session_write");
+    audit.close();
+    const next=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
+    assert.notEqual(next.claimToken,claimToken);
     database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
-      expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+      expectedUpdatedAt,next.claimToken,{...next.request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
         identity_block_verified:true,session_status:"suspended"});
     database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
     assert.ok(database.getJobGroup(source.event_id)?.all_terminal_event_id);
