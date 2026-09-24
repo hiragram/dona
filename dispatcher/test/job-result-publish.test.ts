@@ -19,8 +19,8 @@ const row = (overrides: Partial<JobRow> = {}): JobRow => ({
 } as JobRow);
 const code = (expected: string) => (error: unknown): boolean => error instanceof JobResultPublishError && error.code === expected;
 const testListeners = new WeakMap<JobResultPublishServer, net.Server>();
-async function startServer(server: JobResultPublishServer, socket: string, onConnection?: () => void): Promise<void> {
-  const listener = net.createServer(connection => { onConnection?.(); server.accept(connection); });
+async function startServer(server: JobResultPublishServer, socket: string, onConnection?: (connection: net.Socket) => void): Promise<void> {
+  const listener = net.createServer(connection => { onConnection?.(connection); server.accept(connection); });
   await new Promise<void>((resolve, reject) => listener.once("error", reject).listen(socket, resolve));
   testListeners.set(server, listener);
 }
@@ -77,21 +77,30 @@ describe("job result publish contract", () => {
     for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "auth", "session_id", "sessionId", "sessionid", "cookie", "set-cookie", "passwd", "passphrase", "account_key", "AccountKey", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    for (const value of ["session=CANARY_VALUE", '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}']) {
+    for (const value of ["session=CANARY_VALUE", '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
+      '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}']) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const value of [{ session: "CANARY_VALUE" }, { kty: "RSA", n: "public", e: "AQAB", d: "PRIVATE_VALUE" },
       { kty: "oct", k: "PRIVATE_VALUE" }]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [value] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
+    for (const value of ["http://artifact-service.internal/download/OPAQUE_VALUE", "http://artifact/download/OPAQUE_VALUE",
+      "http://cache.local/private", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt"]) {
+      assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.equal(validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    const repeatedUrls = "http://x?foo=".repeat(20_000);
+    const repeatedUrls = "http://example.com?foo=".repeat(10_000);
     const started = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: repeatedUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - started < 2_000, "署名URL検査は大きな本文でも線形時間で終わる");
+    const publicJwks = '{"kty":"RSA","n":"public"}'.repeat(8_000);
+    const jwkStarted = performance.now();
+    assert.equal(validateJobResultPublish({ ...base, summary: publicJwks }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.ok(performance.now() - jwkStarted < 2_000, "JWK本文検査は反復しても線形時間で終わる");
   });
 
   test("canonical digestはkey順とDispatcher時刻によらず同一で、内容の差を識別する", () => {
@@ -168,6 +177,10 @@ describe("job result publish contract", () => {
     const shortGrant = short.issue(row(), "s1");
     assert.throws(() => short.validate(shortGrant.capability, "s1", { ...base, summary: "s1" }, () => row({ status: "running" })), code("content_requires_redaction"));
     assert.equal(short.validate(shortGrant.capability, "s1", { ...base, summary: "task s1 is complete" }, () => row({ status: "running" })).envelope.status, "completed");
+    const composite = JSON.stringify(["workspace", "pane", "agent", "😀".repeat(512)]);
+    const compositeGrants = new JobResultPublishCapabilities(() => composite);
+    const compositeGrant = compositeGrants.issue(row(), composite);
+    assert.equal(compositeGrants.authorize(compositeGrant.capability, composite, () => row({ status: "running" })).job_id, "job_one");
   });
 
   test("同じjobの旧worker世代のsessionとpaneもResultから除外する", () => {
@@ -193,6 +206,14 @@ describe("job result publish contract", () => {
       "private objective two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
+  });
+
+  test("短いobjectiveは全文一致時だけ拒否する", () => {
+    const grants = new JobResultPublishCapabilities(() => "session-one");
+    const grant = grants.issue(row({ objective: "test" }), "session-one");
+    const current = row({ status: "running", objective: "test" });
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "tests passed" }, () => current).envelope.status, "completed");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "test" }, () => current), code("content_requires_redaction"));
   });
 
   test("terminal cleanup後は同じgrantでread-only照合できる", () => {
@@ -308,6 +329,11 @@ describe("job result publish contract", () => {
       const maximumSessionHeader = Buffer.from(JSON.stringify(session), "utf8").toString("base64url");
       assert.equal(maximumSessionHeader.length, 4099);
       assert.equal(await post(maximumSessionHeader), 202);
+      session = JSON.stringify(["workspace".repeat(100), "pane".repeat(100), "agent".repeat(100), "😀".repeat(512)]);
+      grant = grants.issue(row(), session);
+      const compositeHeader = Buffer.from(JSON.stringify(session), "utf8").toString("base64url");
+      assert.ok(compositeHeader.length > 4099);
+      assert.equal(await post(compositeHeader), 202);
       assert.equal(await post(Buffer.from(JSON.stringify("別session"), "utf8").toString("base64url")), 403);
       assert.equal(await post("%%%"), 403);
     } finally {
@@ -356,8 +382,9 @@ describe("job result publish contract", () => {
       { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
     let client: net.Socket | undefined;
     let stalled: net.Socket | undefined;
+    let waiting: net.Socket | undefined;
     try {
-      await startServer(server, socket);
+      await startServer(server, socket, connection => { waiting = connection; });
       client = net.createConnection(socket);
       client.on("error", () => {});
       await new Promise<void>(resolve => client!.once("connect", resolve));
@@ -375,6 +402,12 @@ describe("job result publish contract", () => {
       assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(stalled.destroyed, true, "header途中のsocketは期限で閉じる");
+      const beforeData = net.createConnection(socket);
+      beforeData.on("error", () => {});
+      await new Promise<void>(resolve => beforeData.once("connect", resolve));
+      assert.ok(waiting);
+      waiting.emit("error", new Error("ECONNRESET"));
+      await new Promise<void>(resolve => beforeData.once("close", resolve));
     } finally {
       client?.destroy();
       stalled?.destroy();

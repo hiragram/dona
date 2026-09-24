@@ -9,6 +9,18 @@ import type { JobResultEnvelope, JobRow } from "./types.js";
 export const jobResultEnvelopeMaxBytes = 1_048_576;
 export const jobResultPublishTtlMs = 30 * 60_000;
 
+/** Composite identity carries a persisted agent session ID of at most 512 code points. */
+export function validJobResultPublishSession(session: string): boolean {
+  if (!session || Buffer.byteLength(JSON.stringify(session), "utf8") > 8_192) return false;
+  let parts: unknown;
+  try { parts = JSON.parse(session); } catch { /* Legacy opaque identity. */ }
+  if (Array.isArray(parts) && parts.length === 4 && parts.every(part => typeof part === "string")) {
+    const agentSession = parts[3] as string;
+    return agentSession.length > 0 && [...agentSession].length <= 512;
+  }
+  return [...session].length <= 512;
+}
+
 export type JobResultPublishErrorCode =
   | "invalid_request" | "payload_too_large" | "content_requires_redaction"
   | "capability_invalid" | "capability_expired" | "capability_revoked"
@@ -29,9 +41,19 @@ function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
   return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
     Object.keys(value).some(key => privateJwkParameter.has(key));
 }
-const privateJwkText = /["']kty["']\s*:\s*["'](?:RSA|EC|OKP|oct)["'][\s\S]*?["'](?:d|p|q|dp|dq|qi|oth|k)["']\s*:/i;
-const localPath = /(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
-const uncPath = /(?:^|[\s"'(`=])(?:\\\\[^\\\s]+\\|\/\/[^/\s]+\/)/;
+const jwkTextField = /["'](kty|d|p|q|dp|dq|qi|oth|k)["']\s*:\s*(?:["'](RSA|EC|OKP|oct)["'])?/gi;
+function hasPrivateJwkText(value: string): boolean {
+  let keyType = false;
+  let privateParameter = false;
+  for (const field of value.matchAll(jwkTextField)) {
+    if (field[1]?.toLowerCase() === "kty") keyType ||= field[2] !== undefined;
+    else privateParameter = true;
+    if (keyType && privateParameter) return true;
+  }
+  return false;
+}
+const localPath = /(?:(?<![A-Za-z0-9:/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
+const uncPath = /(?:(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\|(?<![A-Za-z0-9:/])\/\/[^/\s]+\/)/;
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
@@ -42,6 +64,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
   if (hostname === "localhost" || hostname.endsWith(".localhost") ||
     hostname === "files.slack.com" || hostname === "hooks.slack.com") return true;
   const host = hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host) === 0 && (!host.includes(".") || /\.(?:internal|local|lan|home\.arpa)$/.test(host))) return true;
   if (isIP(host) === 4) {
     const [a, b] = host.split(".").map(Number) as [number, number];
     return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
@@ -123,10 +146,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (forbiddenKey(match[0].replace(/\s*[:=]$/, "").replace(/^["']|["']$/g, ""))) throw new JobResultPublishError("content_requires_redaction");
     }
     if (forbiddenDigests && forbiddenFingerprints && containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
-    if (forbiddenValues?.some(privateValue => privateValue.length >= 4 ? value.includes(privateValue) : value === privateValue)) {
+    if (forbiddenValues?.some(privateValue => privateValue.length >= 8 ? value.includes(privateValue) : value === privateValue)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value) || privateJwkText.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value) || hasPrivateJwkText(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
@@ -256,7 +279,7 @@ export class JobResultPublishCapabilities {
   ) {}
 
   issue(job: JobRow, session: string): { capability: string; expiresAt: string } {
-    if (job.status !== "dispatching" || !session || [...session].length > 512 || this.currentSession(job.job_id) !== session) {
+    if (job.status !== "dispatching" || !validJobResultPublishSession(session) || this.currentSession(job.job_id) !== session) {
       throw new JobResultPublishError("job_not_publishable");
     }
     return this.mint(job, session);

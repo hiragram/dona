@@ -3,7 +3,7 @@ import net from "node:net";
 import { TextDecoder } from "node:util";
 
 import type { JobRow } from "./types.js";
-import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, jobResultPublishTtlMs, type AuthorizedJobResultPublish } from "./job-result-publish.js";
+import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, jobResultPublishTtlMs, validJobResultPublishSession, type AuthorizedJobResultPublish } from "./job-result-publish.js";
 
 export interface JobResultPublishSink {
   /** Must compare candidate.fence in the same durable transaction as Result creation. */
@@ -85,6 +85,7 @@ export class JobResultPublishServer {
   accept(socket: net.Socket): void {
     if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= 32) { socket.destroy(); return; }
     this.sockets.add(socket);
+    socket.on("error", () => socket.destroy());
     // Keep the FD outside the HTTP parser until its first byte. The worker may
     // run for hours before publishing; a partial first header gets a deadline.
     socket.once("data", chunk => {
@@ -132,11 +133,11 @@ export class JobResultPublishServer {
     try {
       // JSON before base64url preserves every persisted 512-character session,
       // including Unicode, control characters and lone surrogates.
-      if (!/^[A-Za-z0-9_-]{1,4099}$/.test(encodedSession)) throw new JobResultPublishError("capability_invalid");
+      if (!/^[A-Za-z0-9_-]{1,12000}$/.test(encodedSession)) throw new JobResultPublishError("capability_invalid");
       let session: unknown;
       try { session = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(encodedSession, "base64url"))); }
       catch { throw new JobResultPublishError("capability_invalid"); }
-      if (typeof session !== "string" || !session || [...session].length > 512 ||
+      if (typeof session !== "string" || !validJobResultPublishSession(session) ||
         Buffer.from(JSON.stringify(session), "utf8").toString("base64url") !== encodedSession) {
         throw new JobResultPublishError("capability_invalid");
       }
