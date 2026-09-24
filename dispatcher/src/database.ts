@@ -2731,6 +2731,8 @@ export class DispatcherDatabase {
         typeof target.thread_ts !== "string") return false;
     if (actions.some(action => action && typeof action === "object" &&
       (action as Record<string, unknown>).ambiguous === true)) return false;
+    const actionSucceeded = (action: Record<string, unknown>) =>
+      action.ambiguous !== true && action.success !== false && action.ok !== false && !("error" in action);
     return actions.some(action => action && typeof action === "object" &&
       (action as Record<string, unknown>).tool === "dona_slack.post_message" &&
       typeof (action as Record<string, unknown>).message_ts === "string" &&
@@ -2739,16 +2741,14 @@ export class DispatcherDatabase {
       (action as Record<string, unknown>).channel_id === target.channel_id &&
       (action as Record<string, unknown>).thread_ts === target.thread_ts &&
       (action as Record<string, unknown>).reply_broadcast !== true &&
-      (action as Record<string, unknown>).ambiguous !== true &&
-      (action as Record<string, unknown>).success !== false) &&
+      actionSucceeded(action as Record<string, unknown>)) &&
       actions.some(action => action && typeof action === "object" &&
         (action as Record<string, unknown>).tool === "dona_slack.set_agent_session_status" &&
         (action as Record<string, unknown>).status === "suspended" &&
         (action as Record<string, unknown>).workspace_id === target.workspace_id &&
         (action as Record<string, unknown>).channel_id === target.channel_id &&
         (action as Record<string, unknown>).thread_ts === target.thread_ts &&
-        (action as Record<string, unknown>).ambiguous !== true &&
-        (action as Record<string, unknown>).success !== false);
+        actionSucceeded(action as Record<string, unknown>));
   }
 
   private recordAttentionResolution(
@@ -2773,6 +2773,16 @@ export class DispatcherDatabase {
       (job_id,source_event_id,attention_event_id,status_at_resolution,resolution_kind,resolution_event_id,resolved_at)
       VALUES(?,?,?,?,?,?,?)`)
       .run(jobId, job.source_event_id, attentionEventId, status, kind, resolutionEventId, at.toISOString());
+    const unresolvedSibling = this.db.prepare(`SELECT 1 FROM jobs j WHERE j.source_event_id=? AND j.job_id<>?
+      AND (j.status IN ('blocked','needs_review') OR (j.status='failed' AND NOT EXISTS (
+        SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
+          AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed'
+      ))) LIMIT 1`).get(job.source_event_id,jobId);
+    if (unresolvedSibling && this.attentionNotificationSettled(attention)) {
+      this.db.prepare(`UPDATE job_groups SET attention_event_id=NULL,updated_at=?
+        WHERE source_event_id=? AND attention_event_id=? AND all_terminal_event_id IS NULL`)
+        .run(at.toISOString(),job.source_event_id,attentionEventId);
+    }
   }
 
   private sealJobGroupIfPresent(sourceEventId: string, timestamp: string): number {
