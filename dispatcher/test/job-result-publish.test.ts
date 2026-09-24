@@ -77,7 +77,8 @@ describe("job result publish contract", () => {
     for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "auth", "session_id", "sessionId", "sessionid", "cookie", "set-cookie", "passwd", "passphrase", "account_key", "AccountKey", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    for (const value of ["session=CANARY_VALUE", '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
+    for (const value of ["session=CANARY_VALUE", '{"to\\u006ben":"CANARY_VALUE"}',
+      '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
       '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}']) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
@@ -86,13 +87,17 @@ describe("job result publish contract", () => {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [value] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const value of ["http://artifact-service.internal/download/OPAQUE_VALUE", "http://artifact/download/OPAQUE_VALUE",
-      "http://cache.local/private", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt"]) {
+      "http://cache.local/private", "ftp://10.0.0.5/private/archive.zip", "sftp://artifact.internal/result",
+      "report,[/root/.dona/result.json]", "report,/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
+    for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}']) {
+      assert.equal(validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    assert.equal(validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.throws(() => validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     const repeatedUrls = "http://example.com?foo=".repeat(10_000);
     const started = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: repeatedUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -214,6 +219,21 @@ describe("job result publish contract", () => {
     const current = row({ status: "running", objective: "test" });
     assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "tests passed" }, () => current).envelope.status, "completed");
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "test" }, () => current), code("content_requires_redaction"));
+  });
+
+  test("多数grantの非公開値を大きい本文で一度だけ走査する", () => {
+    const grants = new JobResultPublishCapabilities(id => id);
+    let own = "";
+    for (let index = 0; index < 300; index++) {
+      const id = `job_${index}`;
+      const issued = grants.issue(row({ job_id: id, objective: `private objective number ${index}` }), id);
+      if (index === 0) own = issued.capability;
+    }
+    const started = performance.now();
+    const candidate = grants.validate(own, "job_0", { ...base, summary: "public report completed ".repeat(5_000) },
+      () => row({ status: "running", job_id: "job_0", objective: "private objective number 0" }));
+    assert.equal(candidate.envelope.status, "completed");
+    assert.ok(performance.now() - started < 2_000, "grant数に比例して本文を再走査しない");
   });
 
   test("terminal cleanup後は同じgrantでread-only照合できる", () => {

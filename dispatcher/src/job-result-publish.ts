@@ -41,21 +41,52 @@ function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
   return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
     Object.keys(value).some(key => privateJwkParameter.has(key));
 }
-const jwkTextField = /["'](kty|d|p|q|dp|dq|qi|oth|k)["']\s*:\s*(?:["'](RSA|EC|OKP|oct)["'])?/gi;
 function hasPrivateJwkText(value: string): boolean {
-  let keyType = false;
-  let privateParameter = false;
-  for (const field of value.matchAll(jwkTextField)) {
-    if (field[1]?.toLowerCase() === "kty") keyType ||= field[2] !== undefined;
-    else privateParameter = true;
-    if (keyType && privateParameter) return true;
+  const jwkTypeAt = /"(?:RSA|EC|OKP|oct)"/y;
+  const scopes: { keyType: boolean; privateParameter: boolean }[] = [];
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char === "{") { scopes.push({ keyType: false, privateParameter: false }); continue; }
+    if (char === "}") {
+      const scope = scopes.pop();
+      if (scope?.keyType && scope.privateParameter) return true;
+      continue;
+    }
+    if (char !== '"') continue;
+    const start = index;
+    index++;
+    for (; index < value.length; index++) {
+      if (value[index] === "\\") { index++; continue; }
+      if (value[index] === '"') break;
+    }
+    if (index >= value.length || scopes.length === 0) continue;
+    let key: unknown;
+    try { key = JSON.parse(value.slice(start, index + 1)); } catch { continue; }
+    let next = index + 1;
+    while (/\s/.test(value[next] ?? "")) next++;
+    if (value[next] !== ":") continue;
+    const scope = scopes.at(-1)!;
+    if (key === "kty") {
+      next++;
+      while (/\s/.test(value[next] ?? "")) next++;
+      jwkTypeAt.lastIndex = next;
+      if (jwkTypeAt.exec(value)) scope.keyType = true;
+    } else if (typeof key === "string" && privateJwkParameter.has(key)) scope.privateParameter = true;
   }
   return false;
 }
 const localPath = /(?:(?<![A-Za-z0-9:/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
-const uncPath = /(?:(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\|(?<![A-Za-z0-9:/])\/\/[^/\s]+\/)/;
+const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
+const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/\s]+)\/[^\s"'<>`]*/g;
+function hasPrivateSlashAuthority(value: string): boolean {
+  for (const match of value.matchAll(slashAuthority)) {
+    const host = match[1]!;
+    if (!host.includes(".") || hasPrivateHttpHost(`https://${host}/`)) return true;
+  }
+  return false;
+}
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
-const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
+const networkUrlCandidate = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
 function hasPrivateHttpHost(candidate: string): boolean {
   let hostname: string;
@@ -136,20 +167,68 @@ function forbiddenKey(key: string): boolean {
 }
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
-function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[], forbiddenFingerprints?: ReadonlySet<number>): void {
+interface MatchNode { next: Map<string, number>; fail: number; terminal: boolean }
+class ForbiddenValueMatcher {
+  private readonly exact = new Set<string>();
+  private readonly nodes: MatchNode[] = [{ next: new Map(), fail: 0, terminal: false }];
+  constructor(values: readonly string[]) {
+    for (const value of new Set(values)) {
+      if (value.length < 8) { this.exact.add(value); continue; }
+      let state = 0;
+      for (const char of value) {
+        let next = this.nodes[state]!.next.get(char);
+        if (next === undefined) {
+          next = this.nodes.length;
+          this.nodes[state]!.next.set(char, next);
+          this.nodes.push({ next: new Map(), fail: 0, terminal: false });
+        }
+        state = next;
+      }
+      this.nodes[state]!.terminal = true;
+    }
+    const queue = [...this.nodes[0]!.next.values()];
+    for (let index = 0; index < queue.length; index++) {
+      const state = queue[index]!;
+      for (const [char, child] of this.nodes[state]!.next) {
+        let fallback = this.nodes[state]!.fail;
+        while (fallback && !this.nodes[fallback]!.next.has(char)) fallback = this.nodes[fallback]!.fail;
+        this.nodes[child]!.fail = this.nodes[fallback]!.next.get(char) ?? 0;
+        this.nodes[child]!.terminal ||= this.nodes[this.nodes[child]!.fail]!.terminal;
+        queue.push(child);
+      }
+    }
+  }
+  contains(value: string): boolean {
+    if (this.exact.has(value)) return true;
+    let state = 0;
+    for (const char of value) {
+      while (state && !this.nodes[state]!.next.has(char)) state = this.nodes[state]!.fail;
+      state = this.nodes[state]!.next.get(char) ?? 0;
+      if (this.nodes[state]!.terminal) return true;
+    }
+    return false;
+  }
+}
+
+function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
-    for (const match of value.matchAll(httpUrlCandidate)) {
+    for (const match of value.matchAll(networkUrlCandidate)) {
       if (hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
-      if (forbiddenKey(match[0].replace(/\s*[:=]$/, "").replace(/^["']|["']$/g, ""))) throw new JobResultPublishError("content_requires_redaction");
+      const rawKey = match[0].replace(/\s*[:=]$/, "");
+      let key = rawKey;
+      if (rawKey.startsWith('"')) {
+        try { key = JSON.parse(rawKey); } catch { throw new JobResultPublishError("content_requires_redaction"); }
+      } else if (rawKey.startsWith("'")) key = rawKey.slice(1, -1);
+      if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
     }
     if (forbiddenDigests && forbiddenFingerprints && containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
-    if (forbiddenValues?.some(privateValue => privateValue.length >= 8 ? value.includes(privateValue) : value === privateValue)) {
+    if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value) || hasPrivateJwkText(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
@@ -227,7 +306,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   if (!parsed.success || !Number.isFinite(Date.parse(completedAt)) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(completedAt)) {
     throw new JobResultPublishError("invalid_request");
   }
-  assertSafeJson(parsed.data, 0, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
+  assertSafeJson(parsed.data, 0, forbiddenDigests, forbiddenValues ? new ForbiddenValueMatcher(forbiddenValues) : undefined, forbiddenFingerprints);
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
