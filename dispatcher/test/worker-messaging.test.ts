@@ -94,6 +94,45 @@ describe("worker messaging ledger",()=>{
     } finally {database.close();}
   });
 
+  test("follow-up event由来のreportも固定job groupで判断する",async()=>{
+    const {database,job,config}=await fixture();
+    try {
+      const followup=database.enqueue(eventEnvelope(`Ev-worker-decision-followup-${roots.length}`)).row;
+      const created=database.workerMessages.appendReport(job.job_id,report(followup.event_id,1,"followup-report"),new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      const decision=database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,new Date("2026-09-21T00:00:03Z"));
+      assert.equal(decision.action,"ack_internal");
+      assert.equal(decision.group_total,1);
+    } finally {database.close();}
+  });
+
+  test("ETAなしの中間reportを挟んでも直近ETA付きreportと比較する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const inputs=[
+        {...report(source.event_id,1),payload:{kind:"checkpoint",summary:"開始",eta_at:"2026-09-21T02:00:00Z"}},
+        {...report(source.event_id,2),payload:{kind:"risk",summary:"軽微な確認",severity:"low"}},
+        {...report(source.event_id,3),payload:{kind:"checkpoint",summary:"見込み変更",eta_at:"2026-09-21T03:00:00Z"}},
+      ];
+      const times=["2026-09-21T00:00:01Z","2026-09-21T00:01:05Z","2026-09-21T00:02:10Z"];
+      const decisions=[];
+      for(let i=0;i<inputs.length;i++){
+        const created=database.workerMessages.appendReport(job.job_id,inputs[i],new Date(times[i]!));
+        assert.equal(database.workerMessages.publishPendingReports(1,new Date(times[i]!)),1);
+        const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+        const sqlite=new Database(config.databasePath);
+        sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+        sqlite.close();
+        decisions.push(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,new Date(times[i]!)));
+      }
+      assert.equal(decisions[2]!.reason,"eta_change");
+    } finally {database.close();}
+  });
+
   test("strict contract、sequence、idempotency、terminal fenceを維持する",async()=>{
     const {database,source,job}=await fixture();
     try {

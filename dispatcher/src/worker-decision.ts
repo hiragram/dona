@@ -26,9 +26,10 @@ export interface WorkerDecisionContext {
   report: WorkerDecisionReport;
   siblings: WorkerDecisionSibling[];
   total_jobs: number;
-  previous?: { action: WorkerDecisionAction; content_sha256: string; severity?: string; eta_at?: string; decided_at: string };
+  previous?: { action: WorkerDecisionAction; content_sha256: string; severity?: string; decided_at: string };
   last_user_decision_at?: string;
   first_report_at?: string;
+  last_eta_at?: string;
   now: string;
   silence_interval_ms: number;
 }
@@ -72,7 +73,7 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
     return { action: "report_to_user", reason: "risk_escalation", content_sha256 };
   if (report.kind === "risk" && previous?.severity !== report.severity)
     return { action: "report_to_user", reason: "risk", content_sha256 };
-  if (report.eta_at && previous?.eta_at && Math.abs(Date.parse(report.eta_at)-Date.parse(previous.eta_at)) >= 300_000)
+  if (report.eta_at && context.last_eta_at && Math.abs(Date.parse(report.eta_at)-Date.parse(context.last_eta_at)) >= 300_000)
     return { action: "report_to_user", reason: "eta_change", content_sha256 };
   const elapsed = Date.parse(context.now) - Date.parse(context.last_user_decision_at ?? context.first_report_at ?? report.accepted_at);
   if (Number.isFinite(elapsed) && elapsed >= context.silence_interval_ms)

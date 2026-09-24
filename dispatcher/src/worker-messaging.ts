@@ -564,17 +564,21 @@ export class WorkerMessageRepository {
       if(!event||!["dispatching","waiting_agent"].includes(event.status))
         throw new WorkerMessageError("worker_message_report_unavailable","notification is no longer active");
       const group=this.db.prepare("SELECT job_id,status FROM jobs WHERE source_event_id=? ORDER BY job_id LIMIT 33")
-        .all(message.source_event_id) as WorkerDecisionSibling[];
+        .all(job.source_event_id) as WorkerDecisionSibling[];
       const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
-        .get(message.source_event_id) as {count:number}).count;
+        .get(job.source_event_id) as {count:number}).count;
       if(!group.some(row=>row.job_id===jobId))
         throw new WorkerMessageError("job_binding_mismatch","report job is absent from its group");
       const previous=this.db.prepare(`SELECT d.action,d.content_sha256,d.decided_at,
-          json_extract(m.payload_json,'$.severity') AS severity,json_extract(m.payload_json,'$.eta_at') AS eta_at
+          json_extract(m.payload_json,'$.severity') AS severity
         FROM worker_message_decisions d JOIN worker_messages m USING(message_id)
         WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
         ORDER BY m.producer_sequence DESC,d.decided_at DESC,d.notification_event_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
-        {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null;eta_at:string|null}|undefined;
+        {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null}|undefined;
+      const lastEta=this.db.prepare(`SELECT json_extract(payload_json,'$.eta_at') AS eta_at FROM worker_messages
+        WHERE job_id=? AND direction='worker_to_dona' AND producer_sequence<?
+          AND json_type(payload_json,'$.eta_at')='text'
+        ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
       const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
         .get(jobId) as {at:string|null};
       const lastUserDecision=this.db.prepare(`SELECT MAX(d.decided_at) AS at FROM worker_message_decisions d
@@ -589,7 +593,8 @@ export class WorkerMessageRepository {
         ...(payload.severity?{severity:payload.severity}:{}),...(payload.options?{options:payload.options}:{}),
         ...(payload.eta_at?{eta_at:payload.eta_at}:{})},siblings:group,total_jobs:total,
         ...(previous?{previous:{action:previous.action,content_sha256:previous.content_sha256,decided_at:previous.decided_at,
-          ...(previous.severity?{severity:previous.severity}:{}),...(previous.eta_at?{eta_at:previous.eta_at}:{})}}:{}),
+          ...(previous.severity?{severity:previous.severity}:{})}}:{}),
+        ...(lastEta?.eta_at?{last_eta_at:lastEta.eta_at}:{}),
         ...(firstReport.at?{first_report_at:firstReport.at}:{}),
         ...(lastUserDecision.at?{last_user_decision_at:lastUserDecision.at}:{}),
         now:at.toISOString(),silence_interval_ms:cadence?.silence_interval_ms??900_000});

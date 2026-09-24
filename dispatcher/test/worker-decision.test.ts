@@ -52,9 +52,12 @@ describe("worker decision policy", () => {
 
   test("ETAの大きな変化を報告し、小さな変化を抑制する", () => {
     const report={...base.report,eta_at:"2026-09-24T02:20:00Z"};
-    const previous={action:"ack_internal" as const,content_sha256:"old",decided_at:base.now,eta_at:"2026-09-24T02:00:00Z"};
-    assert.equal(evaluateWorkerDecision({...base,report,previous}).reason,"eta_change");
-    assert.equal(evaluateWorkerDecision({...base,report:{...report,eta_at:"2026-09-24T02:02:00Z"},previous}).action,"ack_internal");
+    const previous={action:"ack_internal" as const,content_sha256:"old",decided_at:base.now};
+    assert.equal(evaluateWorkerDecision({...base,report,previous,last_eta_at:"2026-09-24T02:00:00Z"}).reason,"eta_change");
+    assert.equal(evaluateWorkerDecision({...base,report:{...report,eta_at:"2026-09-24T02:02:00Z"},previous,
+      last_eta_at:"2026-09-24T02:00:00Z"}).action,"ack_internal");
+    assert.equal(evaluateWorkerDecision({...base,report,previous:{...previous,action:"ask_user"},
+      last_eta_at:"2026-09-24T02:00:00Z"}).reason,"eta_change");
   });
 
   test("内部受領や同文reportは無通知時間をリセットしない", () => {
