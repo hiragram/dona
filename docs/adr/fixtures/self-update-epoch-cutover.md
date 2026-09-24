@@ -11,7 +11,7 @@
 | W5 | lease expiredのみ、旧workerが後からResult公開 | 同一owner/session/fenceでrevokeなしならreceipt化。revokedは隔離 |
 | W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
 | W6a | 旧epoch scheduled workerのcancel | schedule/run/revisionと取消mutation ID、旧owner fence、exact sessionを検証 |
-| W7 | Aのlive workerまたは通知が残るBからCへの更新 | CがA/Bの全live owner/notification protocolを扱えなければactivation拒否 |
+| W7 | Aのlive workerまたは通知が残るBからCへの更新 | CがA/Bのcompletion/progressとnotification protocolを扱えなければactivation拒否 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
@@ -34,6 +34,8 @@
 | M4 | targetでjob stamp/due scan等のwriter開始後に旧snapshotへのrollback要求 | 全mutation journalがないためsnapshot rollback禁止 |
 | M4a | 初回更新で旧releaseにactive-epoch APIなし | rollback不可なのでapply拒否、互換API先行導入が必要 |
 | M5 | Dispatcher active epoch install応答喪失 | safe modeのままreceiptをread-backし、exact一致まで全writer停止 |
+| M5a | writer release intent後に応答喪失 | writer stateとreceiptを照合し、snapshot rollback禁止 |
+| M5b | progress/notification DB migration後にtarget health失敗 | 全runtime DBの同一watermark backup/restore receiptを照合 |
 | M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
 | M7 | 新ingress前のrollback inventory直後にworker Result到着 | writer fence後ならDB commitなし。Result領域を保護し復帰後に回収 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
