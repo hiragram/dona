@@ -31,7 +31,7 @@ const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
 function hasPrivateHttpHost(candidate: string): boolean {
   let hostname: string;
-  try { hostname = new URL(candidate).hostname.toLowerCase(); }
+  try { hostname = new URL(candidate).hostname.toLowerCase().replace(/\.+$/, ""); }
   catch { return true; }
   if (hostname === "localhost" || hostname.endsWith(".localhost") ||
     hostname === "files.slack.com" || hostname === "hooks.slack.com") return true;
@@ -223,10 +223,20 @@ interface Grant {
   paneId: string | null;
   agentName: string | null;
   herdrWorkspaceId: string | null;
+  privateValues: readonly string[];
   expiresAt: number;
   renewableAt: number;
   revoked: boolean;
   fingerprint: number;
+}
+
+function grantPrivateValues(job: JobRow, session: string): string[] {
+  let sessionParts: unknown;
+  try { sessionParts = JSON.parse(session); } catch { /* A legacy opaque session is still valid. */ }
+  return [session, job.herdr_pane_id, job.herdr_workspace_id, job.agent_name,
+    job.objective, job.workspace_path, job.result_path,
+    ...(Array.isArray(sessionParts) && sessionParts.length === 4 ? sessionParts : [])]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
 }
 
 /** Process-local grants fail closed on restart. Only the worker prompt gets the raw token. */
@@ -260,6 +270,7 @@ export class JobResultPublishCapabilities {
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(key, { jobId: job.job_id, session, attemptCount: job.attempt_count,
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
+      privateValues: grantPrivateValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
@@ -272,6 +283,7 @@ export class JobResultPublishCapabilities {
     this.grants.set(createHash("sha256").update(capability).digest("hex"), {
       jobId: job.job_id, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
       agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
+      privateValues: grantPrivateValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
@@ -317,7 +329,7 @@ export class JobResultPublishCapabilities {
       .map(candidate => candidate.fingerprint));
     const grantIdentities = [...this.grants.values()]
       .filter(candidate => candidate.expiresAt > this.now())
-      .flatMap(candidate => [candidate.paneId, candidate.session, candidate.agentName, candidate.herdrWorkspaceId]);
+      .flatMap(candidate => candidate.privateValues);
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);

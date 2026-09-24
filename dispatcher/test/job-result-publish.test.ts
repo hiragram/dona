@@ -19,8 +19,8 @@ const row = (overrides: Partial<JobRow> = {}): JobRow => ({
 } as JobRow);
 const code = (expected: string) => (error: unknown): boolean => error instanceof JobResultPublishError && error.code === expected;
 const testListeners = new WeakMap<JobResultPublishServer, net.Server>();
-async function startServer(server: JobResultPublishServer, socket: string): Promise<void> {
-  const listener = net.createServer(connection => server.accept(connection));
+async function startServer(server: JobResultPublishServer, socket: string, onConnection?: () => void): Promise<void> {
+  const listener = net.createServer(connection => { onConnection?.(); server.accept(connection); });
   await new Promise<void>((resolve, reject) => listener.once("error", reject).listen(socket, resolve));
   testListeners.set(server, listener);
 }
@@ -176,11 +176,14 @@ describe("job result publish contract", () => {
   });
 
   test("他jobの期限内runtime identityと自jobのobjectiveを本文から除外する", () => {
-    const grants = new JobResultPublishCapabilities(id => id === "job_one" ? "session-one" : "session-two");
+    const otherSession = JSON.stringify(["workspace-two", "pane-two", "agent-two", "agent-session-two"]);
+    const grants = new JobResultPublishCapabilities(id => id === "job_one" ? "session-one" : otherSession);
     const grant = grants.issue(row({ herdr_pane_id: "pane-one" }), "session-one");
-    grants.issue(row({ job_id: "job_two", herdr_pane_id: "pane-two", agent_name: "agent-two", herdr_workspace_id: "herdr-two" }), "session-two");
+    grants.issue(row({ job_id: "job_two", herdr_pane_id: "pane-two", agent_name: "agent-two", herdr_workspace_id: "herdr-two",
+      objective: "private objective two", workspace_path: "/workspace/two", result_path: "/result/two" }), otherSession);
     const current = row({ status: "running", herdr_pane_id: "pane-one", objective: "private objective text" });
-    for (const privateValue of ["session-two", "pane-two", "agent-two", "herdr-two", "private objective text"]) {
+    for (const privateValue of ["pane-two", "agent-two", "herdr-two", "workspace-two", "agent-session-two",
+      "private objective two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
   });
@@ -210,8 +213,8 @@ describe("job result publish contract", () => {
     const server = new JobResultPublishServer(grants, id => id === current.job_id ? current : undefined,
       { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" }); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
-    const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
-      const request = http.request({ socketPath: socket, path: route, method: "POST",
+    const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish", agent?: http.Agent) => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
+      const request = http.request({ socketPath: socket, path: route, method: "POST", agent,
         headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": Buffer.from(JSON.stringify(session), "utf8").toString("base64url") } }, response => {
         const chunks: Buffer[] = [];
         response.on("data", chunk => chunks.push(Buffer.from(chunk)));
@@ -219,8 +222,10 @@ describe("job result publish contract", () => {
       });
       request.on("error", reject); request.end(body);
     });
+    let connections = 0;
+    const reusableAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
     try {
-      await startServer(server, socket);
+      await startServer(server, socket, () => { connections++; });
       const unauthorized = await post(JSON.stringify(base));
       assert.equal(unauthorized.status, 403);
       assert.equal(unauthorized.connection, "close");
@@ -245,13 +250,15 @@ describe("job result publish contract", () => {
       assert.equal((await post(" ".repeat(jobResultEnvelopeMaxBytes + 1), grant.capability)).status, 413);
       assert.equal((await post("", grant.capability, "session-1", "/v1/job-result-publish/renew")).status, 425);
       now += 15 * 60_000;
-      const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
+      const beforeReuse = connections;
+      const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
       assert.equal(renewal.status, 200);
-      const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
+      const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
       assert.equal(retriedRenewal.body, renewal.body);
+      assert.equal((await post(JSON.stringify(base), JSON.parse(renewal.body).capability, "session-1", "/v1/job-result-publish", reusableAgent)).status, 202);
+      assert.equal(connections, beforeReuse + 1, "renewalとpublishは同じ接続済みFDを再利用する");
       assert.equal((await post(JSON.stringify(base), grant.capability)).status, 202);
       assert.equal((await post(JSON.stringify({ ...base, summary: grant.capability }), JSON.parse(renewal.body).capability)).status, 400);
-      assert.equal((await post(JSON.stringify(base), JSON.parse(renewal.body).capability)).status, 202);
       assert.equal(accepted.length, 3);
       current = row({ status: "completed", result_json: "{}" });
       const retry = await post(JSON.stringify(base), grant.capability);
@@ -259,6 +266,7 @@ describe("job result publish contract", () => {
       assert.equal(accepted.length, 3);
       assert.deepEqual(reconciled, [accepted[0]]);
     } finally {
+      reusableAgent.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
@@ -422,6 +430,44 @@ describe("job result publish contract", () => {
       assert.equal(clients[0]!.destroyed, false);
     } finally {
       for (const client of clients) client.destroy();
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("切断済みでもcommit中の接続は32件の上限を占有する", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-orphan-cap-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    let started = 0;
+    const entrances: Array<() => void> = [];
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
+      { commit: async () => { started++; entrances.shift()?.(); await barrier; return { outcome: "created" }; },
+        reconcile: async () => ({ outcome: "reused" }) });
+    try {
+      await startServer(server, socket);
+      for (let index = 0; index < 32; index++) {
+        const entered = new Promise<void>(resolve => { entrances.push(resolve); });
+        const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+          headers: { "x-dona-job-result-capability": grant.capability,
+            "x-dona-worker-session": Buffer.from(JSON.stringify("session-1")).toString("base64url") } });
+        request.on("error", () => {});
+        request.end(JSON.stringify(base));
+        await entered;
+        request.destroy();
+        await new Promise<void>(resolve => request.once("close", resolve));
+      }
+      assert.equal(started, 32);
+      const overflow = net.createConnection(socket);
+      overflow.on("error", () => {});
+      await Promise.race([new Promise<void>(resolve => overflow.once("close", resolve)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("orphan publish did not consume admission slot")), 1_000))]);
+      assert.equal(started, 32);
+    } finally {
+      release();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

@@ -3,7 +3,7 @@ import net from "node:net";
 import { TextDecoder } from "node:util";
 
 import type { JobRow } from "./types.js";
-import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, type AuthorizedJobResultPublish } from "./job-result-publish.js";
+import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, jobResultPublishTtlMs, type AuthorizedJobResultPublish } from "./job-result-publish.js";
 
 export interface JobResultPublishSink {
   /** Must compare candidate.fence in the same durable transaction as Result creation. */
@@ -66,6 +66,7 @@ export class JobResultPublishServer {
   private readonly sockets = new Set<net.Socket>();
   private readonly headerDeadlines = new Map<net.Socket, NodeJS.Timeout>();
   private readonly publishingSockets = new Set<net.Socket>();
+  private readonly activeRequests = new Set<net.Socket>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
@@ -75,14 +76,15 @@ export class JobResultPublishServer {
     private readonly bodyTimeoutMs = 15_000,
   ) {
     this.server = http.createServer((request, response) => void this.handle(request, response));
-    // One request per pre-connected FD prevents HTTP pipelining from multiplying
-    // concurrent durable commits beyond the 32 accepted connection cap.
-    this.server.maxRequestsPerSocket = 1;
+    // A worker may renew and then publish over its sole pre-connected FD.
+    // The per-socket active fence below rejects overlapping/pipelined requests.
+    this.server.maxRequestsPerSocket = 128;
+    this.server.keepAliveTimeout = jobResultPublishTtlMs + 60_000;
   }
 
   /** The caller must supply a pre-connected socket over an authenticated channel. */
   accept(socket: net.Socket): void {
-    if (this.stopping || this.sockets.size >= 32) { socket.destroy(); return; }
+    if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= 32) { socket.destroy(); return; }
     this.sockets.add(socket);
     const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
     deadline.unref();
@@ -105,6 +107,11 @@ export class JobResultPublishServer {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (this.activeRequests.has(request.socket)) { request.socket.destroy(); return; }
+    this.activeRequests.add(request.socket);
+    const clearActive = () => this.activeRequests.delete(request.socket);
+    response.once("finish", clearActive);
+    response.once("close", clearActive);
     const headerDeadline = this.headerDeadlines.get(request.socket);
     if (headerDeadline) clearTimeout(headerDeadline);
     this.headerDeadlines.delete(request.socket);
