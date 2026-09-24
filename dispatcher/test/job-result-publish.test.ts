@@ -65,6 +65,10 @@ describe("job result publish contract", () => {
     for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
+    for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE"]) {
+      assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
+    assert.equal(validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
   });
 
   test("canonical digestはkey順とDispatcher時刻によらず同一で、内容の差を識別する", () => {
@@ -117,6 +121,18 @@ describe("job result publish contract", () => {
     const grant = grants.issue(row(), session);
     assert.equal(grants.authorize(grant.capability, session, () => row({ status: "running" })).job_id, "job_one");
     assert.throws(() => grants.issue(row(), `${session}s`), code("job_not_publishable"));
+  });
+
+  test("terminal cleanup後は同じgrantでread-only照合できる", () => {
+    let session: string | undefined = "session-1";
+    const grants = new JobResultPublishCapabilities(() => session);
+    const grant = grants.issue(row(), "session-1");
+    session = undefined;
+    const terminal = row({ status: "completed", herdr_pane_id: null, result_json: "{}" });
+    const candidate = grants.validate(grant.capability, "session-1", base, () => terminal);
+    assert.equal(candidate.reconcileOnly, true);
+    assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" });
+    assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ status: "completed", herdr_pane_id: null, result_json: null })), code("worker_session_stale"));
   });
 
   test("専用UDSだけで認可し、本文・capabilityを応答せずcommit材料へ渡す", async () => {

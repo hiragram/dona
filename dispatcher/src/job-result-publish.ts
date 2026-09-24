@@ -22,11 +22,14 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]*:[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|https?:\/\/[^\s]+[?&](?:token|sig|signature|x-amz-signature|x-goog-signature|api[_-]?key|access[_-]?key|auth)=|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^:/\s@]*:[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|https?:\/\/[^\s]+[?&](?:token|sig|signature|x-amz-signature|x-goog-signature|api[_-]?key|access[_-]?key|auth)=|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
 const capabilityCandidate = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
+const assignmentCandidate = /\b[A-Za-z_][A-Za-z0-9_]*\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|credential|authorization|capability)(?:_|$)/.test(normalized) ||
+    /(?:token|secret|password|credential|authorization|apikey|accesskey|privatekey|capability)$/.test(normalized.replaceAll("_", "")) ||
+    /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
 }
@@ -35,6 +38,9 @@ const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[]): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
+    for (const match of value.matchAll(assignmentCandidate)) {
+      if (forbiddenKey(match[0].replace(/\s*[:=]$/, ""))) throw new JobResultPublishError("content_requires_redaction");
+    }
     if (forbiddenDigests) {
       for (const match of value.matchAll(capabilityCandidate)) {
         if (forbiddenDigests.has(createHash("sha256").update(match[0]).digest("hex"))) {
@@ -199,12 +205,13 @@ export class JobResultPublishCapabilities {
     if (this.now() >= grant.expiresAt) throw new JobResultPublishError("capability_expired");
     const job = getJob(grant.jobId);
     if (!job || job.job_id !== grant.jobId) throw new JobResultPublishError("capability_invalid");
+    const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
+    if (terminalReconcile) return job;
     if (grant.session !== session || this.currentSession(job.job_id) !== session ||
       grant.attemptCount !== job.attempt_count || grant.paneId !== job.herdr_pane_id) {
       throw new JobResultPublishError("worker_session_stale");
     }
-    const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
-    if (job.status !== "running" && job.status !== "dispatching" && !terminalReconcile) {
+    if (job.status !== "running" && job.status !== "dispatching") {
       throw new JobResultPublishError("job_not_publishable");
     }
     return job;
@@ -212,12 +219,13 @@ export class JobResultPublishCapabilities {
 
   validate(capability: string, session: string, input: unknown, getJob: (jobId: string) => JobRow | undefined): AuthorizedJobResultPublish {
     const job = this.authorize(capability, session, getJob);
+    const grant = this.grants.get(createHash("sha256").update(capability).digest("hex"))!;
     const forbiddenDigests = new Set([...this.grants.entries()]
       .filter(([, grant]) => grant.jobId === job.job_id && grant.expiresAt > this.now())
       .map(([digest]) => digest));
-    const forbiddenValues = [job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
-      job.result_path, session].filter((value): value is string => typeof value === "string" && value.length >= 4);
+    const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
+      job.result_path, grant.session].filter((value): value is string => typeof value === "string" && value.length >= 4);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues),
-      fence: { jobId: job.job_id, attemptCount: job.attempt_count, paneId: job.herdr_pane_id, session } };
+      fence: { jobId: job.job_id, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
   }
 }
