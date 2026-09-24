@@ -276,12 +276,12 @@ describe("通常groupのResult統合", () => {
   });
 
   test("旧all_terminal claimは未配送だけを移行時に無効化し曖昧な状態を隔離する", async () => {
-    for(const [oldStatus,resolvedStatus] of [["queued",null],["queued","cancelled"],["queued","completed"],["waiting_agent",null]] as const) {
-      const {database,source,job,config}=await oneJobGroup(`Ev-legacy-terminal-${oldStatus}-${resolvedStatus}`);
+    for(const [oldStatus,resolvedStatus,hasAttention] of [["queued",null,true],["queued","cancelled",true],["queued","completed",true],["queued","completed",false],["waiting_agent",null,true]] as const) {
+      const {database,source,job,config}=await oneJobGroup(`Ev-legacy-terminal-${oldStatus}-${resolvedStatus}-${hasAttention}`);
       database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果不明");
       sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
-      const attention=database.enqueueJobNotification(job.job_id);
-      const oldFinal=database.enqueue({...eventEnvelope(`Ev-legacy-final-${oldStatus}-${resolvedStatus}`),source:"dona_job",
+      const attention=hasAttention ? database.enqueueJobNotification(job.job_id) : null;
+      const oldFinal=database.enqueue({...eventEnvelope(`Ev-legacy-final-${oldStatus}-${resolvedStatus}-${hasAttention}`),source:"dona_job",
         payload:{group:{source_event_id:source.event_id,transition:"all_terminal"}}}).row;
       if(oldStatus==="waiting_agent") {
         database.beginDispatch(oldFinal.event_id,`${config.resultsDir}/old-final.json`);
@@ -289,8 +289,10 @@ describe("通常groupのResult統合", () => {
       }
       const raw=new Database(config.databasePath);
       if(resolvedStatus) raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(resolvedStatus,job.job_id);
+      if(resolvedStatus==="completed" && attention) raw.prepare("UPDATE events SET external_event_id=? WHERE event_id=?")
+        .run(`${job.job_id}:completed`,attention.row.event_id);
       raw.prepare("UPDATE job_groups SET attention_event_id=?,all_terminal_event_id=? WHERE source_event_id=?")
-        .run(attention.row.event_id,oldFinal.event_id,source.event_id);
+        .run(attention?.row.event_id??null,oldFinal.event_id,source.event_id);
       raw.prepare("UPDATE jobs SET completion_event_id=? WHERE job_id=?")
         .run(oldFinal.event_id,job.job_id);
       raw.close();

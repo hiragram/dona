@@ -216,7 +216,7 @@ function ensureJobAttentionResolutionSchema(db: Database.Database): void { db.ex
 function reconcileLegacyAttentionClaims(db: Database.Database): void {
   const candidates=db.prepare(`SELECT g.source_event_id,g.all_terminal_event_id,e.status
     FROM job_groups g JOIN events e ON e.event_id=g.all_terminal_event_id
-    WHERE g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
+    WHERE g.notification_mode='grouped'
       AND g.all_terminal_event_id IS NOT NULL
       AND json_extract(e.payload_json,'$.group.attention_resolution_state') IS NULL`)
     .all() as Array<{source_event_id:string;all_terminal_event_id:string;status:EventStatus}>;
@@ -1659,11 +1659,15 @@ export class DispatcherDatabase {
       const snapshot = group.notification_mode === "grouped"
         ? this.buildJobGroupSnapshot(job.source_event_id, group, job)
         : undefined;
+      const legacyRecovery = snapshot?.transition === "all_terminal"
+        ? this.getLegacyAttentionClaim(job.source_event_id) : undefined;
       const envelope: EventEnvelope = {
         schema_version: 1,
         source: "dona_job",
-        external_event_id: `${job.job_id}:${job.status}${job.completion_event_id
-          ? snapshot?.transition === "attention" ? ":attention_replacement" : ":all_terminal" : ""}`,
+        external_event_id: `${job.job_id}:${job.status}${legacyRecovery
+          ? `:legacy_recovery:${legacyRecovery.all_terminal_event_id}`
+          : job.completion_event_id
+            ? snapshot?.transition === "attention" ? ":attention_replacement" : ":all_terminal" : ""}`,
         type: `job_${job.status}`,
         occurred_at: timestamp,
         subject: {
