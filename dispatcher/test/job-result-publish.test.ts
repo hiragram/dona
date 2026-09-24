@@ -81,10 +81,11 @@ describe("job result publish contract", () => {
       '{"to\\u006ben":"CANARY_VALUE"}',
       '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
       "{ kty: 'RSA', n: 'public', d: 'PRIVATE_VALUE' }",
+      "{ kty: 'RSA', meta: {}, d: 'PRIVATE_VALUE' }",
       '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}',
       '{"kty":"R\\u0053A","n":"public","d":"PRIVATE_VALUE"}',
       '{"kty":"RSA","n":"public","d":"PRIVATE_VALUE"']) {
-      assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+      assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"), value);
     }
     for (const value of [{ session: "CANARY_VALUE" }, { kty: "RSA", n: "public", e: "AQAB", d: "PRIVATE_VALUE" },
       { kty: "oct", k: "PRIVATE_VALUE" }]) {
@@ -101,7 +102,7 @@ describe("job result publish contract", () => {
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "artifact.internal./private/result",
-      "GET /run/secrets/db-password returned 200", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
+      "GET /run/secrets/db-password returned 200", "保存先は/home/worker/private.txt", "結果を/workspace/dona/privateへ保存", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
@@ -278,6 +279,10 @@ describe("job result publish contract", () => {
     const accentGrant = accented.issue(row({ objective: "café" }), "session-accent");
     assert.throws(() => accented.validate(accentGrant.capability, "session-accent", { ...base, summary: "cafe\u0301" },
       () => row({ status: "running", objective: "café" })), code("content_requires_redaction"));
+    const shortAccent = new JobResultPublishCapabilities(() => "session-short");
+    const shortAccentGrant = shortAccent.issue(row({ agent_name: "aaaaaaa\u0301" }), "session-short");
+    assert.throws(() => shortAccent.validate(shortAccentGrant.capability, "session-short", { ...base, summary: "task aaaaaaá done" },
+      () => row({ status: "running", agent_name: "aaaaaaa\u0301" })), code("content_requires_redaction"));
   });
 
   test("短いobjectiveは全文一致時だけ拒否する", () => {

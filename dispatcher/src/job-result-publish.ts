@@ -49,6 +49,7 @@ function hasPrivateJwkText(value: string): boolean {
       /(?:^|[\s,{])['"]?(?:d|p|q|dp|dq|qi|oth|k)['"]?\s*:/.test(scope)) return true;
   }
   const scopes: { keyType: boolean; privateParameter: boolean }[] = [];
+  const inspectField = /(['"]?)(kty|d|p|q|dp|dq|qi|oth|k)\1\s*:\s*['"]?(RSA|EC|OKP|oct)?/y;
   for (let index = 0; index < value.length; index++) {
     const char = value[index];
     if (char === "{") {
@@ -60,6 +61,17 @@ function hasPrivateJwkText(value: string): boolean {
       const scope = scopes.pop();
       if (scope?.keyType && scope.privateParameter) return true;
       continue;
+    }
+    if (scopes.length > 0 && char && /[A-Za-z']/.test(char)) {
+      inspectField.lastIndex = index;
+      const field = inspectField.exec(value);
+      if (field && (field[2] !== "kty" || field[3] !== undefined)) {
+        const scope = scopes.at(-1)!;
+        if (field[2] === "kty") scope.keyType = true;
+        else scope.privateParameter = true;
+        index += field[0].length - 1;
+        continue;
+      }
     }
     if (char !== '"') continue;
     const start = index;
@@ -93,6 +105,7 @@ function hasPrivateJwkText(value: string): boolean {
 }
 const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
 function hasLocalPath(value: string): boolean {
+  if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run)(?:\/|$)/i.test(value)) return true;
   const candidate = new RegExp(localPath.source, "gi");
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
@@ -571,6 +584,7 @@ export class JobResultPublishCapabilities {
     const shortRuntimeValues = new Set([...this.grants.values()]
       .filter(candidate => candidate.expiresAt > this.now())
       .flatMap(candidate => candidate.runtimeValues)
+      .map(value => value.normalize("NFC"))
       .filter(value => value.length < 8));
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
