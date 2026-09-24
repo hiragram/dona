@@ -14,6 +14,7 @@
 | R3 | migration backup後・schema commit前にrestart | backup/receipt/schemaを検査し二重migration禁止 |
 | R4 | pointer rename後・activation commit前にrestart | pointer、receipt、health、sessionを照合し推定で再起動しない |
 | N1 | terminal jobだがnotification event欠損 | 自動event生成なし、`needs_review` |
+| N1a | event永続化済み、`send_not_started`、投稿receiptなし | access再検証後、同一eventから一度だけ送信 |
 | N2 | 投稿応答不明だがexact markerあり | 既送信としてreceiptを確定、再投稿なし |
 | N3 | 投稿応答不明でmarkerなし/old thread | 通知抑止、operator判断待ち |
 | N4 | group attention未解決、全sibling terminal | all-terminal抑止、sessionをactiveへ戻さない |
@@ -21,4 +22,8 @@
 | M1 | migration前、旧schemaでrollback | 旧SHA/schema healthとreceiptを検証して復帰可 |
 | M2 | migration後、旧releaseは新schema非互換 | 検証済みsnapshot復元と外部receipt照合なしではrollback禁止 |
 | M3 | migration後、新epochでprovider write確定 | snapshot復元でもwriteを未実行扱いせずreconcile |
+| M4 | target epoch worker稼働中に旧snapshotへのrollback要求 | 両epochのowner/Result/receiptの再構成を証明できなければrollback禁止 |
+| M5 | Dispatcher active epoch install応答喪失 | receiptをread-backし、exact一致までingress停止 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
+| C2 | dispatch前cancelでResultなし、通知先none | 両dispositionを`not_required`へ確定後、参照がなければGC可 |
+| C3 | completion receipt commit直後にrestart | terminal状態・event/group transitionも同時に存在し、重複生成なし |
