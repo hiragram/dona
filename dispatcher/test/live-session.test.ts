@@ -41,6 +41,23 @@ async function addressableJob(status:"dispatching"|"needs_review"="needs_review"
 }
 
 describe("read-only live session reconciliation",()=>{
+  test("invalid Resultのoperator解決は最新receiptと状態の一致を要求する",async()=>{
+    const state=await addressableJob();
+    state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    const current=state.database.getJob(state.job.job_id)!;
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,"unknown",current.updated_at),/live_session_receipt_mismatch/);
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,"stale"),/job_changed_since_review/);
+    const newer=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at),/newer_live_session_receipt_exists/);
+    const resolved=state.database.resolveInvalidJobResult(current.job_id,newer.receipt_id,current.updated_at);
+    assert.equal(resolved.status,"failed");
+    assert.equal(resolved.last_error_code,"invalid_result_operator_resolved");
+    assert.equal(resolved.result_json,null);
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
+    state.database.close();
+  });
   test("exact identityのworkingを永続receiptへ記録しcontrol commandを呼ばない",async()=>{
     const state=await addressableJob();
     const calls:string[]=[];
