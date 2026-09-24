@@ -9,7 +9,7 @@
 - 有効期間は発行から30分。`revokeJob` は cancel と worker 再投入時に呼ぶ。terminal 後は元の期限まで同じ grant の再送を read-only `reconcile` callback へだけ渡し、新たな commit は禁止する。発行時と認可時に永続 live-session identity の session を確認し、認可時に永続 job の status、attempt count、pane ID も再照合する。job ID や Result path は認可材料にならない。
 - 長時間 job は発行から15分以降、期限前に専用 UDS の `POST /v1/job-result-publish/renew` で現在の grant を更新する。それ以前は固定 code `renewal_not_due` で拒否する。旧 grant は元の期限まで有効で、新しい capability は private な応答で worker に返す。同じ旧 capability からの renewal 再送は同じ successor と期限を返すため、応答喪失後も回収できる。期限切れ後の再発行は自動で行わず、Dispatcher の worker 世代確認が必要になる。
 - grant は process memory だけに保持する。Dispatcher restart では全 grant が失われ、旧 worker の再送は拒否する。restart 後の復旧・再発行は #292 の gate と worker 世代照合で扱う。
-- `JobResultPublishServer` は汎用 Dispatcher API/MCP と別の private UDS 上の `POST /v1/job-result-publish` を定義する。capability は `x-dona-job-result-capability`、worker session は `JSON.stringify(session)` の UTF-8 bytes を base64url 化した `x-dona-worker-session` で受ける。これにより永続化可能な Unicode や制御文字の session も可逆に伝達できる。本文を読む前と commit の直前に永続 job row を照合する。本文の受信期限は15秒で、認証失敗時も未完了接続を短時間で閉じる。停止時は未完了本文の接続を閉じ、開始済み commit／reconcile の完了と応答送出を待つ。接続権限だけでは公開できない。#291 が commit callback を実装し、#292 が server 起動、worker prompt 配送、切替を配線する。
+- `JobResultPublishServer` は汎用 Dispatcher API/MCP と別の private UDS 上の `POST /v1/job-result-publish` を定義する。capability は `x-dona-job-result-capability`、worker session は `JSON.stringify(session)` の UTF-8 bytes を base64url 化した `x-dona-worker-session` で受ける。これにより永続化可能な Unicode や制御文字の session も可逆に伝達できる。本文を読む前と commit の直前に永続 job row を照合する。本文の受信期限は15秒で、認証失敗時は `Connection: close` を返して未完了接続を短時間で閉じる。停止時は未完了本文の接続を閉じ、開始済み commit／reconcile の完了と応答送出または切断を待つ。接続権限だけでは公開できない。#291 が commit callback を実装し、#292 が server 起動、worker prompt 配送、切替を配線する。
 
 ## request と応答材料
 
@@ -19,4 +19,4 @@
 - terminal job の再送は、永続 `result_json` がある場合だけ受け入れ、`reconcileOnly` によって read-only callback へ分岐する。cleanup が live session や pane を削除していても、要求 session と grant 発行時 session の一致は必須とし、期限内の未失効 grant と永続 Result が一致対象になる。#291 は保存済み digest と比較して `reused` または `conflict` だけを返し、terminal Result を更新しない。
 - 認可済み candidate の `fence` は job ID、attempt count、pane ID、live session を保持する。#291 の commit callback は Result 作成と同じ durable transaction でこの世代を再照合し、非同期処理中の cancel・再投入後に旧 worker の結果を保存しない。同じ job の期限内 grant の digest を照合し、更新前後の capability が本文の長い文字列へ埋め込まれていても拒否する。
 - validation error は固定 code だけを返す。本文、capability、private URL、local path は error や通常の log、metrics、監査へ含めない。公開 transport も raw header/body を記録せず、この型付き code だけを返す。
-- artifact と action のキーは区切り文字と camelCase を正規化して資格情報・内部 runtime identity を拒否する。本文中の session、pane、workspace/result path も永続 job の値と照合して拒否する。
+- artifact と action のキーは区切り文字と camelCase を正規化して資格情報・内部 runtime identity を拒否する。本文中の現在および期限内の旧 worker grant に含まれる session／pane、永続 job の workspace/result path 等も値照合して拒否する。

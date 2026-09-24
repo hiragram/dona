@@ -143,6 +143,18 @@ describe("job result publish contract", () => {
     assert.equal(short.validate(shortGrant.capability, "s1", { ...base, summary: "task s1 is complete" }, () => row({ status: "running" })).envelope.status, "completed");
   });
 
+  test("同じjobの旧worker世代のsessionとpaneもResultから除外する", () => {
+    let live = "session-old";
+    const grants = new JobResultPublishCapabilities(() => live);
+    grants.issue(row({ herdr_pane_id: "pane-old" }), live);
+    live = "session-new";
+    const current = row({ status: "running", attempt_count: 2, herdr_pane_id: "pane-new" });
+    const grant = grants.issue({ ...current, status: "dispatching" }, live);
+    for (const oldIdentity of ["session-old", "pane-old"]) {
+      assert.throws(() => grants.validate(grant.capability, live, { ...base, summary: oldIdentity }, () => current), code("content_requires_redaction"));
+    }
+  });
+
   test("terminal cleanup後は同じgrantでread-only照合できる", () => {
     let session: string | undefined = "session-1";
     const grants = new JobResultPublishCapabilities(() => session);
@@ -168,12 +180,12 @@ describe("job result publish contract", () => {
     const server = new JobResultPublishServer(socket, grants, id => id === current.job_id ? current : undefined,
       { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" }); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
-    const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST",
         headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": Buffer.from(JSON.stringify(session), "utf8").toString("base64url") } }, response => {
         const chunks: Buffer[] = [];
         response.on("data", chunk => chunks.push(Buffer.from(chunk)));
-        response.on("end", () => resolve({ status: response.statusCode!, body: Buffer.concat(chunks).toString("utf8") }));
+        response.on("end", () => resolve({ status: response.statusCode!, body: Buffer.concat(chunks).toString("utf8"), connection: response.headers.connection }));
       });
       request.on("error", reject); request.end(body);
     });
@@ -181,12 +193,14 @@ describe("job result publish contract", () => {
       await server.start();
       const unauthorized = await post(JSON.stringify(base));
       assert.equal(unauthorized.status, 403);
+      assert.equal(unauthorized.connection, "close");
       const acceptedResult = await post(JSON.stringify(base), grant.capability);
       assert.equal(acceptedResult.status, 202);
       assert.equal(accepted.length, 1);
       assert.equal(acceptedResult.body.includes(grant.capability), false);
       const secret = await post(JSON.stringify({ ...base, summary: "secret=CANARY_VALUE" }), grant.capability);
       assert.equal(secret.status, 400);
+      assert.equal(secret.connection, "close");
       assert.equal(secret.body.includes("CANARY_VALUE"), false);
       const leaked = await post(JSON.stringify({ ...base, summary: `capability ${grant.capability}` }), grant.capability);
       assert.equal(leaked.status, 400);
@@ -323,6 +337,36 @@ describe("job result publish contract", () => {
       assert.equal(stopped, true);
     } finally {
       finishCommit();
+      await server.stop();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("commit中にworkerが切断しても停止待機が解放される", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-disconnect-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+      { commit: async () => { entered(); await barrier; return { outcome: "created" }; },
+        reconcile: async () => ({ outcome: "reused" }) });
+    try {
+      await server.start();
+      const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+        headers: { "x-dona-job-result-capability": grant.capability,
+          "x-dona-worker-session": Buffer.from(JSON.stringify("session-1")).toString("base64url") } });
+      request.on("error", () => {});
+      request.end(JSON.stringify(base));
+      await started;
+      request.destroy();
+      release();
+      await Promise.race([server.stop(), new Promise((_, fail) => setTimeout(() => fail(new Error("disconnected commit blocked stop")), 1_000))]);
+    } finally {
+      release();
       await server.stop();
       await fs.rm(directory, { recursive: true, force: true });
     }

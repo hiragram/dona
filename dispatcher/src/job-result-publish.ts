@@ -265,8 +265,12 @@ export class JobResultPublishCapabilities {
     const forbiddenFingerprints = new Set([...this.grants.values()]
       .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
       .map(candidate => candidate.fingerprint));
+    const grantIdentities = [...this.grants.values()]
+      .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
+      .flatMap(candidate => [candidate.paneId, candidate.session]);
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
-      job.result_path, job.agent_name, grant.session].filter((value): value is string => typeof value === "string" && value.length > 0);
+      job.result_path, job.agent_name, grant.session, ...grantIdentities]
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
       fence: { jobId: job.job_id, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
   }

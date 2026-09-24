@@ -24,6 +24,8 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   // Drain an already-sent body so the peer can receive the fixed error. A peer
   // that withholds the rest gets a short, bounded window before forced close.
   request.resume();
+  response.setHeader("connection", "close");
+  response.shouldKeepAlive = true;
   const socket = request.socket ?? response.socket;
   response.once("finish", () => {
     if (socket) {
@@ -159,7 +161,11 @@ export class JobResultPublishServer {
         const result = candidate.reconcileOnly
           ? await this.sink.reconcile(candidate)
           : await this.sink.commit(candidate);
-        const finished = new Promise<void>(resolve => response.once("finish", () => resolve()));
+        if (response.destroyed || response.writableFinished) return;
+        const finished = new Promise<void>(resolve => {
+          response.once("finish", () => resolve());
+          response.once("close", () => resolve());
+        });
         reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
         await finished;
       })();
