@@ -35,6 +35,11 @@ function usage(): never {
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
+  dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
+  dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
+  dona-dispatcher job attention-recovery <source_event_id>
+  dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed [--resume <claim_token>]
+  dona-dispatcher job release-rejected-attention-claim <source_event_id> <attention_event_id> <expected_event_updated_at> <claim_token> --definitive-rejection-reviewed --no-session-write-reviewed
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -121,6 +126,45 @@ async function main(): Promise<void> {
         const jobId=eventIdAt(args,2),receiptId=eventIdAt(args,3),expectedUpdatedAt=eventIdAt(args,4);
         const row=database.resolveInvalidJobResult(jobId,receiptId,expectedUpdatedAt);
         console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,last_error_code:row.last_error_code},null,2));return;
+      }
+      if(command==="resolve-failed-attention") {
+        if(args.length!==8 || args[6]!=="--notification-reviewed" || args[7]!=="--side-effects-reviewed") usage();
+        const sourceEventId=eventIdAt(args,2),jobId=eventIdAt(args,3),attentionEventId=eventIdAt(args,4),expectedUpdatedAt=eventIdAt(args,5);
+        const row=database.resolveFailedJobAttention(sourceEventId,jobId,attentionEventId,expectedUpdatedAt);
+        console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,
+          group:database.getJobGroup(sourceEventId)},null,2));return;
+      }
+      if(command==="resolve-review-attention") {
+        if(args.length!==9 || args[7]!=="--worker-stopped-reviewed" || args[8]!=="--side-effects-reviewed") usage();
+        const sourceEventId=eventIdAt(args,2),jobId=eventIdAt(args,3),attentionEventId=eventIdAt(args,4);
+        const row=database.resolveNeedsReviewAttention(sourceEventId,jobId,attentionEventId,eventIdAt(args,5),eventIdAt(args,6));
+        console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,
+          group:database.getJobGroup(sourceEventId)},null,2));return;
+      }
+      if(command==="attention-recovery") {
+        if(args.length!==3)usage();
+        const sourceEventId=eventIdAt(args,2);
+        console.log(JSON.stringify({group:database.getJobGroup(sourceEventId),
+          legacy_claim:database.getLegacyAttentionClaim(sourceEventId)},null,2));return;
+      }
+      if(command==="release-rejected-attention-claim") {
+        if(args.length!==8 || args[6]!=="--definitive-rejection-reviewed" || args[7]!=="--no-session-write-reviewed")usage();
+        const sourceEventId=eventIdAt(args,2),attentionEventId=eventIdAt(args,3);
+        database.releaseRejectedAttentionDeliveryClaim(sourceEventId,attentionEventId,eventIdAt(args,4),eventIdAt(args,5));
+        console.log(JSON.stringify({source_event_id:sourceEventId,attention_event_id:attentionEventId,claim_released:true}));return;
+      }
+      if(command==="reconcile-attention-delivery") {
+        if((args.length!==8 && args.length!==10) || args[7]!=="--notification-reviewed" ||
+          (args.length===10 && args[8]!=="--resume")) usage();
+        const sourceEventId=eventIdAt(args,2),attentionEventId=eventIdAt(args,3),expectedUpdatedAt=eventIdAt(args,4);
+        const messageTs=eventIdAt(args,5),bodySha256=eventIdAt(args,6);
+        const claim=args.length===10
+          ? database.resumeAttentionDeliveryReconciliation(sourceEventId,attentionEventId,expectedUpdatedAt,messageTs,bodySha256,eventIdAt(args,9))
+          : database.claimAttentionDeliveryReconciliation(sourceEventId,attentionEventId,expectedUpdatedAt,messageTs,bodySha256);
+        console.log(JSON.stringify({attention_event_id:attentionEventId,claim_token:claim.claimToken,status:"claimed"}));
+        const evidence=await new SlackAdapterJobNotificationVerifier(config).settle(claim.request);
+        database.recordVerifiedAttentionDelivery(sourceEventId,attentionEventId,expectedUpdatedAt,claim.claimToken,evidence);
+        console.log(JSON.stringify({source_event_id:sourceEventId,attention_event_id:attentionEventId,verified:true},null,2));return;
       }
       usage();
     }

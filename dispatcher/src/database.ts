@@ -160,6 +160,8 @@ function ensureV2BridgeSchema(db: Database.Database): void {
   ensureJobsRunnableFairIndex(db);
   ensureJobsWorkspaceJobIndex(db);
   ensureJobsStatusJobIndex(db);
+  ensureJobAttentionResolutionSchema(db);
+  reconcileLegacyAttentionClaims(db);
 }
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id);
@@ -171,6 +173,86 @@ function ensureJobsStatusJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_nonterminal_job_idx ON jobs(job_id)
     WHERE status NOT IN ('blocked','completed','failed','cancelled','needs_review');
 `);}
+function ensureJobAttentionResolutionSchema(db: Database.Database): void { db.exec(`
+  CREATE TABLE IF NOT EXISTS job_attention_resolutions (
+    job_id TEXT PRIMARY KEY,
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    attention_event_id TEXT NOT NULL REFERENCES events(event_id),
+    status_at_resolution TEXT NOT NULL CHECK (status_at_resolution IN ('failed', 'completed', 'cancelled')),
+    resolution_kind TEXT NOT NULL CHECK (resolution_kind IN ('validated_result', 'operator_reconcile')),
+    resolution_event_id TEXT REFERENCES events(event_id),
+    resolved_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS job_attention_resolutions_event_idx
+    ON job_attention_resolutions(source_event_id, attention_event_id);
+  CREATE TABLE IF NOT EXISTS job_attention_delivery_receipts (
+    attention_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    workspace_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT NOT NULL,
+    message_ts TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS job_attention_delivery_claims (
+    attention_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    claim_token TEXT NOT NULL UNIQUE,
+    expected_event_updated_at TEXT NOT NULL,
+    message_ts TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS job_attention_delivery_claim_releases (
+    claim_token TEXT PRIMARY KEY,
+    attention_event_id TEXT NOT NULL REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    expected_event_updated_at TEXT NOT NULL,
+    release_reason TEXT NOT NULL CHECK (release_reason='definitive_rejection_no_session_write'),
+    released_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS job_attention_legacy_claims (
+    source_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+    all_terminal_event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_status_at_detection TEXT NOT NULL,
+    recovery_state TEXT NOT NULL CHECK (recovery_state IN ('superseded','needs_review')),
+    detected_at TEXT NOT NULL
+  );
+`);}
+
+function reconcileLegacyAttentionClaims(db: Database.Database): void {
+  const candidates=db.prepare(`SELECT g.source_event_id,g.all_terminal_event_id,e.status
+    FROM job_groups g JOIN events e ON e.event_id=g.all_terminal_event_id
+    WHERE g.notification_mode='grouped'
+      AND g.all_terminal_event_id IS NOT NULL
+      AND json_extract(e.payload_json,'$.group.attention_resolution_state') IS NULL`)
+    .all() as Array<{source_event_id:string;all_terminal_event_id:string;status:EventStatus}>;
+  const at=nowUtc();
+  for(const candidate of candidates) {
+    const safeToSupersede=["queued","retryable_failed"].includes(candidate.status);
+    db.prepare(`INSERT OR IGNORE INTO job_attention_legacy_claims
+      (source_event_id,all_terminal_event_id,event_status_at_detection,recovery_state,detected_at)
+      VALUES(?,?,?,?,?)`).run(candidate.source_event_id,candidate.all_terminal_event_id,candidate.status,
+      safeToSupersede?"superseded":"needs_review",at);
+    if(!safeToSupersede) continue;
+    const changed=db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+      last_error_code='legacy_group_terminal_superseded',last_error_message=NULL
+      WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+      .run(at,at,candidate.all_terminal_event_id).changes;
+    if(changed!==1) throw new Error("legacy_group_terminal_changed_during_recovery");
+    db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
+      .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
+    db.prepare(`UPDATE job_groups SET all_terminal_event_id=NULL,
+      attention_event_id=CASE WHEN NOT EXISTS (
+        SELECT 1 FROM jobs j WHERE j.source_event_id=job_groups.source_event_id
+          AND j.status NOT IN ('completed','cancelled')
+      ) THEN NULL ELSE attention_event_id END,
+      updated_at=?
+      WHERE source_event_id=? AND all_terminal_event_id=?`)
+      .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
+  }
+}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -370,6 +452,8 @@ export function migrateDispatcherDatabase(
     ensureJobsRunnableFairIndex(db);
     ensureJobsWorkspaceJobIndex(db);
     ensureJobsStatusJobIndex(db);
+    ensureJobAttentionResolutionSchema(db);
+    reconcileLegacyAttentionClaims(db);
   }
 }
 
@@ -843,6 +927,14 @@ export class DispatcherDatabase {
       .get(sourceEventId) as JobGroupRow | undefined;
   }
 
+  getLegacyAttentionClaim(sourceEventId: string): {
+    source_event_id:string;all_terminal_event_id:string;event_status_at_detection:string;
+    recovery_state:"superseded"|"needs_review";detected_at:string;
+  } | undefined {
+    return this.db.prepare("SELECT * FROM job_attention_legacy_claims WHERE source_event_id=?")
+      .get(sourceEventId) as ReturnType<DispatcherDatabase["getLegacyAttentionClaim"]>;
+  }
+
   ensureJobGroup(
     sourceEventId: string,
     notificationMode: JobGroupNotificationMode,
@@ -888,6 +980,12 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const existing = this.getJobGroupRequired(sourceEventId);
       if (!existing.sealed_at) throw new Error(`Job group ${sourceEventId} is not sealed`);
+      if (transition === "all_terminal" && existing.all_terminal_event_id) {
+        return { row: existing, claimed: false };
+      }
+      if (transition === "all_terminal" && !this.groupCanClaimAllTerminal(sourceEventId, existing)) {
+        throw new Error("job_group_attention_unresolved");
+      }
       const timestamp = at.toISOString();
       const changed = this.db.prepare(`
         UPDATE job_groups SET ${field} = ?, updated_at = ?
@@ -907,10 +1005,20 @@ export class DispatcherDatabase {
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
           AND (g.notification_mode='legacy' OR (g.sealed_at IS NOT NULL AND g.all_terminal_event_id IS NULL))
-          AND (j.completion_event_id IS NULL OR (g.notification_mode='grouped'
-            AND g.attention_event_id IS NOT NULL AND g.all_terminal_event_id IS NULL
-            AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
-              AND sibling.status NOT IN ('completed','failed','cancelled','needs_review')))))
+          AND (j.completion_event_id IS NULL
+            OR (g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
+                AND sibling.status NOT IN ('completed','failed','cancelled'))
+              AND NOT EXISTS (SELECT 1 FROM jobs unresolved WHERE unresolved.source_event_id=j.source_event_id
+                AND unresolved.status='failed' AND NOT EXISTS (
+                  SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=unresolved.job_id
+                    AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed')))
+            OR (g.notification_mode='grouped'
+              AND g.attention_event_id IS NULL AND g.all_terminal_event_id IS NULL
+              AND j.status IN ('blocked','failed','needs_review')
+              AND NOT EXISTS (SELECT 1 FROM job_attention_resolutions r
+                WHERE r.job_id=j.job_id AND r.source_event_id=j.source_event_id
+                  AND r.status_at_resolution=j.status))))
       )
       ORDER BY CASE WHEN j.status IN ('blocked','failed','needs_review') THEN 0 ELSE 1 END,j.updated_at,j.job_id LIMIT ?
     `).all(limit) as JobRow[];
@@ -1035,9 +1143,203 @@ export class DispatcherDatabase {
         WHERE job_id=? AND status='needs_review' AND updated_at=? AND result_json IS NULL`)
         .run(at.toISOString(), at.toISOString(), `Operator reviewed worker termination and side effects; receipt ${receiptId}`, jobId, expectedUpdatedAt).changes;
       if (changed !== 1) throw new Error("job_changed_since_review");
-      this.enqueueJobNotification(jobId, at);
+      if (group?.notification_mode === "grouped" && group.attention_event_id) {
+        const payload=JSON.parse(this.getRequired(group.attention_event_id).payload_json) as {job_id?:string};
+        if(payload.job_id===jobId) this.recordAttentionResolution(jobId, group.attention_event_id, "failed", "operator_reconcile", null, at);
+      }
       this.enqueueJobNotification(jobId, at);
       return this.getJobRequired(jobId);
+    }).immediate();
+  }
+
+  resolveFailedJobAttention(
+    sourceEventId: string, jobId: string, attentionEventId: string, expectedUpdatedAt: string,
+    at = new Date(),
+  ): JobRow {
+    return this.db.transaction(() => {
+      const job = this.getJobRequired(jobId);
+      const group = this.getJobGroupRequired(sourceEventId);
+      if (job.source_event_id !== sourceEventId || group.notification_mode !== "grouped" ||
+          group.attention_event_id !== attentionEventId || group.all_terminal_event_id ||
+          job.status !== "failed" || job.updated_at !== expectedUpdatedAt) {
+        throw new Error("attention_resolution_binding_mismatch");
+      }
+      if (readEventJobBinding(this.db, sourceEventId)?.owner.kind !== "slack_thread") {
+        throw new Error("attention_resolution_owner_mismatch");
+      }
+      const event = this.getRequired(attentionEventId);
+      if ((JSON.parse(event.payload_json) as {job_id?:string}).job_id!==jobId) {
+        throw new Error("attention_resolution_binding_mismatch");
+      }
+      if (!this.attentionNotificationSettled(event)) throw new Error("attention_notification_requires_reconciliation");
+      this.recordAttentionResolution(jobId, attentionEventId, "failed", "operator_reconcile", null, at);
+      this.enqueueJobNotification(jobId, at);
+      return this.getJobRequired(jobId);
+    }).immediate();
+  }
+
+  resolveNeedsReviewAttention(
+    sourceEventId: string, jobId: string, attentionEventId: string,
+    receiptId: string, expectedUpdatedAt: string, at = new Date(),
+  ): JobRow {
+    return this.db.transaction(() => {
+      const job = this.getJobRequired(jobId);
+      const group = this.getJobGroupRequired(sourceEventId);
+      if (job.source_event_id !== sourceEventId || group.notification_mode !== "grouped" ||
+          group.attention_event_id !== attentionEventId || group.all_terminal_event_id ||
+          job.status !== "needs_review" || job.updated_at !== expectedUpdatedAt || job.result_json !== null) {
+        throw new Error("attention_resolution_binding_mismatch");
+      }
+      if (readEventJobBinding(this.db, sourceEventId)?.owner.kind !== "slack_thread") {
+        throw new Error("attention_resolution_owner_mismatch");
+      }
+      if ((JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string}).job_id!==jobId) {
+        throw new Error("attention_resolution_binding_mismatch");
+      }
+      const receipt = this.getLiveSessionReceipt(jobId, receiptId);
+      if (!receipt || receipt.durable_status_after !== "needs_review" || receipt.result_present_after ||
+          receipt.reconciliation.safe_next_action !== "do_not_retry" ||
+          Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) {
+        throw new Error("live_session_receipt_mismatch");
+      }
+      const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
+        .get(jobId) as {receipt_id:string}|undefined;
+      if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
+      const previous = job.completion_event_id ? this.getRequired(job.completion_event_id) : undefined;
+      if (previous && ["queued", "retryable_failed"].includes(previous.status)) {
+        this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+          last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=?`)
+          .run(at.toISOString(),at.toISOString(),previous.event_id);
+        this.db.prepare("UPDATE job_groups SET attention_event_id=NULL WHERE source_event_id=? AND attention_event_id=?")
+          .run(sourceEventId,previous.event_id);
+      } else if (previous && previous.status !== "completed") {
+        throw new Error("prior_notification_requires_reconciliation");
+      }
+      const changed = this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,completion_event_id=NULL,
+        last_error_code='attention_operator_resolved',last_error_message='Operator reviewed worker termination and side effects'
+        WHERE job_id=? AND status='needs_review' AND updated_at=? AND result_json IS NULL`)
+        .run(at.toISOString(),at.toISOString(),jobId,expectedUpdatedAt).changes;
+      if (changed !== 1) throw new Error("job_changed_since_review");
+      this.recordAttentionResolution(jobId,attentionEventId,"failed","operator_reconcile",null,at);
+      this.enqueueJobNotification(jobId,at);
+      return this.getJobRequired(jobId);
+    }).immediate();
+  }
+
+  attentionDeliveryVerificationRequest(
+    sourceEventId: string, attentionEventId: string, messageTs: string, bodySha256: string,
+  ): JobNotificationVerificationRequest {
+    const group = this.getJobGroupRequired(sourceEventId);
+    const event = this.getRequired(attentionEventId);
+    if (group.attention_event_id !== attentionEventId || group.all_terminal_event_id !== null ||
+        event.status !== "completed" || !event.result_json ||
+        !/^[a-f0-9]{64}$/.test(bodySha256) || !/^\d+\.\d+$/.test(messageTs)) {
+      throw new Error("attention_delivery_reconciliation_unavailable");
+    }
+    const result = JSON.parse(event.result_json) as ResultEnvelope;
+    if (result.event_id !== attentionEventId || result.status !== "completed") {
+      throw new Error("attention_delivery_reconciliation_unavailable");
+    }
+    const payload = JSON.parse(event.payload_json) as { group?: { source_event_id?: string; transition?: string } };
+    const target = event.reply_target_json ? JSON.parse(event.reply_target_json) as Record<string, unknown> : null;
+    if (payload.group?.source_event_id !== sourceEventId || payload.group.transition !== "attention" ||
+        target?.kind !== "slack_thread" || typeof target.workspace_id !== "string" ||
+        typeof target.channel_id !== "string" || typeof target.thread_ts !== "string") {
+      throw new Error("attention_delivery_reconciliation_unavailable");
+    }
+    return {schema_version:1,event_id:attentionEventId,workspace_id:target.workspace_id,
+      channel_id:target.channel_id,thread_ts:target.thread_ts,message_ts:messageTs,
+      body_sha256:bodySha256,desired_session_status:"suspended"};
+  }
+
+  claimAttentionDeliveryReconciliation(
+    sourceEventId: string, attentionEventId: string, expectedUpdatedAt: string,
+    messageTs: string, bodySha256: string, at = new Date(),
+  ): { request: JobNotificationVerificationRequest; claimToken: string } {
+    return this.db.transaction(() => {
+      const request=this.attentionDeliveryVerificationRequest(sourceEventId,attentionEventId,messageTs,bodySha256);
+      if(this.getRequired(attentionEventId).updated_at!==expectedUpdatedAt) throw new Error("attention_event_changed_since_verification");
+      if(this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(attentionEventId))
+        throw new Error("attention_delivery_already_verified");
+      const claimToken=ulid();
+      this.db.prepare(`INSERT INTO job_attention_delivery_claims
+        (attention_event_id,source_event_id,claim_token,expected_event_updated_at,message_ts,body_sha256,claimed_at)
+        VALUES(?,?,?,?,?,?,?)`)
+        .run(attentionEventId,sourceEventId,claimToken,expectedUpdatedAt,messageTs,bodySha256,at.toISOString());
+      return {request,claimToken};
+    }).immediate();
+  }
+
+  resumeAttentionDeliveryReconciliation(
+    sourceEventId: string, attentionEventId: string, expectedUpdatedAt: string,
+    messageTs: string, bodySha256: string, claimToken: string,
+  ): { request: JobNotificationVerificationRequest; claimToken: string } {
+    const request=this.attentionDeliveryVerificationRequest(sourceEventId,attentionEventId,messageTs,bodySha256);
+    const claim=this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?")
+      .get(attentionEventId) as {source_event_id:string;claim_token:string;expected_event_updated_at:string;message_ts:string;body_sha256:string}|undefined;
+    if(!claim || claim.source_event_id!==sourceEventId || claim.claim_token!==claimToken ||
+        claim.expected_event_updated_at!==expectedUpdatedAt || claim.message_ts!==messageTs ||
+        claim.body_sha256!==bodySha256 || this.getRequired(attentionEventId).updated_at!==expectedUpdatedAt)
+      throw new Error("attention_delivery_claim_mismatch");
+    return {request,claimToken};
+  }
+
+  releaseRejectedAttentionDeliveryClaim(
+    sourceEventId:string,attentionEventId:string,expectedUpdatedAt:string,claimToken:string,at=new Date(),
+  ):void {
+    this.db.transaction(()=>{
+      const group=this.getJobGroupRequired(sourceEventId);
+      const event=this.getRequired(attentionEventId);
+      const claim=this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?")
+        .get(attentionEventId) as {source_event_id:string;claim_token:string;expected_event_updated_at:string}|undefined;
+      if(group.attention_event_id!==attentionEventId || group.all_terminal_event_id ||
+          event.updated_at!==expectedUpdatedAt || !claim || claim.source_event_id!==sourceEventId ||
+          claim.claim_token!==claimToken || claim.expected_event_updated_at!==expectedUpdatedAt ||
+          this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(attentionEventId)) {
+        throw new Error("attention_delivery_claim_release_mismatch");
+      }
+      this.db.prepare(`INSERT INTO job_attention_delivery_claim_releases
+        (claim_token,attention_event_id,source_event_id,expected_event_updated_at,release_reason,released_at)
+        VALUES(?,?,?,?,?,?)`).run(claimToken,attentionEventId,sourceEventId,expectedUpdatedAt,
+        "definitive_rejection_no_session_write",at.toISOString());
+      this.db.prepare("DELETE FROM job_attention_delivery_claims WHERE attention_event_id=? AND claim_token=?")
+        .run(attentionEventId,claimToken);
+    }).immediate();
+  }
+
+  recordVerifiedAttentionDelivery(
+    sourceEventId: string, attentionEventId: string, expectedUpdatedAt: string, claimToken: string,
+    evidence: JobNotificationEvidence, at = new Date(),
+  ): void {
+    this.db.transaction(() => {
+      const event = this.getRequired(attentionEventId);
+      if (event.updated_at !== expectedUpdatedAt) throw new Error("attention_event_changed_since_verification");
+      const request = this.attentionDeliveryVerificationRequest(sourceEventId, attentionEventId,
+        evidence.message_ts, evidence.body_sha256);
+      const claim=this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?")
+        .get(attentionEventId) as {source_event_id:string;claim_token:string;expected_event_updated_at:string;message_ts:string;body_sha256:string}|undefined;
+      if(!claim || claim.source_event_id!==sourceEventId || claim.claim_token!==claimToken ||
+          claim.expected_event_updated_at!==expectedUpdatedAt || claim.message_ts!==evidence.message_ts ||
+          claim.body_sha256!==evidence.body_sha256) throw new Error("attention_delivery_claim_mismatch");
+      if (evidence.event_id !== request.event_id || evidence.workspace_id !== request.workspace_id ||
+          evidence.channel_id !== request.channel_id || evidence.thread_ts !== request.thread_ts ||
+          evidence.session_status !== "suspended" || evidence.reply_broadcast !== false ||
+          evidence.identity_block_verified !== true) throw new Error("attention_delivery_evidence_mismatch");
+      const existing = this.db.prepare("SELECT * FROM job_attention_delivery_receipts WHERE attention_event_id=?")
+        .get(attentionEventId) as {source_event_id:string;message_ts:string;body_sha256:string}|undefined;
+      if (existing) {
+        if (existing.source_event_id !== sourceEventId || existing.message_ts !== evidence.message_ts ||
+            existing.body_sha256 !== evidence.body_sha256) throw new Error("attention_delivery_receipt_conflict");
+        return;
+      }
+      this.db.prepare(`INSERT INTO job_attention_delivery_receipts
+        (attention_event_id,source_event_id,workspace_id,channel_id,thread_ts,message_ts,body_sha256,verified_at)
+        VALUES(?,?,?,?,?,?,?,?)`)
+        .run(attentionEventId,sourceEventId,evidence.workspace_id,evidence.channel_id,evidence.thread_ts,
+          evidence.message_ts,evidence.body_sha256,at.toISOString());
+      this.db.prepare("DELETE FROM job_attention_delivery_claims WHERE attention_event_id=? AND claim_token=?")
+        .run(attentionEventId,claimToken);
+      this.handoffResolvedAttention(attentionEventId,at);
     }).immediate();
   }
 
@@ -1195,10 +1497,19 @@ export class DispatcherDatabase {
       if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
         throw new Error("completed_at_precedes_prompt_dispatch");
       this.db.transaction(()=>{
+        const attentionEventId = this.getJobGroup(job.source_event_id)?.attention_event_id;
         if(recoverAmbiguous&&job.completion_event_id) {
+          const priorEvent = this.getRequired(job.completion_event_id);
+          if(binding?.owner.kind === "slack_thread" && !["queued", "retryable_failed", "completed"].includes(priorEvent.status)) {
+            throw new Error("prior_notification_requires_reconciliation");
+          }
           const prior=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
           if(prior&&prior.notification_state!=="pending") throw new Error("prior_notification_requires_reconciliation");
-          this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed','dispatching','waiting_agent')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
+          this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
+          if(binding?.owner.kind === "slack_thread" && ["queued", "retryable_failed"].includes(priorEvent.status)) {
+            this.db.prepare("UPDATE job_groups SET attention_event_id=NULL WHERE source_event_id=? AND attention_event_id=?")
+              .run(job.source_event_id, priorEvent.event_id);
+          }
           this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'").run(job.completion_event_id);
           this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
         }
@@ -1208,6 +1519,10 @@ export class DispatcherDatabase {
           last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
           last_error_message: result.status === "failed" ? result.summary : null,
         });
+        if (recoverAmbiguous && attentionEventId && binding?.owner.kind === "slack_thread") {
+          const payload=JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string};
+          if(payload.job_id===jobId) this.recordAttentionResolution(jobId, attentionEventId, status, "validated_result", null, at);
+        }
         if(binding?.owner.kind==="schedule") this.materializeJobCompletion(jobId,at,notificationHook);
       }).immediate();
     }).immediate();
@@ -1311,11 +1626,19 @@ export class DispatcherDatabase {
   }
 
   markJobCancelled(jobId: string, reason: string, at = new Date()): void {
-    this.updateJob(jobId, ["cancelling"], "cancelled", {
-      completed_at: at.toISOString(),
-      last_error_code: "cancelled",
-      last_error_message: reason,
-    });
+    this.db.transaction(() => {
+      this.updateJob(jobId, ["cancelling"], "cancelled", {
+        completed_at: at.toISOString(),
+        last_error_code: "cancelled",
+        last_error_message: reason,
+      });
+      const job=this.getJobRequired(jobId);
+      const attentionEventId=this.getJobGroup(job.source_event_id)?.attention_event_id;
+      if(attentionEventId && readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="slack_thread") {
+        const payload=JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string};
+        if(payload.job_id===jobId) this.recordAttentionResolution(jobId,attentionEventId,"cancelled","operator_reconcile",null,at);
+      }
+    }).immediate();
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
@@ -1339,6 +1662,10 @@ export class DispatcherDatabase {
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const timestamp = at.toISOString();
       let group = this.getJobGroupRequired(job.source_event_id);
+      if(group.notification_mode==="grouped" && group.attention_event_id && jobAttentionStatuses.has(job.status)) {
+        this.handoffResolvedAttention(group.attention_event_id,at);
+        group=this.getJobGroupRequired(job.source_event_id);
+      }
       if (group.notification_mode === "grouped" && group.all_terminal_event_id) {
         const existing = this.getRequired(group.all_terminal_event_id);
         if (!job.completion_event_id) {
@@ -1351,14 +1678,13 @@ export class DispatcherDatabase {
       if (job.completion_event_id) {
         const existing = this.get(job.completion_event_id);
         if (!existing) throw new Error(`Job ${jobId} references a missing completion event`);
+        const needsReplacementAttention = group.notification_mode === "grouped" &&
+          group.attention_event_id === null && group.all_terminal_event_id === null &&
+          jobAttentionStatuses.has(job.status) && !this.jobAttentionResolved(job);
         const needsAllTerminal = group.notification_mode === "grouped" &&
           group.attention_event_id !== null && group.all_terminal_event_id === null &&
-          this.db.prepare(`
-            SELECT 1 FROM jobs
-            WHERE source_event_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'needs_review')
-            LIMIT 1
-          `).get(job.source_event_id) === undefined;
-        if (!needsAllTerminal) return { row: existing, duplicate: true, payloadMismatch: false };
+          this.groupCanClaimAllTerminal(job.source_event_id, group);
+        if (!needsAllTerminal && !needsReplacementAttention) return { row: existing, duplicate: true, payloadMismatch: false };
       }
       if (!jobNotificationStatuses.has(job.status)) {
         throw new Error(`Job ${jobId} in status ${job.status} does not need a notification`);
@@ -1385,10 +1711,15 @@ export class DispatcherDatabase {
       const snapshot = group.notification_mode === "grouped"
         ? this.buildJobGroupSnapshot(job.source_event_id, group, job)
         : undefined;
+      const legacyRecovery = snapshot?.transition === "all_terminal"
+        ? this.getLegacyAttentionClaim(job.source_event_id) : undefined;
       const envelope: EventEnvelope = {
         schema_version: 1,
         source: "dona_job",
-        external_event_id: `${job.job_id}:${job.status}${job.completion_event_id ? ":all_terminal" : ""}`,
+        external_event_id: `${job.job_id}:${job.status}${legacyRecovery
+          ? `:legacy_recovery:${legacyRecovery.all_terminal_event_id}`
+          : job.completion_event_id
+            ? snapshot?.transition === "attention" ? ":attention_replacement" : ":all_terminal" : ""}`,
         type: `job_${job.status}`,
         occurred_at: timestamp,
         subject: {
@@ -1422,6 +1753,9 @@ export class DispatcherDatabase {
       insertEventJobBinding(this.db, enqueued.row.event_id, binding);
       notificationHook("event_enqueued");
       if (snapshot && snapshot.transition !== "progress") {
+        if (snapshot.transition === "all_terminal" && !this.groupCanClaimAllTerminal(job.source_event_id, group)) {
+          throw new Error("job_group_attention_unresolved");
+        }
         const field = snapshot.transition === "attention" ? "attention_event_id" : "all_terminal_event_id";
         const claimed = this.db.prepare(`
           UPDATE job_groups SET ${field} = ?, updated_at = ?
@@ -1962,6 +2296,7 @@ export class DispatcherDatabase {
       if(delivery.runId) {
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
+      if(event.source==="dona_job") this.handoffResolvedAttention(eventId,acceptedAt);
     }).immediate();
   }
 
@@ -2383,9 +2718,12 @@ export class DispatcherDatabase {
     }
 
     let transition: JobGroupTransition = "progress";
-    if (jobAttentionStatuses.has(notificationJob.status) && group.attention_event_id === null) {
+    if (jobAttentionStatuses.has(notificationJob.status) && group.attention_event_id === null &&
+      !this.jobAttentionResolved(notificationJob) &&
+      !this.groupCanClaimAllTerminal(sourceEventId, group)) {
       transition = "attention";
-    } else if (total > 0 && allJobsTerminal && group.all_terminal_event_id === null) {
+    } else if (total > 0 && allJobsTerminal && group.all_terminal_event_id === null &&
+      this.groupCanClaimAllTerminal(sourceEventId, group)) {
       transition = "all_terminal";
     }
 
@@ -2395,12 +2733,127 @@ export class DispatcherDatabase {
     `).all(sourceEventId, jobGroupSnapshotJobLimit) as JobGroupSnapshot["jobs"];
     return {
       source_event_id: sourceEventId,
+      attention_resolution_state: transition === "attention" ? "unresolved"
+        : group.attention_event_id === null ? (statusCounts.failed ? "resolved" : "not_required")
+        : this.groupCanClaimAllTerminal(sourceEventId, group) ? "resolved" : "unresolved",
       total,
       pending,
       status_counts: statusCounts,
       jobs,
       transition,
     };
+  }
+
+  private groupCanClaimAllTerminal(sourceEventId: string, group: JobGroupRow): boolean {
+    if (group.notification_mode !== "grouped" || !group.sealed_at || group.all_terminal_event_id) return false;
+    if (this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE source_event_id=? LIMIT 1")
+      .get(sourceEventId)) return false;
+    if (group.attention_event_id && !this.attentionNotificationSettled(this.getRequired(group.attention_event_id))) return false;
+    const unresolved = this.db.prepare(`
+      SELECT 1 FROM jobs j WHERE j.source_event_id=? AND (
+        j.status NOT IN ('completed','failed','cancelled') OR
+        (j.status='failed' AND NOT EXISTS (
+          SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
+            AND r.source_event_id=j.source_event_id
+            AND r.status_at_resolution='failed'
+        ))
+      ) LIMIT 1
+    `).get(sourceEventId);
+    if (unresolved) return false;
+    return true;
+  }
+
+  private jobAttentionResolved(job: JobRow): boolean {
+    if (job.status !== "failed") return false;
+    return this.db.prepare(`SELECT 1 FROM job_attention_resolutions
+      WHERE job_id=? AND source_event_id=? AND status_at_resolution='failed'`)
+      .get(job.job_id,job.source_event_id) !== undefined;
+  }
+
+  private attentionNotificationSettled(event: EventRow): boolean {
+    if (event.source !== "dona_job" || event.status !== "completed" || !event.result_json) return false;
+    const payload = JSON.parse(event.payload_json) as { group?: { transition?: string } };
+    const result = JSON.parse(event.result_json) as ResultEnvelope;
+    if (payload.group?.transition !== "attention" || result.event_id !== event.event_id || result.status !== "completed") return false;
+    if (this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?")
+      .get(event.event_id)) return true;
+    const actions = result.actions ?? [];
+    const target = event.reply_target_json ? JSON.parse(event.reply_target_json) as Record<string, unknown> : null;
+    if (target?.kind !== "slack_thread" || typeof target.workspace_id !== "string" ||
+        typeof target.channel_id !== "string" ||
+        typeof target.thread_ts !== "string") return false;
+    if (actions.some(action => action && typeof action === "object" &&
+      (action as Record<string, unknown>).ambiguous === true)) return false;
+    const actionSucceeded = (action: Record<string, unknown>) =>
+      action.ambiguous !== true && action.success !== false && action.ok !== false && !("error" in action);
+    const sessionActions=actions.filter((action): action is Record<string, unknown> =>
+      !!action && typeof action==="object" &&
+      (action as Record<string, unknown>).tool==="dona_slack.set_agent_session_status" &&
+      (action as Record<string, unknown>).workspace_id===target.workspace_id &&
+      (action as Record<string, unknown>).channel_id===target.channel_id &&
+      (action as Record<string, unknown>).thread_ts===target.thread_ts);
+    const lastConfirmedSessionAction=sessionActions.filter(actionSucceeded).at(-1);
+    return actions.some(action => action && typeof action === "object" &&
+      (action as Record<string, unknown>).tool === "dona_slack.post_message" &&
+      typeof (action as Record<string, unknown>).message_ts === "string" &&
+      /^\d+\.\d+$/.test((action as Record<string, unknown>).message_ts as string) &&
+      (action as Record<string, unknown>).workspace_id === target.workspace_id &&
+      (action as Record<string, unknown>).channel_id === target.channel_id &&
+      (action as Record<string, unknown>).thread_ts === target.thread_ts &&
+      (action as Record<string, unknown>).reply_broadcast !== true &&
+      actionSucceeded(action as Record<string, unknown>)) &&
+      lastConfirmedSessionAction?.status==="suspended";
+  }
+
+  private recordAttentionResolution(
+    jobId: string, attentionEventId: string, status: "completed" | "failed" | "cancelled",
+    kind: "validated_result" | "operator_reconcile", resolutionEventId: string | null, at: Date,
+  ): void {
+    const job = this.getJobRequired(jobId);
+    const attention = this.getRequired(attentionEventId);
+    if (job.status !== status || attention.source !== "dona_job") throw new Error("attention_resolution_binding_mismatch");
+    const payload = JSON.parse(attention.payload_json) as { job_id?: string; group?: { transition?: string; source_event_id?: string } };
+    if (payload.group?.transition !== "attention" || payload.group.source_event_id !== job.source_event_id ||
+        payload.job_id !== jobId) {
+      throw new Error("attention_resolution_binding_mismatch");
+    }
+    const existing = this.db.prepare("SELECT * FROM job_attention_resolutions WHERE job_id=?")
+      .get(jobId) as { attention_event_id: string; status_at_resolution: string; resolution_kind: string } | undefined;
+    if (existing) {
+      if (existing.attention_event_id !== attentionEventId || existing.status_at_resolution !== status || existing.resolution_kind !== kind)
+        throw new Error("attention_resolution_conflict");
+      return;
+    }
+    this.db.prepare(`INSERT INTO job_attention_resolutions
+      (job_id,source_event_id,attention_event_id,status_at_resolution,resolution_kind,resolution_event_id,resolved_at)
+      VALUES(?,?,?,?,?,?,?)`)
+      .run(jobId, job.source_event_id, attentionEventId, status, kind, resolutionEventId, at.toISOString());
+    this.handoffResolvedAttention(attentionEventId,at);
+  }
+
+  private handoffResolvedAttention(attentionEventId: string, at: Date): void {
+    const attention=this.getRequired(attentionEventId);
+    const payload=JSON.parse(attention.payload_json) as {job_id?:string;group?:{source_event_id?:string;transition?:string}};
+    const causeJobId=payload.job_id;
+    const sourceEventId=payload.group?.source_event_id;
+    if(payload.group?.transition!=="attention" || !causeJobId || !sourceEventId ||
+        this.getJobGroup(sourceEventId)?.attention_event_id!==attentionEventId ||
+        !this.attentionNotificationSettled(attention)) return;
+    if(this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?")
+      .get(attentionEventId)) return;
+    const cause=this.getJob(causeJobId);
+    if(!cause || cause.source_event_id!==sourceEventId ||
+        !(cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
+    const unresolvedSibling = this.db.prepare(`SELECT 1 FROM jobs j WHERE j.source_event_id=? AND j.job_id<>?
+      AND (j.status IN ('blocked','needs_review') OR (j.status='failed' AND NOT EXISTS (
+        SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
+          AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed'
+      ))) LIMIT 1`).get(sourceEventId,causeJobId);
+    if (unresolvedSibling) {
+      this.db.prepare(`UPDATE job_groups SET attention_event_id=NULL,updated_at=?
+        WHERE source_event_id=? AND attention_event_id=? AND all_terminal_event_id IS NULL`)
+        .run(at.toISOString(),sourceEventId,attentionEventId);
+    }
   }
 
   private sealJobGroupIfPresent(sourceEventId: string, timestamp: string): number {

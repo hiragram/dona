@@ -60,7 +60,7 @@ for (const status of ["completed", "failed", "blocked", "needs_review", "cancell
       const group = h.database.getJobGroup(source.event_id)!;
       const expectedAttention = ["failed", "blocked", "needs_review"].includes(status);
       assert.equal(group.attention_event_id !== null, expectedAttention);
-      assert.equal(group.all_terminal_event_id !== null, status !== "blocked");
+      assert.equal(group.all_terminal_event_id !== null, ["completed", "cancelled"].includes(status));
       assert.equal(h.repo.getRun(scheduled.runId)?.status, ["blocked", "needs_review"].includes(status) ? "needs_review" : status);
       assert.equal(h.raw.prepare("SELECT count(*) FROM job_completion_results WHERE job_id=?").pluck().get(scheduled.job.job_id), 1);
       const completion = h.raw.prepare("SELECT work_state,notification_state FROM job_completion_results WHERE job_id=?").get(scheduled.job.job_id) as {work_state:string;notification_state:string};
@@ -168,7 +168,8 @@ for (const schema of ["fresh","v2"] as const) for (const outcome of ["completed"
       for (const id of [ordinary.event_id, eventId]) h.database.saveCompleted(id, { schema_version: 1, event_id: id, status: "completed", completed_at: new Date().toISOString() }, path.join(root, `${id}.json`));
       await supervisor.start();
       await waitFor(() => jobs.every(job => h.database.getJob(job.job_id)?.completion_event_id != null));
-      if (outcome !== "blocked") await waitFor(() => h.database.getJobGroup(ordinary.event_id)?.all_terminal_event_id != null);
+      if (outcome === "completed") await waitFor(() => h.database.getJobGroup(ordinary.event_id)?.all_terminal_event_id != null);
+      else assert.equal(h.database.getJobGroup(ordinary.event_id)?.all_terminal_event_id,null);
       await supervisor.stop(); supervisor = undefined;
       const expected = ["invalid", "missing"].includes(outcome) ? "needs_review" : outcome;
       for (const job of jobs) assert.equal(h.database.getJob(job.job_id)?.status, expected);
