@@ -43,6 +43,23 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
+  test("terminal遷移後の初回decisionを内部受領として保存する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const accepted=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${accepted.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:00:04Z"},job.result_path);
+      const decision=database.workerMessages.decideReport(job.job_id,accepted.message.message_id,event.event_id);
+      assert.equal(decision.action,"ack_internal");
+      assert.equal(decision.reason,"terminal");
+    } finally {database.close();}
+  });
   test("通知に束縛したdecisionをrestart後も再利用し、別eventを拒否する",async()=>{
     const {database,source,job,config}=await fixture();
     const accepted=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));

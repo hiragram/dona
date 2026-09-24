@@ -30,6 +30,8 @@ export interface WorkerDecisionContext {
   last_user_decision_at?: string;
   first_report_at?: string;
   last_eta_at?: string;
+  last_risk_severity?: string;
+  answered?: boolean;
   now: string;
   silence_interval_ms: number;
 }
@@ -37,7 +39,7 @@ export interface WorkerDecisionContext {
 export interface WorkerDecision {
   action: WorkerDecisionAction;
   reason: "terminal" | "group_attention" | "question" | "decision_request" | "risk_escalation" |
-    "risk" | "eta_change" | "silence" | "duplicate" | "heartbeat" | "changed" | "group_wait";
+    "risk" | "eta_change" | "silence" | "duplicate" | "heartbeat" | "changed" | "group_wait" | "answered";
   content_sha256: string;
   safe_projection?: { kind: "question" | "decision_request"; prompt: string; options?: string[] };
 }
@@ -57,6 +59,7 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
   if (!current || terminal.has(current.status) || current.status === "cancelling")
     return { action: "ack_internal", reason: "terminal", content_sha256 };
   if (report.kind === "question" || report.kind === "decision_request") {
+    if (context.answered) return { action: "ack_internal", reason: "answered", content_sha256 };
     const prompt = safeQuestion(report.text);
     const options = report.options?.map(safeQuestion);
     const safe = !!prompt && (!options || options.every(Boolean));
@@ -71,7 +74,7 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
     return { action: "aggregate_wait", reason: "group_attention", content_sha256 };
   if (report.kind === "risk" && report.severity === "high")
     return { action: "report_to_user", reason: "risk_escalation", content_sha256 };
-  if (report.kind === "risk" && previous?.severity !== report.severity)
+  if (report.kind === "risk" && context.last_risk_severity !== report.severity)
     return { action: "report_to_user", reason: "risk", content_sha256 };
   if (report.eta_at && context.last_eta_at && Math.abs(Date.parse(report.eta_at)-Date.parse(context.last_eta_at)) >= 300_000)
     return { action: "report_to_user", reason: "eta_change", content_sha256 };

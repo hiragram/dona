@@ -558,7 +558,7 @@ export class WorkerMessageRepository {
         content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
         ...(row.safe_projection_json?{safe_projection:JSON.parse(row.safe_projection_json)}:{}),decided_at:row.decided_at});
       if(existing)return project(existing);
-      this.getMessage(jobId,messageId,notificationEventId);
+      if(terminal(job.status)===false)this.getMessage(jobId,messageId,notificationEventId);
       const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
         .get(notificationEventId) as {status:string}|undefined;
       if(!event||!["dispatching","waiting_agent"].includes(event.status))
@@ -579,6 +579,13 @@ export class WorkerMessageRepository {
         WHERE job_id=? AND direction='worker_to_dona' AND producer_sequence<?
           AND json_type(payload_json,'$.eta_at')='text'
         ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const lastRisk=this.db.prepare(`SELECT json_extract(payload_json,'$.severity') AS severity FROM worker_messages
+        WHERE job_id=? AND direction='worker_to_dona' AND kind='risk' AND producer_sequence<?
+        ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {severity:string}|undefined;
+      const answered=this.db.prepare(`SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries delivery
+        ON delivery.message_id=answer.message_id WHERE answer.job_id=? AND answer.direction='dona_to_worker'
+        AND answer.kind='answer' AND answer.correlation_message_id=? AND delivery.consumer='worker'
+        AND delivery.state!='superseded' LIMIT 1`).get(jobId,messageId)!==undefined;
       const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
         .get(jobId) as {at:string|null};
       const lastUserDecision=this.db.prepare(`SELECT MAX(d.decided_at) AS at FROM worker_message_decisions d
@@ -595,6 +602,7 @@ export class WorkerMessageRepository {
         ...(previous?{previous:{action:previous.action,content_sha256:previous.content_sha256,decided_at:previous.decided_at,
           ...(previous.severity?{severity:previous.severity}:{})}}:{}),
         ...(lastEta?.eta_at?{last_eta_at:lastEta.eta_at}:{}),
+        ...(lastRisk?.severity?{last_risk_severity:lastRisk.severity}:{}),answered,
         ...(firstReport.at?{first_report_at:firstReport.at}:{}),
         ...(lastUserDecision.at?{last_user_decision_at:lastUserDecision.at}:{}),
         now:at.toISOString(),silence_interval_ms:cadence?.silence_interval_ms??900_000});

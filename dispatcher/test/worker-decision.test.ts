@@ -37,6 +37,7 @@ describe("worker decision policy", () => {
     const repeat=evaluateWorkerDecision({...base,report:{...base.report,kind:"question",text:"確認してください"},
       previous:{action:"ask_user",content_sha256:evaluateWorkerDecision({...base,report:{...base.report,kind:"question",text:"確認してください"}}).content_sha256,decided_at:base.now}});
     assert.equal(repeat.action,"ask_user");
+    assert.equal(evaluateWorkerDecision({...base,report:{...base.report,kind:"question",text:"確認してください"},answered:true}).reason,"answered");
   });
 
   test("risk escalationとmulti-worker attentionを優先する", () => {
@@ -48,6 +49,9 @@ describe("worker decision policy", () => {
       report: { ...base.report, kind: "risk", text: "品質上の懸念", severity: "high" } });
     assert.equal(group.action, "aggregate_wait");
     assert.equal(group.reason, "group_attention");
+    const repeated=evaluateWorkerDecision({...base,report:{...base.report,kind:"risk",text:"同じ懸念",severity:"medium"},
+      previous:{action:"ack_internal",content_sha256:"checkpoint",decided_at:base.now},last_risk_severity:"medium"});
+    assert.equal(repeated.action,"ack_internal");
   });
 
   test("ETAの大きな変化を報告し、小さな変化を抑制する", () => {
