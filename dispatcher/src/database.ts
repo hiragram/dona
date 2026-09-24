@@ -2148,6 +2148,11 @@ export class DispatcherDatabase {
             return;
           }
         }
+        const hasPostOrSuspension=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          (typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")||
+            ((action as Record<string,unknown>).status==="suspended"&&typeof (action as Record<string,unknown>).tool==="string"&&
+              String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status"))));
+        const currentState=()=>this.workerMessages.decisionCurrent(String(payload.job_id),String(payload.message_id),eventId);
         if(["question","decision_request"].includes(String(payload.kind))){
           if(decision?.action==="ack_internal"&&["answered","terminal"].includes(decision.reason)){
             this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
@@ -2160,14 +2165,18 @@ export class DispatcherDatabase {
               WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
                 AND answer.correlation_message_id=? AND delivery.consumer='worker'
                 AND delivery.state!='superseded' LIMIT 1`).get(payload.job_id,payload.message_id)!==undefined;
-          const hasPostOrSuspension=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            (typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")||
-              ((action as Record<string,unknown>).status==="suspended"&&typeof (action as Record<string,unknown>).tool==="string"&&
-                String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status"))));
           if(decision.action==="ask_user"&&answered&&!hasPostOrSuspension){
             this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:null,last_error_message:null});
             return;
+          }
+          if(decision.action==="ask_user"&&!hasPostOrSuspension){
+            const state=currentState();
+            if(!state.current&&state.reason==="job_inactive"){
+              this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+                completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+              return;
+            }
           }
           if(decision.action!=="ask_user"||!decision.safe_projection_json){
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
@@ -2203,6 +2212,14 @@ export class DispatcherDatabase {
           }
         }
         if(decision.action==="report_to_user"){
+          if(!hasPostOrSuspension){
+            const state=currentState();
+            if(!state.current&&["job_inactive","group_changed","group_attention"].includes(state.reason)){
+              this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+                completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+              return;
+            }
+          }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
           const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
