@@ -95,6 +95,10 @@ describe("job result publish contract", () => {
     let current = row({ status: "running" });
     const getJob = (id: string) => id === current.job_id ? current : undefined;
     assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
+    assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `prefix-${grant.capability}-suffix` }, getJob), code("content_requires_redaction"));
+    current = row({ status: "running", agent_name: "internal-worker-42" });
+    assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: "internal-worker-42" }, getJob), code("content_requires_redaction"));
+    current = row({ status: "running" });
     assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ job_id: "job_two" })), code("capability_invalid"));
     assert.throws(() => grants.validate(grant.capability, "session-2", base, getJob), code("worker_session_stale"));
     persistedSession = "session-2";
@@ -204,11 +208,11 @@ describe("job result publish contract", () => {
   });
 
   test("Unicodeと制御文字を含む永続sessionを可逆に認証する", async () => {
-    const session = "セッション\n\ud800";
+    let session = "セッション\n\ud800";
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-session-"));
     const socket = path.join(directory, "p.sock");
     const grants = new JobResultPublishCapabilities(() => session);
-    const grant = grants.issue(row(), session);
+    let grant = grants.issue(row(), session);
     const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
       { commit: async candidate => {
         assert.equal(candidate.fence.session, session);
@@ -224,8 +228,44 @@ describe("job result publish contract", () => {
     try {
       await server.start();
       assert.equal(await post(Buffer.from(JSON.stringify(session), "utf8").toString("base64url")), 202);
+      session = "\ud800".repeat(512);
+      grant = grants.issue(row(), session);
+      const maximumSessionHeader = Buffer.from(JSON.stringify(session), "utf8").toString("base64url");
+      assert.equal(maximumSessionHeader.length, 4099);
+      assert.equal(await post(maximumSessionHeader), 202);
       assert.equal(await post(Buffer.from(JSON.stringify("別session"), "utf8").toString("base64url")), 403);
       assert.equal(await post("%%%"), 403);
+    } finally {
+      await server.stop();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("本文未完了の接続を期限切れと停止時に閉じる", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-stall-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
+    const partial = () => new Promise<http.ClientRequest>((resolve, reject) => {
+      const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+        headers: { "x-dona-job-result-capability": grant.capability,
+          "x-dona-worker-session": Buffer.from(JSON.stringify("session-1")).toString("base64url") } });
+      request.on("error", () => {});
+      request.on("socket", client => client.once("connect", () => resolve(request)));
+      request.write("{");
+      setTimeout(() => reject(new Error("partial request did not connect")), 1_000).unref();
+    });
+    try {
+      await server.start();
+      const timed = await partial();
+      await Promise.race([new Promise<void>(resolve => timed.once("close", () => resolve())), new Promise((_, reject) => setTimeout(() => reject(new Error("body deadline missed")), 1_000))]);
+      const active = await partial();
+      const started = performance.now();
+      await server.stop();
+      assert.ok(performance.now() - started < 1_000);
+      active.destroy();
     } finally {
       await server.stop();
       await fs.rm(directory, { recursive: true, force: true });

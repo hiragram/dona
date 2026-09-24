@@ -23,11 +23,13 @@ function reply(response: ServerResponse, status: number, code: string): void {
 /** Separate UDS. It is never registered on the general Dispatcher API or MCP server. */
 export class JobResultPublishServer {
   private server: http.Server | undefined;
+  private readonly sockets = new Set<net.Socket>();
   constructor(
     private readonly socketPath: string,
     private readonly grants: JobResultPublishCapabilities,
     private readonly getJob: (jobId: string) => JobRow | undefined,
     private readonly sink: JobResultPublishSink,
+    private readonly bodyTimeoutMs = 15_000,
   ) {}
 
   async start(): Promise<void> {
@@ -57,6 +59,10 @@ export class JobResultPublishServer {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     this.server = http.createServer((request, response) => void this.handle(request, response));
+    this.server.on("connection", socket => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
+    });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
       this.server!.listen(this.socketPath, () => { this.server!.off("error", reject); resolve(); });
@@ -67,7 +73,9 @@ export class JobResultPublishServer {
   async stop(): Promise<void> {
     if (!this.server) return;
     if (!this.server.listening) { this.server = undefined; return; }
-    await new Promise<void>((resolve, reject) => this.server!.close(error => error ? reject(error) : resolve()));
+    const closing = new Promise<void>((resolve, reject) => this.server!.close(error => error ? reject(error) : resolve()));
+    for (const socket of this.sockets) socket.destroy();
+    await closing;
     this.server = undefined;
     await fs.unlink(this.socketPath).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
@@ -86,7 +94,7 @@ export class JobResultPublishServer {
     try {
       // JSON before base64url preserves every persisted 512-character session,
       // including Unicode, control characters and lone surrogates.
-      if (!/^[A-Za-z0-9_-]{1,4096}$/.test(encodedSession)) throw new JobResultPublishError("capability_invalid");
+      if (!/^[A-Za-z0-9_-]{1,4099}$/.test(encodedSession)) throw new JobResultPublishError("capability_invalid");
       let session: unknown;
       try { session = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(encodedSession, "base64url"))); }
       catch { throw new JobResultPublishError("capability_invalid"); }
@@ -108,10 +116,16 @@ export class JobResultPublishServer {
       this.grants.authorize(capability, session, this.getJob);
       const chunks: Buffer[] = [];
       let bytes = 0;
-      for await (const chunk of request) {
-        bytes += chunk.length;
-        if (bytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("payload_too_large");
-        chunks.push(Buffer.from(chunk));
+      const deadline = setTimeout(() => request.destroy(), this.bodyTimeoutMs);
+      deadline.unref();
+      try {
+        for await (const chunk of request) {
+          bytes += chunk.length;
+          if (bytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("payload_too_large");
+          chunks.push(Buffer.from(chunk));
+        }
+      } finally {
+        clearTimeout(deadline);
       }
       let input: unknown;
       try { input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); }
