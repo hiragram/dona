@@ -148,7 +148,7 @@ describe("worker messaging ledger",()=>{
         {input:report(source.event_id,3),at:"2026-09-21T00:20:01Z"},
       ];
       const decisions=[];
-      for(const {input,at} of reports){
+      for(const [index,{input,at}] of reports.entries()){
         const created=database.workerMessages.appendReport(job.job_id,input,new Date(at));
         database.workerMessages.publishPendingReports(1,new Date(at));
         const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
@@ -156,6 +156,12 @@ describe("worker messaging ledger",()=>{
         sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
         sqlite.close();
         decisions.push(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,new Date(at)));
+        if(index===1){
+          const settled=new Database(config.databasePath);
+          settled.prepare("UPDATE events SET status='completed',result_json=? WHERE event_id=?")
+            .run(JSON.stringify({actions:[]}),event.event_id);
+          settled.close();
+        }
       }
       assert.equal(decisions[1]?.action,"report_to_user");
       assert.equal(decisions[2]?.reason,"silence");

@@ -604,7 +604,10 @@ export class WorkerMessageRepository {
         JOIN worker_messages m USING(message_id)
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
         WHERE d.job_id=? AND m.producer_sequence<?
-        AND d.action IN ('report_to_user','ask_user')`).get(jobId,message.producer_sequence) as {at:string|null};
+        AND d.action IN ('report_to_user','ask_user')
+        AND EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')`).get(jobId,message.producer_sequence) as {at:string|null};
       const payload=JSON.parse(message.payload_json) as {kind:"checkpoint"|"question"|"risk"|"decision_request";
         summary?:string;question?:string;severity?:"low"|"medium"|"high";options?:string[];eta_at?:string};
       const cadence=this.db.prepare("SELECT silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
