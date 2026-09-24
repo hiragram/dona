@@ -92,9 +92,10 @@ describe("job result publish contract", () => {
     for (const value of ["http://artifact-service.internal/download/OPAQUE_VALUE", "http://artifact/download/OPAQUE_VALUE",
       "http://cache.local/private", "ftp://10.0.0.5/private/archive.zip", "sftp://artifact.internal/result",
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
-      "prefix_https://10.0.0.1/private", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
+      "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
-      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ",
+      "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
@@ -104,6 +105,7 @@ describe("job result publish contract", () => {
     for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}']) {
       assert.equal(validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     }
+    assert.equal(validateJobResultPublish({ ...base, summary: "coverage 95% complete" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.equal(validateJobResultPublish({ ...base, artifacts: [{ session_count: 3 }], actions: [{ token_count: 100 }] }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ session_count: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
@@ -150,6 +152,7 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `prefix-${grant.capability}-suffix` }, getJob), code("content_requires_redaction"));
     const encodedCapability = `%${grant.capability.charCodeAt(0).toString(16).padStart(2, "0")}${grant.capability.slice(1)}`;
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `https://example.com/?id=${encodedCapability}` }, getJob), code("content_requires_redaction"));
+    assert.equal(grants.validate(grant.capability, "session-1", { ...base, summary: "coverage 95% complete" }, getJob).envelope.status, "completed");
     current = row({ status: "running", agent_name: "internal-worker-42" });
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: "internal-worker-42" }, getJob), code("content_requires_redaction"));
     current = row({ status: "running", agent_name: "s1" });

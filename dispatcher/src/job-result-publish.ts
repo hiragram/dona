@@ -98,10 +98,15 @@ const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
-    try {
-      const header = JSON.parse(Buffer.from(match[1]!, "base64url").toString("utf8"));
-      if (header && typeof header === "object" && typeof header.alg === "string") return true;
-    } catch { /* Other dotted identifiers are allowed. */ }
+    const first = match[1]!;
+    for (let start = 0; start <= first.length - 8; start++) {
+      if (start > 0 && first[start - 1] !== "_" && first[start - 1] !== "-") continue;
+      if (first.length - start > 4_096) continue;
+      try {
+        const header = JSON.parse(Buffer.from(first.slice(start), "base64url").toString("utf8"));
+        if (header && typeof header === "object" && typeof header.alg === "string") return true;
+      } catch { /* Other dotted identifiers are allowed. */ }
+    }
   }
   return false;
 }
@@ -179,6 +184,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
   return false;
 }
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_.-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
+const cliCredentialCandidate = /--([A-Za-z][A-Za-z0-9-]*)\s+[^\s]+/g;
 function isPublicCountField(key: string, value: unknown): boolean {
   return /_count$/i.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2")) &&
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -240,7 +246,9 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     for (const match of value.matchAll(networkUrlCandidate)) {
-      if (hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
+      let url: URL;
+      try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
+      if (url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       const rawKey = match[0].replace(/\s*[:=]$/, "");
@@ -250,11 +258,13 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       } else if (rawKey.startsWith("'")) key = rawKey.slice(1, -1);
       if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
     }
+    for (const match of value.matchAll(cliCredentialCandidate)) {
+      if (forbiddenKey(match[1]!)) throw new JobResultPublishError("content_requires_redaction");
+    }
     if (forbiddenDigests && forbiddenFingerprints) {
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
       if (value.includes("%")) {
-        let decoded: string;
-        try { decoded = decodeURIComponent(value); } catch { throw new JobResultPublishError("content_requires_redaction"); }
+        const decoded = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
         if (decoded !== value && containsForbiddenCapability(decoded, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
       }
     }
