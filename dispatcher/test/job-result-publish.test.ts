@@ -77,6 +77,13 @@ describe("job result publish contract", () => {
     for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "auth", "session_id", "sessionId", "sessionid", "cookie", "set-cookie", "passwd", "passphrase", "account_key", "AccountKey", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
+    for (const value of ["session=CANARY_VALUE", '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}']) {
+      assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
+    for (const value of [{ session: "CANARY_VALUE" }, { kty: "RSA", n: "public", e: "AQAB", d: "PRIVATE_VALUE" },
+      { kty: "oct", k: "PRIVATE_VALUE" }]) {
+      assert.throws(() => validateJobResultPublish({ ...base, artifacts: [value] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
@@ -335,6 +342,42 @@ describe("job result publish contract", () => {
       assert.ok(performance.now() - started < 1_000);
       active.destroy();
     } finally {
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("初回request前の待機は接続済みFDを失効させず、header途中は期限を設ける", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-idle-fd-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
+    let client: net.Socket | undefined;
+    let stalled: net.Socket | undefined;
+    try {
+      await startServer(server, socket);
+      client = net.createConnection(socket);
+      client.on("error", () => {});
+      await new Promise<void>(resolve => client!.once("connect", resolve));
+      await new Promise(resolve => setTimeout(resolve, 80));
+      assert.equal(client.destroyed, false);
+      const body = JSON.stringify(base);
+      const response = new Promise<string>(resolve => client!.once("data", chunk => resolve(String(chunk))));
+      client.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}`);
+      assert.match(await response, /^HTTP\/1\.1 202 /);
+      stalled = net.createConnection(socket);
+      stalled.on("error", () => {});
+      await new Promise<void>(resolve => stalled!.once("connect", resolve));
+      stalled.write("POST /v1/job-result-publish HTTP/1.1\r\n");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(stalled.destroyed, true, "header途中のsocketは期限で閉じる");
+    } finally {
+      client?.destroy();
+      stalled?.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

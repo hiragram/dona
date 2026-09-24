@@ -24,6 +24,12 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
+function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
+  return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
+    Object.keys(value).some(key => privateJwkParameter.has(key));
+}
+const privateJwkText = /["']kty["']\s*:\s*["'](?:RSA|EC|OKP|oct)["'][\s\S]*?["'](?:d|p|q|dp|dq|qi|oth|k)["']\s*:/i;
 const localPath = /(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
 const uncPath = /(?:^|[\s"'(`=])(?:\\\\[^\\\s]+\\|\/\/[^/\s]+\/)/;
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
@@ -99,7 +105,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
-  return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie)(?:_|$)/.test(normalized) ||
+  return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie|session)(?:_|$)/.test(normalized) ||
     /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|accountkey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|account|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
@@ -120,11 +126,12 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.some(privateValue => privateValue.length >= 4 ? value.includes(privateValue) : value === privateValue)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value) || privateJwkText.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
   } else if (value !== null && typeof value === "object") {
+    if (hasPrivateJwkFields(value as Record<string, unknown>)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
       if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);

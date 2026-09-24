@@ -85,16 +85,23 @@ export class JobResultPublishServer {
   accept(socket: net.Socket): void {
     if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= 32) { socket.destroy(); return; }
     this.sockets.add(socket);
-    const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
-    deadline.unref();
-    this.headerDeadlines.set(socket, deadline);
+    // Keep the FD outside the HTTP parser until its first byte. The worker may
+    // run for hours before publishing; a partial first header gets a deadline.
+    socket.once("data", chunk => {
+      const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
+      deadline.unref();
+      this.headerDeadlines.set(socket, deadline);
+      socket.pause();
+      socket.unshift(chunk);
+      this.server.emit("connection", socket);
+      socket.resume();
+    });
     socket.once("close", () => {
       this.sockets.delete(socket);
       const pending = this.headerDeadlines.get(socket);
       if (pending) clearTimeout(pending);
       this.headerDeadlines.delete(socket);
     });
-    this.server.emit("connection", socket);
   }
 
   async stop(): Promise<void> {
