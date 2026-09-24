@@ -62,7 +62,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "auth=CANARY_VALUE", "session_id=CANARY_VALUE", "session-id=CANARY_VALUE", "AccountKey=CANARY_VALUE", "sig=CANARY_VALUE", "signature=CANARY_VALUE", "Bearer abcdefghijklmnop", "-----BEGIN ENCRYPTED PRIVATE KEY-----", "-----BEGIN PGP PRIVATE KEY BLOCK-----", "https://files.slack.com/private/abc", "https://files.slack.com./private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "http://localhost:3000/download/OPAQUE_VALUE", "http://localhost.:3000/download/OPAQUE_VALUE", "http://127.0.0.1:8080/private", "http://127.1/private", "http://[::1]/private", "http://10.0.0.5/download/OPAQUE_VALUE", "http://172.16.0.1/private", "http://192.168.1.1/private", "http://169.254.169.254/private", "http://[fc00::1]/private", "http://[fe80::1]/private", "http://[::ffff:10.0.0.5]/private", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "C:/Users/example/.ssh/id_rsa", "D:/private/result.json", "\\\\fileserver\\share\\private\\result.json", "//fileserver/share/private/result.json", "<!channel>", "<!here>", "<!everyone>", "<!subteam^S12345678>", "<@U12345678>", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "auth=CANARY_VALUE", "session_id=CANARY_VALUE", "session-id=CANARY_VALUE", "AccountKey=CANARY_VALUE", "sig=CANARY_VALUE", "signature=CANARY_VALUE", "Bearer abcdefghijklmnop", "-----BEGIN ENCRYPTED PRIVATE KEY-----", "-----BEGIN PGP PRIVATE KEY BLOCK-----", "https://files.slack.com/private/abc", "https://files.slack.com./private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "http://localhost:3000/download/OPAQUE_VALUE", "http://localhost.:3000/download/OPAQUE_VALUE", "http://127.0.0.1:8080/private", "http://127.1/private", "http://[::1]/private", "http://10.0.0.5/download/OPAQUE_VALUE", "http://172.16.0.1/private", "http://192.168.1.1/private", "http://169.254.169.254/private", "http://[fc00::1]/private", "http://[fe80::1]/private", "http://[::ffff:10.0.0.5]/private", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "C:/Users/example/.ssh/id_rsa", "D:/private/result.json", "\\\\fileserver\\share\\private\\result.json", "//fileserver/share/private/result.json", "<!channel>", "<!here>", "<!everyone>", "<!subteam^S12345678>", "<@U12345678>", "ghp_abcdefghijklmnop", "glpat-abcdefghijklmnopqrst", "sk_live_abcdefghijklmnopqrst", "AKIA1234567890ABCDEF", "ghp_\u001b[31mabcdefghijklmnop\u001b[0m"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -94,7 +94,7 @@ describe("job result publish contract", () => {
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
-      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ",
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
@@ -103,7 +103,7 @@ describe("job result publish contract", () => {
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "Bearer authentication is enabled", "Bearer credentials were removed"]) {
+    for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
       assert.equal(validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     }
     assert.equal(validateJobResultPublish({ ...base, summary: "coverage 95% complete" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -259,6 +259,7 @@ describe("job result publish contract", () => {
       "private objective two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
   });
 
   test("短いobjectiveは全文一致時だけ拒否する", () => {

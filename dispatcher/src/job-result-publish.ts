@@ -35,7 +35,8 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
   return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
@@ -82,6 +83,16 @@ function hasPrivateJwkText(value: string): boolean {
   return scopes.some(scope => scope.keyType && scope.privateParameter);
 }
 const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
+function hasLocalPath(value: string): boolean {
+  const candidate = new RegExp(localPath.source, "gi");
+  for (const match of value.matchAll(candidate)) {
+    const route = match[0].trimStart();
+    const prefix = value.slice(0, match.index);
+    if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd())) continue;
+    return true;
+  }
+  return false;
+}
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
 const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/?#\s"'<>`]+)(?:[/?#][^\s"'<>`]*)?/g;
 function hasPrivateSlashAuthority(value: string): boolean {
@@ -100,9 +111,9 @@ function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
     const first = match[1]!;
     const starts = [0];
-    // A compact JSON header normally starts with {" (base64url: eyJ).
+    // A JSON header begins with { (base64url: e...).
     // Limit secondary candidates so a hostile 1 MiB body stays bounded.
-    for (let start = first.lastIndexOf("eyJ"); start > 0 && starts.length < 17; start = first.lastIndexOf("eyJ", start - 1)) {
+    for (let start = first.lastIndexOf("e"); start > 0 && starts.length < 17; start = first.lastIndexOf("e", start - 1)) {
       if ((first[start - 1] === "_" || first[start - 1] === "-") && first.length - start <= 1_024) starts.push(start);
     }
     for (const start of starts) {
@@ -255,12 +266,17 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       let url: URL;
       try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
       if (url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
+      if ((url.search.includes("+") || url.hash.includes("+")) && match[0].includes("+")) {
+        const decodedForm = value.replace(match[0], match[0].replace(/\+/g, " "));
+        assertSafeJson(decodedForm, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+      }
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       const rawKey = match[0].replace(/\s*[:=]$/, "");
       let key = rawKey;
       if (rawKey.startsWith('"')) {
-        try { key = JSON.parse(rawKey); } catch { throw new JobResultPublishError("content_requires_redaction"); }
+        try { key = JSON.parse(rawKey); }
+        catch { key = rawKey.replace(/\\"/g, '"').replace(/^"|"$/g, ""); }
       } else if (rawKey.startsWith("'")) key = rawKey.slice(1, -1);
       if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
     }
@@ -270,6 +286,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenDigests && forbiddenFingerprints) {
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
     }
+    if (value.includes("\u001b")) {
+      const stripped = value.replace(ansiEscape, "");
+      if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+    }
     if (decodeDepth < 2 && value.includes("%")) {
       const decoded = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
       if (decoded !== value) assertSafeJson(decoded, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
@@ -277,7 +297,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
