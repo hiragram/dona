@@ -6,7 +6,7 @@ import type { JobRow } from "./types.js";
 import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, jobResultPublishTtlMs, validJobResultPublishSession, type AuthorizedJobResultPublish } from "./job-result-publish.js";
 
 export interface JobResultPublishSink {
-  /** Must compare candidate.fence in the same durable transaction as Result creation. */
+  /** Compare candidate.fence and call candidate.assertCurrentGrant() inside the synchronous Result transaction. */
   commit(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
   /** Must compare the durable digest and may never mutate a terminal Result. */
   reconcile(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;

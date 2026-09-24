@@ -77,10 +77,12 @@ describe("job result publish contract", () => {
     for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "auth", "session_id", "sessionId", "sessionid", "cookie", "set-cookie", "passwd", "passphrase", "account_key", "AccountKey", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    for (const value of ["session=CANARY_VALUE", '{"to\\u006ben":"CANARY_VALUE"}',
+    for (const value of ["session=CANARY_VALUE", "api.key=CANARY_VALUE", "access.key=CANARY_VALUE", "private.key=CANARY_VALUE",
+      '{"to\\u006ben":"CANARY_VALUE"}',
       '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
       '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}',
-      '{"kty":"R\\u0053A","n":"public","d":"PRIVATE_VALUE"}']) {
+      '{"kty":"R\\u0053A","n":"public","d":"PRIVATE_VALUE"}',
+      '{"kty":"RSA","n":"public","d":"PRIVATE_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const value of [{ session: "CANARY_VALUE" }, { kty: "RSA", n: "public", e: "AQAB", d: "PRIVATE_VALUE" },
@@ -91,6 +93,7 @@ describe("job result publish contract", () => {
       "http://cache.local/private", "ftp://10.0.0.5/private/archive.zip", "sftp://artifact.internal/result",
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
+      "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -174,6 +177,22 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_revoked"));
   });
 
+  test("検証後の再発行とrevokeはcommit直前のgrant照合で拒否する", () => {
+    const grants = new JobResultPublishCapabilities(() => "session-one");
+    const first = grants.issue(row(), "session-one");
+    const current = row({ status: "running" });
+    const candidate = grants.validate(first.capability, "session-one", base, () => current);
+    candidate.assertCurrentGrant();
+    assert.deepEqual(candidate.fence.publishableStatuses, ["dispatching", "running"]);
+    const replacement = grants.issue(row(), "session-one");
+    assert.equal(candidate.fence.grantGeneration, 1);
+    assert.throws(() => candidate.assertCurrentGrant(), code("capability_revoked"));
+    const next = grants.validate(replacement.capability, "session-one", base, () => current);
+    assert.equal(next.fence.grantGeneration, 2);
+    grants.revokeJob("job_one");
+    assert.throws(() => next.assertCurrentGrant(), code("capability_revoked"));
+  });
+
   test("永続live sessionの512文字上限を発行でも受理する", () => {
     const session = "s".repeat(512);
     const grants = new JobResultPublishCapabilities(() => session);
@@ -250,7 +269,8 @@ describe("job result publish contract", () => {
     const terminal = row({ status: "completed", herdr_pane_id: null, result_json: "{}" });
     const candidate = grants.validate(grant.capability, "session-1", base, () => terminal);
     assert.equal(candidate.reconcileOnly, true);
-    assert.deepEqual(candidate.fence, { jobId: "job_one", status: "completed", attemptCount: 1, paneId: "pane-1", session: "session-1" });
+    assert.deepEqual(candidate.fence, { jobId: "job_one", publishableStatuses: ["dispatching", "running"], grantGeneration: 1,
+      attemptCount: 1, paneId: "pane-1", session: "session-1" });
     assert.throws(() => grants.validate(grant.capability, "other-session", base, () => terminal), code("worker_session_stale"));
     assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ status: "completed", herdr_pane_id: null, result_json: null })), code("worker_session_stale"));
   });
@@ -265,7 +285,8 @@ describe("job result publish contract", () => {
     const accepted: string[] = [];
     const reconciled: string[] = [];
     const server = new JobResultPublishServer(grants, id => id === current.job_id ? current : undefined,
-      { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", status: "running", attemptCount: 1, paneId: "pane-1", session: "session-1" }); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
+      { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", publishableStatuses: ["dispatching", "running"], grantGeneration: 1,
+        attemptCount: 1, paneId: "pane-1", session: "session-1" }); candidate.assertCurrentGrant(); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish", agent?: http.Agent) => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST", agent,

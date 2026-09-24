@@ -79,11 +79,11 @@ function hasPrivateJwkText(value: string): boolean {
       }
     } else if (typeof key === "string" && privateJwkParameter.has(key)) scope.privateParameter = true;
   }
-  return false;
+  return scopes.some(scope => scope.keyType && scope.privateParameter);
 }
 const localPath = /(?:(?<![A-Za-z0-9/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
-const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/\s]+)\/[^\s"'<>`]*/g;
+const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/?#\s"'<>`]+)(?:[/?#][^\s"'<>`]*)?/g;
 function hasPrivateSlashAuthority(value: string): boolean {
   for (const match of value.matchAll(slashAuthority)) {
     const host = match[1]!;
@@ -164,7 +164,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
   }
   return false;
 }
-const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
+const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_.-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 function isPublicCountField(key: string, value: unknown): boolean {
   return /_count$/i.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2")) &&
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -309,7 +309,10 @@ export interface ValidatedJobResultPublish {
 
 export interface AuthorizedJobResultPublish extends ValidatedJobResultPublish {
   /** The durable commit must compare this fence in its Result transaction. */
-  fence: { jobId: string; status: JobRow["status"]; attemptCount: number; paneId: string | null; session: string };
+  fence: { jobId: string; publishableStatuses: readonly ["dispatching", "running"]; grantGeneration: number;
+    attemptCount: number; paneId: string | null; session: string };
+  /** Call inside the synchronous durable transaction immediately before Result creation. */
+  assertCurrentGrant: () => void;
 }
 
 export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_id" | "status">, completedAt: string, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[], forbiddenFingerprints?: ReadonlySet<number>): ValidatedJobResultPublish {
@@ -339,6 +342,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
 
 interface Grant {
   jobId: string;
+  generation: number;
   session: string;
   attemptCount: number;
   paneId: string | null;
@@ -363,6 +367,7 @@ function grantPrivateValues(job: JobRow, session: string): string[] {
 /** Process-local grants fail closed on restart. Only the private worker transport receives the raw token. */
 export class JobResultPublishCapabilities {
   private readonly grants = new Map<string, Grant>();
+  private readonly generations = new Map<string, number>();
   private readonly renewalKey = randomBytes(32);
   constructor(
     private readonly currentSession: (jobId: string) => string | undefined,
@@ -389,7 +394,7 @@ export class JobResultPublishCapabilities {
     const predecessor = this.grants.get(createHash("sha256").update(capability).digest("hex"));
     if (!predecessor || this.now() < predecessor.renewableAt) throw new JobResultPublishError("renewal_not_due");
     const expiresAt = this.now() + jobResultPublishTtlMs;
-    this.grants.set(key, { jobId: job.job_id, session, attemptCount: job.attempt_count,
+    this.grants.set(key, { jobId: job.job_id, generation: predecessor.generation, session, attemptCount: job.attempt_count,
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
@@ -399,10 +404,12 @@ export class JobResultPublishCapabilities {
   private mint(job: JobRow, session: string): { capability: string; expiresAt: string } {
     for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
     for (const grant of this.grants.values()) if (grant.jobId === job.job_id) grant.revoked = true;
+    const generation = (this.generations.get(job.job_id) ?? 0) + 1;
+    this.generations.set(job.job_id, generation);
     const capability = randomBytes(32).toString("base64url");
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(createHash("sha256").update(capability).digest("hex"), {
-      jobId: job.job_id, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
+      jobId: job.job_id, generation, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
       agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
@@ -411,6 +418,7 @@ export class JobResultPublishCapabilities {
   }
 
   revokeJob(jobId: string): void {
+    this.generations.set(jobId, (this.generations.get(jobId) ?? 0) + 1);
     for (const grant of this.grants.values()) if (grant.jobId === jobId) grant.revoked = true;
   }
 
@@ -455,6 +463,11 @@ export class JobResultPublishCapabilities {
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
-      fence: { jobId: job.job_id, status: job.status, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
+      fence: { jobId: job.job_id, publishableStatuses: ["dispatching", "running"], grantGeneration: grant.generation,
+        attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session },
+      assertCurrentGrant: () => {
+        if (grant.revoked || this.generations.get(grant.jobId) !== grant.generation) throw new JobResultPublishError("capability_revoked");
+        if (this.now() >= grant.expiresAt) throw new JobResultPublishError("capability_expired");
+      } };
   }
 }
