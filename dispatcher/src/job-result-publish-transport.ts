@@ -1,7 +1,5 @@
-import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
-import path from "node:path";
 import { TextDecoder } from "node:util";
 
 import type { JobRow } from "./types.js";
@@ -36,77 +34,51 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
-/** Separate UDS. It is never registered on the general Dispatcher API or MCP server. */
+/** Dedicated HTTP parser for trusted, already-connected worker sockets. */
 export class JobResultPublishServer {
-  private server: http.Server | undefined;
+  private readonly server: http.Server;
   private readonly sockets = new Set<net.Socket>();
+  private readonly headerDeadlines = new Map<net.Socket, NodeJS.Timeout>();
   private readonly publishingSockets = new Set<net.Socket>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
-    private readonly socketPath: string,
     private readonly grants: JobResultPublishCapabilities,
     private readonly getJob: (jobId: string) => JobRow | undefined,
     private readonly sink: JobResultPublishSink,
     private readonly bodyTimeoutMs = 15_000,
-  ) {}
-
-  async start(): Promise<void> {
-    this.stopping = false;
-    await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
-    await fs.chmod(path.dirname(this.socketPath), 0o700);
-    try {
-      const prior = await fs.lstat(this.socketPath);
-      if (!prior.isSocket()) throw new Error("publish_socket_path_occupied");
-      const alive = await new Promise<boolean>(resolve => {
-        const socket = net.createConnection(this.socketPath);
-        let settled = false;
-        const finish = (value: boolean) => {
-          if (settled) return;
-          settled = true;
-          socket.destroy();
-          resolve(value);
-        };
-        socket.once("connect", () => finish(true));
-        socket.once("error", () => finish(false));
-        socket.setTimeout(500, () => finish(false));
-      });
-      if (alive) throw new Error("publish_socket_owned");
-      const current = await fs.lstat(this.socketPath);
-      if (!current.isSocket() || current.ino !== prior.ino || current.dev !== prior.dev) throw new Error("publish_socket_changed");
-      await fs.unlink(this.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+  ) {
     this.server = http.createServer((request, response) => void this.handle(request, response));
-    this.server.headersTimeout = this.bodyTimeoutMs;
-    this.server.on("connection", socket => {
-      this.sockets.add(socket);
-      socket.once("close", () => this.sockets.delete(socket));
+  }
+
+  /** The caller must supply a pre-connected socket over an authenticated channel. */
+  accept(socket: net.Socket): void {
+    if (this.stopping || this.sockets.size >= 32) { socket.destroy(); return; }
+    this.sockets.add(socket);
+    const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
+    deadline.unref();
+    this.headerDeadlines.set(socket, deadline);
+    socket.once("close", () => {
+      this.sockets.delete(socket);
+      const pending = this.headerDeadlines.get(socket);
+      if (pending) clearTimeout(pending);
+      this.headerDeadlines.delete(socket);
     });
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(this.socketPath, () => { this.server!.off("error", reject); resolve(); });
-    });
-    await fs.chmod(this.socketPath, 0o600);
+    this.server.emit("connection", socket);
   }
 
   async stop(): Promise<void> {
-    if (!this.server) return;
-    if (!this.server.listening) { this.server = undefined; return; }
+    if (this.stopping && this.sockets.size === 0 && this.publishing.size === 0) return;
     this.stopping = true;
-    const closing = new Promise<void>((resolve, reject) => this.server!.close(error => error ? reject(error) : resolve()));
     for (const socket of this.sockets) if (!this.publishingSockets.has(socket)) socket.destroy();
     await Promise.allSettled([...this.publishing]);
     for (const socket of this.sockets) socket.destroy();
-    await closing;
-    this.server = undefined;
-    await fs.unlink(this.socketPath).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const headerDeadline = this.headerDeadlines.get(request.socket);
+    if (headerDeadline) clearTimeout(headerDeadline);
+    this.headerDeadlines.delete(request.socket);
     if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew"].includes(request.url ?? "")) {
       reject(request, response, 404, "not_found"); return;
     }

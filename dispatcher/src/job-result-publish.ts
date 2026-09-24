@@ -24,7 +24,20 @@ export class JobResultPublishError extends Error {
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
 const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
-const signedQueryKey = /[?&](?:token|sig|signature|x-amz-signature|x-goog-signature|api[_-]?key|access[_-]?key|auth)=/i;
+const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
+function hasSignedQueryKey(candidate: string): boolean {
+  const queryStart = candidate.indexOf("?");
+  if (queryStart < 0) return false;
+  for (const parameter of candidate.slice(queryStart + 1).split("&")) {
+    const equal = parameter.indexOf("=");
+    if (equal < 0) continue;
+    try {
+      const key = decodeURIComponent(parameter.slice(0, equal).replaceAll("+", " ")).toLowerCase();
+      if (signedQueryKeys.has(key)) return true;
+    } catch { return true; }
+  }
+  return false;
+}
 const capabilityRun = /[A-Za-z0-9_-]{43,}/g;
 const capabilityWindowLength = 43;
 const capabilityHashBase = 31;
@@ -67,7 +80,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     for (const match of value.matchAll(httpUrlCandidate)) {
-      if (signedQueryKey.test(match[0])) throw new JobResultPublishError("content_requires_redaction");
+      if (hasSignedQueryKey(match[0])) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       if (forbiddenKey(match[0].replace(/\s*[:=]$/, "").replace(/^["']|["']$/g, ""))) throw new JobResultPublishError("content_requires_redaction");

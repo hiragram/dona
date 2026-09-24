@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 
 import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, validateJobResultPublish } from "../src/job-result-publish.js";
 import { buildJobResultPublishInstructions } from "../src/job-prompt.js";
@@ -19,6 +18,18 @@ const row = (overrides: Partial<JobRow> = {}): JobRow => ({
   ...overrides,
 } as JobRow);
 const code = (expected: string) => (error: unknown): boolean => error instanceof JobResultPublishError && error.code === expected;
+const testListeners = new WeakMap<JobResultPublishServer, net.Server>();
+async function startServer(server: JobResultPublishServer, socket: string): Promise<void> {
+  const listener = net.createServer(connection => server.accept(connection));
+  await new Promise<void>((resolve, reject) => listener.once("error", reject).listen(socket, resolve));
+  testListeners.set(server, listener);
+}
+async function stopServer(server: JobResultPublishServer): Promise<void> {
+  await server.stop();
+  const listener = testListeners.get(server);
+  if (listener?.listening) await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
+  testListeners.delete(server);
+}
 
 describe("job result publish contract", () => {
   test("構造化入力だけを許し、Dispatcher所有fieldを補完する", () => {
@@ -51,7 +62,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -168,7 +179,7 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ status: "completed", herdr_pane_id: null, result_json: null })), code("worker_session_stale"));
   });
 
-  test("専用UDSだけで認可し、本文・capabilityを応答せずcommit材料へ渡す", async () => {
+  test("専用接続だけで認可し、本文・capabilityを応答せずcommit材料へ渡す", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-contract-"));
     const socket = path.join(directory, "p.sock");
     let now = Date.now();
@@ -177,7 +188,7 @@ describe("job result publish contract", () => {
     let current = row({ status: "running" });
     const accepted: string[] = [];
     const reconciled: string[] = [];
-    const server = new JobResultPublishServer(socket, grants, id => id === current.job_id ? current : undefined,
+    const server = new JobResultPublishServer(grants, id => id === current.job_id ? current : undefined,
       { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" }); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
@@ -190,7 +201,7 @@ describe("job result publish contract", () => {
       request.on("error", reject); request.end(body);
     });
     try {
-      await server.start();
+      await startServer(server, socket);
       const unauthorized = await post(JSON.stringify(base));
       assert.equal(unauthorized.status, 403);
       assert.equal(unauthorized.connection, "close");
@@ -228,7 +239,7 @@ describe("job result publish contract", () => {
       assert.equal(accepted.length, 3);
       assert.deepEqual(reconciled, [accepted[0]]);
     } finally {
-      await server.stop();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
@@ -239,7 +250,7 @@ describe("job result publish contract", () => {
     const socket = path.join(directory, "p.sock");
     const grants = new JobResultPublishCapabilities(() => session);
     let grant = grants.issue(row(), session);
-    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async candidate => {
         assert.equal(candidate.fence.session, session);
         return { outcome: "created" };
@@ -252,7 +263,7 @@ describe("job result publish contract", () => {
       request.on("error", reject); request.end(JSON.stringify(base));
     });
     try {
-      await server.start();
+      await startServer(server, socket);
       assert.equal(await post(Buffer.from(JSON.stringify(session), "utf8").toString("base64url")), 202);
       session = "\ud800".repeat(512);
       grant = grants.issue(row(), session);
@@ -262,7 +273,7 @@ describe("job result publish contract", () => {
       assert.equal(await post(Buffer.from(JSON.stringify("別session"), "utf8").toString("base64url")), 403);
       assert.equal(await post("%%%"), 403);
     } finally {
-      await server.stop();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
@@ -272,7 +283,7 @@ describe("job result publish contract", () => {
     const socket = path.join(directory, "p.sock");
     const grants = new JobResultPublishCapabilities(() => "session-1");
     const grant = grants.issue(row(), "session-1");
-    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
     const partial = () => new Promise<http.ClientRequest>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
@@ -284,16 +295,16 @@ describe("job result publish contract", () => {
       setTimeout(() => reject(new Error("partial request did not connect")), 1_000).unref();
     });
     try {
-      await server.start();
+      await startServer(server, socket);
       const timed = await partial();
       await Promise.race([new Promise<void>(resolve => timed.once("close", () => resolve())), new Promise((_, reject) => setTimeout(() => reject(new Error("body deadline missed")), 1_000))]);
       const active = await partial();
       const started = performance.now();
-      await server.stop();
+      await stopServer(server);
       assert.ok(performance.now() - started < 1_000);
       active.destroy();
     } finally {
-      await server.stop();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
@@ -307,11 +318,11 @@ describe("job result publish contract", () => {
     const committed = new Promise<void>(resolve => { enteredCommit = resolve; });
     let finishCommit!: () => void;
     const commitBarrier = new Promise<void>(resolve => { finishCommit = resolve; });
-    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { enteredCommit(); await commitBarrier; return { outcome: "created" }; },
         reconcile: async () => ({ outcome: "reused" }) });
     try {
-      await server.start();
+      await startServer(server, socket);
       const rejected = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
         headers: { "content-length": "100000" } });
       rejected.on("error", () => {});
@@ -337,7 +348,7 @@ describe("job result publish contract", () => {
       assert.equal(stopped, true);
     } finally {
       finishCommit();
-      await server.stop();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
@@ -351,11 +362,11 @@ describe("job result publish contract", () => {
     const started = new Promise<void>(resolve => { entered = resolve; });
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
-    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { entered(); await barrier; return { outcome: "created" }; },
         reconcile: async () => ({ outcome: "reused" }) });
     try {
-      await server.start();
+      await startServer(server, socket);
       const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
         headers: { "x-dona-job-result-capability": grant.capability,
           "x-dona-worker-session": Buffer.from(JSON.stringify("session-1")).toString("base64url") } });
@@ -367,27 +378,31 @@ describe("job result publish contract", () => {
       await Promise.race([server.stop(), new Promise((_, fail) => setTimeout(() => fail(new Error("disconnected commit blocked stop")), 1_000))]);
     } finally {
       release();
-      await server.stop();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
 
-  test("停止済みUDSを復旧し、稼働中の別ownerは保持する", async () => {
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-socket-"));
+  test("認証前の接続数を32件に制限する", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-cap-"));
     const socket = path.join(directory, "p.sock");
-    const child = spawn(process.execPath, ["-e", `require('net').createServer().listen(${JSON.stringify(socket)},()=>process.stdout.write('ready'))`], { stdio: ["ignore", "pipe", "ignore"] });
+    const server = new JobResultPublishServer(new JobResultPublishCapabilities(() => undefined), () => undefined,
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) });
+    const clients: net.Socket[] = [];
     try {
-      await once(child.stdout!, "data");
-      const server = new JobResultPublishServer(socket, new JobResultPublishCapabilities(() => undefined), () => undefined,
-        { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) });
-      await assert.rejects(server.start(), /publish_socket_owned/);
-      child.kill("SIGKILL");
-      await once(child, "exit");
-      assert.equal((await fs.lstat(socket)).isSocket(), true);
-      await server.start();
-      await server.stop();
+      await startServer(server, socket);
+      for (let index = 0; index < 33; index++) {
+        const client = net.createConnection(socket);
+        client.on("error", () => {});
+        clients.push(client);
+        await new Promise<void>(resolve => client.once("connect", () => resolve()));
+      }
+      await Promise.race([new Promise<void>(resolve => clients[32]!.once("close", () => resolve())),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("overflow connection remained open")), 1_000))]);
+      assert.equal(clients[0]!.destroyed, false);
     } finally {
-      if (child.exitCode === null) child.kill("SIGKILL");
+      for (const client of clients) client.destroy();
+      await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
