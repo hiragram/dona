@@ -10,7 +10,7 @@
 | W4 | 旧protocol unsupportedまたはowner不明 | Result隔離、削除・resume・notify禁止 |
 | W5 | lease expiredのみ、旧workerが後からResult公開 | 同一owner/session/fenceでrevokeなしならreceipt化。revokedは隔離 |
 | W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
-| W7 | Aのlive workerが残るBからCへの更新 | CがA/Bの全live protocolを扱えなければactivation拒否 |
+| W7 | Aのlive workerまたは通知が残るBからCへの更新 | CがA/Bの全live owner/notification protocolを扱えなければactivation拒否 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
@@ -21,12 +21,14 @@
 | N1b | scheduled通知pending、authorization取消/失効 | 二段階認可が成立せず送信抑止 |
 | N2 | 投稿応答不明だがexact markerあり | 既送信としてreceiptを確定、再投稿なし |
 | N3 | 投稿応答不明でmarkerなし/old thread | 通知抑止、operator判断待ち |
+| N3a | blocked状態commit直後にrestart | attention event/IDとgroup transitionが同一transactionで残る |
 | N4 | group attention未解決、全sibling terminal | all-terminal抑止、sessionをactiveへ戻さない |
 | N5 | attention解決済み、全sibling terminal | 保存済みall-terminal eventだけ一度処理 |
 | M1 | migration前、旧schemaでrollback | 旧SHA/schema healthとreceiptを検証して復帰可 |
 | M2 | migration後、旧releaseは新schema非互換 | 検証済みsnapshot復元と外部receipt照合なしではrollback禁止 |
 | M3 | migration後、新epochでprovider write確定 | snapshot復元でもwriteを未実行扱いせずreconcile |
-| M4 | target ingress開始後に旧snapshotへのrollback要求 | 全mutation journalがないためsnapshot rollback禁止 |
+| M4 | targetでjob stamp/due scan等のwriter開始後に旧snapshotへのrollback要求 | 全mutation journalがないためsnapshot rollback禁止 |
+| M4a | 初回更新で旧releaseにactive-epoch APIなし | rollback不可なのでapply拒否、互換API先行導入が必要 |
 | M5 | Dispatcher active epoch install応答喪失 | receiptをread-backし、exact一致までingress停止 |
 | M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
 | M7 | 新ingress前のrollback inventory直後にworker Result到着 | writer fence後ならDB commitなし。Result領域を保護し復帰後に回収 |
