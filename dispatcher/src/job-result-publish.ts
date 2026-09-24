@@ -36,7 +36,7 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
-const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
+const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
   return typeof value.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(value.kty) &&
@@ -110,6 +110,8 @@ function hasLocalPath(value: string): boolean {
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
     const prefix = value.slice(0, match.index);
+    const slashPosition = match.index + match[0].indexOf("/");
+    if (/\/\/\[[0-9a-f:.]+\]$/i.test(value.slice(0, slashPosition))) continue;
     if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd()) &&
       !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|\b)/i.test(route) &&
       !/\/(?:\.ssh|\.aws|\.env|secrets|id_(?:rsa|ed25519))(?:\/|\b)/i.test(route)) continue;
@@ -124,7 +126,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
     const host = match[1]!;
     let url: URL;
     try { url = new URL(`https:${match[0]}`); } catch { return true; }
-    if (!host.includes(".") || url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(url.href)) return true;
+    if ((!host.includes(".") && !host.startsWith("[")) || url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(url.href)) return true;
     for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
       for (const [, parameterValue] of parameters) if (forbiddenValues?.contains(parameterValue)) return true;
     }
@@ -133,6 +135,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|\d+(?:\.\d+){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
@@ -197,6 +200,12 @@ function hasSignedQueryKey(candidate: string): boolean {
         const key = decodeURIComponent(parameter.slice(0, equal).replaceAll("+", " ")).toLowerCase();
         if (signedQueryKeys.has(key) || forbiddenKey(key)) return true;
       } catch { return true; }
+  }
+  return false;
+}
+function hasForbiddenUrlParameters(url: URL, forbiddenValues?: ForbiddenValueMatcher): boolean {
+  for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
+    for (const [, parameterValue] of parameters) if (forbiddenValues?.contains(parameterValue)) return true;
   }
   return false;
 }
@@ -296,14 +305,17 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       let url: URL;
       try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
       if (url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
-      for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
-        for (const [, parameterValue] of parameters) {
-          if (forbiddenValues?.contains(parameterValue)) throw new JobResultPublishError("content_requires_redaction");
-        }
+      if (hasForbiddenUrlParameters(url, forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
+    }
+    for (const match of value.matchAll(rootRelativeUrlCandidate)) {
+      const route = match[0].trimStart();
+      if (route.includes("?") || route.includes("#")) {
+        if (hasForbiddenUrlParameters(new URL(route, "https://example.com"), forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
       }
     }
     for (const match of value.matchAll(privateHostPathCandidate)) {
       if (hasPrivateHttpHost(`http://${match[1]}`)) throw new JobResultPublishError("content_requires_redaction");
+      if (hasForbiddenUrlParameters(new URL(`http://${match[1]}`), forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       const rawKey = match[0].replace(/\s*[:=]$/, "");
@@ -321,9 +333,15 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
     }
     if (/[\p{Cc}\p{Cf}]/u.test(value)) {
+      if (value.includes("\u001b]")) throw new JobResultPublishError("content_requires_redaction");
       const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
       if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
+    if (decodeDepth < 2 && /\\u[0-9A-Fa-f]{4}/.test(value)) {
+      const decodedJson = value.replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+      assertSafeJson(decodedJson, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
+    }
+    if (decodeDepth >= 2 && /\\u[0-9A-Fa-f]{4}/.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (decodeDepth < 2 && value.includes("%")) {
       const decoded = value.replace(/(?:%[0-9A-Fa-f]{2})+/g, encoded => {
         try { return decodeURIComponent(encoded); }

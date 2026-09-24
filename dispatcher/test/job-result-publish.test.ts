@@ -106,8 +106,8 @@ describe("job result publish contract", () => {
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
-    for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
-      assert.equal(validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    for (const value of ["//cdn.example.com/assets/report.json", "//[2606:4700:4700::1111]/dns-query", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
+      assert.doesNotThrow(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), value);
     }
     assert.equal(validateJobResultPublish({ ...base, summary: "coverage 95% complete" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.equal(validateJobResultPublish({ ...base, artifacts: [{ session_count: 3 }], actions: [{ token_count: 100 }] }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -129,6 +129,9 @@ describe("job result publish contract", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: publicJwks }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - jwkStarted < 2_000, "JWK本文検査は反復しても線形時間で終わる");
     assert.throws(() => validateJobResultPublish({ ...base, summary: "{".repeat(100_000) }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    const oscStarted = performance.now();
+    assert.throws(() => validateJobResultPublish({ ...base, summary: "\u001b]".repeat(20_000) }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    assert.ok(performance.now() - oscStarted < 2_000, "未終端OSCをboundedに拒否する");
     const jwtLike = `${"eyJ_".repeat(200)}.e30.dGVzdHNpZ25hdHVyZQ`;
     const jwtStarted = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: jwtLike.repeat(300) }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -271,6 +274,8 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "private%252520objective%252520text" }, () => current), code("content_requires_redaction"));
     const japanese = new JobResultPublishCapabilities(() => "session-ja");
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
