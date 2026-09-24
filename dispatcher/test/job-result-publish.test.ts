@@ -50,7 +50,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -99,12 +99,21 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.renew(renewed.capability, "session-1", getJob), code("renewal_not_due"));
     assert.equal(grants.renew(grant.capability, "session-1", getJob).capability, renewed.capability);
     assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
+    assert.throws(() => grants.validate(renewed.capability, "session-1", { ...base, summary: grant.capability }, getJob), code("content_requires_redaction"));
     assert.throws(() => new JobResultPublishCapabilities(() => persistedSession, () => now).validate(grant.capability, "session-1", base, getJob), code("capability_invalid"));
     now = Date.parse(renewed.expiresAt);
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"));
     now -= 1;
     grants.revokeJob("job_one");
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_revoked"));
+  });
+
+  test("永続live sessionの512文字上限を発行でも受理する", () => {
+    const session = "s".repeat(512);
+    const grants = new JobResultPublishCapabilities(() => session);
+    const grant = grants.issue(row(), session);
+    assert.equal(grants.authorize(grant.capability, session, () => row({ status: "running" })).job_id, "job_one");
+    assert.throws(() => grants.issue(row(), `${session}s`), code("job_not_publishable"));
   });
 
   test("専用UDSだけで認可し、本文・capabilityを応答せずcommit材料へ渡す", async () => {
@@ -154,6 +163,7 @@ describe("job result publish contract", () => {
       const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
       assert.equal(retriedRenewal.body, renewal.body);
       assert.equal((await post(JSON.stringify(base), grant.capability)).status, 202);
+      assert.equal((await post(JSON.stringify({ ...base, summary: grant.capability }), JSON.parse(renewal.body).capability)).status, 400);
       assert.equal((await post(JSON.stringify(base), JSON.parse(renewal.body).capability)).status, 202);
       assert.equal(accepted.length, 3);
       current = row({ status: "completed", result_json: "{}" });

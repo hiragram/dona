@@ -17,5 +17,5 @@
 - 認可後、Dispatcher が取得した永続 job row から job ID を補い、Dispatcher 時計から `completed_at` を補う。最終 JSON の UTF-8 byte 数は既存 reader と共有する 1 MiB 上限以下とする。
 - `canonicalDigest` は domain prefix、job ID、field 名の Unicode code point 順に安定化した request JSON の SHA-256。Dispatcher 補完時刻は含めない。同じ job と同じ request の再送は同じ digest、異なる内容は異なる digest になる。#291 が永続 receipt と照合して同一再送・異内容競合を確定する。
 - terminal job の再送は、永続 `result_json` がある場合だけ受け入れ、`reconcileOnly` によって read-only callback へ分岐する。#291 は保存済み digest と比較して `reused` または `conflict` だけを返し、terminal Result を更新しない。
-- 認可済み candidate の `fence` は job ID、attempt count、pane ID、live session を保持する。#291 の commit callback は Result 作成と同じ durable transaction でこの世代を再照合し、非同期処理中の cancel・再投入後に旧 worker の結果を保存しない。公開時の capability 自体も本文に完全一致で含まれていれば拒否する。
+- 認可済み candidate の `fence` は job ID、attempt count、pane ID、live session を保持する。#291 の commit callback は Result 作成と同じ durable transaction でこの世代を再照合し、非同期処理中の cancel・再投入後に旧 worker の結果を保存しない。同じ job の期限内 grant の digest を照合し、更新前後の capability が本文に含まれれば拒否する。
 - validation error は固定 code だけを返す。本文、capability、private URL、local path は error や通常の log、metrics、監査へ含めない。公開 transport も raw header/body を記録せず、この型付き code だけを返す。
