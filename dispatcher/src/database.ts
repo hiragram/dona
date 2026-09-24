@@ -283,6 +283,7 @@ export function migrateDispatcherDatabase(
         CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
         CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
         CREATE TEMP TABLE preserved_worker_message_workspace_cadence_v3 AS SELECT * FROM worker_message_workspace_cadence;
+        DROP TABLE worker_message_decisions;
         DROP TABLE worker_message_receipts;
         DROP TABLE worker_message_deliveries;
         DROP TABLE worker_message_cadence;

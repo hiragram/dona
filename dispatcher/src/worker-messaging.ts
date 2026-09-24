@@ -7,6 +7,7 @@ import { z } from "zod";
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
 import type { JobRow } from "./types.js";
 import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
+import { evaluateWorkerDecision, type WorkerDecisionAction, type WorkerDecisionSibling } from "./worker-decision.js";
 
 export const workerMessageProtocolVersion = 1 as const;
 export const workerMessagePayloadUtf8ByteMax = 16_384;
@@ -28,9 +29,9 @@ const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
 const identifier = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const safeText = z.string().trim().min(1).max(4_000);
 const reportPayload = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("checkpoint"), summary: safeText }).strict(),
+  z.object({ kind: z.literal("checkpoint"), summary: safeText, eta_at: utcRfc3339.optional() }).strict(),
   z.object({ kind: z.literal("question"), question: safeText }).strict(),
-  z.object({ kind: z.literal("risk"), summary: safeText, severity: z.enum(["low", "medium", "high"]) }).strict(),
+  z.object({ kind: z.literal("risk"), summary: safeText, severity: z.enum(["low", "medium", "high"]), eta_at: utcRfc3339.optional() }).strict(),
   z.object({ kind: z.literal("decision_request"), question: safeText, options: z.array(safeText.max(1_000)).min(1).max(8) }).strict(),
 ]);
 const instructionPayload = z.discriminatedUnion("operation", [
@@ -237,6 +238,20 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       last_delivery_at       TEXT,
       updated_at             TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS worker_message_decisions (
+      message_id             TEXT PRIMARY KEY REFERENCES worker_messages(message_id) ON DELETE CASCADE,
+      notification_event_id  TEXT NOT NULL REFERENCES events(event_id),
+      job_id                 TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+      action                 TEXT NOT NULL CHECK (action IN ('ack_internal','aggregate_wait','report_to_user','ask_user')),
+      reason                 TEXT NOT NULL,
+      content_sha256         TEXT NOT NULL CHECK (length(content_sha256) = 64),
+      group_sha256           TEXT NOT NULL CHECK (length(group_sha256) = 64),
+      group_total            INTEGER NOT NULL,
+      safe_projection_json   TEXT,
+      decided_at             TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS worker_message_decisions_job_idx ON worker_message_decisions(job_id,decided_at,message_id);
   `);
   const runtimeIdentityColumns=new Set((db.pragma("table_info(worker_message_runtime_identities)") as Array<{name:string}>).map(row=>row.name));
   if(runtimeIdentityColumns.has("job_id"))db.exec(`
@@ -519,6 +534,55 @@ export class WorkerMessageRepository {
         throw new WorkerMessageError("worker_message_report_unavailable","question can no longer receive an answer");
     }
     return message;
+  }
+
+  decideReport(jobId:string,messageId:string,notificationEventId:string,at=new Date()) {
+    return this.db.transaction(()=>{
+      const message=this.getMessage(jobId,messageId,notificationEventId);
+      if(!message||message.direction!=="worker_to_dona")
+        throw new WorkerMessageError("job_binding_mismatch","notification does not own this worker report");
+      const existing=this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=?")
+        .get(messageId) as {message_id:string;notification_event_id:string;action:WorkerDecisionAction;reason:string;
+          content_sha256:string;group_sha256:string;group_total:number;safe_projection_json:string|null;decided_at:string}|undefined;
+      const project=(row:NonNullable<typeof existing>)=>({message_id:row.message_id,job_id:jobId,
+        notification_event_id:row.notification_event_id,action:row.action,reason:row.reason,
+        content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
+        ...(row.safe_projection_json?{safe_projection:JSON.parse(row.safe_projection_json)}:{}),decided_at:row.decided_at});
+      if(existing)return project(existing);
+      const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
+        .get(notificationEventId) as {status:string}|undefined;
+      if(!event||!["dispatching","waiting_agent"].includes(event.status))
+        throw new WorkerMessageError("worker_message_report_unavailable","notification is no longer active");
+      const group=this.db.prepare("SELECT job_id,status FROM jobs WHERE source_event_id=? ORDER BY job_id LIMIT 33")
+        .all(message.source_event_id) as WorkerDecisionSibling[];
+      const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
+        .get(message.source_event_id) as {count:number}).count;
+      if(!group.some(row=>row.job_id===jobId))
+        throw new WorkerMessageError("job_binding_mismatch","report job is absent from its group");
+      const previous=this.db.prepare(`SELECT d.action,d.content_sha256,d.decided_at,
+          json_extract(m.payload_json,'$.severity') AS severity,json_extract(m.payload_json,'$.eta_at') AS eta_at
+        FROM worker_message_decisions d JOIN worker_messages m USING(message_id)
+        WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
+        ORDER BY m.producer_sequence DESC,m.message_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
+        {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null;eta_at:string|null}|undefined;
+      const payload=JSON.parse(message.payload_json) as {kind:"checkpoint"|"question"|"risk"|"decision_request";
+        summary?:string;question?:string;severity?:"low"|"medium"|"high";options?:string[];eta_at?:string};
+      const cadence=this.db.prepare("SELECT silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
+        .get(jobId) as {silence_interval_ms:number}|undefined;
+      const decision=evaluateWorkerDecision({report:{message_id:messageId,job_id:jobId,kind:payload.kind,
+        sequence:message.producer_sequence,accepted_at:message.accepted_at,text:payload.question??payload.summary??"",
+        ...(payload.severity?{severity:payload.severity}:{}),...(payload.options?{options:payload.options}:{}),
+        ...(payload.eta_at?{eta_at:payload.eta_at}:{})},siblings:group,total_jobs:total,
+        ...(previous?{previous:{action:previous.action,content_sha256:previous.content_sha256,decided_at:previous.decided_at,
+          ...(previous.severity?{severity:previous.severity}:{}),...(previous.eta_at?{eta_at:previous.eta_at}:{})}}:{}),
+        now:at.toISOString(),silence_interval_ms:cadence?.silence_interval_ms??900_000});
+      const groupHash=sha256(stableStringify({total,jobs:group}));
+      this.db.prepare(`INSERT INTO worker_message_decisions(message_id,notification_event_id,job_id,action,reason,
+        content_sha256,group_sha256,group_total,safe_projection_json,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .run(messageId,notificationEventId,jobId,decision.action,decision.reason,decision.content_sha256,
+          groupHash,total,decision.safe_projection?stableStringify(decision.safe_projection):null,at.toISOString());
+      return project(this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=?").get(messageId) as NonNullable<typeof existing>);
+    }).immediate();
   }
 
   pendingQuestion(jobId: string) {

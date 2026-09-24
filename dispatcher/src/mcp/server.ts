@@ -28,6 +28,7 @@ export interface DispatcherJobClient {
   cancelJob(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   sendWorkerInstruction?(jobId:string,input:unknown):Promise<Record<string,unknown>>;
   getWorkerMessage?(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>>;
+  decideWorkerMessage?(jobId:string,messageId:string,notificationEventId:string):Promise<Record<string,unknown>>;
   reconcileWorkerMessage?(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
@@ -398,6 +399,17 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   },async({job_id,source_event_id,message_id})=>{
     try {if(!client.getWorkerMessage)throw new Error("Worker messaging is unavailable");return success(await client.getWorkerMessage(job_id,message_id,source_event_id));}
     catch(error){return failure(error,logger,"get_worker_message");}
+  });
+
+  server.registerTool("decide_worker_message", {
+    title:"Decide worker report",
+    description:"現在のworker report通知に束縛した決定をdurableに確定し、同じmessageの再処理は同じ決定を返します。safe_projectionだけを人向け文面候補に使い、raw reportを投稿しません。group attentionとterminalを優先します。",
+    inputSchema:{job_id:jobId,message_id:workerMessageId,notification_event_id:eventId},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({job_id,message_id,notification_event_id})=>{
+    try {if(!client.decideWorkerMessage)throw new Error("Worker decision is unavailable");
+      return success(await client.decideWorkerMessage(job_id,message_id,notification_event_id));}
+    catch(error){return failure(error,logger,"decide_worker_message");}
   });
 
   server.registerTool("reconcile_worker_message", {

@@ -43,6 +43,29 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
+  test("通知に束縛したdecisionをrestart後も再利用し、別eventを拒否する",async()=>{
+    const {database,source,job,config}=await fixture();
+    const accepted=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+    assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z")),1);
+    const event=database.getByExternalId("dona_message",`worker-message:${accepted.message.message_id}`)!;
+    const sqlite=new Database(config.databasePath);
+    sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+    sqlite.close();
+    try {
+      const first=database.workerMessages.decideReport(job.job_id,accepted.message.message_id,event.event_id,new Date("2026-09-21T00:00:03Z"));
+      assert.equal(first.action,"ack_internal");
+      assert.equal(first.notification_event_id,event.event_id);
+      assert.throws(()=>database.workerMessages.decideReport(job.job_id,accepted.message.message_id,source.event_id),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="job_binding_mismatch");
+      database.close();
+      const restarted=new DispatcherDatabase(config.databasePath);
+      try {
+        const replay=restarted.workerMessages.decideReport(job.job_id,accepted.message.message_id,event.event_id,new Date("2026-09-21T00:30:00Z"));
+        assert.deepEqual(replay,first);
+      } finally {restarted.close();}
+    } catch(error) {database.close();throw error;}
+  });
+
   test("strict contract、sequence、idempotency、terminal fenceを維持する",async()=>{
     const {database,source,job}=await fixture();
     try {
