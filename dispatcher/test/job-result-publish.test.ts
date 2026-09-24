@@ -50,7 +50,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
