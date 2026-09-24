@@ -44,6 +44,8 @@ describe("read-only live session reconciliation",()=>{
   test("invalid Resultのoperator解決は最新receiptと状態の一致を要求する",async()=>{
     const state=await addressableJob();
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
+    state.database.sealJobGroup(state.source.event_id);
+    const prior=state.database.enqueueJobNotification(state.job.job_id).row;
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     const current=state.database.getJob(state.job.job_id)!;
@@ -55,7 +57,36 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(resolved.status,"failed");
     assert.equal(resolved.last_error_code,"invalid_result_operator_resolved");
     assert.equal(resolved.result_json,null);
+    assert.equal(state.database.get(prior.event_id)?.last_error_code,"job_result_superseded");
+    assert.notEqual(resolved.completion_event_id,prior.event_id);
+    assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
+    state.database.close();
+  });
+  test("別のneeds_review原因で得たreceiptは後のinvalid Resultに使えない",async()=>{
+    const state=await addressableJob();
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    await new Promise(resolve=>setTimeout(resolve,5));
+    state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
+    const current=state.database.getJob(state.job.job_id)!;
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at),/live_session_receipt_precedes_job_state/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    state.database.close();
+  });
+  test("配達済みの旧通知を保持し確定状態の通知を追加する",async()=>{
+    const state=await addressableJob();
+    state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
+    state.database.sealJobGroup(state.source.event_id);
+    const prior=state.database.enqueueJobNotification(state.job.job_id).row;
+    state.database.manualComplete(prior.event_id);
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    const current=state.database.getJob(state.job.job_id)!;
+    const resolved=state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at);
+    assert.equal(state.database.get(prior.event_id)?.status,"completed");
+    assert.notEqual(resolved.completion_event_id,prior.event_id);
+    assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
     state.database.close();
   });
   test("exact identityのworkingを永続receiptへ記録しcontrol commandを呼ばない",async()=>{
