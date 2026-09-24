@@ -95,12 +95,12 @@ describe("job result publish contract", () => {
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
-      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl",
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
-      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json",
+      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result",
       "GET /run/secrets/db-password returned 200", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -267,6 +267,7 @@ describe("job result publish contract", () => {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     const japanese = new JobResultPublishCapabilities(() => "session-ja");
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
     assert.throws(() => japanese.validate(jaGrant.capability, "session-ja", { ...base, summary: "https://example.com/?detail=%E7%A7%98%E5%AF%86+%E8%A8%88%E7%94%BB" },

@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const ansiEscape = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -106,18 +106,21 @@ function hasLocalPath(value: string): boolean {
 }
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
 const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/?#\s"'<>`]+)(?:[/?#][^\s"'<>`]*)?/g;
-function hasPrivateSlashAuthority(value: string): boolean {
+function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValueMatcher): boolean {
   for (const match of value.matchAll(slashAuthority)) {
     const host = match[1]!;
     let url: URL;
     try { url = new URL(`https:${match[0]}`); } catch { return true; }
     if (!host.includes(".") || url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(url.href)) return true;
+    for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
+      for (const [, parameterValue] of parameters) if (forbiddenValues?.contains(parameterValue)) return true;
+    }
   }
   return false;
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa))(?::\d{1,5})?\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)|[A-Za-z][A-Za-z0-9-]*)(?::\d{1,5})?\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -318,7 +321,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
