@@ -55,8 +55,8 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 const assignmentCandidate = /\b[A-Za-z_][A-Za-z0-9_]*\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
-  return /(?:^|_)(?:token|secret|password|credential|authorization|capability)(?:_|$)/.test(normalized) ||
-    /(?:token|secret|password|credential|authorization|apikey|accesskey|privatekey|capability)$/.test(normalized.replaceAll("_", "")) ||
+  return /(?:^|_)(?:token|secret|password|credential|authorization|capability|cookie)(?:_|$)/.test(normalized) ||
+    /(?:token|secret|password|credential|authorization|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
@@ -73,7 +73,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (forbiddenKey(match[0].replace(/\s*[:=]$/, ""))) throw new JobResultPublishError("content_requires_redaction");
     }
     if (forbiddenDigests && forbiddenFingerprints && containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
-    if (forbiddenValues?.some(privateValue => privateValue.length >= 4 && value.includes(privateValue))) {
+    if (forbiddenValues?.some(privateValue => privateValue.length >= 4 ? value.includes(privateValue) : value === privateValue)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
     if (sensitive.test(value)) throw new JobResultPublishError("content_requires_redaction");
@@ -254,7 +254,7 @@ export class JobResultPublishCapabilities {
       .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
       .map(candidate => candidate.fingerprint));
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
-      job.result_path, job.agent_name, grant.session].filter((value): value is string => typeof value === "string" && value.length >= 4);
+      job.result_path, job.agent_name, grant.session].filter((value): value is string => typeof value === "string" && value.length > 0);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
       fence: { jobId: job.job_id, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
   }

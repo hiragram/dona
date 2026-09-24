@@ -11,12 +11,9 @@ export function jobProgressPath(row: JobRow): string {
   return path.join(path.dirname(row.workspace_path), ".dona-progress", path.basename(row.workspace_path), "progress.json");
 }
 
-/** Explicit opt-in prompt fragment for the future publish rollout. Never log this value. */
-export function buildJobResultPublishInstructions(capability: string, expiresAt: string): string {
-  if (!/^[A-Za-z0-9_-]{43}$/.test(capability) || Number.isNaN(Date.parse(expiresAt))) {
-    throw new Error("invalid_result_publish_delivery");
-  }
-  return `Result公開専用の短命capability: ${capability}\n有効期限: ${expiresAt}\n構造化公開requestはschema_version=1、status、summary、任意のoutput、artifacts（object配列）、actionsだけを送ります。job_id、path、completed_at、ownerは送らず、Dispatcherが永続job契約から補完します。capabilityはResult本文、log、artifactへ含めないでください。期限内でもworker session変更またはDispatcher restart後は再発行が必要です。最大有効期間は${jobResultPublishTtlMs / 60_000}分です。`;
+/** Safe prompt fragment. The rollout must deliver the raw grant outside argv/prompt. */
+export function buildJobResultPublishInstructions(): string {
+  return `Result公開専用の短命capabilityは対象worker専用の非argv経路から取得してください。構造化公開requestはschema_version=1、status、summary、任意のoutput、artifacts（object配列）、actionsだけを送ります。job_id、path、completed_at、ownerは送らず、Dispatcherが永続job契約から補完します。capabilityはprompt、引数、環境変数、Result本文、log、artifactへ含めないでください。期限内でもworker session変更またはDispatcher restart後は再発行が必要です。最大有効期間は${jobResultPublishTtlMs / 60_000}分です。`;
 }
 
 export function buildJobPrompt(row: JobRow, progressEnabled = true): string {

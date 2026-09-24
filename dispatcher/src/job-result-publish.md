@@ -5,7 +5,7 @@
 ## 発行と配送
 
 - Dispatcher の dispatching 境界だけが `issue(job, session)` を呼ぶ。同じ job の既存 grant は失効する。32 byte の暗号学的乱数を base64url にし、server は SHA-256 digest のみを保持する。
-- raw capability は対象 worker への個別 prompt にだけ配送する。`buildJobResultPublishInstructions` は明示的に新方式を選んだ prompt に追加するための部品であり、通常の `buildJobPrompt` は変更しない。共通 Dispatcher MCP に公開 tool を追加しない。
+- raw capability は対象 worker だけが読める専用の stdin／file descriptor 等で配送し、prompt、argv、環境変数、共通 log へ載せない。既存 Herdr 起動経路は prompt を argv に渡すため、`buildJobResultPublishInstructions` は秘密値を引数にも返り値にも含まない案内文だけとする。#292 が非argv配送を実装・検証するまで capability を実際の worker 起動へ配線しない。通常の `buildJobPrompt` は変更せず、共通 Dispatcher MCP に公開 tool を追加しない。
 - 有効期間は発行から30分。`revokeJob` は cancel と worker 再投入時に呼ぶ。terminal 後は元の期限まで同じ grant の再送を read-only `reconcile` callback へだけ渡し、新たな commit は禁止する。発行時と認可時に永続 live-session identity の session を確認し、認可時に永続 job の status、attempt count、pane ID も再照合する。job ID や Result path は認可材料にならない。
 - 長時間 job は発行から15分以降、期限前に専用 UDS の `POST /v1/job-result-publish/renew` で現在の grant を更新する。それ以前は固定 code `renewal_not_due` で拒否する。旧 grant は元の期限まで有効で、新しい capability は private な応答で worker に返す。同じ旧 capability からの renewal 再送は同じ successor と期限を返すため、応答喪失後も回収できる。期限切れ後の再発行は自動で行わず、Dispatcher の worker 世代確認が必要になる。
 - grant は process memory だけに保持する。Dispatcher restart では全 grant が失われ、旧 worker の再送は拒否する。restart 後の復旧・再発行は #292 の gate と worker 世代照合で扱う。

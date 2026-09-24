@@ -62,7 +62,7 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ token: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ nested: { api_key: "CANARY_VALUE" } }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "herdr_pane_id", "agent_session", "workspacePath"]) {
+    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "cookie", "set-cookie", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE"]) {
@@ -89,8 +89,9 @@ describe("job result publish contract", () => {
     const grants = new JobResultPublishCapabilities(() => persistedSession, () => now);
     const original = row();
     const grant = grants.issue(original, "session-1");
-    const instructions = buildJobResultPublishInstructions(grant.capability, grant.expiresAt);
-    assert.ok(instructions.includes(grant.capability));
+    const instructions = buildJobResultPublishInstructions();
+    assert.ok(!instructions.includes(grant.capability));
+    assert.ok(!instructions.includes(grant.expiresAt));
     assert.ok(instructions.includes("job_id、path、completed_at、ownerは送らず"));
     let current = row({ status: "running" });
     const getJob = (id: string) => id === current.job_id ? current : undefined;
@@ -98,6 +99,9 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `prefix-${grant.capability}-suffix` }, getJob), code("content_requires_redaction"));
     current = row({ status: "running", agent_name: "internal-worker-42" });
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: "internal-worker-42" }, getJob), code("content_requires_redaction"));
+    current = row({ status: "running", agent_name: "s1" });
+    assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: "s1" }, getJob), code("content_requires_redaction"));
+    assert.equal(grants.validate(grant.capability, "session-1", { ...base, summary: "task s1 is complete" }, getJob).envelope.status, "completed");
     current = row({ status: "running" });
     assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ job_id: "job_two" })), code("capability_invalid"));
     assert.throws(() => grants.validate(grant.capability, "session-2", base, getJob), code("worker_session_stale"));
@@ -129,6 +133,10 @@ describe("job result publish contract", () => {
     const grant = grants.issue(row(), session);
     assert.equal(grants.authorize(grant.capability, session, () => row({ status: "running" })).job_id, "job_one");
     assert.throws(() => grants.issue(row(), `${session}s`), code("job_not_publishable"));
+    const short = new JobResultPublishCapabilities(() => "s1");
+    const shortGrant = short.issue(row(), "s1");
+    assert.throws(() => short.validate(shortGrant.capability, "s1", { ...base, summary: "s1" }, () => row({ status: "running" })), code("content_requires_redaction"));
+    assert.equal(short.validate(shortGrant.capability, "s1", { ...base, summary: "task s1 is complete" }, () => row({ status: "running" })).envelope.status, "completed");
   });
 
   test("terminal cleanup後は同じgrantでread-only照合できる", () => {
