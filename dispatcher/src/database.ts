@@ -283,6 +283,7 @@ export function migrateDispatcherDatabase(
         CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
         CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
         CREATE TEMP TABLE preserved_worker_message_workspace_cadence_v3 AS SELECT * FROM worker_message_workspace_cadence;
+        CREATE TEMP TABLE preserved_worker_message_decisions_v3 AS SELECT * FROM worker_message_decisions;
         DROP TABLE worker_message_decisions;
         DROP TABLE worker_message_receipts;
         DROP TABLE worker_message_deliveries;
@@ -399,12 +400,18 @@ export function migrateDispatcherDatabase(
           workspace_id, minimum_interval_ms, last_delivery_at, updated_at
         ) SELECT workspace_id, minimum_interval_ms, last_delivery_at, updated_at
         FROM preserved_worker_message_workspace_cadence_v3;
+        INSERT INTO worker_message_decisions (
+          message_id,notification_event_id,job_id,action,reason,content_sha256,group_sha256,
+          group_total,safe_projection_json,decided_at
+        ) SELECT message_id,notification_event_id,job_id,action,reason,content_sha256,group_sha256,
+          group_total,safe_projection_json,decided_at FROM preserved_worker_message_decisions_v3;
         DROP TABLE preserved_worker_messages_v3;
         DROP TABLE preserved_worker_message_runtime_identities_v3;
         DROP TABLE preserved_worker_message_deliveries_v3;
         DROP TABLE preserved_worker_message_receipts_v3;
         DROP TABLE preserved_worker_message_cadence_v3;
         DROP TABLE preserved_worker_message_workspace_cadence_v3;
+        DROP TABLE preserved_worker_message_decisions_v3;
       `);
     }
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)

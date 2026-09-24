@@ -40,7 +40,7 @@ export interface WorkerDecision {
 }
 
 const terminal = new Set<WorkerJobStatus>(["completed", "failed", "cancelled", "needs_review"]);
-const unsafe = /(?:\b(?:https?|file):\/\/\S+|(?:^|\s)(?:~\/|\/[^\s]+|[A-Za-z]:\\[^\s]+)|\b(?:token|secret|password|api[_-]?key)\b|```|\$\(|\b(?:curl|bash|sh|sudo|rm)\b)/i;
+const unsafe = /(?:\b(?:https?|file):\/\/\S+|(?:^|\s)(?:~\/|\/[^\s]+|[A-Za-z]:\\[^\s]+)|\b(?:token|secret|password|api[_-]?key)\b|```|\$\(|\b(?:curl|bash|sh|sudo|rm)\b|<[^>]*>|xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat)-[A-Za-z0-9_-]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
 
 function safeQuestion(text: string): string | undefined {
   const trimmed = text.trim();
@@ -53,20 +53,21 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
   const current = siblings.find(sibling => sibling.job_id === report.job_id);
   if (!current || terminal.has(current.status) || current.status === "cancelling")
     return { action: "ack_internal", reason: "terminal", content_sha256 };
+  if (report.kind === "question" || report.kind === "decision_request") {
+    const prompt = safeQuestion(report.text);
+    const options = report.options?.map(safeQuestion);
+    const safe = !!prompt && (!options || options.every(Boolean));
+    return { action: "ask_user", reason: report.kind,
+      content_sha256, safe_projection: { kind: report.kind,
+        prompt: safe ? prompt : "ワーカーから確認が必要な質問が届きました。安全な方法で内容を確認してください。",
+        ...(safe && options ? { options: options as string[] } : {}) } };
+  }
   if (context.total_jobs > siblings.length)
     return { action: "aggregate_wait", reason: "group_wait", content_sha256 };
   if (siblings.some(sibling => sibling.status === "failed" || sibling.status === "needs_review"))
     return { action: "aggregate_wait", reason: "group_attention", content_sha256 };
   if (previous?.content_sha256 === content_sha256)
     return { action: "ack_internal", reason: "duplicate", content_sha256 };
-  if (report.kind === "question" || report.kind === "decision_request") {
-    const prompt = safeQuestion(report.text);
-    const options = report.options?.map(safeQuestion);
-    if (!prompt || (options && options.some(option => !option)))
-      return { action: "aggregate_wait", reason: "group_wait", content_sha256 };
-    return { action: "ask_user", reason: report.kind,
-      content_sha256, safe_projection: { kind: report.kind, prompt, ...(options ? { options: options as string[] } : {}) } };
-  }
   if (report.kind === "risk" && report.severity === "high")
     return { action: "report_to_user", reason: "risk_escalation", content_sha256 };
   if (report.kind === "risk" && previous?.severity !== report.severity)

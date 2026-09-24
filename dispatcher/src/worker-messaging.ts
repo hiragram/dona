@@ -240,7 +240,7 @@ export function migrateWorkerMessaging(db: Database.Database): void {
     );
 
     CREATE TABLE IF NOT EXISTS worker_message_decisions (
-      message_id             TEXT PRIMARY KEY REFERENCES worker_messages(message_id) ON DELETE CASCADE,
+      message_id             TEXT NOT NULL REFERENCES worker_messages(message_id) ON DELETE CASCADE,
       notification_event_id  TEXT NOT NULL REFERENCES events(event_id),
       job_id                 TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
       action                 TEXT NOT NULL CHECK (action IN ('ack_internal','aggregate_wait','report_to_user','ask_user')),
@@ -249,7 +249,8 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       group_sha256           TEXT NOT NULL CHECK (length(group_sha256) = 64),
       group_total            INTEGER NOT NULL,
       safe_projection_json   TEXT,
-      decided_at             TEXT NOT NULL
+      decided_at             TEXT NOT NULL,
+      PRIMARY KEY(message_id,notification_event_id)
     );
     CREATE INDEX IF NOT EXISTS worker_message_decisions_job_idx ON worker_message_decisions(job_id,decided_at,message_id);
   `);
@@ -538,17 +539,26 @@ export class WorkerMessageRepository {
 
   decideReport(jobId:string,messageId:string,notificationEventId:string,at=new Date()) {
     return this.db.transaction(()=>{
-      const message=this.getMessage(jobId,messageId,notificationEventId);
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+      if(!job)throw new WorkerMessageError("job_not_found","job does not exist");
+      this.assertAuthorized(job,notificationEventId);
+      const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND message_id=?")
+        .get(jobId,messageId) as WorkerMessageRow|undefined;
       if(!message||message.direction!=="worker_to_dona")
         throw new WorkerMessageError("job_binding_mismatch","notification does not own this worker report");
-      const existing=this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=?")
-        .get(messageId) as {message_id:string;notification_event_id:string;action:WorkerDecisionAction;reason:string;
+      const delivery=this.db.prepare("SELECT event_id FROM worker_message_deliveries WHERE message_id=? AND consumer='dona-main'")
+        .get(messageId) as {event_id:string|null}|undefined;
+      if(delivery?.event_id!==notificationEventId)
+        throw new WorkerMessageError("job_binding_mismatch","notification does not own this delivery");
+      const existing=this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=? AND notification_event_id=?")
+        .get(messageId,notificationEventId) as {message_id:string;notification_event_id:string;action:WorkerDecisionAction;reason:string;
           content_sha256:string;group_sha256:string;group_total:number;safe_projection_json:string|null;decided_at:string}|undefined;
       const project=(row:NonNullable<typeof existing>)=>({message_id:row.message_id,job_id:jobId,
         notification_event_id:row.notification_event_id,action:row.action,reason:row.reason,
         content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
         ...(row.safe_projection_json?{safe_projection:JSON.parse(row.safe_projection_json)}:{}),decided_at:row.decided_at});
       if(existing)return project(existing);
+      this.getMessage(jobId,messageId,notificationEventId);
       const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
         .get(notificationEventId) as {status:string}|undefined;
       if(!event||!["dispatching","waiting_agent"].includes(event.status))
@@ -581,7 +591,8 @@ export class WorkerMessageRepository {
         content_sha256,group_sha256,group_total,safe_projection_json,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
         .run(messageId,notificationEventId,jobId,decision.action,decision.reason,decision.content_sha256,
           groupHash,total,decision.safe_projection?stableStringify(decision.safe_projection):null,at.toISOString());
-      return project(this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=?").get(messageId) as NonNullable<typeof existing>);
+      return project(this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=? AND notification_event_id=?")
+        .get(messageId,notificationEventId) as NonNullable<typeof existing>);
     }).immediate();
   }
 

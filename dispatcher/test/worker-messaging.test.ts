@@ -57,6 +57,10 @@ describe("worker messaging ledger",()=>{
       assert.equal(first.notification_event_id,event.event_id);
       assert.throws(()=>database.workerMessages.decideReport(job.job_id,accepted.message.message_id,source.event_id),
         (error:unknown)=>error instanceof WorkerMessageError&&error.code==="job_binding_mismatch");
+      database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"workspace","pane");
+      database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"done",completed_at:"2026-09-21T00:00:04Z"},job.result_path);
+      assert.deepEqual(database.workerMessages.decideReport(job.job_id,accepted.message.message_id,event.event_id),first);
       database.close();
       const restarted=new DispatcherDatabase(config.databasePath);
       try {
@@ -64,6 +68,30 @@ describe("worker messaging ledger",()=>{
         assert.deepEqual(replay,first);
       } finally {restarted.close();}
     } catch(error) {database.close();throw error;}
+  });
+
+  test("同じreportの再発行通知には新しいdecisionを記録する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const created=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const firstEvent=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(firstEvent.event_id);
+      sqlite.close();
+      const first=database.workerMessages.decideReport(job.job_id,created.message.message_id,firstEvent.event_id,new Date("2026-09-21T00:00:03Z"));
+      assert.equal(database.workerMessages.rearmUndispatchedReport(firstEvent.event_id,"2026-09-21T00:01:05Z",new Date("2026-09-21T00:00:04Z")),true);
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:01:06Z")),1);
+      const secondEvent=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}:2`)!;
+      assert.ok(secondEvent);
+      const secondSqlite=new Database(config.databasePath);
+      secondSqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(secondEvent.event_id);
+      secondSqlite.close();
+      const second=database.workerMessages.decideReport(job.job_id,created.message.message_id,secondEvent.event_id,new Date("2026-09-21T00:00:06Z"));
+      assert.notEqual(second.notification_event_id,first.notification_event_id);
+      assert.throws(()=>database.workerMessages.decideReport(job.job_id,created.message.message_id,firstEvent.event_id),
+        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="job_binding_mismatch");
+    } finally {database.close();}
   });
 
   test("strict contract、sequence、idempotency、terminal fenceを維持する",async()=>{
@@ -1081,6 +1109,9 @@ test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
   bridge.close();
 
   const legacyBridge=new Database(config.databasePath);
+  legacyBridge.prepare(`INSERT INTO worker_message_decisions(message_id,notification_event_id,job_id,action,reason,
+    content_sha256,group_sha256,group_total,safe_projection_json,decided_at) VALUES(?,?,?,'ack_internal','heartbeat',?,?,1,NULL,?)`)
+    .run(created.message.message_id,source.event_id,job.job_id,"a".repeat(64),"b".repeat(64),"2026-09-21T00:00:01Z");
   legacyBridge.exec(`
     ALTER TABLE worker_message_deliveries DROP COLUMN delivered_lease_owner;
     ALTER TABLE worker_message_deliveries DROP COLUMN delivered_lease_token_sha256;
@@ -1092,6 +1123,7 @@ test("schema v2 bridgeのledgerをjobs v3再構築後も保全する",async()=>{
   activation.pragma("foreign_keys = ON");
   migrateDispatcherDatabase(activation,()=>{},false,3);
   assert.deepEqual(activation.pragma("foreign_key_check"),[]);
+  assert.equal((activation.prepare("SELECT action FROM worker_message_decisions WHERE message_id=?").get(created.message.message_id) as {action:string}).action,"ack_internal");
   activation.close();
 
   const reopened=new DispatcherDatabase(config.databasePath);
