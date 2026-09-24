@@ -7,7 +7,7 @@ import { z } from "zod";
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
 import type { JobRow } from "./types.js";
 import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
-import { evaluateWorkerDecision, type WorkerDecisionAction, type WorkerDecisionSibling } from "./worker-decision.js";
+import { evaluateWorkerDecision, renderWorkerDecisionPost, type WorkerDecisionAction, type WorkerDecisionSibling } from "./worker-decision.js";
 
 export const workerMessageProtocolVersion = 1 as const;
 export const workerMessagePayloadUtf8ByteMax = 16_384;
@@ -556,7 +556,9 @@ export class WorkerMessageRepository {
       const project=(row:NonNullable<typeof existing>)=>({message_id:row.message_id,job_id:jobId,
         notification_event_id:row.notification_event_id,action:row.action,reason:row.reason,
         content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
-        ...(row.safe_projection_json?{safe_projection:JSON.parse(row.safe_projection_json)}:{}),decided_at:row.decided_at});
+        ...(row.safe_projection_json?(()=>{const safe_projection=JSON.parse(row.safe_projection_json) as NonNullable<ReturnType<typeof evaluateWorkerDecision>["safe_projection"]>;
+          const post_text=renderWorkerDecisionPost(safe_projection);
+          return {safe_projection,post_text,post_body_sha256:sha256(post_text)};})():{}),decided_at:row.decided_at});
       if(existing)return project(existing);
       if(terminal(job.status)===false&&job.status!=="needs_review")this.getMessage(jobId,messageId,notificationEventId);
       const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
@@ -579,9 +581,11 @@ export class WorkerMessageRepository {
         WHERE job_id=? AND direction='worker_to_dona' AND producer_sequence<?
           AND json_type(payload_json,'$.eta_at')='text'
         ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
-      const lastRisk=this.db.prepare(`SELECT json_extract(payload_json,'$.severity') AS severity FROM worker_messages
-        WHERE job_id=? AND direction='worker_to_dona' AND kind='risk' AND producer_sequence<?
-        ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {severity:string}|undefined;
+      const lastRisk=this.db.prepare(`SELECT json_extract(m.payload_json,'$.severity') AS severity FROM worker_messages m
+        JOIN worker_message_decisions d ON d.message_id=m.message_id AND d.action='report_to_user'
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind='risk' AND m.producer_sequence<?
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {severity:string}|undefined;
       const answered=this.db.prepare(`SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries delivery
         ON delivery.message_id=answer.message_id WHERE answer.job_id=? AND answer.direction='dona_to_worker'
         AND answer.kind='answer' AND answer.correlation_message_id=? AND delivery.consumer='worker'
@@ -614,6 +618,40 @@ export class WorkerMessageRepository {
       return project(this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=? AND notification_event_id=?")
         .get(messageId,notificationEventId) as NonNullable<typeof existing>);
     }).immediate();
+  }
+
+  decisionCurrent(jobId:string,messageId:string,notificationEventId:string) {
+    return this.db.transaction(()=>{
+    const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+    if(!job)throw new WorkerMessageError("job_not_found","job does not exist");
+    this.assertAuthorized(job,notificationEventId);
+    const decision=this.db.prepare(`SELECT d.action,d.group_sha256 FROM worker_message_decisions d
+      JOIN worker_message_deliveries delivery ON delivery.message_id=d.message_id
+      WHERE d.job_id=? AND d.message_id=? AND d.notification_event_id=?
+        AND delivery.event_id=? AND delivery.consumer='dona-main'`)
+      .get(jobId,messageId,notificationEventId,notificationEventId) as
+      {action:WorkerDecisionAction;group_sha256:string}|undefined;
+    if(!decision)throw new WorkerMessageError("job_binding_mismatch","notification has no bound decision");
+    const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
+      .get(notificationEventId) as {status:string}|undefined;
+    if(!event||!["dispatching","waiting_agent"].includes(event.status))return {current:false,reason:"notification_inactive"};
+    if(terminal(job.status)||job.status==="needs_review"||job.status==="cancelling")return {current:false,reason:"job_inactive"};
+    if(decision.action==="ask_user"&&this.db.prepare(`SELECT 1 FROM worker_messages answer
+      JOIN worker_message_deliveries delivery ON delivery.message_id=answer.message_id
+      WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
+        AND answer.correlation_message_id=? AND delivery.consumer='worker' AND delivery.state!='superseded' LIMIT 1`)
+      .get(jobId,messageId)!==undefined)return {current:false,reason:"answered"};
+    const group=this.db.prepare("SELECT job_id,status FROM jobs WHERE source_event_id=? ORDER BY job_id LIMIT 33")
+      .all(job.source_event_id) as WorkerDecisionSibling[];
+    const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
+      .get(job.source_event_id) as {count:number}).count;
+    if(sha256(stableStringify({total,jobs:group}))!==decision.group_sha256)return {current:false,reason:"group_changed"};
+    if(group.some(row=>(row.status==="blocked"&&!(decision.action==="ask_user"&&row.job_id===jobId))
+      ||row.status==="failed"||row.status==="needs_review"))
+      return {current:false,reason:"group_attention"};
+    return {current:decision.action==="ask_user"||decision.action==="report_to_user",
+      reason:decision.action==="ask_user"||decision.action==="report_to_user"?"current":"internal_decision"};
+    }).deferred();
   }
 
   pendingQuestion(jobId: string) {

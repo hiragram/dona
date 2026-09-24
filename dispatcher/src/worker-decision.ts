@@ -44,6 +44,12 @@ export interface WorkerDecision {
   safe_projection?: { kind: "question" | "decision_request" | "progress"; prompt: string; options?: string[] };
 }
 
+export function renderWorkerDecisionPost(projection: NonNullable<WorkerDecision["safe_projection"]>): string {
+  return projection.options?.length
+    ? `${projection.prompt}\n選択肢: ${projection.options.map((option,index)=>`${index+1}. ${option}`).join(" / ")}`
+    : projection.prompt;
+}
+
 const terminal = new Set<WorkerJobStatus>(["completed", "failed", "cancelled", "needs_review"]);
 const unsafe = /(?:```|\$\(|\b(?:curl|bash|sh|sudo|rm)\b|<[^>]*>|xox[a-z]-|xapp-|gh[pousr]_|github_pat_|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-|(?:[rs]k_(?:live|test)|whsec)_|sk-(?:proj-)?)/i;
 
@@ -70,7 +76,7 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
   }
   if (context.total_jobs > siblings.length)
     return { action: "aggregate_wait", reason: "group_wait", content_sha256 };
-  if (siblings.some(sibling => sibling.status === "failed" || sibling.status === "needs_review"))
+  if (siblings.some(sibling => sibling.status === "blocked" || sibling.status === "failed" || sibling.status === "needs_review"))
     return { action: "aggregate_wait", reason: "group_attention", content_sha256 };
   const progress=(reason:"risk_escalation"|"risk"|"eta_change"|"silence"):WorkerDecision=>({action:"report_to_user",reason,
     content_sha256,safe_projection:{kind:"progress",prompt:reason==="risk_escalation"?

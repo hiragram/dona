@@ -818,6 +818,15 @@ export class DispatcherApi {
       return;
     }
     const messageDecision = /^\/v1\/jobs\/([^/]+)\/messages\/(msg_[0-9a-hjkmnp-tv-z]{26})\/decision$/.exec(url.pathname);
+    if(request.method==="GET"&&messageDecision){
+      if(!await this.authorizedDonaInternalRequest(request))
+        throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");
+      const notificationEventId=url.searchParams.get("notification_event_id")??"";
+      const state=this.database.workerMessages.decisionCurrent(decodeURIComponent(messageDecision[1]!),
+        messageDecision[2]!,notificationEventId);
+      sendJson(response,200,{schema_version:1,...state});
+      return;
+    }
     if (request.method === "POST" && messageDecision) {
       if(!await this.authorizedDonaInternalRequest(request))
         throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");

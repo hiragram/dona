@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { renderWorkerDecisionPost, type WorkerDecision } from "./worker-decision.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -2121,16 +2122,43 @@ export class DispatcherDatabase {
         }
       }
       if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
-        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
-        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
-          const decision=this.db.prepare(`SELECT d.action,d.reason FROM worker_message_decisions d
+        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;message_id?:unknown;kind?:unknown};
+        const decision=typeof payload.job_id==="string"&&typeof payload.message_id==="string"
+          ?this.db.prepare(`SELECT d.action,d.reason,d.safe_projection_json FROM worker_message_decisions d
             JOIN worker_message_deliveries delivery ON delivery.message_id=d.message_id
-            WHERE d.job_id=? AND d.notification_event_id=? AND delivery.event_id=?
-              AND delivery.consumer='dona-main' LIMIT 1`).get(payload.job_id,eventId,eventId) as
-            {action:string;reason:string}|undefined;
+            WHERE d.job_id=? AND d.message_id=? AND d.notification_event_id=? AND delivery.event_id=?
+              AND delivery.consumer='dona-main' LIMIT 1`).get(payload.job_id,payload.message_id,eventId,eventId) as
+          {action:string;reason:string;safe_projection_json:string|null}|undefined:undefined;
+        const expectedBodySha256=decision?.safe_projection_json?createHash("sha256")
+          .update(renderWorkerDecisionPost(JSON.parse(decision.safe_projection_json) as NonNullable<WorkerDecision["safe_projection"]>)).digest("hex"):undefined;
+        if(!decision){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_decision_missing",
+            last_error_message:"Worker report completed without a bound decision"});
+          this.revealBlockedQuestionOwner(event,"worker_message_decision_missing","Worker report decision is unavailable");
+          return;
+        }
+        if(decision.action==="ack_internal"||decision.action==="aggregate_wait"){
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message"));
+          if(posted){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_unexpected_post",
+              last_error_message:"Worker report was posted despite an internal-only decision"});
+            return;
+          }
+        }
+        if(["question","decision_request"].includes(String(payload.kind))){
           if(decision?.action==="ack_internal"&&["answered","terminal"].includes(decision.reason)){
             this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+            return;
+          }
+          if(decision.action!=="ask_user"||!decision.safe_projection_json){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_question_decision_mismatch",
+              last_error_message:"Question notification has no safe user decision"});
+            this.revealBlockedQuestionOwner(event,"worker_message_question_decision_mismatch","Question decision is unavailable");
             return;
           }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
@@ -2140,6 +2168,7 @@ export class DispatcherDatabase {
             (action as Record<string,unknown>).channel_id===target?.channel_id&&
             (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
             typeof (action as Record<string,unknown>).message_ts==="string"&&
+            (action as Record<string,unknown>).body_sha256===expectedBodySha256&&
             (action as Record<string,unknown>).reply_broadcast===false&&
             (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
           const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
@@ -2155,6 +2184,24 @@ export class DispatcherDatabase {
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:reason,last_error_message:description});
             this.revealBlockedQuestionOwner(event,reason,description);
+            return;
+          }
+        }
+        if(decision.action==="report_to_user"){
+          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
+          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
+            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
+            (action as Record<string,unknown>).channel_id===target?.channel_id&&
+            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
+            typeof (action as Record<string,unknown>).message_ts==="string"&&
+            (action as Record<string,unknown>).body_sha256===expectedBodySha256&&
+            (action as Record<string,unknown>).reply_broadcast===false&&
+            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
+          if(!posted||!decision.safe_projection_json){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_progress_not_posted",
+              last_error_message:"Progress decision completed without a safe confirmed post"});
             return;
           }
         }

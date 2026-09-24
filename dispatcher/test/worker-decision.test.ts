@@ -51,6 +51,9 @@ describe("worker decision policy", () => {
       report: { ...base.report, kind: "risk", text: "品質上の懸念", severity: "high" } });
     assert.equal(group.action, "aggregate_wait");
     assert.equal(group.reason, "group_attention");
+    const blocked=evaluateWorkerDecision({...base,siblings:[...base.siblings,{job_id:"job_2",status:"blocked"}],total_jobs:2,
+      report:{...base.report,kind:"risk",text:"懸念",severity:"high"}});
+    assert.equal(blocked.reason,"group_attention");
     const repeated=evaluateWorkerDecision({...base,report:{...base.report,kind:"risk",text:"同じ懸念",severity:"medium"},
       previous:{action:"ack_internal",content_sha256:"checkpoint",decided_at:base.now},last_risk_severity:"medium"});
     assert.equal(repeated.action,"ack_internal");

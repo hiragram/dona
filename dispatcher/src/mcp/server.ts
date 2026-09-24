@@ -29,6 +29,7 @@ export interface DispatcherJobClient {
   sendWorkerInstruction?(jobId:string,input:unknown):Promise<Record<string,unknown>>;
   getWorkerMessage?(jobId:string,messageId:string,sourceEventId:string):Promise<Record<string,unknown>>;
   decideWorkerMessage?(jobId:string,messageId:string,notificationEventId:string):Promise<Record<string,unknown>>;
+  workerDecisionCurrent?(jobId:string,messageId:string,notificationEventId:string):Promise<Record<string,unknown>>;
   reconcileWorkerMessage?(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>>;
   planSelfUpdate(input: unknown): Promise<Record<string, unknown>>;
   applySelfUpdate(input: unknown): Promise<Record<string, unknown>>;
@@ -410,6 +411,17 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
     try {if(!client.decideWorkerMessage)throw new Error("Worker decision is unavailable");
       return success(await client.decideWorkerMessage(job_id,message_id,notification_event_id));}
     catch(error){return failure(error,logger,"decide_worker_message");}
+  });
+
+  server.registerTool("check_worker_decision_current", {
+    title:"Check worker decision before post",
+    description:"worker reportをSlackへ投稿する直前に、保存済みdecisionの通知event、job状態、固定group snapshotが現在も一致するか読み取りで確認します。currentがtrueでない場合は投稿しません。",
+    inputSchema:{job_id:jobId,message_id:workerMessageId,notification_event_id:eventId},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+  },async({job_id,message_id,notification_event_id})=>{
+    try {if(!client.workerDecisionCurrent)throw new Error("Worker decision check is unavailable");
+      return success(await client.workerDecisionCurrent(job_id,message_id,notification_event_id));}
+    catch(error){return failure(error,logger,"check_worker_decision_current");}
   });
 
   server.registerTool("reconcile_worker_message", {
