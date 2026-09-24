@@ -20,11 +20,6 @@ export class PreparedWorkspaceCleanupError extends Error {
   constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
 }
 
-export class UnverifiedExistingAgentError extends Error {
-  readonly code="existing_agent_permission_unverified";
-  constructor(){super("Existing agent permission identity cannot be verified");this.name="UnverifiedExistingAgentError";}
-}
-
 export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
@@ -50,8 +45,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const args = row.source==="dona_schedule"
     ? ["--strict-config","-C",resultDirectory,...scheduledPermissionArguments(resultDirectory,executablePaths,row.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
         ...disabledMcpServers.flatMap(name=>["-c",`mcp_servers.${name}.enabled=false`])]
-    : ["--add-dir", resultDirectory,"--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
-        "-c","mcp_servers.dona_slack.enabled=false","-c","mcp_servers.dona_dispatcher.enabled=false"];
+    : ["--add-dir", resultDirectory];
   if (progressEnabled && row.source !== "dona_schedule") args.push("--add-dir", path.dirname(jobProgressPath(row)));
   const workspace = workspaceFromJob(row);
   let trustedPaths: string[];
@@ -348,11 +342,18 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     }
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
+      if(row.source==="dona_schedule") throw new Error("Existing scheduled agent permission identity cannot be verified");
       if (workspace.kind === "github") {
-        try { await this.verifyExistingGitHubWorktree(row, workspace.repository, signal); }
-        catch { throw new UnverifiedExistingAgentError(); }
+        await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
       }
-      throw new UnverifiedExistingAgentError();
+      const parsed = parseJson(existingAgent.stdout);
+      const workspaceId = findValue(parsed, ["workspace_id"]);
+      const paneId = findValue(parsed, ["pane_id"]);
+      if (workspaceId !== undefined && paneId !== undefined) {
+        const herdrWorkspaceId=String(workspaceId),herdrPaneId=String(paneId);
+        const herdrAgentSessionId=agentSessionIdFromIdentity(existingAgent.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+        return { herdrWorkspaceId, herdrPaneId, ...(herdrAgentSessionId?{herdrAgentSessionId}:{}) };
+      }
     }
 
     let disabledMcpServers:string[]=[];
