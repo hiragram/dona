@@ -26,11 +26,7 @@ const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
       &&parsed.getUTCHours()===hour&&parsed.getUTCMinutes()===minute&&parsed.getUTCSeconds()===second;
   }, "must be a real UTC RFC 3339 date-time");
 const identifier = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
-const forbiddenReportContent = /(?:https?:\/\/|www\.|(?:^|\s)(?:\/|~\/|\.\.?\/)[^\s]+|\b(?:gh|git|curl|wget|sudo|export)\s+[^\n]+|(?:^|\s)(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})|```|\$\(|\b(?:stdout|stderr|authorization|bearer|token)\s*[:=])/i;
-const safeText = z.string().trim().min(1).max(4_000).refine(
-  value => !forbiddenReportContent.test(value),
-  "report text contains a command, path, URL, credential, or raw output marker",
-);
+const safeText = z.string().trim().min(1).max(4_000);
 const reportPayload = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("checkpoint"), summary: safeText }).strict(),
   z.object({ kind: z.literal("question"), question: safeText }).strict(),

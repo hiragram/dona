@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { DispatcherConfig } from "./config.js";
 import type { DispatcherDatabase } from "./database.js";
 import type { HerdrCommandResult } from "./herdr.js";
-import { PreparedWorkspaceCleanupError, type JobAgentRuntime } from "./job-runtime.js";
+import { PreparedWorkspaceCleanupError, UnverifiedExistingAgentError, type JobAgentRuntime } from "./job-runtime.js";
 import { buildJobPrompt, jobProgressPath } from "./job-prompt.js";
 import { JobResultNotFoundError, readJobResultEnvelope } from "./job-result.js";
 import type { Logger } from "./logger.js";
@@ -684,6 +684,10 @@ export class JobSupervisor {
       if(error instanceof PreparedWorkspaceCleanupError) {
         this.database.setJobRuntime(row.job_id,error.herdrWorkspaceId,error.herdrPaneId);
         this.database.markJobNeedsReview(row.job_id,"workspace_cleanup_failed",error.message);
+        return;
+      }
+      if(error instanceof UnverifiedExistingAgentError){
+        this.database.markJobNeedsReview(row.job_id,error.code,error.message);
         return;
       }
       if (this.stopping) return;

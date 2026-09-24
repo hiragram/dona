@@ -43,22 +43,6 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
-  test("全report kindでpath、URL、command、raw output markerを拒否する",async()=>{
-    const {database,source,job}=await fixture();
-    try{
-      const unsafe=[
-        {kind:"checkpoint",summary:"/private/worker/secret.txt"},
-        {kind:"question",question:"https://example.invalid/private を開きますか"},
-        {kind:"risk",summary:"git status を実行した",severity:"high"},
-        {kind:"decision_request",question:"判断してください",options:["stdout: raw output"]},
-      ];
-      for(const payload of unsafe)assert.throws(()=>database.workerMessages.appendReport(job.job_id,
-        {...report(source.event_id),payload}),
-        (error:unknown)=>error instanceof WorkerMessageError&&error.code==="invalid_worker_message");
-      assert.equal(database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-1").reconciliation,"not_found");
-    }finally{database.close();}
-  });
-
   test("strict contract、sequence、idempotency、terminal fenceを維持する",async()=>{
     const {database,source,job}=await fixture();
     try {

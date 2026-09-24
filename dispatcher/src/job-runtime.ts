@@ -20,6 +20,11 @@ export class PreparedWorkspaceCleanupError extends Error {
   constructor(message:string,readonly herdrWorkspaceId:string,readonly herdrPaneId:string) { super(message);this.name="PreparedWorkspaceCleanupError"; }
 }
 
+export class UnverifiedExistingAgentError extends Error {
+  readonly code="existing_agent_permission_unverified";
+  constructor(){super("Existing agent permission identity cannot be verified");this.name="UnverifiedExistingAgentError";}
+}
+
 export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
@@ -344,7 +349,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
     const existingAgent = await this.get(row.agent_name, signal);
     if (existingAgent.ok) {
       if (workspace.kind === "github") await this.verifyExistingGitHubWorktree(row, workspace.repository, signal);
-      throw new Error("Existing agent permission identity cannot be verified");
+      throw new UnverifiedExistingAgentError();
     }
 
     let disabledMcpServers:string[]=[];
