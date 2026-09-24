@@ -61,3 +61,7 @@ Dispatcher/Slackの`/health/version`は`update_notification_protocol: 1`を返�
 routine releaseはstable updater自身を変更しません。policy/schema変更時はcleanな最新main checkoutから`--upgrade-control`を明示実行します。このmodeはtrusted CIと3 package buildを再検証し、active/approved/awaiting approval requestがないことをUpdater UDSで確認してからだけUpdaterを停止します。同じSHAのreleaseが既にある場合もmanifestだけでは再利用せず、fresh stagingと実行treeの内容hashが一致することを確認します。停止をsocketで確認後、SQLite全件のnonterminal countを再確認し、WALをcheckpointして旧DB・updater・policy・plistをSHA別backupへ保存してからstaged control filesを切り替えます。
 
 新Updaterはlaunchctlの終了コードだけで成功扱いせず、期待SHA、`update_schema: 3`、DB読書きが揃うversion healthを30秒以内に観測します。SHAはplist環境変数由来なので、schemaも照合して旧binaryの取り残しを成功扱いしません。観測できなければ新processの停止を確認し、旧filesとDB snapshotを復元して旧SHA healthを確認します。command応答が曖昧でprocess停止を確定できない場合はfileを上書きしません。control-plane更新が成功してもDispatcher/Slack Adapterは変わらないため、続けて通常のplan/applyで同じ新releaseへ切り替えます。
+
+## workload cutoverの決定
+
+ADR 0003を正本とする。現行のquiesce判定だけではrunning worker、旧Result、通知backlogの移譲を証明しない。実装前にepoch付きinventoryとcompletion/notification receiptを導入し、unknownを隔離する。共用fixtureは`docs/adr/fixtures/self-update-epoch-cutover.md`。
