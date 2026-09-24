@@ -589,7 +589,10 @@ export class WorkerMessageRepository {
       const lastRisk=this.db.prepare(`SELECT json_extract(m.payload_json,'$.severity') AS severity FROM worker_messages m
         JOIN worker_message_decisions d ON d.message_id=m.message_id AND d.action='report_to_user'
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
-        WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.kind='risk' AND m.producer_sequence<?
+        WHERE EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')
+          AND m.job_id=? AND m.direction='worker_to_dona' AND m.kind='risk' AND m.producer_sequence<?
         ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {severity:string}|undefined;
       const answered=this.db.prepare(`SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries delivery
         ON delivery.message_id=answer.message_id WHERE answer.job_id=? AND answer.direction='dona_to_worker'

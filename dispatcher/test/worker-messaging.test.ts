@@ -201,6 +201,34 @@ describe("worker messaging ledger",()=>{
       assert.equal(decision.action,"report_to_user");
     } finally {database.close();}
   });
+  test("投稿なしで完了したriskをseverityの既報baselineに使わない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,{...report(source.event_id,1),
+        payload:{kind:"risk",summary:"中程度の懸念",severity:"medium"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const firstEvent=database.getByExternalId("dona_message",`worker-message:${first.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(firstEvent.event_id);
+      sqlite.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,first.message.message_id,firstEvent.event_id,
+        new Date("2026-09-21T00:00:03Z")).action,"report_to_user");
+      database.createJob({source_event_id:source.event_id,job_key:"sibling",objective:"sibling",
+        workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir);
+      database.saveCompleted(firstEvent.event_id,{schema_version:1,event_id:firstEvent.event_id,status:"completed",
+        summary:"group変更のため投稿しない",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:04Z"},"result.json");
+      assert.equal(database.get(firstEvent.event_id)?.status,"completed");
+      const next=database.workerMessages.appendReport(job.job_id,{...report(source.event_id,2),
+        payload:{kind:"risk",summary:"懸念が継続",severity:"medium"}},new Date("2026-09-21T00:01:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:01:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${next.message.message_id}`)!;
+      const again=new Database(config.databasePath);
+      again.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      again.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,next.message.message_id,event.event_id,
+        new Date("2026-09-21T00:01:03Z")).reason,"risk");
+    } finally {database.close();}
+  });
   test("投稿直前のdecision確認はgroup driftとterminalを拒否する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
@@ -263,6 +291,30 @@ describe("worker messaging ledger",()=>{
           body_sha256:decision.post_body_sha256,reply_broadcast:false,success:true}],
         memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
       assert.equal(database.get(event.event_id)?.status,"completed");
+    } finally {database.close();}
+  });
+  test("無効化済みdecisionの投稿Resultを完了させない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const created=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        payload:{kind:"risk",summary:"懸念",severity:"high"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const target=JSON.parse(event.reply_target_json!) as {workspace_id:string;channel_id:string;thread_ts:string};
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      const decision=database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,
+        new Date("2026-09-21T00:00:03Z"));
+      database.createJob({source_event_id:source.event_id,job_key:"sibling",objective:"sibling",
+        workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir);
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"報告しました",actions:[{tool:"dona_slack.post_message",workspace_id:target.workspace_id,
+          channel_id:target.channel_id,thread_ts:target.thread_ts,message_ts:"1756722031.123456",
+          body_sha256:decision.post_body_sha256,reply_broadcast:false,success:true}],
+        memory_candidates:[],completed_at:"2026-09-21T00:00:04Z"},"result.json");
+      assert.equal(database.get(event.event_id)?.status,"needs_review");
+      assert.equal(database.get(event.event_id)?.last_error_code,"worker_message_post_after_decision_invalidated");
     } finally {database.close();}
   });
   test("回答済み質問の再通知を投稿なしで完了する",async()=>{
