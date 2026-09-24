@@ -135,7 +135,16 @@ describe("通常groupのResult統合", () => {
     database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"failed",
       summary:"別の失敗",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
     assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"progress");
+    assert.throws(()=>database.resolveFailedJobAttention(source.event_id,sibling.job_id,attention.row.event_id,
+      database.getJob(sibling.job_id)!.updated_at),/attention_resolution_binding_mismatch/);
+    const hash="a".repeat(64),expectedUpdatedAt=database.get(attention.row.event_id)!.updated_at;
+    const {request,claimToken}=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
     database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+        identity_block_verified:true,session_status:"suspended"});
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
     assert.equal(database.listJobsNeedingNotification()[0]?.job_id,sibling.job_id);
     const replacement=database.enqueueJobNotification(sibling.job_id);
@@ -194,6 +203,8 @@ describe("通常groupのResult統合", () => {
       `${config.resultsDir}/attention.json`);
     database.markJobNeedsReview(sibling.job_id,"prompt_interrupted","結果待ち");
     database.enqueueJobNotification(sibling.job_id);
+    assert.throws(()=>database.resolveNeedsReviewAttention(source.event_id,sibling.job_id,attention.row.event_id,
+      "no-receipt",database.getJob(sibling.job_id)!.updated_at),/attention_resolution_binding_mismatch/);
     database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"completed",
       summary:"late Result",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
@@ -302,6 +313,37 @@ describe("通常groupのResult統合", () => {
     database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
       expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
         identity_block_verified:true,session_status:"suspended"});
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.listJobsNeedingNotification()[0]?.job_id,sibling.job_id);
+    assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"attention");
+    database.close();
+  });
+
+  test("原因jobの解消後に通常attention Resultが確定して残るfailedへ引き継ぐ", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-result-handoff");
+    const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"failed",
+      summary:"別の失敗",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
+    database.enqueueJobNotification(sibling.job_id);
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:03:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
     assert.equal(database.listJobsNeedingNotification()[0]?.job_id,sibling.job_id);
     assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"attention");

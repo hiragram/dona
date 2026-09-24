@@ -1159,6 +1159,9 @@ export class DispatcherDatabase {
         throw new Error("attention_resolution_owner_mismatch");
       }
       const event = this.getRequired(attentionEventId);
+      if ((JSON.parse(event.payload_json) as {job_id?:string}).job_id!==jobId) {
+        throw new Error("attention_resolution_binding_mismatch");
+      }
       if (!this.attentionNotificationSettled(event)) throw new Error("attention_notification_requires_reconciliation");
       this.recordAttentionResolution(jobId, attentionEventId, "failed", "operator_reconcile", null, at);
       this.enqueueJobNotification(jobId, at);
@@ -1180,6 +1183,9 @@ export class DispatcherDatabase {
       }
       if (readEventJobBinding(this.db, sourceEventId)?.owner.kind !== "slack_thread") {
         throw new Error("attention_resolution_owner_mismatch");
+      }
+      if ((JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string}).job_id!==jobId) {
+        throw new Error("attention_resolution_binding_mismatch");
       }
       const receipt = this.getLiveSessionReceipt(jobId, receiptId);
       if (!receipt || receipt.durable_status_after !== "needs_review" || receipt.result_present_after ||
@@ -2253,6 +2259,7 @@ export class DispatcherDatabase {
       if(delivery.runId) {
         this.setNotificationState(eventId,delivery.delivered?"accepted":"needs_review",new Date(result.completed_at));
       }
+      if(event.source==="dona_job") this.handoffResolvedAttention(eventId,acceptedAt);
     }).immediate();
   }
 
@@ -2794,6 +2801,8 @@ export class DispatcherDatabase {
     if(payload.group?.transition!=="attention" || !causeJobId || !sourceEventId ||
         this.getJobGroup(sourceEventId)?.attention_event_id!==attentionEventId ||
         !this.attentionNotificationSettled(attention)) return;
+    if(this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?")
+      .get(attentionEventId)) return;
     const cause=this.getJob(causeJobId);
     if(!cause || cause.source_event_id!==sourceEventId ||
         !(cause.status==="completed" || cause.status==="cancelled" || this.jobAttentionResolved(cause))) return;
