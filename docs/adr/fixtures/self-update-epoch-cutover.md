@@ -9,12 +9,15 @@
 | W3 | 旧protocol compatible、Result到着後にDispatcher restart | receipt再読で重複回収せずterminal維持 |
 | W4 | 旧protocol unsupportedまたはowner不明 | Result隔離、削除・resume・notify禁止 |
 | W5 | lease expired/revoked、旧workerが後からResult公開 | 死亡や移譲を推定せず`needs_review` |
+| W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
+| W7 | Aのlive workerが残るBからCへの更新 | CがA/Bの全live protocolを扱えなければactivation拒否 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
 | R3 | migration backup後・schema commit前にrestart | backup/receipt/schemaを検査し二重migration禁止 |
 | R4 | pointer rename後・activation commit前にrestart | pointer、receipt、health、sessionを照合し推定で再起動しない |
 | N1 | terminal jobだがnotification event欠損 | 自動event生成なし、`needs_review` |
-| N1a | event永続化済み、`send_not_started`、投稿receiptなし | access再検証後、同一eventから一度だけ送信 |
+| N1a | event永続化済み、`send_not_started`、投稿receiptなし | 必要な認可とaccess再検証後、同一eventから一度だけ送信 |
+| N1b | scheduled通知pending、authorization取消/失効 | 二段階認可が成立せず送信抑止 |
 | N2 | 投稿応答不明だがexact markerあり | 既送信としてreceiptを確定、再投稿なし |
 | N3 | 投稿応答不明でmarkerなし/old thread | 通知抑止、operator判断待ち |
 | N4 | group attention未解決、全sibling terminal | all-terminal抑止、sessionをactiveへ戻さない |
@@ -24,6 +27,8 @@
 | M3 | migration後、新epochでprovider write確定 | snapshot復元でもwriteを未実行扱いせずreconcile |
 | M4 | target epoch worker稼働中に旧snapshotへのrollback要求 | 両epochのowner/Result/receiptの再構成を証明できなければrollback禁止 |
 | M5 | Dispatcher active epoch install応答喪失 | receiptをread-backし、exact一致までingress停止 |
+| M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
+| M7 | targetのterminal event/group stateが旧snapshotにない | completion transaction全体を再構成できなければrollback拒否 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
 | C2 | dispatch前cancelでResultなし、通知先none | 両dispositionを`not_required`へ確定後、参照がなければGC可 |
 | C3 | completion receipt commit直後にrestart | terminal状態・event/group transitionも同時に存在し、重複生成なし |

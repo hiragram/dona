@@ -22,7 +22,7 @@
 | class | apply前とquiesce | activation後 | 証拠不足時 |
 | --- | --- | --- | --- |
 | main agentの受理済みturn | Result公開までdrain。未受理入力を停止し、旧sessionのexact identityを停止・消失確認 | pointer切替後に新releaseで新sessionを開始 | acceptance unknownなら停止して`needs_review` |
-| background worker | owner epochへ固定し継続。新規dispatch/steer/cancelを停止 | 新Dispatcherがversioned completion receiptで回収。実行所有権は移さない | legacy/unknownは隔離、旧Result領域を保持 |
+| background worker | owner epochへ固定し継続。新規dispatch/steer/cancelを停止 | 新Dispatcherがversioned completion receiptで回収。旧owner fence、exact session、source event、workspaceを検証するversioned steer/cancel経路だけを提供し、実行所有権は移さない。経路がないlive workerを残したactivationは禁止 | legacy/unknownは隔離、旧Result領域を保持 |
 | scheduled worker | schedule runとowner bindingを固定し継続。due scanと新規委任を停止 | 同じrun keyの重複を拒否しcompletionを検証 | access/authorization不明なら新規実行・通知抑止 |
 | provider writeとoutbox | in-flight writeをreceiptまでdrain。応答喪失は外部IDで読取照合 | 既存receiptに基づき再開 | acceptance unknownなら再送せず隔離 |
 | job/group notification worker | in-flight postとsession statusをreceiptまでdrain | 保存済みevent/receiptだけ再照合し送信 | 投稿済み不明なら重複送信せず`suspended`相当のattention |
@@ -30,22 +30,22 @@
 
 ## DB snapshotとphase invariant
 
-1. **plan/apply前:** exact current/target SHA、protocol双方のreader/writer互換性、schema migration能力、owner別workload inventory、通知outbox・group state、Result参照、rollback対象を永続snapshotへ結び付ける。inventoryにunknownや未解決writeがあれば適用を拒否するか対象を隔離して明示的に保護する。件数だけで安全判定しない。
+1. **plan/apply前:** exact current/target SHA、inventory上の全live owner protocolに対するcompletion reader・steer/cancel経路と新旧runtimeのwriter互換性、schema migration能力、owner別workload inventory、通知outbox・group state、Result参照、rollback対象を永続snapshotへ結び付ける。inventoryにunknownや未解決writeがあれば適用を拒否するか対象を隔離して明示的に保護する。件数だけで安全判定しない。
 2. **quiesce:** Slack ingress、Dispatcherの新規dispatch・schedule due scan・provider write開始を停止し、in-flight acceptanceをreceiptまでdrainする。両serviceのdrain receiptは同じrequest/epoch/fenceとinventory watermarkに束縛する。watermark以降の新規commitがないことを再照合する。main turnとsteer/cancelの受理不明が残れば進めない。
 3. **migration:** app DBのonline backupをmigration前に取り、WALを含む一貫性、integrity、schema version、open-test、復元可能性を検証する。backupはepochと元SHAへ束縛する。migrationはbackup/receiptを書いてから一度だけ実行し、失敗・応答不明時はschema/receiptを読んで判定する。新schemaを旧releaseが読書きできないならrollbackを禁止し、旧DB snapshotを復元できると証明した場合だけ旧releaseへ戻す。worker ResultはDB snapshotの外にあるため、復元後もreceipt照合を継続する。
-4. **activation:** stable updaterだけがfenced runtime operation intentを記録し、quiesce済み旧process消失を確認してからpointerを切り替え、pointer/activation receipt、新process SHA/schema/protocol/session healthを照合する。新Dispatcherには`request_id`・epoch・release SHA・Updater fenceを束縛したactive-epoch receiptをCASで永続化させ、同じ値をhealthとDB read-backで照合する。応答不明なら再installせずread-backする。exact active epochが確定するまで新規ingress、job stamp、due scanを開かない。
-5. **rollback:** 新ingressを再びdrainし、旧releaseが現在DBを扱えるか、またはepoch付きsnapshotを安全に復元できるかを検証する。rollback直前に新たなfenced inventoryを取得し、target epochで作られたworker、Result領域、owner metadata、completion/通知receiptも列挙する。snapshot復元でtarget epochのDispatcher行が消える場合、stable領域に保存した全owner metadataとreceiptを復元後に再構成し、旧/target両epochを一意に照合できることをrollbackの前提とする。再構成不能なら自動rollbackを禁止し`needs_review`へ隔離する。rollback後もepochは再利用せず、両epochのworkerとResult/通知receiptを保護する。新epochで確定した外部writeをDB復元で「未実行」に戻さない。矛盾は`needs_review`。
+4. **activation:** stable updaterだけがfenced runtime operation intentを記録し、quiesce済み旧process消失を確認してからpointerを切り替え、pointer/activation receipt、新process SHA/schema/protocol/session healthを照合する。新Dispatcherには`request_id`・epoch・release SHA・Updater fenceを束縛したactive-epoch receiptをCASで永続化させ、同じ値をhealthとDB read-backで照合する。rollbackで旧releaseへ戻す場合も別の単調増加epochを予約し、旧release SHAと新Updater fenceを束縛したactive-epoch receiptを旧DispatcherへCAS install/read-backする。target epochのreceiptを再利用しない。応答不明なら再installせずread-backする。exact active epochが確定するまで新規ingress、job stamp、due scanを開かない。
+5. **rollback:** 新ingressを再びdrainし、旧releaseが現在DBを扱えるか、またはepoch付きsnapshotを安全に復元できるかを検証する。rollback直前に新たなfenced inventoryを取得し、target epochで作られたworker、Result領域、owner metadata、completion/通知receipt、terminal状態、event payloadとsend marker、group transitionとattention resolutionも列挙する。snapshot復元でtarget epochのDispatcher行が消える場合、stable領域に保存したcompletion transaction全体とowner metadataを復元後に再構成し、旧/target両epochを一意に照合できることをrollbackの前提とする。再構成不能なら自動rollbackを禁止し`needs_review`へ隔離する。rollback後もepochは再利用せず、両epochのworkerとResult/通知receiptを保護する。新epochで確定した外部writeをDB復元で「未実行」に戻さない。矛盾は`needs_review`。
 6. **post-activation:** inventoryの全workload、Result receipt、notification receipt、runtime operationをboundedに照合する。旧workerが残る間は旧protocol readerとcleanup保護を維持する。通知settleはruntime activationと独立した完了条件とする。
 
 ## terminal通知
 
-`completion_event_id`、groupのattention/all-terminal ID、投稿receipt、保存済みreply targetを正本とする。terminal jobにeventが欠損していても起動時scanから自動生成しない。既存receiptがあればevent ID、payload digest、status、投稿/Agent Sessionの証拠を照合する。永続eventに`send_not_started`のmarkerがありprovider writeのintentもない場合、投稿receiptがなくても正常なpendingとして、accessを再検証した後に保存済みeventから一度だけ送信できる。送信intent後にreceiptを失った状態、旧thread、workspace/owner access不明、投稿済み不明は抑止して`needs_review`へ送る。通知先を現在の会話やjob metadataから推定しない。
+`completion_event_id`、groupのattention/all-terminal ID、投稿receipt、保存済みreply targetを正本とする。terminal jobにeventが欠損していても起動時scanから自動生成しない。既存receiptがあればevent ID、payload digest、status、投稿/Agent Sessionの証拠を照合する。永続eventに`send_not_started`のmarkerがありprovider writeのintentもない場合、投稿receiptがなくても正常なpendingとして、保存済みeventから一度だけ送信できる。ただしscheduled通知では現在の通知event IDで一段目の`authorize_job_notification`、ownerのcurrent channel accessと署名済みaccess receipt、投稿直前の二段目認可と`access_receipt_verified`を順に確認する。cancel/pause/authorization失効を含む不一致は送信を抑止する。通常のSlack thread通知も保存済みtargetとcurrent accessを再検証する。送信intent後にreceiptを失った状態、旧thread、workspace/owner access不明、投稿済み不明は抑止して`needs_review`へ送る。通知先を現在の会話やjob metadataから推定しない。
 
 Grouped通知ではprogressを投稿せず、attentionは同一group/transitionの既存eventだけを一度処理する。all-terminalは全sibling terminalかつattention resolutionが`not_required`または`resolved`であることをdurable stateで再検証してから送る。未解決attention、欠損group snapshot、旧threadはfinal通知を抑止する。投稿応答喪失時は保存済みnotification IDとprovider側のexact markerを読取照合し、一意に確定できなければ再投稿しない。activation成功を通知成功の代用にしない。
 
 ## downstream契約と費用
 
-#233以降で必要な更新: Updaterのepoch/inventory/phase receipt、Dispatcherのworkload owner・completion receipt・versioned reader、schedule runとgroup notificationのfence、Slack投稿receiptとaccess照合、GC参照、管理用reconcile API。既存schemaへepoch列を加えるmigrationと旧protocol readerの維持が必要。旧workerが残る期間は二つのcompletion protocolを読む費用があり、旧reader削除には全旧ownerのterminal/隔離解除と保護期間終了の証拠が要る。逆戻しにはDB snapshotだけでなく外部writeと通知receiptの照合が必要で、証拠がない場合は自動rollbackしない。
+#233以降で必要な更新: Updaterのepoch/inventory/phase receipt、Dispatcherのworkload owner・completion receipt・versioned reader、schedule runとgroup notificationのfence、Slack投稿receiptとaccess照合、GC参照、管理用reconcile API。既存schemaへepoch列を加えるmigrationと旧protocol readerの維持が必要。複数世代のworkerが残る期間はinventory上の全未settle owner protocolを読む費用がある。次のupdateはtargetがその全protocolのcompletionとsteer/cancelを扱えることを検証し、互換でなければactivationを拒否する。readerとcontrol adapterの削除には該当する全ownerのsettleと保護期間終了の証拠が要る。逆戻しにはDB snapshotだけでなく外部writeと通知receiptの照合が必要で、証拠がない場合は自動rollbackしない。
 
 #155のtest runner設計、#181のdiagnostic log形式、production activationは本ADRの対象外。
 
