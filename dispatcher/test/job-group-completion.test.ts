@@ -275,6 +275,42 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("旧all_terminal claimは未配送だけを移行時に無効化し曖昧な状態を隔離する", async () => {
+    for(const oldStatus of ["queued","waiting_agent"] as const) {
+      const {database,source,job,config}=await oneJobGroup(`Ev-legacy-terminal-${oldStatus}`);
+      database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果不明");
+      sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+      database.enqueueJobNotification(job.job_id);
+      const oldFinal=database.enqueue({...eventEnvelope(`Ev-legacy-final-${oldStatus}`),source:"dona_job",
+        payload:{group:{source_event_id:source.event_id,transition:"all_terminal"}}}).row;
+      if(oldStatus==="waiting_agent") {
+        database.beginDispatch(oldFinal.event_id,`${config.resultsDir}/old-final.json`);
+        database.markWaiting(oldFinal.event_id);
+      }
+      const raw=new Database(config.databasePath);
+      raw.prepare("UPDATE job_groups SET all_terminal_event_id=? WHERE source_event_id=?")
+        .run(oldFinal.event_id,source.event_id);
+      raw.prepare("UPDATE jobs SET completion_event_id=? WHERE job_id=?")
+        .run(oldFinal.event_id,job.job_id);
+      raw.close();
+      database.close();
+      const reopened=new DispatcherDatabase(config.databasePath);
+      const audit=reopened.getLegacyAttentionClaim(source.event_id)!;
+      assert.equal(audit.all_terminal_event_id,oldFinal.event_id);
+      if(oldStatus==="queued") {
+        assert.equal(audit.recovery_state,"superseded");
+        assert.equal(reopened.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+        assert.equal(reopened.getJob(job.job_id)?.completion_event_id,null);
+        assert.equal(reopened.get(oldFinal.event_id)?.last_error_code,"legacy_group_terminal_superseded");
+      } else {
+        assert.equal(audit.recovery_state,"needs_review");
+        assert.equal(reopened.getJobGroup(source.event_id)?.all_terminal_event_id,oldFinal.event_id);
+        assert.equal(reopened.get(oldFinal.event_id)?.status,"waiting_agent");
+      }
+      reopened.close();
+    }
+  });
+
   test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

@@ -37,6 +37,7 @@ function usage(): never {
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
+  dona-dispatcher job attention-recovery <source_event_id>
   dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed [--resume <claim_token>]
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
@@ -138,6 +139,12 @@ async function main(): Promise<void> {
         const row=database.resolveNeedsReviewAttention(sourceEventId,jobId,attentionEventId,eventIdAt(args,5),eventIdAt(args,6));
         console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,
           group:database.getJobGroup(sourceEventId)},null,2));return;
+      }
+      if(command==="attention-recovery") {
+        if(args.length!==3)usage();
+        const sourceEventId=eventIdAt(args,2);
+        console.log(JSON.stringify({group:database.getJobGroup(sourceEventId),
+          legacy_claim:database.getLegacyAttentionClaim(sourceEventId)},null,2));return;
       }
       if(command==="reconcile-attention-delivery") {
         if((args.length!==8 && args.length!==10) || args[7]!=="--notification-reviewed" ||

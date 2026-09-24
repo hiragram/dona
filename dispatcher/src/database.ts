@@ -161,6 +161,7 @@ function ensureV2BridgeSchema(db: Database.Database): void {
   ensureJobsWorkspaceJobIndex(db);
   ensureJobsStatusJobIndex(db);
   ensureJobAttentionResolutionSchema(db);
+  reconcileLegacyAttentionClaims(db);
 }
 function ensureJobsWorkspaceJobIndex(db:Database.Database):void {db.exec(`
   CREATE INDEX IF NOT EXISTS jobs_workspace_job_idx ON jobs(workspace_id,job_id);
@@ -203,7 +204,44 @@ function ensureJobAttentionResolutionSchema(db: Database.Database): void { db.ex
     body_sha256 TEXT NOT NULL,
     claimed_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS job_attention_legacy_claims (
+    source_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+    all_terminal_event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_status_at_detection TEXT NOT NULL,
+    recovery_state TEXT NOT NULL CHECK (recovery_state IN ('superseded','needs_review')),
+    detected_at TEXT NOT NULL
+  );
 `);}
+
+function reconcileLegacyAttentionClaims(db: Database.Database): void {
+  const candidates=db.prepare(`SELECT g.source_event_id,g.all_terminal_event_id,e.status
+    FROM job_groups g JOIN events e ON e.event_id=g.all_terminal_event_id
+    WHERE g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
+      AND g.all_terminal_event_id IS NOT NULL
+      AND json_extract(e.payload_json,'$.group.attention_resolution_state') IS NULL
+      AND EXISTS (SELECT 1 FROM jobs j WHERE j.source_event_id=g.source_event_id
+        AND j.status IN ('blocked','needs_review','failed'))`)
+    .all() as Array<{source_event_id:string;all_terminal_event_id:string;status:EventStatus}>;
+  const at=nowUtc();
+  for(const candidate of candidates) {
+    const safeToSupersede=["queued","retryable_failed"].includes(candidate.status);
+    db.prepare(`INSERT OR IGNORE INTO job_attention_legacy_claims
+      (source_event_id,all_terminal_event_id,event_status_at_detection,recovery_state,detected_at)
+      VALUES(?,?,?,?,?)`).run(candidate.source_event_id,candidate.all_terminal_event_id,candidate.status,
+      safeToSupersede?"superseded":"needs_review",at);
+    if(!safeToSupersede) continue;
+    const changed=db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+      last_error_code='legacy_group_terminal_superseded',last_error_message=NULL
+      WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+      .run(at,at,candidate.all_terminal_event_id).changes;
+    if(changed!==1) throw new Error("legacy_group_terminal_changed_during_recovery");
+    db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
+      .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
+    db.prepare(`UPDATE job_groups SET all_terminal_event_id=NULL,updated_at=?
+      WHERE source_event_id=? AND all_terminal_event_id=?`)
+      .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
+  }
+}
 
 export function migrateDispatcherDatabase(
   db: Database.Database,
@@ -404,6 +442,7 @@ export function migrateDispatcherDatabase(
     ensureJobsWorkspaceJobIndex(db);
     ensureJobsStatusJobIndex(db);
     ensureJobAttentionResolutionSchema(db);
+    reconcileLegacyAttentionClaims(db);
   }
 }
 
@@ -875,6 +914,14 @@ export class DispatcherDatabase {
   getJobGroup(sourceEventId: string): JobGroupRow | undefined {
     return this.db.prepare("SELECT * FROM job_groups WHERE source_event_id = ?")
       .get(sourceEventId) as JobGroupRow | undefined;
+  }
+
+  getLegacyAttentionClaim(sourceEventId: string): {
+    source_event_id:string;all_terminal_event_id:string;event_status_at_detection:string;
+    recovery_state:"superseded"|"needs_review";detected_at:string;
+  } | undefined {
+    return this.db.prepare("SELECT * FROM job_attention_legacy_claims WHERE source_event_id=?")
+      .get(sourceEventId) as ReturnType<DispatcherDatabase["getLegacyAttentionClaim"]>;
   }
 
   ensureJobGroup(
