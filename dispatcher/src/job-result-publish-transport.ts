@@ -34,6 +34,32 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
+// JSON.parse discards the original number spelling. Reject decimal and exponent
+// lexemes before parsing so precision loss cannot alias two publish digests.
+function assertExactJsonNumbers(source: string): void {
+  const number = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index]!;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') { quoted = true; continue; }
+    if (char !== "-" && (char < "0" || char > "9")) continue;
+    number.lastIndex = index;
+    const match = number.exec(source);
+    if (!match) continue;
+    if (!/^-?(?:0|[1-9]\d*)$/.test(match[0]) || !Number.isSafeInteger(Number(match[0]))) {
+      throw new JobResultPublishError("invalid_request");
+    }
+    index += match[0].length - 1;
+  }
+}
+
 /** Dedicated HTTP parser for trusted, already-connected worker sockets. */
 export class JobResultPublishServer {
   private readonly server: http.Server;
@@ -127,7 +153,11 @@ export class JobResultPublishServer {
         clearTimeout(deadline);
       }
       let input: unknown;
-      try { input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); }
+      try {
+        const source = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+        assertExactJsonNumbers(source);
+        input = JSON.parse(source);
+      }
       catch { throw new JobResultPublishError("invalid_request"); }
       // Recheck current grant/row after body receipt to close a revoke or worker-change race.
       const candidate = this.grants.validate(capability, session, input, this.getJob);

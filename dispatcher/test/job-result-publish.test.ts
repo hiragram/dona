@@ -62,7 +62,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "auth=CANARY_VALUE", "session_id=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "http://localhost:3000/download/OPAQUE_VALUE", "http://127.0.0.1:8080/private", "http://127.1/private", "http://[::1]/private", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "C:/Users/example/.ssh/id_rsa", "D:/private/result.json", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "auth=CANARY_VALUE", "session_id=CANARY_VALUE", "session-id=CANARY_VALUE", "Bearer abcdefghijklmnop", "-----BEGIN ENCRYPTED PRIVATE KEY-----", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "http://localhost:3000/download/OPAQUE_VALUE", "http://127.0.0.1:8080/private", "http://127.1/private", "http://[::1]/private", "http://10.0.0.5/download/OPAQUE_VALUE", "http://172.16.0.1/private", "http://192.168.1.1/private", "http://169.254.169.254/private", "http://[fc00::1]/private", "http://[fe80::1]/private", "http://[::ffff:10.0.0.5]/private", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "C:/Users/example/.ssh/id_rsa", "D:/private/result.json", "\\\\fileserver\\share\\private\\result.json", "//fileserver/share/private/result.json", "<!channel>", "<!here>", "<!everyone>", "<!subteam^S12345678>", "<@U12345678>", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -97,6 +97,8 @@ describe("job result publish contract", () => {
     const codePointJson = '{"actions":[],"artifacts":[{"\ue000":1,"😀":2}],"schema_version":1,"status":"completed","summary":"確認済み"}';
     assert.equal(unicode.canonicalDigest, createHash("sha256").update(`job-result-publish:v1\njob_one\n${codePointJson}`).digest("hex"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ count: 9_007_199_254_740_992 }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
+    assert.throws(() => validateJobResultPublish({ ...base, actions: [{ count: 1.5 }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
+    assert.throws(() => validateJobResultPublish({ ...base, summary: " \n\t " }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
   });
 
   test("単一job、失効、revocation、stale worker、restart時fail closed", () => {
@@ -176,9 +178,9 @@ describe("job result publish contract", () => {
   test("他jobの期限内runtime identityと自jobのobjectiveを本文から除外する", () => {
     const grants = new JobResultPublishCapabilities(id => id === "job_one" ? "session-one" : "session-two");
     const grant = grants.issue(row({ herdr_pane_id: "pane-one" }), "session-one");
-    grants.issue(row({ job_id: "job_two", herdr_pane_id: "pane-two" }), "session-two");
+    grants.issue(row({ job_id: "job_two", herdr_pane_id: "pane-two", agent_name: "agent-two", herdr_workspace_id: "herdr-two" }), "session-two");
     const current = row({ status: "running", herdr_pane_id: "pane-one", objective: "private objective text" });
-    for (const privateValue of ["session-two", "pane-two", "private objective text"]) {
+    for (const privateValue of ["session-two", "pane-two", "agent-two", "herdr-two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
   });
@@ -236,6 +238,7 @@ describe("job result publish contract", () => {
       assert.equal((await post(JSON.stringify({ ...base, artifacts: [{ capability: "CANARY_VALUE" }] }), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify({ ...base, artifacts: [{ herdr_pane_id: "pane-1", agent_session: "session-1" }] }), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify({ ...base, summary: "session-1" }), grant.capability)).status, 400);
+      assert.equal((await post('{"schema_version":1,"status":"completed","summary":"確認済み","actions":[{"count":1.0000000000000001}]}', grant.capability)).status, 400);
       assert.equal((await post("{", grant.capability)).status, 400);
       assert.equal((await post(Buffer.from([0xff]), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify(base), grant.capability, "old-session")).status, 403);

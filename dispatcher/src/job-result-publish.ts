@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 
 import { z } from "zod";
 
@@ -22,17 +23,38 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const localPath = /(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
+const uncPath = /(?:^|[\s"'(`=])(?:\\\\[^\\\s]+\\|\/\/[^/\s]+\/)/;
+const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
 function hasPrivateHttpHost(candidate: string): boolean {
   let hostname: string;
   try { hostname = new URL(candidate).hostname.toLowerCase(); }
   catch { return true; }
-  return hostname === "localhost" || hostname.endsWith(".localhost") || /^127\./.test(hostname) ||
-    hostname === "[::1]" || hostname === "::1" || hostname === "0.0.0.0" ||
-    hostname === "files.slack.com" || hostname === "hooks.slack.com";
+  if (hostname === "localhost" || hostname.endsWith(".localhost") ||
+    hostname === "files.slack.com" || hostname === "hooks.slack.com") return true;
+  const host = hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host) === 4) {
+    const [a, b] = host.split(".").map(Number) as [number, number];
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127);
+  }
+  if (isIP(host) === 6) {
+    const first = Number.parseInt(host.split(":")[0] || "0", 16);
+    if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true;
+    const mapped = host.match(/(?:^|:)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    if (mapped) return hasPrivateHttpHost(`http://${mapped[1]}/`);
+    // Also cover compressed hexadecimal IPv4-mapped addresses.
+    const hexMapped = host.match(/(?:^|:)ffff:([a-f0-9]{1,4}):([a-f0-9]{1,4})$/i);
+    if (hexMapped) {
+      const bits = (Number.parseInt(hexMapped[1]!, 16) << 16) | Number.parseInt(hexMapped[2]!, 16);
+      return hasPrivateHttpHost(`http://${[(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255].join(".")}/`);
+    }
+  }
+  return false;
 }
 function hasSignedQueryKey(candidate: string): boolean {
   const queryStart = candidate.indexOf("?");
@@ -74,7 +96,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
   }
   return false;
 }
-const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_]*|["'][^"'\r\n]+["'])\s*[:=]/g;
+const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie)(?:_|$)/.test(normalized) ||
@@ -98,7 +120,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.some(privateValue => privateValue.length >= 4 ? value.includes(privateValue) : value === privateValue)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value) || uncPath.test(value) || slackMention.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
@@ -108,7 +130,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
       assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
     }
-  } else if (typeof value === "number" && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
+  } else if (typeof value === "number" && !Number.isSafeInteger(value)) {
     throw new JobResultPublishError("invalid_request");
   } else if (typeof value !== "boolean" && typeof value !== "number" && value !== null) {
     throw new JobResultPublishError("invalid_request");
@@ -149,7 +171,7 @@ const jsonValue: z.ZodType<unknown> = z.json();
 const requestSchema = z.object({
   schema_version: z.literal(1),
   status: z.enum(["completed", "failed"]),
-  summary: z.string().min(1),
+  summary: z.string().min(1).refine(value => value.trim().length > 0),
   output: z.object({ format: z.enum(["markdown", "text"]), text: z.string() }).strict().optional(),
   artifacts: z.array(z.record(z.string(), jsonValue)).optional(),
   actions: z.array(jsonValue).optional(),
@@ -199,6 +221,8 @@ interface Grant {
   session: string;
   attemptCount: number;
   paneId: string | null;
+  agentName: string | null;
+  herdrWorkspaceId: string | null;
   expiresAt: number;
   renewableAt: number;
   revoked: boolean;
@@ -235,7 +259,8 @@ export class JobResultPublishCapabilities {
     if (!predecessor || this.now() < predecessor.renewableAt) throw new JobResultPublishError("renewal_not_due");
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(key, { jobId: job.job_id, session, attemptCount: job.attempt_count,
-      paneId: job.herdr_pane_id, expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
+      paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
+      expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -246,6 +271,7 @@ export class JobResultPublishCapabilities {
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(createHash("sha256").update(capability).digest("hex"), {
       jobId: job.job_id, session, attemptCount: job.attempt_count, paneId: job.herdr_pane_id,
+      agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       expiresAt, renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
@@ -291,7 +317,7 @@ export class JobResultPublishCapabilities {
       .map(candidate => candidate.fingerprint));
     const grantIdentities = [...this.grants.values()]
       .filter(candidate => candidate.expiresAt > this.now())
-      .flatMap(candidate => [candidate.paneId, candidate.session]);
+      .flatMap(candidate => [candidate.paneId, candidate.session, candidate.agentName, candidate.herdrWorkspaceId]);
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
