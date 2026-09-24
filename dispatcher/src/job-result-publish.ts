@@ -26,6 +26,14 @@ const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-
 const localPath = /(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
 const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
+function hasPrivateHttpHost(candidate: string): boolean {
+  let hostname: string;
+  try { hostname = new URL(candidate).hostname.toLowerCase(); }
+  catch { return true; }
+  return hostname === "localhost" || hostname.endsWith(".localhost") || /^127\./.test(hostname) ||
+    hostname === "[::1]" || hostname === "::1" || hostname === "0.0.0.0" ||
+    hostname === "files.slack.com" || hostname === "hooks.slack.com";
+}
 function hasSignedQueryKey(candidate: string): boolean {
   const queryStart = candidate.indexOf("?");
   if (queryStart < 0) return false;
@@ -70,7 +78,7 @@ const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_]*|["'][^"'\r\n]+["'])\s*[
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie)(?:_|$)/.test(normalized) ||
-    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
+    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
@@ -81,7 +89,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     for (const match of value.matchAll(httpUrlCandidate)) {
-      if (hasSignedQueryKey(match[0])) throw new JobResultPublishError("content_requires_redaction");
+      if (hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
     }
     for (const match of value.matchAll(assignmentCandidate)) {
       if (forbiddenKey(match[0].replace(/\s*[:=]$/, "").replace(/^["']|["']$/g, ""))) throw new JobResultPublishError("content_requires_redaction");
@@ -100,6 +108,8 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
       assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
     }
+  } else if (typeof value === "number" && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
+    throw new JobResultPublishError("invalid_request");
   } else if (typeof value !== "boolean" && typeof value !== "number" && value !== null) {
     throw new JobResultPublishError("invalid_request");
   }
@@ -280,10 +290,10 @@ export class JobResultPublishCapabilities {
       .filter(candidate => candidate.expiresAt > this.now())
       .map(candidate => candidate.fingerprint));
     const grantIdentities = [...this.grants.values()]
-      .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
+      .filter(candidate => candidate.expiresAt > this.now())
       .flatMap(candidate => [candidate.paneId, candidate.session]);
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
-      job.result_path, job.agent_name, grant.session, ...grantIdentities]
+      job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints),
       fence: { jobId: job.job_id, attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session } };
