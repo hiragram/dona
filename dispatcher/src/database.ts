@@ -2154,6 +2154,21 @@ export class DispatcherDatabase {
               completed_at:result.completed_at,last_error_code:null,last_error_message:null});
             return;
           }
+          const answered=typeof payload.job_id==="string"&&typeof payload.message_id==="string"&&
+            this.db.prepare(`SELECT 1 FROM worker_messages answer
+              JOIN worker_message_deliveries delivery ON delivery.message_id=answer.message_id
+              WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
+                AND answer.correlation_message_id=? AND delivery.consumer='worker'
+                AND delivery.state!='superseded' LIMIT 1`).get(payload.job_id,payload.message_id)!==undefined;
+          const hasPostOrSuspension=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+            (typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")||
+              ((action as Record<string,unknown>).status==="suspended"&&typeof (action as Record<string,unknown>).tool==="string"&&
+                String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status"))));
+          if(decision.action==="ask_user"&&answered&&!hasPostOrSuspension){
+            this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+            return;
+          }
           if(decision.action!=="ask_user"||!decision.safe_projection_json){
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:"worker_message_question_decision_mismatch",

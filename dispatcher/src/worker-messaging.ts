@@ -594,7 +594,9 @@ export class WorkerMessageRepository {
       const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
         .get(jobId) as {at:string|null};
       const lastUserDecision=this.db.prepare(`SELECT MAX(d.decided_at) AS at FROM worker_message_decisions d
-        JOIN worker_messages m USING(message_id) WHERE d.job_id=? AND m.producer_sequence<?
+        JOIN worker_messages m USING(message_id)
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        WHERE d.job_id=? AND m.producer_sequence<?
         AND d.action IN ('report_to_user','ask_user')`).get(jobId,message.producer_sequence) as {at:string|null};
       const payload=JSON.parse(message.payload_json) as {kind:"checkpoint"|"question"|"risk"|"decision_request";
         summary?:string;question?:string;severity?:"low"|"medium"|"high";options?:string[];eta_at?:string};

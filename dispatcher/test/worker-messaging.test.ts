@@ -43,6 +43,57 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
+  test("decision後に回答が先着した質問は投稿せず完了しanswerを保持する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      bindRuntime(database,job.job_id,"runtime-answered-after-decision");
+      const created=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        conversation_revision:1,payload:{kind:"question",question:"確認が必要です"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id).action,"ask_user");
+      const answer=database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"answer-after-decision",occurred_at:"2026-09-21T00:00:03Z",
+        correlation_message_id:created.message.message_id,conversation_revision:2,
+        payload:{operation:"answer",text:"続けてください"}});
+      assert.deepEqual(database.workerMessages.decisionCurrent(job.job_id,created.message.message_id,event.event_id),
+        {current:false,reason:"answered"});
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"回答済みのため投稿しません",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:04Z"},"result.json");
+      assert.equal(database.get(event.event_id)?.status,"completed");
+      assert.notEqual(database.getJob(job.job_id)?.status,"needs_review");
+      const sqliteAfter=new Database(config.databasePath);
+      const delivery=sqliteAfter.prepare("SELECT state FROM worker_message_deliveries WHERE message_id=? AND consumer='worker'")
+        .get(answer.message.message_id) as {state:string};
+      sqliteAfter.close();
+      assert.notEqual(delivery.state,"superseded");
+    } finally {database.close();}
+  });
+  test("未投稿の利用者向けdecisionは無通知時間をリセットしない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const reports=[
+        {input:report(source.event_id,1),at:"2026-09-21T00:00:01Z"},
+        {input:{...report(source.event_id,2),payload:{kind:"risk",summary:"懸念",severity:"high"}},at:"2026-09-21T00:10:01Z"},
+        {input:report(source.event_id,3),at:"2026-09-21T00:20:01Z"},
+      ];
+      const decisions=[];
+      for(const {input,at} of reports){
+        const created=database.workerMessages.appendReport(job.job_id,input,new Date(at));
+        database.workerMessages.publishPendingReports(1,new Date(at));
+        const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+        const sqlite=new Database(config.databasePath);
+        sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+        sqlite.close();
+        decisions.push(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,new Date(at)));
+      }
+      assert.equal(decisions[1]?.action,"report_to_user");
+      assert.equal(decisions[2]?.reason,"silence");
+    } finally {database.close();}
+  });
   test("cancelling後の質問をterminal decisionとして保存する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
