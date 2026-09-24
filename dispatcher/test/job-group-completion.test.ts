@@ -144,6 +144,34 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("別jobのlate Resultでは配送済みattention ownerを維持する", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-other-result");
+    const sibling=database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.markJobBlocked(job.job_id,"入力待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    database.markJobNeedsReview(sibling.job_id,"prompt_interrupted","結果待ち");
+    database.enqueueJobNotification(sibling.job_id);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"completed",
+      summary:"late Result",completed_at:"2026-09-05T00:01:30.000Z"},sibling.result_path);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    assert.equal((envelopeFromRow(database.enqueueJobNotification(sibling.job_id).row).payload.group as Record<string,unknown>).transition,"progress");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    database.close();
+  });
+
   test("投稿済みattentionは取消後の最終通知まで同一ownerを保持する", async () => {
     const {database,source,job,config} = await oneJobGroup("Ev-attention-delivered-cancel");
     database.markJobBlocked(job.job_id,"入力待ち");

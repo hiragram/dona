@@ -2758,7 +2758,7 @@ export class DispatcherDatabase {
     const job = this.getJobRequired(jobId);
     const attention = this.getRequired(attentionEventId);
     if (job.status !== status || attention.source !== "dona_job") throw new Error("attention_resolution_binding_mismatch");
-    const payload = JSON.parse(attention.payload_json) as { group?: { transition?: string; source_event_id?: string } };
+    const payload = JSON.parse(attention.payload_json) as { job_id?: string; group?: { transition?: string; source_event_id?: string } };
     if (payload.group?.transition !== "attention" || payload.group.source_event_id !== job.source_event_id) {
       throw new Error("attention_resolution_binding_mismatch");
     }
@@ -2778,7 +2778,7 @@ export class DispatcherDatabase {
         SELECT 1 FROM job_attention_resolutions r WHERE r.job_id=j.job_id
           AND r.source_event_id=j.source_event_id AND r.status_at_resolution='failed'
       ))) LIMIT 1`).get(job.source_event_id,jobId);
-    if (unresolvedSibling && this.attentionNotificationSettled(attention)) {
+    if (payload.job_id === jobId && unresolvedSibling && this.attentionNotificationSettled(attention)) {
       this.db.prepare(`UPDATE job_groups SET attention_event_id=NULL,updated_at=?
         WHERE source_event_id=? AND attention_event_id=? AND all_terminal_event_id IS NULL`)
         .run(at.toISOString(),job.source_event_id,attentionEventId);
