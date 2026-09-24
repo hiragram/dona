@@ -60,7 +60,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const projects = trustedPaths
     .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
     .join(", ");
-  args.push("-c", `projects = { ${projects} }`);
+  args.push("-c", "check_for_update_on_startup=false", "-c", `projects = { ${projects} }`);
   return args;
 }
 
