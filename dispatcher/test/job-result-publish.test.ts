@@ -100,7 +100,8 @@ describe("job result publish contract", () => {
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
-      "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
+      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json",
+      "GET /run/secrets/db-password returned 200", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
@@ -122,6 +123,7 @@ describe("job result publish contract", () => {
     const jwkStarted = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: publicJwks }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - jwkStarted < 2_000, "JWK本文検査は反復しても線形時間で終わる");
+    assert.throws(() => validateJobResultPublish({ ...base, summary: "{".repeat(100_000) }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     const jwtLike = `${"eyJ_".repeat(200)}.e30.dGVzdHNpZ25hdHVyZQ`;
     const jwtStarted = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: jwtLike.repeat(300) }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -265,6 +267,10 @@ describe("job result publish contract", () => {
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
     assert.throws(() => japanese.validate(jaGrant.capability, "session-ja", { ...base, summary: "https://example.com/?detail=%E7%A7%98%E5%AF%86+%E8%A8%88%E7%94%BB" },
       () => row({ status: "running", objective: "秘密 計画" })), code("content_requires_redaction"));
+    const accented = new JobResultPublishCapabilities(() => "session-accent");
+    const accentGrant = accented.issue(row({ objective: "café" }), "session-accent");
+    assert.throws(() => accented.validate(accentGrant.capability, "session-accent", { ...base, summary: "cafe\u0301" },
+      () => row({ status: "running", objective: "café" })), code("content_requires_redaction"));
   });
 
   test("短いobjectiveは全文一致時だけ拒否する", () => {

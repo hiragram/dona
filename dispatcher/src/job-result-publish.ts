@@ -51,7 +51,11 @@ function hasPrivateJwkText(value: string): boolean {
   const scopes: { keyType: boolean; privateParameter: boolean }[] = [];
   for (let index = 0; index < value.length; index++) {
     const char = value[index];
-    if (char === "{") { scopes.push({ keyType: false, privateParameter: false }); continue; }
+    if (char === "{") {
+      if (scopes.length >= 64) return true;
+      scopes.push({ keyType: false, privateParameter: false });
+      continue;
+    }
     if (char === "}") {
       const scope = scopes.pop();
       if (scope?.keyType && scope.privateParameter) return true;
@@ -94,8 +98,8 @@ function hasLocalPath(value: string): boolean {
     const route = match[0].trimStart();
     const prefix = value.slice(0, match.index);
     if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd()) &&
-      !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private)(?:\/|\b)/i.test(route) &&
-      !/\/(?:\.ssh|\.aws|\.env|id_(?:rsa|ed25519))(?:\/|\b)/i.test(route)) continue;
+      !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run)(?:\/|\b)/i.test(route) &&
+      !/\/(?:\.ssh|\.aws|\.env|secrets|id_(?:rsa|ed25519))(?:\/|\b)/i.test(route)) continue;
     return true;
   }
   return false;
@@ -113,7 +117,7 @@ function hasPrivateSlashAuthority(value: string): boolean {
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa))\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa))(?::\d{1,5})?\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -229,8 +233,9 @@ class ForbiddenValueMatcher {
   private readonly exact = new Set<string>();
   private readonly nodes: MatchNode[] = [{ next: new Map(), fail: 0, terminal: false }];
   constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
-    for (const value of new Set(values)) {
-      if (value.length < 8 && !substringShortValues.has(value)) { this.exact.add(value); continue; }
+    const normalizedShortValues = new Set([...substringShortValues].map(value => value.normalize("NFC")));
+    for (const value of new Set(values.map(item => item.normalize("NFC")))) {
+      if (value.length < 8 && !normalizedShortValues.has(value)) { this.exact.add(value); continue; }
       let state = 0;
       for (const char of value) {
         let next = this.nodes[state]!.next.get(char);
@@ -256,6 +261,7 @@ class ForbiddenValueMatcher {
     }
   }
   contains(value: string): boolean {
+    value = value.normalize("NFC");
     if (this.exact.has(value)) return true;
     let state = 0;
     for (const char of value) {
